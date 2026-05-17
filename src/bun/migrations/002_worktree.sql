@@ -1,0 +1,3 @@
+ALTER TABLE tasks ADD COLUMN isolation TEXT NOT NULL DEFAULT 'worktree';
+ALTER TABLE tasks ADD COLUMN branch TEXT;
+ALTER TABLE tasks ADD COLUMN worktree_path TEXT;

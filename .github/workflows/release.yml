@@ -1,0 +1,158 @@
+name: Release
+
+# Every push to main produces a signed, notarized release on
+# github.com/alamops/agetor/releases. The job:
+#   1. Bumps the patch in package.json + electrobun.config.ts locally.
+#   2. Runs the same `bun run release` pipeline that works on your laptop —
+#      vendor:tmux → vite build → electrobun build → notarize → verify →
+#      upload to GitHub Releases.
+#   3. ONLY IF every step above succeeded: commits the bump back to main
+#      with [skip ci] so the next push restarts from the new version.
+#
+# This ordering matters: pushing the bump before build means a failed
+# install/build/notarize leaves a hole in version history (v0.0.2 in main
+# but no release published, next run jumps to v0.0.3). Bumping after a
+# clean run keeps main's version aligned with the latest published release.
+#
+# Manual minor/major bumps: edit version in package.json + electrobun.config.ts
+# in your commit. The auto-bump step always increments patch on top of
+# whatever the head version is, so manual major/minor lands correctly.
+
+on:
+  push:
+    branches: [main]
+
+# Serialize releases. Without this, two pushes in quick succession would
+# each try to bump-and-push and race on the same starting version, leaving
+# one job to fail at the push step.
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+# Default GITHUB_TOKEN is read-only; we need write to push the bump commit
+# and to create the GitHub Release.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # macos-14 is arm64 — must match the project's arm64-only build stance.
+    # Don't switch to macos-13 (x64) without revisiting electrobun.config + fetch-tmux.
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    # Skip our own bump commits. GitHub Actions also natively respects
+    # `[skip ci]` in the commit message, but this guard is belt-and-suspenders
+    # for cases where someone manually re-runs the job.
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so a future "build changelog from git log" step has
+          # what it needs. The actual release doesn't require depth > 1.
+          fetch-depth: 0
+          # Default token works for `git push` back to main thanks to the
+          # `permissions.contents: write` block above.
+          persist-credentials: true
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Homebrew tmux (for vendor:tmux)
+        run: |
+          # tmux + its dylibs are the source for scripts/fetch-tmux.ts. The
+          # runner has Homebrew preinstalled; this is a few seconds tops.
+          brew install tmux
+
+      - name: Configure git identity
+        run: |
+          git config user.name "agetor-release-bot"
+          git config user.email "release-bot@alamops.sh"
+
+      - name: Bump patch version (working tree only)
+        id: bump
+        run: |
+          # Modify package.json + electrobun.config.ts in place, but do NOT
+          # commit yet. The commit happens in a later step, only if the build
+          # + upload completed cleanly — so a failed run never leaves a hole
+          # in the release history.
+          NEW_VERSION=$(bun scripts/bump-patch.ts)
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Import code-signing certificate
+        env:
+          CERT_B64: ${{ secrets.DEVELOPER_ID_CERT_P12_BASE64 }}
+          CERT_PWD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          # Recipe straight from Apple's "Customizing your build process for
+          # CI" docs. Build a per-job keychain so we never touch the runner's
+          # default keychain and the cert dies with the job. The
+          # set-key-partition-list call is the magic that prevents codesign
+          # from prompting for the private key the first time it's used —
+          # without it, signing hangs forever waiting on a GUI dialog.
+          CERT_PATH="$RUNNER_TEMP/dev_id.p12"
+          KC_PATH="$RUNNER_TEMP/build.keychain-db"
+          KC_PASSWORD=$(openssl rand -hex 16)
+
+          echo -n "$CERT_B64" | base64 --decode -o "$CERT_PATH"
+          security create-keychain -p "$KC_PASSWORD" "$KC_PATH"
+          security set-keychain-settings -lut 21600 "$KC_PATH"
+          security unlock-keychain -p "$KC_PASSWORD" "$KC_PATH"
+          security import "$CERT_PATH" -P "$CERT_PWD" -A -t cert -f pkcs12 -k "$KC_PATH"
+          security list-keychain -d user -s "$KC_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASSWORD" "$KC_PATH"
+
+      - name: Stage Apple notarization key
+        env:
+          APPLE_KEY_B64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          KEY_PATH="$RUNNER_TEMP/keys/AuthKey.p8"
+          echo -n "$APPLE_KEY_B64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          # Expose to subsequent steps via $GITHUB_ENV so `bun run release`
+          # sees them as regular env vars.
+          echo "ELECTROBUN_APPLEAPIKEYPATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Run release pipeline
+        env:
+          # Secrets → env vars expected by electrobun's notarize step and our
+          # fetch-tmux signing step. The KEYPATH was set in the step above.
+          ELECTROBUN_DEVELOPER_ID: ${{ secrets.ELECTROBUN_DEVELOPER_ID }}
+          ELECTROBUN_APPLEAPIKEY: ${{ secrets.APPLE_API_KEY_ID }}
+          ELECTROBUN_APPLEAPIISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          # GITHUB_TOKEN is auto-provided by Actions; scripts/upload-release.ts
+          # reads it from the env directly.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bun run release
+
+      - name: Commit bump on success
+        # Only fires when every previous step (install, signing setup, build,
+        # notarize, verify, upload) succeeded. If the push race-loses to a
+        # parallel push (shouldn't happen — concurrency group serializes us
+        # — but just in case), we surface the failure rather than silently
+        # diverging.
+        if: success()
+        run: |
+          NEW_VERSION=${{ steps.bump.outputs.version }}
+          git add package.json electrobun.config.ts
+          # [skip ci] tells GitHub Actions to ignore the resulting push, so
+          # we don't trigger an infinite release loop.
+          git commit -m "release v$NEW_VERSION [skip ci]"
+          git push
+
+      - name: Cleanup keychain on failure
+        if: always()
+        run: |
+          # security delete-keychain is best-effort — the job runner gets
+          # nuked between runs anyway, but cleaning up means a re-run with a
+          # rotated cert starts from a clean slate.
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" || true
+          rm -f "$RUNNER_TEMP/keys/AuthKey.p8" || true

@@ -1,0 +1,52 @@
+{
+  "name": "agetor",
+  "version": "0.0.1",
+  "description": "Local agent orchestrator with a kanban view — runs Claude Code, Codex and other CLI agents on tasks you create.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "AGETOR_DATA_DIR=\"$HOME/.agetor-dev\" electrobun dev --watch",
+    "dev:hmr": "AGETOR_DATA_DIR=\"$HOME/.agetor-dev\" concurrently -k -n vite,bun \"bun run hmr\" \"bun run dev\"",
+    "hmr": "vite --port 5173",
+    "wipe:dev": "bun scripts/wipe-dev.ts",
+    "vendor:tmux": "bun scripts/fetch-tmux.ts",
+    "build": "bun run vendor:tmux && vite build && electrobun build && bun scripts/rename-dmg.ts",
+    "build:canary": "bun run vendor:tmux && vite build && electrobun build --env=canary && bun scripts/rename-dmg.ts",
+    "build:stable": "bun run vendor:tmux && vite build && electrobun build --env=stable && bun scripts/rename-dmg.ts",
+    "release": "bun run build:stable && bun scripts/verify-release.ts && bun scripts/upload-release.ts",
+    "release:upload-only": "bun scripts/upload-release.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.5.0",
+    "concurrently": "^9.2.1",
+    "electrobun": "^1.18.1",
+    "postcss": "^8.5.14",
+    "tailwindcss": "^3",
+    "vite": "^8.0.12"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
+    "@fontsource-variable/geist": "^5.2.8",
+    "@lobehub/icons": "^5.8.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.14.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.6.0"
+  }
+}

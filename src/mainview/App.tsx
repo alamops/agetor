@@ -1,0 +1,486 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+import { AlertTriangle, Settings, X } from "lucide-react";
+import { api, type AgentModelMap } from "@/lib/api";
+import { Button } from "@/components/ui/button";
+import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task } from "../shared/types.ts";
+import { AgentIcon } from "@/components/kanban/AgentIcon";
+import { Column } from "@/components/kanban/Column";
+import { KanbanFilters } from "@/components/kanban/KanbanFilters";
+import { NewTaskForm } from "@/components/kanban/NewTaskForm";
+import { RunPanel } from "@/components/kanban/RunPanel";
+import { SettingsDialog } from "@/components/settings/SettingsDialog";
+import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
+import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
+import { UpdateBanner } from "@/components/updater/UpdateBanner";
+import type { UpdateSnapshot } from "@/lib/api";
+import { useConfirm } from "@/components/ui/confirm";
+import { Toaster } from "@/components/ui/sonner";
+import { dismissPending, toastError, toastPending, toastSuccess } from "@/lib/toasts";
+import { cn } from "@/lib/utils";
+import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
+
+/**
+ * Floating bottom-right error toast. Auto-dismisses after 6s; the user can
+ * also close it manually. Renders mounted with a translate animation so a
+ * rapid succession of errors doesn't snap-jitter the layout.
+ */
+function ErrorToast({ error, onDismiss }: { error: string | null; onDismiss: () => void }) {
+  // Hold the last non-null message so the exit animation has something to
+  // render after the parent clears the error.
+  const [shown, setShown] = useState<string | null>(error);
+  useEffect(() => {
+    if (error) setShown(error);
+    if (!error) return;
+    const t = setTimeout(onDismiss, 6000);
+    return () => clearTimeout(t);
+  }, [error, onDismiss]);
+  // Drop the stale message ~250ms after dismissal so the slide-out completes
+  // before the node unmounts.
+  useEffect(() => {
+    if (error) return;
+    if (!shown) return;
+    const t = setTimeout(() => setShown(null), 250);
+    return () => clearTimeout(t);
+  }, [error, shown]);
+  if (!shown) return null;
+  return (
+    <div
+      role="alert"
+      className={cn(
+        "fixed bottom-4 right-4 z-50 flex max-w-md items-start gap-3 rounded-lg border border-destructive/60 bg-card px-4 py-3 text-sm shadow-2xl transition-all duration-200",
+        error ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-2 opacity-0",
+      )}
+    >
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden />
+      <span className="min-w-0 flex-1 whitespace-pre-wrap text-foreground">{shown}</span>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Dismiss error"
+        className="shrink-0 rounded-md p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+      >
+        <X className="size-3.5" />
+      </button>
+    </div>
+  );
+}
+
+export default function App() {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [agents, setAgents] = useState<AgentStatus[]>([]);
+  const [harnesses, setHarnesses] = useState<Harness[]>([]);
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [] });
+  const [selected, setSelected] = useState<Task | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [textQuery, setTextQuery] = useState("");
+  const [repoFilter, setRepoFilter] = useState<string[]>([]);
+  const [statusFilter, setStatusFilter] = useState<ColumnId[]>([]);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
+  const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
+  const [homeDir, setHomeDir] = useState<string>("");
+  // Active data dir resolved server-side (~/.agetor for the packaged .app,
+  // ~/.agetor-dev when launched via `bun run dev` / `dev:hmr`). Threaded to
+  // SettingsDialog so new-harness HOME suggestions point under the current
+  // data dir instead of always hard-coding the prod tree.
+  const [dataDir, setDataDir] = useState<string>("");
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+  const confirm = useConfirm();
+
+  // Fade out the boot splash (defined in index.html) once React has mounted,
+  // with a minimum dwell so fast machines don't flash a 200ms splash. Not
+  // gated on API fetches — a stuck Bun side shouldn't trap the user behind
+  // the logo.
+  useEffect(() => {
+    const splash = document.getElementById("splash");
+    if (!splash) return;
+    const MIN_DWELL_MS = 800;
+    const FADE_MS = 350;
+    const remaining = Math.max(0, MIN_DWELL_MS - performance.now());
+    const hideTimer = setTimeout(() => splash.classList.add("is-hidden"), remaining);
+    const removeTimer = setTimeout(() => splash.remove(), remaining + FADE_MS);
+    return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
+  }, []);
+
+  const refresh = async () => setTasks(await api.listTasks());
+  const refreshAgents = async () => {
+    try {
+      const payload = await api.listHarnesses();
+      setHarnesses(payload.harnesses);
+      setAgents(payload.statuses);
+    } catch { /* leave previous state */ }
+  };
+  const refreshAgentModels = async () => {
+    try { setAgentModels(await api.listAgentModels()); } catch { /* leave previous state */ }
+  };
+  useEffect(() => {
+    void refresh();
+    void refreshAgents();
+    void refreshAgentModels();
+    // Load projects once for the repo filter picker. New projects added
+    // mid-session via NewTaskForm won't show up until reload — matches the
+    // session-only filter persistence model.
+    api.listProjects().then(setProjects).catch(() => { /* leave empty */ });
+    // Resolve the user's home dir once so SettingsDialog can expand `~/…`
+    // template paths into concrete absolute paths before validation.
+    // `/defaults` is small + local, but a hiccup at boot would now leave
+    // dataDir empty for the whole session — SettingsDialog's "Add harness"
+    // button stays disabled until dataDir is set. Retry every 2s until it
+    // lands; the effect's cleanup clears the timer when App unmounts.
+    let defaultsTimer: ReturnType<typeof setTimeout> | null = null;
+    const fetchDefaults = () => {
+      void api.defaults().then((d) => {
+        setHomeDir(d.home);
+        setDataDir(d.dataDir);
+        defaultsTimer = null;
+      }).catch(() => {
+        defaultsTimer = setTimeout(fetchDefaults, 2_000);
+      });
+    };
+    fetchDefaults();
+    // Prime the update snapshot. SSE is live-only, so without this a
+    // freshly-opened webview wouldn't know about an update that was already
+    // downloaded by the previous main-process tick.
+    api.getUpdateStatus().then(setUpdateSnapshot).catch(() => { /* fine */ });
+    const t = setInterval(refresh, 2000);
+    const a = setInterval(refreshAgents, 15_000);
+    return () => {
+      clearInterval(t);
+      clearInterval(a);
+      if (defaultsTimer) clearTimeout(defaultsTimer);
+    };
+  }, []);
+
+  // Keep the selected task in sync as the list refreshes.
+  useEffect(() => {
+    if (!selected) return;
+    const fresh = tasks.find((t) => t.id === selected.id);
+    if (fresh && fresh !== selected) setSelected(fresh);
+  }, [tasks, selected]);
+
+  // Refs mirror the latest tasks + selected task so the global-events
+  // subscription (which closes over its handler ONCE on mount) can read
+  // current state without re-subscribing on every render.
+  const tasksRef = useRef<Task[]>(tasks);
+  const selectedIdRef = useRef<string | null>(selected?.id ?? null);
+  useEffect(() => { tasksRef.current = tasks; }, [tasks]);
+  useEffect(() => { selectedIdRef.current = selected?.id ?? null; }, [selected]);
+
+  // App-wide lifecycle subscription. Drives toasts + native notifications.
+  useEffect(() => {
+    const handle = (ev: GlobalEvent) => {
+      // Update events are app-scoped, not task-scoped — handle them before
+      // reading any taskId-derived state.
+      if (ev.kind === "update") {
+        setUpdateSnapshot({
+          status: ev.status,
+          version: ev.version,
+          error: ev.status === "error" ? ev.message : null,
+          lastCheckedAt: ev.ts,
+        });
+        return;
+      }
+      const isSelected = ev.taskId === selectedIdRef.current;
+      const isFocused = document.hasFocus();
+      // Resolve a display title from the latest tasks snapshot; fall back to
+      // a short id slice if the row hasn't been polled in yet.
+      const task = tasksRef.current.find((t) => t.id === ev.taskId);
+      const title = task?.title || `Task ${ev.taskId.slice(0, 7)}`;
+      const subtitle = task?.agent;
+      const onOpen = () => {
+        const fresh = tasksRef.current.find((t) => t.id === ev.taskId);
+        if (fresh) setSelected(fresh);
+        // Best-effort: bring the agetor window forward when the user clicks
+        // through from a native notification. window.focus() is a no-op in
+        // many browsers but works inside WKWebView.
+        window.focus();
+      };
+      if (ev.kind === "run-status") {
+        if (ev.status === "succeeded") {
+          toastSuccess({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.status === "failed" || ev.status === "orphaned") {
+          toastError({
+            taskId: ev.taskId,
+            title,
+            subtitle,
+            isSelected,
+            isFocused,
+            onOpen,
+            reason: ev.status === "orphaned" ? "agetor restarted while running" : undefined,
+          });
+        }
+        // `cancelled` is intentionally silent — the user issued the cancel.
+        return;
+      }
+      // column transitions
+      if (ev.column === "blocked") {
+        toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+      } else if (ev.prev === "blocked") {
+        // Auto-clear the pending toast once the agent unblocks (the user
+        // answered, the run was cancelled, etc.).
+        dismissPending(ev.taskId);
+      }
+    };
+    const cancel = api.subscribeGlobalEvents(handle);
+    return cancel;
+  }, []);
+
+  // Text + repo filter applied here; status filter narrows the rendered
+  // columns (not the task list) so an unselected status disappears entirely
+  // rather than rendering an empty column.
+  const visibleTasks = useMemo(() => {
+    const q = textQuery.trim().toLowerCase();
+    return tasks.filter((t) => {
+      if (q) {
+        const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
+      return true;
+    });
+  }, [tasks, textQuery, repoFilter]);
+
+  const visibleColumns = useMemo(
+    () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
+    [statusFilter],
+  );
+
+  const surfaceError = (e: unknown) =>
+    setError(e instanceof Error ? e.message : String(e));
+
+  const onDragEnd = async (e: DragEndEvent) => {
+    const id = String(e.active.id);
+    const col = e.over?.id as ColumnId | undefined;
+    if (!col) return;
+    const t = tasks.find((x) => x.id === id);
+    if (!t || t.column === col) return;
+    setTasks((cur) => cur.map((x) => (x.id === id ? { ...x, column: col } : x)));
+    try {
+      setError(null);
+      await api.moveTask(id, col);
+    } catch (e) {
+      surfaceError(e);
+      // Server didn't accept the move — re-sync the optimistic UI.
+      await refresh();
+    }
+  };
+
+  const start = async (t: Task) => {
+    try {
+      setError(null);
+      await api.startTask(t.id);
+      await refresh();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // tmux-missing errors get a guided fix dialog instead of a toast — the
+      // toast is a dead end, the dialog routes to a resolution.
+      if (errorIsTmuxMissing(msg)) {
+        setTmuxDialogOpen(true);
+      } else {
+        surfaceError(e);
+      }
+      void refreshAgents();
+    }
+  };
+  const cancel = async (t: Task) => {
+    if (!t.runId) return;
+    try {
+      setError(null);
+      await api.cancelRun(t.runId);
+    } catch (e) {
+      surfaceError(e);
+    }
+  };
+  const del = async (t: Task) => {
+    const ok = await confirm({
+      title: `Delete "${t.title}"?`,
+      description: (
+        <>
+          The task and its run history will be removed.
+          {t.worktreePath && (
+            <>
+              {" "}Its git worktree (
+              <span className="font-mono text-foreground/80">{t.branch}</span>
+              ) will also be torn down.
+            </>
+          )}
+        </>
+      ),
+      confirmLabel: "Delete",
+      variant: "destructive",
+    });
+    if (!ok) return;
+    try {
+      setError(null);
+      await api.deleteTask(t.id);
+      if (selected?.id === t.id) setSelected(null);
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      // Refresh anyway so the UI matches the server.
+      await refresh();
+    }
+  };
+
+  return (
+    <div className="flex h-screen w-screen flex-col bg-background text-foreground">
+      {/* Top app bar sits on the same row as the macOS traffic lights (see
+          titleBarStyle: "hiddenInset" in src/bun/index.ts). `pl-20` clears the
+          traffic-light cluster (≈64px wide + the 8px x-offset configured on
+          the BrowserWindow). The bar itself is a drag region; the icon + h1
+          inside have no click handlers, but if one is ever added the target
+          must be wrapped in `electrobun-webkit-app-region-no-drag` or the
+          mousedown will be swallowed by the window-move handler. */}
+      {/* Double-click zooms the window — Electrobun's drag-region preload
+          fires startWindowMove on mousedown but doesn't preventDefault, so
+          React's synthesized dblclick still arrives. Guard against zooming
+          when the click originates on a no-drag child (Settings, agent
+          badges) to match AppKit's title-bar behavior — clicking a control
+          there shouldn't zoom. */}
+      <header
+        className="electrobun-webkit-app-region-drag flex h-10 shrink-0 items-center justify-between border-b border-border/60 pl-20 pr-4"
+        onDoubleClick={(e) => {
+          if ((e.target as Element).closest(".electrobun-webkit-app-region-no-drag")) return;
+          void api.toggleWindowZoom().catch(() => {});
+        }}
+      >
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <img src={iconUrl} alt="" className="block size-7 shrink-0 -translate-y-0.5 object-contain" />
+            <h1 className="font-geist text-base font-semibold leading-none tracking-tight">Agetor</h1>
+          </div>
+          <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2 text-xs text-muted-foreground">
+            {agents.map((a) => {
+              const harness = harnesses.find((h) => h.id === a.harnessId);
+              const displayName = harness?.label ?? a.harnessId;
+              return (
+                <span
+                  key={a.harnessId}
+                  className="flex items-center gap-1"
+                  title={a.reason ?? a.path ?? ""}
+                >
+                  <AgentIcon kind={a.kind} className="size-3" />
+                  {displayName}
+                  <span
+                    className={
+                      "inline-block size-1.5 rounded-full " +
+                      (a.available ? "bg-emerald-500" : "bg-red-500")
+                    }
+                  />
+                </span>
+              );
+            })}
+          </div>
+        </div>
+        <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2">
+          <span className="text-xs text-muted-foreground">
+            {visibleTasks.length === tasks.length
+              ? `${tasks.length} tasks`
+              : `${visibleTasks.length} of ${tasks.length} tasks`}
+          </span>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setSettingsOpen(true)}
+            aria-label="Settings"
+            title="Settings"
+          >
+            <Settings className="size-4" />
+          </Button>
+        </div>
+      </header>
+      <div className="flex min-h-0 flex-1">
+        <NewTaskForm
+          agents={agents}
+          harnesses={harnesses}
+          agentModels={agentModels}
+          onSubmit={async (input, { start }) => {
+            try {
+              setError(null);
+              // "Run task" creates the row in `ready` (so it's briefly visible in
+              // that column even when the agent starts immediately afterward),
+              // then asks the orchestrator to start it — which moves the card to
+              // `running`. "To backlog" just queues with no auto-start.
+              const created = await api.createTask({
+                ...input,
+                column: start ? "ready" : "backlog",
+              });
+              await refresh();
+              if (start) {
+                await api.startTask(created.id);
+                await refresh();
+              }
+            } catch (e) {
+              setError(e instanceof Error ? e.message : String(e));
+            }
+          }}
+        />
+        <main className="flex min-w-0 flex-1 flex-col">
+          <UpdateBanner
+            snapshot={updateSnapshot}
+            onChange={() => { void api.getUpdateStatus().then(setUpdateSnapshot).catch(() => {}); }}
+          />
+          <TmuxMissingBanner
+            show={isTmuxMissing(agents)}
+            onResolve={() => setTmuxDialogOpen(true)}
+          />
+          <KanbanFilters
+            textQuery={textQuery}
+            onTextQueryChange={setTextQuery}
+            repoFilter={repoFilter}
+            onRepoFilterChange={setRepoFilter}
+            statusFilter={statusFilter}
+            onStatusFilterChange={setStatusFilter}
+            projects={projects}
+          />
+          <ErrorToast error={error} onDismiss={() => setError(null)} />
+          <Toaster />
+          {/* Kanban gets all remaining vertical space and scrolls horizontally
+              on its own — the bottom bar stays anchored regardless of column
+              count. */}
+          <div className="kanban-scroll flex-1 overflow-x-scroll">
+            <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+              <div className="flex gap-3 p-4">
+                {visibleColumns.map((c) => (
+                  <Column
+                    key={c.id}
+                    id={c.id}
+                    label={c.label}
+                    tasks={visibleTasks.filter((t) => t.column === c.id)}
+                    homeDir={homeDir}
+                    onStart={start}
+                    onCancel={cancel}
+                    onDelete={del}
+                    onOpen={setSelected}
+                  />
+                ))}
+              </div>
+            </DndContext>
+          </div>
+        </main>
+      </div>
+      <RunPanel
+        task={selected}
+        agents={agents}
+        harnesses={harnesses}
+        agentModels={agentModels}
+        homeDir={homeDir}
+        onClose={() => setSelected(null)}
+      />
+      <SettingsDialog
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onChange={refreshAgents}
+        homeDir={homeDir}
+        dataDir={dataDir}
+      />
+      <TmuxInstallDialog
+        open={tmuxDialogOpen}
+        onClose={() => setTmuxDialogOpen(false)}
+        onResolved={refreshAgents}
+      />
+    </div>
+  );
+}

@@ -1,0 +1,788 @@
+import { useEffect, useMemo, useState } from "react";
+import { ChevronLeft, Plus, Trash2, X } from "lucide-react";
+import { api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
+import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+import { useConfirm } from "@/components/ui/confirm";
+import { AgentIcon } from "@/components/kanban/AgentIcon";
+import { abbreviateHome, cn } from "@/lib/utils";
+import {
+  HARNESS_TEMPLATES,
+  type AgentKind,
+  type Harness,
+  type HarnessTemplate,
+} from "../../../shared/types.ts";
+
+interface Props {
+  open: boolean;
+  onClose: () => void;
+  /** Refresh agents/harnesses on the parent after CRUD operations. */
+  onChange?: () => void;
+  /** Resolved home dir from `GET /defaults` — used to expand `~` in templates. */
+  homeDir: string;
+  /** Active data dir from `GET /defaults` — substituted into `{dataDir}` in
+   *  template `home` paths so new harnesses default under the running dir
+   *  (~/.agetor for the .app, ~/.agetor-dev for `bun run dev`). */
+  dataDir: string;
+}
+
+type View =
+  | { kind: "list" }
+  | { kind: "templates" }
+  | { kind: "editor"; harnessId: string | null; template: HarnessTemplate };
+
+/**
+ * Parse a textarea of `KEY=value` lines into a record. Blank lines and
+ * comment lines (`# …`) are skipped; lines that don't fit `KEY=value` are
+ * counted as ignored so the editor can warn the user (rather than silently
+ * dropping a typo).
+ */
+function parseEnv(raw: string): { env: Record<string, string>; ignored: number } {
+  const env: Record<string, string> = {};
+  let ignored = 0;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) { ignored++; continue; }
+    const k = trimmed.slice(0, eq).trim();
+    const v = trimmed.slice(eq + 1);
+    if (!k) { ignored++; continue; }
+    env[k] = v;
+  }
+  return { env, ignored };
+}
+
+function stringifyEnv(env: Record<string, string>): string {
+  return Object.entries(env)
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n");
+}
+
+function expandTilde(p: string | null, homeDir: string): string | null {
+  if (!p) return p;
+  if (!homeDir) return p;
+  if (p.startsWith("~/")) return homeDir + p.slice(1);
+  if (p === "~") return homeDir;
+  return p;
+}
+
+/** Replace the `{dataDir}` placeholder in template paths with the active
+ *  data dir resolved server-side. No-op for the `__edit` template (whose
+ *  paths come from the DB and are already concrete). */
+function resolveTemplate(t: HarnessTemplate, dataDir: string): HarnessTemplate {
+  if (!t.home || !t.home.includes("{dataDir}")) return t;
+  return { ...t, home: t.home.replaceAll("{dataDir}", dataDir) };
+}
+
+/** Bump the trailing number on `base` until it's not in `existing`. Used so
+ *  picking the same template twice doesn't pre-fill a colliding id (the
+ *  uniqueness check would catch it on save, but bumping up front avoids the
+ *  papercut of having to manually rename every time). */
+function uniqueHarnessId(base: string, existing: Set<string>): string {
+  if (!base || !existing.has(base)) return base;
+  const m = base.match(/^(.*?)(\d+)$/);
+  const prefix = m ? m[1] : `${base}-`;
+  let n = m ? parseInt(m[2]!, 10) + 1 : 2;
+  while (existing.has(`${prefix}${n}`)) n++;
+  return `${prefix}${n}`;
+}
+
+export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Props) {
+  const [version, setVersion] = useState<string>("");
+  const [payload, setPayload] = useState<HarnessesPayload>({ harnesses: [], statuses: [] });
+  const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
+  const [tmuxSource, setTmuxSource] = useState<"system" | "bundled">("system");
+  const [bundledTmuxAvailable, setBundledTmuxAvailable] = useState(false);
+  const [view, setView] = useState<View>({ kind: "list" });
+  const [busy, setBusy] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  // Optimistic toggle map: harness id → the value the user *clicked toward*.
+  // Lets the Switch animate the moment the user clicks even though the actual
+  // mutation is gated behind a confirm dialog + network round-trip. Cleared
+  // on confirm-success (refresh overwrites with the server's truth), on
+  // cancel (revert), and on error (revert + surface the message).
+  const [pendingToggle, setPendingToggle] = useState<Record<string, boolean>>({});
+  const confirm = useConfirm();
+
+  const refresh = async () => {
+    const [info, data, prefs, tmux] = await Promise.all([
+      api.info().catch(() => ({ version: "?" })),
+      api.listHarnesses().catch(() => ({ harnesses: [], statuses: [] })),
+      api.listPreferences().catch((): Record<string, string> => ({})),
+      api
+        .getTmuxSource()
+        .catch(() => ({ source: "system" as const, bundledAvailable: false, bundledPath: "", resolvedBin: "" })),
+    ]);
+    setVersion(info.version);
+    setPayload(data);
+    // The default-harness picker only lists *enabled* harnesses. If the
+    // stored pref points at a now-disabled one, reconcile both local state
+    // and the persisted pref to the first enabled fallback — otherwise the
+    // `<Select>` value wouldn't match any `<option>` and the UI would
+    // silently lie about what the stored default is.
+    const stored = prefs["defaultHarness"] || "claude-code";
+    const enabled = data.harnesses.filter((h) => h.enabled);
+    const storedIsEnabled = enabled.some((h) => h.id === stored);
+    if (!storedIsEnabled && enabled.length > 0) {
+      const fallback = enabled[0]!.id;
+      setDefaultHarness(fallback);
+      void api.setPreference("defaultHarness", fallback).catch(() => {
+        /* best-effort; the next refresh will retry. */
+      });
+    } else {
+      setDefaultHarness(stored);
+    }
+    setTmuxSource(tmux.source);
+    setBundledTmuxAvailable(tmux.bundledAvailable);
+  };
+
+  const onPickTmuxSource = async (source: "system" | "bundled") => {
+    setTmuxSource(source);
+    try {
+      await api.setTmuxSource(source);
+      onChange?.();
+    } catch {
+      /* revert? next open re-fetches truth. */
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    void refresh();
+    // Reset to list view on every open so a half-filled editor doesn't
+    // greet the user next time.
+    setView({ kind: "list" });
+    setFormError(null);
+  }, [open]);
+
+  const statusByHarness = useMemo(() => {
+    const map = new Map(payload.statuses.map((s) => [s.harnessId, s]));
+    return map;
+  }, [payload.statuses]);
+
+  const onPickDefault = async (id: string) => {
+    setDefaultHarness(id);
+    try {
+      await api.setPreference("defaultHarness", id);
+      onChange?.();
+    } catch {
+      // Reverting on failure would just confuse the user — the next open
+      // will re-fetch the truth. Silent best-effort is fine.
+    }
+  };
+
+  const onDeleteHarness = async (h: Harness) => {
+    const ok = await confirm({
+      title: `Delete "${h.label}"?`,
+      description: "The alias will be removed. Tasks already using it will fail to start until reassigned.",
+      confirmLabel: "Delete",
+      variant: "destructive",
+    });
+    if (!ok) return;
+    try {
+      await api.deleteHarness(h.id);
+      await refresh();
+      onChange?.();
+    } catch (e) {
+      setFormError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const clearPending = (id: string) =>
+    setPendingToggle((m) => {
+      if (!(id in m)) return m;
+      const { [id]: _, ...rest } = m;
+      return rest;
+    });
+
+  const onToggleEnabled = async (h: Harness) => {
+    const next = !h.enabled;
+    // Flip the optimistic value first so the Switch animates immediately.
+    // We'll clear it on success (refresh has the truth) or revert on
+    // cancel / error.
+    setPendingToggle((m) => ({ ...m, [h.id]: next }));
+    // Re-enable is a one-click action; disable needs a confirmation when
+    // tasks are still running (they keep using the harness until they finish)
+    // so the user isn't blind-sided by background activity.
+    if (h.enabled) {
+      let runningCount: number | null = null;
+      try {
+        const usage = await api.getHarnessUsage(h.id);
+        runningCount = usage.runningTaskIds.length;
+      } catch {
+        // Leave runningCount as null and tell the user in the confirm body —
+        // silently claiming "0 running" would be a lie if the probe fails.
+      }
+      const description = runningCount === null
+        ? "Couldn't check whether any tasks are currently using this harness. Anything in flight will keep running until it finishes. It will be hidden from the New Task picker, but historical tasks keep their reference. Disable anyway?"
+        : runningCount > 0
+          ? `${runningCount} task${runningCount === 1 ? "" : "s"} currently running will keep using this harness until they finish. It will be hidden from the New Task picker, but historical tasks keep their reference.`
+          : "It will be hidden from the New Task picker. Historical tasks keep their reference, and you can re-enable it anytime.";
+      const ok = await confirm({
+        title: `Disable "${h.label}"?`,
+        description,
+        confirmLabel: "Disable",
+        variant: "destructive",
+      });
+      if (!ok) {
+        clearPending(h.id);
+        return;
+      }
+    }
+    try {
+      await api.setHarnessEnabled(h.id, next);
+      await refresh();
+      clearPending(h.id);
+      onChange?.();
+    } catch (e) {
+      clearPending(h.id);
+      setFormError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      className="max-w-2xl"
+      labelledBy="settings-dialog-title"
+    >
+      <div className="flex items-center justify-between border-b border-border/60 pb-3">
+        <div className="flex items-center gap-2">
+          {view.kind !== "list" && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setView({ kind: "list" })}
+              aria-label="Back"
+            >
+              <ChevronLeft className="size-4" />
+            </Button>
+          )}
+          <h2 id="settings-dialog-title" className="text-base font-semibold">
+            {view.kind === "list" && "Settings"}
+            {view.kind === "templates" && "Add harness"}
+            {view.kind === "editor" && (view.harnessId ? "Edit harness" : "Add harness")}
+          </h2>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground">v{version}</span>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onClose}
+            aria-label="Close"
+          >
+            <X className="size-4" />
+          </Button>
+        </div>
+      </div>
+
+      {view.kind === "list" && (
+        <ListView
+          payload={payload}
+          statusByHarness={statusByHarness}
+          defaultHarness={defaultHarness}
+          homeDir={homeDir}
+          onPickDefault={onPickDefault}
+          tmuxSource={tmuxSource}
+          bundledTmuxAvailable={bundledTmuxAvailable}
+          onPickTmuxSource={onPickTmuxSource}
+          canAdd={!!dataDir}
+          onAdd={() => setView({ kind: "templates" })}
+          onEdit={(h) =>
+            setView({
+              kind: "editor",
+              harnessId: h.id,
+              template: {
+                id: "__edit",
+                label: h.label,
+                description: "",
+                kind: h.kind,
+                suggestedHarnessId: h.id,
+                home: h.home,
+                bin: h.bin,
+                env: h.env,
+              },
+            })
+          }
+          onDelete={onDeleteHarness}
+          onToggleEnabled={onToggleEnabled}
+          pendingToggle={pendingToggle}
+        />
+      )}
+
+      {view.kind === "templates" && (
+        <TemplatePicker
+          onPick={(t) =>
+            setView({
+              kind: "editor",
+              harnessId: null,
+              template: resolveTemplate(t, dataDir),
+            })
+          }
+        />
+      )}
+
+      {view.kind === "editor" && (
+        <Editor
+          template={view.template}
+          isEdit={view.harnessId !== null}
+          homeDir={homeDir}
+          dataDir={dataDir}
+          existingIds={new Set(payload.harnesses.map((h) => h.id))}
+          busy={busy}
+          error={formError}
+          onCancel={() => setView({ kind: "list" })}
+          onSubmit={async (input) => {
+            setBusy(true);
+            setFormError(null);
+            try {
+              if (view.harnessId) {
+                await api.updateHarness(view.harnessId, {
+                  label: input.label,
+                  home: input.home,
+                  bin: input.bin,
+                  env: input.env,
+                });
+              } else {
+                await api.createHarness(input);
+              }
+              await refresh();
+              onChange?.();
+              setView({ kind: "list" });
+            } catch (e) {
+              setFormError(e instanceof Error ? e.message : String(e));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        />
+      )}
+    </Dialog>
+  );
+}
+
+function ListView({
+  payload,
+  statusByHarness,
+  defaultHarness,
+  homeDir,
+  onPickDefault,
+  tmuxSource,
+  bundledTmuxAvailable,
+  onPickTmuxSource,
+  canAdd,
+  onAdd,
+  onEdit,
+  onDelete,
+  onToggleEnabled,
+  pendingToggle,
+}: {
+  payload: HarnessesPayload;
+  statusByHarness: Map<string, HarnessesPayload["statuses"][number]>;
+  defaultHarness: string;
+  homeDir: string;
+  onPickDefault: (id: string) => void;
+  tmuxSource: "system" | "bundled";
+  bundledTmuxAvailable: boolean;
+  onPickTmuxSource: (source: "system" | "bundled") => void;
+  /** False while `dataDir` is still loading from `GET /defaults`. Adding a
+   *  harness with an unresolved data dir would persist a broken HOME path
+   *  (`/harnesses/claude-2` instead of `<dataDir>/harnesses/claude-2`). */
+  canAdd: boolean;
+  onAdd: () => void;
+  onEdit: (h: Harness) => void;
+  onDelete: (h: Harness) => void;
+  onToggleEnabled: (h: Harness) => void;
+  /** Optimistic toggle state — keyed by harness id, value is what the user
+   *  clicked toward. Lets the Switch animate before the confirm/round-trip
+   *  resolves. Missing keys mean "use the server's `h.enabled`". */
+  pendingToggle: Record<string, boolean>;
+}) {
+  // Disabled harnesses are excluded from the default-harness picker so a
+  // soft-deleted harness can't silently become the default for new tasks.
+  const enabledHarnesses = payload.harnesses.filter((h) => h.enabled);
+  return (
+    <div className="space-y-4 pt-3 text-sm">
+      <section className="space-y-1">
+        <label className="text-xs text-muted-foreground">Default harness for new tasks</label>
+        <Select value={defaultHarness} onChange={(e) => onPickDefault(e.target.value)}>
+          {enabledHarnesses.map((h) => (
+            <option key={h.id} value={h.id}>
+              {h.label}{" "}
+              {h.label.toLowerCase() !== h.kind ? `(${h.kind})` : ""}
+            </option>
+          ))}
+        </Select>
+      </section>
+
+      <section className="space-y-1">
+        <label className="text-xs text-muted-foreground">tmux for Claude Code</label>
+        <Select
+          value={tmuxSource}
+          onChange={(e) => onPickTmuxSource(e.target.value as "system" | "bundled")}
+        >
+          <option value="system">System tmux (from PATH)</option>
+          <option value="bundled" disabled={!bundledTmuxAvailable}>
+            {bundledTmuxAvailable
+              ? "Bundled tmux (shipped with Agetor)"
+              : "Bundled tmux — not available in this build"}
+          </option>
+        </Select>
+        <p className="text-[11px] text-muted-foreground">
+          Claude Code runs through a tmux session per task. Switch to the bundled
+          binary if you don't want to install tmux system-wide.
+        </p>
+      </section>
+
+      <section className="space-y-2">
+        <div className="flex items-center justify-between">
+          <label className="text-xs text-muted-foreground">Harnesses</label>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onAdd}
+            disabled={!canAdd}
+            title={canAdd ? undefined : "Loading defaults…"}
+          >
+            <Plus className="mr-1 size-3.5" /> Add harness
+          </Button>
+        </div>
+        <div className="space-y-1.5">
+          {payload.harnesses.map((h) => {
+            const status = statusByHarness.get(h.id);
+            const available = status?.available ?? false;
+            return (
+              <div
+                key={h.id}
+                className={cn(
+                  "flex items-center gap-2 rounded-md border border-border/60 px-3 py-2",
+                  !h.enabled && "opacity-60",
+                )}
+              >
+                <AgentIcon kind={h.kind} className="size-4 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate font-medium">{h.label}</span>
+                    {h.isBuiltin && (
+                      <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
+                        built-in
+                      </span>
+                    )}
+                    {!h.enabled && h.kind !== "codex" && (
+                      <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
+                        disabled
+                      </span>
+                    )}
+                    <span
+                      className={cn(
+                        "inline-block size-1.5 rounded-full",
+                        available ? "bg-emerald-500" : "bg-red-500",
+                      )}
+                      title={status?.reason ?? status?.path ?? ""}
+                    />
+                  </div>
+                  <div className="truncate text-[11px] text-muted-foreground">
+                    {h.id} · {h.kind}
+                    {h.home && <> · HOME={abbreviateHome(h.home, homeDir)}</>}
+                    {status?.version && <> · {status.version}</>}
+                  </div>
+                </div>
+                {h.kind === "codex" ? (
+                  <>
+                    <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
+                      Coming soon
+                    </span>
+                    <Switch
+                      checked={false}
+                      onCheckedChange={() => {}}
+                      disabled
+                      aria-label={`${h.label} is coming soon`}
+                      title="Codex support is coming soon"
+                    />
+                  </>
+                ) : (
+                  <Switch
+                    checked={pendingToggle[h.id] ?? h.enabled}
+                    onCheckedChange={() => onToggleEnabled(h)}
+                    aria-label={h.enabled ? `Disable ${h.label}` : `Enable ${h.label}`}
+                  />
+                )}
+                {!h.isBuiltin && (
+                  <>
+                    <Button size="sm" variant="ghost" onClick={() => onEdit(h)}>
+                      Edit
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => onDelete(h)}
+                      aria-label={`Delete ${h.label}`}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
+  return (
+    <div className="space-y-2 pt-3">
+      <p className="text-xs text-muted-foreground">
+        Pick a starting point. You can edit every field before saving.
+      </p>
+      <div className="space-y-1.5">
+        {HARNESS_TEMPLATES.map((t) => {
+          const comingSoon = t.kind === "codex";
+          return (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => { if (!comingSoon) onPick(t); }}
+              disabled={comingSoon}
+              aria-disabled={comingSoon}
+              title={comingSoon ? "Codex support is coming soon" : undefined}
+              className={cn(
+                "flex w-full items-start gap-3 rounded-md border border-border/60 px-3 py-2 text-left",
+                comingSoon
+                  ? "cursor-not-allowed opacity-60"
+                  : "hover:border-primary/60 hover:bg-accent/50",
+              )}
+            >
+              {comingSoon && (
+                <span className="mt-0.5 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
+                  Coming soon
+                </span>
+              )}
+              <AgentIcon kind={t.kind} className="mt-0.5 size-4 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium">{t.label}</div>
+                <div className="text-[11px] text-muted-foreground">{t.description}</div>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Editor({
+  template,
+  isEdit,
+  homeDir,
+  dataDir,
+  existingIds,
+  busy,
+  error,
+  onCancel,
+  onSubmit,
+}: {
+  template: HarnessTemplate;
+  isEdit: boolean;
+  homeDir: string;
+  dataDir: string;
+  existingIds: Set<string>;
+  busy: boolean;
+  error: string | null;
+  onCancel: () => void;
+  onSubmit: (input: HarnessInput) => void;
+}) {
+  // When creating from a template, pre-bump the suggested id past any
+  // already-taken slug (claude-2 → claude-3 …) so two clicks of "Additional
+  // Claude Code" don't both default to the same id. If `home` ends with the
+  // original suggested id, rewrite its trailing segment so the suggested
+  // HOME stays in sync. Editing an existing harness skips this so the row's
+  // own id passes through unchanged.
+  const initialState = useMemo(() => {
+    if (isEdit) {
+      return {
+        id: template.suggestedHarnessId,
+        home: template.home ? abbreviateHome(template.home, homeDir) : "",
+      };
+    }
+    const uniqId = uniqueHarnessId(template.suggestedHarnessId, existingIds);
+    let home = template.home;
+    const orig = template.suggestedHarnessId;
+    if (home && orig && uniqId !== orig && home.endsWith(`/${orig}`)) {
+      home = `${home.slice(0, -orig.length)}${uniqId}`;
+    }
+    return { id: uniqId, home: home ? abbreviateHome(home, homeDir) : "" };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const [id, setId] = useState(initialState.id);
+  const [label, setLabel] = useState(template.label);
+  const [kind, setKind] = useState<AgentKind>(template.kind);
+  const [home, setHome] = useState(initialState.home);
+  const [bin, setBin] = useState(template.bin ?? "");
+  const [envText, setEnvText] = useState(stringifyEnv(template.env));
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  // Parse once per render so we can warn about ignored lines below the
+  // textarea. Cheap — the env block is tiny.
+  const parsedEnv = useMemo(() => parseEnv(envText), [envText]);
+
+  const submit = () => {
+    setLocalError(null);
+    if (!isEdit && kind === "codex") {
+      setLocalError("Codex support is coming soon — new codex harnesses can't be created right now.");
+      return;
+    }
+    const trimmedId = id.trim();
+    if (!/^[a-z0-9][a-z0-9_-]*$/.test(trimmedId)) {
+      setLocalError("id must be a slug — lowercase letters, digits, `_` or `-`, starting with a letter or digit");
+      return;
+    }
+    if (!isEdit && existingIds.has(trimmedId)) {
+      setLocalError(`a harness with id "${trimmedId}" already exists`);
+      return;
+    }
+    if (!label.trim()) {
+      setLocalError("label is required");
+      return;
+    }
+    const homeTrim = home.trim();
+    const homeAbs = expandTilde(homeTrim || null, homeDir);
+    if (homeAbs && !homeAbs.startsWith("/")) {
+      setLocalError("HOME must be an absolute path (use `/...` or `~/...`)");
+      return;
+    }
+    const binTrim = bin.trim();
+    if (binTrim && !binTrim.startsWith("/")) {
+      setLocalError("bin must be an absolute path");
+      return;
+    }
+    onSubmit({
+      id: trimmedId,
+      kind,
+      label: label.trim(),
+      home: homeAbs,
+      bin: binTrim || null,
+      env: parsedEnv.env,
+    });
+  };
+
+  return (
+    <div className="space-y-3 pt-3 text-sm">
+      <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-1">
+          <label className="text-xs text-muted-foreground">Id (slug)</label>
+          <Input
+            value={id}
+            onChange={(e) => setId(e.target.value)}
+            disabled={isEdit}
+            placeholder="claude-work"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs text-muted-foreground">Label</label>
+          <Input
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder="Claude (work)"
+          />
+        </div>
+      </div>
+      <div className="space-y-1">
+        <label className="text-xs text-muted-foreground">Harness type</label>
+        <div className="grid grid-cols-2 gap-1">
+          {(["claude-code", "codex"] as AgentKind[]).map((k) => {
+            // Codex is paused — the server rejects new codex harnesses, so
+            // disabling the kind button keeps the UI honest. Lock it in
+            // create mode too, not just edit mode.
+            const lockedComingSoon = k === "codex";
+            return (
+              <Button
+                key={k}
+                size="sm"
+                variant={kind === k ? "default" : "outline"}
+                onClick={() => setKind(k)}
+                disabled={isEdit || lockedComingSoon}
+                title={lockedComingSoon ? "Codex support is coming soon" : undefined}
+                className="justify-start"
+              >
+                <AgentIcon kind={k} className="mr-1.5 size-3.5" />
+                {k}
+                {lockedComingSoon && (
+                  <span className="ml-1.5 rounded bg-amber-500/15 px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-500">
+                    Soon
+                  </span>
+                )}
+              </Button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="space-y-1">
+        <label className="text-xs text-muted-foreground">
+          HOME override (absolute path; optional)
+        </label>
+        <Input
+          value={home}
+          onChange={(e) => setHome(e.target.value)}
+          placeholder={
+            dataDir
+              ? abbreviateHome(`${dataDir}/harnesses/${kind === "codex" ? "codex-2" : "claude-2"}`, homeDir)
+              : "~/.agetor/harnesses/claude-2"
+          }
+        />
+        <p className="text-[11px] leading-snug text-muted-foreground">
+          {kind === "claude-code"
+            ? "Sets HOME on spawn — claude resolves its login & history under $HOME/.claude/, so a separate HOME gives this harness its own account."
+            : "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account."}
+          {" "}Leave empty to share the system HOME.
+        </p>
+      </div>
+      <div className="space-y-1">
+        <label className="text-xs text-muted-foreground">Bin override (absolute path; optional)</label>
+        <Input
+          value={bin}
+          onChange={(e) => setBin(e.target.value)}
+          placeholder="/opt/homebrew/bin/claude"
+        />
+      </div>
+      <div className="space-y-1">
+        <label className="text-xs text-muted-foreground">Env vars (one KEY=value per line)</label>
+        <Textarea
+          value={envText}
+          onChange={(e) => setEnvText(e.target.value)}
+          rows={3}
+          className="font-mono text-xs"
+        />
+        {parsedEnv.ignored > 0 && (
+          <p className="text-[11px] leading-snug text-amber-500">
+            {parsedEnv.ignored} line{parsedEnv.ignored === 1 ? "" : "s"} ignored — each entry needs <code className="font-mono">KEY=value</code>.
+          </p>
+        )}
+      </div>
+
+      {(localError || error) && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive-foreground">
+          {localError || error}
+        </div>
+      )}
+
+      <div className="flex justify-end gap-2 border-t border-border/60 pt-3">
+        <Button variant="outline" onClick={onCancel} disabled={busy}>
+          Cancel
+        </Button>
+        <Button onClick={submit} disabled={busy}>
+          {isEdit ? "Save" : "Add harness"}
+        </Button>
+      </div>
+    </div>
+  );
+}

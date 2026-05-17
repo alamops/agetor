@@ -1,0 +1,370 @@
+import type {
+  AgentKind,
+  AgentStatus,
+  ColumnId,
+  GlobalEvent,
+  Harness,
+  HarnessStatus,
+  HarnessUsage,
+  Isolation,
+  Project,
+  Run,
+  RunEvent,
+  Task,
+  TaskReference,
+  UpdateStatus,
+} from "../../shared/types.ts";
+
+export interface UpdateSnapshot {
+  status: UpdateStatus;
+  version: string | null;
+  error: string | null;
+  lastCheckedAt: number | null;
+}
+
+export interface BranchInfo { name: string; committedAt: number; current: boolean }
+
+export interface AvailableCommand {
+  name: string;
+  description: string;
+  source: "user" | "project";
+  kind: "command" | "skill";
+}
+
+/** Per-agent model id list discovered from the CLI at boot. */
+export interface AgentModelMap {
+  "claude-code": { id: string; label?: string }[];
+  "codex": { id: string; label?: string }[];
+}
+
+/** Pending tool-call approval (from claude's PreToolUse hook). */
+export interface PendingApproval {
+  kind: "approval";
+  id: string;
+  taskId: string;
+  runId: string;
+  toolName: string;
+  toolInput: unknown;
+  createdAt: number;
+}
+
+/** Pending clarifying question (from the ask_user MCP tool). */
+export interface PendingQuestion {
+  kind: "question";
+  id: string;
+  taskId: string;
+  runId: string;
+  question: string;
+  choices?: string[];
+  multi?: boolean;
+  createdAt: number;
+}
+
+/** Pending multi-question card from claude's built-in AskUserQuestion tool
+ *  (intercepted via PreToolUse hook). */
+export interface PendingAskQuestions {
+  kind: "ask_questions";
+  id: string;
+  taskId: string;
+  runId: string;
+  questions: Array<{
+    question: string;
+    header?: string;
+    multiSelect?: boolean;
+    options: Array<{ label: string; description?: string }>;
+  }>;
+  createdAt: number;
+}
+
+/** Pending plan-approval card from claude's built-in ExitPlanMode tool
+ *  (intercepted via PreToolUse hook). */
+export interface PendingPlanApproval {
+  kind: "plan_approval";
+  id: string;
+  taskId: string;
+  runId: string;
+  plan: string;
+  createdAt: number;
+}
+
+export type PendingInteraction =
+  | PendingApproval
+  | PendingQuestion
+  | PendingAskQuestions
+  | PendingPlanApproval;
+
+// Read api port + token, preferring globals injected by the Bun side via
+// BrowserWindow's `preload` option — that path works under the native
+// views:// scheme, which rejects URLs carrying a fragment or query.
+// Fall back to URL hash for the Vite HMR path, which loads from a plain
+// http:// URL where the hash payload still works.
+declare global {
+  interface Window { __AGETOR?: { port: string; token: string } }
+}
+const injected = window.__AGETOR;
+const params = new URLSearchParams(
+  (window.location.hash || window.location.search).replace(/^[#?]/, ""),
+);
+const API_PORT = injected?.port ?? params.get("api") ?? "4317";
+const API_TOKEN = injected?.token ?? params.get("token") ?? "";
+const BASE = `http://127.0.0.1:${API_PORT}`;
+
+async function j<T>(path: string, init?: RequestInit): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      ...init,
+      headers: {
+        "content-type": "application/json",
+        "authorization": `Bearer ${API_TOKEN}`,
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch (e) {
+    // WebKit's bare "Load failed" tells us nothing — replace with
+    // something the user can act on.
+    const msg = (e as Error).message ?? String(e);
+    throw new Error(
+      msg === "Load failed"
+        ? `cannot reach agetor API at ${BASE} (${path}) — is the bun process running? Try restarting \`bun run dev\`.`
+        : msg,
+    );
+  }
+  if (res.status === 204) return undefined as T;
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    const msg = (body && typeof body === "object" && "error" in body && body.error)
+      ? String(body.error)
+      : `${res.status} ${res.statusText}`;
+    throw new Error(msg);
+  }
+  return body as T;
+}
+
+export interface AppDefaults { home: string; cwd: string; dataDir: string }
+
+export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
+export interface HarnessInput {
+  id: string;
+  kind: AgentKind;
+  label: string;
+  home: string | null;
+  bin: string | null;
+  env: Record<string, string>;
+}
+
+export const api = {
+  defaults: () => j<AppDefaults>("/defaults"),
+  info: () => j<{ version: string }>("/info"),
+  /** Toggle the window's macOS "zoom" state. Wired up to double-click on
+   *  the app bar in App.tsx because Electrobun's drag region doesn't
+   *  implement the native title-bar double-click gesture. */
+  toggleWindowZoom: () =>
+    j<{ ok: boolean; skipped?: string }>("/window/toggle-zoom", { method: "POST" }),
+  getUpdateStatus: () => j<UpdateSnapshot>("/updates/status"),
+  checkForUpdate: () => j<UpdateSnapshot>("/updates/check", { method: "POST" }),
+  applyUpdate: () => j<{ ok: true }>("/updates/apply", { method: "POST" }),
+  listAgents: () => j<AgentStatus[]>("/agents"),
+  listHarnesses: () => j<HarnessesPayload>("/harnesses"),
+  createHarness: (input: HarnessInput) =>
+    j<Harness>("/harnesses", { method: "POST", body: JSON.stringify(input) }),
+  updateHarness: (id: string, patch: Partial<Omit<HarnessInput, "id" | "kind">>) =>
+    j<Harness>(`/harnesses/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteHarness: (id: string) =>
+    j<void>(`/harnesses/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  setHarnessEnabled: (id: string, enabled: boolean) =>
+    j<Harness>(`/harnesses/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
+    }),
+  getHarnessUsage: (id: string) =>
+    j<HarnessUsage>(`/harnesses/${encodeURIComponent(id)}/usage`),
+  listAgentModels: () => j<AgentModelMap>("/agent-models"),
+  refreshAgentModels: () => j<AgentModelMap>("/agent-models", { method: "POST" }),
+  listProjects: () => j<Project[]>("/projects"),
+  pickProject: (startingFolder?: string) =>
+    j<{ project: Project | null }>("/projects/pick", {
+      method: "POST",
+      body: JSON.stringify({ startingFolder }),
+    }),
+  deleteProject: (p: string) =>
+    j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
+  listBranches: (dir: string) =>
+    j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
+  getTmuxSource: () =>
+    j<{
+      source: "system" | "bundled";
+      bundledAvailable: boolean;
+      bundledPath: string;
+      resolvedBin: string;
+    }>("/tmux-source"),
+  setTmuxSource: (source: "system" | "bundled") =>
+    j<{ ok: true; source: "system" | "bundled" }>("/tmux-source", {
+      method: "POST",
+      body: JSON.stringify({ source }),
+    }),
+  listPreferences: () => j<Record<string, string>>("/preferences"),
+  setPreference: (key: string, value: string) =>
+    j<void>(`/preferences/${encodeURIComponent(key)}`, {
+      method: "PUT",
+      body: JSON.stringify({ value }),
+    }),
+  listAgentCommands: (opts: { agent: AgentKind; workdir: string; branch?: string }) => {
+    const q = new URLSearchParams({ agent: opts.agent });
+    if (opts.workdir) q.set("workdir", opts.workdir);
+    if (opts.branch) q.set("branch", opts.branch);
+    return j<AvailableCommand[]>(`/agent-commands?${q.toString()}`);
+  },
+  listTasks: () => j<Task[]>("/tasks"),
+  createTask: (input: {
+    title: string;
+    prompt: string;
+    /** Harness id — see `listHarnesses()`. Built-in ids are `claude-code` / `codex`. */
+    agent: string;
+    workdir: string;
+    isolation: Isolation;
+    baseRef?: string;
+    mode?: string | null;
+    model?: string | null;
+    effort?: string | null;
+    /** Initial column. Defaults to "backlog" if omitted. */
+    column?: ColumnId;
+    references?: TaskReference[];
+  }) => j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }),
+  updateTask: (id: string, patch: Partial<Task>) =>
+    j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  moveTask: (id: string, column: ColumnId) =>
+    j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ column }) }),
+  deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
+  startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
+  listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
+  cancelRun: (runId: string) =>
+    j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
+  sendRunInput: (runId: string, line: string) =>
+    j<{ delivered: true; runId: string } | { delivered: false; reason: string }>(
+      `/runs/${runId}/input`,
+      { method: "POST", body: JSON.stringify({ line }) },
+    ),
+  /**
+   * Open a file or directory with the OS default app. `path` may be absolute
+   * or, when `taskId` is supplied, relative to the task's cwd
+   * (worktreePath ?? workdir).
+   */
+  openPath: (input: { path: string; taskId?: string }) =>
+    j<{ opened: boolean; path: string }>(`/open-path`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  /** Interactions: tool-call approvals and clarifying questions. */
+  answerApproval: (
+    id: string,
+    body: {
+      decision: "allow" | "deny";
+      reason?: string;
+      remember?: boolean;
+      /** Optional permissions.allow entry from the UI's granularity chooser.
+       *  Server falls back to the tool's most-specific scope if absent. */
+      entry?: string;
+    },
+  ) =>
+    j<{ ok: boolean }>(`/approvals/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  answerQuestion: (id: string, body: { selected: string[]; custom?: string }) =>
+    j<{ ok: boolean }>(`/questions/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** Answer claude's AskUserQuestion (intercepted via PreToolUse hook). One
+   *  entry per question in the original tool input, in the same order. */
+  answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; custom?: string }> }) =>
+    j<{ ok: boolean }>(`/ask-questions/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** Answer claude's ExitPlanMode (intercepted via PreToolUse hook). */
+  answerPlanApproval: (
+    id: string,
+    body: { choice: "approve_implement" | "approve_ask" | "reject"; revision?: string },
+  ) =>
+    j<{ ok: boolean }>(`/plan-approvals/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  listPendingInteractions: (taskId: string) =>
+    j<PendingInteraction[]>(`/tasks/${taskId}/interactions/pending`),
+  /** Re-parse a run's events from claude's on-disk JSONL session
+   *  transcript. Use when the persisted `run_events` rows pre-date the
+   *  structured-event refactor (the legacy mapper truncated tool inputs
+   *  at 500 chars, so the in-DB copy is missing the tail bytes). Returns
+   *  an empty list + `reason` when the JSONL is gone or the run had no
+   *  claude session id (e.g. codex runs). */
+  rebuildRunEvents: (runId: string) =>
+    j<{ events: RunEvent[]; source?: string; reason?: string }>(
+      `/runs/${runId}/rebuild-events`,
+    ),
+
+  /** Fire a native macOS notification via the Bun process. Fire-and-forget
+   *  — the OS handles display; clicking the notification just focuses the
+   *  app (Electrobun's bridge doesn't expose a click callback). The
+   *  matching in-app toast carries the deep-link. */
+  notifyOS: (input: { title: string; body?: string; subtitle?: string; silent?: boolean }) =>
+    j<{ ok: boolean }>("/notifications", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  /** App-wide lifecycle event stream. Live-only (no replay) — subscribers
+   *  see events from the moment they connect. Used by the toast hook in
+   *  App.tsx to surface success / error / pending-input across every task
+   *  without subscribing per-task. */
+  subscribeGlobalEvents(onEvent: (e: GlobalEvent) => void): () => void {
+    const es = new EventSource(`${BASE}/events?token=${encodeURIComponent(API_TOKEN)}`);
+    es.onmessage = (m) => {
+      try {
+        const parsed = JSON.parse(m.data);
+        if (parsed.type === "ping") return;
+        onEvent(parsed as GlobalEvent);
+      } catch { /* ignore */ }
+    };
+    // Logged so a future debug session has a breadcrumb when toasts stop
+    // arriving (typically: stale token, backend restart). EventSource
+    // auto-reconnects, so this is informational — no UI surfacing.
+    es.onerror = (e) => { console.warn("[agetor] global events stream error", e); };
+    return () => es.close();
+  },
+
+  subscribeRun(runId: string, onEvent: (e: RunEvent) => void): () => void {
+    // EventSource can't set headers, so the server also accepts the token via query.
+    const es = new EventSource(`${BASE}/runs/${runId}/events?token=${encodeURIComponent(API_TOKEN)}`);
+    es.onmessage = (m) => {
+      try {
+        const parsed = JSON.parse(m.data);
+        if (parsed.type === "ping") return;
+        onEvent(parsed as RunEvent);
+      } catch { /* ignore */ }
+    };
+    es.onerror = (e) => { console.warn("[agetor] run events stream error", runId, e); };
+    return () => es.close();
+  },
+  /** Unified task-level event stream: every run's events, merged in id
+   *  order. Replaces per-run subscriptions for the run panel so the user
+   *  sees the whole conversation as one scrollback. */
+  subscribeTask(taskId: string, onEvent: (e: RunEvent) => void): () => void {
+    const es = new EventSource(`${BASE}/tasks/${taskId}/events?token=${encodeURIComponent(API_TOKEN)}`);
+    es.onmessage = (m) => {
+      try {
+        const parsed = JSON.parse(m.data);
+        if (parsed.type === "ping") return;
+        onEvent(parsed as RunEvent);
+      } catch { /* ignore */ }
+    };
+    es.onerror = (e) => { console.warn("[agetor] task events stream error", taskId, e); };
+    return () => es.close();
+  },
+};

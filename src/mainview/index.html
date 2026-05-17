@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agetor</title>
+    <style>
+      /* Inline so the splash paints at HTML-parse time — before main.tsx or
+         index.css load. HSL value mirrors the .dark `--background` token in
+         index.css; the Tailwind layer hasn't applied yet at this point. */
+      #splash {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483647;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #000;
+        transition: opacity 300ms ease;
+      }
+      #splash img {
+        width: 128px;
+        height: 128px;
+        user-select: none;
+        -webkit-user-drag: none;
+      }
+      #splash.is-hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #splash { transition: none; }
+      }
+    </style>
+  </head>
+  <body class="bg-background text-foreground antialiased">
+    <div id="splash" role="status" aria-label="Loading Agetor"><img src="./splash-logo.png" alt="" /></div>
+    <div id="root"></div>
+    <script type="module" src="/main.tsx"></script>
+  </body>
+</html>
