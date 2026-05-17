@@ -175,8 +175,14 @@ export function startApiServer() {
   ALLOWED_ORIGINS.add(`http://localhost:${PORT}`);
   ALLOWED_ORIGINS.add("http://localhost:5173");
   ALLOWED_ORIGINS.add("http://127.0.0.1:5173");
-  // Electrobun's bundled `views://` scheme typically sends Origin: null; the
-  // requireAuth check covers that case via the token.
+  // Electrobun's bundled `views://` scheme sends Origin: views://<viewName>
+  // (not the `null` originally documented here). Without this entry, every
+  // packaged-build fetch returns 200 from the server but WebKit rejects the
+  // response in the renderer with "Origin views://mainview is not allowed by
+  // Access-Control-Allow-Origin" — so the UI silently sees every API call
+  // reject and falls back to empty data (e.g. `v?`, empty harnesses list).
+  // The auth token still gates the actual request body.
+  ALLOWED_ORIGINS.add("views://mainview");
 
   const server = Bun.serve({
     port: PORT,
