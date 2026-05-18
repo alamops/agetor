@@ -70,11 +70,21 @@ async function findExistingRelease(tag: string): Promise<ReleaseRecord | null> {
 }
 
 async function createRelease(tag: string, body: string | undefined): Promise<ReleaseRecord> {
+  // `target_commitish: "main"` is belt-and-suspenders: release.ts now
+  // pushes the annotated tag *before* this script runs, so GitHub sees
+  // the tag already exists and associates with it (target_commitish is
+  // ignored on that path). If a future caller invokes this script
+  // standalone — without a pushed tag — `target_commitish` makes GitHub
+  // auto-create the tag at the current main HEAD instead of falling
+  // through to the API's implicit default. Doesn't fix the v0.0.3-style
+  // race on its own (you'd still want the bump pushed first) but
+  // documents the intent for the next reader.
   const res = await gh(`/repos/${REPO}/releases`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       tag_name: tag,
+      target_commitish: "main",
       name: tag,
       body: body ?? "",
       draft: false,

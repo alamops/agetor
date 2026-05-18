@@ -11,18 +11,30 @@
 //   2. Bump        — package.json + electrobun.config.ts move in lockstep.
 //   3. Build       — vendor:tmux → vite build → electrobun build (signed + notarized).
 //   4. Verify      — codesign / spctl / stapler checks on the produced artifacts.
-//   5. Upload      — create or refresh the GitHub Release at v<version>.
-//   6. Commit/tag  — only on full success: commit the bump, tag v<version>, push both.
+//   5. Commit/tag  — commit the bump, tag v<version>, push commit + tag.
+//   6. Upload      — create the GitHub Release; the tag already exists on
+//                    remote, so the API associates with it instead of
+//                    auto-creating a lightweight one.
 //
-// Order rationale (same as the old GH workflow): bump first so the build sees
-// the new version, but commit/tag/push only after notarize+upload succeed —
-// a failed build then never leaves a "hole" (bumped tag in main with no
-// matching GitHub Release). If the build fails mid-way, revert the working
-// tree with:
+// Order rationale: bump first so the build sees the new version. Build +
+// verify must pass before any commit/tag, so a failed build leaves main
+// clean (same guarantee as before). The commit + tag + push then runs
+// *before* upload — earlier shape ran upload first to keep main clean on
+// upload failure, but GitHub's `POST /releases` auto-creates the tag at
+// the remote's main HEAD if it doesn't exist, which was the pre-bump
+// commit. The local "real" tag (pointing at the bump commit) then
+// collided on push and the release shipped with a remote tag at the
+// wrong sha. Doing commit+tag+push first means GitHub sees the tag
+// already exists and just associates with it.
+//
+// If the build fails mid-way, revert the working tree with:
 //
 //   git checkout -- package.json electrobun.config.ts
 //
-// and rerun.
+// and rerun. If commit/tag/push or upload fails *after* the bump landed
+// in main, rerun with `bun run release <current-version>` — the
+// applyVersion no-bump path skips the commit and lets you re-attempt
+// the failed downstream step.
 
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
@@ -206,10 +218,8 @@ async function main() {
   console.log("[release] verify…");
   await run(["bun", "scripts/verify-release.ts"]);
 
-  process.env.AGETOR_RELEASE_NOTES = notes;
-  console.log("[release] upload to GitHub…");
-  await run(["bun", "scripts/upload-release.ts"]);
-
+  // Commit + tag + push *before* upload. See the order-rationale block
+  // at the top of this file for the v0.0.3 incident this guards against.
   const tag = `v${to}`;
   if (bumped) {
     console.log(`[release] commit + tag ${tag}`);
@@ -221,14 +231,21 @@ async function main() {
     await run(["git", "push", "origin", tag]);
   } else {
     const existing = await tagExists(tag);
-    if (existing.local || existing.remote) {
-      console.log(`[release] tag ${tag} already exists (local=${existing.local}, remote=${existing.remote}) — skipping tag creation`);
-    } else {
+    if (existing.local && !existing.remote) {
+      console.log(`[release] pushing local tag ${tag} (remote missing)…`);
+      await run(["git", "push", "origin", tag]);
+    } else if (!existing.local && !existing.remote) {
       console.log(`[release] tag ${tag} on HEAD…`);
       await run(["git", "tag", "-a", tag, "-m", `release ${tag}`]);
       await run(["git", "push", "origin", tag]);
+    } else {
+      console.log(`[release] tag ${tag} already on remote — skipping`);
     }
   }
+
+  process.env.AGETOR_RELEASE_NOTES = notes;
+  console.log("[release] upload to GitHub…");
+  await run(["bun", "scripts/upload-release.ts"]);
 
   // Sanity check: the artifacts the auto-updater serves must end up where it
   // looks for them. We don't fetch them back — just point the user at the
