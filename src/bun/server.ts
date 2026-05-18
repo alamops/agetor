@@ -86,7 +86,7 @@ function corsHeaders(req: Request): Record<string, string> {
   const allowed = ALLOWED_ORIGINS.has(origin) ? origin : "null";
   return {
     "access-control-allow-origin": allowed,
-    "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
+    "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
     "access-control-allow-headers": "content-type,authorization",
     "access-control-allow-credentials": "true",
   };

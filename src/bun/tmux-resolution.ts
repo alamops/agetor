@@ -50,13 +50,19 @@ export function setTmuxSource(source: TmuxSource): void {
  * Single source of truth for the tmux binary path. Precedence:
  *   1. AGETOR_TMUX_BIN env override (tests + power users) — never bypassed.
  *   2. `tmux_source = "bundled"` preference → the in-bundle binary.
- *   3. "tmux" (system PATH lookup).
+ *   3. System PATH lookup — resolved to an absolute path so `Bun.spawn`
+ *      doesn't re-do the lookup against its stale cached PATH (see the
+ *      `Bun.which` gotcha in agent-status.ts).
+ *
+ * Returns the literal "tmux" only when nothing on PATH matches — the caller
+ * spawn will then surface the same "Executable not found in $PATH" error
+ * the user would have seen, but from a deterministic codepath.
  */
 export function resolveTmuxBin(): string {
   const override = process.env.AGETOR_TMUX_BIN;
   if (override) return override;
   if (getTmuxSource() === "bundled") return bundledTmuxPath();
-  return "tmux";
+  return Bun.which("tmux", { PATH: process.env.PATH }) ?? "tmux";
 }
 
 /** True when the bundled binary is actually present on disk. */

@@ -89,14 +89,22 @@ function modelDeclinesEffort(kind: AgentKind, model: string): boolean {
  * Resolve the binary path for a harness. Per-harness `bin` wins (set by the
  * user when adding an alias). Falls back to the corresponding process env
  * override for back-compat with `AGETOR_CLAUDE_BIN` / `AGETOR_CODEX_BIN`,
- * then to the kind's default name on PATH.
+ * then to the kind's default name resolved against the current PATH.
+ *
+ * The PATH lookup goes through `Bun.which` with an explicit `{ PATH }` to
+ * dodge Bun's startup PATH cache (see agent-status.ts). Without this, codex
+ * (which is spawned via `Bun.spawn` directly, not through tmux) would fail
+ * to launch from a packaged .app even though `claude` finds it during
+ * `agent-status.checkHarness()`.
  */
 export function resolveBin(harness: Harness): string {
   if (harness.bin) return harness.bin;
-  if (harness.kind === "claude-code") {
-    return process.env.AGETOR_CLAUDE_BIN ?? "claude";
-  }
-  return process.env.AGETOR_CODEX_BIN ?? "codex";
+  const fallback = harness.kind === "claude-code" ? "claude" : "codex";
+  const override = harness.kind === "claude-code"
+    ? process.env.AGETOR_CLAUDE_BIN
+    : process.env.AGETOR_CODEX_BIN;
+  if (override) return override;
+  return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
 }
 
 /**

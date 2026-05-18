@@ -3,9 +3,14 @@ import { buildCommand } from "./agents.ts";
 import { AGENT_OPTIONS, type AgentKind, type Harness } from "../shared/types.ts";
 
 beforeEach(() => {
-  delete process.env.AGETOR_CLAUDE_BIN;
+  // Force the literal "claude" / "codex" names in argv. Production
+  // `resolveBin()` now goes through `Bun.which(name, { PATH })` to dodge
+  // Bun's startup PATH cache (see agent-status.ts) — without these
+  // overrides, tests on a machine with claude installed would see an
+  // absolute path in argv[0] and the equality checks would drift per host.
+  process.env.AGETOR_CLAUDE_BIN = "claude";
+  process.env.AGETOR_CODEX_BIN = "codex";
   delete process.env.AGETOR_CLAUDE_ARGS;
-  delete process.env.AGETOR_CODEX_BIN;
   delete process.env.AGETOR_CODEX_ARGS;
 });
 

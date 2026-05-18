@@ -726,8 +726,16 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // We unconditionally inject our localhost API coordinates so the hook
   // script + MCP server can reach back. These are no-ops on isolation=none
   // tasks (no settings.local.json registers them), but they don't hurt.
+  //
+  // PATH is injected explicitly because the tmux *server* captures env at
+  // its first launch and reuses it for every subsequent session — passing
+  // it per-session via `-e` guarantees the spawned claude sees the
+  // currently-rehydrated PATH even if the server's captured copy is stale
+  // (e.g. agetor restarted with a different login-shell PATH but the
+  // long-running bundled tmux server is still around).
   const fullEnv: Record<string, string> = {
     ...opts.env,
+    PATH: process.env.PATH ?? "",
     AGETOR_API_PORT: String(getApiPort()),
     AGETOR_API_TOKEN: API_TOKEN,
     AGETOR_TASK_ID: opts.taskId,

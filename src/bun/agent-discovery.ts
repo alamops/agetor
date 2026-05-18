@@ -61,7 +61,12 @@ function parseCodexModels(stdout: string): DiscoveredModel[] {
 }
 
 async function discoverCodex(): Promise<DiscoveredModel[]> {
-  const bin = process.env.AGETOR_CODEX_BIN ?? "codex";
+  // Resolve against the rehydrated PATH explicitly — Bun.spawn (and the
+  // implicit lookup inside it) uses Bun's startup PATH cache, which on a
+  // packaged .app is launchd's minimal set. See agent-status.ts for the
+  // full story.
+  const fallback = process.env.AGETOR_CODEX_BIN ?? "codex";
+  const bin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
   // Newer codex builds expose `codex prompt --models`; older builds may not.
   // We try the documented form first; if it fails we return empty rather than
   // probing harder — the hardcoded list is the fallback.
