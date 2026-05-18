@@ -144,6 +144,43 @@ async function tagExists(tag: string): Promise<{ local: boolean; remote: boolean
   return { local, remote };
 }
 
+// Previous release tag, sorted semver-descending, ignoring the tag we're about
+// to publish (handles the no-bump re-cut where vX.Y.Z already exists). The
+// semver-strict filter keeps stray tags (`v-internal`, `viewer`, `v0.1-beta`)
+// from sorting to the top and producing a nonsense `git log` range.
+async function previousTag(currentTag: string): Promise<string | null> {
+  const out = await run(["git", "tag", "--list", "v*", "--sort=-version:refname"], { capture: true });
+  const tags = out
+    .split("\n")
+    .map((t) => t.trim())
+    .filter((t) => /^v\d+\.\d+\.\d+$/.test(t))
+    .filter((t) => t !== currentTag);
+  return tags[0] ?? null;
+}
+
+// Auto-generated release notes: commits since the previous tag, one bullet per
+// subject line, dropping merge commits and the script's own `release vX.Y.Z`
+// bump commits. If there's no previous tag (first ever release) we list every
+// commit on the current branch.
+async function generateNotes(currentTag: string): Promise<string> {
+  const prev = await previousTag(currentTag);
+  const range = prev ? `${prev}..HEAD` : "HEAD";
+  const log = await run(
+    ["git", "log", range, "--no-merges", "--pretty=format:- %s"],
+    { capture: true },
+  );
+  const lines = log
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !/^- release v\d+\.\d+\.\d+/i.test(l));
+  // When prev is null, range = HEAD covers every commit in the repo, so
+  // `lines` is only ever empty on the no-bump re-cut path where prev..HEAD has
+  // nothing new — hence the message references `prev` directly.
+  if (!lines.length) return `No changes since ${prev ?? "previous release"}.`;
+  const header = prev ? `Changes since ${prev}:` : "Changes:";
+  return `${header}\n\n${lines.join("\n")}`;
+}
+
 async function main() {
   const target = parseArg(process.argv[2]);
   console.log("[release] preflight…");
@@ -156,12 +193,20 @@ async function main() {
     console.log(`[release] releasing current version ${to} (no bump)`);
   }
 
+  // Generate notes up front so a git-state issue (corrupt tag, bad range)
+  // surfaces before the ~3-min build/notarize — same fail-fast philosophy as
+  // preflight(). The bump commit hasn't landed yet, so the prev..HEAD range
+  // captures real changes, not the bump itself.
+  const notes = await generateNotes(`v${to}`);
+  console.log(`[release] notes:\n${notes.split("\n").map((l) => `  ${l}`).join("\n")}`);
+
   console.log("[release] build:stable…");
   await run(["bun", "run", "build:stable"]);
 
   console.log("[release] verify…");
   await run(["bun", "scripts/verify-release.ts"]);
 
+  process.env.AGETOR_RELEASE_NOTES = notes;
   console.log("[release] upload to GitHub…");
   await run(["bun", "scripts/upload-release.ts"]);
 

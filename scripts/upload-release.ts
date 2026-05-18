@@ -40,6 +40,7 @@ interface ReleaseRecord {
   id: number;
   html_url: string;
   upload_url: string;
+  body: string | null;
   assets: { id: number; name: string }[];
 }
 
@@ -68,19 +69,28 @@ async function findExistingRelease(tag: string): Promise<ReleaseRecord | null> {
   return (await res.json()) as ReleaseRecord;
 }
 
-async function createRelease(tag: string): Promise<ReleaseRecord> {
+async function createRelease(tag: string, body: string | undefined): Promise<ReleaseRecord> {
   const res = await gh(`/repos/${REPO}/releases`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       tag_name: tag,
       name: tag,
+      body: body ?? "",
       draft: false,
       prerelease: false,
       generate_release_notes: false,
     }),
   });
   return (await res.json()) as ReleaseRecord;
+}
+
+async function updateReleaseBody(releaseId: number, body: string): Promise<void> {
+  await gh(`/repos/${REPO}/releases/${releaseId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ body }),
+  });
 }
 
 async function deleteAsset(assetId: number): Promise<void> {
@@ -150,6 +160,8 @@ async function main() {
 
   const toUpload = [dmg!, tarZst!, updateJson!].map((n) => join(artifactsDir, n));
 
+  const notes = process.env.AGETOR_RELEASE_NOTES;
+
   console.log(`[upload-release] target: ${REPO} @ ${TAG}`);
   let release = await findExistingRelease(TAG);
   if (release) {
@@ -163,9 +175,24 @@ async function main() {
     } else {
       console.log("[upload-release] reusing existing empty release");
     }
+    // Only seed the body on re-cut if the existing release has no manually
+    // edited notes — clobbering hand-written highlights on a hotfix re-upload
+    // would be a nasty surprise. Set AGETOR_RELEASE_NOTES_FORCE=1 to override.
+    if (notes) {
+      const hasManualBody = !!release.body?.trim();
+      if (!hasManualBody) {
+        console.log("[upload-release] seeding release notes (existing body empty)");
+        await updateReleaseBody(release.id, notes);
+      } else if (process.env.AGETOR_RELEASE_NOTES_FORCE) {
+        console.log("[upload-release] overwriting release notes (FORCE=1)");
+        await updateReleaseBody(release.id, notes);
+      } else {
+        console.log("[upload-release] keeping existing release notes (set AGETOR_RELEASE_NOTES_FORCE=1 to overwrite)");
+      }
+    }
   } else {
     console.log(`[upload-release] creating release ${TAG}`);
-    release = await createRelease(TAG);
+    release = await createRelease(TAG, notes);
   }
 
   for (const f of toUpload) await uploadAsset(release, f);
