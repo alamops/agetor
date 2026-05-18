@@ -44,11 +44,19 @@ async function probeVersion(bin: string, env: Record<string, string>): Promise<s
  * and are checked for existence directly — `Bun.which` only searches `$PATH`
  * and returns null for absolute paths, which would falsely report a hand-
  * specified `bin` as missing.
+ *
+ * **Pass `{ PATH: process.env.PATH }` explicitly.** Without it, `Bun.which`
+ * uses the PATH snapshot Bun captured at process startup, which on a packaged
+ * macOS .app is launchd's minimal `/usr/bin:/bin:/usr/sbin:/sbin` — none of
+ * `claude` / `codex` / `tmux` live there. `rehydratePath()` (called at boot)
+ * mutates `process.env.PATH` to include the user's login-shell PATH, but
+ * `Bun.which`'s internal cache won't see the mutation. The options object
+ * forces a fresh lookup against whatever we currently have on `process.env`.
  */
 function resolveBinPath(bin: string): string | null {
   if (!bin) return null;
   if (isAbsolute(bin)) return existsSync(bin) ? bin : null;
-  return Bun.which(bin);
+  return Bun.which(bin, { PATH: process.env.PATH });
 }
 
 /**

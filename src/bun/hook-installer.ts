@@ -93,9 +93,11 @@ function materialiseSharedFiles(): { hookScript: string; mcpLauncher: string; sy
     // Resolve `bun` to an absolute path AT INSTALL TIME so the launcher we
     // write doesn't depend on claude's PATH (Electrobun-launched processes
     // sometimes get a sanitised PATH that's missing Homebrew, etc.).
-    // `Bun.which` searches the parent process's PATH. If it can't find one,
-    // fall back to `bun` and let claude's child shell try its luck.
-    const bunPath = Bun.which("bun") ?? "bun";
+    // `Bun.which` caches PATH at process startup — pass the current PATH
+    // explicitly so it picks up whatever `rehydratePath()` injected at boot.
+    // If it still can't find one, fall back to `bun` and let claude's child
+    // shell try its luck.
+    const bunPath = Bun.which("bun", { PATH: process.env.PATH }) ?? "bun";
     // Materialise the MCP server's source next to the launcher so the
     // launcher can point at a real path. We can't reference
     // `import.meta.dir/mcp/agetor-mcp.ts` because electrobun-build inlines
@@ -400,7 +402,7 @@ function applyAgetorSettings(
   // our launcher suffix). For the bypass scope we *strip* our own previous
   // registration if any — that mode is meant to be modal-free, so we
   // shouldn't leave a stale `ask_user` channel that earlier runs installed.
-  const haveBun = Bun.which("bun") !== null;
+  const haveBun = Bun.which("bun", { PATH: process.env.PATH }) !== null;
   const wantMcp = includeMcpForScope(scope) && haveBun;
   const mcp = (settings.mcpServers && typeof settings.mcpServers === "object" && !Array.isArray(settings.mcpServers))
     ? settings.mcpServers as Record<string, unknown>
