@@ -1,6 +1,7 @@
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { ApplicationMenu, BrowserWindow, Updater } from "electrobun/bun";
+import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN } from "./server.ts";
 import { dataDir, harnesses } from "./db.ts";
 import { reconcileOrphans } from "./orchestrator.ts";
@@ -9,6 +10,38 @@ import { refreshDiscoveredModels } from "./agent-discovery.ts";
 import { startUpdaterLoop } from "./updater.ts";
 import { setMainWindow } from "./window.ts";
 
+const PID_FILE = path.join(dataDir, "agetor.pid");
+
+/** Enforce single-instance: if a prior agetor process is still alive (per
+ *  pidfile), SIGTERM it and wait briefly for the API port to free. Without
+ *  this, launching a second instance lets the new webview talk to the old
+ *  bun process (CORS/auth mismatch, "Status 200 + wrong ACAO" errors). */
+async function ensureSingleInstance(): Promise<void> {
+  if (!existsSync(PID_FILE)) return;
+  let raw: string;
+  try { raw = readFileSync(PID_FILE, "utf8"); } catch { return; }
+  const oldPid = parseInt(raw.trim(), 10);
+  if (!Number.isFinite(oldPid) || oldPid <= 0 || oldPid === process.pid) return;
+  try { process.kill(oldPid, 0); } catch { return; /* dead — nothing to do */ }
+  console.log(`[agetor] another instance is running (pid ${oldPid}) — sending SIGTERM and waiting for port ${API_PORT} to free`);
+  try { process.kill(oldPid, "SIGTERM"); } catch { /* race: already gone */ }
+  // Poll for the port to free. ~2s budget is enough for a clean Bun.serve
+  // shutdown; if the old process is wedged we'll fall through and the loud
+  // Bun.serve bind failure below will surface the conflict to the user.
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    try {
+      const probe = Bun.serve({ port: API_PORT, hostname: "127.0.0.1", fetch: () => new Response("probe") });
+      probe.stop();
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+}
+
+await ensureSingleInstance();
+
 /** Drop a pid file in the data dir so out-of-process tools (notably
  *  `bun run wipe:dev`) can tell whether an agetor instance is using this
  *  data dir, independent of which API port we ended up on. Stale pid
@@ -16,7 +49,7 @@ import { setMainWindow } from "./window.ts";
  *  alive with `kill(pid, 0)` before trusting the file. Best-effort; a
  *  failed write doesn't block boot. */
 try {
-  writeFileSync(path.join(dataDir, "agetor.pid"), String(process.pid));
+  writeFileSync(PID_FILE, String(process.pid));
 } catch {
   /* non-fatal */
 }
@@ -89,6 +122,16 @@ async function getMainViewUrl(): Promise<string> {
   return "views://mainview/index.html";
 }
 
+// When agetor is launched as a packaged .app (Finder, Spotlight, Dock),
+// launchd hands the process a minimal PATH that's missing every place users
+// actually install dev CLIs (/opt/homebrew/bin, ~/.nvm/…, ~/.npm-global/bin,
+// asdf shims, …). Source the user's login-shell PATH once at boot so
+// `Bun.which("claude")` / "codex" / "tmux" can find what's there. Has to run
+// before prewarmSharedFiles (which resolves `bun`) and before the API server
+// starts handling /agents probes. Idempotent and safe in dev runs — the
+// merge dedupes.
+rehydratePath();
+
 // Eagerly refresh the materialised hook + MCP launcher scripts on disk
 // (~/.agetor/bin/*) so a `claude` invocation made directly in a previously-
 // hook-installed repo — between this restart and the first task spawn —
@@ -126,7 +169,19 @@ installNativeMenu();
 // background — we don't await it so a slow CLI never delays the API/window.
 void refreshDiscoveredModels();
 
-startApiServer();
+try {
+  startApiServer();
+} catch (e) {
+  // The webview is created after this — if the API never came up, we'd
+  // leave an orphan window talking to whatever else happens to be on the
+  // port (e.g. a stale agetor, or OTLP gRPC which also defaults to 4317).
+  // Fail loudly instead so the user sees the real problem in the launcher
+  // logs rather than a wall of CORS errors in the renderer console.
+  const msg = (e as Error)?.message ?? String(e);
+  console.error(`[agetor] failed to bind API on 127.0.0.1:${API_PORT}: ${msg}`);
+  console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
+  process.exit(1);
+}
 
 // Background self-update check on launch + every 6h. Emits global events
 // that the UI subscribes to via SSE to render the "update ready" banner.
