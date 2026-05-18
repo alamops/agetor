@@ -1,56 +1,33 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import path from "node:path";
+import { writeFileSync } from "node:fs";
 import Electrobun, { ApplicationMenu, BrowserWindow, Updater } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN } from "./server.ts";
-import { db, dataDir, harnesses, tasks } from "./db.ts";
+import { db, harnesses, pidFilePath, tasks } from "./db.ts";
 import { reconcileOrphans } from "./orchestrator.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { prewarmSharedFiles } from "./hook-installer.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
 import { startUpdaterLoop } from "./updater.ts";
-import { setMainWindow } from "./window.ts";
-
-const PID_FILE = path.join(dataDir, "agetor.pid");
-
-/** Enforce single-instance: if a prior agetor process is still alive (per
- *  pidfile), SIGTERM it and wait briefly for the API port to free. Without
- *  this, launching a second instance lets the new webview talk to the old
- *  bun process (CORS/auth mismatch, "Status 200 + wrong ACAO" errors). */
-async function ensureSingleInstance(): Promise<void> {
-  if (!existsSync(PID_FILE)) return;
-  let raw: string;
-  try { raw = readFileSync(PID_FILE, "utf8"); } catch { return; }
-  const oldPid = parseInt(raw.trim(), 10);
-  if (!Number.isFinite(oldPid) || oldPid <= 0 || oldPid === process.pid) return;
-  try { process.kill(oldPid, 0); } catch { return; /* dead — nothing to do */ }
-  console.log(`[agetor] another instance is running (pid ${oldPid}) — sending SIGTERM and waiting for port ${API_PORT} to free`);
-  try { process.kill(oldPid, "SIGTERM"); } catch { /* race: already gone */ }
-  // Poll for the port to free. ~2s budget is enough for a clean Bun.serve
-  // shutdown; if the old process is wedged we'll fall through and the loud
-  // Bun.serve bind failure below will surface the conflict to the user.
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    try {
-      const probe = Bun.serve({ port: API_PORT, hostname: "127.0.0.1", fetch: () => new Response("probe") });
-      probe.stop();
-      return;
-    } catch {
-      await new Promise((r) => setTimeout(r, 100));
-    }
-  }
-}
-
-await ensureSingleInstance();
+import { getMainWindow, setMainWindow } from "./window.ts";
+import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 
 /** Drop a pid file in the data dir so out-of-process tools (notably
  *  `bun run wipe:dev`) can tell whether an agetor instance is using this
  *  data dir, independent of which API port we ended up on. Stale pid
  *  files left behind by crashes are harmless — readers verify the pid is
  *  alive with `kill(pid, 0)` before trusting the file. Best-effort; a
- *  failed write doesn't block boot. */
+ *  failed write doesn't block boot.
+ *
+ *  Single-instance enforcement at the application layer is intentionally
+ *  absent: macOS Launch Services already dedupes packaged-app launches by
+ *  bundle identifier (see `electrobun.config.ts:app.identifier`), so a
+ *  double-click in Finder/Spotlight/Dock can't spawn a second process. In
+ *  dev mode, dev and prod use different default ports (4318 vs 4317), so
+ *  the common stale-process case can't collide. If a port is still held
+ *  by something else, the try/catch around `startApiServer()` below fails
+ *  loudly with a useful `lsof` hint rather than silently fighting it. */
 try {
-  writeFileSync(PID_FILE, String(process.pid));
+  writeFileSync(pidFilePath, String(process.pid));
 } catch {
   /* non-fatal */
 }
@@ -235,34 +212,98 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
 // Defers its first probe 5s past boot so it doesn't slow window open.
 startUpdaterLoop();
 
-const url = await getMainViewUrl();
-// The native views:// scheme handler refuses URLs that carry a fragment
-// or query — it treats the part after the scheme as a literal file path,
-// so `views://mainview/index.html#api=…` resolves to a non-existent file
-// and returns "empty response". Instead, ship the per-launch API
-// coordinates through a WKUserScript injection (BrowserWindow's
-// `preload` option), which runs before any page script. The webview
-// reads them off `window.__AGETOR`. For Vite HMR mode the URL is plain
-// http://, which DOES support hash, so we keep the legacy hash payload
-// as a fallback there.
-const bootGlobals = `window.__AGETOR=${JSON.stringify({
-  port: String(API_PORT),
-  token: API_TOKEN,
-})};`;
-const isHttpUrl = url.startsWith("http://") || url.startsWith("https://");
-// macOS-only chrome: `hiddenInset` removes the native title bar background +
-// text but keeps inset traffic lights, letting the React header at the top of
-// App.tsx render full-bleed on the same row. `trafficLightOffset` shifts the
-// lights to vertically center inside that header's 40px (h-10) height — keep
-// `x` here in sync with the header's left padding (`pl-20` in App.tsx).
-const mainWindow = new BrowserWindow({
-  title: "Agetor",
-  titleBarStyle: "hiddenInset",
-  trafficLightOffset: { x: 8, y: 8 },
-  url: isHttpUrl ? `${url}#api=${API_PORT}&token=${API_TOKEN}` : url,
-  preload: bootGlobals,
-  frame: { width: 1200, height: 800, x: 120, y: 120 },
+/** Lifecycle wrapper around BrowserWindow construction. Handles:
+ *   - idempotency (concurrent reopen events share one in-flight build),
+ *   - frame memory (remembered position/size survives close → reopen so
+ *     the window doesn't jump back to its DEFAULT_FRAME on every Dock
+ *     click — the user-visible Mac standard).
+ *  See window-lifecycle.ts + window-lifecycle.test.ts for the contract
+ *  and the race-safety / restore-frame coverage. */
+const windowLifecycle = makeWindowLifecycle({
+  getMainWindow,
+  setMainWindow,
+  buildWindow: async (frame: Frame) => {
+    const url = await getMainViewUrl();
+    // The native views:// scheme handler refuses URLs that carry a fragment
+    // or query — it treats the part after the scheme as a literal file path,
+    // so `views://mainview/index.html#api=…` resolves to a non-existent file
+    // and returns "empty response". Instead, ship the per-launch API
+    // coordinates through a WKUserScript injection (BrowserWindow's
+    // `preload` option), which runs before any page script. The webview
+    // reads them off `window.__AGETOR`. For Vite HMR mode the URL is plain
+    // http://, which DOES support hash, so we keep the legacy hash payload
+    // as a fallback there.
+    const bootGlobals = `window.__AGETOR=${JSON.stringify({
+      port: String(API_PORT),
+      token: API_TOKEN,
+    })};`;
+    const isHttpUrl = url.startsWith("http://") || url.startsWith("https://");
+    // macOS-only chrome: `hiddenInset` removes the native title bar background
+    // + text but keeps inset traffic lights, letting the React header at the
+    // top of App.tsx render full-bleed on the same row. `trafficLightOffset`
+    // shifts the lights to vertically center inside that header's 40px (h-10)
+    // height — keep `x` here in sync with the header's left padding (`pl-20`
+    // in App.tsx).
+    const mainWindow = new BrowserWindow({
+      title: "Agetor",
+      titleBarStyle: "hiddenInset",
+      trafficLightOffset: { x: 8, y: 8 },
+      url: isHttpUrl ? `${url}#api=${API_PORT}&token=${API_TOKEN}` : url,
+      preload: bootGlobals,
+      frame,
+    });
+    setMainWindow(mainWindow);
+    console.log("[agetor] main window ready");
+  },
 });
-setMainWindow(mainWindow);
 
-console.log("[agetor] main window ready");
+// Shadow the window's frame as the user moves / resizes it, so the next
+// reopen restores their last placement. Both events carry `id`; we filter
+// to *our* main window so a future secondary window's drags don't pollute
+// the main-window placement memory. `move` is x/y only; `resize` carries
+// both, so we accept partial patches in rememberFrame.
+Electrobun.events.on("move", (e: { data: { id: number; x: number; y: number } }) => {
+  if (getMainWindow()?.id === e.data.id) {
+    windowLifecycle.rememberFrame({ x: e.data.x, y: e.data.y });
+  }
+});
+Electrobun.events.on(
+  "resize",
+  (e: { data: { id: number; x: number; y: number; width: number; height: number } }) => {
+    if (getMainWindow()?.id === e.data.id) {
+      windowLifecycle.rememberFrame({
+        x: e.data.x, y: e.data.y, width: e.data.width, height: e.data.height,
+      });
+    }
+  },
+);
+
+// Clear the registered window reference *only* when the main window
+// closes. The "close" event fires for every BrowserWindow the bun
+// process owns; without the id filter, closing a future secondary
+// window (about box, settings dialog, devtools split) would silently
+// clear the main-window registration and break getMainWindow callers
+// like the /window/toggle-zoom endpoint.
+Electrobun.events.on("close", (e: { data: { id: number } }) => {
+  if (getMainWindow()?.id === e.data.id) setMainWindow(null);
+});
+
+// macOS Dock-icon click on an already-running app fires Cocoa's
+// `applicationShouldHandleReopen:hasVisibleWindows:`, which Electrobun
+// surfaces as the "reopen" event (see node_modules/electrobun/dist/api/
+// bun/proc/native.ts setAppReopenHandler). Re-create the window if the
+// user dismissed it earlier — this is the modern replacement for the
+// old HTTP /focus endpoint, and it's what makes agetor feel like a real
+// macOS app rather than a webapp that happens to live in a window.
+//
+// We catch errors here because a silent fail-to-recreate would look
+// like "Dock click does nothing" to the user, with no diagnostic. The
+// boot-time await further below surfaces first-launch failures via the
+// top-level await; this catch covers every subsequent reopen.
+Electrobun.events.on("reopen", () => {
+  windowLifecycle.createMainWindow().catch((err) => {
+    console.error("[agetor] failed to recreate window on reopen:", err);
+  });
+});
+
+await windowLifecycle.createMainWindow();

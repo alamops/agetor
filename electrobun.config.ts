@@ -20,6 +20,15 @@ export default {
     // complexity for ~4 KB updates instead of ~5–30 MB full bundles.
     generatePatch: false,
   },
+  runtime: {
+    // Don't quit the bun process when the user closes the window. Agetor
+    // hosts long-running claude/codex sessions in tmux that should survive
+    // a dismissed window — the user can bring the window back via the Dock
+    // icon (handled by the `reopen` event in src/bun/index.ts). Cmd+Q is
+    // the explicit quit path and goes through the `before-quit` confirm
+    // dialog in quit-guard.ts.
+    exitOnLastWindowClosed: false,
+  },
   build: {
     copy: {
       "dist/index.html": "views/mainview/index.html",

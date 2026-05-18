@@ -5,8 +5,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "AGETOR_DATA_DIR=\"$HOME/.agetor-dev\" electrobun dev --watch",
-    "dev:hmr": "AGETOR_DATA_DIR=\"$HOME/.agetor-dev\" concurrently -k -n vite,bun \"bun run hmr\" \"bun run dev\"",
+    "dev": "AGETOR_DATA_DIR=\"$HOME/.agetor-dev\" AGETOR_API_PORT=4318 electrobun dev --watch",
+    "dev:hmr": "AGETOR_DATA_DIR=\"$HOME/.agetor-dev\" AGETOR_API_PORT=4318 concurrently -k -n vite,bun \"bun run hmr\" \"bun run dev\"",
     "hmr": "vite --port 5173",
     "wipe:dev": "bun scripts/wipe-dev.ts",
     "vendor:tmux": "bun scripts/fetch-tmux.ts",

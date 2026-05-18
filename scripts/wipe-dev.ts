@@ -15,14 +15,19 @@
 import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { DEV_API_PORT } from "../src/bun/dev-defaults.ts";
 
 const DEV_DIR = path.join(homedir(), ".agetor-dev");
+// Filename mirrors `pidFilePath` in src/bun/db.ts. Intentionally not
+// imported from there: db.ts opens a SQLite handle on import, which would
+// race with the wipe we're about to do.
 const PID_FILE = path.join(DEV_DIR, "agetor.pid");
 const force = process.argv.includes("--force");
-// Mirrors `getApiPort()` in src/bun/api-config.ts — kept in sync by hand
-// (single integer, rarely changes). If you change the port resolution
-// there, mirror it here too.
-const API_PORT = Number(process.env.AGETOR_API_PORT ?? 4317);
+// Single source of truth: `DEV_API_PORT` from `src/bun/dev-defaults.ts`.
+// `package.json`'s `dev` / `dev:hmr` scripts embed the same value as a
+// literal in their `AGETOR_API_PORT=…` prefix; the `dev-defaults.test.ts`
+// suite enforces that the two sides agree, so we don't drift silently.
+const API_PORT = Number(process.env.AGETOR_API_PORT ?? DEV_API_PORT);
 
 if (!DEV_DIR.endsWith(".agetor-dev")) {
   console.error(`[wipe-dev] refusing: resolved path doesn't end in .agetor-dev (${DEV_DIR})`);

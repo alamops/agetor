@@ -30,6 +30,11 @@ mkdirSync(DATA_DIR, { recursive: true });
 
 export const dataDir = DATA_DIR;
 
+/** Pidfile path. Written at boot by `index.ts`, read by `wipe-dev.ts` for
+ *  liveness checks. Single source of truth so a future rename doesn't
+ *  leave silent stragglers. */
+export const pidFilePath = path.join(DATA_DIR, "agetor.pid");
+
 export const db = new Database(path.join(DATA_DIR, "agetor.sqlite"));
 db.exec("PRAGMA journal_mode = WAL;");
 db.exec("PRAGMA foreign_keys = ON;");
