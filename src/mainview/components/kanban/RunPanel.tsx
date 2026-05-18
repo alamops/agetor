@@ -292,6 +292,18 @@ function RunPanelBody({
         } catch { /* ignore malformed */ }
         return;
       }
+      if (e.stream === "interaction_resolved") {
+        // Server-side resolution (scraper auto-cancel, run cancellation,
+        // delete) — drop the matching card so the UI doesn't keep
+        // showing a stale prompt. The card's own submit handler also
+        // calls `dismissInteraction(id)` directly; both paths are
+        // idempotent under `id`-based filtering.
+        try {
+          const { id } = JSON.parse(e.data) as { id: string };
+          setInteractions((cur) => cur.filter((x) => x.id !== id));
+        } catch { /* ignore malformed */ }
+        return;
+      }
       setEvents((cur) => [...cur, e]);
     });
     return unsub;
@@ -926,6 +938,8 @@ function RunEventList({
         return <AskQuestionsCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
       case "plan_approval":
         return <PlanApprovalCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
+      case "tmux_prompt":
+        return <TmuxPromptCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
     }
   };
 
@@ -2630,6 +2644,70 @@ function PlanApprovalCard({
             </Button>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Card for a REPL modal the tmux pane scraper caught — typically a
+ * plan-mode safety dialog, `/login`, model picker, or any prompt the
+ * PreToolUse hook system never sees. Clicking a choice ships the
+ * literal key (e.g. `"1"`) back to the server, which `tmux send-keys`-es
+ * it into the pane so claude reads it as the user's keypress.
+ *
+ * The card's appearance is intentionally pane-like (monospace, dark
+ * background) so the user recognises that they're looking at what's
+ * actually on the tmux screen, not an agetor-synthesised question.
+ */
+function TmuxPromptCard({
+  req,
+  onResolved,
+}: {
+  req: Extract<PendingInteraction, { kind: "tmux_prompt" }>;
+  onResolved: (id: string) => void;
+}) {
+  const [submitting, setSubmitting] = useState<string | null>(null);
+  const send = async (key: string) => {
+    if (submitting) return;
+    setSubmitting(key);
+    try {
+      await api.answerTmuxPrompt(req.id, { key });
+      onResolved(req.id);
+    } finally {
+      setSubmitting(null);
+    }
+  };
+  return (
+    <div className="rounded-md border border-amber-500/60 bg-card p-3 ring-1 ring-amber-500/40">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-amber-500">
+          <Terminal className="size-3.5" aria-hidden /> Claude is paused on a prompt
+        </span>
+      </div>
+      <pre className="max-h-96 overflow-auto whitespace-pre rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-snug">
+        {req.paneText}
+      </pre>
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        {req.choices.map((c) => {
+          // Visual hint only: dim out the "negative" choice so it doesn't
+          // sit at equal weight with the primary one. Anchor the regex
+          // so labels like "Notify me" or "Nominate" don't accidentally
+          // get styled as a destructive action.
+          const isNegative = c.key.toLowerCase() === "n"
+            || /^(no|reject|cancel|deny|abort|quit)\b/i.test(c.label.trim());
+          return (
+            <Button
+              key={c.key}
+              onClick={() => void send(c.key)}
+              size="sm"
+              variant={isNegative ? "outline" : "secondary"}
+              disabled={submitting !== null}
+            >
+              {submitting === c.key ? "Sending…" : `${c.key}. ${c.label}`}
+            </Button>
+          );
+        })}
       </div>
     </div>
   );
