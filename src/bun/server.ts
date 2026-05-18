@@ -52,7 +52,8 @@ import {
   type QuestionAnswer,
 } from "./interactions.ts";
 import { MODEL_EFFORT_SUPPORT } from "../shared/types.ts";
-import type { AgentKind, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
+import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
+import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -1188,6 +1189,62 @@ export function startApiServer() {
             subtitle: trunc(body.subtitle),
             silent: Boolean(body.silent),
           });
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // App-level SSE channel. Currently used by the QuitConfirmDialog so the
+      // main process can ask the webview "are you sure?" when Cmd+Q lands
+      // while runs are active. Live-only (no replay) — events are transient
+      // and short-lived.
+      "/app/events": authed((req) => {
+        const stream = new ReadableStream({
+          start(controller) {
+            const enc = new TextEncoder();
+            const send = (e: AppEvent | { type: "ping" }) => {
+              controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+            };
+            const unsubscribe = subscribeAppEvents((e) => send(e));
+            const ping = setInterval(() => send({ type: "ping" }), 15_000);
+            req.signal.addEventListener("abort", () => {
+              clearInterval(ping);
+              unsubscribe();
+              controller.close();
+            });
+          },
+        });
+        return new Response(stream, {
+          headers: {
+            "content-type": "text/event-stream",
+            "cache-control": "no-cache",
+            ...corsHeaders(req),
+          },
+        });
+      }),
+
+      // Confirm-on-quit follow-up. The QuitConfirmDialog POSTs here when the
+      // user picks "Quit anyway"; we arm the force-quit flag and re-issue
+      // Utils.quit(), which fires `before-quit` again — index.ts sees the
+      // flag and allows the second pass through. Token-gated so a foreign
+      // page that knows the port can't forcibly close the app.
+      "/app/force-quit": {
+        POST: authed((req) => {
+          // Only the first call queues Utils.quit() — subsequent POSTs
+          // (rapid double-click on "Quit anyway", a buggy/looping caller,
+          // etc.) short-circuit. Electrobun's own `isQuitting` guard is a
+          // backstop, but no point spawning extra timers + log-spamming in
+          // the meantime.
+          const armed = armForceQuit();
+          if (!armed) {
+            return json({ ok: true, alreadyArmed: true }, { headers: corsHeaders(req) });
+          }
+          // The HTTP response races process exit. Send synchronously, then
+          // queue the quit to fire on the next tick so the response actually
+          // reaches the webview before the renderer is torn down. (Even if
+          // it doesn't, the client doesn't care — its EventSource just drops.)
+          setTimeout(() => {
+            try { Utils.quit(); } catch { /* electrobun internals may throw on second quit; safe to swallow */ }
+          }, 0);
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },

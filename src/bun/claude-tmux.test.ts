@@ -291,3 +291,31 @@ test("mapJsonlEventToChunks: unknown event types are no-ops", () => {
   mapJsonlEventToChunks(JSON.stringify({ type: "ai-title", title: "x" }), onChunk);
   expect(out).toEqual([]);
 });
+
+test("mapJsonlEventToChunks: forwards the JSONL line uuid as the third onChunk arg", () => {
+  // Reattach dedup depends on this — each chunk has to know which JSONL line
+  // it came from so `run_events.line_uuid` can serve as the idempotency key.
+  const seen: { stream: string; data: string; uuid?: string }[] = [];
+  const onChunk = (s: string, d: string, uuid?: string) => seen.push({ stream: s, data: d, uuid });
+  const line = JSON.stringify({
+    type: "assistant",
+    uuid: "line-uuid-123",
+    message: { content: [{ type: "text", text: "hi" }] },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.lineUuid).toBe("line-uuid-123");
+  expect(seen[0]?.uuid).toBe("line-uuid-123");
+});
+
+test("mapJsonlEventToChunks: end-of-turn marker also carries the line uuid", () => {
+  const seen: { stream: string; uuid?: string }[] = [];
+  const onChunk = (s: string, _d: string, uuid?: string) => seen.push({ stream: s, uuid });
+  const line = JSON.stringify({
+    type: "assistant",
+    uuid: "end-line",
+    message: { stop_reason: "end_turn", content: [] },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  expect(seen.find((s) => s.stream === "status")?.uuid).toBe("end-line");
+});

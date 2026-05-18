@@ -524,10 +524,32 @@ export const runs = {
        ORDER BY run_events.id ASC`,
     ).all(taskId);
   },
-  appendEvent(runId: string, stream: RunEventStream, data: string) {
-    db.run(
-      `INSERT INTO run_events (run_id, stream, data, ts) VALUES (?, ?, ?, ?)`,
-      [runId, stream, data, Date.now()],
-    );
+  appendEvent(runId: string, stream: RunEventStream, data: string, lineUuid?: string | null) {
+    // INSERT OR IGNORE only when a dedup key is provided. With NULL keys the
+    // partial unique index (`WHERE line_uuid IS NOT NULL`) doesn't apply, so
+    // non-JSONL events still insert unconditionally and we don't accidentally
+    // suppress two genuinely distinct status/stderr rows that happen to share
+    // (runId, NULL).
+    if (lineUuid) {
+      db.run(
+        `INSERT OR IGNORE INTO run_events (run_id, stream, data, ts, line_uuid) VALUES (?, ?, ?, ?, ?)`,
+        [runId, stream, data, Date.now(), lineUuid],
+      );
+    } else {
+      db.run(
+        `INSERT INTO run_events (run_id, stream, data, ts) VALUES (?, ?, ?, ?)`,
+        [runId, stream, data, Date.now()],
+      );
+    }
+  },
+  /** Return the set of JSONL line uuids already persisted for this run. Used
+   *  by reattachRun to seed an in-memory dedup set so re-tailing from offset
+   *  0 (after agetor restarts and finds the tmux session still alive) skips
+   *  events we already streamed during the previous process's lifetime. */
+  seenLineUuids(runId: string): Set<string> {
+    const rows = db.query<{ line_uuid: string }, [string]>(
+      `SELECT line_uuid FROM run_events WHERE run_id = ? AND line_uuid IS NOT NULL`,
+    ).all(runId);
+    return new Set(rows.map((r) => r.line_uuid));
   },
 };

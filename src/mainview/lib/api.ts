@@ -1,6 +1,7 @@
 import type {
   AgentKind,
   AgentStatus,
+  AppEvent,
   ColumnId,
   GlobalEvent,
   Harness,
@@ -338,6 +339,27 @@ export const api = {
     es.onerror = (e) => { console.warn("[agetor] global events stream error", e); };
     return () => es.close();
   },
+
+  /** App-level event stream — currently carries the quit_request signal
+   *  the main process sends when the user hits Cmd+Q while runs are
+   *  active. Live-only (no replay). */
+  subscribeAppEvents(onEvent: (e: AppEvent) => void): () => void {
+    const es = new EventSource(`${BASE}/app/events?token=${encodeURIComponent(API_TOKEN)}`);
+    es.onmessage = (m) => {
+      try {
+        const parsed = JSON.parse(m.data);
+        if (parsed.type === "ping") return;
+        onEvent(parsed as AppEvent);
+      } catch { /* ignore */ }
+    };
+    es.onerror = (e) => { console.warn("[agetor] app events stream error", e); };
+    return () => es.close();
+  },
+
+  /** Tell the main process to quit despite running tasks. Used by the
+   *  QuitConfirmDialog after the user picks "Quit anyway". Fire-and-forget
+   *  — the response races process exit. */
+  forceQuit: () => j<{ ok: boolean }>("/app/force-quit", { method: "POST" }),
 
   subscribeRun(runId: string, onEvent: (e: RunEvent) => void): () => void {
     // EventSource can't set headers, so the server also accepts the token via query.

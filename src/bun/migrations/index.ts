@@ -17,6 +17,7 @@ import m014 from "./014_harness_enabled.sql" with { type: "text" };
 import m015 from "./015_default_model_effort.sql" with { type: "text" };
 import m016 from "./016_disable_codex.sql" with { type: "text" };
 import m017 from "./017_drop_approval_rules.sql" with { type: "text" };
+import m018 from "./018_run_events_dedup.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -38,4 +39,5 @@ export const migrations: Migration[] = [
   { id: "015_default_model_effort", sql: m015 },
   { id: "016_disable_codex", sql: m016 },
   { id: "017_drop_approval_rules", sql: m017 },
+  { id: "018_run_events_dedup", sql: m018 },
 ];

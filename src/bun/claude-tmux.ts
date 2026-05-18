@@ -39,7 +39,15 @@ import { resolveTmuxBin } from "./tmux-resolution.ts";
 
 import type { RunEventStream } from "../shared/types.ts";
 
-export type ChunkHandler = (stream: RunEventStream, data: string) => void;
+/**
+ * Stream chunk callback. `lineUuid` is the JSONL line's `uuid` field (claude
+ * stamps one per event) when the chunk originates from a JSONL line; it stays
+ * undefined for chunks the agetor side synthesises (status banners, stderr,
+ * `sendInput` user echoes). The orchestrator's chunk handler forwards it to
+ * `runs.appendEvent` as the per-row dedup key — that's what makes re-reading
+ * JSONL from offset 0 on reattach idempotent.
+ */
+export type ChunkHandler = (stream: RunEventStream, data: string, lineUuid?: string) => void;
 
 export interface SpawnedAgent {
   /** Interrupt the in-progress turn. Does not destroy the session. */
@@ -208,22 +216,40 @@ interface UserMessage {
  * a new kind we keep working; the user just doesn't see the new variant
  * until we add a renderer for it.
  */
+interface ParsedJsonlEvent {
+  type?: string;
+  uuid?: string;
+  message?: AssistantMessage & UserMessage;
+  permissionMode?: string;
+  summary?: string;
+}
+
 export function mapJsonlEventToChunks(
   line: string,
   onChunk: ChunkHandler,
-): { endOfTurn: boolean } {
-  let evt: {
-    type?: string;
-    message?: AssistantMessage & UserMessage;
-    permissionMode?: string;
-    summary?: string;
-  };
+): { endOfTurn: boolean; lineUuid?: string } {
+  let evt: ParsedJsonlEvent;
   try {
     evt = JSON.parse(line);
   } catch (e) {
     onChunk("stderr", `jsonl parse error: ${(e as Error).message}`);
     return { endOfTurn: false };
   }
+  return mapParsedEventToChunks(evt, onChunk);
+}
+
+/** String-variant entry point delegates to this once the JSON has been
+ *  parsed. `dispatchLine` parses up front (to peek the uuid for dedup) and
+ *  calls this directly — saves a second JSON.parse per JSONL line. */
+function mapParsedEventToChunks(
+  evt: ParsedJsonlEvent,
+  onChunk: ChunkHandler,
+): { endOfTurn: boolean; lineUuid?: string } {
+  // Claude stamps a uuid on every event line. Forward it as the third arg
+  // to onChunk so the orchestrator can persist it as the run_events row's
+  // dedup key — that's what makes a re-read of the JSONL on reattach (after
+  // agetor restarts and finds the tmux session still alive) idempotent.
+  const uuid = typeof evt.uuid === "string" ? evt.uuid : undefined;
 
   switch (evt.type) {
     case "user": {
@@ -237,7 +263,7 @@ export function mapJsonlEventToChunks(
       // (runId, data) only (ignoring ts), so the live + JSONL paths
       // collapse into one bubble per message.
       if (typeof content === "string") {
-        if (content) onChunk("user", content);
+        if (content) onChunk("user", content, uuid);
       } else if (Array.isArray(content)) {
         for (const block of content) {
           if (block?.type === "tool_result") {
@@ -249,14 +275,14 @@ export function mapJsonlEventToChunks(
               toolUseId: block.tool_use_id ?? "",
               content: block.content,
               isError,
-            }));
+            }), uuid);
           } else if (block?.type === "text" && block.text) {
-            onChunk("user", block.text);
+            onChunk("user", block.text, uuid);
           }
           // Image / unknown blocks intentionally silent.
         }
       }
-      return { endOfTurn: false };
+      return { endOfTurn: false, lineUuid: uuid };
     }
 
     case "assistant": {
@@ -265,16 +291,16 @@ export function mapJsonlEventToChunks(
       for (const block of blocks) {
         switch (block.type) {
           case "text":
-            if (block.text) onChunk("assistant", block.text);
+            if (block.text) onChunk("assistant", block.text, uuid);
             break;
           case "thinking":
-            if (block.thinking) onChunk("thinking", block.thinking);
+            if (block.thinking) onChunk("thinking", block.thinking, uuid);
             break;
           case "redacted_thinking":
             // Anthropic returns these when extended thinking was redacted
             // server-side — the content is opaque but the *fact* of it is
             // useful so the user knows reasoning happened.
-            onChunk("thinking", "[redacted thinking]");
+            onChunk("thinking", "[redacted thinking]", uuid);
             break;
           case "tool_use":
           case "server_tool_use":
@@ -283,21 +309,21 @@ export function mapJsonlEventToChunks(
               name: block.name ?? "?",
               input: block.input ?? {},
               serverSide: block.type === "server_tool_use",
-            }));
+            }), uuid);
             break;
           case "web_search_tool_result":
             onChunk("tool_result", JSON.stringify({
               toolUseId: block.tool_use_id ?? "",
               content: block.content,
               isError: false,
-            }));
+            }), uuid);
             break;
           case "image":
             // Claude can return inline images in newer SDK builds; we
             // don't have a renderer for those yet, so log a placeholder
             // instead of dropping silently — the user can at least tell
             // *something* came back.
-            onChunk("assistant", "[image]");
+            onChunk("assistant", "[image]", uuid);
             break;
           default:
             // Forward-compat: unknown block types are left silent so we
@@ -307,29 +333,29 @@ export function mapJsonlEventToChunks(
         }
       }
       if (msg.stop_reason === "end_turn") {
-        onChunk("status", "turn complete");
-        return { endOfTurn: true };
+        onChunk("status", "turn complete", uuid);
+        return { endOfTurn: true, lineUuid: uuid };
       }
-      return { endOfTurn: false };
+      return { endOfTurn: false, lineUuid: uuid };
     }
 
     case "system":
     case "permission-mode":
       if (evt.permissionMode) {
-        onChunk("status", `permission-mode: ${evt.permissionMode}`);
+        onChunk("status", `permission-mode: ${evt.permissionMode}`, uuid);
       }
-      return { endOfTurn: false };
+      return { endOfTurn: false, lineUuid: uuid };
 
     case "summary":
       // Context-compaction checkpoint claude inserts when older turns get
       // rolled up. Useful breadcrumb in the log.
-      if (evt.summary) onChunk("status", `summary: ${evt.summary}`);
-      return { endOfTurn: false };
+      if (evt.summary) onChunk("status", `summary: ${evt.summary}`, uuid);
+      return { endOfTurn: false, lineUuid: uuid };
 
     default:
       // attachment, last-prompt, ai-title, agent-name, file-history-snapshot,
       // result, and any future bookkeeping types: intentionally silent.
-      return { endOfTurn: false };
+      return { endOfTurn: false, lineUuid: uuid };
   }
 }
 
@@ -366,6 +392,12 @@ function tmux(args: string[], opts: { stdinText?: string } = {}): RunResult {
 /** True when `tmux has-session -t <name>` returns 0. */
 export function sessionExists(taskId: string): boolean {
   return tmux(["has-session", "-t", sessionNameFor(taskId)]).ok;
+}
+
+/** Name-keyed variant for callers that hold a persisted session name (e.g.
+ *  `runs.tmux_session`) and don't want to recompute it from a task id. */
+export function sessionExistsByName(name: string): boolean {
+  return tmux(["has-session", "-t", name]).ok;
 }
 
 /** All currently-running `agetor-*` tmux sessions. Used by reconcileOrphans. */
@@ -416,6 +448,17 @@ interface SessionState {
    *  hangover handler those events would land on a `() => {}` no-op and
    *  vanish. Cleared when a new slot enters the queue. */
   lastChunk: ChunkHandler | null;
+  /** Set of JSONL line uuids we've already dispatched on this session. Empty
+   *  for fresh `spawnClaudeViaTmux` sessions; pre-seeded from `run_events`
+   *  on reattach so a re-read from offset 0 doesn't double-emit events that
+   *  already landed in the DB during the previous agetor process. */
+  seenLineUuids: Set<string>;
+  /** Fires when a JSONL line ends a turn and the turnQueue is empty (no
+   *  awaiter to pop). Reattached runs install this so the orchestrator can
+   *  flip the run row to `succeeded` even though no in-process promise is
+   *  waiting on `done`. Cleared after the first fire. Untouched on freshly-
+   *  spawned sessions (those resolve via the turn slot's promise instead). */
+  onEndOfTurn: (() => void) | null;
 }
 
 interface TurnSlot {
@@ -496,6 +539,24 @@ async function waitForJsonlAt(
  *  from `sendTurn` so we drain leftover content before queueing a new
  *  turn). */
 function dispatchLine(state: SessionState, line: string): void {
+  // Parse once, then route. The parsed event carries `uuid` (claude stamps
+  // one per JSONL line); we use it as the dedup key — if we've already
+  // dispatched this line in a previous process (and it's still in
+  // run_events), skip the whole line so SSE-broadcast and run_events stay
+  // idempotent across an agetor restart.
+  let evt: ParsedJsonlEvent;
+  try {
+    evt = JSON.parse(line);
+  } catch (e) {
+    // Surface the parse error through whichever handler would have received
+    // a normal chunk — same routing as mapJsonlEventToChunks's own catch.
+    const handler = state.turnQueue[0]?.onChunk ?? state.lastChunk;
+    handler?.("stderr", `jsonl parse error: ${(e as Error).message}`);
+    return;
+  }
+  const uuid = typeof evt.uuid === "string" ? evt.uuid : undefined;
+  if (uuid && state.seenLineUuids.has(uuid)) return;
+
   const slot = state.turnQueue[0];
   // Active turn → its handler. No active turn → fall back to the most
   // recently popped slot's handler so trailing metadata (permission-mode,
@@ -503,14 +564,25 @@ function dispatchLine(state: SessionState, line: string): void {
   // disappearing. If neither exists (session just opened, nothing emitted
   // yet) it's safe to drop.
   const onChunk: ChunkHandler = slot?.onChunk ?? state.lastChunk ?? (() => {});
-  const { endOfTurn } = mapJsonlEventToChunks(line, onChunk);
-  if (endOfTurn && slot) {
-    state.turnQueue.shift();
-    state.lastChunk = slot.onChunk;
-    const resolve = slot.resolve;
-    slot.resolve = null;
-    slot.reject = null;
-    resolve?.(0);
+  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk);
+  if (uuid) state.seenLineUuids.add(uuid);
+  if (endOfTurn) {
+    if (slot) {
+      state.turnQueue.shift();
+      state.lastChunk = slot.onChunk;
+      const resolve = slot.resolve;
+      slot.resolve = null;
+      slot.reject = null;
+      resolve?.(0);
+    } else if (state.onEndOfTurn) {
+      // Reattached run: no in-process promise to resolve, but the orchestrator
+      // still needs to flip the run row to `succeeded`. Fire-once: clear
+      // before calling so a follow-up turn on the same session (which would
+      // never happen without a new slot being pushed first) can't re-trigger.
+      const handler = state.onEndOfTurn;
+      state.onEndOfTurn = null;
+      handler();
+    }
   }
 }
 
@@ -687,6 +759,8 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
     pollTimer: null,
     turnQueue: [],
     lastChunk: null,
+    seenLineUuids: new Set(),
+    onEndOfTurn: null,
   };
   sessions.set(opts.taskId, state);
 
@@ -734,6 +808,93 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   })();
 
   return makeAgent(opts.taskId, done);
+}
+
+export interface ReattachOptions {
+  taskId: string;
+  cwd: string;
+  sessionId: string;
+  home: string | null;
+  /** Per-run chunk handler that persists to run_events + broadcasts on SSE.
+   *  Built by the orchestrator the same way it does for fresh runs. */
+  onChunk: ChunkHandler;
+  /** Dedup set seeded from `runs.seenLineUuids(runId)`. The dispatcher skips
+   *  any line whose uuid is already in this set, preventing double-emission
+   *  of events that the previous process already streamed and persisted. */
+  seenLineUuids: Set<string>;
+}
+
+/**
+ * Reattach to a tmux session that survived an agetor restart. Rebuilds the
+ * in-memory `SessionState`, installs the file watcher + poll backstop, and
+ * replays the JSONL from offset 0 — the dedup set filters out anything we
+ * already streamed in the prior process. The returned SpawnedAgent's `done`
+ * promise resolves on the next end-of-turn (so the orchestrator can route
+ * it through the same `attachDoneHandler` as a fresh run).
+ *
+ * Returns `null` when the JSONL doesn't exist (caller should treat the run
+ * as orphaned and kill the tmux session — without the JSONL we'd have no
+ * structured visibility into the session anyway).
+ */
+export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
+  const sessionName = sessionNameFor(opts.taskId);
+  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.home);
+  if (!existsSync(jsonlPath)) return null;
+
+  let resolveDone: ((code: number) => void) | null = null;
+  let rejectDone: ((err: Error) => void) | null = null;
+  const done = new Promise<number>((res, rej) => {
+    resolveDone = res;
+    rejectDone = rej;
+  });
+
+  const state: SessionState = {
+    taskId: opts.taskId,
+    sessionName,
+    cwd: opts.cwd,
+    jsonlPath,
+    offset: 0,
+    watcher: null,
+    pollTimer: null,
+    turnQueue: [],
+    // Trailing metadata that lands before the first new turn slot still
+    // wants to flow to run_events — route it through the reattach handler
+    // by seeding lastChunk, same pattern as spawnClaudeViaTmux.
+    lastChunk: opts.onChunk,
+    seenLineUuids: opts.seenLineUuids,
+    onEndOfTurn: () => resolveDone?.(0),
+  };
+  // Belt to reconcileOrphans's sort-and-dedup suspender: if some prior
+  // reattach (or other code path) already left a SessionState in the map
+  // for this taskId, dispose its watcher + pollTimer before we overwrite
+  // it. Without this, an overwritten state's interval keeps firing on a
+  // stale closure — every JSONL append would be dispatched twice (once
+  // per state's onChunk), spraying duplicate events into the wrong run.
+  disposeSessionState(sessions.get(opts.taskId));
+  sessions.set(opts.taskId, state);
+  attachTailer(state);
+
+  return {
+    kill: () => {
+      const s = sessions.get(opts.taskId);
+      if (!s) return;
+      // Stop-the-turn semantics match `makeAgent`: send Ctrl+C, reject any
+      // queued slots (none here, but future-proof), reject the reattach
+      // done promise so the orchestrator's done-handler records `cancelled`.
+      tmux(["send-keys", "-t", s.sessionName, "C-c"]);
+      const err = new Error("cancelled");
+      for (const slot of s.turnQueue.splice(0)) slot.reject?.(err);
+      s.onEndOfTurn = null;
+      rejectDone?.(err);
+    },
+    writeInput: (line) => {
+      const s = sessions.get(opts.taskId);
+      if (!s) return false;
+      pastePrompt(s.sessionName, line);
+      return true;
+    },
+    done,
+  };
 }
 
 /**
@@ -791,14 +952,26 @@ export function sendSlashCommand(taskId: string, line: string): boolean {
 export function dropSession(taskId: string): void {
   const state = sessions.get(taskId);
   if (state) {
-    state.watcher?.close();
-    if (state.pollTimer) clearInterval(state.pollTimer);
-    // Reject every queued turn so all dependent done promises settle.
-    const err = new Error("session killed");
-    for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
+    disposeSessionState(state);
     sessions.delete(taskId);
   }
   killTaskSession(taskId);
+}
+
+/** Close any watcher / interval timer held by a SessionState and reject any
+ *  queued turn slots so dependent promises settle. Used both by
+ *  `dropSession` (intentional teardown) and by `reattachSession` (defensive
+ *  cleanup before overwriting an entry in the sessions map). Safe to call
+ *  with `undefined` so the caller can pass `sessions.get(taskId)` directly. */
+function disposeSessionState(state: SessionState | undefined): void {
+  if (!state) return;
+  state.watcher?.close();
+  state.watcher = null;
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  state.pollTimer = null;
+  state.onEndOfTurn = null;
+  const err = new Error("session killed");
+  for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
 }
 
 function makeAgent(taskId: string, done: Promise<number>): SpawnedAgent {
@@ -849,6 +1022,8 @@ export const __forTest = {
       pollTimer: null,
       turnQueue: [],
       lastChunk: null,
+      seenLineUuids: new Set(),
+      onEndOfTurn: null,
     };
     sessions.set(taskId, state);
     return state;

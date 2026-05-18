@@ -547,6 +547,22 @@ export type GlobalEvent =
     };
 
 /**
+ * App-level events the webview subscribes to over `GET /app/events`. Used
+ * for cross-cutting flows that aren't tied to a single task — currently:
+ *
+ *   quit_request — main process intercepted Cmd+Q / window close with N
+ *                  runs still active. Webview shows a confirm modal; the
+ *                  user picks Quit-anyway (POST /app/force-quit) or stays.
+ */
+export type AppEvent =
+  | {
+      type: "quit_request";
+      runningRunCount: number;
+      runningTaskTitles: string[];
+      ts: number;
+    };
+
+/**
  * Lifecycle of the Electrobun self-updater as exposed to the UI. Mirrors the
  * subset of `Updater`'s internal state we want to surface — the underlying
  * state machine has ~25 substates (downloading-patch, decompressing, …) but

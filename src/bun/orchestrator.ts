@@ -26,9 +26,11 @@ import {
   dropSession,
   listAgetorSessions,
   killSessionByName,
+  reattachSession,
   sendSlashCommand,
   sendTurn,
   sessionExists,
+  sessionExistsByName,
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName } from "./worktree.ts";
@@ -143,74 +145,141 @@ setBroadcaster((req: AnyRequest) => {
 });
 
 /**
- * Mark any runs left in `running` state from a previous process as orphaned
- * and return their parent tasks to `ready`. The agent process is gone (it was
- * a child of the old agetor process), so the rows are guaranteed stale.
+ * Decide what to do with runs left in `status='running'` from a previous
+ * agetor process. For claude-code runs whose tmux session is still alive
+ * (the REPL is detached — it survives our exit), we *reattach* and resume
+ * tailing claude's JSONL; the run stays in `running` and the user picks up
+ * where they left off. Anything else (tmux gone, JSONL missing, codex run
+ * whose child process died with us) is flipped to `orphaned`.
+ *
+ * Any leftover `agetor-*` tmux sessions that don't correspond to a still-
+ * running DB row are killed at the end — stragglers from a crash or from
+ * tasks that were deleted while detached.
+ *
  * Called once at boot from `src/bun/index.ts`.
  */
 export function reconcileOrphans(): number {
-  const stale = db.query<{ id: string; task_id: string }, []>(
-    `SELECT id, task_id FROM runs WHERE status = 'running'`,
+  // Sort newest-first so the at-most-one-reattach-per-task rule below keeps
+  // the latest run row. If agetor crashed in the narrow window between
+  // `sendTurnInExistingSession` inserting Run2 and `attachDoneHandler`
+  // marking Run1 succeeded, the DB has two `running` rows for the same
+  // task; only the latest reflects the user's current intent. Older
+  // siblings get flipped to orphaned so we never have two SessionState
+  // objects fighting for the same tmux session.
+  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; agent: string }, []>(
+    `SELECT id, task_id, tmux_session, claude_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
   ).all();
 
-  // Kill any leftover agetor-* tmux sessions from a previous process. We
-  // could in principle reattach to them, but we'd lose the JSONL tail's
-  // byte-offset cursor and replay (a different concern from the SSE replay).
-  // Easier and consistent with the orphan model: tear them down. Runs nicely
-  // even when there are no stale DB rows — useful if an earlier crash left
-  // sessions behind without DB markers.
-  let killedSessions = 0;
-  for (const name of listAgetorSessions()) {
-    killSessionByName(name);
-    killedSessions++;
-  }
-  if (killedSessions) console.log(`[agetor] killed ${killedSessions} leftover tmux session(s)`);
+  const reattachedTaskIds = new Set<string>();
+  const orphaned: { id: string; task_id: string; prevColumn: ColumnId | null }[] = [];
 
-  if (stale.length === 0) return 0;
+  for (const row of stale) {
+    const task = tasks.get(row.task_id);
+    const prevColumn: ColumnId | null = task?.column ?? null;
+    const kind = resolveHarness(row.agent)?.kind ?? null;
+    // Only claude-code runs can be reattached (codex runs spawn a single
+    // child process that died with us). Need a tmux session name, a
+    // claude session id (for the JSONL path), and the session must still
+    // be alive on this machine. Also: if we already reattached a newer
+    // sibling for this task, orphan the older one — only one SessionState
+    // can drive a given tmux session at a time.
+    const canTryReattach =
+      kind === "claude-code"
+      && task !== null
+      && row.tmux_session !== null
+      && row.claude_session_id !== null
+      && !reattachedTaskIds.has(row.task_id)
+      && sessionExistsByName(row.tmux_session);
+
+    if (canTryReattach && task) {
+      const cwd = task.worktreePath ?? task.workdir;
+      const harness = resolveHarness(task.agent);
+      const onChunk = makeChunkHandler(row.id, row.task_id, kind, task.mode);
+      const spawned = reattachSession({
+        taskId: row.task_id,
+        cwd,
+        sessionId: row.claude_session_id as string,
+        home: harness?.home ?? null,
+        onChunk,
+        seenLineUuids: runs.seenLineUuids(row.id),
+      });
+      if (spawned) {
+        registerActiveRun(row.id, row.task_id, task, spawned);
+        attachDoneHandler(row.id, row.task_id, spawned);
+        reattachedTaskIds.add(row.task_id);
+        // Visible seam in the run panel so the user can tell where the
+        // process boundary is. Non-JSONL chunk → no dedup key needed.
+        onChunk("status", "reconnected to live session after agetor restart");
+        continue;
+      }
+      // JSONL missing despite live tmux — can't safely resume; kill the
+      // session and fall through to orphan marking.
+      killSessionByName(row.tmux_session as string);
+    }
+    orphaned.push({ id: row.id, task_id: row.task_id, prevColumn });
+  }
 
   const now = Date.now();
-  // Capture each task's pre-reconcile column so the global event carries an
-  // accurate `prev`. Only tasks that were actually in `running` flip to
-  // `ready` (mirrors the WHERE clause below), so we filter the emit set the
-  // same way.
-  const prevColumns = new Map<string, ColumnId | null>();
-  for (const row of stale) {
-    const t = tasks.get(row.task_id);
-    prevColumns.set(row.task_id, t?.column ?? null);
-  }
-  const reconcile = db.transaction(() => {
-    for (const row of stale) {
-      db.run(
-        `UPDATE runs SET status = 'orphaned', ended_at = ?, exit_code = -1 WHERE id = ?`,
-        [now, row.id],
-      );
-      db.run(
-        `INSERT INTO run_events (run_id, stream, data, ts) VALUES (?, ?, ?, ?)`,
-        [row.id, "status", "orphaned — agetor restarted while this run was active", now],
-      );
-      db.run(
-        `UPDATE tasks SET "column" = 'ready', run_id = NULL WHERE id = ? AND "column" = 'running'`,
-        [row.task_id],
-      );
-    }
-  });
-  reconcile();
-  for (const row of stale) {
-    emitGlobal({
-      kind: "run-status",
-      taskId: row.task_id,
-      runId: row.id,
-      status: "orphaned",
-      ts: now,
+  if (orphaned.length > 0) {
+    const reconcile = db.transaction(() => {
+      for (const row of orphaned) {
+        db.run(
+          `UPDATE runs SET status = 'orphaned', ended_at = ?, exit_code = -1 WHERE id = ?`,
+          [now, row.id],
+        );
+        db.run(
+          `INSERT INTO run_events (run_id, stream, data, ts) VALUES (?, ?, ?, ?)`,
+          [row.id, "status", "orphaned — agetor restarted while this run was active", now],
+        );
+        db.run(
+          `UPDATE tasks SET "column" = 'ready', run_id = NULL WHERE id = ? AND "column" = 'running'`,
+          [row.task_id],
+        );
+      }
     });
-    const prev = prevColumns.get(row.task_id) ?? null;
-    if (prev === "running") {
-      emitGlobal({ kind: "column", taskId: row.task_id, runId: null, column: "ready", prev, ts: now });
+    reconcile();
+    for (const row of orphaned) {
+      emitGlobal({
+        kind: "run-status",
+        taskId: row.task_id,
+        runId: row.id,
+        status: "orphaned",
+        ts: now,
+      });
+      if (row.prevColumn === "running") {
+        emitGlobal({ kind: "column", taskId: row.task_id, runId: null, column: "ready", prev: row.prevColumn, ts: now });
+      }
     }
   }
-  console.log(`[agetor] reconciled ${stale.length} orphan run(s)`);
-  return stale.length;
+
+  // Kill any leftover `agetor-*` tmux sessions whose task didn't reattach.
+  // These are real stragglers — crash artifacts or sessions whose task was
+  // deleted while agetor was down. Sessions matched to a reattached run
+  // are spared (they're now driven by the new process's session state).
+  let killedStragglers = 0;
+  for (const name of listAgetorSessions()) {
+    // Session names are `agetor-<taskId-prefix>` (first 12 chars). Spare
+    // any session whose prefix matches a reattached taskId.
+    const matchesReattached = [...reattachedTaskIds].some(
+      (id) => name === sessionNameFor(id),
+    );
+    if (matchesReattached) continue;
+    killSessionByName(name);
+    killedStragglers++;
+  }
+
+  if (reattachedTaskIds.size > 0) {
+    console.log(`[agetor] reattached to ${reattachedTaskIds.size} live tmux session(s)`);
+  }
+  if (orphaned.length > 0) {
+    console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
+  }
+  if (killedStragglers > 0) {
+    console.log(`[agetor] killed ${killedStragglers} stale tmux session(s) with no matching run`);
+  }
+  return orphaned.length;
 }
+
 
 export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
   const task = tasks.get(taskId);
@@ -325,8 +394,8 @@ function makeChunkHandler(
   kind: AgentKind,
   mode: Task["mode"],
 ) {
-  return (stream: RunEvent["stream"], data: string) => {
-    runs.appendEvent(runId, stream, data);
+  return (stream: RunEvent["stream"], data: string, lineUuid?: string) => {
+    runs.appendEvent(runId, stream, data, lineUuid);
     emit({ runId, taskId, stream, data, ts: Date.now() });
     if (kind !== "codex") return;
     const handle = active.get(runId);

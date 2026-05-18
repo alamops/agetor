@@ -168,6 +168,41 @@ export default function App() {
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
   useEffect(() => { selectedIdRef.current = selected?.id ?? null; }, [selected]);
 
+  // Confirm-on-quit. The main process emits `quit_request` over the app
+  // SSE channel when Cmd+Q / window close lands while runs are active. We
+  // surface a modal explaining tasks will keep running detached; on "Quit
+  // anyway" the server arms a one-shot flag and re-issues Utils.quit().
+  useEffect(() => {
+    const cancel = api.subscribeAppEvents((ev) => {
+      if (ev.type !== "quit_request") return;
+      const n = ev.runningRunCount;
+      const noun = n === 1 ? "task is" : "tasks are";
+      const titlesPreview = ev.runningTaskTitles.length > 0
+        ? ev.runningTaskTitles.slice(0, 3).join(", ")
+          + (ev.runningTaskTitles.length > 3 ? ", …" : "")
+        : null;
+      void confirm({
+        title: "Quit Agetor?",
+        description: (
+          <div className="space-y-2">
+            <div>
+              {n} {noun} still running. They will keep running in the background;
+              you can reconnect to them next time you open Agetor.
+            </div>
+            {titlesPreview && (
+              <div className="font-mono text-foreground/80">{titlesPreview}</div>
+            )}
+          </div>
+        ),
+        confirmLabel: "Quit anyway",
+        cancelLabel: "Stay open",
+      }).then((ok) => {
+        if (ok) void api.forceQuit().catch(() => { /* response races process exit */ });
+      });
+    });
+    return cancel;
+  }, [confirm]);
+
   // App-wide lifecycle subscription. Drives toasts + native notifications.
   useEffect(() => {
     const handle = (ev: GlobalEvent) => {

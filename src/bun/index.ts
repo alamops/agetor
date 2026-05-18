@@ -1,10 +1,11 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { ApplicationMenu, BrowserWindow, Updater } from "electrobun/bun";
+import Electrobun, { ApplicationMenu, BrowserWindow, Updater } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN } from "./server.ts";
-import { dataDir, harnesses } from "./db.ts";
+import { db, dataDir, harnesses, tasks } from "./db.ts";
 import { reconcileOrphans } from "./orchestrator.ts";
+import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { prewarmSharedFiles } from "./hook-installer.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
 import { startUpdaterLoop } from "./updater.ts";
@@ -182,6 +183,52 @@ try {
   console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
   process.exit(1);
 }
+
+// Warn the user before quitting when runs are still active. Electrobun's
+// `before-quit` event fires synchronously from Utils.quit() and reads
+// `responseWasSet && response.allow === false` to veto — we can't await an
+// async confirm here, so the flow is:
+//   1. Block this quit (set allow:false) and broadcast a quit_request app
+//      event over SSE.
+//   2. The webview's QuitConfirmDialog shows the modal.
+//   3. On confirm, the webview POSTs /app/force-quit which arms a one-shot
+//      flag and re-issues Utils.quit(); this handler then sees the flag
+//      via consumeForceQuit() and allows the quit through.
+// Reattached runs (claude-code sessions kept alive across restart) count
+// as running, so the user is still prompted if they try to quit while one
+// is in flight.
+Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
+  if (consumeForceQuit()) {
+    event.response = { allow: true };
+    return;
+  }
+  let runningCount = 0;
+  let runningTaskTitles: string[] = [];
+  try {
+    const rows = db.query<{ task_id: string }, []>(
+      `SELECT DISTINCT task_id FROM runs WHERE status = 'running'`,
+    ).all();
+    runningCount = rows.length;
+    runningTaskTitles = rows
+      .map((r) => tasks.get(r.task_id)?.title ?? "")
+      .filter((t) => t.length > 0)
+      .slice(0, 10);
+  } catch {
+    // If the DB is unavailable for any reason, allow the quit — the cost
+    // of a missed warning is small; the cost of trapping the user is high.
+  }
+  if (runningCount === 0) {
+    event.response = { allow: true };
+    return;
+  }
+  broadcastAppEvent({
+    type: "quit_request",
+    runningRunCount: runningCount,
+    runningTaskTitles,
+    ts: Date.now(),
+  });
+  event.response = { allow: false };
+});
 
 // Background self-update check on launch + every 6h. Emits global events
 // that the UI subscribes to via SSE to render the "update ready" banner.
