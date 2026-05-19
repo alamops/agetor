@@ -22,7 +22,13 @@ import {
 function resolveHarness(harnessId: string): Harness | null {
   return harnesses.getByIdOrKind(harnessId);
 }
-import { cancelPendingForTask, setBroadcaster, type AnyRequest } from "./interactions.ts";
+import {
+  cancelPendingForTask,
+  setBroadcaster,
+  setResolvedBroadcaster,
+  type AnyRequest,
+  type InteractionResolved,
+} from "./interactions.ts";
 import {
   cycleToMode,
   type CycleResult,
@@ -144,6 +150,22 @@ setBroadcaster((req: AnyRequest) => {
     stream: "interaction",
     data: JSON.stringify(req),
     ts: req.createdAt,
+  });
+});
+
+// Companion bridge for the *removal* side. Every answer*/cancel* path
+// in interactions.ts calls into this, so the run panel can drop the
+// card immediately instead of waiting for a refresh poll. Without
+// this, scraper auto-cancel and run-cancellation leave stale cards in
+// the panel (the existing additions-only SSE plumbing has no way to
+// signal "this is gone").
+setResolvedBroadcaster((res: InteractionResolved) => {
+  emit({
+    runId: res.runId,
+    taskId: res.taskId,
+    stream: "interaction_resolved",
+    data: JSON.stringify({ id: res.id, kind: res.kind }),
+    ts: Date.now(),
   });
 });
 

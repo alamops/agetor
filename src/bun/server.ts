@@ -26,7 +26,14 @@ import {
   setTmuxSource,
   type TmuxSource,
 } from "./tmux-resolution.ts";
-import { jsonlPathFor, mapJsonlEventToChunks } from "./claude-tmux.ts";
+import {
+  dismissTmuxPrompt,
+  getCurrentPermissionMode,
+  jsonlPathFor,
+  mapJsonlEventToChunks,
+  markTmuxPromptAnswered,
+  sessionExists,
+} from "./claude-tmux.ts";
 import { listBranches } from "./worktree.ts";
 import { listAvailableCommands } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -37,6 +44,8 @@ import {
   answerAskQuestions,
   answerPlanApproval,
   answerQuestion,
+  answerTmuxPrompt,
+  findTmuxPromptById,
   formatAskQuestionsReason,
   formatPlanApprovalReason,
   listPendingForTask,
@@ -848,11 +857,24 @@ export function startApiServer() {
           // accidental "Allow always" path that used to route through the
           // generic ApprovalCard) shouldn't be able to disable the safety.
           const ALWAYS_INTERCEPT = new Set(["AskUserQuestion", "ExitPlanMode"]);
+          // Plan mode is the user explicitly opting into "stop and ask
+          // before any write". A saved allow-rule from a prior non-plan
+          // run must not silently bypass that — otherwise the kanban
+          // shows "Agent is working…" while claude is actually paused on
+          // its plan-mode confirmation dialog inside tmux (see
+          // docs/can-we-apply-both-* plan). Read-only tools keep their
+          // fast-path even here: they can't mutate the workspace, so
+          // the plan-mode safety doesn't apply.
+          const PLAN_MODE_INTERCEPT = new Set([
+            "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash",
+          ]);
+          const currentMode = getCurrentPermissionMode(taskId);
+          const planModeForce = currentMode === "plan" && PLAN_MODE_INTERCEPT.has(toolName);
           // Fast paths: safe tools and previously-saved rules auto-allow,
           // except for the always-intercept set above. The allow-rule lookup
           // now reads `.claude/settings.local.json` `permissions.allow` and
           // matches per the claude pattern syntax (see claude-permissions.ts).
-          if (!ALWAYS_INTERCEPT.has(toolName) &&
+          if (!ALWAYS_INTERCEPT.has(toolName) && !planModeForce &&
               (SAFE_TOOLS.has(toolName) ||
                lookupAllowRule({ taskId, toolName, toolInput: payload.tool_input }) === "allow")) {
             return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
@@ -1006,6 +1028,67 @@ export function startApiServer() {
           }
           const revision = typeof body.revision === "string" ? body.revision : undefined;
           const ok = answerPlanApproval(req.params.id, { choice: body.choice, revision });
+          return json({ ok }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // ─── Interactions: tmux pane scraper (catch-all REPL prompts) ────
+      // The scraper detects modals the PreToolUse hook never sees
+      // (plan-mode safety dialogs that bypass hooks, `/login`, model
+      // picker, …). Answering ships the chosen key — typically a single
+      // digit — back into the tmux pane via send-keys so claude reads
+      // it as the user's keypress and dismisses the modal.
+      "/tmux-prompts/:id/answer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { key?: unknown };
+          const key = typeof body.key === "string" ? body.key : "";
+          if (!key) {
+            return json({ error: "key required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const pending = findTmuxPromptById(req.params.id);
+          if (!pending) {
+            // Either the prompt was auto-cancelled (scraper saw the pane
+            // change) or the id is unknown. Either way return ok:false so
+            // the UI can drop the card on its next poll.
+            return json({ ok: false }, { headers: corsHeaders(req) });
+          }
+          // Reject anything not in the recorded choice set — the request
+          // ships the exact keys we want the user to be able to send, and
+          // the UI is the only legitimate caller, so an unknown key here
+          // is an attempt to inject arbitrary keystrokes. Letting it
+          // through would let any code that reaches this endpoint type
+          // into the user's REPL.
+          if (!pending.choices.some((c) => c.key === key)) {
+            return json(
+              { error: `key '${key}' is not one of the registered choices` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // Drive tmux FIRST. If the session is gone or send-keys
+          // fails, we must not resolve the interaction — doing so would
+          // remove the card from the UI while leaving claude paused on
+          // the modal. The user clicks "Yes", the card vanishes, and
+          // nothing actually happens. Surface the failure so the UI
+          // can leave the card up for retry.
+          if (!sessionExists(pending.taskId)) {
+            return json(
+              { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
+              { status: 410, headers: corsHeaders(req) },
+            );
+          }
+          const delivered = dismissTmuxPrompt(pending.taskId, key);
+          if (!delivered) {
+            return json(
+              { ok: false, error: "failed to deliver keystroke to tmux" },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+          // Stamp the fingerprint as just-answered before resolving so
+          // the next scrape tick (which may catch the modal still on
+          // screen mid-repaint) doesn't register a ghost duplicate. See
+          // `markTmuxPromptAnswered` for why this is two-step.
+          markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
+          const ok = answerTmuxPrompt(req.params.id, { key });
           return json({ ok }, { headers: corsHeaders(req) });
         }),
       },
