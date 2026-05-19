@@ -21,7 +21,7 @@ import { cn } from "@/lib/utils";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
 /**
- * Floating bottom-right error toast. Auto-dismisses after 6s; the user can
+ * Floating top-right error toast. Auto-dismisses after 6s; the user can
  * also close it manually. Renders mounted with a translate animation so a
  * rapid succession of errors doesn't snap-jitter the layout.
  */
@@ -48,8 +48,8 @@ function ErrorToast({ error, onDismiss }: { error: string | null; onDismiss: () 
     <div
       role="alert"
       className={cn(
-        "fixed bottom-4 right-4 z-50 flex max-w-md items-start gap-3 rounded-lg border border-destructive/60 bg-card px-4 py-3 text-sm shadow-2xl transition-all duration-200",
-        error ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-2 opacity-0",
+        "fixed top-14 right-4 z-50 flex max-w-md items-start gap-3 rounded-lg border border-destructive/60 bg-card px-4 py-3 text-sm shadow-2xl transition-all duration-200",
+        error ? "translate-y-0 opacity-100" : "pointer-events-none -translate-y-2 opacity-0",
       )}
     >
       <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden />
@@ -233,6 +233,10 @@ export default function App() {
         window.focus();
       };
       if (ev.kind === "run-status") {
+        // Any terminal run state supersedes a pending-input prompt — clear the
+        // "Waiting on you" toast so it doesn't linger next to the success/
+        // failure toast (or silently after a cancel).
+        dismissPending(ev.taskId);
         if (ev.status === "succeeded") {
           toastSuccess({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.status === "failed" || ev.status === "orphaned") {
