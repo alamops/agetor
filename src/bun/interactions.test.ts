@@ -364,3 +364,98 @@ test("tasks.get / tasks.list expose pendingInteractionCount reflecting open inte
   await q2.answer;
   expect(tasks.get("tCount")!.pendingInteractionCount).toBe(3);
 });
+
+test("registerTmuxPrompt + answerTmuxPrompt round-trips a key", async () => {
+  const { registerTmuxPrompt, answerTmuxPrompt, __testing } = await import("./interactions.ts");
+  expect(__testing.tmuxPromptsSize()).toBe(0);
+  const { id, answer } = registerTmuxPrompt({
+    taskId: "tT", runId: "rT",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "abc123",
+  });
+  expect(__testing.tmuxPromptsSize()).toBe(1);
+  expect(answerTmuxPrompt(id, { key: "1" })).toBe(true);
+  await expect(answer).resolves.toEqual({ key: "1" });
+  expect(__testing.tmuxPromptsSize()).toBe(0);
+});
+
+test("findTmuxPromptByFingerprint hits only the same task + fingerprint", async () => {
+  const { registerTmuxPrompt, findTmuxPromptByFingerprint } = await import("./interactions.ts");
+  registerTmuxPrompt({
+    taskId: "tA", runId: "r1",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-A",
+  });
+  registerTmuxPrompt({
+    taskId: "tB", runId: "r1",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-B",
+  });
+  expect(findTmuxPromptByFingerprint("tA", "fp-A")?.fingerprint).toBe("fp-A");
+  expect(findTmuxPromptByFingerprint("tA", "fp-B")).toBeNull();   // wrong task
+  expect(findTmuxPromptByFingerprint("tB", "fp-A")).toBeNull();   // wrong fp
+});
+
+test("listPendingForTask returns tmux_prompt entries alongside other kinds", async () => {
+  const { registerApproval, registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
+  registerApproval({ taskId: "tM", runId: "rM", toolName: "Edit", toolInput: {} });
+  registerTmuxPrompt({
+    taskId: "tM", runId: "rM",
+    paneText: "?", choices: [{ key: "1", label: "Y" }], fingerprint: "fp",
+  });
+  const kinds = listPendingForTask("tM").map((r) => r.kind).sort();
+  expect(kinds).toEqual(["approval", "tmux_prompt"]);
+});
+
+test("cancelPendingForTask resolves tmux_prompt entries with the sentinel", async () => {
+  const { registerTmuxPrompt, cancelPendingForTask } = await import("./interactions.ts");
+  const { answer } = registerTmuxPrompt({
+    taskId: "tX", runId: "rX",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-X",
+  });
+  cancelPendingForTask("tX", "task deleted");
+  await expect(answer).resolves.toEqual({ key: "__cancelled__" });
+});
+
+test("registerTmuxPrompt rejects reserved sentinel keys", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  expect(() => registerTmuxPrompt({
+    taskId: "t-sentinel", runId: "r1",
+    paneText: "?",
+    choices: [{ key: "__external__", label: "External" }],
+    fingerprint: "fp-sentinel",
+  })).toThrow(/reserved/);
+});
+
+test("answer* paths emit on the resolved broadcaster", async () => {
+  const {
+    setResolvedBroadcaster,
+    registerApproval, answerApproval,
+    registerTmuxPrompt, answerTmuxPrompt,
+    cancelPendingForTask,
+  } = await import("./interactions.ts");
+  const seen: Array<{ id: string; kind: string }> = [];
+  setResolvedBroadcaster((r) => { seen.push({ id: r.id, kind: r.kind }); });
+
+  const a = registerApproval({ taskId: "tR", runId: "rR", toolName: "Bash", toolInput: {} });
+  answerApproval(a.id, { decision: "allow" });
+  await a.answer;
+
+  const t = registerTmuxPrompt({
+    taskId: "tR", runId: "rR",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-r",
+  });
+  answerTmuxPrompt(t.id, { key: "1" });
+  await t.answer;
+
+  // cancellation path should fan out too
+  const t2 = registerTmuxPrompt({
+    taskId: "tR", runId: "rR",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-r2",
+  });
+  cancelPendingForTask("tR", "test");
+  await t2.answer;
+
+  // Expect three resolution emissions in order.
+  expect(seen.map((s) => s.kind)).toEqual(["approval", "tmux_prompt", "tmux_prompt"]);
+  expect(seen.map((s) => s.id)).toEqual([a.id, t.id, t2.id]);
+});

@@ -194,11 +194,15 @@ function RunPanelBody({
   const nearBottomRef = useRef(true);
 
   // Reset on task switch (no remount because we no longer key on task.id).
+  // Re-arm the auto-scroll heuristic so opening a different task pins the
+  // viewport to the most recent message instead of inheriting the previous
+  // task's scrolled-up position.
   useEffect(() => {
     setEvents([]);
     setRebuilt(null);
     setRebuildNote(null);
     setInteractions([]);
+    nearBottomRef.current = true;
   }, [task.id]);
 
   // Latest run for this task — drives the send button, indicator, and
@@ -292,15 +296,50 @@ function RunPanelBody({
         } catch { /* ignore malformed */ }
         return;
       }
+      if (e.stream === "interaction_resolved") {
+        // Server-side resolution (scraper auto-cancel, run cancellation,
+        // delete) — drop the matching card so the UI doesn't keep
+        // showing a stale prompt. The card's own submit handler also
+        // calls `dismissInteraction(id)` directly; both paths are
+        // idempotent under `id`-based filtering.
+        try {
+          const { id } = JSON.parse(e.data) as { id: string };
+          setInteractions((cur) => cur.filter((x) => x.id !== id));
+        } catch { /* ignore malformed */ }
+        return;
+      }
       setEvents((cur) => [...cur, e]);
     });
     return unsub;
   }, [task.id]);
 
+  // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
+  // a user who scrolled up to read history is never yanked back down:
+  //   1. On every event / rebuild / interaction change, scroll once after
+  //      the React commit. Handles the steady-state streaming case.
+  //   2. On task switch, additionally loop on rAF for a short window. Events
+  //      stream in over multiple frames and rendered children (markdown,
+  //      code, tool results) keep growing scrollHeight after their initial
+  //      mount, so a single post-commit scroll can leave us short. The loop
+  //      bails the moment the user scrolls (nearBottomRef flips to false).
   useEffect(() => {
     if (!nearBottomRef.current) return;
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [events, rebuilt, interactions.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const deadline = performance.now() + 600;
+    const pin = () => {
+      if (cancelled || !nearBottomRef.current) return;
+      const el = logRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+      if (performance.now() < deadline) requestAnimationFrame(pin);
+    };
+    requestAnimationFrame(pin);
+    return () => { cancelled = true; };
+  }, [task.id]);
 
   // Auto-rebuild from the latest run's on-disk JSONL when the run is
   // finished and has a claude session id. The persisted `run_events`
@@ -926,6 +965,8 @@ function RunEventList({
         return <AskQuestionsCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
       case "plan_approval":
         return <PlanApprovalCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
+      case "tmux_prompt":
+        return <TmuxPromptCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
     }
   };
 
@@ -2630,6 +2671,70 @@ function PlanApprovalCard({
             </Button>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Card for a REPL modal the tmux pane scraper caught — typically a
+ * plan-mode safety dialog, `/login`, model picker, or any prompt the
+ * PreToolUse hook system never sees. Clicking a choice ships the
+ * literal key (e.g. `"1"`) back to the server, which `tmux send-keys`-es
+ * it into the pane so claude reads it as the user's keypress.
+ *
+ * The card's appearance is intentionally pane-like (monospace, dark
+ * background) so the user recognises that they're looking at what's
+ * actually on the tmux screen, not an agetor-synthesised question.
+ */
+function TmuxPromptCard({
+  req,
+  onResolved,
+}: {
+  req: Extract<PendingInteraction, { kind: "tmux_prompt" }>;
+  onResolved: (id: string) => void;
+}) {
+  const [submitting, setSubmitting] = useState<string | null>(null);
+  const send = async (key: string) => {
+    if (submitting) return;
+    setSubmitting(key);
+    try {
+      await api.answerTmuxPrompt(req.id, { key });
+      onResolved(req.id);
+    } finally {
+      setSubmitting(null);
+    }
+  };
+  return (
+    <div className="rounded-md border border-amber-500/60 bg-card p-3 ring-1 ring-amber-500/40">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-amber-500">
+          <Terminal className="size-3.5" aria-hidden /> Claude is paused on a prompt
+        </span>
+      </div>
+      <pre className="max-h-96 overflow-auto whitespace-pre rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-snug">
+        {req.paneText}
+      </pre>
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        {req.choices.map((c) => {
+          // Visual hint only: dim out the "negative" choice so it doesn't
+          // sit at equal weight with the primary one. Anchor the regex
+          // so labels like "Notify me" or "Nominate" don't accidentally
+          // get styled as a destructive action.
+          const isNegative = c.key.toLowerCase() === "n"
+            || /^(no|reject|cancel|deny|abort|quit)\b/i.test(c.label.trim());
+          return (
+            <Button
+              key={c.key}
+              onClick={() => void send(c.key)}
+              size="sm"
+              variant={isNegative ? "outline" : "secondary"}
+              disabled={submitting !== null}
+            >
+              {submitting === c.key ? "Sending…" : `${c.key}. ${c.label}`}
+            </Button>
+          );
+        })}
       </div>
     </div>
   );

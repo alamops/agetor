@@ -1,11 +1,19 @@
 import { test, expect } from "bun:test";
 import { homedir } from "node:os";
 import {
+  CLAUDE_MODE_ACCEPT_EDITS,
+  CLAUDE_MODE_AUTO,
+  CLAUDE_MODE_BYPASS,
+  CLAUDE_MODE_DEFAULT,
+  CLAUDE_MODE_PLAN,
+  cycleDistance,
+  cycleOrderFor,
   encodeProjectPath,
   isAgetorInterceptReply,
   jsonlPathFor,
   mapJsonlEventToChunks,
   sessionNameFor,
+  toClaudeModeString,
 } from "./claude-tmux.ts";
 import {
   ASK_QUESTIONS_REPLY_PREFIX,
@@ -318,4 +326,99 @@ test("mapJsonlEventToChunks: end-of-turn marker also carries the line uuid", () 
   const res = mapJsonlEventToChunks(line, onChunk);
   expect(res.endOfTurn).toBe(true);
   expect(seen.find((s) => s.stream === "status")?.uuid).toBe("end-line");
+});
+
+test("toClaudeModeString translates agetor shorthand to canonical claude strings", () => {
+  expect(toClaudeModeString("bypass")).toBe(CLAUDE_MODE_BYPASS);
+  expect(toClaudeModeString("ask")).toBe(CLAUDE_MODE_DEFAULT);
+  // Already canonical / unknown — pass through verbatim.
+  expect(toClaudeModeString("auto")).toBe(CLAUDE_MODE_AUTO);
+  expect(toClaudeModeString("acceptEdits")).toBe(CLAUDE_MODE_ACCEPT_EDITS);
+  expect(toClaudeModeString("plan")).toBe(CLAUDE_MODE_PLAN);
+  expect(toClaudeModeString("dontAsk")).toBe("dontAsk");
+});
+
+test("cycleOrderFor: base 3 modes always present; bypass only when enabled; auto always at the end", () => {
+  expect(cycleOrderFor(false)).toEqual([
+    CLAUDE_MODE_DEFAULT,
+    CLAUDE_MODE_ACCEPT_EDITS,
+    CLAUDE_MODE_PLAN,
+    CLAUDE_MODE_AUTO,
+  ]);
+  expect(cycleOrderFor(true)).toEqual([
+    CLAUDE_MODE_DEFAULT,
+    CLAUDE_MODE_ACCEPT_EDITS,
+    CLAUDE_MODE_PLAN,
+    CLAUDE_MODE_BYPASS,
+    CLAUDE_MODE_AUTO,
+  ]);
+});
+
+test("cycleDistance returns press count via forward cycle", () => {
+  const cycle = cycleOrderFor(false); // default, acceptEdits, plan, auto
+  expect(cycleDistance(cycle, CLAUDE_MODE_DEFAULT, CLAUDE_MODE_ACCEPT_EDITS)).toBe(1);
+  expect(cycleDistance(cycle, CLAUDE_MODE_DEFAULT, CLAUDE_MODE_PLAN)).toBe(2);
+  expect(cycleDistance(cycle, CLAUDE_MODE_DEFAULT, CLAUDE_MODE_AUTO)).toBe(3);
+  // wrap-around: from auto to default is one press, not three back.
+  expect(cycleDistance(cycle, CLAUDE_MODE_AUTO, CLAUDE_MODE_DEFAULT)).toBe(1);
+  // same mode → 0 presses (caller can skip).
+  expect(cycleDistance(cycle, CLAUDE_MODE_PLAN, CLAUDE_MODE_PLAN)).toBe(0);
+});
+
+test("cycleDistance returns null when target isn't in the cycle (e.g. bypass without launch flag)", () => {
+  const cycle = cycleOrderFor(false); // bypass NOT included
+  expect(cycleDistance(cycle, CLAUDE_MODE_DEFAULT, CLAUDE_MODE_BYPASS)).toBeNull();
+  // Same for an unrecognized mode.
+  expect(cycleDistance(cycle, CLAUDE_MODE_DEFAULT, "dontAsk")).toBeNull();
+});
+
+test("cycleDistance with bypass enabled: order goes plan → bypass → auto", () => {
+  const cycle = cycleOrderFor(true);
+  // From bypass: one press lands on auto, two presses on default.
+  expect(cycleDistance(cycle, CLAUDE_MODE_BYPASS, CLAUDE_MODE_AUTO)).toBe(1);
+  expect(cycleDistance(cycle, CLAUDE_MODE_BYPASS, CLAUDE_MODE_DEFAULT)).toBe(2);
+  // plan → bypass is exactly one press (the new neighbour).
+  expect(cycleDistance(cycle, CLAUDE_MODE_PLAN, CLAUDE_MODE_BYPASS)).toBe(1);
+});
+
+test("system event updates state.permissionMode (dispatchLine path)", async () => {
+  // Use the test harness for SessionState since the watcher path needs a
+  // real fs but we only care that dispatchLine routes the permissionMode
+  // off `system` events into SessionState.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-mode-track";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  expect(state.permissionMode).toBeNull();
+  __forTest.dispatchLine(
+    state,
+    JSON.stringify({ type: "system", permissionMode: "acceptEdits" }),
+  );
+  expect(state.permissionMode).toBe("acceptEdits");
+  // Subsequent permission-mode events overwrite.
+  __forTest.dispatchLine(
+    state,
+    JSON.stringify({ type: "permission-mode", permissionMode: "auto" }),
+  );
+  expect(state.permissionMode).toBe("auto");
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: permissionMode still updates when the event's uuid is already in seenLineUuids (reattach path)", async () => {
+  // On reattach, seenLineUuids is pre-seeded from run_events.line_uuid so
+  // the user-facing chunk replay stays idempotent. The permissionMode
+  // tracking has to run BEFORE that dedup check — otherwise the field
+  // would stay null until claude emitted a fresh mode event, and the
+  // first cycleToMode call after every restart would skip with
+  // "current mode unknown".
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-mode-track-dedup";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  state.seenLineUuids.add("system-event-uuid-1");
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system",
+    uuid: "system-event-uuid-1",
+    permissionMode: "bypassPermissions",
+  }));
+  expect(state.permissionMode).toBe("bypassPermissions");
+  __forTest.uninstallSession(taskId);
 });

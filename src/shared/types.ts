@@ -507,6 +507,7 @@ export type RunEventStream =
   | "stderr"
   | "status"
   | "interaction"
+  | "interaction_resolved"
   | "user"
   | "assistant"
   | "thinking"
