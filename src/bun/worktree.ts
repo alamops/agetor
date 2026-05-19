@@ -147,6 +147,45 @@ export async function listBranches(dir: string): Promise<BranchInfo[]> {
   return branches;
 }
 
+/**
+ * Create a local branch at `dir`, pointing at the resolved `from` ref. Pure
+ * ref creation — no checkout, no working-tree side effects, so this is safe
+ * to call against a repo the user has open in another tool.
+ *
+ * `from` may be any ref git understands (branch, tag, remote-tracking ref,
+ * sha). Empty `from` defaults to HEAD. Branches under the `agetor/` namespace
+ * are reserved for orchestrator-managed worktree branches; rejecting them
+ * here keeps a user-created branch from colliding with the picker's hide
+ * rule (which filters `agetor/*` out of the dropdown anyway).
+ */
+export async function createBranch(
+  dir: string,
+  name: string,
+  from: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const root = await repoRoot(dir);
+  if (!root) return { ok: false, error: `"${dir}" is not inside a git repo` };
+  const branch = name.trim();
+  if (!branch) return { ok: false, error: "branch name required" };
+  if (branch.startsWith("agetor/")) {
+    return { ok: false, error: "the `agetor/` prefix is reserved for managed worktree branches" };
+  }
+  const check = await git(["check-ref-format", "--branch", branch], root, 5_000);
+  if (!check.ok) {
+    return { ok: false, error: `invalid branch name "${branch}"` };
+  }
+  const exists = (await git(["rev-parse", "--verify", `refs/heads/${branch}`], root, 5_000)).ok;
+  if (exists) return { ok: false, error: `branch "${branch}" already exists` };
+  const source = from.trim() || "HEAD";
+  const sourceSha = await resolveRef(root, source);
+  if (!sourceSha) return { ok: false, error: `source ref "${source}" not found` };
+  const created = await git(["branch", branch, sourceSha], root, 10_000);
+  if (!created.ok) {
+    return { ok: false, error: created.stderr || created.stdout || "git branch failed" };
+  }
+  return { ok: true };
+}
+
 function slugify(s: string): string {
   return s
     .toLowerCase()

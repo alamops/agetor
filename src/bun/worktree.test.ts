@@ -171,6 +171,55 @@ test("prepareWorkdir re-attaches existing branch when worktree dir was manually 
   expect(log).toContain("agent work");
 });
 
+test("createBranch creates a local branch pointed at the source ref", async () => {
+  const { createBranch } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const res = await createBranch(repo, "feature/new", "main");
+  expect(res.ok).toBe(true);
+  const proc = Bun.spawn(["git", "rev-parse", "--verify", "refs/heads/feature/new"], {
+    cwd: repo,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const sha = (await new Response(proc.stdout).text()).trim();
+  await proc.exited;
+  expect(sha).toMatch(/^[0-9a-f]{40}$/);
+
+  // Working tree should still be on main (no checkout side effect).
+  const headProc = Bun.spawn(["git", "symbolic-ref", "--short", "HEAD"], { cwd: repo, stdout: "pipe" });
+  const head = (await new Response(headProc.stdout).text()).trim();
+  await headProc.exited;
+  expect(head).toBe("main");
+});
+
+test("createBranch rejects names that collide, are invalid, or reuse the agetor/ namespace", async () => {
+  const { createBranch } = await import("./worktree.ts");
+  const repo = await makeRepo();
+
+  const dup = await createBranch(repo, "main", "main");
+  expect(dup.ok).toBe(false);
+  if (!dup.ok) expect(dup.error).toContain("already exists");
+
+  const reserved = await createBranch(repo, "agetor/foo", "main");
+  expect(reserved.ok).toBe(false);
+  if (!reserved.ok) expect(reserved.error).toContain("reserved");
+
+  const bad = await createBranch(repo, "bad name", "main");
+  expect(bad.ok).toBe(false);
+
+  const missing = await createBranch(repo, "from-nowhere", "no-such-ref");
+  expect(missing.ok).toBe(false);
+  if (!missing.ok) expect(missing.error).toContain("not found");
+});
+
+test("createBranch errors when workdir is not a git repo", async () => {
+  const { createBranch } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-create-"));
+  const res = await createBranch(dir, "anything", "HEAD");
+  expect(res.ok).toBe(false);
+  if (!res.ok) expect(res.error).toContain("not inside a git repo");
+});
+
 test("removeWorktree tears down both the worktree and the branch", async () => {
   const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
   const repo = await makeRepo();

@@ -19,8 +19,11 @@ interface Props {
   placeholder?: string;
   /** Shown in the trigger when no value is selected. */
   emptyLabel?: string;
-  /** Optional row rendered below the list (e.g. "Browse for folder"). */
-  footer?: ReactNode;
+  /** Optional row rendered below the list (e.g. "Browse for folder"). Pass a
+   *  function to receive a `close` callback the footer can invoke to dismiss
+   *  the popover (handy when the footer opens a dialog and we don't want a
+   *  stale popover lingering underneath). */
+  footer?: ReactNode | ((close: () => void) => ReactNode);
   /** Override the trigger label for an arbitrary value (e.g. show basename for a path). */
   displayValue?: (value: string) => string;
   className?: string;
@@ -180,7 +183,9 @@ export function SearchSelect({
             )}
           </div>
           {footer && (
-            <div className="border-t border-border/60">{footer}</div>
+            <div className="border-t border-border/60">
+              {typeof footer === "function" ? footer(() => setOpen(false)) : footer}
+            </div>
           )}
         </div>
       )}

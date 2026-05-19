@@ -23,7 +23,7 @@ export interface UpdateSnapshot {
   lastCheckedAt: number | null;
 }
 
-export interface BranchInfo { name: string; committedAt: number; current: boolean }
+export interface BranchInfo { name: string; committedAt: number; current: boolean; remote: boolean }
 
 export interface AvailableCommand {
   name: string;
@@ -195,6 +195,11 @@ export const api = {
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
+  createBranch: (input: { path: string; name: string; from: string }) =>
+    j<{ ok: true; branch: string }>("/projects/branches", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   getTmuxSource: () =>
     j<{
       source: "system" | "bundled";

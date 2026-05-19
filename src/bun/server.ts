@@ -26,7 +26,7 @@ import {
   type TmuxSource,
 } from "./tmux-resolution.ts";
 import { jsonlPathFor, mapJsonlEventToChunks } from "./claude-tmux.ts";
-import { listBranches } from "./worktree.ts";
+import { createBranch, listBranches } from "./worktree.ts";
 import { listAvailableCommands } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
@@ -251,6 +251,27 @@ export function startApiServer() {
           const dir = url.searchParams.get("path");
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
           return json(await listBranches(dir), { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            name?: string;
+            from?: string;
+          };
+          if (!body.path || typeof body.path !== "string") {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!body.name || typeof body.name !== "string") {
+            return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.from !== undefined && typeof body.from !== "string") {
+            return json({ error: "from must be a string" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const res = await createBranch(body.path, body.name, body.from ?? "");
+          if (!res.ok) {
+            return json({ error: res.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json({ ok: true, branch: body.name }, { headers: corsHeaders(req) });
         }),
       },
 

@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -245,6 +245,77 @@ test("PATCH /tasks/:id rejects an unknown harness id with 400", async () => {
 // Codex is paused — the server matches the UI's "Coming soon" lock so a
 // stale client (or a curl) can't sneak past it. Both branches (create with
 // kind=codex, re-enable an existing codex row) return 400.
+
+async function makeRepoForBranchTests(): Promise<string> {
+  const repo = mkdtempSync(path.join(tmpdir(), "agetor-srv-branch-"));
+  const run = async (args: string[]) => {
+    const proc = Bun.spawn(["git", ...args], { cwd: repo, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    await proc.exited;
+  };
+  await run(["init", "-b", "main"]);
+  await run(["config", "user.email", "test@example.com"]);
+  await run(["config", "user.name", "test"]);
+  writeFileSync(path.join(repo, "README"), "hi\n");
+  await run(["add", "."]);
+  await run(["commit", "-m", "init"]);
+  return repo;
+}
+
+test("POST /projects/branches creates a branch and rejects malformed payloads", async () => {
+  const repo = await makeRepoForBranchTests();
+
+  // Missing path → 400.
+  const noPath = await fetch(url("/projects/branches"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ name: "x", from: "main" }),
+  });
+  expect(noPath.status).toBe(400);
+
+  // Missing name → 400.
+  const noName = await fetch(url("/projects/branches"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ path: repo, from: "main" }),
+  });
+  expect(noName.status).toBe(400);
+
+  // Non-string `from` → 400 (regression guard: previously crashed in
+  // createBranch's .trim()).
+  const badFrom = await fetch(url("/projects/branches"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ path: repo, name: "x", from: 42 }),
+  });
+  expect(badFrom.status).toBe(400);
+  expect((await badFrom.json()).error).toContain("from must be a string");
+
+  // Bogus source ref → 400 with descriptive error.
+  const badSource = await fetch(url("/projects/branches"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ path: repo, name: "feature-a", from: "no-such-ref" }),
+  });
+  expect(badSource.status).toBe(400);
+  expect((await badSource.json()).error).toContain("not found");
+
+  // Happy path.
+  const ok = await fetch(url("/projects/branches"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ path: repo, name: "feature-a", from: "main" }),
+  });
+  expect(ok.status).toBe(200);
+  expect(await ok.json()).toEqual({ ok: true, branch: "feature-a" });
+
+  // Listing now contains the new branch.
+  const list = await fetch(url(`/projects/branches?path=${encodeURIComponent(repo)}`), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(list.status).toBe(200);
+  const branches = (await list.json()) as Array<{ name: string }>;
+  expect(branches.map((b) => b.name)).toContain("feature-a");
+});
 
 test("POST /harnesses with kind=codex is rejected (coming soon)", async () => {
   const res = await fetch(url("/harnesses"), {
