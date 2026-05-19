@@ -25,7 +25,7 @@ import {
   setTmuxSource,
   type TmuxSource,
 } from "./tmux-resolution.ts";
-import { jsonlPathFor, mapJsonlEventToChunks } from "./claude-tmux.ts";
+import { jsonlPathFor, mapJsonlEventToChunks, sessionExists, sessionNameFor } from "./claude-tmux.ts";
 import { listBranches } from "./worktree.ts";
 import { listAvailableCommands } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -751,6 +751,84 @@ export function startApiServer() {
 
       "/tasks/:id/runs": {
         GET: authed((req) => json(runs.listForTask(req.params.id), { headers: corsHeaders(req) })),
+      },
+
+      // Open the task's claude-code tmux session in a new Terminal.app window.
+      // The session name is deterministic (`agetor-<taskId-prefix>`) so we can
+      // look it up without consulting the run row. We probe tmux availability
+      // and session liveness up-front so the UI gets a clear, distinct error
+      // for each failure mode instead of an empty Terminal that immediately
+      // errors with "can't find session".
+      "/tasks/:id/open-tmux": {
+        POST: authed((req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "task not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const harness = harnesses.getByIdOrKind(task.agent);
+          if (harness?.kind !== "claude-code") {
+            return json(
+              { error: "tmux attach is only available for claude-code tasks" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const sessionName = sessionNameFor(task.id);
+          // Distinguish "tmux missing" from "session missing" — both would
+          // otherwise look like sessionExists() === false and tell the user
+          // to restart the task, which doesn't help when the real problem
+          // is the tmux binary itself. Mirror the resolution path used by
+          // checkHarness so the same install hint applies.
+          const tmuxBin = resolveTmuxBin();
+          const tmuxPath = path.isAbsolute(tmuxBin)
+            ? (existsSync(tmuxBin) ? tmuxBin : null)
+            : Bun.which(tmuxBin, { PATH: process.env.PATH });
+          if (!tmuxPath) {
+            return json(
+              {
+                error: "tmux binary not found — install tmux (brew install tmux) or enable the bundled tmux in Settings",
+                sessionName,
+                reason: "tmux-missing",
+              },
+              { status: 503, headers: corsHeaders(req) },
+            );
+          }
+          if (!sessionExists(task.id)) {
+            return json(
+              {
+                error: `no live tmux session "${sessionName}" — start (or send a message to) the task first`,
+                sessionName,
+                reason: "session-missing",
+              },
+              { status: 404, headers: corsHeaders(req) },
+            );
+          }
+          // AppleScript `do script` runs the string through `/bin/bash`, so
+          // we escape anything bash would interpret inside double-quotes:
+          // backslash, dollar, backtick, and the double-quote itself. Without
+          // this, a tmux bin path containing `$` (legal but unusual) would
+          // silently misbehave. Session names are server-generated and only
+          // contain `agetor-<hex>` so they don't strictly need escaping, but
+          // we apply the same helper for symmetry.
+          const shellEscape = (s: string) => s.replace(/(["\\$`])/g, "\\$1");
+          const script =
+            `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\" attach -t \\"${shellEscape(sessionName)}\\""\n` +
+            `activate application "Terminal"`;
+          const proc = Bun.spawn(["osascript", "-e", script], {
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+          // Don't block on the AppleScript — Terminal.app opening shouldn't
+          // hold the HTTP response open. Log non-zero exits so users with
+          // Automation permissions revoked have a breadcrumb in the console.
+          void proc.exited.then((code) => {
+            if (code !== 0) {
+              console.warn(
+                `[agetor] osascript exited ${code} while attaching to tmux session "${sessionName}" — check System Settings → Privacy & Security → Automation`,
+              );
+            }
+          });
+          return json({ ok: true, sessionName }, { headers: corsHeaders(req) });
+        }),
       },
 
       "/runs/:id/cancel": {

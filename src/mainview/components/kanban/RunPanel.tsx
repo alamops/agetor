@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { toast } from "sonner";
 import {
   Bot, ClipboardList, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
   Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
@@ -12,6 +13,7 @@ import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
+import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
   DEFAULT_EFFORT,
@@ -26,6 +28,11 @@ import {
   type Task,
   type TaskReference,
 } from "../../../shared/types.ts";
+import { appendReferences } from "../../../shared/refs.ts";
+import { proposeAllowRules, type AllowRuleProposal } from "../../../shared/claude-permissions.ts";
+import { AgentIcon } from "./AgentIcon";
+import { ReferencesPicker } from "./ReferencesPicker";
+import { SlashAutocomplete } from "./SlashAutocomplete";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -36,12 +43,6 @@ import {
 function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
   return harnesses.find((h) => h.id === harnessId)?.kind ?? "claude-code";
 }
-import { iconForRef, refBasename } from "@/lib/file-icons";
-import { appendReferences } from "../../../shared/refs.ts";
-import { proposeAllowRules, type AllowRuleProposal } from "../../../shared/claude-permissions.ts";
-import { AgentIcon } from "./AgentIcon";
-import { ReferencesPicker } from "./ReferencesPicker";
-import { SlashAutocomplete } from "./SlashAutocomplete";
 
 interface Props {
   /** When null, the panel slides off-screen and unmounts after the exit animation. */
@@ -513,7 +514,14 @@ function RunPanelBody({
           model / effort each PATCH the task on change, and if a live claude
           tmux session exists the backend mirrors the change via slash commands
           so the conversation context survives the edit. */}
-      <TaskDetails task={task} agents={agents} harnesses={harnesses} agentModels={agentModels} homeDir={homeDir} />
+      <TaskDetails
+        task={task}
+        agents={agents}
+        harnesses={harnesses}
+        agentModels={agentModels}
+        homeDir={homeDir}
+        tmuxSession={latestRun?.tmuxSession ?? null}
+      />
 
       <RunsList runs={runs} />
 
@@ -1838,12 +1846,17 @@ function TaskDetails({
   harnesses,
   agentModels,
   homeDir,
+  tmuxSession,
 }: {
   task: Task;
   agents: AgentStatus[];
   harnesses: Harness[];
   agentModels: AgentModelMap;
   homeDir: string;
+  /** Tmux session name from the latest run (claude-code only). `null` when
+   *  no run has spawned a session yet — the Tmux row hides itself in that
+   *  case rather than presenting an Attach button that's guaranteed to 404. */
+  tmuxSession: string | null;
 }) {
   const editable = task.column !== "running" && task.column !== "blocked";
   const kind = harnessKindOf(task.agent, harnesses);
@@ -1995,6 +2008,30 @@ function TaskDetails({
             <>
               <dt className="text-muted-foreground">Base</dt>
               <dd className="min-w-0 truncate font-mono">{task.baseRef.slice(0, 12)}</dd>
+            </>
+          )}
+          {kind === "claude-code" && tmuxSession && (
+            <>
+              <dt className="text-muted-foreground">Tmux</dt>
+              <dd className="flex min-w-0 items-center justify-between gap-2">
+                <span className="min-w-0 truncate font-mono" title={tmuxSession}>
+                  {tmuxSession}
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 shrink-0 px-2 text-[11px]"
+                  onClick={() => {
+                    void api.openTmux(task.id).catch((err: unknown) => {
+                      const msg = err instanceof Error ? err.message : "Could not attach to tmux session";
+                      toast.error(msg);
+                    });
+                  }}
+                  title={`Attach to the tmux session in a new Terminal window (tmux attach -t ${tmuxSession})`}
+                >
+                  <Terminal className="mr-1 size-3" /> Attach
+                </Button>
+              </dd>
             </>
           )}
           {task.references.length > 0 && (
