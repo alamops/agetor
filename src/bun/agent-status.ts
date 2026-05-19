@@ -1,9 +1,10 @@
 import { existsSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { TMUX_MISSING_REASON, type AgentKind, type Harness, type HarnessStatus } from "../shared/types.ts";
 import { resolveBin, harnessEnv } from "./agents.ts";
 import { harnesses } from "./db.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
+import { detectClaudeNativeInstall } from "./harness-setup.ts";
 
 const VERSION_PROBE_TIMEOUT_MS = 2000;
 
@@ -67,6 +68,14 @@ function resolveBinPath(bin: string): string | null {
  */
 const TMUX_INSTALL_HINT = "brew install tmux (macOS) or apt install tmux (Debian/Ubuntu)";
 
+/**
+ * Surfaced when a claude-code alias with a custom HOME is missing the
+ * native-install integrity-check symlink. `orchestrator.startTask` self-heals
+ * on the next run, so the cure is usually "just run the task again"; the
+ * second-line workaround is recreating the alias.
+ */
+const CLAUDE_NATIVE_REPAIR_HINT = "Start a task on this alias once — agetor will repair it. Or remove and re-add the alias in Settings.";
+
 export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
   const bin = resolveBin(harness);
   const path = resolveBinPath(bin);
@@ -96,6 +105,29 @@ export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
         reason: TMUX_MISSING_REASON,
         installHint: TMUX_INSTALL_HINT,
       };
+    }
+
+    // Native-install integrity check: claude validates `$HOME/.local/bin/claude`
+    // exists on every interactive launch — but `--version` short-circuits the
+    // check, so probeVersion would happily green-light a misconfigured alias
+    // whose tasks then explode at spawn time. Catch the gap explicitly when:
+    //   - the alias overrides HOME (built-in claude-code has home=null)
+    //   - the alias didn't pin a custom bin (we're using the system claude)
+    //   - the system claude is actually a native install
+    if (harness.home && !harness.bin && detectClaudeNativeInstall()) {
+      const integrityPath = join(harness.home, ".local", "bin", "claude");
+      if (!existsSync(integrityPath)) {
+        return {
+          harnessId: harness.id,
+          kind: harness.kind,
+          bin,
+          available: false,
+          path,
+          version: null,
+          reason: `${integrityPath} missing — claude's native-install integrity check will fail at launch`,
+          installHint: CLAUDE_NATIVE_REPAIR_HINT,
+        };
+      }
     }
   }
 
