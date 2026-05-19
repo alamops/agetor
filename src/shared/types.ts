@@ -225,6 +225,17 @@ export interface Task {
    * persisted on the row itself.
    */
   hasOpenableRun: boolean;
+  /**
+   * Number of pending interactions waiting on the user for this task —
+   * `ask_user` MCP calls, `AskUserQuestion` / `ExitPlanMode` Claude built-ins,
+   * and tool-call approval requests. Computed in `tasks.list()` / `tasks.get()`
+   * via `countPendingForTask` (interactions live in memory; not persisted).
+   * Drives the kanban card's "Answer →" call-to-action.
+   *
+   * Codex's narrative `column='blocked'` signal is reflected via `task.column`,
+   * not this counter — the card combines both at render time.
+   */
+  pendingInteractionCount: number;
   createdAt: number;
   updatedAt: number;
 }

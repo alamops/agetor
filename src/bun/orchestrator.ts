@@ -925,6 +925,9 @@ export async function createTask(
     // `Task` shape is complete; `tasks.insert` re-fetches and the real
     // value flows back to the caller.
     hasOpenableRun: false,
+    // Derived from the in-memory interactions Maps in `interactions.ts`; a
+    // brand-new task has no pending interactions, so 0 is the correct seed.
+    pendingInteractionCount: 0,
     createdAt: now,
     updatedAt: now,
   });
