@@ -88,11 +88,27 @@ export interface PendingPlanApproval {
   createdAt: number;
 }
 
+/** Modal the tmux pane scraper detected — typically a plan-mode safety
+ *  dialog or another REPL prompt the PreToolUse hook system never sees.
+ *  Each `choices[i].key` is the literal keystroke the server will
+ *  `tmux send-keys` on click. */
+export interface PendingTmuxPrompt {
+  kind: "tmux_prompt";
+  id: string;
+  taskId: string;
+  runId: string;
+  paneText: string;
+  choices: Array<{ key: string; label: string }>;
+  fingerprint: string;
+  createdAt: number;
+}
+
 export type PendingInteraction =
   | PendingApproval
   | PendingQuestion
   | PendingAskQuestions
-  | PendingPlanApproval;
+  | PendingPlanApproval
+  | PendingTmuxPrompt;
 
 // Read api port + token, preferring globals injected by the Bun side via
 // BrowserWindow's `preload` option — that path works under the native
@@ -294,6 +310,14 @@ export const api = {
     body: { choice: "approve_implement" | "approve_ask" | "reject"; revision?: string },
   ) =>
     j<{ ok: boolean }>(`/plan-approvals/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** Answer a tmux-pane-scraped REPL prompt. `key` must be one of the
+   *  keys advertised on the request — the server validates against the
+   *  recorded set before injecting keystrokes via `tmux send-keys`. */
+  answerTmuxPrompt: (id: string, body: { key: string }) =>
+    j<{ ok: boolean }>(`/tmux-prompts/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

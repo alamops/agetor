@@ -10,12 +10,19 @@ import {
 import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { API_TOKEN, getApiPort } from "./api-config.ts";
+import { tasks } from "./db.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
   ASK_QUESTIONS_REPLY_PREFIX,
   PLAN_APPROVED_REPLY_PREFIX,
   PLAN_REJECTED_REPLY_PREFIX,
+  activeTmuxPromptsForTask,
+  answerTmuxPrompt,
+  findTmuxPromptByFingerprint,
+  registerTmuxPrompt,
+  type TmuxPromptChoice,
 } from "./interactions.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
 
@@ -473,6 +480,42 @@ export function killSessionByName(name: string): void {
   tmux(["kill-session", "-t", name]);
 }
 
+/**
+ * Current permission-mode for this task's claude session, as last reported
+ * by a JSONL `permission-mode` event (or, on first launch, the value the
+ * orchestrator passed to `spawnClaudeViaTmux`). Returns null when no
+ * session is registered for this task (idle, between runs, or unknown
+ * task). Read by the `/approvals` route so plan mode can never silently
+ * short-circuit a tool call via the saved-rule fast-path.
+ */
+export function getCurrentPermissionMode(taskId: string): string | null {
+  return sessions.get(taskId)?.permissionMode ?? null;
+}
+
+/**
+ * Send a literal keystroke (or short sequence) to a task's tmux session
+ * followed by Enter. Used by the `/tmux-prompts/:id/answer` route to
+ * dismiss a Claude REPL modal the scraper detected — typing `"1"` then
+ * Enter into the pane is how the user would manually pick choice 1.
+ *
+ * NOT a chat message: we deliberately bypass the `load-buffer +
+ * paste-buffer` flow `pastePrompt` uses, because that path delivers the
+ * text into claude's input buffer to become the next prompt. The modal
+ * wants a direct keypress, not a queued message.
+ *
+ * Returns true on apparent success (tmux command exited 0). Silently
+ * returns false when no session is registered.
+ */
+export function dismissTmuxPrompt(taskId: string, key: string): boolean {
+  const state = sessions.get(taskId);
+  if (!state) return false;
+  // send-keys interprets every positional arg as a tmux key spec — pass
+  // the literal first, then "Enter" as a separate token so claude sees
+  // an actual carriage return.
+  const res = tmux(["send-keys", "-t", state.sessionName, key, "Enter"]);
+  return res.ok;
+}
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * Per-task session state.
  * ────────────────────────────────────────────────────────────────────────── */
@@ -516,11 +559,21 @@ interface SessionState {
    *  spawned sessions (those resolve via the turn slot's promise instead). */
   onEndOfTurn: (() => void) | null;
   /**
-   * Most recently observed claude permission mode (canonical string from
-   * the JSONL `system` / `permission-mode` events — `default` / `acceptEdits`
-   * / `plan` / `bypassPermissions` / `auto` / `dontAsk`). Null until claude
-   * emits its first event. `cycleToMode` reads this to compute how many
-   * Shift+Tab presses are needed to land on the target.
+   * Most recently observed claude permission mode — canonical string from
+   * the JSONL `system` / `permission-mode` events (`default` / `acceptEdits`
+   * / `plan` / `bypassPermissions` / `auto` / `dontAsk`). Seeded from the
+   * launch `mode` (via `toClaudeModeString`) at spawn so the plan-mode
+   * safety net in `/approvals` is in force the instant the session is
+   * registered; null on reattach until the JSONL replay's first
+   * `system` / `permission-mode` event re-hydrates the field.
+   *
+   * Two consumers read this:
+   *   - `cycleToMode` — computes how many Shift+Tab presses are needed
+   *     to land on the target mode.
+   *   - The `/approvals` route — when the value is `plan`, mutating
+   *     tools skip the saved-rule fast-path and surface as approval
+   *     interactions (so the user can never miss claude's plan-mode
+   *     safety dialog because it bypasses our PreToolUse hook).
    */
   permissionMode: string | null;
   /**
@@ -532,6 +585,34 @@ interface SessionState {
    * respawn anyway, since claude requires the enabling flag at launch).
    */
   bypassEnabled: boolean;
+  /** Periodic scrape of the visible tmux pane — looks for `Do you want
+   *  to … 1.Yes 2.Yes,allow 3.No` style modals that bypass the hook
+   *  system (plan-mode dialogs, `acceptEdits` + Bash, `/login`, etc.).
+   *  Lazily armed when a turn enters the queue; torn down with the
+   *  pollTimer. */
+  scrapeTimer: ReturnType<typeof setInterval> | null;
+  /** Last fingerprint the scraper saw; an entry must match the previous
+   *  scrape (i.e. two consecutive ticks) before we register a real
+   *  TmuxPromptRequest. Suppresses false positives where a numbered list
+   *  flickers past during normal output. Reset whenever the pane no
+   *  longer matches any signature. */
+  scrapeLastFingerprint: string | null;
+  /** `Date.now()` stamp of the most recent successful JSONL append the
+   *  flusher dispatched. The scraper consults it to (a) suppress
+   *  matches that happened while claude was actively writing (the
+   *  "prompt" is probably transient list output, not a stable modal)
+   *  and (b) cheaply detect a truly idle session so the 1s scrape
+   *  tick can self-throttle. 0 means "no append observed yet". */
+  lastJsonlAppendAt: number;
+  /** Fingerprint → `Date.now()` of when it was answered. The route
+   *  handler stamps an entry here right after `dismissTmuxPrompt`; the
+   *  scraper skips re-registering a fingerprint that's still inside
+   *  the TTL window. Without this, the next tick's two-tick-stability
+   *  fires *after* the user clicked (the same fingerprint was on the
+   *  pane the previous tick AND now), the entry is gone from the
+   *  pending map, and we'd register a ghost duplicate before
+   *  tmux/claude actually repainted. */
+  recentlyAnsweredFingerprints: Map<string, number>;
 }
 
 interface TurnSlot {
@@ -629,14 +710,21 @@ function dispatchLine(state: SessionState, line: string): void {
   }
   const uuid = typeof evt.uuid === "string" ? evt.uuid : undefined;
 
-  // Mirror permission-mode events into SessionState so cycleToMode knows
-  // where claude is right now. This MUST run before the dedup early-return
-  // below: on reattach, `seenLineUuids` is pre-seeded from `run_events`, so
-  // the historical system/permission-mode lines would otherwise be silently
-  // skipped and `state.permissionMode` would stay null until claude emitted
-  // a fresh mode event. permissionMode is session metadata, not a per-line
-  // chunk the user sees twice — it's safe (and necessary) to update it on
-  // dedup hits.
+  // Mirror the latest mode-bearing JSONL event into SessionState. Two
+  // consumers depend on this being current: `cycleToMode` (Shift+Tab
+  // press math against the live mode) and the `/approvals` route's
+  // plan-mode safety net (skip the saved-rule fast-path when claude is
+  // in `plan`, regardless of what the saved rule says).
+  //
+  // IMPORTANT: this update MUST stay above the seenLineUuids early-
+  // return below. On reattach the dedup set is pre-seeded from
+  // run_events, so every replayed line — including the mode event the
+  // prior process recorded — would otherwise be silently skipped and
+  // state.permissionMode would stay null. The mode is session metadata,
+  // not a per-line chunk the user sees twice, so re-applying it on a
+  // dedup hit is cheap and idempotent. Both event types carry the mode
+  // string (claude emits `system` at session start with the launch mode,
+  // then `permission-mode` for every mid-session change).
   if ((evt.type === "system" || evt.type === "permission-mode")
     && typeof evt.permissionMode === "string") {
     state.permissionMode = evt.permissionMode;
@@ -754,10 +842,273 @@ async function flush(state: SessionState): Promise<void> {
   // Advance the cursor to *just before* the partial tail so we re-read it
   // once it's complete.
   state.offset = chunk.next - Buffer.byteLength(tail, "utf8");
+  // Mark claude as actively writing — the scraper consults this to
+  // suppress false positives from numbered output that streams in mid-
+  // turn (and that one-tick-stable list-printing wouldn't normally
+  // beat the two-tick stability requirement).
+  state.lastJsonlAppendAt = Date.now();
   for (const line of lines) {
     if (!line) continue;
     dispatchLine(state, line);
   }
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Tmux pane scraper — catches REPL modals the PreToolUse hook never sees.
+ *
+ * The hook system is a closed loop with claude's permission engine: only
+ * tool calls fire PreToolUse, and within that, only paths claude routes to
+ * the hook. Plan-mode safety dialogs, `/login`, the model picker, auth
+ * re-prompts, and `acceptEdits` + Bash all paint a modal in the TUI that
+ * the hook never sees. Without this scraper, the kanban shows
+ * "Agent is working…" while claude is actually paused on a 3-choice
+ * dialog inside tmux, invisible to anyone who hasn't `tmux attach`-ed.
+ *
+ * The scraper runs every ~1s, capture-panes the visible window, and tries
+ * a small set of regex matchers against the tail. On a match it hashes
+ * the matched block and waits one more tick before registering — a
+ * single-tick blip never wins, which suppresses false positives from
+ * normal numbered-list output. Once registered, the prompt rides the
+ * standard interaction broadcast → SSE → run-panel path; answering ships
+ * the choice's `key` back via `tmux send-keys` (see `dismissTmuxPrompt`).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** How often the scraper polls the tmux pane. Aligned with the SSE poll
+ *  budget — slower than this lets dialogs sit unannounced for too long;
+ *  faster wastes CPU on `tmux capture-pane` syscalls during normal work. */
+const SCRAPE_INTERVAL_MS = 1000;
+
+/** Number of trailing pane lines we look at. Modal dialogs always anchor
+ *  to the bottom of the pane; ignoring the rest avoids matching old
+ *  output that scrolled past. */
+const SCRAPE_TAIL_LINES = 40;
+
+interface ScrapeMatch {
+  /** Verbatim text the user will see in the UI card. */
+  paneText: string;
+  /** Buttons to render — `key` is what we send to tmux on click. */
+  choices: TmuxPromptChoice[];
+  /** Stable hash that survives across consecutive scrapes as long as the
+   *  modal stays on screen unchanged. */
+  fingerprint: string;
+}
+
+/** Recognise claude's standard numbered-choice modal:
+ *
+ *   Do you want to proceed?
+ *   ❯ 1. Yes
+ *     2. Yes, allow always
+ *     3. No
+ *
+ * Different claude versions use `❯` or `›` as the cursor on the
+ * selected line. We deliberately do NOT accept `>` — markdown
+ * blockquotes (`> 1. some text`), CLI usage examples, and shell-prompt
+ * captures all start with `>` and would otherwise misfire the matcher.
+ * Choices are captured verbatim from the pane so the UI label matches
+ * what was on screen. The `key` is the literal digit — typing it +
+ * Enter dismisses the modal exactly the way the user would. */
+function matchNumberedModal(tail: string): ScrapeMatch | null {
+  const lines = tail.split("\n");
+  const numbered: Array<{ key: string; label: string; cursorHere: boolean }> = [];
+  for (const raw of lines) {
+    const m = raw.match(/^\s*([›❯])?\s*(\d+)\.\s+(.+?)\s*$/);
+    if (!m) continue;
+    numbered.push({
+      cursorHere: !!m[1],
+      key: m[2]!,
+      label: m[3]!.trim(),
+    });
+  }
+  if (numbered.length < 2) return null;
+  // Need at least one cursor marker on the numbered block — otherwise
+  // we're probably looking at a printed list, not an interactive modal.
+  if (!numbered.some((n) => n.cursorHere)) return null;
+  // Take the contiguous trailing run of numbered lines (a list further
+  // up the pane shouldn't poison the choice set).
+  const tailRun: typeof numbered = [];
+  for (let i = numbered.length - 1; i >= 0; i--) {
+    tailRun.unshift(numbered[i]!);
+    if (i > 0 && Number(numbered[i - 1]!.key) + 1 !== Number(numbered[i]!.key)) break;
+  }
+  if (tailRun.length < 2) return null;
+  const choices: TmuxPromptChoice[] = tailRun.map((n) => ({ key: n.key, label: n.label }));
+  // Use the last ~12 lines for the displayed pane snippet so the user
+  // sees the question text + the choices, not 40 lines of unrelated
+  // context above.
+  const paneText = lines.slice(-12).join("\n").trimEnd();
+  const fingerprint = sha1(`numbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}`);
+  return { paneText, choices, fingerprint };
+}
+
+/** Recognise `(y/N)` / `(Y/n)` / `[y/n]` confirmation prompts on the
+ *  last non-empty line. Lower priority than the numbered matcher — only
+ *  fires when no numbered choices were found. */
+function matchYesNoModal(tail: string): ScrapeMatch | null {
+  const lines = tail.split("\n").filter((l) => l.trim().length > 0);
+  const last = lines[lines.length - 1] ?? "";
+  // Match patterns like `… (y/N)`, `… [Y/n]`, with optional trailing
+  // whitespace or a `?`. Case-insensitive to forgive minor variants.
+  if (!/[(\[][yYnN]\/[yYnN][)\]]\s*[?:]?\s*$/.test(last)) return null;
+  // Default capital indicates the default answer if the user just hits
+  // Enter — we surface both as explicit buttons regardless so the user
+  // always picks consciously.
+  const choices: TmuxPromptChoice[] = [
+    { key: "y", label: "Yes" },
+    { key: "n", label: "No" },
+  ];
+  const paneText = lines.slice(-6).join("\n").trimEnd();
+  const fingerprint = sha1(`y-n:${last}`);
+  return { paneText, choices, fingerprint };
+}
+
+function sha1(s: string): string {
+  return createHash("sha1").update(s).digest("hex").slice(0, 16);
+}
+
+/** TTL on the "just answered this fingerprint" suppression. Has to
+ *  comfortably exceed the worst-case lag between sending Enter into
+ *  tmux and claude repainting the pane without the modal. 3s is
+ *  generous on a busy machine but cheap to wait through.  */
+const RECENTLY_ANSWERED_TTL_MS = 3_000;
+
+/** A scrape tick is skipped when the JSONL has been written to this
+ *  recently — claude is mid-stream, so whatever's on the pane is
+ *  likely transient output (a numbered list being printed) and not a
+ *  stable modal awaiting input. */
+const JSONL_RECENT_WRITE_MS = 500;
+
+/** Beyond this idle window with no active turn, the scraper stops
+ *  tick'ing entirely — there's no plausible scenario where a brand-
+ *  new modal appears on a session that hasn't seen output in a long
+ *  time. Idle sessions cost nothing this way. */
+const SCRAPE_IDLE_AFTER_MS = 5_000;
+
+/** Run a single scrape tick. Idempotent: registers at most one new
+ *  TmuxPromptRequest per call, auto-cancels any pending one whose
+ *  fingerprint no longer matches the pane. */
+function scrapeOnce(state: SessionState): void {
+  const now = Date.now();
+  // Idle gate: skip the syscall entirely when nothing is plausibly
+  // happening. A session with no turn in flight that hasn't appended
+  // to its JSONL in 5s is at the REPL prompt; the user isn't waiting
+  // on a modal we missed.
+  if (state.turnQueue.length === 0
+      && state.lastJsonlAppendAt !== 0
+      && now - state.lastJsonlAppendAt > SCRAPE_IDLE_AFTER_MS
+      && activeTmuxPromptsForTask(state.taskId).length === 0) {
+    return;
+  }
+
+  const cap = tmux(["capture-pane", "-p", "-t", state.sessionName]);
+  if (!cap.ok) {
+    // Session vanished — let `disposeSessionState` clean us up the next
+    // time the orchestrator notices. Don't churn here.
+    return;
+  }
+  const lines = cap.stdout.split("\n");
+  const tail = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n");
+
+  // JSONL-recency gate: claude is actively writing. The pane content
+  // is mid-render, not a stable modal — defer matching until things
+  // settle. We still run the auto-cancel sweep below so a previously
+  // registered prompt that just disappeared can clear out.
+  const claudeIsWriting = state.lastJsonlAppendAt !== 0
+    && now - state.lastJsonlAppendAt < JSONL_RECENT_WRITE_MS;
+
+  const match = claudeIsWriting
+    ? null
+    : (matchNumberedModal(tail) ?? matchYesNoModal(tail));
+
+  // Auto-cancel: any registered prompt for this task whose fingerprint
+  // is NOT what we see now has been dismissed (either externally via
+  // `tmux attach`, or the dialog was transient). Resolve those entries
+  // so the UI stops showing them.
+  const stillPresent = new Set<string>(match ? [match.fingerprint] : []);
+  for (const pending of activeTmuxPromptsForTask(state.taskId)) {
+    if (!stillPresent.has(pending.fingerprint)) {
+      answerTmuxPrompt(pending.id, { key: "__external__" });
+    }
+  }
+
+  // Garbage-collect the recently-answered map. Cheap (typically 0–1
+  // entries) and keeps stale fingerprints from leaking memory if a
+  // session lives long enough to churn through hundreds of prompts.
+  for (const [fp, ts] of state.recentlyAnsweredFingerprints) {
+    if (now - ts > RECENTLY_ANSWERED_TTL_MS) {
+      state.recentlyAnsweredFingerprints.delete(fp);
+    }
+  }
+
+  if (!match) {
+    state.scrapeLastFingerprint = null;
+    return;
+  }
+
+  // Re-registration suppression: if the user *just* answered this
+  // exact fingerprint, the modal may still be on the pane for one
+  // more tick while tmux/claude finish repainting. Skip — without
+  // this, the two-tick stability requirement (the previous tick
+  // saw the same fingerprint) would register a ghost duplicate.
+  if (state.recentlyAnsweredFingerprints.has(match.fingerprint)) {
+    return;
+  }
+
+  // Two-tick stability — require the same match on two consecutive
+  // scrapes before registering. Single-tick blips (a numbered list the
+  // agent is printing) never make it through.
+  if (state.scrapeLastFingerprint !== match.fingerprint) {
+    state.scrapeLastFingerprint = match.fingerprint;
+    return;
+  }
+
+  // Already registered? Nothing to do — the previous tick's broadcast
+  // is what the UI is showing.
+  if (findTmuxPromptByFingerprint(state.taskId, match.fingerprint)) return;
+
+  // Look up the active run id for this task. We need it on the
+  // interaction so the run panel can scope correctly; without one the
+  // prompt would float unattached. Idle tasks (no run) skip — there's
+  // nothing for the user to react to without an active session anyway.
+  const runId = tasks.get(state.taskId)?.runId;
+  if (!runId) return;
+
+  registerTmuxPrompt({
+    taskId: state.taskId,
+    runId,
+    paneText: match.paneText,
+    choices: match.choices,
+    fingerprint: match.fingerprint,
+  });
+}
+
+/**
+ * Stamp a fingerprint as "just answered" so the next scrape tick
+ * doesn't immediately re-register a ghost copy while tmux/claude
+ * finish repainting. Called by the `/tmux-prompts/:id/answer` route
+ * right after `dismissTmuxPrompt`.
+ *
+ * No-op when there's no session for the task — same idempotent
+ * behaviour as `dismissTmuxPrompt` on a torn-down session.
+ */
+export function markTmuxPromptAnswered(taskId: string, fingerprint: string): void {
+  const state = sessions.get(taskId);
+  if (!state) return;
+  state.recentlyAnsweredFingerprints.set(fingerprint, Date.now());
+  // Clear the stability cursor so the next match has to re-stabilise
+  // before it can register again — this defends against the case where
+  // the same fingerprint genuinely re-appears later (the user answered,
+  // claude immediately printed an identical-looking dialog), without
+  // racing the registration.
+  state.scrapeLastFingerprint = null;
+}
+
+/** Install or refresh the scraper interval for a session. Called from
+ *  `attachTailer`; torn down by `disposeSessionState`. */
+function startScraper(state: SessionState): void {
+  if (state.scrapeTimer) return;
+  state.scrapeTimer = setInterval(() => {
+    try { scrapeOnce(state); } catch { /* swallow — never crash the timer */ }
+  }, SCRAPE_INTERVAL_MS);
 }
 
 function attachTailer(state: SessionState): void {
@@ -773,6 +1124,7 @@ function attachTailer(state: SessionState): void {
   // accumulated in the JSONL without firing the watcher. A 400ms tick is
   // cheap (one stat + read-if-grew) and bulletproof.
   state.pollTimer = setInterval(() => { void flush(state); }, 400);
+  startScraper(state);
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -856,11 +1208,21 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
     lastChunk: null,
     seenLineUuids: new Set(),
     onEndOfTurn: null,
-    permissionMode: null,
+    // Canonical claude mode string (e.g. "plan", "bypassPermissions"),
+    // not the agetor-internal id ("plan", "bypass"). Seeding here means
+    // the plan-mode safety check in `/approvals` works from the very
+    // first PreToolUse hook — before the JSONL has even been opened.
+    // The JSONL's `system` event will overwrite this within a tick if
+    // claude renegotiates, which is fine.
+    permissionMode: opts.mode ? toClaudeModeString(opts.mode) : null,
     // `bypass` is the only agetor mode that emits the launch flag
     // (--dangerously-skip-permissions) — that's what puts
     // `bypassPermissions` into the Shift+Tab cycle.
     bypassEnabled: opts.mode === "bypass",
+    scrapeTimer: null,
+    scrapeLastFingerprint: null,
+    lastJsonlAppendAt: 0,
+    recentlyAnsweredFingerprints: new Map(),
   };
   sessions.set(opts.taskId, state);
 
@@ -975,6 +1337,10 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
     // Conservatively assume not — cycling to bypass after a restart needs
     // a respawn (claude requires the flag at launch anyway).
     bypassEnabled: false,
+    scrapeTimer: null,
+    scrapeLastFingerprint: null,
+    lastJsonlAppendAt: 0,
+    recentlyAnsweredFingerprints: new Map(),
   };
   // Belt to reconcileOrphans's sort-and-dedup suspender: if some prior
   // reattach (or other code path) already left a SessionState in the map
@@ -1153,6 +1519,9 @@ function disposeSessionState(state: SessionState | undefined): void {
   state.watcher = null;
   if (state.pollTimer) clearInterval(state.pollTimer);
   state.pollTimer = null;
+  if (state.scrapeTimer) clearInterval(state.scrapeTimer);
+  state.scrapeTimer = null;
+  state.scrapeLastFingerprint = null;
   state.onEndOfTurn = null;
   const err = new Error("session killed");
   for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
@@ -1210,6 +1579,10 @@ export const __forTest = {
       onEndOfTurn: null,
       permissionMode: null,
       bypassEnabled: false,
+      scrapeTimer: null,
+      scrapeLastFingerprint: null,
+      lastJsonlAppendAt: 0,
+      recentlyAnsweredFingerprints: new Map(),
     };
     sessions.set(taskId, state);
     return state;
@@ -1223,6 +1596,8 @@ export const __forTest = {
   flushSync,
   flush,
   dispatchLine,
+  matchNumberedModal,
+  matchYesNoModal,
 };
 
 /**
