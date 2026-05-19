@@ -38,6 +38,7 @@ async function makeTaskWithCwd(id: string): Promise<string> {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     hasOpenableRun: false,
+    pendingInteractionCount: 0,
   });
   return cwd;
 }
@@ -321,4 +322,45 @@ test("cancelPendingForTask resolves ask_questions + plan_approval entries", asyn
   const pa = await p.answer;
   expect(pa.choice).toBe("reject");
   expect(pa.revision).toBe("cancelled by user");
+});
+
+test("tasks.get / tasks.list expose pendingInteractionCount reflecting open interactions", async () => {
+  await makeTaskWithCwd("tCount");
+  const { tasks } = await import("./db.ts");
+  const {
+    registerApproval, registerQuestion, registerAskQuestions, registerPlanApproval,
+    answerApproval, answerQuestion,
+  } = await import("./interactions.ts");
+
+  // No interactions yet → 0.
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(0);
+
+  // One of each kind from the four in-memory maps; counter should reflect all.
+  const ap = registerApproval({ taskId: "tCount", runId: "r1", toolName: "Bash", toolInput: { command: "ls" } });
+  registerQuestion({ taskId: "tCount", runId: "r1", question: "?" });
+  registerAskQuestions({
+    taskId: "tCount", runId: "r1",
+    questions: [{ question: "?", options: [{ label: "A" }] }],
+  });
+  registerPlanApproval({ taskId: "tCount", runId: "r1", plan: "P" });
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(4);
+  // And the same count surfaces via tasks.list (the kanban's polling path).
+  const fromList = tasks.list().find((t) => t.id === "tCount");
+  expect(fromList?.pendingInteractionCount).toBe(4);
+
+  // Answering removes the entry from its map and decrements the count.
+  answerApproval(ap.id, { decision: "allow" });
+  await ap.answer;
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(3);
+
+  // Counter is scoped to the task: a sibling task with no interactions reads 0.
+  await makeTaskWithCwd("tCountSibling");
+  expect(tasks.get("tCountSibling")!.pendingInteractionCount).toBe(0);
+
+  // Answer the bare question too; counter keeps dropping.
+  const q2 = registerQuestion({ taskId: "tCount", runId: "r1", question: "?" });
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(4);
+  answerQuestion(q2.id, { selected: ["ok"] });
+  await q2.answer;
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(3);
 });

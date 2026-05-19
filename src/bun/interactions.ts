@@ -442,6 +442,18 @@ export function listPendingForTask(taskId: string): AnyRequest[] {
   return out.sort((a, b) => a.createdAt - b.createdAt);
 }
 
+/** Cheap counter used by `tasks.list()` / `tasks.get()` to surface the
+ *  pending-interaction badge on each kanban card without serializing the
+ *  full payloads. Linear scan over the four small in-memory Maps. */
+export function countPendingForTask(taskId: string): number {
+  let n = 0;
+  for (const e of approvals.values()) if (e.req.taskId === taskId) n++;
+  for (const e of questions.values()) if (e.req.taskId === taskId) n++;
+  for (const e of askQuestions.values()) if (e.req.taskId === taskId) n++;
+  for (const e of planApprovals.values()) if (e.req.taskId === taskId) n++;
+  return n;
+}
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * Allow-rules (persistent, stored as native claude permission entries in the
  * task cwd's `.claude/settings.local.json`)

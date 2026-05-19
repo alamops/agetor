@@ -1,6 +1,6 @@
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { FolderOpen, GitBranch, Play, Square, Trash2 } from "lucide-react";
+import { ArrowRight, FolderOpen, GitBranch, MessageCircleQuestion, Play, Square, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -26,13 +26,30 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }:
     ? { transform: CSS.Translate.toString(transform) }
     : undefined;
 
-  // Button precedence: Stop > Open > Run.
+  // Button precedence: Answer > Stop > Open > Run.
+  //  - Answer when at least one interaction (ask_user / AskUserQuestion /
+  //    ExitPlanMode / tool-approval) is pending OR codex flipped the task to
+  //    `blocked` via the approval-prompt heuristic. Opens the run panel; Stop
+  //    moves to a trailing icon slot so the user can still cancel.
   //  - Stop while the agent process is live (running OR blocked-awaiting-user).
   //  - Open once any run has reached succeeded/running/orphaned — there's
   //    something worth re-reading; Run stays reachable from inside the panel.
   //  - Run otherwise (no openable history yet, or only failed/cancelled).
   const active = task.column === "running" || task.column === "blocked";
   const openable = task.hasOpenableRun;
+  // Combine structured interactions with codex's narrative `blocked` signal.
+  // The latter has no answerable payload — the user resolves it from the run
+  // panel — but it represents the same "waiting on you" state to the user.
+  // When the only signal is `blocked` (no structured questions), we label the
+  // call-to-action "Review" instead of "Answer" to avoid promising a Q&A flow
+  // the panel can't deliver.
+  const pendingCount = task.pendingInteractionCount;
+  const blocked = task.column === "blocked";
+  const awaiting = pendingCount > 0 || blocked;
+  const awaitingLabel =
+    pendingCount > 1 ? `Answer (${pendingCount})`
+    : pendingCount === 1 ? "Answer"
+    : "Review";
 
   return (
     <Card
@@ -41,6 +58,7 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }:
       className={cn(
         "cursor-grab select-none border-border/60 hover:border-border transition-colors",
         isDragging && "opacity-50",
+        awaiting && "ring-2 ring-amber-500/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
       )}
       onClick={() => onOpen(task)}
       {...listeners}
@@ -82,7 +100,18 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }:
           </div>
         )}
         <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
-          {active ? (
+          {awaiting ? (
+            <Button
+              size="sm"
+              className="gap-1 bg-amber-500 text-amber-950 hover:bg-amber-500/90 focus-visible:ring-amber-500"
+              onClick={() => onOpen(task)}
+              title={pendingCount > 0 ? "Open run panel to answer" : "Agent is waiting on you — open the run panel"}
+            >
+              <MessageCircleQuestion className="size-3" />
+              {awaitingLabel}
+              <ArrowRight className="size-3" />
+            </Button>
+          ) : active ? (
             <Button size="sm" variant="destructive" onClick={() => onCancel(task)}>
               <Square className="size-3" /> Stop
             </Button>
@@ -93,6 +122,11 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }:
           ) : (
             <Button size="sm" onClick={() => onStart(task)}>
               <Play className="size-3" /> Run
+            </Button>
+          )}
+          {awaiting && active && (
+            <Button size="icon" variant="ghost" onClick={() => onCancel(task)} title="Stop">
+              <Square className="size-3" />
             </Button>
           )}
           <Button size="icon" variant="ghost" onClick={() => onDelete(task)} title="Delete task">
