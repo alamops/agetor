@@ -3,7 +3,12 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-import { defaultDevPaths, rehydratePath } from "./login-path.ts";
+import {
+  defaultDevPaths,
+  getLastRehydration,
+  parseExtraPathDirs,
+  rehydratePath,
+} from "./login-path.ts";
 
 // rehydratePath() and defaultDevPaths() both read process.env at call time and
 // rehydratePath mutates process.env.PATH. Snapshot the relevant vars and
@@ -133,5 +138,46 @@ describe("rehydratePath", () => {
     process.env.PATH = `/my/custom/bin:/usr/bin`;
     const result = rehydratePath();
     expect(result.split(":")).toContain("/my/custom/bin");
+  });
+
+  test("prepends extraDirs ahead of defaults and the existing PATH", () => {
+    process.env.PATH = "/usr/bin";
+    const result = rehydratePath({ extraDirs: ["/zzz/first", "/zzz/second"] });
+    const segs = result.split(":");
+    // Both extras land before any default-dev path. Using /opt/homebrew/bin
+    // as the marker since defaultDevPaths() always emits it.
+    const homebrewIdx = segs.indexOf("/opt/homebrew/bin");
+    expect(segs.indexOf("/zzz/first")).toBeLessThan(homebrewIdx);
+    expect(segs.indexOf("/zzz/second")).toBeLessThan(homebrewIdx);
+    // And extraDirs preserve the order they were given.
+    expect(segs.indexOf("/zzz/first")).toBeLessThan(segs.indexOf("/zzz/second"));
+  });
+
+  test("snapshot captures extras + login-probe outcome", () => {
+    process.env.PATH = "/usr/bin";
+    rehydratePath({ extraDirs: ["/zzz/mine"] });
+    const snap = getLastRehydration();
+    expect(snap).not.toBeNull();
+    expect(snap!.extraDirs).toEqual(["/zzz/mine"]);
+    // SHELL was deleted in beforeEach — the login-shell probe should miss.
+    expect(snap!.loginProbeOk).toBe(false);
+    expect(snap!.path).toBe(process.env.PATH);
+  });
+});
+
+describe("parseExtraPathDirs", () => {
+  test("returns [] for null / empty / whitespace-only inputs", () => {
+    expect(parseExtraPathDirs(null)).toEqual([]);
+    expect(parseExtraPathDirs(undefined)).toEqual([]);
+    expect(parseExtraPathDirs("")).toEqual([]);
+    expect(parseExtraPathDirs("\n\n  \n")).toEqual([]);
+  });
+
+  test("splits on newlines, trims, drops blanks", () => {
+    expect(parseExtraPathDirs("/a/b\n  /c/d  \n\n/e/f")).toEqual([
+      "/a/b",
+      "/c/d",
+      "/e/f",
+    ]);
   });
 });

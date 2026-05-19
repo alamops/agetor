@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
+import type { EnvSnapshot } from "../shared/types.ts";
 
 /**
  * When agetor is launched as a packaged .app (Finder, Spotlight, Dock,
@@ -23,6 +24,23 @@ import path from "node:path";
 
 const MARKER_START = "__AGETOR_PATH_START__";
 const MARKER_END = "__AGETOR_PATH_END__";
+
+/** Preference key for the user-supplied extra-PATH list. Value is one
+ *  directory per line; blank lines and surrounding whitespace are
+ *  ignored at parse time. Defined here so the boot path
+ *  (`index.ts:rehydratePath`) and the API setter (`server.ts:/env/extra-paths`)
+ *  share the same key. */
+export const EXTRA_PATH_DIRS_PREF_KEY = "extra_path_dirs";
+
+/** Parse the textarea-style preference value (one dir per line) into a
+ *  clean list. Empty result for null/empty strings. */
+export function parseExtraPathDirs(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
 
 function readLoginShellPath(): string | null {
   const shell = process.env.SHELL;
@@ -178,22 +196,48 @@ export function defaultDevPaths(): string[] {
   return candidates;
 }
 
+let lastSnapshot: EnvSnapshot | null = null;
+
+/** Return the most recent rehydratePath() result, or null if it hasn't run
+ *  yet (only relevant in tests — boot always calls rehydratePath first).
+ *  Shape lives in `shared/types.ts:EnvSnapshot` so the webview can import
+ *  it without duplicating the structure. */
+export function getLastRehydration(): EnvSnapshot | null {
+  return lastSnapshot;
+}
+
 /**
  * Rehydrate `process.env.PATH` with the user's login-shell PATH plus common
  * dev locations. Idempotent — safe to call multiple times. Returns the new
  * PATH so callers can log it during debugging.
+ *
+ * `extraDirs` is the user's escape hatch (Settings → Environment): every
+ * non-empty entry is prepended ahead of the login-shell PATH and the
+ * default candidates, so it wins over both. Re-runnable at runtime — when
+ * the user saves a new list, the server calls this again and the next
+ * `Bun.which({ PATH: process.env.PATH })` lookup in `agent-status.ts` picks
+ * up the fresh value on the next `/agents` poll.
  */
-export function rehydratePath(): string {
+export function rehydratePath(opts: { extraDirs?: string[] } = {}): string {
   const current = (process.env.PATH ?? "").split(":").filter(Boolean);
   const loginPath = readLoginShellPath();
+  // De-dupe + trim the user's extras up front so the snapshot reports
+  // exactly what we used (textarea input often has trailing whitespace
+  // or blank lines).
+  const extraDirs = (opts.extraDirs ?? [])
+    .map((d) => d.trim())
+    .filter((d) => d.length > 0);
+  const defaultDirs = defaultDevPaths();
   const extras = [
+    ...extraDirs,
     ...(loginPath ? loginPath.split(":").filter(Boolean) : []),
-    ...defaultDevPaths(),
+    ...defaultDirs,
   ];
 
   // Login-shell PATH wins (it includes the user's intentional additions in
   // the order they want them). Current PATH appended after dedupe so we never
-  // *drop* something that was already there.
+  // *drop* something that was already there. User-supplied extraDirs are
+  // first in `extras`, so they win over both.
   const seen = new Set<string>();
   const merged: string[] = [];
   for (const p of [...extras, ...current]) {
@@ -234,13 +278,16 @@ export function rehydratePath(): string {
   // line, no PII beyond the absolute path the user installed `claude` at —
   // which is what the bug report needs.
   const resolved = {
-    claude: Bun.which("claude", { PATH: next }) ?? "not found",
-    codex: Bun.which("codex", { PATH: next }) ?? "not found",
-    tmux: Bun.which("tmux", { PATH: next }) ?? "not found",
+    claude: Bun.which("claude", { PATH: next }),
+    codex: Bun.which("codex", { PATH: next }),
+    tmux: Bun.which("tmux", { PATH: next }),
   };
   console.log(
-    `[agetor] PATH rehydrated (login-probe=${loginPath ? "ok" : "miss"}): ` +
-      `claude=${resolved.claude} codex=${resolved.codex} tmux=${resolved.tmux}`,
+    `[agetor] PATH rehydrated (login-probe=${loginPath ? "ok" : "miss"}, ` +
+      `extra-dirs=${extraDirs.length}): ` +
+      `claude=${resolved.claude ?? "not found"} ` +
+      `codex=${resolved.codex ?? "not found"} ` +
+      `tmux=${resolved.tmux ?? "not found"}`,
   );
   if (aliasHint) {
     console.log(
@@ -249,6 +296,16 @@ export function rehydratePath(): string {
         "(or point the harness at an absolute path in Settings → Harnesses).",
     );
   }
+
+  lastSnapshot = {
+    path: next,
+    loginProbeOk: loginPath !== null,
+    extraDirs,
+    defaultDirs,
+    resolved,
+    claudeAliasHint: aliasHint,
+    at: Date.now(),
+  };
 
   return next;
 }

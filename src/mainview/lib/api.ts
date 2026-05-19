@@ -3,6 +3,8 @@ import type {
   AgentStatus,
   AppEvent,
   ColumnId,
+  EnvPayload,
+  EnvSnapshot,
   GlobalEvent,
   Harness,
   HarnessStatus,
@@ -15,6 +17,8 @@ import type {
   TaskReference,
   UpdateStatus,
 } from "../../shared/types.ts";
+
+export type { EnvPayload, EnvSnapshot };
 
 export interface UpdateSnapshot {
   status: UpdateStatus;
@@ -195,6 +199,18 @@ export const api = {
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
+  getEnv: () => j<EnvPayload>("/env"),
+  /**
+   * Snapshot is typed `| null` for symmetry with `GET /env`. In practice the
+   * server runs `rehydratePath()` inside the request handler so the snapshot
+   * is always populated by the time the response leaves; the nullable
+   * declaration just leaves an escape hatch if the contract ever weakens.
+   */
+  setExtraPathDirs: (dirs: string[]) =>
+    j<{ ok: true; snapshot: EnvSnapshot | null; extraDirs: string[] }>(
+      "/env/extra-paths",
+      { method: "PUT", body: JSON.stringify({ dirs }) },
+    ),
   getTmuxSource: () =>
     j<{
       source: "system" | "bundled";

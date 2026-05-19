@@ -26,6 +26,12 @@ import {
   type TmuxSource,
 } from "./tmux-resolution.ts";
 import { jsonlPathFor, mapJsonlEventToChunks } from "./claude-tmux.ts";
+import {
+  EXTRA_PATH_DIRS_PREF_KEY,
+  getLastRehydration,
+  parseExtraPathDirs,
+  rehydratePath,
+} from "./login-path.ts";
 import { listBranches } from "./worktree.ts";
 import { listAvailableCommands } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -341,6 +347,92 @@ export function startApiServer() {
           // when the process goes away.
           void applyUpdate();
           return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Environment diagnostics for the Settings → Environment panel and
+      // the first-run "claude not found" banner. Returns the same info the
+      // boot log prints (resolved bins, login-probe outcome) plus the
+      // user's saved extra-PATH list and the in-memory `process.env.PATH`.
+      // Mutation goes through PUT /env/extra-paths.
+      "/env": {
+        GET: authed((req) => {
+          const snap = getLastRehydration();
+          // Always echo `process.env.PATH` separately — the snapshot's
+          // `path` field is what rehydratePath wrote, but a later boot step
+          // could in principle have mutated it. Cheap to send both so the
+          // UI can show the live value.
+          return json(
+            {
+              snapshot: snap,
+              livePath: process.env.PATH ?? "",
+              extraDirs: parseExtraPathDirs(preferences.get(EXTRA_PATH_DIRS_PREF_KEY)),
+            },
+            { headers: corsHeaders(req) },
+          );
+        }),
+      },
+
+      "/env/extra-paths": {
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { dirs?: unknown };
+          // Accept either an array of strings (preferred — UI sends this)
+          // or a single newline-joined string (round-trips raw textarea
+          // contents). Anything else is rejected so a buggy caller can't
+          // silently wipe the list with garbage.
+          let dirs: string[];
+          if (Array.isArray(body.dirs)) {
+            dirs = body.dirs.filter((d): d is string => typeof d === "string");
+          } else if (typeof body.dirs === "string") {
+            dirs = parseExtraPathDirs(body.dirs);
+          } else {
+            return json(
+              { error: "dirs must be string[] or a newline-separated string" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // Cleaning: drop blanks, require absolute paths so a relative
+          // entry doesn't resolve against the agetor process cwd (which is
+          // never what the user means). Same rule we already enforce for
+          // harness `home` / `bin`. Reject `:` too — the textarea is
+          // one-dir-per-line, so an embedded colon almost certainly means
+          // the user pasted a `$PATH`-shaped string and would otherwise
+          // see their entry silently split in two by the colon-join into
+          // `process.env.PATH`.
+          const cleaned: string[] = [];
+          for (const raw of dirs) {
+            const d = raw.trim();
+            if (!d) continue;
+            if (!path.isAbsolute(d)) {
+              return json(
+                { error: `extra PATH entries must be absolute: "${d}"` },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            if (d.includes(":")) {
+              return json(
+                {
+                  error:
+                    `extra PATH entries cannot contain ':' — put each directory on its own line: "${d}"`,
+                },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            cleaned.push(d);
+          }
+          // Persist as one-per-line so a future hand-edit of the SQLite
+          // row is readable. The parser is tolerant on the way back in.
+          preferences.set(EXTRA_PATH_DIRS_PREF_KEY, cleaned.join("\n"));
+          // Re-run rehydration in-process so the next /agents probe (polled
+          // every 2s by the kanban header dots) reflects the new dirs
+          // without requiring a restart. Already-spawned tmux sessions
+          // won't see the change — that's expected and matches how PATH
+          // works on Unix.
+          rehydratePath({ extraDirs: cleaned });
+          return json(
+            { ok: true, snapshot: getLastRehydration(), extraDirs: cleaned },
+            { headers: corsHeaders(req) },
+          );
         }),
       },
 

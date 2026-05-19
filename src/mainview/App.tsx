@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import { AlertTriangle, Settings, X } from "lucide-react";
-import { api, type AgentModelMap } from "@/lib/api";
+import { api, type AgentModelMap, type EnvPayload } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
@@ -9,6 +9,7 @@ import { Column } from "@/components/kanban/Column";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { RunPanel } from "@/components/kanban/RunPanel";
+import { EnvMissingBanner } from "@/components/settings/EnvMissingBanner";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
@@ -80,6 +81,10 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
+  // Boot-time PATH diagnostics. Powers the "claude not found" banner above
+  // the kanban; the Settings → Environment panel fetches its own copy on
+  // open so the two views can refresh independently.
+  const [env, setEnv] = useState<EnvPayload | null>(null);
   const [homeDir, setHomeDir] = useState<string>("");
   // Active data dir resolved server-side (~/.agetor for the packaged .app,
   // ~/.agetor-dev when launched via `bun run dev` / `dev:hmr`). Threaded to
@@ -144,6 +149,10 @@ export default function App() {
     // freshly-opened webview wouldn't know about an update that was already
     // downloaded by the previous main-process tick.
     api.getUpdateStatus().then(setUpdateSnapshot).catch(() => { /* fine */ });
+    // Boot-time env diagnostic (resolved claude/codex/tmux paths). Only used
+    // by the first-run banner — Settings refetches on open so a user editing
+    // the extras list always sees fresh server state.
+    api.getEnv().then(setEnv).catch(() => { /* fine */ });
     const t = setInterval(refresh, 2000);
     const a = setInterval(refreshAgents, 15_000);
     return () => {
@@ -461,6 +470,10 @@ export default function App() {
             show={isTmuxMissing(agents)}
             onResolve={() => setTmuxDialogOpen(true)}
           />
+          <EnvMissingBanner
+            env={env}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
           <KanbanFilters
             textQuery={textQuery}
             onTextQueryChange={setTextQuery}
@@ -506,7 +519,14 @@ export default function App() {
       />
       <SettingsDialog
         open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+        onClose={() => {
+          setSettingsOpen(false);
+          // Refresh the boot-env snapshot — saving extras inside Settings
+          // re-runs rehydratePath server-side, so the banner here should
+          // disappear (or persist with the same hint) without waiting for
+          // a full reload.
+          void api.getEnv().then(setEnv).catch(() => { /* fine */ });
+        }}
         onChange={refreshAgents}
         homeDir={homeDir}
         dataDir={dataDir}

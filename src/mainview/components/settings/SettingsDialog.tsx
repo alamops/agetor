@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronLeft, Plus, Trash2, X } from "lucide-react";
-import { api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
+import { AlertTriangle, Check, ChevronLeft, Plus, Trash2, X } from "lucide-react";
+import {
+  api,
+  type EnvPayload,
+  type HarnessesPayload,
+  type HarnessInput,
+} from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -98,6 +103,7 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
   const [tmuxSource, setTmuxSource] = useState<"system" | "bundled">("system");
   const [bundledTmuxAvailable, setBundledTmuxAvailable] = useState(false);
+  const [env, setEnv] = useState<EnvPayload | null>(null);
   const [view, setView] = useState<View>({ kind: "list" });
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -110,14 +116,16 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
   const confirm = useConfirm();
 
   const refresh = async () => {
-    const [info, data, prefs, tmux] = await Promise.all([
+    const [info, data, prefs, tmux, envPayload] = await Promise.all([
       api.info().catch(() => ({ version: "?" })),
       api.listHarnesses().catch(() => ({ harnesses: [], statuses: [] })),
       api.listPreferences().catch((): Record<string, string> => ({})),
       api
         .getTmuxSource()
         .catch(() => ({ source: "system" as const, bundledAvailable: false, bundledPath: "", resolvedBin: "" })),
+      api.getEnv().catch((): EnvPayload | null => null),
     ]);
+    setEnv(envPayload);
     setVersion(info.version);
     setPayload(data);
     // The default-harness picker only lists *enabled* harnesses. If the
@@ -293,6 +301,8 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
           tmuxSource={tmuxSource}
           bundledTmuxAvailable={bundledTmuxAvailable}
           onPickTmuxSource={onPickTmuxSource}
+          env={env}
+          onEnvChange={setEnv}
           canAdd={!!dataDir}
           onAdd={() => setView({ kind: "templates" })}
           onEdit={(h) =>
@@ -377,6 +387,8 @@ function ListView({
   tmuxSource,
   bundledTmuxAvailable,
   onPickTmuxSource,
+  env,
+  onEnvChange,
   canAdd,
   onAdd,
   onEdit,
@@ -392,6 +404,13 @@ function ListView({
   tmuxSource: "system" | "bundled";
   bundledTmuxAvailable: boolean;
   onPickTmuxSource: (source: "system" | "bundled") => void;
+  /** Boot-time PATH resolution + the user's saved extra-PATH list. Null
+   *  while `/env` is still in-flight. */
+  env: EnvPayload | null;
+  /** Lets the EnvironmentSection refresh the parent's copy after a save
+   *  (the server returns the fresh snapshot) without forcing a full
+   *  Settings refresh round-trip. */
+  onEnvChange: (e: EnvPayload | null) => void;
   /** False while `dataDir` is still loading from `GET /defaults`. Adding a
    *  harness with an unresolved data dir would persist a broken HOME path
    *  (`/harnesses/claude-2` instead of `<dataDir>/harnesses/claude-2`). */
@@ -440,6 +459,9 @@ function ListView({
           binary if you don't want to install tmux system-wide.
         </p>
       </section>
+
+      <EnvironmentSection env={env} onEnvChange={onEnvChange} />
+
 
       <section className="space-y-2">
         <div className="flex items-center justify-between">
@@ -534,6 +556,206 @@ function ListView({
           })}
         </div>
       </section>
+    </div>
+  );
+}
+
+/**
+ * Boot-time environment diagnostics + the "Extra PATH directories" escape
+ * hatch. Saved dirs are prepended ahead of the login-shell PATH on every
+ * launch, so a user whose rc file doesn't expose their CLIs (e.g. nvm
+ * default unset, asdf inside an `if [ -t 0 ]` guard) can still point agetor
+ * at the right bin dir manually.
+ *
+ * The save handler re-rehydrates server-side, so the green/red dots flip
+ * within the next `/agents` poll (~2s). No restart needed for the bin
+ * probes; already-spawned tmux sessions keep their captured env though,
+ * so new task runs are when the change really takes effect.
+ */
+function EnvironmentSection({
+  env,
+  onEnvChange,
+}: {
+  env: EnvPayload | null;
+  onEnvChange: (e: EnvPayload | null) => void;
+}) {
+  // Local textarea state seeded from the persisted dirs. Decoupled from
+  // `env.extraDirs` so typing doesn't lose focus on every parent re-render,
+  // and so the Save button can detect a real dirty state.
+  //
+  // useState only consumes its initial value on first render. The Dialog
+  // unmounts its children on close (see `ui/dialog.tsx:116`), so this
+  // component remounts on every open — meaning useState gives us the
+  // freshest persisted value whenever env was already loaded at open time.
+  const [draft, setDraft] = useState((env?.extraDirs ?? []).join("\n"));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  // Reseed when env arrives after first mount — i.e. the dialog opened
+  // before the parent's `/env` fetch resolved. Guarded on `draft === ""`
+  // so a user who started typing while loading doesn't get their input
+  // clobbered when env lands.
+  useEffect(() => {
+    if (env && draft === "") {
+      setDraft((env.extraDirs ?? []).join("\n"));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [env?.snapshot?.at]);
+
+  const parsedDraft = useMemo(
+    () =>
+      draft
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0),
+    [draft],
+  );
+
+  const persisted = env?.extraDirs ?? [];
+  const dirty =
+    parsedDraft.length !== persisted.length ||
+    parsedDraft.some((d, i) => d !== persisted[i]);
+
+  const onSave = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.setExtraPathDirs(parsedDraft);
+      // `result.snapshot` is typed nullable to match GET /env, but the
+      // server-side rehydrate runs synchronously inside the PUT handler so
+      // we always have one in practice. Fall back to the live PATH only if
+      // some future refactor stops returning a snapshot.
+      onEnvChange({
+        snapshot: result.snapshot,
+        livePath: result.snapshot?.path ?? "",
+        extraDirs: result.extraDirs,
+      });
+      setDraft(result.extraDirs.join("\n"));
+      setSavedAt(Date.now());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const snap = env?.snapshot;
+  const pathSegments = (snap?.path ?? env?.livePath ?? "").split(":").filter(Boolean);
+
+  return (
+    <section className="space-y-2">
+      <div className="flex items-center justify-between">
+        <label className="text-xs text-muted-foreground">Environment</label>
+      </div>
+
+      {/* Resolved bins — same info the boot log prints to Console.app, but
+          in a place a user without a terminal can actually see. */}
+      <div className="space-y-1 rounded-md border border-border/60 px-3 py-2">
+        <BinRow label="claude" path={snap?.resolved.claude ?? null} />
+        <BinRow label="codex" path={snap?.resolved.codex ?? null} />
+        <BinRow label="tmux" path={snap?.resolved.tmux ?? null} />
+        <div className="pt-1 text-[11px] text-muted-foreground">
+          {snap == null
+            ? "Loading…"
+            : snap.loginProbeOk
+              ? "Login-shell PATH probe succeeded."
+              : "Login-shell PATH probe didn't return a result — only built-in default dirs and your extras are in PATH."}
+        </div>
+        {snap?.claudeAliasHint && (
+          <div className="flex items-start gap-1.5 pt-1 text-[11px] text-amber-500">
+            <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+            <span>
+              <code className="font-mono">claude</code> looks like a shell
+              alias/function in your rc, not a real binary. Install it with{" "}
+              <code className="font-mono">npm i -g @anthropic-ai/claude-code</code>{" "}
+              or set a <strong>Bin override</strong> on the harness.
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Editable extras. Tailwind classes match the env-vars textarea in
+          the harness editor for visual consistency. */}
+      <div className="space-y-1">
+        <label className="text-xs text-muted-foreground">
+          Extra PATH directories (one absolute path per line)
+        </label>
+        <Textarea
+          value={draft}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setSavedAt(null);
+          }}
+          rows={3}
+          placeholder="/opt/homebrew/bin&#10;/Users/me/.local/bin"
+          className="font-mono text-xs"
+        />
+        <p className="text-[11px] leading-snug text-muted-foreground">
+          Prepended ahead of the auto-detected PATH on every launch. Use this when
+          the auto-probe can't reach your CLIs (e.g. nvm default not set, asdf
+          inside a tty guard).
+        </p>
+        {error && (
+          <p className="text-[11px] leading-snug text-destructive">{error}</p>
+        )}
+        <div className="flex items-center justify-between pt-1">
+          <span className="text-[11px] text-muted-foreground">
+            {savedAt && !dirty && (
+              <span className="inline-flex items-center gap-1 text-emerald-500">
+                <Check className="size-3" /> Saved — green/red dots refresh on the
+                next probe.
+              </span>
+            )}
+          </span>
+          <Button size="sm" onClick={onSave} disabled={busy || !dirty}>
+            {busy ? "Saving…" : "Save extras"}
+          </Button>
+        </div>
+      </div>
+
+      {/* Read-only PATH listing, collapsed by default so it doesn't dominate
+          the dialog. <details> is fine — no need for headless-ui machinery
+          for a debug aid. */}
+      <details className="rounded-md border border-border/60 px-3 py-2 text-[11px]">
+        <summary className="cursor-pointer select-none text-muted-foreground">
+          Resolved PATH ({pathSegments.length} {pathSegments.length === 1 ? "entry" : "entries"})
+        </summary>
+        <ol className="mt-2 space-y-0.5 font-mono">
+          {pathSegments.length === 0 && (
+            <li className="text-muted-foreground">(empty — boot hasn't run yet)</li>
+          )}
+          {pathSegments.map((p, i) => (
+            <li key={`${p}-${i}`} className="truncate" title={p}>
+              {i + 1}. {p}
+            </li>
+          ))}
+        </ol>
+      </details>
+    </section>
+  );
+}
+
+function BinRow({ label, path }: { label: string; path: string | null }) {
+  const ok = path !== null && path.length > 0;
+  return (
+    <div className="flex items-center gap-2 text-[12px]">
+      <span
+        className={cn(
+          "inline-block size-1.5 shrink-0 rounded-full",
+          ok ? "bg-emerald-500" : "bg-red-500",
+        )}
+      />
+      <code className="font-mono text-muted-foreground">{label}</code>
+      <span
+        className={cn(
+          "truncate font-mono",
+          ok ? "" : "text-red-500",
+        )}
+        title={path ?? "not found"}
+      >
+        {ok ? path : "not found"}
+      </span>
     </div>
   );
 }

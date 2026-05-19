@@ -8,6 +8,53 @@ export type ColumnId = "backlog" | "ready" | "running" | "blocked" | "review" | 
  */
 export const TMUX_MISSING_REASON = "tmux is required to drive claude-code interactively";
 
+/**
+ * Snapshot of the most recent `rehydratePath()` call on the Bun side.
+ * Returned by `GET /env` and `PUT /env/extra-paths` so the Settings →
+ * Environment panel and the first-run "claude not found" banner can render
+ * a consistent picture of what we resolved at boot. Pure data — no runtime
+ * imports — so it lives here per the shared/types contract.
+ */
+export interface EnvSnapshot {
+  /** Final colon-joined PATH written to `process.env.PATH`. */
+  path: string;
+  /** Whether the login-shell PATH probe succeeded (markers found). */
+  loginProbeOk: boolean;
+  /** User-supplied extra dirs prepended ahead of everything else. */
+  extraDirs: string[];
+  /** Dirs added from the built-in default list (homebrew, nvm shims, …). */
+  defaultDirs: string[];
+  /** Resolved absolute paths (or null when missing) for the three CLIs the
+   *  agetor harnesses depend on. */
+  resolved: {
+    claude: string | null;
+    codex: string | null;
+    tmux: string | null;
+  };
+  /** True when `claude` appears as a shell alias/function but no external
+   *  binary was found — the boot log surfaces a one-time hint, and the UI
+   *  can show the same hint inline. */
+  claudeAliasHint: boolean;
+  /** When the snapshot was taken (epoch ms). */
+  at: number;
+}
+
+/**
+ * Response shape for `GET /env`. The snapshot may be null only in tests
+ * where `rehydratePath()` was never invoked — in prod, boot always calls it
+ * before the API server starts handling requests.
+ */
+export interface EnvPayload {
+  snapshot: EnvSnapshot | null;
+  /** Current `process.env.PATH` in the bun process. Usually equals
+   *  `snapshot.path`, but kept separate so a later mutation would be
+   *  visible to the UI. */
+  livePath: string;
+  /** Persisted extra-PATH dirs. The snapshot also carries them; this
+   *  field is the source of truth for the editor's initial value. */
+  extraDirs: string[];
+}
+
 export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "backlog", label: "Backlog" },
   { id: "ready", label: "Ready" },

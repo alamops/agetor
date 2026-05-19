@@ -1,8 +1,12 @@
 import { writeFileSync } from "node:fs";
 import Electrobun, { ApplicationMenu, BrowserWindow, Updater } from "electrobun/bun";
-import { rehydratePath } from "./login-path.ts";
+import {
+  EXTRA_PATH_DIRS_PREF_KEY,
+  parseExtraPathDirs,
+  rehydratePath,
+} from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN } from "./server.ts";
-import { db, harnesses, pidFilePath, tasks } from "./db.ts";
+import { db, harnesses, pidFilePath, preferences, tasks } from "./db.ts";
 import { reconcileOrphans } from "./orchestrator.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { prewarmSharedFiles } from "./hook-installer.ts";
@@ -108,7 +112,14 @@ async function getMainViewUrl(): Promise<string> {
 // before prewarmSharedFiles (which resolves `bun`) and before the API server
 // starts handling /agents probes. Idempotent and safe in dev runs — the
 // merge dedupes.
-rehydratePath();
+//
+// User-supplied extra dirs (Settings → Environment) take precedence over
+// everything else in `extras` so a manual override always wins. Read here
+// instead of inside login-path.ts to keep that module free of a hard DB
+// dependency (the tests import it without booting the DB).
+rehydratePath({
+  extraDirs: parseExtraPathDirs(preferences.get(EXTRA_PATH_DIRS_PREF_KEY)),
+});
 
 // Eagerly refresh the materialised hook + MCP launcher scripts on disk
 // (~/.agetor/bin/*) so a `claude` invocation made directly in a previously-
