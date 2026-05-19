@@ -43,6 +43,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     references: [],
     runId: null,
     hasOpenableRun: false,
+    pendingInteractionCount: 0,
     createdAt: 0,
     updatedAt: 0,
     ...overrides,

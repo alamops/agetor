@@ -38,6 +38,7 @@ test("reconcileOrphans marks running rows as orphaned and returns tasks to ready
     references: [],
     runId,
     hasOpenableRun: false,
+    pendingInteractionCount: 0,
     createdAt: now,
     updatedAt: now,
   });

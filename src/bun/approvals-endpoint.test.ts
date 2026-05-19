@@ -54,6 +54,7 @@ async function seedPendingApproval(args: {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     hasOpenableRun: false,
+    pendingInteractionCount: 0,
   });
   const { registerApproval } = await import("./interactions.ts");
   const { id } = registerApproval({

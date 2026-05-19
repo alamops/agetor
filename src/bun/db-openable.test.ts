@@ -43,6 +43,7 @@ function makeTask() {
     references: [],
     runId: null,
     hasOpenableRun: false,
+    pendingInteractionCount: 0,
     createdAt: now,
     updatedAt: now,
   });
