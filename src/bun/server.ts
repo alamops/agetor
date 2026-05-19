@@ -16,6 +16,7 @@ import {
 } from "./db.ts";
 import { createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { prepareClaudeHarnessHome } from "./harness-setup.ts";
 import { applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import {
   bundledTmuxAvailable,
@@ -468,6 +469,13 @@ export function startApiServer() {
               bin,
               env,
             });
+            // Native-install claude validates `$HOME/.local/bin/claude` exists
+            // on every launch and errors out otherwise. When the user gives
+            // this harness its own HOME but no BIN, pre-link the system
+            // binary into the new HOME so the integrity check passes.
+            if (created.kind === "claude-code" && created.home && !created.bin) {
+              prepareClaudeHarnessHome(created.home);
+            }
             return json(created, { headers: corsHeaders(req) });
           } catch (e) {
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
@@ -537,6 +545,12 @@ export function startApiServer() {
           }
           try {
             const updated = harnesses.update(req.params.id, patch);
+            // Same rationale as the POST handler: if a claude-code alias
+            // gains (or changes) a custom HOME without an explicit BIN, make
+            // sure the native-install integrity-check path exists.
+            if (updated.kind === "claude-code" && updated.home && !updated.bin && "home" in body) {
+              prepareClaudeHarnessHome(updated.home);
+            }
             return json(updated, { headers: corsHeaders(req) });
           } catch (e) {
             if (e instanceof HarnessBuiltinError) {
