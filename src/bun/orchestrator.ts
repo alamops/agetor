@@ -24,6 +24,8 @@ function resolveHarness(harnessId: string): Harness | null {
 }
 import { cancelPendingForTask, setBroadcaster, type AnyRequest } from "./interactions.ts";
 import {
+  cycleToMode,
+  type CycleResult,
   dropSession,
   listAgetorSessions,
   killSessionByName,
@@ -523,8 +525,10 @@ function attachDoneHandler(
  *   • Agent change (claude ↔ codex): kills any claude tmux session we had
  *     for this task. The new agent will spawn fresh on next Run.
  *   • Same-agent mode / model / effort change on a live claude session:
- *     send the matching `/permission-mode`, `/model`, `/effort` slash command
- *     via tmux. The session keeps running with the new posture.
+ *     for `/model` and `/effort` send the real slash command; for the
+ *     permission mode there is no slash command, so we call `cycleToMode`
+ *     which sends Shift+Tab keystrokes (or `/plan` when the target is plan).
+ *     The session keeps running with the new posture.
  *   • Anything else (codex; no live session): no-op — the change just
  *     persists for the next spawn.
  */
@@ -551,8 +555,13 @@ export function reconcileTaskSession(taskId: string, before: Task, after: Task):
   if (afterKind !== "claude-code") return;
   if (!sessionExists(taskId)) return;
 
+  // `after.mode` guard: a PATCH that clears the mode (mode → null) leaves
+  // the live session alone — the UI doesn't expose a "clear mode" control
+  // and there's no canonical "unset" mode to dial claude back to, so
+  // silently keeping the current posture is the least-surprising option.
   if (before.mode !== after.mode && after.mode) {
-    sendSlashCommand(taskId, `/permission-mode ${after.mode}`);
+    const result = cycleToMode(taskId, after.mode);
+    emitModeChangeStatus(taskId, after.mode, result);
   }
   if (before.model !== after.model && after.model) {
     sendSlashCommand(taskId, `/model ${toClaudeModelArg(after.model)}`);
@@ -560,6 +569,35 @@ export function reconcileTaskSession(taskId: string, before: Task, after: Task):
   if (before.effort !== after.effort && after.effort) {
     sendSlashCommand(taskId, `/effort ${after.effort}`);
   }
+}
+
+/**
+ * Surface a `cycleToMode` outcome on the task's most recent run so the user
+ * sees it in the run panel. Both success and skip ride the `status` stream
+ * — skipping is an orchestrator-side decision (e.g. asking for `bypass` on
+ * a session that wasn't launched with the flag), not an agent error, so
+ * `stderr` would mislead the user into thinking claude crashed. We
+ * disambiguate with a "⚠️" prefix on the skip case. Silent when there's no
+ * run row to attach to (shouldn't happen — a live tmux session implies at
+ * least one prior run — but defensive).
+ */
+function emitModeChangeStatus(
+  taskId: string,
+  agetorMode: string,
+  result: CycleResult,
+): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const runId = recent.id;
+  const ts = Date.now();
+  const data = result.ok
+    ? (result.via === "noop"
+      ? null
+      : `mode → ${agetorMode} (${result.via === "slash-plan" ? "via /plan" : `via Shift+Tab ×${result.presses}`})`)
+    : `⚠️ mode change to ${agetorMode} skipped: ${result.reason} — stop the run and start again to apply.`;
+  if (!data) return;
+  runs.appendEvent(runId, "status", data);
+  emit({ runId, taskId, stream: "status", data, ts });
 }
 
 export function cancelRun(runId: string): boolean {
