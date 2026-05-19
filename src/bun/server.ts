@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Utils } from "electrobun/bun";
@@ -798,6 +798,60 @@ export function startApiServer() {
           }
           const ok = Utils.openPath(abs);
           return json({ opened: ok, path: abs }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Persist a screenshot blob to `${dataDir}/screenshots/` and return its
+      // absolute path. Backs the textarea drag/drop + paste flows on the
+      // webview — macOS floating-thumbnail drags and clipboard pastes carry
+      // an image blob with no filesystem path, so the only way to give an
+      // agent an absolute path to read is to write the bytes out first.
+      "/screenshots": {
+        POST: authed(async (req) => {
+          const ctype = (req.headers.get("content-type") ?? "").toLowerCase();
+          const allowed: Record<string, string> = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/gif": "gif",
+            "image/webp": "webp",
+          };
+          const ext = allowed[ctype.split(";")[0].trim()];
+          if (!ext) {
+            return json(
+              { error: `unsupported content-type: ${ctype || "(missing)"}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+          const MAX = 25 * 1024 * 1024;
+          // Reject oversized uploads via Content-Length before allocating
+          // the body — a buggy client shouldn't be able to pin RAM by
+          // streaming gigabytes only to see a 413 at the end. Clients
+          // omitting the header still hit the post-read check below.
+          const claimed = Number(req.headers.get("content-length") ?? "");
+          if (Number.isFinite(claimed) && claimed > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          const buf = await req.arrayBuffer();
+          if (buf.byteLength > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          if (buf.byteLength === 0) {
+            return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const dir = path.join(dataDir, "screenshots");
+          mkdirSync(dir, { recursive: true });
+          const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+          const id = crypto.randomUUID().slice(0, 8);
+          const basename = `screenshot-${ts}-${id}.${ext}`;
+          const abs = path.join(dir, basename);
+          await Bun.write(abs, buf);
+          return json({ path: abs, basename }, { headers: corsHeaders(req) });
         }),
       },
 
