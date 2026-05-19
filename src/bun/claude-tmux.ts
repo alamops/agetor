@@ -112,6 +112,62 @@ export interface ClaudeLaunchOptions {
  * ────────────────────────────────────────────────────────────────────────── */
 
 /**
+ * Canonical permission-mode strings claude reports in its JSONL `system` /
+ * `permission-mode` events (and accepts at `--permission-mode`). Agetor's own
+ * mode ids (see AGENT_OPTIONS in shared/types.ts) overlap on `auto`,
+ * `acceptEdits`, `plan` but use shorthand for the other two: `bypass` →
+ * `bypassPermissions`, `ask` → `default`. Translate via `toClaudeModeString`.
+ */
+export const CLAUDE_MODE_DEFAULT = "default";
+export const CLAUDE_MODE_ACCEPT_EDITS = "acceptEdits";
+export const CLAUDE_MODE_PLAN = "plan";
+export const CLAUDE_MODE_BYPASS = "bypassPermissions";
+export const CLAUDE_MODE_AUTO = "auto";
+
+/** Translate an agetor mode id (from AGENT_OPTIONS) to claude's canonical
+ *  permission-mode string. Unknown ids fall through verbatim so future agetor
+ *  ids that happen to match claude's strings (e.g. `dontAsk`) just work. */
+export function toClaudeModeString(agetorMode: string): string {
+  switch (agetorMode) {
+    case "bypass": return CLAUDE_MODE_BYPASS;
+    case "ask": return CLAUDE_MODE_DEFAULT;
+    default: return agetorMode;
+  }
+}
+
+/**
+ * The Shift+Tab cycle order claude implements. The 3 base modes are always
+ * present; `bypassPermissions` only appears when claude was launched with one
+ * of `--permission-mode bypassPermissions`, `--dangerously-skip-permissions`,
+ * or `--allow-dangerously-skip-permissions`. `auto` appears when the account
+ * is eligible — we can't probe that programmatically, so we optimistically
+ * include it; if the user's account isn't eligible the press will land
+ * somewhere unexpected (and the JSONL event tells us where).
+ *
+ * Order documented at https://code.claude.com/docs/en/permission-modes —
+ * optional modes slot in after `plan`, bypass first then auto.
+ */
+export function cycleOrderFor(bypassEnabled: boolean): string[] {
+  const cycle = [CLAUDE_MODE_DEFAULT, CLAUDE_MODE_ACCEPT_EDITS, CLAUDE_MODE_PLAN];
+  if (bypassEnabled) cycle.push(CLAUDE_MODE_BYPASS);
+  cycle.push(CLAUDE_MODE_AUTO);
+  return cycle;
+}
+
+/**
+ * Compute the number of Shift+Tab presses to step from `current` to `target`
+ * within `cycle`. Returns null when either mode isn't in the cycle (caller
+ * should treat as "unreachable — needs a respawn"). Returns 0 when already
+ * at the target — caller can skip the keystrokes.
+ */
+export function cycleDistance(cycle: string[], current: string, target: string): number | null {
+  const curIdx = cycle.indexOf(current);
+  const tgtIdx = cycle.indexOf(target);
+  if (curIdx < 0 || tgtIdx < 0) return null;
+  return (tgtIdx - curIdx + cycle.length) % cycle.length;
+}
+
+/**
  * Encode an absolute filesystem path the way Claude Code does for its project
  * directory name under `~/.claude/projects/`. Every `/` AND `.` becomes `-` —
  * so `/Users/me/.agetor/x` collapses to `-Users-me--agetor-x` (note the
@@ -459,6 +515,23 @@ interface SessionState {
    *  waiting on `done`. Cleared after the first fire. Untouched on freshly-
    *  spawned sessions (those resolve via the turn slot's promise instead). */
   onEndOfTurn: (() => void) | null;
+  /**
+   * Most recently observed claude permission mode (canonical string from
+   * the JSONL `system` / `permission-mode` events — `default` / `acceptEdits`
+   * / `plan` / `bypassPermissions` / `auto` / `dontAsk`). Null until claude
+   * emits its first event. `cycleToMode` reads this to compute how many
+   * Shift+Tab presses are needed to land on the target.
+   */
+  permissionMode: string | null;
+  /**
+   * Whether `bypassPermissions` is in this session's Shift+Tab cycle. True
+   * iff the session was launched with `--dangerously-skip-permissions` (the
+   * agetor `bypass` mode emits exactly that). Reattached sessions default
+   * to false — we don't persist the launch flag across agetor restarts, so
+   * mid-cycle to bypass after a restart isn't supported (would need a
+   * respawn anyway, since claude requires the enabling flag at launch).
+   */
+  bypassEnabled: boolean;
 }
 
 interface TurnSlot {
@@ -555,6 +628,20 @@ function dispatchLine(state: SessionState, line: string): void {
     return;
   }
   const uuid = typeof evt.uuid === "string" ? evt.uuid : undefined;
+
+  // Mirror permission-mode events into SessionState so cycleToMode knows
+  // where claude is right now. This MUST run before the dedup early-return
+  // below: on reattach, `seenLineUuids` is pre-seeded from `run_events`, so
+  // the historical system/permission-mode lines would otherwise be silently
+  // skipped and `state.permissionMode` would stay null until claude emitted
+  // a fresh mode event. permissionMode is session metadata, not a per-line
+  // chunk the user sees twice — it's safe (and necessary) to update it on
+  // dedup hits.
+  if ((evt.type === "system" || evt.type === "permission-mode")
+    && typeof evt.permissionMode === "string") {
+    state.permissionMode = evt.permissionMode;
+  }
+
   if (uuid && state.seenLineUuids.has(uuid)) return;
 
   const slot = state.turnQueue[0];
@@ -769,6 +856,11 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
     lastChunk: null,
     seenLineUuids: new Set(),
     onEndOfTurn: null,
+    permissionMode: null,
+    // `bypass` is the only agetor mode that emits the launch flag
+    // (--dangerously-skip-permissions) — that's what puts
+    // `bypassPermissions` into the Shift+Tab cycle.
+    bypassEnabled: opts.mode === "bypass",
   };
   sessions.set(opts.taskId, state);
 
@@ -871,6 +963,18 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
     lastChunk: opts.onChunk,
     seenLineUuids: opts.seenLineUuids,
     onEndOfTurn: () => resolveDone?.(0),
+    // Replaying the JSONL from offset 0 re-runs every historical
+    // `system` / `permission-mode` line through `dispatchLine`. The
+    // permissionMode update there sits above the seenLineUuids dedup
+    // check, so even when the line's uuid is already in the dedup set
+    // (pre-seeded from run_events on reattach) the field still gets
+    // overwritten with whatever mode claude is currently in.
+    permissionMode: null,
+    // The launch flag isn't persisted across agetor restarts, so we can't
+    // tell whether bypassPermissions is in the cycle on this reattach.
+    // Conservatively assume not — cycling to bypass after a restart needs
+    // a respawn (claude requires the flag at launch anyway).
+    bypassEnabled: false,
   };
   // Belt to reconcileOrphans's sort-and-dedup suspender: if some prior
   // reattach (or other code path) already left a SessionState in the map
@@ -943,14 +1047,86 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
  * whether to spawn fresh or surface an error.
  *
  * Used by the orchestrator to mirror inline config edits onto a live claude
- * session: `/permission-mode <id>`, `/model <id>`, `/effort <id>`. Keeping the
- * session alive preserves the conversation context across config changes.
+ * session: `/model <id>`, `/effort <id>`. (Permission-mode changes don't have
+ * a slash command — see `cycleToMode`.) Keeping the session alive preserves
+ * the conversation context across config changes.
  */
 export function sendSlashCommand(taskId: string, line: string): boolean {
   const state = sessions.get(taskId);
   if (!state) return false;
   pastePrompt(state.sessionName, line);
   return true;
+}
+
+export type CycleResult =
+  | { ok: true; presses: number; via: "noop" | "slash-plan" | "shift-tab" }
+  | { ok: false; reason: string };
+
+/**
+ * Switch a live claude session's permission mode to `targetAgetorMode` by
+ * sending the right number of `Shift+Tab` keystrokes (claude's only
+ * mid-session mode-switch mechanism — there's no `/permission-mode` slash
+ * command despite what the prior code assumed). For the `plan` target we
+ * prefer the `/plan` slash command instead: it's deterministic, doesn't
+ * depend on knowing the current mode, and works from anywhere.
+ *
+ * Returns:
+ *   - `{ ok: true, via: "noop" }` when the session is already at the target.
+ *   - `{ ok: true, via: "slash-plan" }` when we sent `/plan`.
+ *   - `{ ok: true, via: "shift-tab", presses: N }` when we sent N tabs.
+ *   - `{ ok: false, reason: "no live session" }` for an unknown task.
+ *   - `{ ok: false, reason: "current mode unknown" }` before claude's first
+ *     `system` event has arrived (rare — typically only at the very start of
+ *     a session before its first JSONL entry).
+ *   - `{ ok: false, reason: "unreachable in current cycle" }` when the
+ *     target isn't in this session's cycle. The most common case is asking
+ *     for `bypassPermissions` on a session that wasn't launched with the
+ *     enabling flag — a respawn is required.
+ *
+ * Caveat — first cycle to `auto`: claude shows a one-time opt-in modal the
+ * first time you cycle to auto on a given account. Our keystrokes pass
+ * through but the cycle pauses on the modal until the user (or some other
+ * keystroke) dismisses it. After the first acceptance, subsequent cycles
+ * work without intervention.
+ */
+export function cycleToMode(taskId: string, targetAgetorMode: string): CycleResult {
+  const state = sessions.get(taskId);
+  if (!state) return { ok: false, reason: "no live session" };
+  const target = toClaudeModeString(targetAgetorMode);
+
+  // `/plan` works from any state, no cycle math needed. Prefer it.
+  // No optimistic state update here — `pastePrompt` is fire-and-forget
+  // (its tmux load-buffer / paste-buffer / send-keys helpers swallow
+  // errors), so claiming success before claude has acknowledged would
+  // lie when the paste fails. The JSONL `permission-mode` event that
+  // follows `/plan` is the authoritative source.
+  if (target === CLAUDE_MODE_PLAN) {
+    pastePrompt(state.sessionName, "/plan");
+    return { ok: true, presses: 0, via: "slash-plan" };
+  }
+
+  const current = state.permissionMode;
+  if (!current) return { ok: false, reason: "current mode unknown" };
+  if (current === target) return { ok: true, presses: 0, via: "noop" };
+
+  const cycle = cycleOrderFor(state.bypassEnabled);
+  const presses = cycleDistance(cycle, current, target);
+  if (presses === null) {
+    return { ok: false, reason: `mode '${target}' not in this session's cycle` };
+  }
+  if (presses > 0) {
+    // One tmux invocation with N keys — cleaner than N sync spawns, and
+    // tmux delivers them as a single stream so claude's TUI doesn't get
+    // a chance to debounce them apart on slow terminals.
+    const keys = Array<string>(presses).fill("S-Tab");
+    tmux(["send-keys", "-t", state.sessionName, ...keys]);
+  }
+  // Optimistic local update. The JSONL `permission-mode` event will arrive
+  // shortly after and overwrite this with claude's authoritative value —
+  // if a press landed somewhere unexpected (e.g. account isn't auto-eligible)
+  // the event corrects state.
+  state.permissionMode = target;
+  return { ok: true, presses, via: "shift-tab" };
 }
 
 /**
@@ -1032,6 +1208,8 @@ export const __forTest = {
       lastChunk: null,
       seenLineUuids: new Set(),
       onEndOfTurn: null,
+      permissionMode: null,
+      bypassEnabled: false,
     };
     sessions.set(taskId, state);
     return state;
