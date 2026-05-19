@@ -198,7 +198,13 @@ test("POST /approvals — saved Edit rule still auto-allows in non-plan mode (re
     taskId: "t-saved-rule-auto",
     ruleEntry: "Edit(/tmp/**)",
   });
-  state.permissionMode = "auto"; // not plan
+  // `acceptEdits` is the mode that proves the saved-rule path: it isn't
+  // plan (so the saved-rule fast-path isn't skipped) and it isn't
+  // auto/bypass (so the auto-mode fast-path doesn't preempt it). If we
+  // used `auto` here the new auto-mode fast-path would short-circuit
+  // before lookupAllowRule runs and the test would silently stop
+  // exercising what its name claims.
+  state.permissionMode = "acceptEdits";
   const res = await fetch(url(`/approvals?taskId=t-saved-rule-auto`), {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },

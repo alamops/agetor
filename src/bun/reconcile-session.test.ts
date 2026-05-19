@@ -155,11 +155,14 @@ test("reconcileTaskSession refreshes the hook matcher to narrow on ask → auto"
   tasks.insert(before);
 
   // Install a synthetic claude-tmux session so cycleToMode finds the
-  // in-memory state. We don't actually press Shift+Tab — the test only
-  // exercises the hook-reinstall side effect.
+  // in-memory state. Seed `permissionMode` (claude's string for the
+  // launch mode) so cycleToMode gets past the "current mode unknown"
+  // early return and returns `ok: true` — the matcher refresh is gated
+  // on success.
   const jsonl = path.join(cwd, "session.jsonl");
   writeFileSync(jsonl, "");
-  __forTest.installSession("task-matcher-narrow", jsonl);
+  const state = __forTest.installSession("task-matcher-narrow", jsonl);
+  state.permissionMode = "default"; // claude string for agetor's `ask`
 
   const after: Task = { ...before, mode: "auto" };
   reconcileTaskSession("task-matcher-narrow", before, after);
@@ -179,17 +182,10 @@ test("reconcileTaskSession refreshes the hook matcher to full on auto → ask", 
   const cwd = mkdtempSync(path.join(tmpdir(), "agetor-matcher-full-"));
   const { mkdirSync } = await import("node:fs");
   mkdirSync(path.join(cwd, ".claude"), { recursive: true });
-  // Pre-seed with a narrow matcher — what a fresh auto-mode spawn would
-  // have written. The reinstall on mode change should widen it back to
-  // `.*` when the user goes back to `ask`.
-  writeFileSync(
-    path.join(cwd, ".claude", "settings.local.json"),
-    JSON.stringify({
-      hooks: {
-        PreToolUse: [{ matcher: "^(AskUserQuestion|ExitPlanMode)$", hooks: [] }],
-      },
-    }),
-  );
+  // Bare baseline. `readMatcher` filters by hook-command filename suffix,
+  // so any matcher the merge writes for agetor will be found by the
+  // assertion regardless of what else is in the file.
+  writeFileSync(path.join(cwd, ".claude", "settings.local.json"), "{}");
 
   const before = baseTask({
     id: "task-matcher-full",
@@ -202,11 +198,53 @@ test("reconcileTaskSession refreshes the hook matcher to full on auto → ask", 
 
   const jsonl = path.join(cwd, "session.jsonl");
   writeFileSync(jsonl, "");
-  __forTest.installSession("task-matcher-full", jsonl);
+  const state = __forTest.installSession("task-matcher-full", jsonl);
+  state.permissionMode = "auto"; // claude string for agetor's `auto`
 
   const after: Task = { ...before, mode: "ask" };
   reconcileTaskSession("task-matcher-full", before, after);
 
   expect(readMatcher(cwd)).toBe(".*");
   __forTest.uninstallSession("task-matcher-full");
+});
+
+test("reconcileTaskSession does NOT refresh the matcher when cycleToMode fails (unreachable target)", async () => {
+  // Asking for `bypass` on a session that wasn't launched with the
+  // enabling flag is unreachable via Shift+Tab — cycleToMode returns
+  // `ok: false`. Refreshing the matcher to bypass's narrow-no-mcp scope
+  // anyway would leave claude in `default` while agetor stopped routing
+  // tools through the hook, deadlocking the run on claude's own modal.
+  // Pin the gate so a future refactor can't quietly drop it.
+  const { reconcileTaskSession } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+
+  const cwd = mkdtempSync(path.join(tmpdir(), "agetor-matcher-skip-"));
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(path.join(cwd, ".claude"), { recursive: true });
+  writeFileSync(path.join(cwd, ".claude", "settings.local.json"), "{}");
+
+  const before = baseTask({
+    id: "task-matcher-skip",
+    workdir: cwd,
+    worktreePath: null,
+    isolation: "none",
+    mode: "ask",
+  });
+  tasks.insert(before);
+
+  const jsonl = path.join(cwd, "session.jsonl");
+  writeFileSync(jsonl, "");
+  const state = __forTest.installSession("task-matcher-skip", jsonl);
+  // Seed a real "current" mode so cycleToMode gets past the
+  // "current mode unknown" early return and into the cycle math —
+  // where it discovers `bypassPermissions` isn't reachable.
+  state.permissionMode = "default";
+
+  const after: Task = { ...before, mode: "bypass" };
+  reconcileTaskSession("task-matcher-skip", before, after);
+
+  // No agetor entry was written, so readMatcher returns undefined.
+  expect(readMatcher(cwd)).toBeUndefined();
+  __forTest.uninstallSession("task-matcher-skip");
 });

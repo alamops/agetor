@@ -585,22 +585,20 @@ export function reconcileTaskSession(taskId: string, before: Task, after: Task):
   if (before.mode !== after.mode && after.mode) {
     const result = cycleToMode(taskId, after.mode);
     emitModeChangeStatus(taskId, after.mode, result);
-    // Refresh the PreToolUse hook matcher so it lines up with the new
-    // mode. The matcher is set at spawn-time by `ensureInstalledForCwd`
-    // (narrow for auto/bypass, full for everything else) and a mid-
-    // session mode change otherwise leaves the launch-time matcher in
-    // place — that drives both the "auto over-approves" bug (full
-    // matcher caught every tool after a switch to auto) and its
-    // symmetric "ask under-prompts" bug (narrow matcher missed Bash
-    // after a switch back to ask). The `/approvals` route's auto/bypass
-    // fast-path covers the first direction even when claude doesn't re-
-    // read settings mid-session; this refresh is the only thing that
-    // covers the second direction, and it'll also start working live
-    // for both if/when claude picks up the settings change without a
-    // session restart. Cheap idempotent settings.local.json merge —
-    // user-added rules are preserved.
-    const cwd = after.worktreePath ?? after.workdir;
-    ensureInstalledForCwd(cwd, after.mode);
+    // Only refresh the PreToolUse matcher when the mode change actually
+    // took effect. Otherwise we'd narrow the matcher (e.g. to bypass's
+    // narrow-no-mcp scope) while claude is still in the old mode — the
+    // hook stops firing for routine Bash but claude's own permission
+    // modal still pops inside tmux, deadlocking the run. The matcher is
+    // set at spawn-time by `ensureInstalledForCwd` (narrow for auto/
+    // bypass, full for everything else); leaving it in place on a
+    // failed cycle preserves the existing intercept-and-surface flow,
+    // which is the right fallback for "we couldn't switch modes."
+    if (result.ok) {
+      const cwd = after.worktreePath ?? after.workdir;
+      const refreshed = ensureInstalledForCwd(cwd, after.mode);
+      if (!refreshed) emitMatcherRefreshFailure(taskId, cwd);
+    }
   }
   if (before.model !== after.model && after.model) {
     sendSlashCommand(taskId, `/model ${toClaudeModelArg(after.model)}`);
@@ -637,6 +635,25 @@ function emitModeChangeStatus(
   if (!data) return;
   runs.appendEvent(runId, "status", data);
   emit({ runId, taskId, stream: "status", data, ts });
+}
+
+/**
+ * Tell the user when the PreToolUse hook matcher couldn't be rewritten
+ * after a successful mode change. The mode itself did take effect on the
+ * live session, so the user sees claude responding to the new posture —
+ * but the on-disk matcher is stale, which on the next spawn (or on a
+ * mid-session settings-reread, if claude does that) would surface routine
+ * tools as approvals (or, in the other direction, swallow ones the user
+ * wanted prompts for). The most common cause is the user having
+ * hand-edited `.claude/settings.local.json` into malformed JSON — point
+ * them at the file so they can fix it.
+ */
+function emitMatcherRefreshFailure(taskId: string, cwd: string): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const data = `⚠️ mode took effect but the hook matcher couldn't be refreshed — check ${cwd}/.claude/settings.local.json for malformed JSON. The matcher will sync on the next session start.`;
+  runs.appendEvent(recent.id, "status", data);
+  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
 }
 
 export function cancelRun(runId: string): boolean {
