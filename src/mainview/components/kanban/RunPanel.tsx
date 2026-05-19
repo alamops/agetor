@@ -194,11 +194,15 @@ function RunPanelBody({
   const nearBottomRef = useRef(true);
 
   // Reset on task switch (no remount because we no longer key on task.id).
+  // Re-arm the auto-scroll heuristic so opening a different task pins the
+  // viewport to the most recent message instead of inheriting the previous
+  // task's scrolled-up position.
   useEffect(() => {
     setEvents([]);
     setRebuilt(null);
     setRebuildNote(null);
     setInteractions([]);
+    nearBottomRef.current = true;
   }, [task.id]);
 
   // Latest run for this task — drives the send button, indicator, and
@@ -297,10 +301,33 @@ function RunPanelBody({
     return unsub;
   }, [task.id]);
 
+  // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
+  // a user who scrolled up to read history is never yanked back down:
+  //   1. On every event / rebuild / interaction change, scroll once after
+  //      the React commit. Handles the steady-state streaming case.
+  //   2. On task switch, additionally loop on rAF for a short window. Events
+  //      stream in over multiple frames and rendered children (markdown,
+  //      code, tool results) keep growing scrollHeight after their initial
+  //      mount, so a single post-commit scroll can leave us short. The loop
+  //      bails the moment the user scrolls (nearBottomRef flips to false).
   useEffect(() => {
     if (!nearBottomRef.current) return;
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [events, rebuilt, interactions.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const deadline = performance.now() + 600;
+    const pin = () => {
+      if (cancelled || !nearBottomRef.current) return;
+      const el = logRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+      if (performance.now() < deadline) requestAnimationFrame(pin);
+    };
+    requestAnimationFrame(pin);
+    return () => { cancelled = true; };
+  }, [task.id]);
 
   // Auto-rebuild from the latest run's on-disk JSONL when the run is
   // finished and has a claude session id. The persisted `run_events`
