@@ -229,7 +229,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ value }),
     }),
-  listAgentCommands: (opts: { agent: AgentKind; workdir: string; branch?: string }) => {
+  listAgentCommands: (opts: { agent: string; workdir: string; branch?: string }) => {
+    // `agent` is a harness id (built-ins use id-equals-kind, so passing
+    // "claude-code" / "codex" still works). The server resolves to the
+    // harness via getByIdOrKind and reads commands/skills from the harness's
+    // own home when set.
     const q = new URLSearchParams({ agent: opts.agent });
     if (opts.workdir) q.set("workdir", opts.workdir);
     if (opts.branch) q.set("branch", opts.branch);

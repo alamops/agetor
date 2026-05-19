@@ -48,14 +48,17 @@ function alias(kind: AgentKind, opts: { home?: string; bin?: string; env?: Recor
 const claudeDefaults = { mode: "auto", model: "opus-4.7", effort: "high" } as const;
 const codexDefaults = { mode: "auto", model: "gpt-5-codex", effort: "high" } as const;
 
-test("aliased claude-code with HOME override emits HOME only (no CLAUDE_CONFIG_DIR)", () => {
+test("aliased claude-code with a config-dir override emits CLAUDE_CONFIG_DIR (not HOME)", () => {
+  // HOME is deliberately not overridden — see harnessEnv: re-homing breaks
+  // macOS keychain access for claude's "Claude Code-credentials" lookup and
+  // surfaces as "Not logged in" even with valid tokens.
   const result = buildCommand(
     alias("claude-code", { home: "/tmp/agetor-test/claude-2" }),
     "p",
     { ...claudeDefaults },
   );
-  expect(result.env?.HOME).toBe("/tmp/agetor-test/claude-2");
-  expect(result.env?.CLAUDE_CONFIG_DIR).toBeUndefined();
+  expect(result.env?.CLAUDE_CONFIG_DIR).toBe("/tmp/agetor-test/claude-2");
+  expect(result.env?.HOME).toBeUndefined();
 });
 
 test("aliased codex with HOME override emits HOME + CODEX_HOME", () => {

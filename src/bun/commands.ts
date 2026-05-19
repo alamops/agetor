@@ -101,6 +101,13 @@ function discoverSkills(dir: string, source: "user" | "project"): AvailableComma
  * entries are read from the workdir's `.claude/` (or `.codex/`) tree when the
  * workdir exists. Project entries override user entries by name.
  *
+ * `harnessHome` is the harness-level config-dir override (from `Harness.home`):
+ *  - claude-code: CLAUDE_CONFIG_DIR=<harnessHome>, so user commands/skills live
+ *    directly under it (no `.claude/` segment, matching what spawned claude sees).
+ *  - codex: HOME=<harnessHome>, so user prompts live at <harnessHome>/.codex/prompts.
+ *  - NULL: fall back to the agetor process homedir + the default `.claude/`
+ *    or `.codex/` layout.
+ *
  * Branch is accepted but not used to swap filesystem views — when the user
  * picks a different branch, the worktree will be checked out from that branch
  * at task-start, but for autocomplete we read what the user currently has on
@@ -112,20 +119,24 @@ export async function listAvailableCommands(opts: {
   agent: AgentKind;
   workdir: string | null;
   branch?: string | null;
+  harnessHome?: string | null;
 }): Promise<AvailableCommand[]> {
-  const home = homedir();
   const all: AvailableCommand[] = [];
 
   if (opts.agent === "claude-code") {
-    all.push(...discoverCommands(path.join(home, ".claude", "commands"), "user"));
-    all.push(...discoverSkills(path.join(home, ".claude", "skills"), "user"));
+    const userCmdRoot = opts.harnessHome ?? path.join(homedir(), ".claude");
+    all.push(...discoverCommands(path.join(userCmdRoot, "commands"), "user"));
+    all.push(...discoverSkills(path.join(userCmdRoot, "skills"), "user"));
     if (opts.workdir) {
       const root = (await repoRoot(opts.workdir)) ?? opts.workdir;
       all.push(...discoverCommands(path.join(root, ".claude", "commands"), "project"));
       all.push(...discoverSkills(path.join(root, ".claude", "skills"), "project"));
     }
   } else if (opts.agent === "codex") {
-    all.push(...discoverCommands(path.join(home, ".codex", "prompts"), "user"));
+    const userCmdRoot = opts.harnessHome
+      ? path.join(opts.harnessHome, ".codex")
+      : path.join(homedir(), ".codex");
+    all.push(...discoverCommands(path.join(userCmdRoot, "prompts"), "user"));
     if (opts.workdir) {
       const root = (await repoRoot(opts.workdir)) ?? opts.workdir;
       all.push(...discoverCommands(path.join(root, ".codex", "prompts"), "project"));
