@@ -67,7 +67,7 @@ test("detectClaudeNativeInstall returns null when claude is not a native install
 
 test("linkClaudeNativeBinIntoHome populates a fresh harness HOME with the integrity symlink", () => {
   const { symlink } = installFakeClaude();
-  const harnessHome = path.join(sandbox, "harness", "claude-bravo");
+  const harnessHome = path.join(sandbox, "harness", "claude-alt");
   mkdirSync(harnessHome, { recursive: true });
 
   const result = linkClaudeNativeBinIntoHome(harnessHome);

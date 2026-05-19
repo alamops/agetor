@@ -88,9 +88,9 @@ function plantFakeNativeClaude(): { harnessHome: string } {
 test("claude-code alias is unavailable when the native-install integrity symlink is missing", async () => {
   const { harnessHome } = plantFakeNativeClaude();
   const alias: Harness = {
-    id: "claude-bravo",
+    id: "claude-alt",
     kind: "claude-code",
-    label: "Claude (bravo)",
+    label: "Claude (alt)",
     isBuiltin: false,
     home: harnessHome,
     bin: null,
@@ -115,9 +115,9 @@ test("claude-code alias is available when the integrity symlink is present", asy
   symlinkSync("/bin/echo", path.join(harnessBin, "claude"));
 
   const alias: Harness = {
-    id: "claude-bravo",
+    id: "claude-alt",
     kind: "claude-code",
-    label: "Claude (bravo)",
+    label: "Claude (alt)",
     isBuiltin: false,
     home: harnessHome,
     bin: null,
