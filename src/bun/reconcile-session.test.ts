@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Task } from "../shared/types.ts";
@@ -115,4 +115,98 @@ test("reconcileTaskSession ignores codex tasks (no live tmux for codex)", async 
   const before = baseTask({ agent: "codex", mode: "auto" });
   const after = baseTask({ agent: "codex", mode: "ask" });
   expect(() => reconcileTaskSession("t1", before, after)).not.toThrow();
+});
+
+/** Find the matcher on agetor's own PreToolUse entry (identified by the
+ *  hook command's filename suffix). User-installed entries with their own
+ *  matchers may sit alongside ours after the merge — reading `[0]` would
+ *  see whichever happens to be first. */
+function readMatcher(cwd: string): string | undefined {
+  const settings = JSON.parse(
+    readFileSync(path.join(cwd, ".claude", "settings.local.json"), "utf-8"),
+  ) as { hooks?: { PreToolUse?: Array<{ matcher?: string; hooks?: Array<{ command?: string }> }> } };
+  const entries = settings.hooks?.PreToolUse ?? [];
+  for (const e of entries) {
+    const cmd = e.hooks?.[0]?.command ?? "";
+    if (cmd.endsWith("agetor-approval-hook.sh")) return e.matcher;
+  }
+  return undefined;
+}
+
+test("reconcileTaskSession refreshes the hook matcher to narrow on ask → auto", async () => {
+  const { reconcileTaskSession } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+
+  const cwd = mkdtempSync(path.join(tmpdir(), "agetor-matcher-narrow-"));
+  // Pre-seed a bare settings.local.json so ensureInstalledMerged has a
+  // non-malformed base to merge into.
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(path.join(cwd, ".claude"), { recursive: true });
+  writeFileSync(path.join(cwd, ".claude", "settings.local.json"), "{}");
+
+  const before = baseTask({
+    id: "task-matcher-narrow",
+    workdir: cwd,
+    worktreePath: null,
+    isolation: "none",
+    mode: "ask",
+  });
+  tasks.insert(before);
+
+  // Install a synthetic claude-tmux session so cycleToMode finds the
+  // in-memory state. We don't actually press Shift+Tab — the test only
+  // exercises the hook-reinstall side effect.
+  const jsonl = path.join(cwd, "session.jsonl");
+  writeFileSync(jsonl, "");
+  __forTest.installSession("task-matcher-narrow", jsonl);
+
+  const after: Task = { ...before, mode: "auto" };
+  reconcileTaskSession("task-matcher-narrow", before, after);
+
+  // Auto mode → narrow matcher (only AskUserQuestion + ExitPlanMode hit
+  // the hook). Without the reinstall the file would still hold the
+  // baseline `{}` we wrote above (no matcher at all) or the FULL `.*`.
+  expect(readMatcher(cwd)).toBe("^(AskUserQuestion|ExitPlanMode)$");
+  __forTest.uninstallSession("task-matcher-narrow");
+});
+
+test("reconcileTaskSession refreshes the hook matcher to full on auto → ask", async () => {
+  const { reconcileTaskSession } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+
+  const cwd = mkdtempSync(path.join(tmpdir(), "agetor-matcher-full-"));
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(path.join(cwd, ".claude"), { recursive: true });
+  // Pre-seed with a narrow matcher — what a fresh auto-mode spawn would
+  // have written. The reinstall on mode change should widen it back to
+  // `.*` when the user goes back to `ask`.
+  writeFileSync(
+    path.join(cwd, ".claude", "settings.local.json"),
+    JSON.stringify({
+      hooks: {
+        PreToolUse: [{ matcher: "^(AskUserQuestion|ExitPlanMode)$", hooks: [] }],
+      },
+    }),
+  );
+
+  const before = baseTask({
+    id: "task-matcher-full",
+    workdir: cwd,
+    worktreePath: null,
+    isolation: "none",
+    mode: "auto",
+  });
+  tasks.insert(before);
+
+  const jsonl = path.join(cwd, "session.jsonl");
+  writeFileSync(jsonl, "");
+  __forTest.installSession("task-matcher-full", jsonl);
+
+  const after: Task = { ...before, mode: "ask" };
+  reconcileTaskSession("task-matcher-full", before, after);
+
+  expect(readMatcher(cwd)).toBe(".*");
+  __forTest.uninstallSession("task-matcher-full");
 });

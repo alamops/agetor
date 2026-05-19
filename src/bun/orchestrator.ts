@@ -43,6 +43,7 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName } from "./worktree.ts";
+import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
   ColumnId,
   GlobalEvent,
@@ -584,6 +585,22 @@ export function reconcileTaskSession(taskId: string, before: Task, after: Task):
   if (before.mode !== after.mode && after.mode) {
     const result = cycleToMode(taskId, after.mode);
     emitModeChangeStatus(taskId, after.mode, result);
+    // Refresh the PreToolUse hook matcher so it lines up with the new
+    // mode. The matcher is set at spawn-time by `ensureInstalledForCwd`
+    // (narrow for auto/bypass, full for everything else) and a mid-
+    // session mode change otherwise leaves the launch-time matcher in
+    // place — that drives both the "auto over-approves" bug (full
+    // matcher caught every tool after a switch to auto) and its
+    // symmetric "ask under-prompts" bug (narrow matcher missed Bash
+    // after a switch back to ask). The `/approvals` route's auto/bypass
+    // fast-path covers the first direction even when claude doesn't re-
+    // read settings mid-session; this refresh is the only thing that
+    // covers the second direction, and it'll also start working live
+    // for both if/when claude picks up the settings change without a
+    // session restart. Cheap idempotent settings.local.json merge —
+    // user-added rules are preserved.
+    const cwd = after.worktreePath ?? after.workdir;
+    ensureInstalledForCwd(cwd, after.mode);
   }
   if (before.model !== after.model && after.model) {
     sendSlashCommand(taskId, `/model ${toClaudeModelArg(after.model)}`);
