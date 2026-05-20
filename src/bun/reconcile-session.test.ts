@@ -58,7 +58,7 @@ test("reconcileTaskSession resets mode/model/effort when the harness kind change
   tasks.insert(before);
 
   const after: Task = { ...before, agent: "codex-alias" };
-  reconcileTaskSession(before.id, before, after);
+  await reconcileTaskSession(before.id, before, after);
 
   const updated = tasks.get(before.id)!;
   // Reset mode → codex's first option (auto), and model/effort cleared.
@@ -83,7 +83,7 @@ test("reconcileTaskSession preserves mode/model/effort on same-kind alias swap",
   tasks.insert(before);
 
   const after: Task = { ...before, agent: "claude-alt" };
-  reconcileTaskSession(before.id, before, after);
+  await reconcileTaskSession(before.id, before, after);
 
   const updated = tasks.get(before.id)!;
   // Same kind → ids stay valid → keep the picks.
@@ -98,7 +98,7 @@ test("reconcileTaskSession is a no-op when there's no live tmux session", async 
   // simply return without throwing.
   const before = baseTask({ mode: "auto", model: null, effort: null });
   const after = baseTask({ mode: "plan", model: "opus-4.7", effort: "high" });
-  expect(() => reconcileTaskSession("nonexistent-task", before, after)).not.toThrow();
+  await expect(reconcileTaskSession("nonexistent-task", before, after)).resolves.toBeUndefined();
 });
 
 test("reconcileTaskSession drops the claude session when the agent flips", async () => {
@@ -107,14 +107,14 @@ test("reconcileTaskSession drops the claude session when the agent flips", async
   // exits cleanly (dropSession is best-effort and no-ops without a session).
   const before = baseTask({ agent: "claude-code" });
   const after = baseTask({ agent: "codex" });
-  expect(() => reconcileTaskSession("t1", before, after)).not.toThrow();
+  await expect(reconcileTaskSession("t1", before, after)).resolves.toBeUndefined();
 });
 
 test("reconcileTaskSession ignores codex tasks (no live tmux for codex)", async () => {
   const { reconcileTaskSession } = await import("./orchestrator.ts");
   const before = baseTask({ agent: "codex", mode: "auto" });
   const after = baseTask({ agent: "codex", mode: "ask" });
-  expect(() => reconcileTaskSession("t1", before, after)).not.toThrow();
+  await expect(reconcileTaskSession("t1", before, after)).resolves.toBeUndefined();
 });
 
 /** Find the matcher on agetor's own PreToolUse entry (identified by the

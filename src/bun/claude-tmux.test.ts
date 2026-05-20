@@ -1,5 +1,12 @@
 import { test, expect } from "bun:test";
 import { homedir } from "node:os";
+
+// cycleToMode's tmux send-keys call runs `Bun.spawnSync` on the tmux
+// binary; point it at /bin/echo so the per-press spawn is fast and the
+// (irrelevant) exit code stays 0 instead of depending on whether real
+// tmux is installed on the test host.
+process.env.AGETOR_TMUX_BIN = "/bin/echo";
+
 import {
   CLAUDE_MODE_ACCEPT_EDITS,
   CLAUDE_MODE_AUTO,
@@ -8,6 +15,7 @@ import {
   CLAUDE_MODE_PLAN,
   cycleDistance,
   cycleOrderFor,
+  cycleToMode,
   encodeProjectPath,
   isAgetorInterceptReply,
   jsonlPathFor,
@@ -28,9 +36,11 @@ test("jsonlPathFor with home=null falls back to the system homedir", () => {
   expect(p).toContain(encodeProjectPath("/a/b"));
 });
 
-test("jsonlPathFor honors a per-harness HOME override", () => {
+test("jsonlPathFor honors a per-harness CLAUDE_CONFIG_DIR override", () => {
+  // claude treats CLAUDE_CONFIG_DIR as the `.claude/` equivalent, so the
+  // override path itself is the root — no `.claude/` segment in between.
   const p = jsonlPathFor("/a/b", "session-uuid", "/tmp/alt-home");
-  expect(p).toBe(`/tmp/alt-home/.claude/projects/${encodeProjectPath("/a/b")}/session-uuid.jsonl`);
+  expect(p).toBe(`/tmp/alt-home/projects/${encodeProjectPath("/a/b")}/session-uuid.jsonl`);
 });
 
 test("encodeProjectPath turns every slash and dot into a dash", () => {
@@ -421,4 +431,177 @@ test("dispatchLine: permissionMode still updates when the event's uuid is alread
   }));
   expect(state.permissionMode).toBe("bypassPermissions");
   __forTest.uninstallSession(taskId);
+});
+
+test("cycleToMode: noop when already at target", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cycle-noop";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  state.permissionMode = CLAUDE_MODE_ACCEPT_EDITS;
+  const result = await cycleToMode(taskId, "acceptEdits");
+  expect(result).toEqual({ ok: true, presses: 0, via: "noop" });
+  __forTest.uninstallSession(taskId);
+});
+
+test("cycleToMode: returns 'current mode unknown' before claude's first event", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cycle-unknown";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  expect(state.permissionMode).toBeNull();
+  const result = await cycleToMode(taskId, "auto");
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.reason).toBe("current mode unknown");
+  __forTest.uninstallSession(taskId);
+});
+
+test("cycleToMode: success on first attempt when the JSONL event reports the target", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cycle-success";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  state.permissionMode = CLAUDE_MODE_DEFAULT;
+  // cycleToMode installs the listener synchronously inside the Promise
+  // executor before tmux send-keys runs, so a synchronous dispatchLine
+  // call after invoking it (but before the await) fires the listener and
+  // resolves the verification.
+  const pending = cycleToMode(taskId, "auto");
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "permission-mode",
+    permissionMode: CLAUDE_MODE_AUTO,
+  }));
+  const result = await pending;
+  // Cycle: [default, acceptEdits, plan, auto] — 3 presses.
+  expect(result).toEqual({ ok: true, presses: 3, via: "shift-tab" });
+  __forTest.uninstallSession(taskId);
+});
+
+test("cycleToMode: retries from the newly-observed mode when the first press lands short", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cycle-retry";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  state.permissionMode = CLAUDE_MODE_DEFAULT;
+  // First attempt: dispatch a "wrong" mode (acceptEdits) so cycleToMode
+  // observes the mismatch and retries. Second attempt: dispatch the target.
+  const pending = cycleToMode(taskId, "auto");
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "permission-mode",
+    permissionMode: CLAUDE_MODE_ACCEPT_EDITS,
+  }));
+  // Yield once so cycleToMode's await-continuation can install the next
+  // listener before we fire the next synthetic event.
+  await Promise.resolve();
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "permission-mode",
+    permissionMode: CLAUDE_MODE_AUTO,
+  }));
+  const result = await pending;
+  // Attempt 1: default → auto = 3 presses (lands on acceptEdits instead).
+  // Attempt 2: acceptEdits → auto = 2 presses. Total: 5.
+  expect(result).toEqual({ ok: true, presses: 5, via: "shift-tab" });
+  __forTest.uninstallSession(taskId);
+});
+
+test("cycleToMode: returns 'verification timed out' when no JSONL event follows", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevTimeout = __forTest.setModeVerifyTimeoutMs(20);
+  try {
+    const taskId = "task-cycle-timeout";
+    const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+    state.permissionMode = CLAUDE_MODE_DEFAULT;
+    const result = await cycleToMode(taskId, "auto");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("verification timed out");
+      expect(result.attempts).toBe(1);
+      // lastObserved should still be the pre-press mode because the JSONL
+      // event never arrived to update it.
+      expect(result.lastObserved).toBe(CLAUDE_MODE_DEFAULT);
+    }
+    // Listener slot must be cleared after the timeout so a late event
+    // can't fire on a stale resolver.
+    expect(state.onPermissionMode).toBeNull();
+    __forTest.uninstallSession(taskId);
+  } finally {
+    __forTest.setModeVerifyTimeoutMs(prevTimeout);
+  }
+});
+
+test("cycleToMode: gives up with 'verification mismatch' after MAX_VERIFY_ATTEMPTS wrong modes", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cycle-mismatch";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  state.permissionMode = CLAUDE_MODE_DEFAULT;
+  const pending = cycleToMode(taskId, "auto");
+  // Three wrong modes back to back — exhausts MAX_VERIFY_ATTEMPTS.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "permission-mode",
+    permissionMode: CLAUDE_MODE_ACCEPT_EDITS,
+  }));
+  // Yield once so cycleToMode's await-continuation can install the next
+  // listener before we fire the next synthetic event.
+  await Promise.resolve();
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "permission-mode",
+    permissionMode: CLAUDE_MODE_PLAN,
+  }));
+  // Yield once so cycleToMode's await-continuation can install the next
+  // listener before we fire the next synthetic event.
+  await Promise.resolve();
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "permission-mode",
+    permissionMode: CLAUDE_MODE_DEFAULT,
+  }));
+  const result = await pending;
+  expect(result.ok).toBe(false);
+  if (!result.ok) {
+    expect(result.reason).toBe("verification mismatch");
+    expect(result.attempts).toBe(__forTest.MAX_VERIFY_ATTEMPTS);
+    expect(result.lastObserved).toBe(CLAUDE_MODE_DEFAULT);
+  }
+  __forTest.uninstallSession(taskId);
+});
+
+test("cycleToMode: /plan target bypasses the verify loop entirely", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cycle-plan";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  state.permissionMode = CLAUDE_MODE_DEFAULT;
+  // No dispatched event — /plan returns immediately without waiting.
+  const result = await cycleToMode(taskId, "plan");
+  expect(result).toEqual({ ok: true, presses: 0, via: "slash-plan" });
+  expect(state.onPermissionMode).toBeNull();
+  __forTest.uninstallSession(taskId);
+});
+
+test("cycleToMode: overlapping calls don't clobber each other's listeners", async () => {
+  // Identity-guard regression test: without the `state.onPermissionMode
+  // === myListener` check in the timeout handler, the earlier call's
+  // setTimeout would null out the *later* call's listener, causing both
+  // calls to falsely time out. With the guard, the later caller wins
+  // (its listener fires on the next JSONL event) and the earlier caller
+  // gracefully times out without affecting the later one.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const prevTimeout = __forTest.setModeVerifyTimeoutMs(40);
+  try {
+    const taskId = "task-cycle-race";
+    const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+    state.permissionMode = CLAUDE_MODE_DEFAULT;
+
+    // Two overlapping calls. `b` is launched synchronously after `a`,
+    // so by the time the dispatch fires the session slot holds b's
+    // listener. b should win; a should fall through to timeout.
+    const a = cycleToMode(taskId, "auto");
+    const b = cycleToMode(taskId, "acceptEdits");
+    __forTest.dispatchLine(state, JSON.stringify({
+      type: "permission-mode",
+      permissionMode: CLAUDE_MODE_ACCEPT_EDITS,
+    }));
+    const [ra, rb] = await Promise.all([a, b]);
+
+    expect(rb).toEqual({ ok: true, presses: 1, via: "shift-tab" });
+    expect(ra.ok).toBe(false);
+    if (!ra.ok) expect(ra.reason).toBe("verification timed out");
+    __forTest.uninstallSession(taskId);
+  } finally {
+    __forTest.setModeVerifyTimeoutMs(prevTimeout);
+  }
 });

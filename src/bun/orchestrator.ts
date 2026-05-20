@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { db, tasks, runs, harnesses } from "./db.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
-import { prepareClaudeHarnessHome } from "./harness-setup.ts";
 import {
   AGENT_OPTIONS,
   DEFAULT_EFFORT,
@@ -225,7 +224,7 @@ export function reconcileOrphans(): number {
         taskId: row.task_id,
         cwd,
         sessionId: row.claude_session_id as string,
-        home: harness?.home ?? null,
+        configDir: harness?.home ?? null,
         onChunk,
         seenLineUuids: runs.seenLineUuids(row.id),
       });
@@ -321,15 +320,6 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // blocked. The user re-enables in Settings to recover.
   if (!harness.enabled) {
     return { error: `${harness.label} is disabled — re-enable it in Settings to start new runs.` };
-  }
-  // Self-heal for claude-code aliases created before the harness-setup fix
-  // shipped: pre-link the native-install integrity-check path so checkHarness
-  // (and the subsequent spawn) doesn't trip on `installMethod is native, but
-  // claude command not found at <harness home>/.local/bin/claude`. Idempotent
-  // and gated on `bin` being unset so users who pinned an explicit binary
-  // keep full control.
-  if (harness.kind === "claude-code" && harness.home && !harness.bin) {
-    prepareClaudeHarnessHome(harness.home);
   }
   const status = await checkHarness(harness);
   if (!status.available) {
@@ -555,7 +545,7 @@ function attachDoneHandler(
  *   • Anything else (codex; no live session): no-op — the change just
  *     persists for the next spawn.
  */
-export function reconcileTaskSession(taskId: string, before: Task, after: Task): void {
+export async function reconcileTaskSession(taskId: string, before: Task, after: Task): Promise<void> {
   const beforeKind = resolveHarness(before.agent)?.kind ?? null;
   const afterKind = resolveHarness(after.agent)?.kind ?? null;
   // Treat any harness id change as a session-killing event for claude — the
@@ -583,7 +573,7 @@ export function reconcileTaskSession(taskId: string, before: Task, after: Task):
   // and there's no canonical "unset" mode to dial claude back to, so
   // silently keeping the current posture is the least-surprising option.
   if (before.mode !== after.mode && after.mode) {
-    const result = cycleToMode(taskId, after.mode);
+    const result = await cycleToMode(taskId, after.mode);
     emitModeChangeStatus(taskId, after.mode, result);
     // Only refresh the PreToolUse matcher when the mode change actually
     // took effect. Otherwise we'd narrow the matcher (e.g. to bypass's
@@ -631,7 +621,7 @@ function emitModeChangeStatus(
     ? (result.via === "noop"
       ? null
       : `mode → ${agetorMode} (${result.via === "slash-plan" ? "via /plan" : `via Shift+Tab ×${result.presses}`})`)
-    : `⚠️ mode change to ${agetorMode} skipped: ${result.reason} — stop the run and start again to apply.`;
+    : formatModeChangeFailure(agetorMode, result);
   if (!data) return;
   runs.appendEvent(runId, "status", data);
   emit({ runId, taskId, stream: "status", data, ts });
@@ -654,6 +644,35 @@ function emitMatcherRefreshFailure(taskId: string, cwd: string): void {
   const data = `⚠️ mode took effect but the hook matcher couldn't be refreshed — check ${cwd}/.claude/settings.local.json for malformed JSON. The matcher will sync on the next session start.`;
   runs.appendEvent(recent.id, "status", data);
   emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+}
+
+/**
+ * Build the user-facing warning string for an unsuccessful `cycleToMode`
+ * outcome. Switch is exhaustive on `result.reason` (a literal union); the
+ * TS compiler flags any future reason that isn't handled here. The
+ * verification-* reasons carry the most diagnostic value — we surface
+ * the observed mode so the user can see exactly where claude landed.
+ */
+function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult, { ok: false }>): string {
+  const seen = result.lastObserved ?? "unknown";
+  switch (result.reason) {
+    case "verification timed out": {
+      // The auto opt-in modal is by far the most common reason a press
+      // produces no JSONL event, but only when the target is `auto`. For
+      // any other target the modal advice is misleading, so we drop it.
+      const tail = agetorMode === "auto"
+        ? " If this is the first time cycling to auto on this account, accept the opt-in prompt in the run panel and try again."
+        : "";
+      return `⚠️ mode change to ${agetorMode}: claude didn't acknowledge after ${result.attempts ?? "?"} attempt(s) (last seen: ${seen}).${tail}`;
+    }
+    case "verification mismatch":
+      return `⚠️ mode change to ${agetorMode} failed after ${result.attempts ?? "?"} attempt(s) (claude landed on ${seen}). Your account may not have access to this mode — pick a different one in the task details.`;
+    case "mode not in cycle":
+      return `⚠️ mode change to ${agetorMode} skipped: '${result.target ?? agetorMode}' isn't in this session's Shift+Tab cycle — stop the run and start again with that mode at launch.`;
+    case "no live session":
+    case "current mode unknown":
+      return `⚠️ mode change to ${agetorMode} skipped: ${result.reason} — stop the run and start again to apply.`;
+  }
 }
 
 export function cancelRun(runId: string): boolean {

@@ -134,14 +134,16 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   useEffect(() => {
     if (!workdir.trim()) { setAgentCommands([]); return; }
     let cancelled = false;
-    // `/agent-commands` keys on AgentKind, so resolve the harness's kind
-    // before querying. Alias-of-claude shares its parent's command list.
+    // Pass the harness id (not just the kind) so aliased multi-account
+    // harnesses read their own per-harness commands/skills — the server
+    // resolves it via getByIdOrKind, so a built-in's id-equals-kind is still
+    // honored unchanged.
     api
-      .listAgentCommands({ agent: kind, workdir: workdir.trim(), branch: baseRef.trim() || undefined })
+      .listAgentCommands({ agent, workdir: workdir.trim(), branch: baseRef.trim() || undefined })
       .then((cmds) => { if (!cancelled) setAgentCommands(cmds); })
       .catch(() => { if (!cancelled) setAgentCommands([]); });
     return () => { cancelled = true; };
-  }, [kind, workdir, baseRef]);
+  }, [agent, workdir, baseRef]);
 
   // Per-kind cache so switching aliases-of-the-same-kind preserves the prior
   // picks (mode/model/effort are kind-specific, not alias-specific).
