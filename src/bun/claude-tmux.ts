@@ -293,6 +293,13 @@ interface ParsedJsonlEvent {
    *  `task-notification` (background `run_in_background` Bash completions);
    *  if claude adds more synthetic kinds, extend the filter below. */
   origin?: { kind?: string };
+  /** Claude sets this on `user` entries it injects itself (slash-command
+   *  caveats, skill base-dir injections, "tool call was malformed" retries,
+   *  Stop-hook notices, …) rather than the human typing them. Genuine human
+   *  prompts and tool_result envelopes are `isMeta:null`, so this is a reliable
+   *  "not a real turn" marker. We demote any isMeta entry to a status
+   *  breadcrumb. `origin.kind` (above) is a narrower, nicer-summarized subset. */
+  isMeta?: boolean;
 }
 
 export function mapJsonlEventToChunks(
@@ -339,6 +346,33 @@ function mapParsedEventToChunks(
         const text = typeof content === "string" ? content : "";
         const summary = /<summary>([\s\S]*?)<\/summary>/.exec(text)?.[1]?.trim();
         onChunk("status", summary ? `background task: ${summary}` : "background task completed", uuid);
+        return { endOfTurn: false, lineUuid: uuid };
+      }
+      // Any other synthetic user entry: claude flags messages it injects on the
+      // user's behalf with `isMeta: true` (slash-command caveats, skill base-dir
+      // injections, malformed-tool-call retries, Stop-hook notices). These are
+      // NOT human turns — demote to a dim status breadcrumb, never a YOU bubble.
+      // Human prompts and tool_result envelopes are `isMeta:null`, so this is safe.
+      if (evt.isMeta === true) {
+        const hasContent =
+          (typeof content === "string" && content.length > 0) ||
+          (Array.isArray(content) && content.length > 0);
+        const text =
+          typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content.filter((b) => b?.type === "text").map((b) => b.text ?? "").join(" ")
+              : "";
+        // Strip a leading wrapper tag (`<local-command-caveat>`, `<task-notification>`,
+        // …) so the breadcrumb reads as prose rather than raw markup.
+        const firstLine =
+          text.replace(/^\s*<[^>]+>/, "").split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+        const summary = firstLine.length > 140 ? firstLine.slice(0, 137) + "…" : firstLine;
+        // Never let a synthetic entry vanish without a trace: if it had content
+        // but yielded no text line (e.g. a non-text block), emit a generic label
+        // instead of silently dropping it. Truly empty entries stay silent.
+        const data = summary || (hasContent ? "synthetic message" : "");
+        if (data) onChunk("status", data, uuid);
         return { endOfTurn: false, lineUuid: uuid };
       }
       // The human's interactive turn. We DO emit a "user" stream event
