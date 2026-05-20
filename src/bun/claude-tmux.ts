@@ -687,6 +687,23 @@ async function waitForJsonlAt(
   });
 }
 
+/**
+ * Tail-cursor position for a pre-existing JSONL — used by the resume path
+ * in `spawnClaudeViaTmux` to park the cursor past everything claude already
+ * wrote, so historical `end_turn` markers can't pop the new turn slot and
+ * flip the freshly-created run to `succeeded` before claude has processed
+ * the new prompt. Returns 0 when the file doesn't exist (fresh spawn) or
+ * can't be stat'd (race), letting the tailer behave like a normal cold
+ * start.
+ */
+function resumeJsonlOffset(jsonlPath: string): number {
+  try {
+    return fsStatSync(jsonlPath).size;
+  } catch {
+    return 0;
+  }
+}
+
 /** Dispatch one parsed JSONL line through the active turn slot's handler,
  *  advancing the queue when the line ends a turn. Shared between the
  *  async `flush` (file watcher / poll) and the sync `flushSync` (called
@@ -1195,13 +1212,23 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // existing file at the same path). No mtime poll, no freshest-file pick.
   const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.home);
 
+  // When the JSONL already exists at spawn time, we're resuming a prior
+  // claude session (`--resume <id>` reopens the same file). The file holds
+  // the full historical conversation including past `end_turn` markers — if
+  // we tailed from offset 0 those historical `end_turn`s would pop the
+  // turn slot we're about to push and resolve the new run's `done`
+  // promise immediately, flipping the freshly-created run row to
+  // `succeeded` before claude has even processed the new prompt. Park the
+  // cursor at EOF so the tailer only sees what claude appends post-launch.
+  const initialOffset = resumeJsonlOffset(jsonlPath);
+
   // Allocate the per-session state up front so flush() can find it.
   const state: SessionState = {
     taskId: opts.taskId,
     sessionName,
     cwd: opts.cwd,
     jsonlPath,
-    offset: 0,
+    offset: initialOffset,
     watcher: null,
     pollTimer: null,
     turnQueue: [],
@@ -1211,9 +1238,13 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
     // Canonical claude mode string (e.g. "plan", "bypassPermissions"),
     // not the agetor-internal id ("plan", "bypass"). Seeding here means
     // the plan-mode safety check in `/approvals` works from the very
-    // first PreToolUse hook — before the JSONL has even been opened.
-    // The JSONL's `system` event will overwrite this within a tick if
-    // claude renegotiates, which is fine.
+    // first PreToolUse hook — before the JSONL has even been opened. The
+    // JSONL's `system` event will overwrite this within a tick if claude
+    // renegotiates, which is fine. On resume we deliberately keep
+    // sourcing from `opts.mode` (what claude is launched with) rather
+    // than the JSONL's last recorded mode — the user may have edited
+    // task.mode since the prior session, in which case the launch flags
+    // are the truth and the JSONL is stale.
     permissionMode: opts.mode ? toClaudeModeString(opts.mode) : null,
     // `bypass` is the only agetor mode that emits the launch flag
     // (--dangerously-skip-permissions) — that's what puts
@@ -1598,6 +1629,7 @@ export const __forTest = {
   dispatchLine,
   matchNumberedModal,
   matchYesNoModal,
+  resumeJsonlOffset,
 };
 
 /**

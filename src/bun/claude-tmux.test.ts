@@ -422,3 +422,42 @@ test("dispatchLine: permissionMode still updates when the event's uuid is alread
   expect(state.permissionMode).toBe("bypassPermissions");
   __forTest.uninstallSession(taskId);
 });
+
+test("resumeJsonlOffset: returns EOF for an existing JSONL so the tailer skips historical content", async () => {
+  // Pins the resume fix: when claude --resume reopens an existing JSONL,
+  // the tailer must NOT re-dispatch historical end_turn markers, or the
+  // freshly-pushed turn slot for the new prompt would pop on a stale
+  // event and flip the new run to `succeeded` before claude has even
+  // processed the prompt. The fix is to anchor state.offset at the file
+  // size at spawn time; this test verifies the helper that produces it.
+  const { mkdtempSync, writeFileSync, statSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = await import("node:path");
+  const { __forTest } = await import("./claude-tmux.ts");
+
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-resume-offset-"));
+  const jsonlPath = path.join(dir, "session.jsonl");
+  const historical = [
+    JSON.stringify({ type: "system", uuid: "u1", permissionMode: "default" }),
+    JSON.stringify({ type: "user", uuid: "u2", message: { role: "user", content: "hi" } }),
+    JSON.stringify({ type: "assistant", uuid: "u3", message: { role: "assistant", content: [], stop_reason: "end_turn" } }),
+  ].join("\n") + "\n";
+  writeFileSync(jsonlPath, historical);
+  const fileSize = statSync(jsonlPath).size;
+
+  // Offset must point at EOF so the tailer skips the historical end_turn
+  // marker on u3 — that was the source of the spurious `succeeded` flip.
+  expect(__forTest.resumeJsonlOffset(jsonlPath)).toBe(fileSize);
+});
+
+test("resumeJsonlOffset: returns 0 for a missing JSONL so a fresh spawn behaves like a cold start", async () => {
+  // Fresh-spawn path: the JSONL doesn't exist yet (claude creates it on
+  // boot), so the helper must return 0 — the tailer then reads from the
+  // very beginning when claude writes its first events.
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = await import("node:path");
+  const { __forTest } = await import("./claude-tmux.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-resume-missing-"));
+  expect(__forTest.resumeJsonlOffset(path.join(dir, "session.jsonl"))).toBe(0);
+});
