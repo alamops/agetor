@@ -755,7 +755,18 @@ export function startApiServer() {
           // Mirror behavioural changes onto a live claude session via slash
           // commands so the conversation context survives a model/mode/effort
           // change. Agent changes wipe the session — different harness entirely.
-          reconcileTaskSession(req.params.id, before, updated);
+          // Fire-and-forget: the mode-change path now verifies via the JSONL
+          // event before resolving, which can take up to 4.5s on the
+          // exhaust-retries path. The PATCH response payload only carries the
+          // updated Task row (already in hand); the verify outcome reaches
+          // the user through the `status` SSE events that
+          // `emitModeChangeStatus` writes. Blocking the response would add
+          // unbounded latency for no benefit. `.catch` keeps an unexpected
+          // throw from becoming an unhandledRejection — every failure mode
+          // the function knows about already surfaces via SSE.
+          reconcileTaskSession(req.params.id, before, updated).catch((err: unknown) => {
+            console.error("reconcileTaskSession failed:", err);
+          });
           return json(updated, { headers: corsHeaders(req) });
         }),
         DELETE: authed(async (req) => {
