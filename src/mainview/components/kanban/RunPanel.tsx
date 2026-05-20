@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Bot, ClipboardList, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
+  GitCommit, Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type PendingInteraction } from "@/lib/api";
@@ -431,6 +431,14 @@ function RunPanelBody({
   const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
+  // Whether the task's working tree has uncommitted changes. Drives the
+  // "Commit & push" action chip above the textarea. Reset to `false`
+  // whenever the latest run is not in a succeeded state so the chip
+  // disappears the moment a new turn starts (`send()` refreshes the runs
+  // list immediately, so `latestRun.status` flips to "running" within
+  // ~200ms of the click). A polling effect keeps the flag in sync with
+  // the actual git state while the run sits idle on success.
+  const [hasChanges, setHasChanges] = useState(false);
   // `/`-command and skill autocomplete for the send field. Same list the
   // New Task form uses — depends on (agent, workdir, branch) so a slash
   // command available in this project shows up here too.
@@ -457,6 +465,38 @@ function RunPanelBody({
     return () => { cancelled = true; };
   }, [kind, task.workdir, task.branch]);
 
+  // Keep `hasChanges` aligned with the latest run's terminal state. We only
+  // ever offer "Commit & push" when the latest run succeeded — any other
+  // status (running / failed / cancelled / orphaned / no runs yet) hides
+  // the chip. While in the succeeded state, poll every 5s so the chip
+  // disappears if the agent (or the user, from a separate terminal)
+  // commits the changes through another path. The loop is sequential
+  // (each tick waits for the previous git status to resolve before
+  // sleeping) so a slow `git status` can't produce out-of-order
+  // setHasChanges calls.
+  useEffect(() => {
+    if (latestRun?.status !== "succeeded") {
+      setHasChanges(false);
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      while (!cancelled) {
+        try {
+          const res = await api.getTaskGitStatus(task.id);
+          if (cancelled) return;
+          setHasChanges(res.hasChanges && !res.ignored);
+        } catch {
+          if (cancelled) return;
+          setHasChanges(false);
+        }
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    };
+    void tick();
+    return () => { cancelled = true; };
+  }, [task.id, latestRun?.id, latestRun?.status]);
+
   const send = async () => {
     const line = input.trim();
     if (!line && !sendRefs.length) return;
@@ -478,6 +518,11 @@ function RunPanelBody({
         // message never appears.
         setRebuilt(null);
         setRebuildNote(null);
+        // Hide the "Commit & push" chip optimistically — a new turn is
+        // about to land. Without this there's a brief window between this
+        // finally and the listRuns response where `latestRun.status` is
+        // still "succeeded" and the chip flickers back into view.
+        setHasChanges(false);
         // Refresh the runs list right away so the new run row appears
         // immediately, rather than waiting up to 2s for the next poll.
         void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
@@ -502,6 +547,43 @@ function RunPanelBody({
   const stop = async () => {
     if (!liveRunId) return;
     try { await api.cancelRun(liveRunId); } catch { /* surfaced via log */ }
+  };
+
+  // One-click follow-up: ask the agent to commit & push the changes it just
+  // made. Reuses the same `sendRunInput` plumbing as a typed message so the
+  // resulting turn shows up as a normal run row with streamed events.
+  const sendCommitPush = async () => {
+    if (!resumableRunId || sending) return;
+    const message =
+      "Commit all changes with a clear, conventional commit message " +
+      "summarizing the work and push the current branch to origin. " +
+      "If the branch has no upstream yet, set it with `git push -u origin <branch>`.";
+    // Intentionally leaves `input` / `sendRefs` alone — Commit & push is a
+    // side action that shouldn't discard text the user has typed for the
+    // next turn. `send()` clears those because it consumed them.
+    setSending(true);
+    setSendHint(null);
+    try {
+      const res = await api.sendRunInput(resumableRunId, message);
+      if (!res.delivered) {
+        setSendHint(res.reason);
+      } else {
+        setRebuilt(null);
+        setRebuildNote(null);
+        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        // Optimistically hide the chip — the new turn is in flight so we
+        // won't render it again until the next succeeded state.
+        setHasChanges(false);
+        nearBottomRef.current = true;
+        requestAnimationFrame(() => {
+          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+        });
+      }
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+    }
   };
 
   return (
@@ -618,6 +700,18 @@ function RunPanelBody({
             refs={sendRefs}
             onChange={setSendRefs}
           />
+        )}
+        {canSend && latestRun?.status === "succeeded" && hasChanges && !sending && (
+          <div>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => void sendCommitPush()}
+              title="Ask the agent to commit the working-tree changes and push the current branch to origin."
+            >
+              <GitCommit className="mr-1 size-3" /> Commit &amp; push
+            </Button>
+          </div>
         )}
         <div className="flex items-stretch gap-2">
           <div className="relative flex-1">

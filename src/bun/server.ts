@@ -34,7 +34,7 @@ import {
   markTmuxPromptAnswered,
   sessionExists,
 } from "./claude-tmux.ts";
-import { listBranches } from "./worktree.ts";
+import { listBranches, hasUncommittedChanges } from "./worktree.ts";
 import { listAvailableCommands } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
@@ -774,6 +774,26 @@ export function startApiServer() {
 
       "/tasks/:id/runs": {
         GET: authed((req) => json(runs.listForTask(req.params.id), { headers: corsHeaders(req) })),
+      },
+
+      // Whether the task's working tree has uncommitted changes. Drives the
+      // "Commit & push" action in the run panel, which only makes sense to
+      // show when there's actually something to commit. `ignored: true` means
+      // we couldn't tell (not a git repo, dir missing, git failed) — the UI
+      // treats that as "don't offer the action" rather than guessing.
+      "/tasks/:id/git-status": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const dir = t.worktreePath ?? t.workdir;
+          const result = await hasUncommittedChanges(dir);
+          if (result === null) {
+            return json({ hasChanges: false, ignored: true }, { headers: corsHeaders(req) });
+          }
+          return json({ hasChanges: result, ignored: false }, { headers: corsHeaders(req) });
+        }),
       },
 
       "/runs/:id/cancel": {
