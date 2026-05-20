@@ -60,6 +60,148 @@ export type ApprovalRememberScope =
 const BASH_WRAPPERS = new Set(["env", "sudo", "time", "nice", "xargs", "doas"]);
 
 /* ────────────────────────────────────────────────────────────────────────── *
+ * isReadOnlyBashCommand — conservative read-only shell classifier
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Pure read-only shell commands: regardless of flags, none of these can
+ * mutate the workspace or run arbitrary code. Mirrors the spirit of Claude
+ * Code's own read-only Bash validation. Deliberately excludes anything with
+ * a mutating form: `sed` (`-i`), `awk` (can `print > file` / `system()`),
+ * `tee`, `cp`, `mv`, `rm`, interpreters, package runners, etc.
+ */
+const READ_ONLY_COMMANDS = new Set([
+  "ls", "cat", "head", "tail", "wc", "nl", "tac", "rev", "fold", "cut",
+  "paste", "column", "tr", "sort", "uniq", "comm", "cmp", "diff",
+  "grep", "egrep", "fgrep", "rg", "ag",
+  "find", "fd", "fdfind", "tree", "basename", "dirname", "realpath", "readlink",
+  "echo", "printf", "pwd", "od", "hexdump", "xxd", "strings",
+  "md5sum", "sha1sum", "sha256sum", "shasum", "cksum",
+  "file", "stat", "du", "df",
+  // Lookup / locate / introspection — "which and similars". `command` and
+  // `env` are deliberately absent: they run a *wrapped* command, so they're
+  // rejected as wrappers (see BASH_WRAPPERS) rather than trusted as safe
+  // terminals. `man`/`info` are absent too — they page through $PAGER and
+  // can hang a detached session.
+  "which", "type", "whereis", "whatis", "apropos",
+  "help", "tty", "locale", "getconf", "nproc", "free", "pgrep", "pidof",
+  "lsof", "tput",
+  "date", "cal", "printenv", "id", "whoami", "groups", "hostname",
+  "uname", "arch", "uptime", "ps", "jobs", "true", "false", "seq", "expr",
+  "test", "jq",
+]);
+
+/**
+ * `find` predicates/actions that mutate the filesystem or execute arbitrary
+ * commands. Their presence disqualifies an otherwise read-only `find`.
+ * `fd`/`fdfind` get the same treatment via their `-x`/`--exec` family.
+ */
+const FIND_MUTATING_ACTIONS = new Set([
+  "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls",
+]);
+const FD_EXEC_FLAGS = new Set(["-x", "--exec", "-X", "--exec-batch"]);
+
+/**
+ * `git` subcommands that are read-only regardless of their flags. Excludes
+ * subcommands that have a mutating form even though some invocations are
+ * read-only (`branch -D`, `config --set`, `stash drop`, `tag -d`, `remote
+ * add`, `checkout`, `worktree add`…) — those still draw an approval card.
+ */
+const GIT_READ_ONLY_SUBCOMMANDS = new Set([
+  "status", "log", "diff", "show", "blame", "ls-files", "ls-remote",
+  "rev-parse", "describe", "shortlog", "cat-file", "for-each-ref", "reflog",
+  "whatchanged", "rev-list", "name-rev", "merge-base", "count-objects",
+]);
+
+/** Strip a leading path so `/usr/bin/grep` classifies as `grep`. */
+function leafCommand(token: string): string {
+  const slash = token.lastIndexOf("/");
+  return slash === -1 ? token : token.slice(slash + 1);
+}
+
+/**
+ * True when `command` is confidently read-only: it cannot write the
+ * workspace, delete, or execute arbitrary code. Fail-closed — anything we're
+ * unsure about returns false, so the caller still draws an approval card.
+ *
+ * Rules:
+ *   - No command substitution (`$( … )` or backticks) and no process
+ *     substitution (`<( … )` / `>( … )`) anywhere — all run arbitrary commands.
+ *   - No output redirection to a real file (`>`/`>>`); `/dev/null` and the
+ *     `2>&1` / `>&2` fd-dup forms are tolerated.
+ *   - No background `&`.
+ *   - Every top-level segment (split on `|` `||` `&&` `;` and newlines), after
+ *     skipping leading `VAR=val` assignments, must lead with a command that is
+ *     either in READ_ONLY_COMMANDS, a read-only `git` subcommand, or a
+ *     dual-use command (`find`/`fd`/`sort`/`tail`) whose args carry no
+ *     mutating/exec/write flag. Command wrappers (`env`, `sudo`, …) are
+ *     rejected outright since they run whatever follows.
+ */
+export function isReadOnlyBashCommand(command: string): boolean {
+  let cmd = command.trim();
+  if (!cmd) return false;
+
+  // Command substitution and process substitution → could run anything. Bail.
+  if (cmd.includes("$(") || cmd.includes("`") || /[<>]\(/.test(cmd)) return false;
+
+  // Tolerate the safe redirect forms, then reject if any `>` remains (a write
+  // to a real file). Order matters: strip the longer forms first.
+  const sanitized = cmd
+    .replace(/2>&1/g, " ")
+    .replace(/[12]?>&[12]/g, " ")
+    .replace(/[12]?>>?\s*\/dev\/null/g, " ");
+  if (sanitized.includes(">")) return false;
+  cmd = sanitized;
+
+  // Background execution or process-substitution leftovers.
+  if (/(^|[^&])&($|[^&])/.test(cmd)) return false;
+
+  const segments = cmd.split(/\|\||&&|[|;\n]/);
+  for (const rawSegment of segments) {
+    const segment = rawSegment.trim();
+    if (!segment) continue;
+    const tokens = segment.split(/\s+/).filter(Boolean);
+    let i = 0;
+    // Skip leading environment assignments (FOO=bar grep …).
+    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]!)) i++;
+    if (i >= tokens.length) return false;
+    const lead = leafCommand(tokens[i]!);
+    const rest = tokens.slice(i + 1);
+
+    // Wrappers (env, sudo, time, nice, xargs, doas) execute whatever command
+    // follows them — never a safe terminal. Fail closed.
+    if (BASH_WRAPPERS.has(lead)) return false;
+
+    // Dual-use commands: read-only only for certain argument shapes.
+    if (lead === "git") {
+      if (rest.length === 0 || !GIT_READ_ONLY_SUBCOMMANDS.has(rest[0]!)) return false;
+      continue;
+    }
+    if (lead === "find") {
+      if (rest.some((t) => FIND_MUTATING_ACTIONS.has(t))) return false;
+      continue;
+    }
+    if (lead === "fd" || lead === "fdfind") {
+      if (rest.some((t) => FD_EXEC_FLAGS.has(t))) return false;
+      continue;
+    }
+    if (lead === "sort") {
+      // `-o file` / `-ofile` / `--output[=file]` write to a file.
+      if (rest.some((t) => t === "-o" || /^-o./.test(t) || t === "--output" || t.startsWith("--output="))) return false;
+      continue;
+    }
+    if (lead === "tail") {
+      // `-f`/`-F`/`--follow` never terminate without a TTY — would hang the run.
+      if (rest.some((t) => t === "--follow" || t.startsWith("--follow=") || /^-[a-zA-Z]*[fF]$/.test(t))) return false;
+      continue;
+    }
+
+    if (!READ_ONLY_COMMANDS.has(lead)) return false;
+  }
+  return true;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
  * Helpers
  * ────────────────────────────────────────────────────────────────────────── */
 
