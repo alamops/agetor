@@ -286,6 +286,13 @@ interface ParsedJsonlEvent {
   message?: AssistantMessage & UserMessage;
   permissionMode?: string;
   summary?: string;
+  /** Origin tag claude stamps on *synthetic* `user` entries — messages it
+   *  injects on the user's behalf rather than the human typing them. Genuine
+   *  human prompts carry no `origin` at all, so this is effectively a marker
+   *  for "not a real turn." The only kind observed so far is
+   *  `task-notification` (background `run_in_background` Bash completions);
+   *  if claude adds more synthetic kinds, extend the filter below. */
+  origin?: { kind?: string };
 }
 
 export function mapJsonlEventToChunks(
@@ -318,6 +325,22 @@ function mapParsedEventToChunks(
   switch (evt.type) {
     case "user": {
       const content = evt.message?.content;
+      // Background-task completion notifications: claude re-injects the
+      // `<task-notification>…</task-notification>` blob as a synthetic
+      // user message (tagged `origin.kind: "task-notification"`) so the
+      // model picks up the result on its next turn. It is NOT a human turn
+      // — surface it as a dim status breadcrumb instead of a user bubble.
+      // Deny-known-synthetic, allow-by-default: we only demote kinds we've
+      // confirmed are non-human (today just `task-notification`). If another
+      // synthetic kind starts leaking into the panel as a user bubble, add
+      // it here rather than blanket-filtering every `origin`-bearing entry —
+      // a future human prompt could plausibly gain an origin too.
+      if (evt.origin?.kind === "task-notification") {
+        const text = typeof content === "string" ? content : "";
+        const summary = /<summary>([\s\S]*?)<\/summary>/.exec(text)?.[1]?.trim();
+        onChunk("status", summary ? `background task: ${summary}` : "background task completed", uuid);
+        return { endOfTurn: false, lineUuid: uuid };
+      }
       // The human's interactive turn. We DO emit a "user" stream event
       // here — both for the run-panel rendering (so the bubble appears
       // alongside assistant text) and so a rebuild-from-JSONL contains

@@ -267,6 +267,33 @@ test("mapJsonlEventToChunks: user.content[].text → `user` stream (array-form p
   expect(out).toEqual([{ stream: "user", data: "hello there" }]);
 });
 
+test("mapJsonlEventToChunks: task-notification user message → `status` breadcrumb, not a user bubble", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    origin: { kind: "task-notification" },
+    message: {
+      content:
+        "<task-notification>\n<task-id>b21qu207r</task-id>\n<status>completed</status>\n<summary>Background command \"Find bun executable\" completed (exit code 0)</summary>\n</task-notification>",
+    },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: 'background task: Background command "Find bun executable" completed (exit code 0)' },
+  ]);
+});
+
+test("mapJsonlEventToChunks: task-notification without a summary still emits a generic status", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    origin: { kind: "task-notification" },
+    message: { content: "<task-notification><status>completed</status></task-notification>" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "status", data: "background task completed" }]);
+});
+
 test("mapJsonlEventToChunks: empty user string content stays silent", () => {
   const { out, onChunk } = recorder();
   const line = JSON.stringify({ type: "user", message: { content: "" } });
