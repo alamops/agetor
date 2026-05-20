@@ -447,8 +447,20 @@ function RunPanelBody({
   //     recent run id to identify which task → which claude session to
   //     resume. Codex has no resume mechanism; restrict to claude-code.
   const liveRunId = task.runId;
+  // Reconcile against the independently-polled runs list: if the live run has
+  // already resolved (succeeded/failed/cancelled/orphaned), the task isn't
+  // running regardless of what `task.column` says. `task.column` is a snapshot
+  // polled into the board and can briefly lag the DB; `runs` is polled here
+  // (with its own error handling) so a resolved live run is the more
+  // trustworthy "no longer running" signal. When the live run hasn't been
+  // polled in yet (freshly started — not in `runs` yet), `liveRun` is null and
+  // we fall back to trusting `task.column`, so Stop never hides on a genuinely
+  // in-flight turn.
+  const liveRun = liveRunId ? runs.find((r) => r.id === liveRunId) ?? null : null;
+  const liveRunTerminal = !!liveRun && liveRun.status !== "running";
   const canControl = !!liveRunId
-    && (task.column === "running" || task.column === "blocked");
+    && (task.column === "running" || task.column === "blocked")
+    && !liveRunTerminal;
   const resumableRunId = liveRunId
     ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
   // Send is enabled whenever the task has ever been run. While a turn is
@@ -701,7 +713,13 @@ function RunPanelBody({
             onClick={() => void send()}
             disabled={!canSend || sending || (!input.trim() && sendRefs.length === 0)}
             title={
-              canControl
+              // Distinguish "live session exists" from "needs resume" — not
+              // "turn in flight". `liveRunId` (task.runId) stays set while the
+              // tmux session is alive (including between turns) and is only
+              // null once the session is gone (orphan-reconciled), which is the
+              // resume path. Keying off `canControl` here would mislabel the
+              // common "session alive, no turn in flight" state as a resume.
+              liveRunId
                 ? "Send to the live agent"
                 : "Resume the conversation with this message"
             }

@@ -104,7 +104,9 @@ export default function App() {
     return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
   }, []);
 
-  const refresh = async () => setTasks(await api.listTasks());
+  const refresh = async () => {
+    try { setTasks(await api.listTasks()); } catch { /* keep last good snapshot; retry next tick */ }
+  };
   const refreshAgents = async () => {
     try {
       const payload = await api.listHarnesses();
@@ -275,7 +277,15 @@ export default function App() {
         // `cancelled` is intentionally silent — the user issued the cancel.
         return;
       }
-      // column transitions
+      // column transitions. Patch `tasks` optimistically so the board and any
+      // open run panel (via the selected-sync effect) reflect the new column
+      // the instant the backend pushes it — rather than waiting up to 2s for
+      // the next poll (and staying stale indefinitely if that poll lags). This
+      // is what keeps the panel header + Stop button from lingering on a
+      // `running` snapshot after the turn has actually finished.
+      setTasks((cur) =>
+        cur.map((t) => (t.id === ev.taskId ? { ...t, column: ev.column } : t)),
+      );
       if (ev.column === "blocked") {
         toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
       } else if (ev.prev === "blocked") {
