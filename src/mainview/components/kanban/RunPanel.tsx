@@ -100,11 +100,16 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
     if (task) {
       setMountedTask(task);
       // Defer the open flip to the next frame so the panel mounts at
-      // translate-x-full first, then animates to translate-x-0.
-      requestAnimationFrame(() => setOpen(true));
-    } else {
-      setOpen(false);
+      // translate-x-full first, then animates to translate-x-0. Cancel on
+      // cleanup: without this, a pending rAF from a truthy run can fire AFTER
+      // a later task→null run set open=false, wedging the panel open (open=true
+      // while task=null, so every close path's setSelected(null) is a no-op).
+      // The 2s kanban poll re-creates `selected` — and so re-runs this effect —
+      // every tick, which is what made the bug intermittent.
+      const raf = requestAnimationFrame(() => setOpen(true));
+      return () => cancelAnimationFrame(raf);
     }
+    setOpen(false);
   }, [task]);
 
   // After the exit animation completes, drop the mountedTask so we don't keep
