@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Task } from "../shared/types.ts";
@@ -58,7 +58,7 @@ test("reconcileTaskSession resets mode/model/effort when the harness kind change
   tasks.insert(before);
 
   const after: Task = { ...before, agent: "codex-alias" };
-  reconcileTaskSession(before.id, before, after);
+  await reconcileTaskSession(before.id, before, after);
 
   const updated = tasks.get(before.id)!;
   // Reset mode → codex's first option (auto), and model/effort cleared.
@@ -83,7 +83,7 @@ test("reconcileTaskSession preserves mode/model/effort on same-kind alias swap",
   tasks.insert(before);
 
   const after: Task = { ...before, agent: "claude-alt" };
-  reconcileTaskSession(before.id, before, after);
+  await reconcileTaskSession(before.id, before, after);
 
   const updated = tasks.get(before.id)!;
   // Same kind → ids stay valid → keep the picks.
@@ -98,7 +98,7 @@ test("reconcileTaskSession is a no-op when there's no live tmux session", async 
   // simply return without throwing.
   const before = baseTask({ mode: "auto", model: null, effort: null });
   const after = baseTask({ mode: "plan", model: "opus-4.7", effort: "high" });
-  expect(() => reconcileTaskSession("nonexistent-task", before, after)).not.toThrow();
+  await expect(reconcileTaskSession("nonexistent-task", before, after)).resolves.toBeUndefined();
 });
 
 test("reconcileTaskSession drops the claude session when the agent flips", async () => {
@@ -107,12 +107,144 @@ test("reconcileTaskSession drops the claude session when the agent flips", async
   // exits cleanly (dropSession is best-effort and no-ops without a session).
   const before = baseTask({ agent: "claude-code" });
   const after = baseTask({ agent: "codex" });
-  expect(() => reconcileTaskSession("t1", before, after)).not.toThrow();
+  await expect(reconcileTaskSession("t1", before, after)).resolves.toBeUndefined();
 });
 
 test("reconcileTaskSession ignores codex tasks (no live tmux for codex)", async () => {
   const { reconcileTaskSession } = await import("./orchestrator.ts");
   const before = baseTask({ agent: "codex", mode: "auto" });
   const after = baseTask({ agent: "codex", mode: "ask" });
-  expect(() => reconcileTaskSession("t1", before, after)).not.toThrow();
+  await expect(reconcileTaskSession("t1", before, after)).resolves.toBeUndefined();
+});
+
+/** Find the matcher on agetor's own PreToolUse entry (identified by the
+ *  hook command's filename suffix). User-installed entries with their own
+ *  matchers may sit alongside ours after the merge — reading `[0]` would
+ *  see whichever happens to be first. */
+function readMatcher(cwd: string): string | undefined {
+  const settings = JSON.parse(
+    readFileSync(path.join(cwd, ".claude", "settings.local.json"), "utf-8"),
+  ) as { hooks?: { PreToolUse?: Array<{ matcher?: string; hooks?: Array<{ command?: string }> }> } };
+  const entries = settings.hooks?.PreToolUse ?? [];
+  for (const e of entries) {
+    const cmd = e.hooks?.[0]?.command ?? "";
+    if (cmd.endsWith("agetor-approval-hook.sh")) return e.matcher;
+  }
+  return undefined;
+}
+
+test("reconcileTaskSession refreshes the hook matcher to narrow on ask → auto", async () => {
+  const { reconcileTaskSession } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+
+  const cwd = mkdtempSync(path.join(tmpdir(), "agetor-matcher-narrow-"));
+  // Pre-seed a bare settings.local.json so ensureInstalledMerged has a
+  // non-malformed base to merge into.
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(path.join(cwd, ".claude"), { recursive: true });
+  writeFileSync(path.join(cwd, ".claude", "settings.local.json"), "{}");
+
+  const before = baseTask({
+    id: "task-matcher-narrow",
+    workdir: cwd,
+    worktreePath: null,
+    isolation: "none",
+    mode: "ask",
+  });
+  tasks.insert(before);
+
+  // Install a synthetic claude-tmux session so cycleToMode finds the
+  // in-memory state. Seed `permissionMode` (claude's string for the
+  // launch mode) so cycleToMode gets past the "current mode unknown"
+  // early return and returns `ok: true` — the matcher refresh is gated
+  // on success.
+  const jsonl = path.join(cwd, "session.jsonl");
+  writeFileSync(jsonl, "");
+  const state = __forTest.installSession("task-matcher-narrow", jsonl);
+  state.permissionMode = "default"; // claude string for agetor's `ask`
+
+  const after: Task = { ...before, mode: "auto" };
+  reconcileTaskSession("task-matcher-narrow", before, after);
+
+  // Auto mode → narrow matcher (only AskUserQuestion + ExitPlanMode hit
+  // the hook). Without the reinstall the file would still hold the
+  // baseline `{}` we wrote above (no matcher at all) or the FULL `.*`.
+  expect(readMatcher(cwd)).toBe("^(AskUserQuestion|ExitPlanMode)$");
+  __forTest.uninstallSession("task-matcher-narrow");
+});
+
+test("reconcileTaskSession refreshes the hook matcher to full on auto → ask", async () => {
+  const { reconcileTaskSession } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+
+  const cwd = mkdtempSync(path.join(tmpdir(), "agetor-matcher-full-"));
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(path.join(cwd, ".claude"), { recursive: true });
+  // Bare baseline. `readMatcher` filters by hook-command filename suffix,
+  // so any matcher the merge writes for agetor will be found by the
+  // assertion regardless of what else is in the file.
+  writeFileSync(path.join(cwd, ".claude", "settings.local.json"), "{}");
+
+  const before = baseTask({
+    id: "task-matcher-full",
+    workdir: cwd,
+    worktreePath: null,
+    isolation: "none",
+    mode: "auto",
+  });
+  tasks.insert(before);
+
+  const jsonl = path.join(cwd, "session.jsonl");
+  writeFileSync(jsonl, "");
+  const state = __forTest.installSession("task-matcher-full", jsonl);
+  state.permissionMode = "auto"; // claude string for agetor's `auto`
+
+  const after: Task = { ...before, mode: "ask" };
+  reconcileTaskSession("task-matcher-full", before, after);
+
+  expect(readMatcher(cwd)).toBe(".*");
+  __forTest.uninstallSession("task-matcher-full");
+});
+
+test("reconcileTaskSession does NOT refresh the matcher when cycleToMode fails (unreachable target)", async () => {
+  // Asking for `bypass` on a session that wasn't launched with the
+  // enabling flag is unreachable via Shift+Tab — cycleToMode returns
+  // `ok: false`. Refreshing the matcher to bypass's narrow-no-mcp scope
+  // anyway would leave claude in `default` while agetor stopped routing
+  // tools through the hook, deadlocking the run on claude's own modal.
+  // Pin the gate so a future refactor can't quietly drop it.
+  const { reconcileTaskSession } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { __forTest } = await import("./claude-tmux.ts");
+
+  const cwd = mkdtempSync(path.join(tmpdir(), "agetor-matcher-skip-"));
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(path.join(cwd, ".claude"), { recursive: true });
+  writeFileSync(path.join(cwd, ".claude", "settings.local.json"), "{}");
+
+  const before = baseTask({
+    id: "task-matcher-skip",
+    workdir: cwd,
+    worktreePath: null,
+    isolation: "none",
+    mode: "ask",
+  });
+  tasks.insert(before);
+
+  const jsonl = path.join(cwd, "session.jsonl");
+  writeFileSync(jsonl, "");
+  const state = __forTest.installSession("task-matcher-skip", jsonl);
+  // Seed a real "current" mode so cycleToMode gets past the
+  // "current mode unknown" early return and into the cycle math —
+  // where it discovers `bypassPermissions` isn't reachable.
+  state.permissionMode = "default";
+
+  const after: Task = { ...before, mode: "bypass" };
+  reconcileTaskSession("task-matcher-skip", before, after);
+
+  // No agetor entry was written, so readMatcher returns undefined.
+  expect(readMatcher(cwd)).toBeUndefined();
+  __forTest.uninstallSession("task-matcher-skip");
 });

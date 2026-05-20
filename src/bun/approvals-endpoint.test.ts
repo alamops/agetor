@@ -168,6 +168,7 @@ async function seedTaskWithSavedRule(args: {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     hasOpenableRun: false,
+    pendingInteractionCount: 0,
   });
   // Pre-write the allow-rule directly to the task's settings file so the
   // route's lookupAllowRule call hits "allow" — same shape we'd get if the
@@ -197,7 +198,13 @@ test("POST /approvals — saved Edit rule still auto-allows in non-plan mode (re
     taskId: "t-saved-rule-auto",
     ruleEntry: "Edit(/tmp/**)",
   });
-  state.permissionMode = "auto"; // not plan
+  // `acceptEdits` is the mode that proves the saved-rule path: it isn't
+  // plan (so the saved-rule fast-path isn't skipped) and it isn't
+  // auto/bypass (so the auto-mode fast-path doesn't preempt it). If we
+  // used `auto` here the new auto-mode fast-path would short-circuit
+  // before lookupAllowRule runs and the test would silently stop
+  // exercising what its name claims.
+  state.permissionMode = "acceptEdits";
   const res = await fetch(url(`/approvals?taskId=t-saved-rule-auto`), {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -265,4 +272,82 @@ test("POST /approvals — plan mode still fast-paths read-only tools (Read)", as
   expect(res.status).toBe(200);
   const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
   expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+});
+
+test("POST /approvals — auto mode auto-allows arbitrary Bash without registering an approval", async () => {
+  // Regression: when a task was launched in `ask` mode and the user later
+  // PATCHes the mode to `auto`, the FULL hook matcher is still installed
+  // from spawn time so every PreToolUse lands on /approvals. Auto mode
+  // means "let claude's classifier decide" — we must not surface routine
+  // Bash as an approval card.
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-auto-bash",
+    ruleEntry: "Edit(/tmp/**)", // unrelated, just satisfies the seed helper
+  });
+  state.permissionMode = "auto";
+  const res = await fetch(url(`/approvals?taskId=t-auto-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      tool_name: "Bash",
+      tool_input: { command: "git diff HEAD -- file.tsx | tail -90" },
+    }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
+  expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+  const { __testing } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(0);
+});
+
+test("POST /approvals — bypassPermissions mode auto-allows arbitrary Bash too", async () => {
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-bypass-bash",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "bypassPermissions";
+  const res = await fetch(url(`/approvals?taskId=t-bypass-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf /tmp/x" } }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
+  expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+  const { __testing } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(0);
+});
+
+test("POST /approvals — auto mode still intercepts AskUserQuestion (modal-deadlock prevention)", async () => {
+  // ALWAYS_INTERCEPT must hold regardless of mode — AskUserQuestion's
+  // tmux-internal modal would deadlock the run if we auto-allowed.
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-auto-ask",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "auto";
+  const pending = fetch(url(`/approvals?taskId=t-auto-ask`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      tool_name: "AskUserQuestion",
+      tool_input: { questions: [{ question: "pick one", header: "x", multiSelect: false, options: [{ label: "a" }, { label: "b" }] }] },
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const { __testing, listPendingForTask, answerAskQuestions } = await import("./interactions.ts");
+  expect(__testing.askQuestionsSize()).toBe(1);
+  // Drain so the fetch settles without leaking into sibling tests.
+  const list = listPendingForTask("t-auto-ask");
+  if (list[0]?.kind === "ask_questions") {
+    answerAskQuestions(list[0].id, { answers: [{ selected: ["a"] }] });
+  }
+  const res = await pending;
+  expect(res.status).toBe(200);
 });

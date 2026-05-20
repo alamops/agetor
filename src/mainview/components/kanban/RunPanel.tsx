@@ -63,7 +63,7 @@ const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" 
   failed: "destructive",
 };
 
-const EXIT_DURATION_MS = 250;
+export const EXIT_DURATION_MS = 250;
 
 function formatDuration(r: Run): string {
   const end = r.endedAt ?? Date.now();
@@ -115,6 +115,33 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
     const t = setTimeout(() => setMountedTask(null), EXIT_DURATION_MS);
     return () => clearTimeout(t);
   }, [open, mountedTask]);
+
+  // Escape closes the panel — but only when no higher-priority dismissable
+  // layer is up: a modal Dialog (confirm, edit, settings, tmux-missing —
+  // each renders `[role="dialog"][aria-modal="true"]`) or an open
+  // search-select / multi-search-select popover (marked with
+  // `[data-popover-open]`). Esc peels one layer at a time, top down.
+  //
+  // Note: stopPropagation/stopImmediatePropagation can't help here because
+  // both the panel and the popovers attach to `document`, so DOM markers
+  // are the order-independent way to coordinate the handoff.
+  //
+  // onClose is captured into a ref because the parent passes an inline arrow
+  // function — depending on it directly would tear down + re-add the listener
+  // on every kanban poll (every 2s).
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      e.preventDefault();
+      onCloseRef.current();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
 
   if (!mountedTask) return null;
 
@@ -446,16 +473,18 @@ function RunPanelBody({
     // SHA used only for reproducibility) — commands are discovered
     // against the live branch context, not the historical base.
     const branch = task.branch?.trim() || undefined;
+    // Pass the harness id (task.agent) so aliased multi-account harnesses
+    // read their own per-harness commands/skills.
     api
       .listAgentCommands({
-        agent: kind,
+        agent: task.agent,
         workdir: task.workdir.trim(),
         branch,
       })
       .then((cmds) => { if (!cancelled) setSendCommands(cmds); })
       .catch(() => { if (!cancelled) setSendCommands([]); });
     return () => { cancelled = true; };
-  }, [kind, task.workdir, task.branch]);
+  }, [task.agent, task.workdir, task.branch]);
 
   const send = async () => {
     const line = input.trim();

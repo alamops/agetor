@@ -90,12 +90,13 @@ export interface ClaudeLaunchOptions {
    */
   sessionId: string;
   /**
-   * Per-harness HOME override. When set, claude writes its JSONL under
-   * `<home>/.claude/projects/…` instead of the system homedir — this is
-   * how multi-account harnesses keep their login & history separate.
-   * NULL falls back to `homedir()`.
+   * Per-harness config-dir override (passed to claude as CLAUDE_CONFIG_DIR).
+   * When set, claude writes its JSONL under `<configDir>/projects/…` — the
+   * path itself replaces `~/.claude/`. NULL falls back to
+   * `~/.claude/projects/…`. This is how multi-account harnesses keep their
+   * login & history separate. Sourced from `Harness.home` at the call site.
    */
-  home: string | null;
+  configDir: string | null;
   /**
    * Agetor permission mode for this task (see AGENT_OPTIONS in
    * shared/types.ts). Forwarded to `ensureInstalledForCwd` to pick the
@@ -577,6 +578,17 @@ interface SessionState {
    */
   permissionMode: string | null;
   /**
+   * One-shot listener fired by `dispatchLine` immediately after it updates
+   * `permissionMode` from a JSONL `system` / `permission-mode` event.
+   * Installed by `cycleToMode` so it can verify whether a Shift+Tab press
+   * actually landed on the requested mode (claude's cycle is opaque — the
+   * account may not have `auto` access, the press may have hit a one-time
+   * opt-in modal, etc.). Cleared before invocation so a retry inside the
+   * callback can install a fresh listener for the next press without
+   * racing this fire.
+   */
+  onPermissionMode: ((mode: string) => void) | null;
+  /**
    * Whether `bypassPermissions` is in this session's Shift+Tab cycle. True
    * iff the session was launched with `--dangerously-skip-permissions` (the
    * agetor `bypass` mode emits exactly that). Reattached sessions default
@@ -630,17 +642,28 @@ const sessions = new Map<string, SessionState>(); // taskId → state
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** Absolute filesystem path to the JSONL claude writes for this session.
- *  `home` overrides the system homedir — used so multi-account harnesses
- *  (which set HOME=<alias home> on the spawned claude) read their JSONL
- *  from the matching alias dir instead of the agetor process's HOME. */
-export function jsonlPathFor(cwd: string, sessionId: string, home: string | null): string {
-  return path.join(
-    home ?? homedir(),
-    ".claude",
-    "projects",
-    encodeProjectPath(cwd),
-    `${sessionId}.jsonl`,
-  );
+ *  `configDir` is the per-harness CLAUDE_CONFIG_DIR — claude treats that
+ *  path itself as the `.claude/` equivalent, so new writes land at
+ *  `<configDir>/projects/<encoded>/<sid>.jsonl` (no `.claude/` segment).
+ *  When NULL, the default `~/.claude/projects/…` layout applies.
+ *
+ *  Migration fallback: agetor used to set HOME=<harness home> instead of
+ *  CLAUDE_CONFIG_DIR, which made claude write under
+ *  `<harness home>/.claude/projects/…`. When we have a configDir but the
+ *  new-layout file is missing, fall back to the legacy path so rebuild +
+ *  reattach can still read pre-upgrade JSONLs. New writes always use the
+ *  new layout. */
+export function jsonlPathFor(cwd: string, sessionId: string, configDir: string | null): string {
+  const encoded = encodeProjectPath(cwd);
+  const fileName = `${sessionId}.jsonl`;
+  if (configDir) {
+    const fresh = path.join(configDir, "projects", encoded, fileName);
+    if (existsSync(fresh)) return fresh;
+    const legacy = path.join(configDir, ".claude", "projects", encoded, fileName);
+    if (existsSync(legacy)) return legacy;
+    return fresh;
+  }
+  return path.join(homedir(), ".claude", "projects", encoded, fileName);
 }
 
 /**
@@ -745,6 +768,15 @@ function dispatchLine(state: SessionState, line: string): void {
   if ((evt.type === "system" || evt.type === "permission-mode")
     && typeof evt.permissionMode === "string") {
     state.permissionMode = evt.permissionMode;
+    // Fire any one-shot verification listener installed by `cycleToMode`.
+    // Snapshot+clear before invoking so a retry inside the listener can
+    // install a fresh listener for the next press without this fire
+    // clobbering it.
+    if (state.onPermissionMode) {
+      const cb = state.onPermissionMode;
+      state.onPermissionMode = null;
+      cb(evt.permissionMode);
+    }
   }
 
   if (uuid && state.seenLineUuids.has(uuid)) return;
@@ -1210,7 +1242,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // The JSONL path is deterministic from cwd + session uuid (we passed
   // `--session-id <uuid>` for new sessions, and `--resume <id>` reopens an
   // existing file at the same path). No mtime poll, no freshest-file pick.
-  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.home);
+  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.configDir);
 
   // When the JSONL already exists at spawn time, we're resuming a prior
   // claude session (`--resume <id>` reopens the same file). The file holds
@@ -1246,6 +1278,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
     // task.mode since the prior session, in which case the launch flags
     // are the truth and the JSONL is stale.
     permissionMode: opts.mode ? toClaudeModeString(opts.mode) : null,
+    onPermissionMode: null,
     // `bypass` is the only agetor mode that emits the launch flag
     // (--dangerously-skip-permissions) — that's what puts
     // `bypassPermissions` into the Shift+Tab cycle.
@@ -1307,7 +1340,9 @@ export interface ReattachOptions {
   taskId: string;
   cwd: string;
   sessionId: string;
-  home: string | null;
+  /** Per-harness CLAUDE_CONFIG_DIR (sourced from `Harness.home`). See
+   *  `SpawnOptions.configDir` for the full semantics. */
+  configDir: string | null;
   /** Per-run chunk handler that persists to run_events + broadcasts on SSE.
    *  Built by the orchestrator the same way it does for fresh runs. */
   onChunk: ChunkHandler;
@@ -1331,7 +1366,7 @@ export interface ReattachOptions {
  */
 export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
   const sessionName = sessionNameFor(opts.taskId);
-  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.home);
+  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.configDir);
   if (!existsSync(jsonlPath)) return null;
 
   let resolveDone: ((code: number) => void) | null = null;
@@ -1363,6 +1398,7 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
     // (pre-seeded from run_events on reattach) the field still gets
     // overwritten with whatever mode claude is currently in.
     permissionMode: null,
+    onPermissionMode: null,
     // The launch flag isn't persisted across agetor restarts, so we can't
     // tell whether bypassPermissions is in the cycle on this reattach.
     // Conservatively assume not — cycling to bypass after a restart needs
@@ -1455,9 +1491,33 @@ export function sendSlashCommand(taskId: string, line: string): boolean {
   return true;
 }
 
+/** Reasons `cycleToMode` can fail. Modeled as a literal union (rather than
+ *  free-form strings) so a typo in either the producer or the consumer
+ *  branches surfaces at compile time — the failure path's user-facing
+ *  message depends on string equality, and a silent typo would route the
+ *  user to a generic fallback that doesn't match the actual problem. */
+export type CycleFailureReason =
+  | "no live session"
+  | "current mode unknown"
+  | "mode not in cycle"
+  | "verification timed out"
+  | "verification mismatch";
+
 export type CycleResult =
   | { ok: true; presses: number; via: "noop" | "slash-plan" | "shift-tab" }
-  | { ok: false; reason: string };
+  | { ok: false; reason: CycleFailureReason; target?: string; attempts?: number; lastObserved?: string | null };
+
+/** How many times `cycleToMode` will resend Shift+Tab presses before giving
+ *  up. Each press is verified against the next JSONL `permission-mode`
+ *  event; a mismatch (account isn't auto-eligible, cycle width assumed
+ *  wrong) triggers another attempt from the newly-observed mode. */
+const MAX_VERIFY_ATTEMPTS = 3;
+
+/** How long to wait for a `permission-mode` JSONL event after sending the
+ *  Shift+Tab presses before declaring the press "lost" (most likely
+ *  swallowed by claude's one-time auto opt-in modal). 1.5s comfortably
+ *  exceeds the ~100ms claude takes to emit the event in practice. */
+let modeVerifyTimeoutMs = 1500;
 
 /**
  * Switch a live claude session's permission mode to `targetAgetorMode` by
@@ -1467,63 +1527,132 @@ export type CycleResult =
  * prefer the `/plan` slash command instead: it's deterministic, doesn't
  * depend on knowing the current mode, and works from anywhere.
  *
+ * After each batch of presses we wait for the next JSONL `permission-mode`
+ * event and compare it to the target. A mismatch — account isn't
+ * auto-eligible (cycle is 3-wide instead of 4), assumed press count was
+ * off, etc. — triggers another attempt from the newly-observed mode, up
+ * to `MAX_VERIFY_ATTEMPTS` times. If the event never arrives within
+ * `modeVerifyTimeoutMs` (most likely cause: claude's one-time auto
+ * opt-in modal swallowed the keystrokes), we bail with `verification
+ * timed out` so the orchestrator can warn the user rather than report
+ * a successful mode change that didn't happen.
+ *
  * Returns:
  *   - `{ ok: true, via: "noop" }` when the session is already at the target.
  *   - `{ ok: true, via: "slash-plan" }` when we sent `/plan`.
- *   - `{ ok: true, via: "shift-tab", presses: N }` when we sent N tabs.
+ *   - `{ ok: true, via: "shift-tab", presses: N }` when N tabs got claude
+ *     to the target (verified by the JSONL event).
  *   - `{ ok: false, reason: "no live session" }` for an unknown task.
  *   - `{ ok: false, reason: "current mode unknown" }` before claude's first
- *     `system` event has arrived (rare — typically only at the very start of
- *     a session before its first JSONL entry).
- *   - `{ ok: false, reason: "unreachable in current cycle" }` when the
- *     target isn't in this session's cycle. The most common case is asking
- *     for `bypassPermissions` on a session that wasn't launched with the
- *     enabling flag — a respawn is required.
- *
- * Caveat — first cycle to `auto`: claude shows a one-time opt-in modal the
- * first time you cycle to auto on a given account. Our keystrokes pass
- * through but the cycle pauses on the modal until the user (or some other
- * keystroke) dismisses it. After the first acceptance, subsequent cycles
- * work without intervention.
+ *     `system` event has arrived.
+ *   - `{ ok: false, reason: "mode not in cycle", target }` when the target
+ *     isn't reachable (e.g. `bypassPermissions` without the launch flag —
+ *     a respawn is required).
+ *   - `{ ok: false, reason: "verification timed out", attempts, lastObserved }`
+ *     when no `permission-mode` event followed our keystrokes.
+ *   - `{ ok: false, reason: "verification mismatch", attempts, lastObserved }`
+ *     when every attempt landed somewhere other than the target.
  */
-export function cycleToMode(taskId: string, targetAgetorMode: string): CycleResult {
+export async function cycleToMode(taskId: string, targetAgetorMode: string): Promise<CycleResult> {
   const state = sessions.get(taskId);
   if (!state) return { ok: false, reason: "no live session" };
   const target = toClaudeModeString(targetAgetorMode);
 
   // `/plan` works from any state, no cycle math needed. Prefer it.
-  // No optimistic state update here — `pastePrompt` is fire-and-forget
-  // (its tmux load-buffer / paste-buffer / send-keys helpers swallow
-  // errors), so claiming success before claude has acknowledged would
-  // lie when the paste fails. The JSONL `permission-mode` event that
-  // follows `/plan` is the authoritative source.
+  // Fire-and-forget — `pastePrompt`'s tmux load-buffer / paste-buffer /
+  // send-keys helpers swallow errors, and verifying via the JSONL would
+  // require the same listener machinery the Shift+Tab path uses; for
+  // `plan` the slash command is reliable enough that the added complexity
+  // doesn't pay for itself.
   if (target === CLAUDE_MODE_PLAN) {
     pastePrompt(state.sessionName, "/plan");
     return { ok: true, presses: 0, via: "slash-plan" };
   }
 
-  const current = state.permissionMode;
-  if (!current) return { ok: false, reason: "current mode unknown" };
-  if (current === target) return { ok: true, presses: 0, via: "noop" };
+  if (!state.permissionMode) return { ok: false, reason: "current mode unknown" };
+  if (state.permissionMode === target) return { ok: true, presses: 0, via: "noop" };
 
   const cycle = cycleOrderFor(state.bypassEnabled);
-  const presses = cycleDistance(cycle, current, target);
-  if (presses === null) {
-    return { ok: false, reason: `mode '${target}' not in this session's cycle` };
+  if (cycleDistance(cycle, state.permissionMode, target) === null) {
+    return { ok: false, reason: "mode not in cycle", target };
   }
-  if (presses > 0) {
-    // One tmux invocation with N keys — cleaner than N sync spawns, and
-    // tmux delivers them as a single stream so claude's TUI doesn't get
-    // a chance to debounce them apart on slow terminals.
-    const keys = Array<string>(presses).fill("S-Tab");
-    tmux(["send-keys", "-t", state.sessionName, ...keys]);
+
+  let totalPresses = 0;
+  let attempts = 0;
+  while (attempts < MAX_VERIFY_ATTEMPTS) {
+    const current = state.permissionMode;
+    if (current === target) {
+      return { ok: true, presses: totalPresses, via: "shift-tab" };
+    }
+    // `current` is non-null on every iteration: the pre-loop guard
+    // returned early when permissionMode was null, and `dispatchLine`
+    // only ever writes strings to the field. The explicit check keeps
+    // TS narrowing happy for the cycleDistance call below.
+    const presses = current ? cycleDistance(cycle, current, target) : null;
+    if (presses === null) {
+      // Target was validated as in-cycle before the loop, so reaching
+      // here means claude moved to a mode we don't recognise between
+      // attempts (e.g. claude introduced a new mode). Bail rather than
+      // spin.
+      return {
+        ok: false,
+        reason: "verification mismatch",
+        attempts,
+        lastObserved: current,
+      };
+    }
+    totalPresses += presses;
+    attempts += 1;
+
+    // Install the listener BEFORE sending keys so a fast `permission-mode`
+    // event can't beat us. The Promise executor runs synchronously, so the
+    // assignment is in place before `tmux send-keys` returns.
+    //
+    // Identity guard: hold our listener in a local and only clear the
+    // session slot when it still points at *this* call's listener. Without
+    // it, two overlapping `cycleToMode` calls (e.g. a user double-PATCH on
+    // the same task) would have the earlier call's setTimeout-driven
+    // cleanup null out the later call's listener, falsely reporting
+    // `verification timed out` for both.
+    const observed = await new Promise<string | null>((resolve) => {
+      let myListener: ((mode: string) => void) | null = null;
+      const timer = setTimeout(() => {
+        if (state.onPermissionMode === myListener) state.onPermissionMode = null;
+        resolve(null);
+      }, modeVerifyTimeoutMs);
+      myListener = (mode) => {
+        clearTimeout(timer);
+        resolve(mode);
+      };
+      state.onPermissionMode = myListener;
+      // One tmux invocation with N keys — cleaner than N sync spawns, and
+      // tmux delivers them as a single stream so claude's TUI doesn't get
+      // a chance to debounce them apart on slow terminals.
+      const keys = Array<string>(presses).fill("S-Tab");
+      tmux(["send-keys", "-t", state.sessionName, ...keys]);
+    });
+
+    if (observed === null) {
+      return {
+        ok: false,
+        reason: "verification timed out",
+        attempts,
+        lastObserved: state.permissionMode,
+      };
+    }
+    if (observed === target) {
+      return { ok: true, presses: totalPresses, via: "shift-tab" };
+    }
+    // Mismatch — loop and retry from the newly-observed mode. `dispatchLine`
+    // has already updated `state.permissionMode` to `observed`.
   }
-  // Optimistic local update. The JSONL `permission-mode` event will arrive
-  // shortly after and overwrite this with claude's authoritative value —
-  // if a press landed somewhere unexpected (e.g. account isn't auto-eligible)
-  // the event corrects state.
-  state.permissionMode = target;
-  return { ok: true, presses, via: "shift-tab" };
+
+  return {
+    ok: false,
+    reason: "verification mismatch",
+    attempts,
+    lastObserved: state.permissionMode,
+  };
 }
 
 /**
@@ -1554,6 +1683,7 @@ function disposeSessionState(state: SessionState | undefined): void {
   state.scrapeTimer = null;
   state.scrapeLastFingerprint = null;
   state.onEndOfTurn = null;
+  state.onPermissionMode = null;
   const err = new Error("session killed");
   for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
 }
@@ -1609,6 +1739,7 @@ export const __forTest = {
       seenLineUuids: new Set(),
       onEndOfTurn: null,
       permissionMode: null,
+      onPermissionMode: null,
       bypassEnabled: false,
       scrapeTimer: null,
       scrapeLastFingerprint: null,
@@ -1630,6 +1761,20 @@ export const __forTest = {
   matchNumberedModal,
   matchYesNoModal,
   resumeJsonlOffset,
+  /** Override the JSONL verification timeout used by `cycleToMode`. Tests
+   *  shrink it to keep "timeout" cases fast. Returns the previous value
+   *  so the test can restore it in `afterEach`. */
+  setModeVerifyTimeoutMs(ms: number): number {
+    const prev = modeVerifyTimeoutMs;
+    modeVerifyTimeoutMs = ms;
+    return prev;
+  },
+  /** Read-only accessor for the current verify timeout. */
+  getModeVerifyTimeoutMs(): number { return modeVerifyTimeoutMs; },
+  /** Max attempts cycleToMode will make before reporting `verification
+   *  mismatch`. Exposed so tests can assert against the constant rather
+   *  than hardcoding "3". */
+  MAX_VERIFY_ATTEMPTS,
 };
 
 /**
