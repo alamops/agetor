@@ -90,12 +90,13 @@ export interface ClaudeLaunchOptions {
    */
   sessionId: string;
   /**
-   * Per-harness HOME override. When set, claude writes its JSONL under
-   * `<home>/.claude/projects/…` instead of the system homedir — this is
-   * how multi-account harnesses keep their login & history separate.
-   * NULL falls back to `homedir()`.
+   * Per-harness config-dir override (passed to claude as CLAUDE_CONFIG_DIR).
+   * When set, claude writes its JSONL under `<configDir>/projects/…` — the
+   * path itself replaces `~/.claude/`. NULL falls back to
+   * `~/.claude/projects/…`. This is how multi-account harnesses keep their
+   * login & history separate. Sourced from `Harness.home` at the call site.
    */
-  home: string | null;
+  configDir: string | null;
   /**
    * Agetor permission mode for this task (see AGENT_OPTIONS in
    * shared/types.ts). Forwarded to `ensureInstalledForCwd` to pick the
@@ -630,17 +631,28 @@ const sessions = new Map<string, SessionState>(); // taskId → state
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** Absolute filesystem path to the JSONL claude writes for this session.
- *  `home` overrides the system homedir — used so multi-account harnesses
- *  (which set HOME=<alias home> on the spawned claude) read their JSONL
- *  from the matching alias dir instead of the agetor process's HOME. */
-export function jsonlPathFor(cwd: string, sessionId: string, home: string | null): string {
-  return path.join(
-    home ?? homedir(),
-    ".claude",
-    "projects",
-    encodeProjectPath(cwd),
-    `${sessionId}.jsonl`,
-  );
+ *  `configDir` is the per-harness CLAUDE_CONFIG_DIR — claude treats that
+ *  path itself as the `.claude/` equivalent, so new writes land at
+ *  `<configDir>/projects/<encoded>/<sid>.jsonl` (no `.claude/` segment).
+ *  When NULL, the default `~/.claude/projects/…` layout applies.
+ *
+ *  Migration fallback: agetor used to set HOME=<harness home> instead of
+ *  CLAUDE_CONFIG_DIR, which made claude write under
+ *  `<harness home>/.claude/projects/…`. When we have a configDir but the
+ *  new-layout file is missing, fall back to the legacy path so rebuild +
+ *  reattach can still read pre-upgrade JSONLs. New writes always use the
+ *  new layout. */
+export function jsonlPathFor(cwd: string, sessionId: string, configDir: string | null): string {
+  const encoded = encodeProjectPath(cwd);
+  const fileName = `${sessionId}.jsonl`;
+  if (configDir) {
+    const fresh = path.join(configDir, "projects", encoded, fileName);
+    if (existsSync(fresh)) return fresh;
+    const legacy = path.join(configDir, ".claude", "projects", encoded, fileName);
+    if (existsSync(legacy)) return legacy;
+    return fresh;
+  }
+  return path.join(homedir(), ".claude", "projects", encoded, fileName);
 }
 
 /**
@@ -1193,7 +1205,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // The JSONL path is deterministic from cwd + session uuid (we passed
   // `--session-id <uuid>` for new sessions, and `--resume <id>` reopens an
   // existing file at the same path). No mtime poll, no freshest-file pick.
-  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.home);
+  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.configDir);
 
   // Allocate the per-session state up front so flush() can find it.
   const state: SessionState = {
@@ -1276,7 +1288,9 @@ export interface ReattachOptions {
   taskId: string;
   cwd: string;
   sessionId: string;
-  home: string | null;
+  /** Per-harness CLAUDE_CONFIG_DIR (sourced from `Harness.home`). See
+   *  `SpawnOptions.configDir` for the full semantics. */
+  configDir: string | null;
   /** Per-run chunk handler that persists to run_events + broadcasts on SSE.
    *  Built by the orchestrator the same way it does for fresh runs. */
   onChunk: ChunkHandler;
@@ -1300,7 +1314,7 @@ export interface ReattachOptions {
  */
 export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
   const sessionName = sessionNameFor(opts.taskId);
-  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.home);
+  const jsonlPath = jsonlPathFor(opts.cwd, opts.sessionId, opts.configDir);
   if (!existsSync(jsonlPath)) return null;
 
   let resolveDone: ((code: number) => void) | null = null;

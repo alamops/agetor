@@ -58,9 +58,9 @@ test("returns available=false with install hint when the bin is missing", async 
 });
 
 /**
- * Plant a fake native-install layout on PATH so detectClaudeNativeInstall
- * recognises the system claude as native. Returns the harness HOME root and
- * the binary path agent-status will probe via --version.
+ * Plant a fake native-install layout on PATH so the probe finds a working
+ * `claude` binary at <sandbox>/system/.local/bin/claude. Returns the harness
+ * config-dir root the alias under test will use.
  *
  * Shape mirrors the real install:
  *   <sandbox>/system/.local/share/claude/versions/<v>   (binary file)
@@ -85,35 +85,13 @@ function plantFakeNativeClaude(): { harnessHome: string } {
   return { harnessHome };
 }
 
-test("claude-code alias is unavailable when the native-install integrity symlink is missing", async () => {
+test("claude-code alias with a CLAUDE_CONFIG_DIR override is available without pre-linking the harness home", async () => {
+  // Regression: previously we set HOME=<harness home> on spawn and so had to
+  // pre-link <harness home>/.local/bin/claude to satisfy claude's native-
+  // install integrity check. After switching to CLAUDE_CONFIG_DIR=<home> the
+  // user's real $HOME is unchanged, the integrity check resolves against the
+  // system install, and no per-harness symlink is required.
   const { harnessHome } = plantFakeNativeClaude();
-  const alias: Harness = {
-    id: "claude-alt",
-    kind: "claude-code",
-    label: "Claude (alt)",
-    isBuiltin: false,
-    home: harnessHome,
-    bin: null,
-    env: {},
-    enabled: true,
-  };
-
-  const status = await checkHarness(alias);
-  expect(status.available).toBe(false);
-  expect(status.reason).toContain(".local/bin/claude");
-  expect(status.reason).toContain("integrity check");
-  expect(status.installHint).toContain("repair");
-});
-
-test("claude-code alias is available when the integrity symlink is present", async () => {
-  const { harnessHome } = plantFakeNativeClaude();
-  // Pre-populate the same symlink that prepareClaudeHarnessHome would create.
-  const harnessBin = path.join(harnessHome, ".local", "bin");
-  mkdirSync(harnessBin, { recursive: true });
-  // Point at any string — existsSync only checks for presence, and probeVersion
-  // runs the actual system claude (via resolveBin → Bun.which), not this link.
-  symlinkSync("/bin/echo", path.join(harnessBin, "claude"));
-
   const alias: Harness = {
     id: "claude-alt",
     kind: "claude-code",

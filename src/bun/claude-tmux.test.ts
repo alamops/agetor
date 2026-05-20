@@ -28,9 +28,11 @@ test("jsonlPathFor with home=null falls back to the system homedir", () => {
   expect(p).toContain(encodeProjectPath("/a/b"));
 });
 
-test("jsonlPathFor honors a per-harness HOME override", () => {
+test("jsonlPathFor honors a per-harness CLAUDE_CONFIG_DIR override", () => {
+  // claude treats CLAUDE_CONFIG_DIR as the `.claude/` equivalent, so the
+  // override path itself is the root — no `.claude/` segment in between.
   const p = jsonlPathFor("/a/b", "session-uuid", "/tmp/alt-home");
-  expect(p).toBe(`/tmp/alt-home/.claude/projects/${encodeProjectPath("/a/b")}/session-uuid.jsonl`);
+  expect(p).toBe(`/tmp/alt-home/projects/${encodeProjectPath("/a/b")}/session-uuid.jsonl`);
 });
 
 test("encodeProjectPath turns every slash and dot into a dash", () => {
