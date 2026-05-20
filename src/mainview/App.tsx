@@ -8,7 +8,7 @@ import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
-import { RunPanel } from "@/components/kanban/RunPanel";
+import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
@@ -159,6 +159,28 @@ export default function App() {
     const fresh = tasks.find((t) => t.id === selected.id);
     if (fresh && fresh !== selected) setSelected(fresh);
   }, [tasks, selected]);
+
+  // Once the user opens a task's panel, any "Waiting on you" toast for that
+  // task is noise — they're already looking at the prompt. Clearing it also
+  // removes one more high-z-index click target that could otherwise sit on
+  // top of the panel header and eat clicks meant for the X button.
+  useEffect(() => {
+    if (!selected) return;
+    dismissPending(selected.id);
+  }, [selected?.id]);
+
+  // `panelMounted` follows `selected !== null` on open but lags by the
+  // RunPanel's exit animation on close, so the Toaster doesn't snap back to
+  // the right edge (and slide under the receding panel) for ~250ms.
+  const [panelMounted, setPanelMounted] = useState(false);
+  useEffect(() => {
+    if (selected) {
+      setPanelMounted(true);
+      return;
+    }
+    const t = setTimeout(() => setPanelMounted(false), RUN_PANEL_EXIT_MS);
+    return () => clearTimeout(t);
+  }, [selected]);
 
   // Refs mirror the latest tasks + selected task so the global-events
   // subscription (which closes over its handler ONCE on mount) can read
@@ -475,7 +497,7 @@ export default function App() {
             projects={projects}
           />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
-          <Toaster />
+          <Toaster panelOpen={panelMounted} />
           {/* Kanban gets all remaining vertical space and scrolls horizontally
               on its own — the bottom bar stays anchored regardless of column
               count. */}
