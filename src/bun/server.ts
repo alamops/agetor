@@ -16,7 +16,6 @@ import {
 } from "./db.ts";
 import { createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
-import { prepareClaudeHarnessHome } from "./harness-setup.ts";
 import { applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import {
   bundledTmuxAvailable,
@@ -469,13 +468,6 @@ export function startApiServer() {
               bin,
               env,
             });
-            // Native-install claude validates `$HOME/.local/bin/claude` exists
-            // on every launch and errors out otherwise. When the user gives
-            // this harness its own HOME but no BIN, pre-link the system
-            // binary into the new HOME so the integrity check passes.
-            if (created.kind === "claude-code" && created.home && !created.bin) {
-              prepareClaudeHarnessHome(created.home);
-            }
             return json(created, { headers: corsHeaders(req) });
           } catch (e) {
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
@@ -545,12 +537,6 @@ export function startApiServer() {
           }
           try {
             const updated = harnesses.update(req.params.id, patch);
-            // Same rationale as the POST handler: if a claude-code alias
-            // gains (or changes) a custom HOME without an explicit BIN, make
-            // sure the native-install integrity-check path exists.
-            if (updated.kind === "claude-code" && updated.home && !updated.bin && "home" in body) {
-              prepareClaudeHarnessHome(updated.home);
-            }
             return json(updated, { headers: corsHeaders(req) });
           } catch (e) {
             if (e instanceof HarnessBuiltinError) {
@@ -622,20 +608,35 @@ export function startApiServer() {
         }),
       },
 
-      // Slash commands + skills available to the picked agent in the picked
-      // project. The new-task form queries this whenever agent/workdir/branch
+      // Slash commands + skills available to the picked harness in the picked
+      // project. The new-task form queries this whenever harness/workdir/branch
       // change so the prompt textarea can offer `/…` autocomplete.
+      //
+      // The `agent` query param is a harness id (or, for built-ins, the bare
+      // AgentKind — they share the same value). Resolving via getByIdOrKind
+      // lets us look up the harness's home, so an aliased multi-account
+      // harness reads its own per-harness commands/skills instead of the
+      // system home's.
       "/agent-commands": {
         GET: authed(async (req) => {
           const url = new URL(req.url);
-          const agent = url.searchParams.get("agent") as AgentKind | null;
+          const agentParam = url.searchParams.get("agent");
           const workdir = url.searchParams.get("workdir");
           const branch = url.searchParams.get("branch");
-          if (agent !== "claude-code" && agent !== "codex") {
+          if (!agentParam) {
+            return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const harness = harnesses.getByIdOrKind(agentParam);
+          if (!harness) {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
           }
           return json(
-            await listAvailableCommands({ agent, workdir, branch }),
+            await listAvailableCommands({
+              agent: harness.kind,
+              workdir,
+              branch,
+              harnessHome: harness.home,
+            }),
             { headers: corsHeaders(req) },
           );
         }),
@@ -1140,9 +1141,9 @@ export function startApiServer() {
           // Reconstruct the cwd claude was launched against. Worktree tasks
           // had cwd = worktreePath; isolation=none had cwd = workdir.
           const cwd = task.worktreePath ?? task.workdir;
-          // Resolve the harness so we read from the alias's HOME-derived
-          // claude config dir (multi-account); built-ins resolve to
-          // `homedir()` via the `home: null` branch inside jsonlPathFor.
+          // Resolve the harness so we read from the alias's CLAUDE_CONFIG_DIR
+          // (multi-account); built-ins resolve to `~/.claude/projects/…` via
+          // the `configDir: null` branch inside jsonlPathFor.
           const harness = harnesses.getByIdOrKind(task.agent);
           const jsonlPath = jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null);
           if (!existsSync(jsonlPath)) {

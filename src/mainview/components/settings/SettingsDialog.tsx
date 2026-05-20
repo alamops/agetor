@@ -728,7 +728,9 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">
-          HOME override (absolute path; optional)
+          {kind === "claude-code"
+            ? "CLAUDE_CONFIG_DIR override (absolute path; optional)"
+            : "HOME override (absolute path; optional)"}
         </label>
         <Input
           value={home}
@@ -741,9 +743,9 @@ function Editor({
         />
         <p className="text-[11px] leading-snug text-muted-foreground">
           {kind === "claude-code"
-            ? "Sets HOME on spawn — claude resolves its login & history under $HOME/.claude/, so a separate HOME gives this harness its own account."
+            ? "Sets CLAUDE_CONFIG_DIR on spawn — claude stores config, sessions, and login under this path, so a separate path gives this harness its own account. Authenticate by running: CLAUDE_CONFIG_DIR=<path> claude /login."
             : "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account."}
-          {" "}Leave empty to share the system HOME.
+          {" "}Leave empty to share the default account.
         </p>
       </div>
       <div className="space-y-1">

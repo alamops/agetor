@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { db, tasks, runs, harnesses } from "./db.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
-import { prepareClaudeHarnessHome } from "./harness-setup.ts";
 import {
   AGENT_OPTIONS,
   DEFAULT_EFFORT,
@@ -224,7 +223,7 @@ export function reconcileOrphans(): number {
         taskId: row.task_id,
         cwd,
         sessionId: row.claude_session_id as string,
-        home: harness?.home ?? null,
+        configDir: harness?.home ?? null,
         onChunk,
         seenLineUuids: runs.seenLineUuids(row.id),
       });
@@ -320,15 +319,6 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // blocked. The user re-enables in Settings to recover.
   if (!harness.enabled) {
     return { error: `${harness.label} is disabled — re-enable it in Settings to start new runs.` };
-  }
-  // Self-heal for claude-code aliases created before the harness-setup fix
-  // shipped: pre-link the native-install integrity-check path so checkHarness
-  // (and the subsequent spawn) doesn't trip on `installMethod is native, but
-  // claude command not found at <harness home>/.local/bin/claude`. Idempotent
-  // and gated on `bin` being unset so users who pinned an explicit binary
-  // keep full control.
-  if (harness.kind === "claude-code" && harness.home && !harness.bin) {
-    prepareClaudeHarnessHome(harness.home);
   }
   const status = await checkHarness(harness);
   if (!status.available) {

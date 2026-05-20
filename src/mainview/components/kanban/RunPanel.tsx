@@ -446,16 +446,18 @@ function RunPanelBody({
     // SHA used only for reproducibility) — commands are discovered
     // against the live branch context, not the historical base.
     const branch = task.branch?.trim() || undefined;
+    // Pass the harness id (task.agent) so aliased multi-account harnesses
+    // read their own per-harness commands/skills.
     api
       .listAgentCommands({
-        agent: kind,
+        agent: task.agent,
         workdir: task.workdir.trim(),
         branch,
       })
       .then((cmds) => { if (!cancelled) setSendCommands(cmds); })
       .catch(() => { if (!cancelled) setSendCommands([]); });
     return () => { cancelled = true; };
-  }, [kind, task.workdir, task.branch]);
+  }, [task.agent, task.workdir, task.branch]);
 
   const send = async () => {
     const line = input.trim();
