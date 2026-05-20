@@ -2,6 +2,7 @@ import { test, expect } from "bun:test";
 import {
   derivePermissionEntry,
   isReadOnlyBashCommand,
+  isValidPermissionEntry,
   matchesPermissionEntry,
   parsePermissionEntry,
   proposeAllowRules,
@@ -364,4 +365,42 @@ test("propose: unknown tool only offers all-of-tool", () => {
   const opts = proposeAllowRules("CustomTool", { foo: "bar" });
   expect(opts).toHaveLength(1);
   expect(opts[0]).toMatchObject({ scope: "tool", entry: "CustomTool" });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * isValidPermissionEntry — rules claude's settings parser will accept
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("valid-entry: bare tool name and simple patterns pass", () => {
+  expect(isValidPermissionEntry("Bash")).toBe(true);
+  expect(isValidPermissionEntry("Bash(git status)")).toBe(true);
+  expect(isValidPermissionEntry("Bash(git *)")).toBe(true);
+  expect(isValidPermissionEntry("Edit(/repo/src/**)")).toBe(true);
+  expect(isValidPermissionEntry("WebFetch(domain:api.github.com)")).toBe(true);
+});
+
+test("valid-entry: empty parens, parens, or newlines in the pattern fail", () => {
+  expect(isValidPermissionEntry("Bash()")).toBe(false);
+  expect(isValidPermissionEntry("Bash(   )")).toBe(false);
+  expect(isValidPermissionEntry("Bash(echo $((1+1)))")).toBe(false);
+  expect(isValidPermissionEntry("Bash(cat <<'EOF'\nhi\nEOF)")).toBe(false);
+  expect(isValidPermissionEntry("Bash(foo (bar))")).toBe(false);
+  // Unparseable shapes also fail closed.
+  expect(isValidPermissionEntry("")).toBe(false);
+  expect(isValidPermissionEntry("Bash(unclosed")).toBe(false);
+});
+
+test("derive: bash_exact refuses commands with parens or newlines", () => {
+  expect(derivePermissionEntry("Bash", { command: "echo $((1+1))" }, "bash_exact")).toBeNull();
+  expect(derivePermissionEntry("Bash", { command: "cat a.ts <<'EOF'\nx\nEOF" }, "bash_exact")).toBeNull();
+  // A clean command still derives normally.
+  expect(derivePermissionEntry("Bash", { command: "git status" }, "bash_exact")).toBe("Bash(git status)");
+});
+
+test("propose: paren/newline command omits exact but keeps the all-Bash fallback", () => {
+  const opts = proposeAllowRules("Bash", { command: "echo $((1+1))" });
+  // No invalid Bash(...) exact entry, but the user still has a usable scope.
+  expect(opts.some((o) => o.scope === "bash_exact")).toBe(false);
+  expect(opts.some((o) => o.entry === "Bash")).toBe(true);
+  for (const o of opts) expect(isValidPermissionEntry(o.entry)).toBe(true);
 });

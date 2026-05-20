@@ -240,25 +240,35 @@ export function derivePermissionEntry(
     if (command === null) return null;
     const trimmed = command.trim();
     if (!trimmed) return null;
-    if (scope === "bash_exact") return `Bash(${trimmed})`;
+    if (scope === "bash_exact") {
+      // A command carrying parens/newlines (`$((…))`, subshells, heredocs)
+      // can't be expressed as a valid `Bash(...)` pattern — claude would
+      // reject it at startup. Skip the exact scope rather than corrupt
+      // settings; the caller still offers prefix / all-Bash scopes.
+      return validOrNull(`Bash(${trimmed})`);
+    }
     const tokens = bashTokens(trimmed);
     if (tokens.length === 0) return null;
     if (BASH_WRAPPERS.has(tokens[0]!)) return null;
-    return `Bash(${tokens[0]} *)`;
+    return validOrNull(`Bash(${tokens[0]} *)`);
   }
 
   if (scope === "path_exact" || scope === "path_prefix") {
     const filePath = readString(toolInput, "file_path");
     if (filePath === null) return null;
     if (!filePath) return null;
-    if (scope === "path_exact") return `${toolName}(${filePath})`;
+    // A path carrying parens/newlines can't be expressed as a valid
+    // `Tool(...)` pattern — claude rejects it at startup exactly like a
+    // parenthesised Bash command. Guard every constructed entry, not just
+    // the Bash ones above.
+    if (scope === "path_exact") return validOrNull(`${toolName}(${filePath})`);
     // path_prefix → dir-recursive glob. Manual lastIndexOf so this module
     // stays Node-import-free (shared with the webview).
     const lastSlash = filePath.lastIndexOf("/");
     if (lastSlash <= 0) return null; // top-level path or bare filename
     const dir = filePath.slice(0, lastSlash);
     if (!dir) return null;
-    return `${toolName}(${dir}/**)`;
+    return validOrNull(`${toolName}(${dir}/**)`);
   }
 
   if (scope === "host_exact") {
@@ -266,10 +276,17 @@ export function derivePermissionEntry(
     if (url === null) return null;
     const host = hostFromUrl(url);
     if (!host) return null;
-    return `${toolName}(domain:${host})`;
+    return validOrNull(`${toolName}(domain:${host})`);
   }
 
   return null;
+}
+
+/** Return `entry` only when claude's settings parser would accept it,
+ *  else null — so callers never persist a rule that would halt the next
+ *  session on a startup recovery dialog. */
+function validOrNull(entry: string): string | null {
+  return isValidPermissionEntry(entry) ? entry : null;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -360,6 +377,25 @@ function parsePermissionEntryRaw(entry: string): ParsedEntry | null {
 }
 
 /**
+ * True when `entry` is a permission rule claude's settings parser will
+ * actually accept. Claude closes a `Tool(...)` pattern at the first `)` and
+ * rejects an empty `()` ("Empty parentheses") — both surface as a startup
+ * recovery dialog that blocks the session. So a valid pattern argument must
+ * be non-empty and contain no parenthesis or newline. Bare tool names
+ * (`Bash`) are always fine.
+ *
+ * We use this both to refuse emitting bad entries (derivePermissionEntry /
+ * proposeAllowRules) and to strip any that earlier versions wrote into a
+ * settings.local.json (hook-installer / appendPermissionEntry).
+ */
+export function isValidPermissionEntry(entry: string): boolean {
+  const raw = parsePermissionEntryRaw(entry);
+  if (!raw) return false;
+  if (raw.pattern === null) return true;
+  return raw.pattern.trim() !== "" && !/[()\r\n]/.test(raw.pattern);
+}
+
+/**
  * Public parser for the rules-manager UI. Returns the scope inferred from
  * the pattern shape (best-effort — we lose the original UI intent but can
  * label rules accurately enough for display).
@@ -435,11 +471,15 @@ export function proposeAllowRules(
       if (!hasWrapper) {
         if (tokens.length >= 1) {
           const entry = `Bash(${tokens[0]} *)`;
-          out.push({ scope: "bash_prefix", variant: "1", entry, label: `All "${tokens[0]} *" commands` });
+          if (isValidPermissionEntry(entry)) {
+            out.push({ scope: "bash_prefix", variant: "1", entry, label: `All "${tokens[0]} *" commands` });
+          }
         }
         if (tokens.length >= 2) {
           const entry = `Bash(${tokens[0]} ${tokens[1]} *)`;
-          out.push({ scope: "bash_prefix", variant: "2", entry, label: `All "${tokens[0]} ${tokens[1]} *" commands` });
+          if (isValidPermissionEntry(entry)) {
+            out.push({ scope: "bash_prefix", variant: "2", entry, label: `All "${tokens[0]} ${tokens[1]} *" commands` });
+          }
         }
       }
     }

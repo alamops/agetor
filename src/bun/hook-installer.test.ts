@@ -313,3 +313,46 @@ test("ensureInstalled preserves `permissions.allow` across re-spawns (regression
   expect(final.hooks.PreToolUse).toHaveLength(1);
   expect(final.mcpServers?.agetor).toBeDefined();
 });
+
+test("ensureInstalled: strips permission entries claude's parser would reject (owned worktree self-heal)", async () => {
+  const { ensureInstalled } = await import("./hook-installer.ts");
+  const owned = makeCwd();
+  const dir = path.join(owned, ".claude");
+  require("node:fs").mkdirSync(dir, { recursive: true });
+  // A settings file an older "Allow always" save poisoned: two valid rules
+  // plus three claude would reject at startup (paren / newline / empty).
+  writeFileSync(path.join(dir, "settings.local.json"), JSON.stringify({
+    permissions: {
+      allow: [
+        "Bash(git status)",
+        "Bash(echo $((1+1)))",
+        "Bash(cat <<'EOF'\nx\nEOF)",
+        "Bash()",
+        "Edit(/repo/src/**)",
+      ],
+    },
+  }));
+
+  ensureInstalled(owned, "full");
+
+  const settings = readSettings(owned) as { permissions: { allow: string[] } };
+  expect(settings.permissions.allow).toEqual(["Bash(git status)", "Edit(/repo/src/**)"]);
+});
+
+test("ensureInstalledMerged: does NOT strip a user repo's own permission entries", async () => {
+  // The user's source repo (isolation=none) — we add our hook but must
+  // never silently delete the user's version-controlled rules, even ones
+  // claude would itself reject. claude's own startup dialog surfaces those.
+  const { ensureInstalledMerged } = await import("./hook-installer.ts");
+  const cwd = makeCwd();
+  const dir = path.join(cwd, ".claude");
+  require("node:fs").mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "settings.local.json"), JSON.stringify({
+    permissions: { allow: ["Bash(git status)", "Bash(echo $((1+1)))"] },
+  }));
+
+  ensureInstalledMerged(cwd);
+
+  const settings = readSettings(cwd) as { permissions: { allow: string[] } };
+  expect(settings.permissions.allow).toEqual(["Bash(git status)", "Bash(echo $((1+1)))"]);
+});

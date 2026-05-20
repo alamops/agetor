@@ -2747,12 +2747,25 @@ function TmuxPromptCard({
   onResolved: (id: string) => void;
 }) {
   const [submitting, setSubmitting] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const send = async (key: string) => {
     if (submitting) return;
     setSubmitting(key);
+    setError(null);
     try {
+      // Only clear the card once the server has handled it. Resolving
+      // optimistically (the old behaviour) made a failed keystroke briefly
+      // hide the card, then the scraper re-detected the still-present modal
+      // and re-registered it — the "flicker that stays" the user saw.
+      //
+      // `{ ok: false }` (HTTP 200) means the prompt was already resolved
+      // server-side (scraper auto-cancel, double-click) — the card should
+      // just go away, not show an error. Genuine delivery failures come
+      // back as 410/500 and throw, landing in the catch below.
       await api.answerTmuxPrompt(req.id, { key });
       onResolved(req.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to send choice.");
     } finally {
       setSubmitting(null);
     }
@@ -2788,6 +2801,9 @@ function TmuxPromptCard({
           );
         })}
       </div>
+      {error && (
+        <p className="mt-2 text-right text-[11px] text-destructive">{error}</p>
+      )}
     </div>
   );
 }

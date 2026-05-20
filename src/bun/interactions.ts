@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import path from "node:path";
 import {
   derivePermissionEntry,
+  isValidPermissionEntry,
   matchesPermissionEntry,
   type ApprovalRememberScope,
 } from "../shared/claude-permissions.ts";
@@ -800,8 +801,25 @@ function appendPermissionEntry(cwd: string, entry: string): void {
     ? settings.permissions as Record<string, unknown>
     : {};
   const allowRaw = Array.isArray(permissions.allow) ? permissions.allow as unknown[] : [];
-  const existing = allowRaw.filter((e): e is string => typeof e === "string");
-  if (!existing.includes(entry)) existing.push(entry);
+  // Drop any pre-existing entry claude's parser would reject (paren/newline/
+  // empty patterns from older saves) so we never re-persist junk that would
+  // halt the next session on a startup recovery dialog.
+  const existing = allowRaw.filter(
+    (e): e is string => typeof e === "string" && isValidPermissionEntry(e),
+  );
+  // Defence-in-depth: never persist an entry this writer would itself
+  // reject (callers derive entries that are now guarded, but a future
+  // caller passing a paren/newline pattern shouldn't reintroduce the bug).
+  // Log the skip so a verbatim-`entry` caller (saveAllowRule accepts arbitrary
+  // strings) isn't left wondering why their save silently no-op'd.
+  if (!isValidPermissionEntry(entry)) {
+    console.error(
+      `[agetor:interactions] skipping invalid permission entry ${JSON.stringify(entry)} — ` +
+      `claude's settings parser would reject it (empty/paren/newline pattern).`,
+    );
+  } else if (!existing.includes(entry)) {
+    existing.push(entry);
+  }
   permissions.allow = existing;
   settings.permissions = permissions;
 

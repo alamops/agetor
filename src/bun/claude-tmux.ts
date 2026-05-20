@@ -564,14 +564,22 @@ export function getCurrentPermissionMode(taskId: string): string | null {
  * Returns true on apparent success (tmux command exited 0). Silently
  * returns false when no session is registered.
  */
-export function dismissTmuxPrompt(taskId: string, key: string): boolean {
+export async function dismissTmuxPrompt(taskId: string, key: string): Promise<boolean> {
   const state = sessions.get(taskId);
   if (!state) return false;
-  // send-keys interprets every positional arg as a tmux key spec — pass
-  // the literal first, then "Enter" as a separate token so claude sees
-  // an actual carriage return.
-  const res = tmux(["send-keys", "-t", state.sessionName, key, "Enter"]);
-  return res.ok;
+  // Two SEPARATE send-keys calls — not "key Enter" in one. A combined
+  // invocation makes tmux deliver "1\r" as a single read chunk, and
+  // claude's Ink select consumes only the digit (moves/highlights the
+  // choice) while the trailing carriage return is dropped — so the choice
+  // is never confirmed and the modal just sits there. Splitting them
+  // (mirrors pastePrompt's separate Enter) lets the digit register first,
+  // then the Enter confirms. The brief gap guarantees the two keystrokes
+  // land in distinct reads on claude's stdin; `await Bun.sleep` (not the
+  // sync variant) keeps the gap off the SSE/scrape event loop.
+  const sent = tmux(["send-keys", "-t", state.sessionName, key]);
+  if (!sent.ok) return false;
+  await Bun.sleep(50);
+  return tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
