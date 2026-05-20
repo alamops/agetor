@@ -238,6 +238,13 @@ export interface Task {
   pendingInteractionCount: number;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Unix ms timestamp when the task was archived; null when not archived.
+   * Archived tasks remain in their column (always `done` in practice — the
+   * server rejects archive from other columns) but are hidden from the
+   * default kanban filter and rendered read-only in the run panel.
+   */
+  archivedAt: number | null;
 }
 
 /**

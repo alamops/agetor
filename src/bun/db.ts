@@ -58,6 +58,7 @@ type TaskRow = {
   mode: string | null; model: string | null; effort: string | null;
   refs: string;
   run_id: string | null; created_at: number; updated_at: number;
+  archived_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
    *  a correlated subquery in `list` / `get` — see those for the full SQL. */
   has_openable_run?: number;
@@ -108,6 +109,7 @@ const toTask = (r: TaskRow): Task => ({
   pendingInteractionCount: countPendingForTask(r.id),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
+  archivedAt: r.archived_at,
 });
 
 // LEFT JOIN + aggregation, so the runs scan happens once instead of once
@@ -141,19 +143,19 @@ export const tasks = {
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation,
           branch, worktree_path, base_ref, mode, model, effort, refs,
-          run_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          run_id, created_at, updated_at, archived_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.branch, t.worktreePath, t.baseRef, t.mode, t.model, t.effort,
         JSON.stringify(t.references ?? []),
-        t.runId, t.createdAt, t.updatedAt,
+        t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
       ],
     );
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0 };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -163,13 +165,13 @@ export const tasks = {
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?,
          branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?,
-         run_id=?, updated_at=?
+         run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
         next.branch, next.worktreePath, next.baseRef, next.mode, next.model, next.effort,
         JSON.stringify(next.references ?? []),
-        next.runId, next.updatedAt, id,
+        next.runId, next.updatedAt, next.archivedAt ?? null, id,
       ],
     );
     // Re-fetch so hasOpenableRun reflects the row state immediately after

@@ -930,8 +930,55 @@ export async function createTask(
     pendingInteractionCount: 0,
     createdAt: now,
     updatedAt: now,
+    archivedAt: null,
   });
   return { task };
+}
+
+/**
+ * Archive a finished task: stamp `archivedAt`, kill its claude tmux session
+ * (best-effort) so a background REPL doesn't outlive the user's interest in
+ * the task. Worktree, run history, and prompt stay intact for later reference.
+ *
+ * Only allowed when the task is in the `done` column — archive is the
+ * terminal step of the explicit review → done → archive flow.
+ */
+export function archiveTask(taskId: string): { task: Task } | { error: string } {
+  const task = tasks.get(taskId);
+  if (!task) return { error: "task not found" };
+  if (task.column !== "done") {
+    return { error: "only tasks in Done can be archived" };
+  }
+  // Defence-in-depth: column='done' should imply no live run, but column is
+  // freely PATCHable (drag-to-Done on a running card is allowed today). If a
+  // run is still active, refuse rather than killing tmux out from under it —
+  // the exit handler would then flip the now-archived task to 'ready' and
+  // leave the row in a contradictory state.
+  if (task.runId && active.has(task.runId)) {
+    return { error: "task is still running — cancel the run before archiving" };
+  }
+  if (task.archivedAt != null) {
+    return { task };
+  }
+  const updated = tasks.update(taskId, { archivedAt: Date.now() });
+  if (!updated) return { error: "task not found" };
+  // Same contract as deleteTask: dropSession is non-throwing (it best-efforts
+  // tmux teardown internally). Don't wrap — a silent catch would hide a
+  // regression in claude-tmux from the next reviewer.
+  if (resolveHarness(task.agent)?.kind === "claude-code") dropSession(taskId);
+  return { task: updated };
+}
+
+/** Reverse of `archiveTask`: clear the timestamp. No tmux work — sending a
+ *  follow-up message on a non-archived task already spawns a fresh session via
+ *  the resume path. */
+export function unarchiveTask(taskId: string): { task: Task } | { error: string } {
+  const task = tasks.get(taskId);
+  if (!task) return { error: "task not found" };
+  if (task.archivedAt == null) return { task };
+  const updated = tasks.update(taskId, { archivedAt: null });
+  if (!updated) return { error: "task not found" };
+  return { task: updated };
 }
 
 /**

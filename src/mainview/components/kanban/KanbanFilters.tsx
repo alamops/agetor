@@ -2,7 +2,10 @@ import { Folder, Search, Tag } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { MultiSearchSelect } from "@/components/ui/multi-search-select";
+import { Select } from "@/components/ui/select";
 import { COLUMNS, type ColumnId, type Project } from "../../../shared/types.ts";
+
+export type ArchivedView = "active" | "all" | "archived";
 
 interface Props {
   textQuery: string;
@@ -11,6 +14,8 @@ interface Props {
   onRepoFilterChange: (v: string[]) => void;
   statusFilter: ColumnId[];
   onStatusFilterChange: (v: ColumnId[]) => void;
+  archivedView: ArchivedView;
+  onArchivedViewChange: (v: ArchivedView) => void;
   projects: Project[];
 }
 
@@ -27,6 +32,8 @@ export function KanbanFilters({
   onRepoFilterChange,
   statusFilter,
   onStatusFilterChange,
+  archivedView,
+  onArchivedViewChange,
   projects,
 }: Props) {
   const repoItems = projects.map((p) => ({
@@ -36,7 +43,10 @@ export function KanbanFilters({
   }));
   const statusItems = COLUMNS.map((c) => ({ value: c.id, label: c.label } as const));
   const anyActive =
-    textQuery !== "" || repoFilter.length > 0 || statusFilter.length > 0;
+    textQuery !== ""
+    || repoFilter.length > 0
+    || statusFilter.length > 0
+    || archivedView !== "active";
 
   return (
     <div className="flex shrink-0 items-center gap-2 border-b border-border/60 px-4 py-2">
@@ -67,6 +77,16 @@ export function KanbanFilters({
         leadingIcon={<Tag className="size-3.5" />}
         className="w-48"
       />
+      <Select
+        value={archivedView}
+        onChange={(e) => onArchivedViewChange(e.target.value as ArchivedView)}
+        className="w-36"
+        title="Filter by archive state"
+      >
+        <option value="active">Active only</option>
+        <option value="all">All</option>
+        <option value="archived">Archived only</option>
+      </Select>
       {anyActive && (
         <Button
           variant="ghost"
@@ -75,6 +95,7 @@ export function KanbanFilters({
             onTextQueryChange("");
             onRepoFilterChange([]);
             onStatusFilterChange([]);
+            onArchivedViewChange("active");
           }}
         >
           Clear

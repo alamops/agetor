@@ -14,7 +14,7 @@ import {
   HarnessInUseError,
   dataDir,
 } from "./db.ts";
-import { createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { prepareClaudeHarnessHome } from "./harness-setup.ts";
 import { applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
@@ -697,6 +697,17 @@ export function startApiServer() {
           if (!before) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
+          // Archived rows are frozen — the UI hides every mutator (drag is
+          // disabled, action buttons are stripped, the composer is replaced
+          // by a footer). Enforce it server-side too so a direct API caller
+          // (or a stale tab racing the timestamp flip) can't drag the row
+          // back to a live column and re-trigger session reconciliation.
+          if (before.archivedAt != null) {
+            return json(
+              { error: "task is archived — unarchive it before editing" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
           const patch = filterPatch(await req.json());
           // Prevent workdir from being swapped after a worktree has been
           // materialized. The worktree is registered against the original repo;
@@ -769,6 +780,24 @@ export function startApiServer() {
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/archive": {
+        POST: authed((req) => {
+          const result = archiveTask(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(result.task, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/unarchive": {
+        POST: authed((req) => {
+          const result = unarchiveTask(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(result.task, { headers: corsHeaders(req) });
         }),
       },
 
