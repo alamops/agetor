@@ -882,6 +882,21 @@ export function startApiServer() {
           ]);
           const currentMode = getCurrentPermissionMode(taskId);
           const planModeForce = currentMode === "plan" && PLAN_MODE_INTERCEPT.has(toolName);
+          // Auto / bypass fast-path: claude's own classifier has already
+          // decided this tool is safe to run (auto = "let claude decide",
+          // bypassPermissions = "don't ask me anything"). Second-guessing
+          // it here only annoys the user — they explicitly opted into the
+          // hands-off posture. ALWAYS_INTERCEPT still applies (the modal-
+          // deadlock prevention isn't negotiable). This branch matters
+          // primarily for the mid-session mode-change path: a task spawned
+          // in `ask` mode installed the FULL hook matcher, and a later
+          // PATCH to `auto` doesn't re-narrow the matcher — so every tool
+          // call still lands here. Without this fast-path the user gets
+          // approval cards for routine Bash even after switching to auto.
+          if (!ALWAYS_INTERCEPT.has(toolName) &&
+              (currentMode === "auto" || currentMode === "bypassPermissions")) {
+            return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
+          }
           // Fast paths: safe tools and previously-saved rules auto-allow,
           // except for the always-intercept set above. The allow-rule lookup
           // now reads `.claude/settings.local.json` `permissions.allow` and
