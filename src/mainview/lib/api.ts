@@ -126,6 +126,21 @@ const API_PORT = injected?.port ?? params.get("api") ?? "4317";
 const API_TOKEN = injected?.token ?? params.get("token") ?? "";
 const BASE = `http://127.0.0.1:${API_PORT}`;
 
+/** Error thrown for any non-2xx API response. Carries the parsed JSON body
+ *  so callers can read structured fields (e.g. the `taskIds` list returned
+ *  by `DELETE /harnesses/:id` when the harness is still in use) instead of
+ *  re-parsing the message string. */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly body: unknown;
+  constructor(message: string, status: number, body: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
@@ -153,7 +168,7 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
     const msg = (body && typeof body === "object" && "error" in body && body.error)
       ? String(body.error)
       : `${res.status} ${res.statusText}`;
-    throw new Error(msg);
+    throw new ApiError(msg, res.status, body);
   }
   return body as T;
 }
