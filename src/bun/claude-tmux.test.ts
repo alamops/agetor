@@ -267,6 +267,109 @@ test("mapJsonlEventToChunks: user.content[].text → `user` stream (array-form p
   expect(out).toEqual([{ stream: "user", data: "hello there" }]);
 });
 
+test("mapJsonlEventToChunks: task-notification user message → `status` breadcrumb, not a user bubble", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    origin: { kind: "task-notification" },
+    message: {
+      content:
+        "<task-notification>\n<task-id>b21qu207r</task-id>\n<status>completed</status>\n<summary>Background command \"Find bun executable\" completed (exit code 0)</summary>\n</task-notification>",
+    },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: 'background task: Background command "Find bun executable" completed (exit code 0)' },
+  ]);
+});
+
+test("mapJsonlEventToChunks: task-notification without a summary still emits a generic status", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    origin: { kind: "task-notification" },
+    message: { content: "<task-notification><status>completed</status></task-notification>" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "status", data: "background task completed" }]);
+});
+
+test("mapJsonlEventToChunks: malformed-tool-call retry (isMeta) → status breadcrumb, not a user bubble", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: "Your tool call was malformed and could not be parsed. Please retry." },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: "Your tool call was malformed and could not be parsed. Please retry." },
+  ]);
+});
+
+test("mapJsonlEventToChunks: large multi-line isMeta blob is truncated to one capped line", () => {
+  const { out, onChunk } = recorder();
+  const longFirstLine = "x".repeat(200);
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: [{ type: "text", text: `${longFirstLine}\nsecond line\nthird line` }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out.length).toBe(1);
+  expect(out[0]!.stream).toBe("status");
+  expect(out[0]!.data).toBe("x".repeat(137) + "…");
+});
+
+test("mapJsonlEventToChunks: isMeta breadcrumb strips a leading wrapper tag", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: "<local-command-caveat>Caveat: generated while running local commands.</local-command-caveat>" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: "Caveat: generated while running local commands.</local-command-caveat>" },
+  ]);
+});
+
+test("mapJsonlEventToChunks: isMeta entry with only non-text blocks falls back to a generic label", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: [{ type: "image", source: {} }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "status", data: "synthetic message" }]);
+});
+
+test("mapJsonlEventToChunks: empty isMeta content stays silent", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "user", isMeta: true, message: { content: "" } });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("mapJsonlEventToChunks: genuine human turn (no isMeta) still emits a user bubble", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "user", message: { content: "ship the fix please" } });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "user", data: "ship the fix please" }]);
+});
+
+test("mapJsonlEventToChunks: tool_result user entry (no isMeta) still emits tool_result, not a breadcrumb", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "tu_1", content: "ok", is_error: false }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out.length).toBe(1);
+  expect(out[0]!.stream).toBe("tool_result");
+});
+
 test("mapJsonlEventToChunks: empty user string content stays silent", () => {
   const { out, onChunk } = recorder();
   const line = JSON.stringify({ type: "user", message: { content: "" } });

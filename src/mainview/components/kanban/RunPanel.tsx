@@ -100,11 +100,16 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
     if (task) {
       setMountedTask(task);
       // Defer the open flip to the next frame so the panel mounts at
-      // translate-x-full first, then animates to translate-x-0.
-      requestAnimationFrame(() => setOpen(true));
-    } else {
-      setOpen(false);
+      // translate-x-full first, then animates to translate-x-0. Cancel on
+      // cleanup: without this, a pending rAF from a truthy run can fire AFTER
+      // a later task→null run set open=false, wedging the panel open (open=true
+      // while task=null, so every close path's setSelected(null) is a no-op).
+      // The 2s kanban poll re-creates `selected` — and so re-runs this effect —
+      // every tick, which is what made the bug intermittent.
+      const raf = requestAnimationFrame(() => setOpen(true));
+      return () => cancelAnimationFrame(raf);
     }
+    setOpen(false);
   }, [task]);
 
   // After the exit animation completes, drop the mountedTask so we don't keep
@@ -442,8 +447,20 @@ function RunPanelBody({
   //     recent run id to identify which task → which claude session to
   //     resume. Codex has no resume mechanism; restrict to claude-code.
   const liveRunId = task.runId;
+  // Reconcile against the independently-polled runs list: if the live run has
+  // already resolved (succeeded/failed/cancelled/orphaned), the task isn't
+  // running regardless of what `task.column` says. `task.column` is a snapshot
+  // polled into the board and can briefly lag the DB; `runs` is polled here
+  // (with its own error handling) so a resolved live run is the more
+  // trustworthy "no longer running" signal. When the live run hasn't been
+  // polled in yet (freshly started — not in `runs` yet), `liveRun` is null and
+  // we fall back to trusting `task.column`, so Stop never hides on a genuinely
+  // in-flight turn.
+  const liveRun = liveRunId ? runs.find((r) => r.id === liveRunId) ?? null : null;
+  const liveRunTerminal = !!liveRun && liveRun.status !== "running";
   const canControl = !!liveRunId
-    && (task.column === "running" || task.column === "blocked");
+    && (task.column === "running" || task.column === "blocked")
+    && !liveRunTerminal;
   const resumableRunId = liveRunId
     ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
   // Send is enabled whenever the task has ever been run. While a turn is
@@ -696,7 +713,13 @@ function RunPanelBody({
             onClick={() => void send()}
             disabled={!canSend || sending || (!input.trim() && sendRefs.length === 0)}
             title={
-              canControl
+              // Distinguish "live session exists" from "needs resume" — not
+              // "turn in flight". `liveRunId` (task.runId) stays set while the
+              // tmux session is alive (including between turns) and is only
+              // null once the session is gone (orphan-reconciled), which is the
+              // resume path. Keying off `canControl` here would mislabel the
+              // common "session alive, no turn in flight" state as a resume.
+              liveRunId
                 ? "Send to the live agent"
                 : "Resume the conversation with this message"
             }
@@ -2724,12 +2747,25 @@ function TmuxPromptCard({
   onResolved: (id: string) => void;
 }) {
   const [submitting, setSubmitting] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const send = async (key: string) => {
     if (submitting) return;
     setSubmitting(key);
+    setError(null);
     try {
+      // Only clear the card once the server has handled it. Resolving
+      // optimistically (the old behaviour) made a failed keystroke briefly
+      // hide the card, then the scraper re-detected the still-present modal
+      // and re-registered it — the "flicker that stays" the user saw.
+      //
+      // `{ ok: false }` (HTTP 200) means the prompt was already resolved
+      // server-side (scraper auto-cancel, double-click) — the card should
+      // just go away, not show an error. Genuine delivery failures come
+      // back as 410/500 and throw, landing in the catch below.
       await api.answerTmuxPrompt(req.id, { key });
       onResolved(req.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to send choice.");
     } finally {
       setSubmitting(null);
     }
@@ -2765,6 +2801,9 @@ function TmuxPromptCard({
           );
         })}
       </div>
+      {error && (
+        <p className="mt-2 text-right text-[11px] text-destructive">{error}</p>
+      )}
     </div>
   );
 }

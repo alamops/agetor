@@ -61,6 +61,7 @@ import {
   type QuestionAnswer,
 } from "./interactions.ts";
 import { MODEL_EFFORT_SUPPORT } from "../shared/types.ts";
+import { isReadOnlyBashCommand } from "../shared/claude-permissions.ts";
 import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 
@@ -880,8 +881,19 @@ export function startApiServer() {
           const PLAN_MODE_INTERCEPT = new Set([
             "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash",
           ]);
+          // A `Bash` call whose command is confidently read-only (grep/find/
+          // ls/cat/…) is treated like the dedicated read-only tools: it can't
+          // mutate the workspace, so it auto-allows even in ask/acceptEdits
+          // and is exempt from the plan-mode force-intercept below. Mutating
+          // Bash (rm, git push, an Edit-equivalent shell write…) classifies
+          // false and still draws a card.
+          const ti = payload.tool_input as { command?: unknown } | null | undefined;
+          const bashCommand = ti && typeof ti.command === "string" ? ti.command : "";
+          const readOnlyBash = toolName === "Bash" && bashCommand !== "" &&
+            isReadOnlyBashCommand(bashCommand);
           const currentMode = getCurrentPermissionMode(taskId);
-          const planModeForce = currentMode === "plan" && PLAN_MODE_INTERCEPT.has(toolName);
+          const planModeForce = currentMode === "plan" &&
+            PLAN_MODE_INTERCEPT.has(toolName) && !readOnlyBash;
           // Auto / bypass fast-path: claude's own classifier has already
           // decided this tool is safe to run (auto = "let claude decide",
           // bypassPermissions = "don't ask me anything"). Second-guessing
@@ -902,7 +914,7 @@ export function startApiServer() {
           // now reads `.claude/settings.local.json` `permissions.allow` and
           // matches per the claude pattern syntax (see claude-permissions.ts).
           if (!ALWAYS_INTERCEPT.has(toolName) && !planModeForce &&
-              (SAFE_TOOLS.has(toolName) ||
+              (SAFE_TOOLS.has(toolName) || readOnlyBash ||
                lookupAllowRule({ taskId, toolName, toolInput: payload.tool_input }) === "allow")) {
             return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
           }
@@ -1103,7 +1115,7 @@ export function startApiServer() {
               { status: 410, headers: corsHeaders(req) },
             );
           }
-          const delivered = dismissTmuxPrompt(pending.taskId, key);
+          const delivered = await dismissTmuxPrompt(pending.taskId, key);
           if (!delivered) {
             return json(
               { ok: false, error: "failed to deliver keystroke to tmux" },
