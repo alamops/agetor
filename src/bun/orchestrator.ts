@@ -42,6 +42,7 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName } from "./worktree.ts";
+import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
   ColumnId,
@@ -981,6 +982,9 @@ export async function createTask(
     // Derived from the in-memory interactions Maps in `interactions.ts`; a
     // brand-new task has no pending interactions, so 0 is the correct seed.
     pendingInteractionCount: 0,
+    // Derived from the in-memory terminal manager in `terminals.ts`; a
+    // brand-new task has no open terminals, so 0 is the correct seed.
+    openTerminalCount: 0,
     createdAt: now,
     updatedAt: now,
   });
@@ -1003,6 +1007,10 @@ export async function deleteTask(taskId: string): Promise<void> {
   // here before tearing down the worktree so we don't leave an orphaned
   // session behind. No-op when the task is codex or no session exists.
   if (resolveHarness(task.agent)?.kind === "claude-code") dropSession(taskId);
+  // Kill any open terminal tabs before removing the worktree — a live shell
+  // sitting in the worktree dir would block `git worktree remove`. Awaited so
+  // the shells are actually gone before we tear the directory down.
+  await killTerminalsForTask(taskId);
   await removeWorktree(task);
   // No per-task attachments directory to clean up — refs are path-only,
   // agetor never copied anything to disk.

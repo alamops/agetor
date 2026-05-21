@@ -1,6 +1,6 @@
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { ArrowRight, FolderOpen, GitBranch, MessageCircleQuestion, Play, Square, Trash2 } from "lucide-react";
+import { ArrowRight, FolderOpen, GitBranch, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -76,6 +76,16 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }:
               <span className="text-[10px] font-mono text-muted-foreground">
                 {[task.model, task.mode].filter(Boolean).join(" · ")}
               </span>
+            )}
+            {task.openTerminalCount > 0 && (
+              <Badge
+                variant="outline"
+                className="gap-1 text-[10px]"
+                title={`${task.openTerminalCount} open terminal${task.openTerminalCount > 1 ? "s" : ""}`}
+              >
+                <Terminal className="size-3" />
+                {task.openTerminalCount}
+              </Badge>
             )}
           </div>
         </div>

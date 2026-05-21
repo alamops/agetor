@@ -55,6 +55,7 @@ async function seedPendingApproval(args: {
     updatedAt: Date.now(),
     hasOpenableRun: false,
     pendingInteractionCount: 0,
+    openTerminalCount: 0,
   });
   const { registerApproval } = await import("./interactions.ts");
   const { id } = registerApproval({
@@ -169,6 +170,7 @@ async function seedTaskWithSavedRule(args: {
     updatedAt: Date.now(),
     hasOpenableRun: false,
     pendingInteractionCount: 0,
+    openTerminalCount: 0,
   });
   // Pre-write the allow-rule directly to the task's settings file so the
   // route's lookupAllowRule call hits "allow" — same shape we'd get if the

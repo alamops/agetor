@@ -14,6 +14,10 @@ import { migrations } from "./migrations/index.ts";
 // bindings the unresolved cycle becomes an undefined-binding crash at
 // import time. Keep both sides lazy.
 import { countPendingForTask } from "./interactions.ts";
+// Same lazy-cycle contract as interactions.ts above: terminals.ts imports
+// `tasks` from this module, and we call `countTerminals` only inside `toTask`
+// (a function body), never at top level. Do not hoist this call site.
+import { countTerminals } from "./terminals.ts";
 
 // Hard guard against test fixtures silently leaking into the user's real
 // SQLite db. `bun test` runs every *.test.ts file in one process, so the
@@ -106,6 +110,7 @@ const toTask = (r: TaskRow): Task => ({
   // no runs exist yet → false is the right default).
   hasOpenableRun: r.has_openable_run === 1,
   pendingInteractionCount: countPendingForTask(r.id),
+  openTerminalCount: countTerminals(r.id),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
 });
@@ -153,7 +158,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0 };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0 };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);

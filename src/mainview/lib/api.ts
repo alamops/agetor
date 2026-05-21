@@ -13,6 +13,7 @@ import type {
   RunEvent,
   Task,
   TaskReference,
+  TerminalTab,
   UpdateStatus,
 } from "../../shared/types.ts";
 
@@ -276,6 +277,17 @@ export const api = {
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ column }) }),
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
   startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
+
+  // Terminal tabs. State is in-memory on the bun side; the live byte stream
+  // runs over the WebSocket whose URL `terminalSocketUrl` builds.
+  listTerminals: (taskId: string) => j<TerminalTab[]>(`/tasks/${taskId}/terminals`),
+  createTerminal: (taskId: string) =>
+    j<TerminalTab>(`/tasks/${taskId}/terminals`, { method: "POST" }),
+  closeTerminal: (id: string) => j<void>(`/terminals/${id}`, { method: "DELETE" }),
+  /** ws:// URL for a terminal's duplex stream. EventSource-style token in the
+   *  query string since WebSockets can't set the Authorization header. */
+  terminalSocketUrl: (id: string) =>
+    `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?token=${encodeURIComponent(API_TOKEN)}`,
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
