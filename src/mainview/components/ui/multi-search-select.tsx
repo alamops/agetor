@@ -10,6 +10,8 @@ export interface MultiSearchSelectItem<T extends string = string> {
   hint?: string;
   /** Render at the top of the list above non-pinned items. */
   pinned?: boolean;
+  /** Optional glyph rendered on the left side of the option row. */
+  icon?: ReactNode;
 }
 
 interface Props<T extends string> {
@@ -93,14 +95,16 @@ export function MultiSearchSelect<T extends string>({
 
   const valueSet = useMemo(() => new Set(values), [values]);
 
+  const selectedSingle = useMemo(
+    () => (values.length === 1 ? items.find((i) => i.value === values[0]) : undefined),
+    [values, items],
+  );
   const triggerLabel = useMemo(() => {
     if (values.length === 0) return emptyLabel;
-    if (values.length === 1) {
-      const only = items.find((i) => i.value === values[0]);
-      return only?.label ?? values[0]!;
-    }
+    if (values.length === 1) return selectedSingle?.label ?? values[0]!;
     return `${values.length} selected`;
-  }, [values, items, emptyLabel]);
+  }, [values, selectedSingle, emptyLabel]);
+  const triggerIcon = selectedSingle?.icon ?? leadingIcon;
 
   const toggle = (value: T) => {
     if (valueSet.has(value)) onChange(values.filter((v) => v !== value));
@@ -119,7 +123,7 @@ export function MultiSearchSelect<T extends string>({
           disabled && "cursor-not-allowed opacity-50",
         )}
       >
-        {leadingIcon && <span className="shrink-0 text-muted-foreground">{leadingIcon}</span>}
+        {triggerIcon && <span className="shrink-0 text-muted-foreground">{triggerIcon}</span>}
         <span className={cn("min-w-0 flex-1 truncate", values.length === 0 && "text-muted-foreground")}>
           {triggerLabel}
         </span>
@@ -128,6 +132,9 @@ export function MultiSearchSelect<T extends string>({
 
       {open && (
         <div
+          // Marker for enclosing Esc handlers (RunPanel) to bail and let
+          // this popover consume Escape first.
+          data-popover-open=""
           className={cn(
             "absolute left-0 right-0 z-50 overflow-hidden rounded-md border border-border bg-card text-card-foreground shadow-xl",
             placement === "top" ? "bottom-full mb-1" : "top-full mt-1",
@@ -166,6 +173,11 @@ export function MultiSearchSelect<T extends string>({
                       )}
                       aria-hidden
                     />
+                    {item.icon && (
+                      <span className="mt-0.5 flex size-3.5 shrink-0 items-center justify-center">
+                        {item.icon}
+                      </span>
+                    )}
                     <span className="min-w-0 flex-1">
                       <span className="block truncate">{item.label}</span>
                       {item.hint && (

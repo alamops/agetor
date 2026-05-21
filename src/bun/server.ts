@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Utils } from "electrobun/bun";
@@ -16,7 +16,6 @@ import {
 } from "./db.ts";
 import { createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
-import { prepareClaudeHarnessHome } from "./harness-setup.ts";
 import { applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import {
   bundledTmuxAvailable,
@@ -62,6 +61,7 @@ import {
   type QuestionAnswer,
 } from "./interactions.ts";
 import { MODEL_EFFORT_SUPPORT } from "../shared/types.ts";
+import { isReadOnlyBashCommand } from "../shared/claude-permissions.ts";
 import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 
@@ -469,13 +469,6 @@ export function startApiServer() {
               bin,
               env,
             });
-            // Native-install claude validates `$HOME/.local/bin/claude` exists
-            // on every launch and errors out otherwise. When the user gives
-            // this harness its own HOME but no BIN, pre-link the system
-            // binary into the new HOME so the integrity check passes.
-            if (created.kind === "claude-code" && created.home && !created.bin) {
-              prepareClaudeHarnessHome(created.home);
-            }
             return json(created, { headers: corsHeaders(req) });
           } catch (e) {
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
@@ -545,12 +538,6 @@ export function startApiServer() {
           }
           try {
             const updated = harnesses.update(req.params.id, patch);
-            // Same rationale as the POST handler: if a claude-code alias
-            // gains (or changes) a custom HOME without an explicit BIN, make
-            // sure the native-install integrity-check path exists.
-            if (updated.kind === "claude-code" && updated.home && !updated.bin && "home" in body) {
-              prepareClaudeHarnessHome(updated.home);
-            }
             return json(updated, { headers: corsHeaders(req) });
           } catch (e) {
             if (e instanceof HarnessBuiltinError) {
@@ -622,20 +609,35 @@ export function startApiServer() {
         }),
       },
 
-      // Slash commands + skills available to the picked agent in the picked
-      // project. The new-task form queries this whenever agent/workdir/branch
+      // Slash commands + skills available to the picked harness in the picked
+      // project. The new-task form queries this whenever harness/workdir/branch
       // change so the prompt textarea can offer `/…` autocomplete.
+      //
+      // The `agent` query param is a harness id (or, for built-ins, the bare
+      // AgentKind — they share the same value). Resolving via getByIdOrKind
+      // lets us look up the harness's home, so an aliased multi-account
+      // harness reads its own per-harness commands/skills instead of the
+      // system home's.
       "/agent-commands": {
         GET: authed(async (req) => {
           const url = new URL(req.url);
-          const agent = url.searchParams.get("agent") as AgentKind | null;
+          const agentParam = url.searchParams.get("agent");
           const workdir = url.searchParams.get("workdir");
           const branch = url.searchParams.get("branch");
-          if (agent !== "claude-code" && agent !== "codex") {
+          if (!agentParam) {
+            return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const harness = harnesses.getByIdOrKind(agentParam);
+          if (!harness) {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
           }
           return json(
-            await listAvailableCommands({ agent, workdir, branch }),
+            await listAvailableCommands({
+              agent: harness.kind,
+              workdir,
+              branch,
+              harnessHome: harness.home,
+            }),
             { headers: corsHeaders(req) },
           );
         }),
@@ -754,7 +756,18 @@ export function startApiServer() {
           // Mirror behavioural changes onto a live claude session via slash
           // commands so the conversation context survives a model/mode/effort
           // change. Agent changes wipe the session — different harness entirely.
-          reconcileTaskSession(req.params.id, before, updated);
+          // Fire-and-forget: the mode-change path now verifies via the JSONL
+          // event before resolving, which can take up to 4.5s on the
+          // exhaust-retries path. The PATCH response payload only carries the
+          // updated Task row (already in hand); the verify outcome reaches
+          // the user through the `status` SSE events that
+          // `emitModeChangeStatus` writes. Blocking the response would add
+          // unbounded latency for no benefit. `.catch` keeps an unexpected
+          // throw from becoming an unhandledRejection — every failure mode
+          // the function knows about already surfaces via SSE.
+          reconcileTaskSession(req.params.id, before, updated).catch((err: unknown) => {
+            console.error("reconcileTaskSession failed:", err);
+          });
           return json(updated, { headers: corsHeaders(req) });
         }),
         DELETE: authed(async (req) => {
@@ -844,6 +857,60 @@ export function startApiServer() {
         }),
       },
 
+      // Persist a screenshot blob to `${dataDir}/screenshots/` and return its
+      // absolute path. Backs the textarea drag/drop + paste flows on the
+      // webview — macOS floating-thumbnail drags and clipboard pastes carry
+      // an image blob with no filesystem path, so the only way to give an
+      // agent an absolute path to read is to write the bytes out first.
+      "/screenshots": {
+        POST: authed(async (req) => {
+          const ctype = (req.headers.get("content-type") ?? "").toLowerCase();
+          const allowed: Record<string, string> = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/gif": "gif",
+            "image/webp": "webp",
+          };
+          const ext = allowed[ctype.split(";")[0].trim()];
+          if (!ext) {
+            return json(
+              { error: `unsupported content-type: ${ctype || "(missing)"}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+          const MAX = 25 * 1024 * 1024;
+          // Reject oversized uploads via Content-Length before allocating
+          // the body — a buggy client shouldn't be able to pin RAM by
+          // streaming gigabytes only to see a 413 at the end. Clients
+          // omitting the header still hit the post-read check below.
+          const claimed = Number(req.headers.get("content-length") ?? "");
+          if (Number.isFinite(claimed) && claimed > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          const buf = await req.arrayBuffer();
+          if (buf.byteLength > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          if (buf.byteLength === 0) {
+            return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const dir = path.join(dataDir, "screenshots");
+          mkdirSync(dir, { recursive: true });
+          const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+          const id = crypto.randomUUID().slice(0, 8);
+          const basename = `screenshot-${ts}-${id}.${ext}`;
+          const abs = path.join(dir, basename);
+          await Bun.write(abs, buf);
+          return json({ path: abs, basename }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // ─── Interactions: tool-call approvals (from the PreToolUse hook) ───
       "/approvals": {
         POST: authed(async (req) => {
@@ -888,14 +955,40 @@ export function startApiServer() {
           const PLAN_MODE_INTERCEPT = new Set([
             "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash",
           ]);
+          // A `Bash` call whose command is confidently read-only (grep/find/
+          // ls/cat/…) is treated like the dedicated read-only tools: it can't
+          // mutate the workspace, so it auto-allows even in ask/acceptEdits
+          // and is exempt from the plan-mode force-intercept below. Mutating
+          // Bash (rm, git push, an Edit-equivalent shell write…) classifies
+          // false and still draws a card.
+          const ti = payload.tool_input as { command?: unknown } | null | undefined;
+          const bashCommand = ti && typeof ti.command === "string" ? ti.command : "";
+          const readOnlyBash = toolName === "Bash" && bashCommand !== "" &&
+            isReadOnlyBashCommand(bashCommand);
           const currentMode = getCurrentPermissionMode(taskId);
-          const planModeForce = currentMode === "plan" && PLAN_MODE_INTERCEPT.has(toolName);
+          const planModeForce = currentMode === "plan" &&
+            PLAN_MODE_INTERCEPT.has(toolName) && !readOnlyBash;
+          // Auto / bypass fast-path: claude's own classifier has already
+          // decided this tool is safe to run (auto = "let claude decide",
+          // bypassPermissions = "don't ask me anything"). Second-guessing
+          // it here only annoys the user — they explicitly opted into the
+          // hands-off posture. ALWAYS_INTERCEPT still applies (the modal-
+          // deadlock prevention isn't negotiable). This branch matters
+          // primarily for the mid-session mode-change path: a task spawned
+          // in `ask` mode installed the FULL hook matcher, and a later
+          // PATCH to `auto` doesn't re-narrow the matcher — so every tool
+          // call still lands here. Without this fast-path the user gets
+          // approval cards for routine Bash even after switching to auto.
+          if (!ALWAYS_INTERCEPT.has(toolName) &&
+              (currentMode === "auto" || currentMode === "bypassPermissions")) {
+            return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
+          }
           // Fast paths: safe tools and previously-saved rules auto-allow,
           // except for the always-intercept set above. The allow-rule lookup
           // now reads `.claude/settings.local.json` `permissions.allow` and
           // matches per the claude pattern syntax (see claude-permissions.ts).
           if (!ALWAYS_INTERCEPT.has(toolName) && !planModeForce &&
-              (SAFE_TOOLS.has(toolName) ||
+              (SAFE_TOOLS.has(toolName) || readOnlyBash ||
                lookupAllowRule({ taskId, toolName, toolInput: payload.tool_input }) === "allow")) {
             return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
           }
@@ -1096,7 +1189,7 @@ export function startApiServer() {
               { status: 410, headers: corsHeaders(req) },
             );
           }
-          const delivered = dismissTmuxPrompt(pending.taskId, key);
+          const delivered = await dismissTmuxPrompt(pending.taskId, key);
           if (!delivered) {
             return json(
               { ok: false, error: "failed to deliver keystroke to tmux" },
@@ -1160,9 +1253,9 @@ export function startApiServer() {
           // Reconstruct the cwd claude was launched against. Worktree tasks
           // had cwd = worktreePath; isolation=none had cwd = workdir.
           const cwd = task.worktreePath ?? task.workdir;
-          // Resolve the harness so we read from the alias's HOME-derived
-          // claude config dir (multi-account); built-ins resolve to
-          // `homedir()` via the `home: null` branch inside jsonlPathFor.
+          // Resolve the harness so we read from the alias's CLAUDE_CONFIG_DIR
+          // (multi-account); built-ins resolve to `~/.claude/projects/…` via
+          // the `configDir: null` branch inside jsonlPathFor.
           const harness = harnesses.getByIdOrKind(task.agent);
           const jsonlPath = jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null);
           if (!existsSync(jsonlPath)) {

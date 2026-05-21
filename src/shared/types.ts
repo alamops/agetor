@@ -61,10 +61,15 @@ export interface Harness {
   kind: AgentKind;
   label: string;
   isBuiltin: boolean;
-  /** Optional HOME-equivalent override. We emit HOME=<home> and the
-   *  matching CLI-specific config-dir env (CLAUDE_CONFIG_DIR=<home>/.claude
-   *  for claude-code, CODEX_HOME=<home>/.codex for codex) on spawn. NULL
-   *  means "inherit the agetor process HOME". */
+  /** Optional per-harness config root.
+   *  - claude-code: emitted as CLAUDE_CONFIG_DIR=<home> (treated by claude as
+   *    the `.claude/` equivalent). HOME is deliberately NOT overridden — on
+   *    macOS that would point claude's keychain lookup at a non-existent
+   *    `<home>/Library/Keychains/login.keychain-db` and surface as
+   *    "Not logged in" even with valid tokens.
+   *  - codex: emitted as HOME=<home> + CODEX_HOME=<home>/.codex (codex doesn't
+   *    use the macOS keychain, so re-homing it is safe).
+   *  NULL means "inherit the agetor process env". */
   home: string | null;
   /** Optional binary path override. NULL falls back to the AGETOR_*_BIN
    *  env var (back-compat), then to the kind's default name on PATH. */
@@ -139,7 +144,7 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
     id: "claude-code-additional",
     label: "Additional Claude Code",
     description:
-      "Another claude-code harness with its own HOME so login, history, and config live separately from the built-in.",
+      "Another claude-code harness with its own CLAUDE_CONFIG_DIR so login, history, and config live separately from the built-in.",
     kind: "claude-code",
     suggestedHarnessId: "claude-2",
     home: "{dataDir}/harnesses/claude-2",

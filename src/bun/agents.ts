@@ -117,19 +117,26 @@ export function resolveBin(harness: Harness): string {
 export function harnessEnv(harness: Harness): Record<string, string> {
   const env: Record<string, string> = {};
   if (harness.home) {
-    // Setting HOME is documented as sufficient for claude-code — its config,
-    // sessions, and login state all resolve under `$HOME/.claude/`. For codex
-    // the CLI honors a dedicated `CODEX_HOME` override (default `~/.codex`,
-    // per developers.openai.com/codex/config-advanced) — we emit it alongside
-    // HOME so a non-conventional home layout still works.
-    env.HOME = harness.home;
-    if (harness.kind === "codex") {
+    // claude-code uses CLAUDE_CONFIG_DIR (which it treats as the `.claude/`
+    // equivalent — config, sessions, projects, and `.claude.json` all live
+    // directly under it). We deliberately do NOT override HOME: on macOS,
+    // claude's keychain reads ("Claude Code-credentials" via Security.framework)
+    // resolve `$HOME/Library/Keychains/login.keychain-db` against the live
+    // HOME, so re-homing the spawn lands on a non-existent keychain and the
+    // CLI reports "Not logged in" even when a valid token is present.
+    //
+    // Codex goes through its own CODEX_HOME override and doesn't touch the
+    // macOS keychain, so re-homing it is harmless — but CODEX_HOME is what
+    // actually controls its login & history, so we set both as a belt-and-
+    // braces measure.
+    if (harness.kind === "claude-code") {
+      env.CLAUDE_CONFIG_DIR = harness.home;
+    } else {
+      env.HOME = harness.home;
       env.CODEX_HOME = path.join(harness.home, ".codex");
     }
   }
-  // User-provided env wins over the home-derived defaults so a power user
-  // can point at a non-conventional config dir (e.g. CLAUDE_CONFIG_DIR, if
-  // they know their claude build honors it).
+  // User-provided env wins over the home-derived defaults.
   for (const [k, v] of Object.entries(harness.env ?? {})) env[k] = v;
   return env;
 }
@@ -340,7 +347,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       cwd,
       onChunk,
       sessionId,
-      home: harness.home,
+      configDir: harness.home,
       mode: opts.mode ?? null,
     });
   }
