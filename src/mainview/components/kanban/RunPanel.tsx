@@ -481,7 +481,6 @@ function RunPanelBody({
   const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
-<<<<<<< agetor/105e3a83db4a-commit-and-push-button
   // Whether the task's working tree has uncommitted changes. Drives the
   // "Commit & push" action chip above the textarea. Reset to `false`
   // whenever the latest run is not in a succeeded state so the chip
@@ -490,9 +489,7 @@ function RunPanelBody({
   // ~200ms of the click). A polling effect keeps the flag in sync with
   // the actual git state while the run sits idle on success.
   const [hasChanges, setHasChanges] = useState(false);
-=======
   const [sendDragging, setSendDragging] = useState(false);
->>>>>>> main
   // `/`-command and skill autocomplete for the send field. Same list the
   // New Task form uses — depends on (agent, workdir, branch) so a slash
   // command available in this project shows up here too.
@@ -605,7 +602,6 @@ function RunPanelBody({
     try { await api.cancelRun(liveRunId); } catch { /* surfaced via log */ }
   };
 
-<<<<<<< agetor/105e3a83db4a-commit-and-push-button
   // One-click follow-up: ask the agent to commit & push the changes it just
   // made. Reuses the same `sendRunInput` plumbing as a typed message so the
   // resulting turn shows up as a normal run row with streamed events.
@@ -641,7 +637,8 @@ function RunPanelBody({
     } finally {
       setSending(false);
     }
-=======
+  };
+
   // Drag/drop + paste capture for the message textarea. Mirrors the
   // NewTaskForm sidebar flow: pathful files come straight through, blob
   // screenshots (macOS floating thumbnail, clipboard paste) get uploaded
@@ -703,7 +700,6 @@ function RunPanelBody({
     const result = await captureDroppedOrPastedItems(cd);
     reportSendCapture(result);
     applySendCaptured(result.items);
->>>>>>> main
   };
 
   return (
