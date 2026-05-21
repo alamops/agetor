@@ -274,6 +274,74 @@ test("POST /approvals — plan mode still fast-paths read-only tools (Read)", as
   expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
 });
 
+test("POST /approvals — plan mode fast-paths read-only Bash (grep/find/ls/cat)", async () => {
+  // The reported pain: in plan mode, routine read-only shell commands drew
+  // an approval card for every grep/find/ls/cat. They can't mutate the
+  // workspace, so they now auto-allow even though plan mode gates writes.
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-plan-ro-bash",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "plan";
+  const res = await fetch(url(`/approvals?taskId=t-plan-ro-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      tool_name: "Bash",
+      tool_input: { command: "grep -rn foo src/ | head -20" },
+    }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
+  expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+  const { __testing } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(0);
+});
+
+test("POST /approvals — plan mode still intercepts mutating Bash", async () => {
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-plan-mut-bash",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "plan";
+  const pending = fetch(url(`/approvals?taskId=t-plan-mut-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf build" } }),
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const { __testing, listPendingForTask, answerApproval } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(1);
+  const list = listPendingForTask("t-plan-mut-bash");
+  if (list[0]?.kind === "approval") answerApproval(list[0].id, { decision: "allow" });
+  const res = await pending;
+  expect(res.status).toBe(200);
+});
+
+test("POST /approvals — acceptEdits mode auto-allows read-only Bash", async () => {
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-accept-ro-bash",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "acceptEdits";
+  const res = await fetch(url(`/approvals?taskId=t-accept-ro-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "find . -name '*.ts'" } }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
+  expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+  const { __testing } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(0);
+});
+
 test("POST /approvals — auto mode auto-allows arbitrary Bash without registering an approval", async () => {
   // Regression: when a task was launched in `ask` mode and the user later
   // PATCHes the mode to `auto`, the FULL hook matcher is still installed
