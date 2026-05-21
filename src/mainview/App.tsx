@@ -8,7 +8,7 @@ import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
-import { RunPanel } from "@/components/kanban/RunPanel";
+import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
@@ -21,7 +21,7 @@ import { cn } from "@/lib/utils";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
 /**
- * Floating bottom-right error toast. Auto-dismisses after 6s; the user can
+ * Floating top-right error toast. Auto-dismisses after 6s; the user can
  * also close it manually. Renders mounted with a translate animation so a
  * rapid succession of errors doesn't snap-jitter the layout.
  */
@@ -48,8 +48,8 @@ function ErrorToast({ error, onDismiss }: { error: string | null; onDismiss: () 
     <div
       role="alert"
       className={cn(
-        "fixed bottom-4 right-4 z-50 flex max-w-md items-start gap-3 rounded-lg border border-destructive/60 bg-card px-4 py-3 text-sm shadow-2xl transition-all duration-200",
-        error ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-2 opacity-0",
+        "fixed top-14 right-4 z-50 flex max-w-md items-start gap-3 rounded-lg border border-destructive/60 bg-card px-4 py-3 text-sm shadow-2xl transition-all duration-200",
+        error ? "translate-y-0 opacity-100" : "pointer-events-none -translate-y-2 opacity-0",
       )}
     >
       <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden />
@@ -77,6 +77,7 @@ export default function App() {
   const [textQuery, setTextQuery] = useState("");
   const [repoFilter, setRepoFilter] = useState<string[]>([]);
   const [statusFilter, setStatusFilter] = useState<ColumnId[]>([]);
+  const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
@@ -104,7 +105,9 @@ export default function App() {
     return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
   }, []);
 
-  const refresh = async () => setTasks(await api.listTasks());
+  const refresh = async () => {
+    try { setTasks(await api.listTasks()); } catch { /* keep last good snapshot; retry next tick */ }
+  };
   const refreshAgents = async () => {
     try {
       const payload = await api.listHarnesses();
@@ -159,6 +162,28 @@ export default function App() {
     const fresh = tasks.find((t) => t.id === selected.id);
     if (fresh && fresh !== selected) setSelected(fresh);
   }, [tasks, selected]);
+
+  // Once the user opens a task's panel, any "Waiting on you" toast for that
+  // task is noise — they're already looking at the prompt. Clearing it also
+  // removes one more high-z-index click target that could otherwise sit on
+  // top of the panel header and eat clicks meant for the X button.
+  useEffect(() => {
+    if (!selected) return;
+    dismissPending(selected.id);
+  }, [selected?.id]);
+
+  // `panelMounted` follows `selected !== null` on open but lags by the
+  // RunPanel's exit animation on close, so the Toaster doesn't snap back to
+  // the right edge (and slide under the receding panel) for ~250ms.
+  const [panelMounted, setPanelMounted] = useState(false);
+  useEffect(() => {
+    if (selected) {
+      setPanelMounted(true);
+      return;
+    }
+    const t = setTimeout(() => setPanelMounted(false), RUN_PANEL_EXIT_MS);
+    return () => clearTimeout(t);
+  }, [selected]);
 
   // Refs mirror the latest tasks + selected task so the global-events
   // subscription (which closes over its handler ONCE on mount) can read
@@ -233,6 +258,10 @@ export default function App() {
         window.focus();
       };
       if (ev.kind === "run-status") {
+        // Any terminal run state supersedes a pending-input prompt — clear the
+        // "Waiting on you" toast so it doesn't linger next to the success/
+        // failure toast (or silently after a cancel).
+        dismissPending(ev.taskId);
         if (ev.status === "succeeded") {
           toastSuccess({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.status === "failed" || ev.status === "orphaned") {
@@ -249,7 +278,15 @@ export default function App() {
         // `cancelled` is intentionally silent — the user issued the cancel.
         return;
       }
-      // column transitions
+      // column transitions. Patch `tasks` optimistically so the board and any
+      // open run panel (via the selected-sync effect) reflect the new column
+      // the instant the backend pushes it — rather than waiting up to 2s for
+      // the next poll (and staying stale indefinitely if that poll lags). This
+      // is what keeps the panel header + Stop button from lingering on a
+      // `running` snapshot after the turn has actually finished.
+      setTasks((cur) =>
+        cur.map((t) => (t.id === ev.taskId ? { ...t, column: ev.column } : t)),
+      );
       if (ev.column === "blocked") {
         toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
       } else if (ev.prev === "blocked") {
@@ -273,13 +310,21 @@ export default function App() {
         if (!hay.includes(q)) return false;
       }
       if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
+      if (harnessFilter.length > 0 && !harnessFilter.includes(t.agent)) return false;
       return true;
     });
-  }, [tasks, textQuery, repoFilter]);
+  }, [tasks, textQuery, repoFilter, harnessFilter]);
 
   const visibleColumns = useMemo(
     () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
     [statusFilter],
+  );
+
+  // Distinct harness ids referenced by any task — feeds the harness filter so
+  // ids belonging to removed harnesses still show up as filter options.
+  const taskAgentIds = useMemo(
+    () => Array.from(new Set(tasks.map((t) => t.agent))),
+    [tasks],
   );
 
   const surfaceError = (e: unknown) =>
@@ -468,10 +513,14 @@ export default function App() {
             onRepoFilterChange={setRepoFilter}
             statusFilter={statusFilter}
             onStatusFilterChange={setStatusFilter}
+            harnessFilter={harnessFilter}
+            onHarnessFilterChange={setHarnessFilter}
             projects={projects}
+            harnesses={harnesses}
+            taskAgentIds={taskAgentIds}
           />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
-          <Toaster />
+          <Toaster panelOpen={panelMounted} />
           {/* Kanban gets all remaining vertical space and scrolls horizontally
               on its own — the bottom bar stays anchored regardless of column
               count. */}

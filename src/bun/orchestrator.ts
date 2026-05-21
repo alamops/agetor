@@ -21,8 +21,16 @@ import {
 function resolveHarness(harnessId: string): Harness | null {
   return harnesses.getByIdOrKind(harnessId);
 }
-import { cancelPendingForTask, setBroadcaster, type AnyRequest } from "./interactions.ts";
 import {
+  cancelPendingForTask,
+  setBroadcaster,
+  setResolvedBroadcaster,
+  type AnyRequest,
+  type InteractionResolved,
+} from "./interactions.ts";
+import {
+  cycleToMode,
+  type CycleResult,
   dropSession,
   listAgetorSessions,
   killSessionByName,
@@ -34,6 +42,7 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName } from "./worktree.ts";
+import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
   ColumnId,
   GlobalEvent,
@@ -144,6 +153,22 @@ setBroadcaster((req: AnyRequest) => {
   });
 });
 
+// Companion bridge for the *removal* side. Every answer*/cancel* path
+// in interactions.ts calls into this, so the run panel can drop the
+// card immediately instead of waiting for a refresh poll. Without
+// this, scraper auto-cancel and run-cancellation leave stale cards in
+// the panel (the existing additions-only SSE plumbing has no way to
+// signal "this is gone").
+setResolvedBroadcaster((res: InteractionResolved) => {
+  emit({
+    runId: res.runId,
+    taskId: res.taskId,
+    stream: "interaction_resolved",
+    data: JSON.stringify({ id: res.id, kind: res.kind }),
+    ts: Date.now(),
+  });
+});
+
 /**
  * Decide what to do with runs left in `status='running'` from a previous
  * agetor process. For claude-code runs whose tmux session is still alive
@@ -199,7 +224,7 @@ export function reconcileOrphans(): number {
         taskId: row.task_id,
         cwd,
         sessionId: row.claude_session_id as string,
-        home: harness?.home ?? null,
+        configDir: harness?.home ?? null,
         onChunk,
         seenLineUuids: runs.seenLineUuids(row.id),
       });
@@ -513,12 +538,14 @@ function attachDoneHandler(
  *   • Agent change (claude ↔ codex): kills any claude tmux session we had
  *     for this task. The new agent will spawn fresh on next Run.
  *   • Same-agent mode / model / effort change on a live claude session:
- *     send the matching `/permission-mode`, `/model`, `/effort` slash command
- *     via tmux. The session keeps running with the new posture.
+ *     for `/model` and `/effort` send the real slash command; for the
+ *     permission mode there is no slash command, so we call `cycleToMode`
+ *     which sends Shift+Tab keystrokes (or `/plan` when the target is plan).
+ *     The session keeps running with the new posture.
  *   • Anything else (codex; no live session): no-op — the change just
  *     persists for the next spawn.
  */
-export function reconcileTaskSession(taskId: string, before: Task, after: Task): void {
+export async function reconcileTaskSession(taskId: string, before: Task, after: Task): Promise<void> {
   const beforeKind = resolveHarness(before.agent)?.kind ?? null;
   const afterKind = resolveHarness(after.agent)?.kind ?? null;
   // Treat any harness id change as a session-killing event for claude — the
@@ -541,14 +568,110 @@ export function reconcileTaskSession(taskId: string, before: Task, after: Task):
   if (afterKind !== "claude-code") return;
   if (!sessionExists(taskId)) return;
 
+  // `after.mode` guard: a PATCH that clears the mode (mode → null) leaves
+  // the live session alone — the UI doesn't expose a "clear mode" control
+  // and there's no canonical "unset" mode to dial claude back to, so
+  // silently keeping the current posture is the least-surprising option.
   if (before.mode !== after.mode && after.mode) {
-    sendSlashCommand(taskId, `/permission-mode ${after.mode}`);
+    const result = await cycleToMode(taskId, after.mode);
+    emitModeChangeStatus(taskId, after.mode, result);
+    // Only refresh the PreToolUse matcher when the mode change actually
+    // took effect. Otherwise we'd narrow the matcher (e.g. to bypass's
+    // narrow-no-mcp scope) while claude is still in the old mode — the
+    // hook stops firing for routine Bash but claude's own permission
+    // modal still pops inside tmux, deadlocking the run. The matcher is
+    // set at spawn-time by `ensureInstalledForCwd` (narrow for auto/
+    // bypass, full for everything else); leaving it in place on a
+    // failed cycle preserves the existing intercept-and-surface flow,
+    // which is the right fallback for "we couldn't switch modes."
+    if (result.ok) {
+      const cwd = after.worktreePath ?? after.workdir;
+      const refreshed = ensureInstalledForCwd(cwd, after.mode);
+      if (!refreshed) emitMatcherRefreshFailure(taskId, cwd);
+    }
   }
   if (before.model !== after.model && after.model) {
     sendSlashCommand(taskId, `/model ${toClaudeModelArg(after.model)}`);
   }
   if (before.effort !== after.effort && after.effort) {
     sendSlashCommand(taskId, `/effort ${after.effort}`);
+  }
+}
+
+/**
+ * Surface a `cycleToMode` outcome on the task's most recent run so the user
+ * sees it in the run panel. Both success and skip ride the `status` stream
+ * — skipping is an orchestrator-side decision (e.g. asking for `bypass` on
+ * a session that wasn't launched with the flag), not an agent error, so
+ * `stderr` would mislead the user into thinking claude crashed. We
+ * disambiguate with a "⚠️" prefix on the skip case. Silent when there's no
+ * run row to attach to (shouldn't happen — a live tmux session implies at
+ * least one prior run — but defensive).
+ */
+function emitModeChangeStatus(
+  taskId: string,
+  agetorMode: string,
+  result: CycleResult,
+): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const runId = recent.id;
+  const ts = Date.now();
+  const data = result.ok
+    ? (result.via === "noop"
+      ? null
+      : `mode → ${agetorMode} (${result.via === "slash-plan" ? "via /plan" : `via Shift+Tab ×${result.presses}`})`)
+    : formatModeChangeFailure(agetorMode, result);
+  if (!data) return;
+  runs.appendEvent(runId, "status", data);
+  emit({ runId, taskId, stream: "status", data, ts });
+}
+
+/**
+ * Tell the user when the PreToolUse hook matcher couldn't be rewritten
+ * after a successful mode change. The mode itself did take effect on the
+ * live session, so the user sees claude responding to the new posture —
+ * but the on-disk matcher is stale, which on the next spawn (or on a
+ * mid-session settings-reread, if claude does that) would surface routine
+ * tools as approvals (or, in the other direction, swallow ones the user
+ * wanted prompts for). The most common cause is the user having
+ * hand-edited `.claude/settings.local.json` into malformed JSON — point
+ * them at the file so they can fix it.
+ */
+function emitMatcherRefreshFailure(taskId: string, cwd: string): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const data = `⚠️ mode took effect but the hook matcher couldn't be refreshed — check ${cwd}/.claude/settings.local.json for malformed JSON. The matcher will sync on the next session start.`;
+  runs.appendEvent(recent.id, "status", data);
+  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+}
+
+/**
+ * Build the user-facing warning string for an unsuccessful `cycleToMode`
+ * outcome. Switch is exhaustive on `result.reason` (a literal union); the
+ * TS compiler flags any future reason that isn't handled here. The
+ * verification-* reasons carry the most diagnostic value — we surface
+ * the observed mode so the user can see exactly where claude landed.
+ */
+function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult, { ok: false }>): string {
+  const seen = result.lastObserved ?? "unknown";
+  switch (result.reason) {
+    case "verification timed out": {
+      // The auto opt-in modal is by far the most common reason a press
+      // produces no JSONL event, but only when the target is `auto`. For
+      // any other target the modal advice is misleading, so we drop it.
+      const tail = agetorMode === "auto"
+        ? " If this is the first time cycling to auto on this account, accept the opt-in prompt in the run panel and try again."
+        : "";
+      return `⚠️ mode change to ${agetorMode}: claude didn't acknowledge after ${result.attempts ?? "?"} attempt(s) (last seen: ${seen}).${tail}`;
+    }
+    case "verification mismatch":
+      return `⚠️ mode change to ${agetorMode} failed after ${result.attempts ?? "?"} attempt(s) (claude landed on ${seen}). Your account may not have access to this mode — pick a different one in the task details.`;
+    case "mode not in cycle":
+      return `⚠️ mode change to ${agetorMode} skipped: '${result.target ?? agetorMode}' isn't in this session's Shift+Tab cycle — stop the run and start again with that mode at launch.`;
+    case "no live session":
+    case "current mode unknown":
+      return `⚠️ mode change to ${agetorMode} skipped: ${result.reason} — stop the run and start again to apply.`;
   }
 }
 
@@ -855,6 +978,9 @@ export async function createTask(
     // `Task` shape is complete; `tasks.insert` re-fetches and the real
     // value flows back to the caller.
     hasOpenableRun: false,
+    // Derived from the in-memory interactions Maps in `interactions.ts`; a
+    // brand-new task has no pending interactions, so 0 is the correct seed.
+    pendingInteractionCount: 0,
     createdAt: now,
     updatedAt: now,
   });

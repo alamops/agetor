@@ -2,6 +2,7 @@ import path from "node:path";
 import { MODEL_EFFORT_SUPPORT, type AgentKind, type Harness } from "../shared/types.ts";
 import {
   spawnClaudeViaTmux,
+  toClaudeModeString,
   type ChunkHandler,
   type SpawnedAgent,
 } from "./claude-tmux.ts";
@@ -116,19 +117,26 @@ export function resolveBin(harness: Harness): string {
 export function harnessEnv(harness: Harness): Record<string, string> {
   const env: Record<string, string> = {};
   if (harness.home) {
-    // Setting HOME is documented as sufficient for claude-code — its config,
-    // sessions, and login state all resolve under `$HOME/.claude/`. For codex
-    // the CLI honors a dedicated `CODEX_HOME` override (default `~/.codex`,
-    // per developers.openai.com/codex/config-advanced) — we emit it alongside
-    // HOME so a non-conventional home layout still works.
-    env.HOME = harness.home;
-    if (harness.kind === "codex") {
+    // claude-code uses CLAUDE_CONFIG_DIR (which it treats as the `.claude/`
+    // equivalent — config, sessions, projects, and `.claude.json` all live
+    // directly under it). We deliberately do NOT override HOME: on macOS,
+    // claude's keychain reads ("Claude Code-credentials" via Security.framework)
+    // resolve `$HOME/Library/Keychains/login.keychain-db` against the live
+    // HOME, so re-homing the spawn lands on a non-existent keychain and the
+    // CLI reports "Not logged in" even when a valid token is present.
+    //
+    // Codex goes through its own CODEX_HOME override and doesn't touch the
+    // macOS keychain, so re-homing it is harmless — but CODEX_HOME is what
+    // actually controls its login & history, so we set both as a belt-and-
+    // braces measure.
+    if (harness.kind === "claude-code") {
+      env.CLAUDE_CONFIG_DIR = harness.home;
+    } else {
+      env.HOME = harness.home;
       env.CODEX_HOME = path.join(harness.home, ".codex");
     }
   }
-  // User-provided env wins over the home-derived defaults so a power user
-  // can point at a non-conventional config dir (e.g. CLAUDE_CONFIG_DIR, if
-  // they know their claude build honors it).
+  // User-provided env wins over the home-derived defaults.
   for (const [k, v] of Object.entries(harness.env ?? {})) env[k] = v;
   return env;
 }
@@ -180,46 +188,39 @@ export function buildCommand(
 
     // Permission mode. Null → "auto" for back-compat.
     //
-    // `auto` maps to claude's real `--permission-mode auto` (server-side AI
-    // classifier decides per call). The PreToolUse hook is installed with a
-    // narrow matcher (`^(AskUserQuestion|ExitPlanMode)$`) so it only fires
-    // on the two TUI-modal built-ins — every other tool call is invisible
-    // to our hook, which means claude's permission engine handles it and
-    // the classifier runs as designed. No per-tool approval cards in auto
-    // mode; cards only appear when claude itself surfaces an interactive
-    // tool (AskUserQuestion / ExitPlanMode).
+    // Most agetor mode ids translate 1:1 to claude's `--permission-mode`
+    // values via `toClaudeModeString` (which canonicalizes `bypass` →
+    // `bypassPermissions` and `ask` → `default`). Two cases bypass the
+    // straight translation:
     //
-    // `bypass` maps to `--dangerously-skip-permissions` with the same
-    // narrow matcher AND `installScopeForMode` strips the MCP + CLAUDE.md
-    // addendum — truly silent, no classifier, no clarifying-question
-    // channel. Hooks-off in the strongest sense. The narrow matcher stays
-    // so a stray AskUserQuestion / ExitPlanMode call doesn't deadlock.
+    //   - `bypass` → emit `--dangerously-skip-permissions` instead of the
+    //     `--permission-mode bypassPermissions` form. Both are valid, but
+    //     the legacy flag is what users see in claude's own docs and what
+    //     the hook scope check (`installScopeForMode`) keys off — keep
+    //     parity with that and the narrow PreToolUse matcher behavior
+    //     described below.
     //
-    // Other modes (`ask`, `plan`, `acceptEdits`) install the full `.*`
-    // hook so per-tool approval cards render in agetor's UI — claude's
-    // own TUI prompts are invisible to the user in detached tmux, so
-    // agetor's UI is the user's only window into per-call decisions.
+    //   - `ask` → emit nothing; claude lands in its built-in `default`
+    //     mode, which is exactly the "ask before each action" posture we
+    //     want for this id. Setting `--permission-mode default`
+    //     explicitly works too, but omitting it matches the prior
+    //     behavior so the launch transcript is unchanged.
     //
-    // See `installScopeForMode` in hook-installer.ts.
+    // Hook scope context: `auto` and `bypass` install the narrow
+    // PreToolUse matcher (`^(AskUserQuestion|ExitPlanMode)$`) so claude's
+    // own permission engine + classifier handles every other tool call;
+    // a `.*` matcher would short-circuit the classifier and force every
+    // tool through agetor's UI. Other modes (`ask`, `plan`,
+    // `acceptEdits`) install the full `.*` matcher so per-tool approval
+    // cards render in agetor's UI — claude's own TUI prompts are
+    // invisible in detached tmux, so agetor's UI is the user's only
+    // window into per-call decisions. See `installScopeForMode` in
+    // hook-installer.ts.
     const mode = opts.mode ?? "auto";
-    switch (mode) {
-      case "auto":
-        args.push("--permission-mode", "auto");
-        break;
-      case "bypass":
-        args.push("--dangerously-skip-permissions");
-        break;
-      case "acceptEdits":
-        args.push("--permission-mode", "acceptEdits");
-        break;
-      case "plan":
-        args.push("--permission-mode", "plan");
-        break;
-      case "ask":
-        break;
-      default:
-        args.push("--permission-mode", mode);
-        break;
+    if (mode === "bypass") {
+      args.push("--dangerously-skip-permissions");
+    } else if (mode !== "ask") {
+      args.push("--permission-mode", toClaudeModeString(mode));
     }
 
     args.push(...extra);
@@ -346,7 +347,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       cwd,
       onChunk,
       sessionId,
-      home: harness.home,
+      configDir: harness.home,
       mode: opts.mode ?? null,
     });
   }

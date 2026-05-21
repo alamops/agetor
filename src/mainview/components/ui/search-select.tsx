@@ -128,6 +128,9 @@ export function SearchSelect({
 
       {open && (
         <div
+          // Marker for enclosing Esc handlers (RunPanel) to bail and let
+          // this popover consume Escape first.
+          data-popover-open=""
           className={cn(
             "absolute left-0 right-0 z-50 overflow-hidden rounded-md border border-border bg-card text-card-foreground shadow-xl",
             placement === "top" ? "bottom-full mb-1" : "top-full mt-1",

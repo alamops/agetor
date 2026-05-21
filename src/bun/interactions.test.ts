@@ -1,5 +1,5 @@
 import { test, expect, beforeEach } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -8,9 +8,25 @@ import path from "node:path";
 // process, falling back to ~/.agetor and polluting the user's real db.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-int-"));
 
+/** Allow-rules are now stored agetor-wide at `<dataDir>/settings.local.json`,
+ *  not per-task. Tests share this single file across cases — wipe between
+ *  tests so a leftover rule from one case can't auto-allow in the next.
+ *
+ *  Resolved lazily from `db.ts`'s `dataDir` export (rather than the env var)
+ *  because Bun's test runner shares one process across files: if a sibling
+ *  file imported `db.ts` first, `dataDir` is frozen to *that* file's env,
+ *  not ours. Trusting `dataDir` always agrees with what `interactions.ts`
+ *  actually writes to. */
+async function globalAllowFile(): Promise<string> {
+  const { dataDir } = await import("./db.ts");
+  return path.join(dataDir, "settings.local.json");
+}
+
 beforeEach(async () => {
   const { __testing } = await import("./interactions.ts");
   __testing.reset();
+  const file = await globalAllowFile();
+  if (existsSync(file)) rmSync(file);
 });
 
 /** Insert a Task row pointing at a fresh temp directory so the JSON-file
@@ -38,6 +54,7 @@ async function makeTaskWithCwd(id: string): Promise<string> {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     hasOpenableRun: false,
+    pendingInteractionCount: 0,
   });
   return cwd;
 }
@@ -68,10 +85,12 @@ test("answerApproval with remember=true persists a rule (default-derive: bash_ex
   answerApproval(id, { decision: "allow", remember: true });
   await answer;
 
-  // The rule should be written to <cwd>/.claude/settings.local.json as a
-  // native claude permission entry.
-  const settings = JSON.parse(readFileSync(path.join(cwd, ".claude", "settings.local.json"), "utf8"));
+  // The rule should be written to the agetor-global settings file as a
+  // native claude permission entry — NOT to the task cwd anymore. That's
+  // what makes the next task auto-allow the same call.
+  const settings = JSON.parse(readFileSync(await globalAllowFile(), "utf8"));
   expect(settings.permissions.allow).toContain("Bash(npm test)");
+  expect(existsSync(path.join(cwd, ".claude", "settings.local.json"))).toBe(false);
 
   // And subsequent lookups should hit it.
   expect(lookupAllowRule({ taskId: "t2", toolName: "Bash", toolInput: { command: "npm test" } })).toBe("allow");
@@ -79,12 +98,13 @@ test("answerApproval with remember=true persists a rule (default-derive: bash_ex
   expect(lookupAllowRule({ taskId: "t2", toolName: "Bash", toolInput: { command: "npm install" } })).toBeNull();
   // A different tool must NOT auto-allow.
   expect(lookupAllowRule({ taskId: "t2", toolName: "Edit", toolInput: { file_path: "/foo" } })).toBeNull();
-  // A different task with no settings file → null.
-  expect(lookupAllowRule({ taskId: "other-task", toolName: "Bash", toolInput: { command: "npm test" } })).toBeNull();
+  // A different task (even one that doesn't exist) auto-allows — that's
+  // the cross-task share guarantee.
+  expect(lookupAllowRule({ taskId: "other-task", toolName: "Bash", toolInput: { command: "npm test" } })).toBe("allow");
 });
 
 test("answerApproval honors an explicit entry from the granularity chooser", async () => {
-  const cwd = await makeTaskWithCwd("t2b");
+  await makeTaskWithCwd("t2b");
   const { registerApproval, answerApproval, lookupAllowRule } = await import("./interactions.ts");
   const { id, answer } = registerApproval({
     taskId: "t2b",
@@ -96,7 +116,7 @@ test("answerApproval honors an explicit entry from the granularity chooser", asy
   answerApproval(id, { decision: "allow", remember: true, entry: "Bash(git *)" });
   await answer;
 
-  const settings = JSON.parse(readFileSync(path.join(cwd, ".claude", "settings.local.json"), "utf8"));
+  const settings = JSON.parse(readFileSync(await globalAllowFile(), "utf8"));
   expect(settings.permissions.allow).toContain("Bash(git *)");
   // Prefix matches any `git ...` (word boundary; `gitleaks` does NOT match).
   expect(lookupAllowRule({ taskId: "t2b", toolName: "Bash", toolInput: { command: "git log" } })).toBe("allow");
@@ -113,40 +133,74 @@ test("answerApproval with decision='deny' does NOT save a rule, even with rememb
     toolInput: { command: "rm something" },
   });
   answerApproval(id, { decision: "deny", remember: true });
-  // No settings file should be created.
+  // Neither the global settings file nor the legacy per-task one should be created.
+  expect(existsSync(await globalAllowFile())).toBe(false);
   expect(existsSync(path.join(cwd, ".claude", "settings.local.json"))).toBe(false);
   expect(lookupAllowRule({ taskId: "t3", toolName: "Bash", toolInput: { command: "rm something" } })).toBeNull();
 });
 
-test("saveAllowRule preserves pre-existing user entries when merging", async () => {
-  const cwd = await makeTaskWithCwd("t-merge");
+test("saveAllowRule preserves pre-existing entries in the global file when merging", async () => {
   const { mkdirSync, writeFileSync } = await import("node:fs");
-  mkdirSync(path.join(cwd, ".claude"), { recursive: true });
-  // Seed a pre-existing user-authored permissions.allow + unrelated key.
+  mkdirSync(path.dirname(await globalAllowFile()), { recursive: true });
+  // Seed a pre-existing permissions.allow + unrelated user-authored key.
   writeFileSync(
-    path.join(cwd, ".claude", "settings.local.json"),
+    await globalAllowFile(),
     JSON.stringify({
       permissions: { allow: ["Bash(ls *)"] },
       customUserKey: { keep: "this" },
     }, null, 2),
   );
 
+  await makeTaskWithCwd("t-merge");
   const { saveAllowRule } = await import("./interactions.ts");
   saveAllowRule({ taskId: "t-merge", toolName: "Bash", toolInput: { command: "npm test" } });
 
-  const settings = JSON.parse(readFileSync(path.join(cwd, ".claude", "settings.local.json"), "utf8"));
+  const settings = JSON.parse(readFileSync(await globalAllowFile(), "utf8"));
   expect(settings.permissions.allow).toEqual(["Bash(ls *)", "Bash(npm test)"]);
   expect(settings.customUserKey).toEqual({ keep: "this" });
 });
 
 test("saveAllowRule is idempotent — repeated saves of the same entry dedupe", async () => {
-  const cwd = await makeTaskWithCwd("t-dedupe");
+  await makeTaskWithCwd("t-dedupe");
   const { saveAllowRule } = await import("./interactions.ts");
   saveAllowRule({ taskId: "t-dedupe", toolName: "Bash", toolInput: { command: "npm test" } });
   saveAllowRule({ taskId: "t-dedupe", toolName: "Bash", toolInput: { command: "npm test" } });
   saveAllowRule({ taskId: "t-dedupe", toolName: "Bash", toolInput: { command: "npm test" } });
-  const settings = JSON.parse(readFileSync(path.join(cwd, ".claude", "settings.local.json"), "utf8"));
+  const settings = JSON.parse(readFileSync(await globalAllowFile(), "utf8"));
   expect(settings.permissions.allow).toEqual(["Bash(npm test)"]);
+});
+
+test("saved allow-rule applies across tasks — saving on task A auto-allows on task B", async () => {
+  await makeTaskWithCwd("t-share-A");
+  await makeTaskWithCwd("t-share-B");
+  const { saveAllowRule, lookupAllowRule } = await import("./interactions.ts");
+  // Approve on A.
+  saveAllowRule({ taskId: "t-share-A", toolName: "Bash", toolInput: { command: "git status" } });
+  // Lookup on B (different cwd) matches the same global rule.
+  expect(lookupAllowRule({
+    taskId: "t-share-B", toolName: "Bash", toolInput: { command: "git status" },
+  })).toBe("allow");
+});
+
+test("lookupAllowRule still honors legacy per-task .claude/settings.local.json (back-compat)", async () => {
+  const cwd = await makeTaskWithCwd("t-legacy");
+  const { mkdirSync, writeFileSync } = await import("node:fs");
+  mkdirSync(path.join(cwd, ".claude"), { recursive: true });
+  // Pretend an older agetor build saved a per-task rule here.
+  writeFileSync(
+    path.join(cwd, ".claude", "settings.local.json"),
+    JSON.stringify({ permissions: { allow: ["Bash(legacy-cmd)"] } }, null, 2),
+  );
+  const { lookupAllowRule } = await import("./interactions.ts");
+  expect(lookupAllowRule({
+    taskId: "t-legacy", toolName: "Bash", toolInput: { command: "legacy-cmd" },
+  })).toBe("allow");
+  // …but it's scoped to that task — a different task can't see it via the
+  // legacy file (only via the global file).
+  await makeTaskWithCwd("t-legacy-sibling");
+  expect(lookupAllowRule({
+    taskId: "t-legacy-sibling", toolName: "Bash", toolInput: { command: "legacy-cmd" },
+  })).toBeNull();
 });
 
 test("registerQuestion resolves with selected + custom from answerQuestion", async () => {
@@ -321,4 +375,140 @@ test("cancelPendingForTask resolves ask_questions + plan_approval entries", asyn
   const pa = await p.answer;
   expect(pa.choice).toBe("reject");
   expect(pa.revision).toBe("cancelled by user");
+});
+
+test("tasks.get / tasks.list expose pendingInteractionCount reflecting open interactions", async () => {
+  await makeTaskWithCwd("tCount");
+  const { tasks } = await import("./db.ts");
+  const {
+    registerApproval, registerQuestion, registerAskQuestions, registerPlanApproval,
+    answerApproval, answerQuestion,
+  } = await import("./interactions.ts");
+
+  // No interactions yet → 0.
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(0);
+
+  // One of each kind from the four in-memory maps; counter should reflect all.
+  const ap = registerApproval({ taskId: "tCount", runId: "r1", toolName: "Bash", toolInput: { command: "ls" } });
+  registerQuestion({ taskId: "tCount", runId: "r1", question: "?" });
+  registerAskQuestions({
+    taskId: "tCount", runId: "r1",
+    questions: [{ question: "?", options: [{ label: "A" }] }],
+  });
+  registerPlanApproval({ taskId: "tCount", runId: "r1", plan: "P" });
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(4);
+  // And the same count surfaces via tasks.list (the kanban's polling path).
+  const fromList = tasks.list().find((t) => t.id === "tCount");
+  expect(fromList?.pendingInteractionCount).toBe(4);
+
+  // Answering removes the entry from its map and decrements the count.
+  answerApproval(ap.id, { decision: "allow" });
+  await ap.answer;
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(3);
+
+  // Counter is scoped to the task: a sibling task with no interactions reads 0.
+  await makeTaskWithCwd("tCountSibling");
+  expect(tasks.get("tCountSibling")!.pendingInteractionCount).toBe(0);
+
+  // Answer the bare question too; counter keeps dropping.
+  const q2 = registerQuestion({ taskId: "tCount", runId: "r1", question: "?" });
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(4);
+  answerQuestion(q2.id, { selected: ["ok"] });
+  await q2.answer;
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(3);
+});
+
+test("registerTmuxPrompt + answerTmuxPrompt round-trips a key", async () => {
+  const { registerTmuxPrompt, answerTmuxPrompt, __testing } = await import("./interactions.ts");
+  expect(__testing.tmuxPromptsSize()).toBe(0);
+  const { id, answer } = registerTmuxPrompt({
+    taskId: "tT", runId: "rT",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "abc123",
+  });
+  expect(__testing.tmuxPromptsSize()).toBe(1);
+  expect(answerTmuxPrompt(id, { key: "1" })).toBe(true);
+  await expect(answer).resolves.toEqual({ key: "1" });
+  expect(__testing.tmuxPromptsSize()).toBe(0);
+});
+
+test("findTmuxPromptByFingerprint hits only the same task + fingerprint", async () => {
+  const { registerTmuxPrompt, findTmuxPromptByFingerprint } = await import("./interactions.ts");
+  registerTmuxPrompt({
+    taskId: "tA", runId: "r1",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-A",
+  });
+  registerTmuxPrompt({
+    taskId: "tB", runId: "r1",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-B",
+  });
+  expect(findTmuxPromptByFingerprint("tA", "fp-A")?.fingerprint).toBe("fp-A");
+  expect(findTmuxPromptByFingerprint("tA", "fp-B")).toBeNull();   // wrong task
+  expect(findTmuxPromptByFingerprint("tB", "fp-A")).toBeNull();   // wrong fp
+});
+
+test("listPendingForTask returns tmux_prompt entries alongside other kinds", async () => {
+  const { registerApproval, registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
+  registerApproval({ taskId: "tM", runId: "rM", toolName: "Edit", toolInput: {} });
+  registerTmuxPrompt({
+    taskId: "tM", runId: "rM",
+    paneText: "?", choices: [{ key: "1", label: "Y" }], fingerprint: "fp",
+  });
+  const kinds = listPendingForTask("tM").map((r) => r.kind).sort();
+  expect(kinds).toEqual(["approval", "tmux_prompt"]);
+});
+
+test("cancelPendingForTask resolves tmux_prompt entries with the sentinel", async () => {
+  const { registerTmuxPrompt, cancelPendingForTask } = await import("./interactions.ts");
+  const { answer } = registerTmuxPrompt({
+    taskId: "tX", runId: "rX",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-X",
+  });
+  cancelPendingForTask("tX", "task deleted");
+  await expect(answer).resolves.toEqual({ key: "__cancelled__" });
+});
+
+test("registerTmuxPrompt rejects reserved sentinel keys", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  expect(() => registerTmuxPrompt({
+    taskId: "t-sentinel", runId: "r1",
+    paneText: "?",
+    choices: [{ key: "__external__", label: "External" }],
+    fingerprint: "fp-sentinel",
+  })).toThrow(/reserved/);
+});
+
+test("answer* paths emit on the resolved broadcaster", async () => {
+  const {
+    setResolvedBroadcaster,
+    registerApproval, answerApproval,
+    registerTmuxPrompt, answerTmuxPrompt,
+    cancelPendingForTask,
+  } = await import("./interactions.ts");
+  const seen: Array<{ id: string; kind: string }> = [];
+  setResolvedBroadcaster((r) => { seen.push({ id: r.id, kind: r.kind }); });
+
+  const a = registerApproval({ taskId: "tR", runId: "rR", toolName: "Bash", toolInput: {} });
+  answerApproval(a.id, { decision: "allow" });
+  await a.answer;
+
+  const t = registerTmuxPrompt({
+    taskId: "tR", runId: "rR",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-r",
+  });
+  answerTmuxPrompt(t.id, { key: "1" });
+  await t.answer;
+
+  // cancellation path should fan out too
+  const t2 = registerTmuxPrompt({
+    taskId: "tR", runId: "rR",
+    paneText: "x", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-r2",
+  });
+  cancelPendingForTask("tR", "test");
+  await t2.answer;
+
+  // Expect three resolution emissions in order.
+  expect(seen.map((s) => s.kind)).toEqual(["approval", "tmux_prompt", "tmux_prompt"]);
+  expect(seen.map((s) => s.id)).toEqual([a.id, t.id, t2.id]);
 });

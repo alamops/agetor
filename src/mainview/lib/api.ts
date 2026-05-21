@@ -88,11 +88,27 @@ export interface PendingPlanApproval {
   createdAt: number;
 }
 
+/** Modal the tmux pane scraper detected — typically a plan-mode safety
+ *  dialog or another REPL prompt the PreToolUse hook system never sees.
+ *  Each `choices[i].key` is the literal keystroke the server will
+ *  `tmux send-keys` on click. */
+export interface PendingTmuxPrompt {
+  kind: "tmux_prompt";
+  id: string;
+  taskId: string;
+  runId: string;
+  paneText: string;
+  choices: Array<{ key: string; label: string }>;
+  fingerprint: string;
+  createdAt: number;
+}
+
 export type PendingInteraction =
   | PendingApproval
   | PendingQuestion
   | PendingAskQuestions
-  | PendingPlanApproval;
+  | PendingPlanApproval
+  | PendingTmuxPrompt;
 
 // Read api port + token, preferring globals injected by the Bun side via
 // BrowserWindow's `preload` option — that path works under the native
@@ -102,13 +118,32 @@ export type PendingInteraction =
 declare global {
   interface Window { __AGETOR?: { port: string; token: string } }
 }
-const injected = window.__AGETOR;
+// Guard `window` access for the test runtime (`bun test` runs this module
+// outside a browser). Production paths always have a real window, so the
+// `?? undefined` fallback never trips at runtime in the app.
+const _win = typeof window !== "undefined" ? window : undefined;
+const injected = _win?.__AGETOR;
 const params = new URLSearchParams(
-  (window.location.hash || window.location.search).replace(/^[#?]/, ""),
+  ((_win?.location.hash || _win?.location.search) ?? "").replace(/^[#?]/, ""),
 );
 const API_PORT = injected?.port ?? params.get("api") ?? "4317";
 const API_TOKEN = injected?.token ?? params.get("token") ?? "";
 const BASE = `http://127.0.0.1:${API_PORT}`;
+
+/** Error thrown for any non-2xx API response. Carries the parsed JSON body
+ *  so callers can read structured fields (e.g. the `taskIds` list returned
+ *  by `DELETE /harnesses/:id` when the harness is still in use) instead of
+ *  re-parsing the message string. */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly body: unknown;
+  constructor(message: string, status: number, body: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+}
 
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
@@ -137,7 +172,7 @@ async function j<T>(path: string, init?: RequestInit): Promise<T> {
     const msg = (body && typeof body === "object" && "error" in body && body.error)
       ? String(body.error)
       : `${res.status} ${res.statusText}`;
-    throw new Error(msg);
+    throw new ApiError(msg, res.status, body);
   }
   return body as T;
 }
@@ -218,7 +253,11 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ value }),
     }),
-  listAgentCommands: (opts: { agent: AgentKind; workdir: string; branch?: string }) => {
+  listAgentCommands: (opts: { agent: string; workdir: string; branch?: string }) => {
+    // `agent` is a harness id (built-ins use id-equals-kind, so passing
+    // "claude-code" / "codex" still works). The server resolves to the
+    // harness via getByIdOrKind and reads commands/skills from the harness's
+    // own home when set.
     const q = new URLSearchParams({ agent: opts.agent });
     if (opts.workdir) q.set("workdir", opts.workdir);
     if (opts.branch) q.set("branch", opts.branch);
@@ -247,6 +286,8 @@ export const api = {
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
   startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
+  getTaskGitStatus: (taskId: string) =>
+    j<{ hasChanges: boolean; ignored: boolean }>(`/tasks/${taskId}/git-status`),
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
   sendRunInput: (runId: string, line: string) =>
@@ -264,6 +305,28 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+
+  /** Persist an in-memory image (clipboard paste or macOS floating-thumbnail
+   *  drag) to disk and get back its absolute path. Bypasses `j()` because the
+   *  body is raw bytes, not JSON. */
+  uploadScreenshot: async (blob: Blob): Promise<{ path: string; basename: string }> => {
+    const res = await fetch(`${BASE}/screenshots`, {
+      method: "POST",
+      headers: {
+        "content-type": blob.type || "application/octet-stream",
+        "authorization": `Bearer ${API_TOKEN}`,
+      },
+      body: blob,
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const msg = body && typeof body === "object" && "error" in body && body.error
+        ? String((body as { error: unknown }).error)
+        : `${res.status} ${res.statusText}`;
+      throw new Error(msg);
+    }
+    return body as { path: string; basename: string };
+  },
 
   /** Interactions: tool-call approvals and clarifying questions. */
   answerApproval: (
@@ -299,6 +362,14 @@ export const api = {
     body: { choice: "approve_implement" | "approve_ask" | "reject"; revision?: string },
   ) =>
     j<{ ok: boolean }>(`/plan-approvals/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** Answer a tmux-pane-scraped REPL prompt. `key` must be one of the
+   *  keys advertised on the request — the server validates against the
+   *  recorded set before injecting keystrokes via `tmux send-keys`. */
+  answerTmuxPrompt: (id: string, body: { key: string }) =>
+    j<{ ok: boolean }>(`/tmux-prompts/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

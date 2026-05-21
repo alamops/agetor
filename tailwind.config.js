@@ -43,6 +43,20 @@ export default {
       fontFamily: {
         geist: ['"Geist Variable"', "ui-sans-serif", "system-ui", "sans-serif"],
       },
+      keyframes: {
+        // Slower, calmer than tailwind's default `pulse` — used by TaskCard
+        // to indicate "this card is waiting on you" without feeling anxious.
+        // Pulses `filter: drop-shadow` rather than `box-shadow` so it stacks
+        // cleanly on top of Tailwind's `ring-*` utilities (which themselves
+        // compile to box-shadow and would otherwise be clobbered).
+        "awaiting-pulse": {
+          "0%, 100%": { filter: "drop-shadow(0 0 6px rgba(245, 158, 11, 0.55))" },
+          "50%":      { filter: "drop-shadow(0 0 14px rgba(245, 158, 11, 0.85))" },
+        },
+      },
+      animation: {
+        "awaiting-pulse": "awaiting-pulse 2.4s ease-in-out infinite",
+      },
     },
   },
   plugins: [],
