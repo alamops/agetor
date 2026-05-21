@@ -206,12 +206,14 @@ function includeMcpForScope(scope: InstallScope): boolean {
 
 export function ensureInstalled(cwd: string, scope: InstallScope = "full"): InstalledPaths {
   // Even though we own the worktree dir, the settings.local.json INSIDE it
-  // is shared with `saveAllowRule` (which appends `permissions.allow`
-  // entries). A fresh-object write would clobber those rules on every task
-  // re-spawn. So owned-worktree installs use the same merge path as
-  // user-repo installs, only relaxed on the malformed-JSON branch (we
-  // wrote the file last; if it's malformed, that's our bug to recover
-  // from, not the user's data).
+  // may still hold `permissions.allow` entries we have to preserve across
+  // re-spawns: legacy entries from older agetor builds (back when
+  // `saveAllowRule` wrote per-cwd), rules the user hand-added, and any
+  // entries left over from a direct `claude` invocation inside the
+  // worktree. A fresh-object write would clobber those. So owned-worktree
+  // installs use the same merge path as user-repo installs, only relaxed
+  // on the malformed-JSON branch (we wrote the file last; if it's
+  // malformed, that's our bug to recover from, not the user's data).
   //
   // We DO write the CLAUDE.md addendum here (unlike ensureInstalledMerged
   // which leaves user repos alone). The addendum teaches claude when to
@@ -468,8 +470,8 @@ function applyAgetorSettings(
 /** Atomic JSON write: stringify, write to a sibling tempfile, rename onto
  *  the target. rename is atomic on POSIX, so a partial write can never
  *  leave the destination corrupted. Crucial for settings.local.json which
- *  multiple subsystems (hook-installer, interactions/saveAllowRule) merge
- *  into during normal operation. */
+ *  hook-installer merges into on every task spawn while preserving any
+ *  pre-existing user / legacy entries underneath. */
 function writeJsonAtomic(file: string, value: unknown): void {
   const tmp = `${file}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
   writeFileSync(tmp, JSON.stringify(value, null, 2));

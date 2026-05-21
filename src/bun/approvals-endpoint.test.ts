@@ -66,8 +66,17 @@ async function seedPendingApproval(args: {
   return { approvalId: id, cwd };
 }
 
+/** Allow-rules now persist to the agetor-global `<dataDir>/settings.local.json`
+ *  (so an approval on task A auto-allows the same call on task B). Resolved
+ *  lazily from `db.ts`'s `dataDir` because Bun shares modules across test
+ *  files — see the matching note in interactions.test.ts. */
+async function globalAllowFile(): Promise<string> {
+  const { dataDir } = await import("./db.ts");
+  return path.join(dataDir, "settings.local.json");
+}
+
 test("/approvals/:id/answer forwards explicit `entry` to permissions.allow", async () => {
-  const { approvalId, cwd } = await seedPendingApproval({
+  const { approvalId } = await seedPendingApproval({
     taskId: "t-endpoint-explicit",
     toolName: "Bash",
     toolInput: { command: "git status" },
@@ -84,13 +93,13 @@ test("/approvals/:id/answer forwards explicit `entry` to permissions.allow", asy
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ ok: true });
 
-  const settings = JSON.parse(readFileSync(path.join(cwd, ".claude", "settings.local.json"), "utf8"));
+  const settings = JSON.parse(readFileSync(await globalAllowFile(), "utf8"));
   expect(settings.permissions.allow).toContain("Bash(git *)");
   expect(settings.permissions.allow).not.toContain("Bash(git status)");
 });
 
 test("/approvals/:id/answer with remember=true and no `entry` falls back to most-specific", async () => {
-  const { approvalId, cwd } = await seedPendingApproval({
+  const { approvalId } = await seedPendingApproval({
     taskId: "t-endpoint-default",
     toolName: "Bash",
     toolInput: { command: "npm test" },
@@ -103,13 +112,15 @@ test("/approvals/:id/answer with remember=true and no `entry` falls back to most
   });
   expect(res.status).toBe(200);
 
-  const settings = JSON.parse(readFileSync(path.join(cwd, ".claude", "settings.local.json"), "utf8"));
+  const settings = JSON.parse(readFileSync(await globalAllowFile(), "utf8"));
   // Default-derive picks bash_exact for Bash → the exact command verbatim.
-  expect(settings.permissions.allow).toEqual(["Bash(npm test)"]);
+  // The rule from the previous test ("Bash(git *)") is also present since
+  // the global file persists across cases in this file.
+  expect(settings.permissions.allow).toContain("Bash(npm test)");
 });
 
-test("/approvals/:id/answer with decision=deny does NOT write any settings file", async () => {
-  const { approvalId, cwd } = await seedPendingApproval({
+test("/approvals/:id/answer with decision=deny does NOT write the saved rule", async () => {
+  const { approvalId } = await seedPendingApproval({
     taskId: "t-endpoint-deny",
     toolName: "Bash",
     toolInput: { command: "rm -rf /" },
@@ -122,7 +133,14 @@ test("/approvals/:id/answer with decision=deny does NOT write any settings file"
     body: JSON.stringify({ decision: "deny", remember: true, entry: "Bash(rm *)" }),
   });
   expect(res.status).toBe(200);
-  expect(existsSync(path.join(cwd, ".claude", "settings.local.json"))).toBe(false);
+  // The earlier tests in this file may have populated the global file; what
+  // matters is that "Bash(rm *)" never made it in.
+  const file = await globalAllowFile();
+  if (existsSync(file)) {
+    const settings = JSON.parse(readFileSync(file, "utf8"));
+    const allow = (settings.permissions?.allow ?? []) as string[];
+    expect(allow).not.toContain("Bash(rm *)");
+  }
 });
 
 test("/approvals/:id/answer rejects invalid decision values", async () => {
