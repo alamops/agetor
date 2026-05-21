@@ -40,7 +40,13 @@ import { iconForRef, refBasename } from "@/lib/file-icons";
 import { appendReferences } from "../../../shared/refs.ts";
 import { proposeAllowRules, type AllowRuleProposal } from "../../../shared/claude-permissions.ts";
 import { AgentIcon } from "./AgentIcon";
-import { ReferencesPicker } from "./ReferencesPicker";
+import {
+  ReferencesPicker,
+  captureDroppedOrPastedItems,
+  mergeRefs,
+  type CapturedItem,
+} from "./ReferencesPicker";
+import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 import { SlashAutocomplete } from "./SlashAutocomplete";
 
 interface Props {
@@ -475,6 +481,7 @@ function RunPanelBody({
   const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
+  const [sendDragging, setSendDragging] = useState(false);
   // `/`-command and skill autocomplete for the send field. Same list the
   // New Task form uses — depends on (agent, workdir, branch) so a slash
   // command available in this project shows up here too.
@@ -548,6 +555,69 @@ function RunPanelBody({
   const stop = async () => {
     if (!liveRunId) return;
     try { await api.cancelRun(liveRunId); } catch { /* surfaced via log */ }
+  };
+
+  // Drag/drop + paste capture for the message textarea. Mirrors the
+  // NewTaskForm sidebar flow: pathful files come straight through, blob
+  // screenshots (macOS floating thumbnail, clipboard paste) get uploaded
+  // to `~/.agetor/screenshots/` first. Captured items land both as chips
+  // in `sendRefs` *and* as `[basename]` markers at the cursor.
+  const applySendCaptured = (items: CapturedItem[]) => {
+    if (!items.length) return;
+    setSendRefs((cur) => mergeRefs(cur, items.map((i) => i.ref)));
+    const marker = items.map((i) => `[${i.basename}]`).join(" ");
+    const selection = readCaret(sendRef.current);
+    let caret = 0;
+    setInput((cur) => {
+      const r = spliceAtSelection(cur, selection, marker);
+      caret = r.caret;
+      return r.next;
+    });
+    restoreCaret(sendRef.current, caret);
+  };
+  const onSendDragOver = (e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    // Always preventDefault on a file dragover so WKWebView doesn't fall back
+    // to its native handler (navigate / open). The visual ring only lights up
+    // when canSend is true, but the wrapper still claims the drop.
+    e.preventDefault();
+    if (canSend) setSendDragging(true);
+  };
+  const onSendDragLeave = (e: React.DragEvent) => {
+    // Always clear when `canSend` flipped to false mid-drag — otherwise the
+    // ring can outlive the drag if the task transitioned out of running.
+    if (!canSend) { setSendDragging(false); return; }
+    if (e.currentTarget === e.target) setSendDragging(false);
+  };
+  const reportSendCapture = ({ items, skipped, error }: {
+    items: CapturedItem[];
+    skipped: number;
+    error?: string;
+  }) => {
+    if (error) setSendHint(`Couldn't save screenshot: ${error}`);
+    else if (skipped && !items.length) setSendHint("Nothing to attach — drag a file from Finder, or a screenshot blob.");
+  };
+  const onSendDrop = async (e: React.DragEvent) => {
+    // preventDefault unconditionally so a stray drop while !canSend doesn't
+    // hand the file to WKWebView's native handler.
+    e.preventDefault();
+    setSendDragging(false);
+    if (!canSend) return;
+    setSendHint(null);
+    const result = await captureDroppedOrPastedItems(e.dataTransfer);
+    reportSendCapture(result);
+    applySendCaptured(result.items);
+  };
+  const onSendPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const cd = e.clipboardData;
+    if (!cd) return;
+    const hasFile = Array.from(cd.items ?? []).some((it) => it.kind === "file");
+    if (!hasFile) return;
+    e.preventDefault();
+    setSendHint(null);
+    const result = await captureDroppedOrPastedItems(cd);
+    reportSendCapture(result);
+    applySendCaptured(result.items);
   };
 
   return (
@@ -656,8 +726,19 @@ function RunPanelBody({
           run — the backend reattaches to the live tmux session if there is one,
           or spawns a fresh one seeded with the previous turn's last response
           when the original session is gone. The button is given the same fixed
-          height as the textarea so they baseline together. */}
-      <div className="shrink-0 space-y-1.5 border-t border-border/60 p-2">
+          height as the textarea so they baseline together. The whole dock is
+          one drop zone so dragging a screenshot anywhere over the input area
+          (chips, textarea, send button gap) routes through the same capture
+          path. */}
+      <div
+        className={cn(
+          "relative shrink-0 space-y-1.5 border-t border-border/60 p-2",
+          sendDragging && "ring-2 ring-inset ring-primary",
+        )}
+        onDragOver={onSendDragOver}
+        onDragLeave={onSendDragLeave}
+        onDrop={onSendDrop}
+      >
         {canSend && (
           <ReferencesPicker
             variant="inline"
@@ -671,6 +752,7 @@ function RunPanelBody({
               ref={sendRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onPaste={onSendPaste}
               onKeyDown={(e) => {
                 // Enter to send; Shift+Enter for a newline. SlashAutocomplete
                 // attaches a native keydown listener that calls preventDefault
