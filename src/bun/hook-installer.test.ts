@@ -280,11 +280,14 @@ test("ensureInstalledForCwd: overwrites inside an agetor-owned worktree", async 
 });
 
 test("ensureInstalled preserves `permissions.allow` across re-spawns (regression)", async () => {
-  // Repro of the bug where ensureInstalled built a fresh settings object on
-  // every call, clobbering allow-rules written by saveAllowRule between the
-  // first task spawn and a re-run. This test simulates: (1) initial install,
-  // (2) saveAllowRule appends an entry, (3) re-spawn calls ensureInstalled
-  // again — the entry must survive.
+  // Repro of the bug where ensureInstalled built a fresh settings object
+  // on every call, clobbering pre-existing `permissions.allow` entries
+  // between the first task spawn and a re-run. Today those entries come
+  // from: legacy agetor builds (saveAllowRule used to write per-cwd),
+  // direct user edits, or a manual `claude` invocation inside the
+  // worktree. This test simulates: (1) initial install, (2) an entry is
+  // written into the same settings file, (3) re-spawn calls
+  // ensureInstalled again — the entry must survive.
   const { ensureInstalled } = await import("./hook-installer.ts");
   const owned = path.join(process.env.AGETOR_DATA_DIR!, "worktrees", "regression-task");
   require("node:fs").mkdirSync(owned, { recursive: true });
@@ -292,10 +295,8 @@ test("ensureInstalled preserves `permissions.allow` across re-spawns (regression
   // 1. First install (fresh worktree, no settings file).
   ensureInstalled(owned, "full");
 
-  // 2. Simulate saveAllowRule writing a permissions.allow entry into the
-  //    same settings file. (We don't import saveAllowRule here to keep
-  //    this test focused on hook-installer behavior; the merge logic in
-  //    appendPermissionEntry is exercised by interactions.test.ts.)
+  // 2. Simulate a permissions.allow entry landing in the same settings
+  //    file (from any of the sources noted above).
   const settingsFile = path.join(owned, ".claude", "settings.local.json");
   const after1 = JSON.parse(require("node:fs").readFileSync(settingsFile, "utf8"));
   after1.permissions = { allow: ["Bash(git status)"] };

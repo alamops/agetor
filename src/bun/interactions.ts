@@ -7,7 +7,7 @@ import {
   matchesPermissionEntry,
   type ApprovalRememberScope,
 } from "../shared/claude-permissions.ts";
-import { tasks } from "./db.ts";
+import { dataDir, tasks } from "./db.ts";
 
 /**
  * In-process registry for user interactions claude needs to drive through
@@ -18,9 +18,12 @@ import { tasks } from "./db.ts";
  * Everything here is in-memory. Pending interactions don't survive an agetor
  * restart, by design: on boot we kill all `agetor-*` tmux sessions, which
  * tears down the curl / MCP children waiting on these promises. Allow-rules
- * (the "Allow always for this task" persistent decisions) live as native
- * claude permission strings in the task cwd's `.claude/settings.local.json`
- * — see `saveAllowRule` / `lookupAllowRule` below.
+ * (the "Allow always" persistent decisions) live as native claude permission
+ * strings in the agetor-global `<dataDir>/settings.local.json`, so an approval
+ * granted in one task auto-allows the same tool call in every other task and
+ * across mode changes. The legacy per-task `.claude/settings.local.json` is
+ * still consulted as a read-only fallback so previously-saved rules keep
+ * working — see `saveAllowRule` / `lookupAllowRule` below.
  */
 
 export type InteractionKind =
@@ -644,12 +647,21 @@ export function countPendingForTask(taskId: string): number {
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Allow-rules (persistent, stored as native claude permission entries in the
- * task cwd's `.claude/settings.local.json`)
+ * agetor-global `<dataDir>/settings.local.json`)
  *
  * Why this storage shape rather than our own DB table:
- *   1. Human-readable — `cat .claude/settings.local.json` shows everything.
- *   2. Version-controllable — settings.local.json travels with the repo.
- *   3. Mirrors claude's conventions — no parallel system to learn.
+ *   1. Human-readable — `cat ~/.agetor/settings.local.json` shows everything.
+ *   2. Mirrors claude's conventions — no parallel system to learn.
+ *
+ * Why global (one file for all tasks) rather than per-task:
+ *   Approvals are about which tool calls the user trusts on their machine,
+ *   not which they trust *in this repo*. Saving per-task meant the same
+ *   approval card popped up on every new task and after every mode change —
+ *   exactly the friction "Allow always" is supposed to eliminate.
+ *
+ * Back-compat: per-task `.claude/settings.local.json` is still consulted as
+ * a read-only fallback in `lookupAllowRule`, so rules saved by older agetor
+ * builds keep working.
  *
  * Note: claude itself never consults these entries in our setup — our
  * PreToolUse hook always returns a terminal decision before claude's
@@ -665,28 +677,32 @@ export interface AllowRuleArgs {
   toolInput: unknown;
 }
 
-/** Look up whether the task has a saved allow-rule that matches this tool
- *  call. Walks `permissions.allow` in the task's effective settings file.
- *  Returns "allow" on first match, null otherwise. */
+/** Look up whether a saved allow-rule matches this tool call. Consults the
+ *  agetor-global allow-list first (the source of truth for new saves), then
+ *  falls back to the legacy per-task `.claude/settings.local.json` so older
+ *  rules keep working. Returns "allow" on first match, null otherwise. */
 export function lookupAllowRule(args: AllowRuleArgs): "allow" | null {
-  const cwd = resolveTaskCwd(args.taskId);
-  if (!cwd) return null;
-  for (const entry of readPermissionsAllow(cwd)) {
+  for (const entry of readGlobalPermissionsAllow()) {
     if (matchesPermissionEntry(entry, args.toolName, args.toolInput)) return "allow";
+  }
+  const cwd = resolveTaskCwd(args.taskId);
+  if (cwd) {
+    for (const entry of readPermissionsAllow(cwd)) {
+      if (matchesPermissionEntry(entry, args.toolName, args.toolInput)) return "allow";
+    }
   }
   return null;
 }
 
-/** Save an allow-rule for the task. If `entry` is supplied, it's stored
- *  verbatim. Otherwise the most-specific scope for the tool is derived from
- *  `toolInput`. Falls back to the bare tool name if no scope can be
- *  derived (always works). */
+/** Save an allow-rule to the agetor-global allow-list so every task — current
+ *  and future — auto-allows the same call. If `entry` is supplied, it's
+ *  stored verbatim. Otherwise the most-specific scope for the tool is
+ *  derived from `toolInput`. Falls back to the bare tool name if no scope
+ *  can be derived (always works). */
 export function saveAllowRule(args: AllowRuleArgs & { entry?: string }): void {
-  const cwd = resolveTaskCwd(args.taskId);
-  if (!cwd) return;
   const entry = (args.entry && args.entry.trim()) || pickDefaultEntry(args.toolName, args.toolInput);
   if (!entry) return;
-  appendPermissionEntry(cwd, entry);
+  appendGlobalPermissionEntry(entry);
 }
 
 /** Tool names whose `toolInput.file_path` is the canonical scoping key.
@@ -726,12 +742,41 @@ function resolveTaskCwd(taskId: string): string | null {
   return task.worktreePath ?? task.workdir ?? null;
 }
 
-/** Read the `permissions.allow` array from `<cwd>/.claude/settings.local.json`.
- *  Returns an empty array on missing file, parse errors, or unexpected shape
- *  — failing closed (the user just sees more cards, not fewer) is the right
- *  failure mode here. */
+/** Path to the agetor-global allow-list. Lives at the root of dataDir
+ *  (not under `.claude/`) because it isn't claude's settings — it's
+ *  agetor's, just borrowing claude's permission-entry format as the
+ *  on-disk shape. */
+function globalAllowFile(): string {
+  return path.join(dataDir, "settings.local.json");
+}
+
+/** Read the `permissions.allow` array from the agetor-global settings file.
+ *  Same fail-closed semantics as `readPermissionsAllow`. */
+function readGlobalPermissionsAllow(): string[] {
+  return readPermissionsAllowFromFile(globalAllowFile());
+}
+
+/** Append a single `permissions.allow` entry to the agetor-global settings
+ *  file. Creates `<dataDir>/settings.local.json` if missing. Merge-safe:
+ *  preserves all other keys, dedupes against existing entries, atomic
+ *  rename on write. */
+function appendGlobalPermissionEntry(entry: string): void {
+  mkdirSync(dataDir, { recursive: true });
+  appendPermissionEntryToFile(globalAllowFile(), entry);
+}
+
+/** Read the `permissions.allow` array from a legacy per-task settings file.
+ *  Kept so `lookupAllowRule` can still surface rules saved by older agetor
+ *  builds (which wrote per-cwd) — see the back-compat note on the
+ *  allow-rules section header. Returns an empty array on missing file,
+ *  parse errors, or unexpected shape — failing closed (the user just sees
+ *  more cards, not fewer) is the right failure mode here. */
 function readPermissionsAllow(cwd: string): string[] {
-  const file = path.join(cwd, ".claude", "settings.local.json");
+  return readPermissionsAllowFromFile(path.join(cwd, ".claude", "settings.local.json"));
+}
+
+/** Shared reader used by both the global and per-task allow-list helpers. */
+function readPermissionsAllowFromFile(file: string): string[] {
   if (!existsSync(file)) return [];
   let raw: string;
   try {
@@ -754,15 +799,12 @@ function readPermissionsAllow(cwd: string): string[] {
   return allow.filter((e): e is string => typeof e === "string");
 }
 
-/** Append a single `permissions.allow` entry to the task's settings file.
- *  Merge-safe: preserves all other keys, dedupes against existing entries.
- *  Creates the file if missing. Logs and skips on malformed pre-existing
- *  JSON rather than overwriting the user's edits. */
-function appendPermissionEntry(cwd: string, entry: string): void {
-  const dir = path.join(cwd, ".claude");
-  mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, "settings.local.json");
-
+/** Atomic, merge-safe writer for a `{ permissions: { allow: [...] } }`
+ *  settings file. Preserves all other keys, dedupes against existing
+ *  entries, logs and skips on malformed pre-existing JSON rather than
+ *  overwriting the user's edits. Caller is responsible for ensuring the
+ *  parent directory exists. */
+function appendPermissionEntryToFile(file: string, entry: string): void {
   let settings: Record<string, unknown> = {};
   if (existsSync(file)) {
     let raw: string;
