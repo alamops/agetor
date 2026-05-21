@@ -118,9 +118,13 @@ export type PendingInteraction =
 declare global {
   interface Window { __AGETOR?: { port: string; token: string } }
 }
-const injected = window.__AGETOR;
+// Guard `window` access for the test runtime (`bun test` runs this module
+// outside a browser). Production paths always have a real window, so the
+// `?? undefined` fallback never trips at runtime in the app.
+const _win = typeof window !== "undefined" ? window : undefined;
+const injected = _win?.__AGETOR;
 const params = new URLSearchParams(
-  (window.location.hash || window.location.search).replace(/^[#?]/, ""),
+  ((_win?.location.hash || _win?.location.search) ?? "").replace(/^[#?]/, ""),
 );
 const API_PORT = injected?.port ?? params.get("api") ?? "4317";
 const API_TOKEN = injected?.token ?? params.get("token") ?? "";
@@ -294,6 +298,28 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+
+  /** Persist an in-memory image (clipboard paste or macOS floating-thumbnail
+   *  drag) to disk and get back its absolute path. Bypasses `j()` because the
+   *  body is raw bytes, not JSON. */
+  uploadScreenshot: async (blob: Blob): Promise<{ path: string; basename: string }> => {
+    const res = await fetch(`${BASE}/screenshots`, {
+      method: "POST",
+      headers: {
+        "content-type": blob.type || "application/octet-stream",
+        "authorization": `Bearer ${API_TOKEN}`,
+      },
+      body: blob,
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const msg = body && typeof body === "object" && "error" in body && body.error
+        ? String((body as { error: unknown }).error)
+        : `${res.status} ${res.statusText}`;
+      throw new Error(msg);
+    }
+    return body as { path: string; basename: string };
+  },
 
   /** Interactions: tool-call approvals and clarifying questions. */
   answerApproval: (
