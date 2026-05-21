@@ -281,6 +281,8 @@ export const api = {
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
   startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
+  getTaskGitStatus: (taskId: string) =>
+    j<{ hasChanges: boolean; ignored: boolean }>(`/tasks/${taskId}/git-status`),
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
   sendRunInput: (runId: string, line: string) =>
