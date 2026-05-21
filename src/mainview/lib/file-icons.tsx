@@ -12,6 +12,9 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { TaskReference } from "../../shared/types.ts";
+import { refBasename } from "./path";
+
+export { refBasename };
 
 const IMAGE = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif", "heic"]);
 const CODE = new Set([
@@ -65,9 +68,3 @@ export function iconForRef(ref: Pick<TaskReference, "path" | "isDirectory">): Lu
   return File;
 }
 
-/** Last path segment, trimmed of trailing slashes. Falls back to the input. */
-export function refBasename(p: string): string {
-  const trimmed = p.replace(/[\\/]+$/, "");
-  const slash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
-  return slash >= 0 ? trimmed.slice(slash + 1) || trimmed : trimmed;
-}

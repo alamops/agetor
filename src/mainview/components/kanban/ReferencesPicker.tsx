@@ -3,7 +3,10 @@ import { FilePlus, FolderPlus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { iconForRef, refBasename } from "@/lib/file-icons";
+import { captureDroppedOrPastedItems, type ElectroFile } from "@/lib/capture-refs";
 import type { TaskReference } from "../../../shared/types.ts";
+
+export { captureDroppedOrPastedItems, type CapturedItem, type CaptureResult } from "@/lib/capture-refs";
 
 interface Props {
   refs: TaskReference[];
@@ -16,12 +19,6 @@ interface Props {
   /** Extra className on the outer container. */
   className?: string;
 }
-
-// `File` in WKWebView (Electrobun) carries a non-standard `path` property that
-// holds the absolute filesystem path. We rely on it for the picker AND drop
-// paths — without it we can't build a `TaskReference`. Plain-browser drops
-// fall back to a one-liner hint.
-type ElectroFile = File & { path?: string };
 
 /**
  * Derive a folder's absolute path from a single File in a `webkitdirectory`
@@ -47,41 +44,6 @@ function deriveFolderRoot(file: ElectroFile): string | null {
     if (!r) break;
   }
   return a || null;
-}
-
-export interface DropExtractResult {
-  additions: TaskReference[];
-  /** Items that lacked a filesystem path. Caller may want to show a hint
-   *  when nothing was added. */
-  skipped: number;
-}
-
-/**
- * Pure helper exported so containers (e.g. NewTaskForm's outer aside) can
- * forward drops to the picker without duplicating the WKWebView quirks.
- */
-export function extractDroppedRefs(e: React.DragEvent | DragEvent): DropExtractResult {
-  const additions: TaskReference[] = [];
-  let skipped = 0;
-  if (!e.dataTransfer) return { additions, skipped };
-  const items = e.dataTransfer.items ? Array.from(e.dataTransfer.items) : [];
-  if (items.length) {
-    for (const item of items) {
-      if (item.kind !== "file") continue;
-      const file = item.getAsFile() as ElectroFile | null;
-      const entry = item.webkitGetAsEntry?.();
-      const isDir = entry?.isDirectory ?? false;
-      const abs = file?.path ?? null;
-      if (!abs) { skipped++; continue; }
-      additions.push({ path: abs, isDirectory: isDir });
-    }
-  } else if (e.dataTransfer.files?.length) {
-    for (const f of Array.from(e.dataTransfer.files) as ElectroFile[]) {
-      if (!f.path) { skipped++; continue; }
-      additions.push({ path: f.path, isDirectory: false });
-    }
-  }
-  return { additions, skipped };
 }
 
 /** Dedupe additions against an existing list, returning a new array. */
@@ -160,16 +122,18 @@ export function ReferencesPicker({
     e.target.value = "";
   };
 
-  const onDrop = (e: React.DragEvent) => {
+  const onDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setDragging(false);
     setHint(null);
-    const { additions, skipped } = extractDroppedRefs(e);
-    if (skipped && !additions.length) {
-      setHint("Drag from Finder — these items had no filesystem path.");
+    const { items, skipped, error } = await captureDroppedOrPastedItems(e.dataTransfer);
+    if (error) {
+      setHint(`Couldn't save screenshot: ${error}`);
+    } else if (skipped && !items.length) {
+      setHint("Drag a file from Finder, or a screenshot from the macOS thumbnail.");
     }
-    append(additions);
+    append(items.map((i) => i.ref));
   };
 
   const onDragOver = (e: React.DragEvent) => {

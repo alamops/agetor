@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Utils } from "electrobun/bun";
@@ -33,7 +33,7 @@ import {
   markTmuxPromptAnswered,
   sessionExists,
 } from "./claude-tmux.ts";
-import { getTaskDiff, listBranches } from "./worktree.ts";
+import { getTaskDiff, listBranches, hasUncommittedChanges } from "./worktree.ts";
 import { listAvailableCommands } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
@@ -61,6 +61,7 @@ import {
   type QuestionAnswer,
 } from "./interactions.ts";
 import { MODEL_EFFORT_SUPPORT } from "../shared/types.ts";
+import { isReadOnlyBashCommand } from "../shared/claude-permissions.ts";
 import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 
@@ -797,6 +798,26 @@ export function startApiServer() {
           return json(await getTaskDiff(t), { headers: corsHeaders(req) });
         }),
       },
+  
+      // Whether the task's working tree has uncommitted changes. Drives the
+      // "Commit & push" action in the run panel, which only makes sense to
+      // show when there's actually something to commit. `ignored: true` means
+      // we couldn't tell (not a git repo, dir missing, git failed) — the UI
+      // treats that as "don't offer the action" rather than guessing.
+      "/tasks/:id/git-status": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const dir = t.worktreePath ?? t.workdir;
+          const result = await hasUncommittedChanges(dir);
+          if (result === null) {
+            return json({ hasChanges: false, ignored: true }, { headers: corsHeaders(req) });
+          }
+          return json({ hasChanges: result, ignored: false }, { headers: corsHeaders(req) });
+        }),
+      },
 
       "/runs/:id/cancel": {
         POST: authed((req) =>
@@ -846,6 +867,60 @@ export function startApiServer() {
         }),
       },
 
+      // Persist a screenshot blob to `${dataDir}/screenshots/` and return its
+      // absolute path. Backs the textarea drag/drop + paste flows on the
+      // webview — macOS floating-thumbnail drags and clipboard pastes carry
+      // an image blob with no filesystem path, so the only way to give an
+      // agent an absolute path to read is to write the bytes out first.
+      "/screenshots": {
+        POST: authed(async (req) => {
+          const ctype = (req.headers.get("content-type") ?? "").toLowerCase();
+          const allowed: Record<string, string> = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/gif": "gif",
+            "image/webp": "webp",
+          };
+          const ext = allowed[ctype.split(";")[0].trim()];
+          if (!ext) {
+            return json(
+              { error: `unsupported content-type: ${ctype || "(missing)"}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+          const MAX = 25 * 1024 * 1024;
+          // Reject oversized uploads via Content-Length before allocating
+          // the body — a buggy client shouldn't be able to pin RAM by
+          // streaming gigabytes only to see a 413 at the end. Clients
+          // omitting the header still hit the post-read check below.
+          const claimed = Number(req.headers.get("content-length") ?? "");
+          if (Number.isFinite(claimed) && claimed > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          const buf = await req.arrayBuffer();
+          if (buf.byteLength > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          if (buf.byteLength === 0) {
+            return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const dir = path.join(dataDir, "screenshots");
+          mkdirSync(dir, { recursive: true });
+          const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+          const id = crypto.randomUUID().slice(0, 8);
+          const basename = `screenshot-${ts}-${id}.${ext}`;
+          const abs = path.join(dir, basename);
+          await Bun.write(abs, buf);
+          return json({ path: abs, basename }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // ─── Interactions: tool-call approvals (from the PreToolUse hook) ───
       "/approvals": {
         POST: authed(async (req) => {
@@ -890,8 +965,19 @@ export function startApiServer() {
           const PLAN_MODE_INTERCEPT = new Set([
             "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash",
           ]);
+          // A `Bash` call whose command is confidently read-only (grep/find/
+          // ls/cat/…) is treated like the dedicated read-only tools: it can't
+          // mutate the workspace, so it auto-allows even in ask/acceptEdits
+          // and is exempt from the plan-mode force-intercept below. Mutating
+          // Bash (rm, git push, an Edit-equivalent shell write…) classifies
+          // false and still draws a card.
+          const ti = payload.tool_input as { command?: unknown } | null | undefined;
+          const bashCommand = ti && typeof ti.command === "string" ? ti.command : "";
+          const readOnlyBash = toolName === "Bash" && bashCommand !== "" &&
+            isReadOnlyBashCommand(bashCommand);
           const currentMode = getCurrentPermissionMode(taskId);
-          const planModeForce = currentMode === "plan" && PLAN_MODE_INTERCEPT.has(toolName);
+          const planModeForce = currentMode === "plan" &&
+            PLAN_MODE_INTERCEPT.has(toolName) && !readOnlyBash;
           // Auto / bypass fast-path: claude's own classifier has already
           // decided this tool is safe to run (auto = "let claude decide",
           // bypassPermissions = "don't ask me anything"). Second-guessing
@@ -912,7 +998,7 @@ export function startApiServer() {
           // now reads `.claude/settings.local.json` `permissions.allow` and
           // matches per the claude pattern syntax (see claude-permissions.ts).
           if (!ALWAYS_INTERCEPT.has(toolName) && !planModeForce &&
-              (SAFE_TOOLS.has(toolName) ||
+              (SAFE_TOOLS.has(toolName) || readOnlyBash ||
                lookupAllowRule({ taskId, toolName, toolInput: payload.tool_input }) === "allow")) {
             return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
           }
@@ -1113,7 +1199,7 @@ export function startApiServer() {
               { status: 410, headers: corsHeaders(req) },
             );
           }
-          const delivered = dismissTmuxPrompt(pending.taskId, key);
+          const delivered = await dismissTmuxPrompt(pending.taskId, key);
           if (!delivered) {
             return json(
               { ok: false, error: "failed to deliver keystroke to tmux" },

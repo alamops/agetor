@@ -79,6 +79,7 @@ export default function App() {
   const [textQuery, setTextQuery] = useState("");
   const [repoFilter, setRepoFilter] = useState<string[]>([]);
   const [statusFilter, setStatusFilter] = useState<ColumnId[]>([]);
+  const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
@@ -106,7 +107,9 @@ export default function App() {
     return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
   }, []);
 
-  const refresh = async () => setTasks(await api.listTasks());
+  const refresh = async () => {
+    try { setTasks(await api.listTasks()); } catch { /* keep last good snapshot; retry next tick */ }
+  };
   const refreshAgents = async () => {
     try {
       const payload = await api.listHarnesses();
@@ -277,7 +280,15 @@ export default function App() {
         // `cancelled` is intentionally silent — the user issued the cancel.
         return;
       }
-      // column transitions
+      // column transitions. Patch `tasks` optimistically so the board and any
+      // open run panel (via the selected-sync effect) reflect the new column
+      // the instant the backend pushes it — rather than waiting up to 2s for
+      // the next poll (and staying stale indefinitely if that poll lags). This
+      // is what keeps the panel header + Stop button from lingering on a
+      // `running` snapshot after the turn has actually finished.
+      setTasks((cur) =>
+        cur.map((t) => (t.id === ev.taskId ? { ...t, column: ev.column } : t)),
+      );
       if (ev.column === "blocked") {
         toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
       } else if (ev.prev === "blocked") {
@@ -301,13 +312,21 @@ export default function App() {
         if (!hay.includes(q)) return false;
       }
       if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
+      if (harnessFilter.length > 0 && !harnessFilter.includes(t.agent)) return false;
       return true;
     });
-  }, [tasks, textQuery, repoFilter]);
+  }, [tasks, textQuery, repoFilter, harnessFilter]);
 
   const visibleColumns = useMemo(
     () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
     [statusFilter],
+  );
+
+  // Distinct harness ids referenced by any task — feeds the harness filter so
+  // ids belonging to removed harnesses still show up as filter options.
+  const taskAgentIds = useMemo(
+    () => Array.from(new Set(tasks.map((t) => t.agent))),
+    [tasks],
   );
 
   const surfaceError = (e: unknown) =>
@@ -496,7 +515,11 @@ export default function App() {
             onRepoFilterChange={setRepoFilter}
             statusFilter={statusFilter}
             onStatusFilterChange={setStatusFilter}
+            harnessFilter={harnessFilter}
+            onHarnessFilterChange={setHarnessFilter}
             projects={projects}
+            harnesses={harnesses}
+            taskAgentIds={taskAgentIds}
           />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
           <Toaster panelOpen={panelMounted} />

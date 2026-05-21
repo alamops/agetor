@@ -24,10 +24,12 @@ import { BranchPicker } from "./BranchPicker";
 import { ProjectPicker } from "./ProjectPicker";
 import {
   ReferencesPicker,
-  extractDroppedRefs,
+  captureDroppedOrPastedItems,
   mergeRefs,
+  type CapturedItem,
 } from "./ReferencesPicker";
 import { SlashAutocomplete } from "./SlashAutocomplete";
+import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 
 const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
 
@@ -125,6 +127,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   }, [availableHarnesses, agent]);
   const [references, setReferences] = useState<TaskReference[]>([]);
   const [dragging, setDragging] = useState(false);
+  const [dropHint, setDropHint] = useState<string | null>(null);
   const [agentCommands, setAgentCommands] = useState<AvailableCommand[]>([]);
   const promptRef = useRef<HTMLTextAreaElement>(null);
 
@@ -305,6 +308,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     setPrompt("");
     setBaseRef("");
     setReferences([]);
+    setDropHint(null);
     // Keep `workdir`, `model`, `effort`, `mode` set on purpose — the next
     // task should default to the same project + picks the user just used.
   };
@@ -324,11 +328,52 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   const onAsideDragLeave = (e: React.DragEvent) => {
     if (e.currentTarget === e.target) setDragging(false);
   };
-  const onAsideDrop = (e: React.DragEvent) => {
+  const applyCaptured = (items: CapturedItem[]) => {
+    if (!items.length) return;
+    setReferences((cur) => mergeRefs(cur, items.map((i) => i.ref)));
+    const marker = items.map((i) => `[${i.basename}]`).join(" ");
+    // Read the caret synchronously (DOM state, not React state) then drive
+    // setPrompt with a functional updater so two captures landing back-to-
+    // back across an async boundary don't see stale `prompt` closures.
+    const selection = readCaret(promptRef.current);
+    let caret = 0;
+    setPrompt((cur) => {
+      const r = spliceAtSelection(cur, selection, marker);
+      caret = r.caret;
+      return r.next;
+    });
+    restoreCaret(promptRef.current, caret);
+  };
+  const reportCapture = ({ items, skipped, error }: {
+    items: CapturedItem[];
+    skipped: number;
+    error?: string;
+  }) => {
+    if (error) setDropHint(`Couldn't save screenshot: ${error}`);
+    else if (skipped && !items.length) setDropHint("Nothing to attach — drag a file from Finder, or a screenshot blob.");
+    else setDropHint(null);
+  };
+  const onAsideDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     setDragging(false);
-    const { additions } = extractDroppedRefs(e);
-    if (additions.length) setReferences((cur) => mergeRefs(cur, additions));
+    setDropHint(null);
+    const dt = e.dataTransfer;
+    const result = await captureDroppedOrPastedItems(dt);
+    reportCapture(result);
+    applyCaptured(result.items);
+  };
+  const onPromptPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const cd = e.clipboardData;
+    if (!cd) return;
+    // Only intercept when the clipboard actually carries a file — otherwise
+    // let the default text paste run.
+    const hasFile = Array.from(cd.items ?? []).some((it) => it.kind === "file");
+    if (!hasFile) return;
+    e.preventDefault();
+    setDropHint(null);
+    const result = await captureDroppedOrPastedItems(cd);
+    reportCapture(result);
+    applyCaptured(result.items);
   };
 
   return (
@@ -367,7 +412,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
               ref={promptRef}
               placeholder="What should the agent do? Type / for commands."
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              onChange={(e) => { setPrompt(e.target.value); if (dropHint) setDropHint(null); }}
+              onPaste={onPromptPaste}
               rows={6}
               className="resize-none"
             />
@@ -378,6 +424,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
               textareaRef={promptRef}
             />
           </div>
+          {dropHint && (
+            <p className="text-[10px] text-muted-foreground">{dropHint}</p>
+          )}
         </div>
 
         <ReferencesPicker
