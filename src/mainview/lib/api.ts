@@ -12,6 +12,7 @@ import type {
   Run,
   RunEvent,
   Task,
+  TaskDiff,
   TaskReference,
   UpdateStatus,
 } from "../../shared/types.ts";
@@ -277,6 +278,9 @@ export const api = {
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
   startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
+  /** Everything the task's worktree changed vs its pinned base. Empty `files`
+   *  + a `note` when there's no worktree or no diff. */
+  getTaskDiff: (taskId: string) => j<TaskDiff>(`/tasks/${taskId}/diff`),
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
   sendRunInput: (runId: string, line: string) =>

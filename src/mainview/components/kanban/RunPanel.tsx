@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Bot, ClipboardList, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
+  GitCompare, Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type PendingInteraction } from "@/lib/api";
@@ -53,6 +53,8 @@ interface Props {
   agentModels: AgentModelMap;
   homeDir: string;
   onClose: () => void;
+  /** Open the git diff viewer for the given task. */
+  onShowDiff: (task: Task) => void;
 }
 
 const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" | "destructive"> = {
@@ -90,7 +92,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose }: Props) {
+export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -169,6 +171,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           agentModels={agentModels}
           homeDir={homeDir}
           onClose={onClose}
+          onShowDiff={onShowDiff}
         />
       </aside>
     </>
@@ -186,6 +189,7 @@ function RunPanelBody({
   agentModels,
   homeDir,
   onClose,
+  onShowDiff,
 }: {
   task: Task;
   agents: AgentStatus[];
@@ -193,6 +197,7 @@ function RunPanelBody({
   agentModels: AgentModelMap;
   homeDir: string;
   onClose: () => void;
+  onShowDiff: (task: Task) => void;
 }) {
   const kind = harnessKindOf(task.agent, harnesses);
   const [runs, setRuns] = useState<Run[]>([]);
@@ -547,6 +552,14 @@ function RunPanelBody({
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => onShowDiff(task)}
+            title="View this task's changes (git diff)"
+          >
+            <GitCompare className="mr-1 size-3" /> Diff
+          </Button>
           <Button
             size="sm"
             variant="outline"

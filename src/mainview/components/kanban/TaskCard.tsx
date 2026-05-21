@@ -1,6 +1,6 @@
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { ArrowRight, FolderOpen, GitBranch, MessageCircleQuestion, Play, Square, Trash2 } from "lucide-react";
+import { ArrowRight, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, Square, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,9 +15,10 @@ interface Props {
   onCancel: (t: Task) => void;
   onDelete: (t: Task) => void;
   onOpen: (t: Task) => void;
+  onDiff: (t: Task) => void;
 }
 
-export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }: Props) {
+export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff }: Props) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
   });
@@ -129,6 +130,9 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }:
               <Square className="size-3" />
             </Button>
           )}
+          <Button size="icon" variant="ghost" onClick={() => onDiff(task)} title="View changes (git diff)">
+            <GitCompare className="size-3" />
+          </Button>
           <Button size="icon" variant="ghost" onClick={() => onDelete(task)} title="Delete task">
             <Trash2 className="size-3" />
           </Button>

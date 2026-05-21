@@ -492,6 +492,46 @@ export interface Run {
   claudeSessionId: string | null;
 }
 
+/** One changed file in a task's git diff (worktree vs its pinned base). */
+export interface DiffFile {
+  /** Repo-relative path of the file in its new state. */
+  path: string;
+  /** Previous path for renames; null otherwise. */
+  oldPath: string | null;
+  status: "added" | "modified" | "deleted" | "renamed";
+  /** Lines added (`+`) in this file's hunks. 0 for binary. */
+  additions: number;
+  /** Lines removed (`-`) in this file's hunks. 0 for binary. */
+  deletions: number;
+  /** True when git reports the file as binary (no textual hunks). */
+  binary: boolean;
+  /**
+   * Unified-diff body for this file (the `@@ … @@` hunks, without the
+   * `diff --git` header). Empty for binary files. May be truncated — see
+   * `truncated`.
+   */
+  hunks: string;
+  /** True when `hunks` was cut off because the file's diff was very large. */
+  truncated: boolean;
+}
+
+/**
+ * A task's git diff: everything its worktree changed relative to the pinned
+ * base ref (committed + uncommitted + newly created files). Returned by
+ * `GET /tasks/:id/diff`.
+ */
+export interface TaskDiff {
+  /** Short base sha the diff is computed against, or null when not applicable. */
+  base: string | null;
+  files: DiffFile[];
+  /**
+   * Friendly explanation when there's nothing to show — e.g. the task has no
+   * worktree yet, isolation is off, or the worktree is clean. Absent when
+   * `files` is non-empty.
+   */
+  note?: string;
+}
+
 /**
  * Streams the run panel listens on. Codex (and any unstructured agent)
  * uses the flat trio: stdout / stderr / status. Claude's JSONL is parsed

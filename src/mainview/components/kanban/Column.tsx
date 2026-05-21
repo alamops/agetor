@@ -13,9 +13,10 @@ interface Props {
   onCancel: (t: Task) => void;
   onDelete: (t: Task) => void;
   onOpen: (t: Task) => void;
+  onDiff: (t: Task) => void;
 }
 
-export function Column({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen }: Props) {
+export function Column({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -41,6 +42,7 @@ export function Column({ id, label, tasks, homeDir, onStart, onCancel, onDelete,
             onCancel={onCancel}
             onDelete={onDelete}
             onOpen={onOpen}
+            onDiff={onDiff}
           />
         ))}
       </div>
