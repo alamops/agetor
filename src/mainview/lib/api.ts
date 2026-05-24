@@ -301,6 +301,16 @@ export const api = {
       body: JSON.stringify(input),
     }),
 
+  /**
+   * Open the claude-code task's tmux session in a new Terminal.app window.
+   * Returns the session name on success. Server-side checks the session is
+   * actually live and that the task uses a claude-code harness.
+   */
+  openTmux: (taskId: string) =>
+    j<{ ok: true; sessionName: string }>(`/tasks/${taskId}/open-tmux`, {
+      method: "POST",
+    }),
+
   /** Persist an in-memory image (clipboard paste or macOS floating-thumbnail
    *  drag) to disk and get back its absolute path. Bypasses `j()` because the
    *  body is raw bytes, not JSON. */
