@@ -5,6 +5,15 @@ import path from "node:path";
 import type { AgentKind, Harness, HarnessUsage, Project, Task, TaskReference, Run, RunEventStream } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
+// Interactions live in-memory in `interactions.ts`. The import creates a
+// cycle: db.ts → interactions.ts → db.ts (for `tasks`). It is safe ONLY
+// because both modules access each other's exports exclusively from
+// function bodies that run after module init — never at top level. Do
+// NOT add a top-level call site in either direction (e.g. a `const x =
+// tasks.get(...)` at module scope in interactions.ts) — under ESM live
+// bindings the unresolved cycle becomes an undefined-binding crash at
+// import time. Keep both sides lazy.
+import { countPendingForTask } from "./interactions.ts";
 
 // Hard guard against test fixtures silently leaking into the user's real
 // SQLite db. `bun test` runs every *.test.ts file in one process, so the
@@ -96,6 +105,7 @@ const toTask = (r: TaskRow): Task => ({
   // join (e.g. insert/update returning the freshly-written shape, where
   // no runs exist yet → false is the right default).
   hasOpenableRun: r.has_openable_run === 1,
+  pendingInteractionCount: countPendingForTask(r.id),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
 });
@@ -143,7 +153,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0 };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);

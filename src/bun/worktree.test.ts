@@ -43,6 +43,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     references: [],
     runId: null,
     hasOpenableRun: false,
+    pendingInteractionCount: 0,
     createdAt: 0,
     updatedAt: 0,
     ...overrides,
@@ -191,4 +192,36 @@ test("removeWorktree tears down both the worktree and the branch", async () => {
   const out = (await new Response(proc.stdout).text()).trim();
   await proc.exited;
   expect(out).toBe("");
+});
+
+test("hasUncommittedChanges returns null when the dir doesn't exist", async () => {
+  const { hasUncommittedChanges } = await import("./worktree.ts");
+  const missing = path.join(tmpdir(), `agetor-wt-missing-${randomUUID()}`);
+  expect(await hasUncommittedChanges(missing)).toBeNull();
+});
+
+test("hasUncommittedChanges returns null for a non-git directory", async () => {
+  const { hasUncommittedChanges } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-status-"));
+  expect(await hasUncommittedChanges(dir)).toBeNull();
+});
+
+test("hasUncommittedChanges returns false for a clean repo", async () => {
+  const { hasUncommittedChanges } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  expect(await hasUncommittedChanges(repo)).toBe(false);
+});
+
+test("hasUncommittedChanges returns true for an untracked file", async () => {
+  const { hasUncommittedChanges } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "new.txt"), "hello\n");
+  expect(await hasUncommittedChanges(repo)).toBe(true);
+});
+
+test("hasUncommittedChanges returns true for a modified tracked file", async () => {
+  const { hasUncommittedChanges } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "README"), "changed\n");
+  expect(await hasUncommittedChanges(repo)).toBe(true);
 });

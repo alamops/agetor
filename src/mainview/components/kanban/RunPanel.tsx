@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Bot, ClipboardList, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
+  GitCommit, Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type PendingInteraction } from "@/lib/api";
@@ -31,7 +31,13 @@ import {
 import { appendReferences } from "../../../shared/refs.ts";
 import { proposeAllowRules, type AllowRuleProposal } from "../../../shared/claude-permissions.ts";
 import { AgentIcon } from "./AgentIcon";
-import { ReferencesPicker } from "./ReferencesPicker";
+import {
+  ReferencesPicker,
+  captureDroppedOrPastedItems,
+  mergeRefs,
+  type CapturedItem,
+} from "./ReferencesPicker";
+import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 import { SlashAutocomplete } from "./SlashAutocomplete";
 
 /**
@@ -64,7 +70,7 @@ const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" 
   failed: "destructive",
 };
 
-const EXIT_DURATION_MS = 250;
+export const EXIT_DURATION_MS = 250;
 
 function formatDuration(r: Run): string {
   const end = r.endedAt ?? Date.now();
@@ -101,11 +107,16 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
     if (task) {
       setMountedTask(task);
       // Defer the open flip to the next frame so the panel mounts at
-      // translate-x-full first, then animates to translate-x-0.
-      requestAnimationFrame(() => setOpen(true));
-    } else {
-      setOpen(false);
+      // translate-x-full first, then animates to translate-x-0. Cancel on
+      // cleanup: without this, a pending rAF from a truthy run can fire AFTER
+      // a later task→null run set open=false, wedging the panel open (open=true
+      // while task=null, so every close path's setSelected(null) is a no-op).
+      // The 2s kanban poll re-creates `selected` — and so re-runs this effect —
+      // every tick, which is what made the bug intermittent.
+      const raf = requestAnimationFrame(() => setOpen(true));
+      return () => cancelAnimationFrame(raf);
     }
+    setOpen(false);
   }, [task]);
 
   // After the exit animation completes, drop the mountedTask so we don't keep
@@ -116,6 +127,33 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
     const t = setTimeout(() => setMountedTask(null), EXIT_DURATION_MS);
     return () => clearTimeout(t);
   }, [open, mountedTask]);
+
+  // Escape closes the panel — but only when no higher-priority dismissable
+  // layer is up: a modal Dialog (confirm, edit, settings, tmux-missing —
+  // each renders `[role="dialog"][aria-modal="true"]`) or an open
+  // search-select / multi-search-select popover (marked with
+  // `[data-popover-open]`). Esc peels one layer at a time, top down.
+  //
+  // Note: stopPropagation/stopImmediatePropagation can't help here because
+  // both the panel and the popovers attach to `document`, so DOM markers
+  // are the order-independent way to coordinate the handoff.
+  //
+  // onClose is captured into a ref because the parent passes an inline arrow
+  // function — depending on it directly would tear down + re-add the listener
+  // on every kanban poll (every 2s).
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      e.preventDefault();
+      onCloseRef.current();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
 
   if (!mountedTask) return null;
 
@@ -195,11 +233,15 @@ function RunPanelBody({
   const nearBottomRef = useRef(true);
 
   // Reset on task switch (no remount because we no longer key on task.id).
+  // Re-arm the auto-scroll heuristic so opening a different task pins the
+  // viewport to the most recent message instead of inheriting the previous
+  // task's scrolled-up position.
   useEffect(() => {
     setEvents([]);
     setRebuilt(null);
     setRebuildNote(null);
     setInteractions([]);
+    nearBottomRef.current = true;
   }, [task.id]);
 
   // Latest run for this task — drives the send button, indicator, and
@@ -293,15 +335,50 @@ function RunPanelBody({
         } catch { /* ignore malformed */ }
         return;
       }
+      if (e.stream === "interaction_resolved") {
+        // Server-side resolution (scraper auto-cancel, run cancellation,
+        // delete) — drop the matching card so the UI doesn't keep
+        // showing a stale prompt. The card's own submit handler also
+        // calls `dismissInteraction(id)` directly; both paths are
+        // idempotent under `id`-based filtering.
+        try {
+          const { id } = JSON.parse(e.data) as { id: string };
+          setInteractions((cur) => cur.filter((x) => x.id !== id));
+        } catch { /* ignore malformed */ }
+        return;
+      }
       setEvents((cur) => [...cur, e]);
     });
     return unsub;
   }, [task.id]);
 
+  // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
+  // a user who scrolled up to read history is never yanked back down:
+  //   1. On every event / rebuild / interaction change, scroll once after
+  //      the React commit. Handles the steady-state streaming case.
+  //   2. On task switch, additionally loop on rAF for a short window. Events
+  //      stream in over multiple frames and rendered children (markdown,
+  //      code, tool results) keep growing scrollHeight after their initial
+  //      mount, so a single post-commit scroll can leave us short. The loop
+  //      bails the moment the user scrolls (nearBottomRef flips to false).
   useEffect(() => {
     if (!nearBottomRef.current) return;
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [events, rebuilt, interactions.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const deadline = performance.now() + 600;
+    const pin = () => {
+      if (cancelled || !nearBottomRef.current) return;
+      const el = logRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+      if (performance.now() < deadline) requestAnimationFrame(pin);
+    };
+    requestAnimationFrame(pin);
+    return () => { cancelled = true; };
+  }, [task.id]);
 
   // Auto-rebuild from the latest run's on-disk JSONL when the run is
   // finished and has a claude session id. The persisted `run_events`
@@ -377,8 +454,20 @@ function RunPanelBody({
   //     recent run id to identify which task → which claude session to
   //     resume. Codex has no resume mechanism; restrict to claude-code.
   const liveRunId = task.runId;
+  // Reconcile against the independently-polled runs list: if the live run has
+  // already resolved (succeeded/failed/cancelled/orphaned), the task isn't
+  // running regardless of what `task.column` says. `task.column` is a snapshot
+  // polled into the board and can briefly lag the DB; `runs` is polled here
+  // (with its own error handling) so a resolved live run is the more
+  // trustworthy "no longer running" signal. When the live run hasn't been
+  // polled in yet (freshly started — not in `runs` yet), `liveRun` is null and
+  // we fall back to trusting `task.column`, so Stop never hides on a genuinely
+  // in-flight turn.
+  const liveRun = liveRunId ? runs.find((r) => r.id === liveRunId) ?? null : null;
+  const liveRunTerminal = !!liveRun && liveRun.status !== "running";
   const canControl = !!liveRunId
-    && (task.column === "running" || task.column === "blocked");
+    && (task.column === "running" || task.column === "blocked")
+    && !liveRunTerminal;
   const resumableRunId = liveRunId
     ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
   // Send is enabled whenever the task has ever been run. While a turn is
@@ -393,6 +482,15 @@ function RunPanelBody({
   const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
+  // Whether the task's working tree has uncommitted changes. Drives the
+  // "Commit & push" action chip above the textarea. Reset to `false`
+  // whenever the latest run is not in a succeeded state so the chip
+  // disappears the moment a new turn starts (`send()` refreshes the runs
+  // list immediately, so `latestRun.status` flips to "running" within
+  // ~200ms of the click). A polling effect keeps the flag in sync with
+  // the actual git state while the run sits idle on success.
+  const [hasChanges, setHasChanges] = useState(false);
+  const [sendDragging, setSendDragging] = useState(false);
   // `/`-command and skill autocomplete for the send field. Same list the
   // New Task form uses — depends on (agent, workdir, branch) so a slash
   // command available in this project shows up here too.
@@ -408,16 +506,50 @@ function RunPanelBody({
     // SHA used only for reproducibility) — commands are discovered
     // against the live branch context, not the historical base.
     const branch = task.branch?.trim() || undefined;
+    // Pass the harness id (task.agent) so aliased multi-account harnesses
+    // read their own per-harness commands/skills.
     api
       .listAgentCommands({
-        agent: kind,
+        agent: task.agent,
         workdir: task.workdir.trim(),
         branch,
       })
       .then((cmds) => { if (!cancelled) setSendCommands(cmds); })
       .catch(() => { if (!cancelled) setSendCommands([]); });
     return () => { cancelled = true; };
-  }, [kind, task.workdir, task.branch]);
+  }, [task.agent, task.workdir, task.branch]);
+
+  // Keep `hasChanges` aligned with the latest run's terminal state. We only
+  // ever offer "Commit & push" when the latest run succeeded — any other
+  // status (running / failed / cancelled / orphaned / no runs yet) hides
+  // the chip. While in the succeeded state, poll every 5s so the chip
+  // disappears if the agent (or the user, from a separate terminal)
+  // commits the changes through another path. The loop is sequential
+  // (each tick waits for the previous git status to resolve before
+  // sleeping) so a slow `git status` can't produce out-of-order
+  // setHasChanges calls.
+  useEffect(() => {
+    if (latestRun?.status !== "succeeded") {
+      setHasChanges(false);
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      while (!cancelled) {
+        try {
+          const res = await api.getTaskGitStatus(task.id);
+          if (cancelled) return;
+          setHasChanges(res.hasChanges && !res.ignored);
+        } catch {
+          if (cancelled) return;
+          setHasChanges(false);
+        }
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    };
+    void tick();
+    return () => { cancelled = true; };
+  }, [task.id, latestRun?.id, latestRun?.status]);
 
   const send = async () => {
     const line = input.trim();
@@ -440,6 +572,11 @@ function RunPanelBody({
         // message never appears.
         setRebuilt(null);
         setRebuildNote(null);
+        // Hide the "Commit & push" chip optimistically — a new turn is
+        // about to land. Without this there's a brief window between this
+        // finally and the listRuns response where `latestRun.status` is
+        // still "succeeded" and the chip flickers back into view.
+        setHasChanges(false);
         // Refresh the runs list right away so the new run row appears
         // immediately, rather than waiting up to 2s for the next poll.
         void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
@@ -464,6 +601,106 @@ function RunPanelBody({
   const stop = async () => {
     if (!liveRunId) return;
     try { await api.cancelRun(liveRunId); } catch { /* surfaced via log */ }
+  };
+
+  // One-click follow-up: ask the agent to commit & push the changes it just
+  // made. Reuses the same `sendRunInput` plumbing as a typed message so the
+  // resulting turn shows up as a normal run row with streamed events.
+  const sendCommitPush = async () => {
+    if (!resumableRunId || sending) return;
+    const message =
+      "Commit all changes with a clear, conventional commit message " +
+      "summarizing the work and push the current branch to origin. " +
+      "If the branch has no upstream yet, set it with `git push -u origin <branch>`.";
+    // Intentionally leaves `input` / `sendRefs` alone — Commit & push is a
+    // side action that shouldn't discard text the user has typed for the
+    // next turn. `send()` clears those because it consumed them.
+    setSending(true);
+    setSendHint(null);
+    try {
+      const res = await api.sendRunInput(resumableRunId, message);
+      if (!res.delivered) {
+        setSendHint(res.reason);
+      } else {
+        setRebuilt(null);
+        setRebuildNote(null);
+        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        // Optimistically hide the chip — the new turn is in flight so we
+        // won't render it again until the next succeeded state.
+        setHasChanges(false);
+        nearBottomRef.current = true;
+        requestAnimationFrame(() => {
+          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+        });
+      }
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  // Drag/drop + paste capture for the message textarea. Mirrors the
+  // NewTaskForm sidebar flow: pathful files come straight through, blob
+  // screenshots (macOS floating thumbnail, clipboard paste) get uploaded
+  // to `~/.agetor/screenshots/` first. Captured items land both as chips
+  // in `sendRefs` *and* as `[basename]` markers at the cursor.
+  const applySendCaptured = (items: CapturedItem[]) => {
+    if (!items.length) return;
+    setSendRefs((cur) => mergeRefs(cur, items.map((i) => i.ref)));
+    const marker = items.map((i) => `[${i.basename}]`).join(" ");
+    const selection = readCaret(sendRef.current);
+    let caret = 0;
+    setInput((cur) => {
+      const r = spliceAtSelection(cur, selection, marker);
+      caret = r.caret;
+      return r.next;
+    });
+    restoreCaret(sendRef.current, caret);
+  };
+  const onSendDragOver = (e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    // Always preventDefault on a file dragover so WKWebView doesn't fall back
+    // to its native handler (navigate / open). The visual ring only lights up
+    // when canSend is true, but the wrapper still claims the drop.
+    e.preventDefault();
+    if (canSend) setSendDragging(true);
+  };
+  const onSendDragLeave = (e: React.DragEvent) => {
+    // Always clear when `canSend` flipped to false mid-drag — otherwise the
+    // ring can outlive the drag if the task transitioned out of running.
+    if (!canSend) { setSendDragging(false); return; }
+    if (e.currentTarget === e.target) setSendDragging(false);
+  };
+  const reportSendCapture = ({ items, skipped, error }: {
+    items: CapturedItem[];
+    skipped: number;
+    error?: string;
+  }) => {
+    if (error) setSendHint(`Couldn't save screenshot: ${error}`);
+    else if (skipped && !items.length) setSendHint("Nothing to attach — drag a file from Finder, or a screenshot blob.");
+  };
+  const onSendDrop = async (e: React.DragEvent) => {
+    // preventDefault unconditionally so a stray drop while !canSend doesn't
+    // hand the file to WKWebView's native handler.
+    e.preventDefault();
+    setSendDragging(false);
+    if (!canSend) return;
+    setSendHint(null);
+    const result = await captureDroppedOrPastedItems(e.dataTransfer);
+    reportSendCapture(result);
+    applySendCaptured(result.items);
+  };
+  const onSendPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const cd = e.clipboardData;
+    if (!cd) return;
+    const hasFile = Array.from(cd.items ?? []).some((it) => it.kind === "file");
+    if (!hasFile) return;
+    e.preventDefault();
+    setSendHint(null);
+    const result = await captureDroppedOrPastedItems(cd);
+    reportSendCapture(result);
+    applySendCaptured(result.items);
   };
 
   return (
@@ -579,8 +816,19 @@ function RunPanelBody({
           run — the backend reattaches to the live tmux session if there is one,
           or spawns a fresh one seeded with the previous turn's last response
           when the original session is gone. The button is given the same fixed
-          height as the textarea so they baseline together. */}
-      <div className="shrink-0 space-y-1.5 border-t border-border/60 p-2">
+          height as the textarea so they baseline together. The whole dock is
+          one drop zone so dragging a screenshot anywhere over the input area
+          (chips, textarea, send button gap) routes through the same capture
+          path. */}
+      <div
+        className={cn(
+          "relative shrink-0 space-y-1.5 border-t border-border/60 p-2",
+          sendDragging && "ring-2 ring-inset ring-primary",
+        )}
+        onDragOver={onSendDragOver}
+        onDragLeave={onSendDragLeave}
+        onDrop={onSendDrop}
+      >
         {canSend && (
           <ReferencesPicker
             variant="inline"
@@ -588,12 +836,25 @@ function RunPanelBody({
             onChange={setSendRefs}
           />
         )}
+        {canSend && latestRun?.status === "succeeded" && hasChanges && !sending && (
+          <div>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => void sendCommitPush()}
+              title="Ask the agent to commit the working-tree changes and push the current branch to origin."
+            >
+              <GitCommit className="mr-1 size-3" /> Commit &amp; push
+            </Button>
+          </div>
+        )}
         <div className="flex items-stretch gap-2">
           <div className="relative flex-1">
             <Textarea
               ref={sendRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onPaste={onSendPaste}
               onKeyDown={(e) => {
                 // Enter to send; Shift+Enter for a newline. SlashAutocomplete
                 // attaches a native keydown listener that calls preventDefault
@@ -636,7 +897,13 @@ function RunPanelBody({
             onClick={() => void send()}
             disabled={!canSend || sending || (!input.trim() && sendRefs.length === 0)}
             title={
-              canControl
+              // Distinguish "live session exists" from "needs resume" — not
+              // "turn in flight". `liveRunId` (task.runId) stays set while the
+              // tmux session is alive (including between turns) and is only
+              // null once the session is gone (orphan-reconciled), which is the
+              // resume path. Keying off `canControl` here would mislabel the
+              // common "session alive, no turn in flight" state as a resume.
+              liveRunId
                 ? "Send to the live agent"
                 : "Resume the conversation with this message"
             }
@@ -934,6 +1201,8 @@ function RunEventList({
         return <AskQuestionsCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
       case "plan_approval":
         return <PlanApprovalCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
+      case "tmux_prompt":
+        return <TmuxPromptCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
     }
   };
 
@@ -2668,6 +2937,86 @@ function PlanApprovalCard({
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Card for a REPL modal the tmux pane scraper caught — typically a
+ * plan-mode safety dialog, `/login`, model picker, or any prompt the
+ * PreToolUse hook system never sees. Clicking a choice ships the
+ * literal key (e.g. `"1"`) back to the server, which `tmux send-keys`-es
+ * it into the pane so claude reads it as the user's keypress.
+ *
+ * The card's appearance is intentionally pane-like (monospace, dark
+ * background) so the user recognises that they're looking at what's
+ * actually on the tmux screen, not an agetor-synthesised question.
+ */
+function TmuxPromptCard({
+  req,
+  onResolved,
+}: {
+  req: Extract<PendingInteraction, { kind: "tmux_prompt" }>;
+  onResolved: (id: string) => void;
+}) {
+  const [submitting, setSubmitting] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const send = async (key: string) => {
+    if (submitting) return;
+    setSubmitting(key);
+    setError(null);
+    try {
+      // Only clear the card once the server has handled it. Resolving
+      // optimistically (the old behaviour) made a failed keystroke briefly
+      // hide the card, then the scraper re-detected the still-present modal
+      // and re-registered it — the "flicker that stays" the user saw.
+      //
+      // `{ ok: false }` (HTTP 200) means the prompt was already resolved
+      // server-side (scraper auto-cancel, double-click) — the card should
+      // just go away, not show an error. Genuine delivery failures come
+      // back as 410/500 and throw, landing in the catch below.
+      await api.answerTmuxPrompt(req.id, { key });
+      onResolved(req.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to send choice.");
+    } finally {
+      setSubmitting(null);
+    }
+  };
+  return (
+    <div className="rounded-md border border-amber-500/60 bg-card p-3 ring-1 ring-amber-500/40">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-amber-500">
+          <Terminal className="size-3.5" aria-hidden /> Claude is paused on a prompt
+        </span>
+      </div>
+      <pre className="max-h-96 overflow-auto whitespace-pre rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-snug">
+        {req.paneText}
+      </pre>
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        {req.choices.map((c) => {
+          // Visual hint only: dim out the "negative" choice so it doesn't
+          // sit at equal weight with the primary one. Anchor the regex
+          // so labels like "Notify me" or "Nominate" don't accidentally
+          // get styled as a destructive action.
+          const isNegative = c.key.toLowerCase() === "n"
+            || /^(no|reject|cancel|deny|abort|quit)\b/i.test(c.label.trim());
+          return (
+            <Button
+              key={c.key}
+              onClick={() => void send(c.key)}
+              size="sm"
+              variant={isNegative ? "outline" : "secondary"}
+              disabled={submitting !== null}
+            >
+              {submitting === c.key ? "Sending…" : `${c.key}. ${c.label}`}
+            </Button>
+          );
+        })}
+      </div>
+      {error && (
+        <p className="mt-2 text-right text-[11px] text-destructive">{error}</p>
+      )}
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Utils } from "electrobun/bun";
@@ -25,8 +25,16 @@ import {
   setTmuxSource,
   type TmuxSource,
 } from "./tmux-resolution.ts";
-import { jsonlPathFor, mapJsonlEventToChunks, sessionExists, sessionNameFor } from "./claude-tmux.ts";
-import { listBranches } from "./worktree.ts";
+import {
+  dismissTmuxPrompt,
+  getCurrentPermissionMode,
+  jsonlPathFor,
+  mapJsonlEventToChunks,
+  markTmuxPromptAnswered,
+  sessionExists,
+  sessionNameFor,
+} from "./claude-tmux.ts";
+import { listBranches, hasUncommittedChanges } from "./worktree.ts";
 import { listAvailableCommands } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
@@ -36,6 +44,8 @@ import {
   answerAskQuestions,
   answerPlanApproval,
   answerQuestion,
+  answerTmuxPrompt,
+  findTmuxPromptById,
   formatAskQuestionsReason,
   formatPlanApprovalReason,
   listPendingForTask,
@@ -52,6 +62,7 @@ import {
   type QuestionAnswer,
 } from "./interactions.ts";
 import { MODEL_EFFORT_SUPPORT } from "../shared/types.ts";
+import { isReadOnlyBashCommand } from "../shared/claude-permissions.ts";
 import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 
@@ -599,20 +610,35 @@ export function startApiServer() {
         }),
       },
 
-      // Slash commands + skills available to the picked agent in the picked
-      // project. The new-task form queries this whenever agent/workdir/branch
+      // Slash commands + skills available to the picked harness in the picked
+      // project. The new-task form queries this whenever harness/workdir/branch
       // change so the prompt textarea can offer `/…` autocomplete.
+      //
+      // The `agent` query param is a harness id (or, for built-ins, the bare
+      // AgentKind — they share the same value). Resolving via getByIdOrKind
+      // lets us look up the harness's home, so an aliased multi-account
+      // harness reads its own per-harness commands/skills instead of the
+      // system home's.
       "/agent-commands": {
         GET: authed(async (req) => {
           const url = new URL(req.url);
-          const agent = url.searchParams.get("agent") as AgentKind | null;
+          const agentParam = url.searchParams.get("agent");
           const workdir = url.searchParams.get("workdir");
           const branch = url.searchParams.get("branch");
-          if (agent !== "claude-code" && agent !== "codex") {
+          if (!agentParam) {
+            return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const harness = harnesses.getByIdOrKind(agentParam);
+          if (!harness) {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
           }
           return json(
-            await listAvailableCommands({ agent, workdir, branch }),
+            await listAvailableCommands({
+              agent: harness.kind,
+              workdir,
+              branch,
+              harnessHome: harness.home,
+            }),
             { headers: corsHeaders(req) },
           );
         }),
@@ -731,7 +757,18 @@ export function startApiServer() {
           // Mirror behavioural changes onto a live claude session via slash
           // commands so the conversation context survives a model/mode/effort
           // change. Agent changes wipe the session — different harness entirely.
-          reconcileTaskSession(req.params.id, before, updated);
+          // Fire-and-forget: the mode-change path now verifies via the JSONL
+          // event before resolving, which can take up to 4.5s on the
+          // exhaust-retries path. The PATCH response payload only carries the
+          // updated Task row (already in hand); the verify outcome reaches
+          // the user through the `status` SSE events that
+          // `emitModeChangeStatus` writes. Blocking the response would add
+          // unbounded latency for no benefit. `.catch` keeps an unexpected
+          // throw from becoming an unhandledRejection — every failure mode
+          // the function knows about already surfaces via SSE.
+          reconcileTaskSession(req.params.id, before, updated).catch((err: unknown) => {
+            console.error("reconcileTaskSession failed:", err);
+          });
           return json(updated, { headers: corsHeaders(req) });
         }),
         DELETE: authed(async (req) => {
@@ -831,6 +868,26 @@ export function startApiServer() {
         }),
       },
 
+      // Whether the task's working tree has uncommitted changes. Drives the
+      // "Commit & push" action in the run panel, which only makes sense to
+      // show when there's actually something to commit. `ignored: true` means
+      // we couldn't tell (not a git repo, dir missing, git failed) — the UI
+      // treats that as "don't offer the action" rather than guessing.
+      "/tasks/:id/git-status": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const dir = t.worktreePath ?? t.workdir;
+          const result = await hasUncommittedChanges(dir);
+          if (result === null) {
+            return json({ hasChanges: false, ignored: true }, { headers: corsHeaders(req) });
+          }
+          return json({ hasChanges: result, ignored: false }, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/runs/:id/cancel": {
         POST: authed((req) =>
           json({ cancelled: cancelRun(req.params.id) }, { headers: corsHeaders(req) })),
@@ -879,6 +936,60 @@ export function startApiServer() {
         }),
       },
 
+      // Persist a screenshot blob to `${dataDir}/screenshots/` and return its
+      // absolute path. Backs the textarea drag/drop + paste flows on the
+      // webview — macOS floating-thumbnail drags and clipboard pastes carry
+      // an image blob with no filesystem path, so the only way to give an
+      // agent an absolute path to read is to write the bytes out first.
+      "/screenshots": {
+        POST: authed(async (req) => {
+          const ctype = (req.headers.get("content-type") ?? "").toLowerCase();
+          const allowed: Record<string, string> = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/gif": "gif",
+            "image/webp": "webp",
+          };
+          const ext = allowed[ctype.split(";")[0].trim()];
+          if (!ext) {
+            return json(
+              { error: `unsupported content-type: ${ctype || "(missing)"}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+          const MAX = 25 * 1024 * 1024;
+          // Reject oversized uploads via Content-Length before allocating
+          // the body — a buggy client shouldn't be able to pin RAM by
+          // streaming gigabytes only to see a 413 at the end. Clients
+          // omitting the header still hit the post-read check below.
+          const claimed = Number(req.headers.get("content-length") ?? "");
+          if (Number.isFinite(claimed) && claimed > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          const buf = await req.arrayBuffer();
+          if (buf.byteLength > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          if (buf.byteLength === 0) {
+            return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const dir = path.join(dataDir, "screenshots");
+          mkdirSync(dir, { recursive: true });
+          const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+          const id = crypto.randomUUID().slice(0, 8);
+          const basename = `screenshot-${ts}-${id}.${ext}`;
+          const abs = path.join(dir, basename);
+          await Bun.write(abs, buf);
+          return json({ path: abs, basename }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // ─── Interactions: tool-call approvals (from the PreToolUse hook) ───
       "/approvals": {
         POST: authed(async (req) => {
@@ -912,12 +1023,51 @@ export function startApiServer() {
           // accidental "Allow always" path that used to route through the
           // generic ApprovalCard) shouldn't be able to disable the safety.
           const ALWAYS_INTERCEPT = new Set(["AskUserQuestion", "ExitPlanMode"]);
+          // Plan mode is the user explicitly opting into "stop and ask
+          // before any write". A saved allow-rule from a prior non-plan
+          // run must not silently bypass that — otherwise the kanban
+          // shows "Agent is working…" while claude is actually paused on
+          // its plan-mode confirmation dialog inside tmux (see
+          // docs/can-we-apply-both-* plan). Read-only tools keep their
+          // fast-path even here: they can't mutate the workspace, so
+          // the plan-mode safety doesn't apply.
+          const PLAN_MODE_INTERCEPT = new Set([
+            "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash",
+          ]);
+          // A `Bash` call whose command is confidently read-only (grep/find/
+          // ls/cat/…) is treated like the dedicated read-only tools: it can't
+          // mutate the workspace, so it auto-allows even in ask/acceptEdits
+          // and is exempt from the plan-mode force-intercept below. Mutating
+          // Bash (rm, git push, an Edit-equivalent shell write…) classifies
+          // false and still draws a card.
+          const ti = payload.tool_input as { command?: unknown } | null | undefined;
+          const bashCommand = ti && typeof ti.command === "string" ? ti.command : "";
+          const readOnlyBash = toolName === "Bash" && bashCommand !== "" &&
+            isReadOnlyBashCommand(bashCommand);
+          const currentMode = getCurrentPermissionMode(taskId);
+          const planModeForce = currentMode === "plan" &&
+            PLAN_MODE_INTERCEPT.has(toolName) && !readOnlyBash;
+          // Auto / bypass fast-path: claude's own classifier has already
+          // decided this tool is safe to run (auto = "let claude decide",
+          // bypassPermissions = "don't ask me anything"). Second-guessing
+          // it here only annoys the user — they explicitly opted into the
+          // hands-off posture. ALWAYS_INTERCEPT still applies (the modal-
+          // deadlock prevention isn't negotiable). This branch matters
+          // primarily for the mid-session mode-change path: a task spawned
+          // in `ask` mode installed the FULL hook matcher, and a later
+          // PATCH to `auto` doesn't re-narrow the matcher — so every tool
+          // call still lands here. Without this fast-path the user gets
+          // approval cards for routine Bash even after switching to auto.
+          if (!ALWAYS_INTERCEPT.has(toolName) &&
+              (currentMode === "auto" || currentMode === "bypassPermissions")) {
+            return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
+          }
           // Fast paths: safe tools and previously-saved rules auto-allow,
           // except for the always-intercept set above. The allow-rule lookup
           // now reads `.claude/settings.local.json` `permissions.allow` and
           // matches per the claude pattern syntax (see claude-permissions.ts).
-          if (!ALWAYS_INTERCEPT.has(toolName) &&
-              (SAFE_TOOLS.has(toolName) ||
+          if (!ALWAYS_INTERCEPT.has(toolName) && !planModeForce &&
+              (SAFE_TOOLS.has(toolName) || readOnlyBash ||
                lookupAllowRule({ taskId, toolName, toolInput: payload.tool_input }) === "allow")) {
             return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
           }
@@ -1074,6 +1224,67 @@ export function startApiServer() {
         }),
       },
 
+      // ─── Interactions: tmux pane scraper (catch-all REPL prompts) ────
+      // The scraper detects modals the PreToolUse hook never sees
+      // (plan-mode safety dialogs that bypass hooks, `/login`, model
+      // picker, …). Answering ships the chosen key — typically a single
+      // digit — back into the tmux pane via send-keys so claude reads
+      // it as the user's keypress and dismisses the modal.
+      "/tmux-prompts/:id/answer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { key?: unknown };
+          const key = typeof body.key === "string" ? body.key : "";
+          if (!key) {
+            return json({ error: "key required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const pending = findTmuxPromptById(req.params.id);
+          if (!pending) {
+            // Either the prompt was auto-cancelled (scraper saw the pane
+            // change) or the id is unknown. Either way return ok:false so
+            // the UI can drop the card on its next poll.
+            return json({ ok: false }, { headers: corsHeaders(req) });
+          }
+          // Reject anything not in the recorded choice set — the request
+          // ships the exact keys we want the user to be able to send, and
+          // the UI is the only legitimate caller, so an unknown key here
+          // is an attempt to inject arbitrary keystrokes. Letting it
+          // through would let any code that reaches this endpoint type
+          // into the user's REPL.
+          if (!pending.choices.some((c) => c.key === key)) {
+            return json(
+              { error: `key '${key}' is not one of the registered choices` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // Drive tmux FIRST. If the session is gone or send-keys
+          // fails, we must not resolve the interaction — doing so would
+          // remove the card from the UI while leaving claude paused on
+          // the modal. The user clicks "Yes", the card vanishes, and
+          // nothing actually happens. Surface the failure so the UI
+          // can leave the card up for retry.
+          if (!sessionExists(pending.taskId)) {
+            return json(
+              { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
+              { status: 410, headers: corsHeaders(req) },
+            );
+          }
+          const delivered = await dismissTmuxPrompt(pending.taskId, key);
+          if (!delivered) {
+            return json(
+              { ok: false, error: "failed to deliver keystroke to tmux" },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+          // Stamp the fingerprint as just-answered before resolving so
+          // the next scrape tick (which may catch the modal still on
+          // screen mid-repaint) doesn't register a ghost duplicate. See
+          // `markTmuxPromptAnswered` for why this is two-step.
+          markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
+          const ok = answerTmuxPrompt(req.params.id, { key });
+          return json({ ok }, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/interactions/pending": {
         GET: authed((req) =>
           json(listPendingForTask(req.params.id), { headers: corsHeaders(req) })),
@@ -1121,9 +1332,9 @@ export function startApiServer() {
           // Reconstruct the cwd claude was launched against. Worktree tasks
           // had cwd = worktreePath; isolation=none had cwd = workdir.
           const cwd = task.worktreePath ?? task.workdir;
-          // Resolve the harness so we read from the alias's HOME-derived
-          // claude config dir (multi-account); built-ins resolve to
-          // `homedir()` via the `home: null` branch inside jsonlPathFor.
+          // Resolve the harness so we read from the alias's CLAUDE_CONFIG_DIR
+          // (multi-account); built-ins resolve to `~/.claude/projects/…` via
+          // the `configDir: null` branch inside jsonlPathFor.
           const harness = harnesses.getByIdOrKind(task.agent);
           const jsonlPath = jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null);
           if (!existsSync(jsonlPath)) {

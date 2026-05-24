@@ -3,10 +3,11 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import path from "node:path";
 import {
   derivePermissionEntry,
+  isValidPermissionEntry,
   matchesPermissionEntry,
   type ApprovalRememberScope,
 } from "../shared/claude-permissions.ts";
-import { tasks } from "./db.ts";
+import { dataDir, tasks } from "./db.ts";
 
 /**
  * In-process registry for user interactions claude needs to drive through
@@ -17,16 +18,20 @@ import { tasks } from "./db.ts";
  * Everything here is in-memory. Pending interactions don't survive an agetor
  * restart, by design: on boot we kill all `agetor-*` tmux sessions, which
  * tears down the curl / MCP children waiting on these promises. Allow-rules
- * (the "Allow always for this task" persistent decisions) live as native
- * claude permission strings in the task cwd's `.claude/settings.local.json`
- * — see `saveAllowRule` / `lookupAllowRule` below.
+ * (the "Allow always" persistent decisions) live as native claude permission
+ * strings in the agetor-global `<dataDir>/settings.local.json`, so an approval
+ * granted in one task auto-allows the same tool call in every other task and
+ * across mode changes. The legacy per-task `.claude/settings.local.json` is
+ * still consulted as a read-only fallback so previously-saved rules keep
+ * working — see `saveAllowRule` / `lookupAllowRule` below.
  */
 
 export type InteractionKind =
   | "approval"
   | "question"
   | "ask_questions"   // claude built-in AskUserQuestion intercepted via PreToolUse hook
-  | "plan_approval";  // claude built-in ExitPlanMode intercepted via PreToolUse hook
+  | "plan_approval"   // claude built-in ExitPlanMode intercepted via PreToolUse hook
+  | "tmux_prompt";    // unstructured in-REPL prompt detected by scraping the tmux pane
 
 export interface ApprovalRequest {
   kind: "approval";
@@ -134,11 +139,63 @@ export interface PlanApprovalAnswer {
   revision?: string;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Tmux pane scraper (catch-all for prompts the hook never sees).
+ *
+ * Some Claude REPL prompts — plan-mode safety dialogs that bypass hooks,
+ * `acceptEdits` + Bash, `/login`, model picker, auth re-prompts — never
+ * surface through PreToolUse. The scraper in `claude-tmux.ts` regex-matches
+ * the visible pane and registers one of these for each detected prompt.
+ * Answering ships the choice's `key` (typically `"1"`/`"2"`/`"3"` for
+ * numbered modals or `"y"`/`"n"` for y/N prompts) back to claude via
+ * `tmux send-keys` so the modal dismisses without the user touching tmux.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+export interface TmuxPromptChoice {
+  /** The literal keystroke(s) to send. Numbered modals expect a single
+   *  digit; y/N prompts expect a single letter.
+   *
+   *  RESERVED: keys starting with `__` are sentinels for the resolver
+   *  (`__external__` for scraper-detected dismissals, `__cancelled__`
+   *  for run-teardown). `registerTmuxPrompt` rejects choices using a
+   *  reserved key so a future matcher can't accidentally collide. */
+  key: string;
+  /** Display label shown on the UI button. */
+  label: string;
+}
+
+export interface TmuxPromptRequest {
+  kind: "tmux_prompt";
+  id: string;
+  taskId: string;
+  runId: string;
+  /** Verbatim trailing slice of the tmux pane that matched a known prompt
+   *  signature. Rendered as monospace in the UI so the user sees exactly
+   *  what claude is asking. */
+  paneText: string;
+  choices: TmuxPromptChoice[];
+  /** Stable hash of the matched block — used to debounce duplicate
+   *  registrations across consecutive scrapes and to detect external
+   *  dismissal (the prompt disappeared from the pane). */
+  fingerprint: string;
+  createdAt: number;
+}
+
+export interface TmuxPromptAnswer {
+  /** Must equal one of the keys advertised on the request. The route
+   *  validates this before sending keystrokes to tmux. The sentinel
+   *  `"__external__"` is reserved for the scraper's auto-cancel path
+   *  (the prompt vanished from the pane on its own — e.g. user
+   *  attached to tmux and answered directly). */
+  key: string;
+}
+
 export type AnyRequest =
   | ApprovalRequest
   | QuestionRequest
   | AskQuestionsRequest
-  | PlanApprovalRequest;
+  | PlanApprovalRequest
+  | TmuxPromptRequest;
 
 /**
  * Tools we never bother the user about. Same list lives in the hook script
@@ -166,14 +223,33 @@ interface PlanApprovalEntry {
   req: PlanApprovalRequest;
   resolve: (answer: PlanApprovalAnswer) => void;
 }
+interface TmuxPromptEntry {
+  req: TmuxPromptRequest;
+  resolve: (answer: TmuxPromptAnswer) => void;
+}
 
 const approvals = new Map<string, ApprovalEntry>();
 const questions = new Map<string, QuestionEntry>();
 const askQuestions = new Map<string, AskQuestionsEntry>();
 const planApprovals = new Map<string, PlanApprovalEntry>();
+const tmuxPrompts = new Map<string, TmuxPromptEntry>();
 
 type BroadcastFn = (req: AnyRequest) => void;
 let broadcast: BroadcastFn = () => { /* installed by the orchestrator */ };
+
+/** Carries the bare minimum the UI needs to drop a card whose interaction
+ *  has been resolved server-side (auto-cancel from the scraper, tear-down
+ *  from `cancelPendingForTask`, route-driven answer, …). The UI filters
+ *  its local interactions array on `id`. */
+export interface InteractionResolved {
+  id: string;
+  taskId: string;
+  runId: string;
+  kind: InteractionKind;
+}
+
+type ResolveBroadcastFn = (res: InteractionResolved) => void;
+let broadcastResolved: ResolveBroadcastFn = () => { /* installed by the orchestrator */ };
 
 /**
  * The orchestrator hands us its event emitter so we can fan out new
@@ -183,6 +259,24 @@ let broadcast: BroadcastFn = () => { /* installed by the orchestrator */ };
  */
 export function setBroadcaster(fn: BroadcastFn): void {
   broadcast = fn;
+}
+
+/**
+ * Companion to `setBroadcaster` for the *removal* side: every `answer*`
+ * call and `cancelPendingForTask` path emits one of these so the UI can
+ * drop the resolved card without waiting for a polling refresh. Without
+ * this, scraper auto-cancel and run-cancellation leave stale cards in
+ * the run panel until the user closes and reopens it.
+ */
+export function setResolvedBroadcaster(fn: ResolveBroadcastFn): void {
+  broadcastResolved = fn;
+}
+
+/** Internal helper — every answer* / cancel* path that deletes from one
+ *  of the maps should call this with the request it removed so the UI
+ *  hears about it. */
+function fanoutResolved(req: AnyRequest): void {
+  broadcastResolved({ id: req.id, taskId: req.taskId, runId: req.runId, kind: req.kind });
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -230,6 +324,7 @@ export function answerApproval(id: string, answer: ApprovalAnswer): boolean {
     });
   }
   pending.resolve(answer);
+  fanoutResolved(pending.req);
   return true;
 }
 
@@ -272,6 +367,7 @@ export function answerQuestion(id: string, answer: QuestionAnswer): boolean {
   if (!entry) return false;
   questions.delete(id);
   entry.resolve(answer);
+  fanoutResolved(entry.req);
   return true;
 }
 
@@ -305,6 +401,7 @@ export function answerAskQuestions(id: string, answer: AskQuestionsAnswer): bool
   if (!entry) return false;
   askQuestions.delete(id);
   entry.resolve(answer);
+  fanoutResolved(entry.req);
   return true;
 }
 
@@ -376,6 +473,7 @@ export function answerPlanApproval(id: string, answer: PlanApprovalAnswer): bool
   if (!entry) return false;
   planApprovals.delete(id);
   entry.resolve(answer);
+  fanoutResolved(entry.req);
   return true;
 }
 
@@ -398,6 +496,85 @@ export function formatPlanApprovalReason(ans: PlanApprovalAnswer): string {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
+ * Tmux pane scraper interactions
+ * ────────────────────────────────────────────────────────────────────────── */
+
+export function registerTmuxPrompt(args: {
+  taskId: string;
+  runId: string;
+  paneText: string;
+  choices: TmuxPromptChoice[];
+  fingerprint: string;
+}): { id: string; req: TmuxPromptRequest; answer: Promise<TmuxPromptAnswer> } {
+  // Defend the reserved-key namespace — `__external__` / `__cancelled__`
+  // must be unambiguously sentinels, not legitimate user keystrokes.
+  for (const c of args.choices) {
+    if (c.key.startsWith("__")) {
+      throw new Error(
+        `registerTmuxPrompt: choice key '${c.key}' is reserved (keys starting with '__' are sentinels)`,
+      );
+    }
+  }
+  const id = randomUUID();
+  const req: TmuxPromptRequest = {
+    kind: "tmux_prompt",
+    id,
+    taskId: args.taskId,
+    runId: args.runId,
+    paneText: args.paneText,
+    choices: args.choices,
+    fingerprint: args.fingerprint,
+    createdAt: Date.now(),
+  };
+  const answer = new Promise<TmuxPromptAnswer>((resolve) => {
+    tmuxPrompts.set(id, { req, resolve });
+  });
+  broadcast(req);
+  return { id, req, answer };
+}
+
+export function answerTmuxPrompt(id: string, answer: TmuxPromptAnswer): boolean {
+  const entry = tmuxPrompts.get(id);
+  if (!entry) return false;
+  tmuxPrompts.delete(id);
+  entry.resolve(answer);
+  fanoutResolved(entry.req);
+  return true;
+}
+
+/** Look up a pending tmux_prompt by id — used by the route handler to
+ *  validate the key against the recorded choices before sending
+ *  keystrokes to tmux. */
+export function findTmuxPromptById(id: string): TmuxPromptRequest | null {
+  return tmuxPrompts.get(id)?.req ?? null;
+}
+
+/** Find a pending tmux_prompt for the task by its content fingerprint —
+ *  used by the scraper to skip re-registering an already-pending prompt. */
+export function findTmuxPromptByFingerprint(
+  taskId: string,
+  fingerprint: string,
+): TmuxPromptRequest | null {
+  for (const entry of tmuxPrompts.values()) {
+    if (entry.req.taskId === taskId && entry.req.fingerprint === fingerprint) {
+      return entry.req;
+    }
+  }
+  return null;
+}
+
+/** List the ids of every active tmux_prompt for this task. The scraper
+ *  uses this to auto-cancel prompts whose fingerprints disappeared from
+ *  the pane (the user dismissed them from a real tmux attach). */
+export function activeTmuxPromptsForTask(taskId: string): TmuxPromptRequest[] {
+  const out: TmuxPromptRequest[] = [];
+  for (const entry of tmuxPrompts.values()) {
+    if (entry.req.taskId === taskId) out.push(entry.req);
+  }
+  return out;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
  * Shared helpers
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -413,11 +590,13 @@ export function cancelPendingForTask(taskId: string, reason: string): void {
     if (entry.req.taskId !== taskId) continue;
     approvals.delete(id);
     entry.resolve({ decision: "deny", reason });
+    fanoutResolved(entry.req);
   }
   for (const [id, entry] of questions) {
     if (entry.req.taskId !== taskId) continue;
     questions.delete(id);
     entry.resolve({ selected: [], custom: reason });
+    fanoutResolved(entry.req);
   }
   for (const [id, entry] of askQuestions) {
     if (entry.req.taskId !== taskId) continue;
@@ -425,11 +604,22 @@ export function cancelPendingForTask(taskId: string, reason: string): void {
     entry.resolve({
       answers: entry.req.questions.map(() => ({ selected: [], custom: reason })),
     });
+    fanoutResolved(entry.req);
   }
   for (const [id, entry] of planApprovals) {
     if (entry.req.taskId !== taskId) continue;
     planApprovals.delete(id);
     entry.resolve({ choice: "reject", revision: reason });
+    fanoutResolved(entry.req);
+  }
+  for (const [id, entry] of tmuxPrompts) {
+    if (entry.req.taskId !== taskId) continue;
+    tmuxPrompts.delete(id);
+    // Sentinel — the route handler reads this and skips the send-keys
+    // step so we don't inject random keystrokes into a session that's
+    // already being torn down.
+    entry.resolve({ key: "__cancelled__" });
+    fanoutResolved(entry.req);
   }
 }
 
@@ -439,17 +629,39 @@ export function listPendingForTask(taskId: string): AnyRequest[] {
   for (const e of questions.values()) if (e.req.taskId === taskId) out.push(e.req);
   for (const e of askQuestions.values()) if (e.req.taskId === taskId) out.push(e.req);
   for (const e of planApprovals.values()) if (e.req.taskId === taskId) out.push(e.req);
+  for (const e of tmuxPrompts.values()) if (e.req.taskId === taskId) out.push(e.req);
   return out.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+/** Cheap counter used by `tasks.list()` / `tasks.get()` to surface the
+ *  pending-interaction badge on each kanban card without serializing the
+ *  full payloads. Linear scan over the four small in-memory Maps. */
+export function countPendingForTask(taskId: string): number {
+  let n = 0;
+  for (const e of approvals.values()) if (e.req.taskId === taskId) n++;
+  for (const e of questions.values()) if (e.req.taskId === taskId) n++;
+  for (const e of askQuestions.values()) if (e.req.taskId === taskId) n++;
+  for (const e of planApprovals.values()) if (e.req.taskId === taskId) n++;
+  return n;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Allow-rules (persistent, stored as native claude permission entries in the
- * task cwd's `.claude/settings.local.json`)
+ * agetor-global `<dataDir>/settings.local.json`)
  *
  * Why this storage shape rather than our own DB table:
- *   1. Human-readable — `cat .claude/settings.local.json` shows everything.
- *   2. Version-controllable — settings.local.json travels with the repo.
- *   3. Mirrors claude's conventions — no parallel system to learn.
+ *   1. Human-readable — `cat ~/.agetor/settings.local.json` shows everything.
+ *   2. Mirrors claude's conventions — no parallel system to learn.
+ *
+ * Why global (one file for all tasks) rather than per-task:
+ *   Approvals are about which tool calls the user trusts on their machine,
+ *   not which they trust *in this repo*. Saving per-task meant the same
+ *   approval card popped up on every new task and after every mode change —
+ *   exactly the friction "Allow always" is supposed to eliminate.
+ *
+ * Back-compat: per-task `.claude/settings.local.json` is still consulted as
+ * a read-only fallback in `lookupAllowRule`, so rules saved by older agetor
+ * builds keep working.
  *
  * Note: claude itself never consults these entries in our setup — our
  * PreToolUse hook always returns a terminal decision before claude's
@@ -465,28 +677,32 @@ export interface AllowRuleArgs {
   toolInput: unknown;
 }
 
-/** Look up whether the task has a saved allow-rule that matches this tool
- *  call. Walks `permissions.allow` in the task's effective settings file.
- *  Returns "allow" on first match, null otherwise. */
+/** Look up whether a saved allow-rule matches this tool call. Consults the
+ *  agetor-global allow-list first (the source of truth for new saves), then
+ *  falls back to the legacy per-task `.claude/settings.local.json` so older
+ *  rules keep working. Returns "allow" on first match, null otherwise. */
 export function lookupAllowRule(args: AllowRuleArgs): "allow" | null {
-  const cwd = resolveTaskCwd(args.taskId);
-  if (!cwd) return null;
-  for (const entry of readPermissionsAllow(cwd)) {
+  for (const entry of readGlobalPermissionsAllow()) {
     if (matchesPermissionEntry(entry, args.toolName, args.toolInput)) return "allow";
+  }
+  const cwd = resolveTaskCwd(args.taskId);
+  if (cwd) {
+    for (const entry of readPermissionsAllow(cwd)) {
+      if (matchesPermissionEntry(entry, args.toolName, args.toolInput)) return "allow";
+    }
   }
   return null;
 }
 
-/** Save an allow-rule for the task. If `entry` is supplied, it's stored
- *  verbatim. Otherwise the most-specific scope for the tool is derived from
- *  `toolInput`. Falls back to the bare tool name if no scope can be
- *  derived (always works). */
+/** Save an allow-rule to the agetor-global allow-list so every task — current
+ *  and future — auto-allows the same call. If `entry` is supplied, it's
+ *  stored verbatim. Otherwise the most-specific scope for the tool is
+ *  derived from `toolInput`. Falls back to the bare tool name if no scope
+ *  can be derived (always works). */
 export function saveAllowRule(args: AllowRuleArgs & { entry?: string }): void {
-  const cwd = resolveTaskCwd(args.taskId);
-  if (!cwd) return;
   const entry = (args.entry && args.entry.trim()) || pickDefaultEntry(args.toolName, args.toolInput);
   if (!entry) return;
-  appendPermissionEntry(cwd, entry);
+  appendGlobalPermissionEntry(entry);
 }
 
 /** Tool names whose `toolInput.file_path` is the canonical scoping key.
@@ -526,12 +742,41 @@ function resolveTaskCwd(taskId: string): string | null {
   return task.worktreePath ?? task.workdir ?? null;
 }
 
-/** Read the `permissions.allow` array from `<cwd>/.claude/settings.local.json`.
- *  Returns an empty array on missing file, parse errors, or unexpected shape
- *  — failing closed (the user just sees more cards, not fewer) is the right
- *  failure mode here. */
+/** Path to the agetor-global allow-list. Lives at the root of dataDir
+ *  (not under `.claude/`) because it isn't claude's settings — it's
+ *  agetor's, just borrowing claude's permission-entry format as the
+ *  on-disk shape. */
+function globalAllowFile(): string {
+  return path.join(dataDir, "settings.local.json");
+}
+
+/** Read the `permissions.allow` array from the agetor-global settings file.
+ *  Same fail-closed semantics as `readPermissionsAllow`. */
+function readGlobalPermissionsAllow(): string[] {
+  return readPermissionsAllowFromFile(globalAllowFile());
+}
+
+/** Append a single `permissions.allow` entry to the agetor-global settings
+ *  file. Creates `<dataDir>/settings.local.json` if missing. Merge-safe:
+ *  preserves all other keys, dedupes against existing entries, atomic
+ *  rename on write. */
+function appendGlobalPermissionEntry(entry: string): void {
+  mkdirSync(dataDir, { recursive: true });
+  appendPermissionEntryToFile(globalAllowFile(), entry);
+}
+
+/** Read the `permissions.allow` array from a legacy per-task settings file.
+ *  Kept so `lookupAllowRule` can still surface rules saved by older agetor
+ *  builds (which wrote per-cwd) — see the back-compat note on the
+ *  allow-rules section header. Returns an empty array on missing file,
+ *  parse errors, or unexpected shape — failing closed (the user just sees
+ *  more cards, not fewer) is the right failure mode here. */
 function readPermissionsAllow(cwd: string): string[] {
-  const file = path.join(cwd, ".claude", "settings.local.json");
+  return readPermissionsAllowFromFile(path.join(cwd, ".claude", "settings.local.json"));
+}
+
+/** Shared reader used by both the global and per-task allow-list helpers. */
+function readPermissionsAllowFromFile(file: string): string[] {
   if (!existsSync(file)) return [];
   let raw: string;
   try {
@@ -554,15 +799,12 @@ function readPermissionsAllow(cwd: string): string[] {
   return allow.filter((e): e is string => typeof e === "string");
 }
 
-/** Append a single `permissions.allow` entry to the task's settings file.
- *  Merge-safe: preserves all other keys, dedupes against existing entries.
- *  Creates the file if missing. Logs and skips on malformed pre-existing
- *  JSON rather than overwriting the user's edits. */
-function appendPermissionEntry(cwd: string, entry: string): void {
-  const dir = path.join(cwd, ".claude");
-  mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, "settings.local.json");
-
+/** Atomic, merge-safe writer for a `{ permissions: { allow: [...] } }`
+ *  settings file. Preserves all other keys, dedupes against existing
+ *  entries, logs and skips on malformed pre-existing JSON rather than
+ *  overwriting the user's edits. Caller is responsible for ensuring the
+ *  parent directory exists. */
+function appendPermissionEntryToFile(file: string, entry: string): void {
   let settings: Record<string, unknown> = {};
   if (existsSync(file)) {
     let raw: string;
@@ -601,8 +843,25 @@ function appendPermissionEntry(cwd: string, entry: string): void {
     ? settings.permissions as Record<string, unknown>
     : {};
   const allowRaw = Array.isArray(permissions.allow) ? permissions.allow as unknown[] : [];
-  const existing = allowRaw.filter((e): e is string => typeof e === "string");
-  if (!existing.includes(entry)) existing.push(entry);
+  // Drop any pre-existing entry claude's parser would reject (paren/newline/
+  // empty patterns from older saves) so we never re-persist junk that would
+  // halt the next session on a startup recovery dialog.
+  const existing = allowRaw.filter(
+    (e): e is string => typeof e === "string" && isValidPermissionEntry(e),
+  );
+  // Defence-in-depth: never persist an entry this writer would itself
+  // reject (callers derive entries that are now guarded, but a future
+  // caller passing a paren/newline pattern shouldn't reintroduce the bug).
+  // Log the skip so a verbatim-`entry` caller (saveAllowRule accepts arbitrary
+  // strings) isn't left wondering why their save silently no-op'd.
+  if (!isValidPermissionEntry(entry)) {
+    console.error(
+      `[agetor:interactions] skipping invalid permission entry ${JSON.stringify(entry)} — ` +
+      `claude's settings parser would reject it (empty/paren/newline pattern).`,
+    );
+  } else if (!existing.includes(entry)) {
+    existing.push(entry);
+  }
   permissions.allow = existing;
   settings.permissions = permissions;
 
@@ -649,11 +908,14 @@ export const __testing = {
   questionsSize: () => questions.size,
   askQuestionsSize: () => askQuestions.size,
   planApprovalsSize: () => planApprovals.size,
+  tmuxPromptsSize: () => tmuxPrompts.size,
   reset() {
     approvals.clear();
     questions.clear();
     askQuestions.clear();
     planApprovals.clear();
+    tmuxPrompts.clear();
     broadcast = () => { /* reset */ };
+    broadcastResolved = () => { /* reset */ };
   },
 };

@@ -97,6 +97,12 @@ export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
         installHint: TMUX_INSTALL_HINT,
       };
     }
+
+    // Note: claude's native-install integrity check (`$HOME/.local/bin/claude`
+    // exists) used to require pre-linking into the harness HOME because we
+    // re-homed the spawn. Now that we re-home via CLAUDE_CONFIG_DIR instead
+    // (HOME stays at the real user home), the integrity check resolves against
+    // the system install and always passes — no per-harness symlink needed.
   }
 
   const version = await probeVersion(path, harnessEnv(harness));
