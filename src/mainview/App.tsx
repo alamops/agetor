@@ -8,7 +8,7 @@ import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
-import { RunPanel } from "@/components/kanban/RunPanel";
+import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
@@ -78,6 +78,7 @@ export default function App() {
   const [repoFilter, setRepoFilter] = useState<string[]>([]);
   const [statusFilter, setStatusFilter] = useState<ColumnId[]>([]);
   const [archivedView, setArchivedView] = useState<"active" | "all" | "archived">("active");
+  const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
@@ -105,7 +106,9 @@ export default function App() {
     return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
   }, []);
 
-  const refresh = async () => setTasks(await api.listTasks());
+  const refresh = async () => {
+    try { setTasks(await api.listTasks()); } catch { /* keep last good snapshot; retry next tick */ }
+  };
   const refreshAgents = async () => {
     try {
       const payload = await api.listHarnesses();
@@ -160,6 +163,28 @@ export default function App() {
     const fresh = tasks.find((t) => t.id === selected.id);
     if (fresh && fresh !== selected) setSelected(fresh);
   }, [tasks, selected]);
+
+  // Once the user opens a task's panel, any "Waiting on you" toast for that
+  // task is noise — they're already looking at the prompt. Clearing it also
+  // removes one more high-z-index click target that could otherwise sit on
+  // top of the panel header and eat clicks meant for the X button.
+  useEffect(() => {
+    if (!selected) return;
+    dismissPending(selected.id);
+  }, [selected?.id]);
+
+  // `panelMounted` follows `selected !== null` on open but lags by the
+  // RunPanel's exit animation on close, so the Toaster doesn't snap back to
+  // the right edge (and slide under the receding panel) for ~250ms.
+  const [panelMounted, setPanelMounted] = useState(false);
+  useEffect(() => {
+    if (selected) {
+      setPanelMounted(true);
+      return;
+    }
+    const t = setTimeout(() => setPanelMounted(false), RUN_PANEL_EXIT_MS);
+    return () => clearTimeout(t);
+  }, [selected]);
 
   // Refs mirror the latest tasks + selected task so the global-events
   // subscription (which closes over its handler ONCE on mount) can read
@@ -254,7 +279,15 @@ export default function App() {
         // `cancelled` is intentionally silent — the user issued the cancel.
         return;
       }
-      // column transitions
+      // column transitions. Patch `tasks` optimistically so the board and any
+      // open run panel (via the selected-sync effect) reflect the new column
+      // the instant the backend pushes it — rather than waiting up to 2s for
+      // the next poll (and staying stale indefinitely if that poll lags). This
+      // is what keeps the panel header + Stop button from lingering on a
+      // `running` snapshot after the turn has actually finished.
+      setTasks((cur) =>
+        cur.map((t) => (t.id === ev.taskId ? { ...t, column: ev.column } : t)),
+      );
       if (ev.column === "blocked") {
         toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
       } else if (ev.prev === "blocked") {
@@ -278,15 +311,23 @@ export default function App() {
         if (!hay.includes(q)) return false;
       }
       if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
+      if (harnessFilter.length > 0 && !harnessFilter.includes(t.agent)) return false;
       if (archivedView === "active" && t.archivedAt != null) return false;
       if (archivedView === "archived" && t.archivedAt == null) return false;
       return true;
     });
-  }, [tasks, textQuery, repoFilter, archivedView]);
+  }, [tasks, textQuery, repoFilter, harnessFilter, archivedView]);
 
   const visibleColumns = useMemo(
     () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
     [statusFilter],
+  );
+
+  // Distinct harness ids referenced by any task — feeds the harness filter so
+  // ids belonging to removed harnesses still show up as filter options.
+  const taskAgentIds = useMemo(
+    () => Array.from(new Set(tasks.map((t) => t.agent))),
+    [tasks],
   );
 
   const surfaceError = (e: unknown) =>
@@ -511,10 +552,14 @@ export default function App() {
             onStatusFilterChange={setStatusFilter}
             archivedView={archivedView}
             onArchivedViewChange={setArchivedView}
+            harnessFilter={harnessFilter}
+            onHarnessFilterChange={setHarnessFilter}
             projects={projects}
+            harnesses={harnesses}
+            taskAgentIds={taskAgentIds}
           />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
-          <Toaster />
+          <Toaster panelOpen={panelMounted} />
           {/* Kanban gets all remaining vertical space and scrolls horizontally
               on its own — the bottom bar stays anchored regardless of column
               count. */}

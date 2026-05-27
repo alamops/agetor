@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import pkg from "../../package.json" with { type: "json" };
 import { dataDir } from "./db.ts";
+import { isValidPermissionEntry } from "../shared/claude-permissions.ts";
 
 // Bundled source text — pulled in at build time so the packaged app doesn't
 // need to know about absolute paths inside the dev tree. The MCP server is
@@ -205,12 +206,14 @@ function includeMcpForScope(scope: InstallScope): boolean {
 
 export function ensureInstalled(cwd: string, scope: InstallScope = "full"): InstalledPaths {
   // Even though we own the worktree dir, the settings.local.json INSIDE it
-  // is shared with `saveAllowRule` (which appends `permissions.allow`
-  // entries). A fresh-object write would clobber those rules on every task
-  // re-spawn. So owned-worktree installs use the same merge path as
-  // user-repo installs, only relaxed on the malformed-JSON branch (we
-  // wrote the file last; if it's malformed, that's our bug to recover
-  // from, not the user's data).
+  // may still hold `permissions.allow` entries we have to preserve across
+  // re-spawns: legacy entries from older agetor builds (back when
+  // `saveAllowRule` wrote per-cwd), rules the user hand-added, and any
+  // entries left over from a direct `claude` invocation inside the
+  // worktree. A fresh-object write would clobber those. So owned-worktree
+  // installs use the same merge path as user-repo installs, only relaxed
+  // on the malformed-JSON branch (we wrote the file last; if it's
+  // malformed, that's our bug to recover from, not the user's data).
   //
   // We DO write the CLAUDE.md addendum here (unlike ensureInstalledMerged
   // which leaves user repos alone). The addendum teaches claude when to
@@ -224,6 +227,7 @@ export function ensureInstalled(cwd: string, scope: InstallScope = "full"): Inst
   const result = applyAgetorSettings(cwd, scope, {
     writeClaudeMd: true,
     refuseOnMalformed: false,
+    sanitizeAllow: true,
   });
   // For owned worktrees the caller has already existsSync'd the dir, so
   // null returns only happen on truly unexpected I/O errors. Fall back to
@@ -302,6 +306,7 @@ export function ensureInstalledMerged(cwd: string, scope: InstallScope = "full")
   return applyAgetorSettings(cwd, scope, {
     writeClaudeMd: false,
     refuseOnMalformed: true,
+    sanitizeAllow: false,
   });
 }
 
@@ -314,6 +319,13 @@ interface ApplyOpts {
    *  log and proceed with an empty base — for owned worktrees, the file
    *  is ours and a malformed state is our bug to recover from. */
   refuseOnMalformed: boolean;
+  /** Strip `permissions.allow` entries claude's parser would reject (empty/
+   *  paren/newline patterns earlier "Allow always" saves wrote). Owned
+   *  worktrees only — the file is agetor scratch there, so self-healing it
+   *  is safe. For user repos we leave their version-controlled rules alone;
+   *  claude's own startup dialog already surfaces a bad rule, and deleting
+   *  the user's data on every session start would be a surprise mutation. */
+  sanitizeAllow: boolean;
 }
 
 /**
@@ -422,6 +434,25 @@ function applyAgetorSettings(
     }
   }
 
+  // Sanitize permissions.allow: strip any entry claude's settings parser
+  // would reject (empty/paren/newline patterns earlier versions wrote).
+  // Left in place they make claude halt on a startup recovery dialog the
+  // moment the session launches. Runs on every session start, so this
+  // self-heals a settings file poisoned by an old "Allow always" save.
+  // Owned worktrees only (opts.sanitizeAllow) — we never silently delete a
+  // user repo's own permission rules.
+  if (opts.sanitizeAllow) {
+    const perms = settings.permissions;
+    if (perms && typeof perms === "object" && !Array.isArray(perms)) {
+      const allow = (perms as Record<string, unknown>).allow;
+      if (Array.isArray(allow)) {
+        (perms as Record<string, unknown>).allow = allow.filter(
+          (e): e is string => typeof e === "string" && isValidPermissionEntry(e),
+        );
+      }
+    }
+  }
+
   writeJsonAtomic(settingsFile, settings);
 
   // Project-level CLAUDE.md teaches claude about the `ask_user` MCP tool.
@@ -439,8 +470,8 @@ function applyAgetorSettings(
 /** Atomic JSON write: stringify, write to a sibling tempfile, rename onto
  *  the target. rename is atomic on POSIX, so a partial write can never
  *  leave the destination corrupted. Crucial for settings.local.json which
- *  multiple subsystems (hook-installer, interactions/saveAllowRule) merge
- *  into during normal operation. */
+ *  hook-installer merges into on every task spawn while preserving any
+ *  pre-existing user / legacy entries underneath. */
 function writeJsonAtomic(file: string, value: unknown): void {
   const tmp = `${file}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
   writeFileSync(tmp, JSON.stringify(value, null, 2));

@@ -67,8 +67,17 @@ async function seedPendingApproval(args: {
   return { approvalId: id, cwd };
 }
 
+/** Allow-rules now persist to the agetor-global `<dataDir>/settings.local.json`
+ *  (so an approval on task A auto-allows the same call on task B). Resolved
+ *  lazily from `db.ts`'s `dataDir` because Bun shares modules across test
+ *  files — see the matching note in interactions.test.ts. */
+async function globalAllowFile(): Promise<string> {
+  const { dataDir } = await import("./db.ts");
+  return path.join(dataDir, "settings.local.json");
+}
+
 test("/approvals/:id/answer forwards explicit `entry` to permissions.allow", async () => {
-  const { approvalId, cwd } = await seedPendingApproval({
+  const { approvalId } = await seedPendingApproval({
     taskId: "t-endpoint-explicit",
     toolName: "Bash",
     toolInput: { command: "git status" },
@@ -85,13 +94,13 @@ test("/approvals/:id/answer forwards explicit `entry` to permissions.allow", asy
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ ok: true });
 
-  const settings = JSON.parse(readFileSync(path.join(cwd, ".claude", "settings.local.json"), "utf8"));
+  const settings = JSON.parse(readFileSync(await globalAllowFile(), "utf8"));
   expect(settings.permissions.allow).toContain("Bash(git *)");
   expect(settings.permissions.allow).not.toContain("Bash(git status)");
 });
 
 test("/approvals/:id/answer with remember=true and no `entry` falls back to most-specific", async () => {
-  const { approvalId, cwd } = await seedPendingApproval({
+  const { approvalId } = await seedPendingApproval({
     taskId: "t-endpoint-default",
     toolName: "Bash",
     toolInput: { command: "npm test" },
@@ -104,13 +113,15 @@ test("/approvals/:id/answer with remember=true and no `entry` falls back to most
   });
   expect(res.status).toBe(200);
 
-  const settings = JSON.parse(readFileSync(path.join(cwd, ".claude", "settings.local.json"), "utf8"));
+  const settings = JSON.parse(readFileSync(await globalAllowFile(), "utf8"));
   // Default-derive picks bash_exact for Bash → the exact command verbatim.
-  expect(settings.permissions.allow).toEqual(["Bash(npm test)"]);
+  // The rule from the previous test ("Bash(git *)") is also present since
+  // the global file persists across cases in this file.
+  expect(settings.permissions.allow).toContain("Bash(npm test)");
 });
 
-test("/approvals/:id/answer with decision=deny does NOT write any settings file", async () => {
-  const { approvalId, cwd } = await seedPendingApproval({
+test("/approvals/:id/answer with decision=deny does NOT write the saved rule", async () => {
+  const { approvalId } = await seedPendingApproval({
     taskId: "t-endpoint-deny",
     toolName: "Bash",
     toolInput: { command: "rm -rf /" },
@@ -123,7 +134,14 @@ test("/approvals/:id/answer with decision=deny does NOT write any settings file"
     body: JSON.stringify({ decision: "deny", remember: true, entry: "Bash(rm *)" }),
   });
   expect(res.status).toBe(200);
-  expect(existsSync(path.join(cwd, ".claude", "settings.local.json"))).toBe(false);
+  // The earlier tests in this file may have populated the global file; what
+  // matters is that "Bash(rm *)" never made it in.
+  const file = await globalAllowFile();
+  if (existsSync(file)) {
+    const settings = JSON.parse(readFileSync(file, "utf8"));
+    const allow = (settings.permissions?.allow ?? []) as string[];
+    expect(allow).not.toContain("Bash(rm *)");
+  }
 });
 
 test("/approvals/:id/answer rejects invalid decision values", async () => {
@@ -200,7 +218,13 @@ test("POST /approvals — saved Edit rule still auto-allows in non-plan mode (re
     taskId: "t-saved-rule-auto",
     ruleEntry: "Edit(/tmp/**)",
   });
-  state.permissionMode = "auto"; // not plan
+  // `acceptEdits` is the mode that proves the saved-rule path: it isn't
+  // plan (so the saved-rule fast-path isn't skipped) and it isn't
+  // auto/bypass (so the auto-mode fast-path doesn't preempt it). If we
+  // used `auto` here the new auto-mode fast-path would short-circuit
+  // before lookupAllowRule runs and the test would silently stop
+  // exercising what its name claims.
+  state.permissionMode = "acceptEdits";
   const res = await fetch(url(`/approvals?taskId=t-saved-rule-auto`), {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -268,4 +292,150 @@ test("POST /approvals — plan mode still fast-paths read-only tools (Read)", as
   expect(res.status).toBe(200);
   const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
   expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+});
+
+test("POST /approvals — plan mode fast-paths read-only Bash (grep/find/ls/cat)", async () => {
+  // The reported pain: in plan mode, routine read-only shell commands drew
+  // an approval card for every grep/find/ls/cat. They can't mutate the
+  // workspace, so they now auto-allow even though plan mode gates writes.
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-plan-ro-bash",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "plan";
+  const res = await fetch(url(`/approvals?taskId=t-plan-ro-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      tool_name: "Bash",
+      tool_input: { command: "grep -rn foo src/ | head -20" },
+    }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
+  expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+  const { __testing } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(0);
+});
+
+test("POST /approvals — plan mode still intercepts mutating Bash", async () => {
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-plan-mut-bash",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "plan";
+  const pending = fetch(url(`/approvals?taskId=t-plan-mut-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf build" } }),
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const { __testing, listPendingForTask, answerApproval } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(1);
+  const list = listPendingForTask("t-plan-mut-bash");
+  if (list[0]?.kind === "approval") answerApproval(list[0].id, { decision: "allow" });
+  const res = await pending;
+  expect(res.status).toBe(200);
+});
+
+test("POST /approvals — acceptEdits mode auto-allows read-only Bash", async () => {
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-accept-ro-bash",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "acceptEdits";
+  const res = await fetch(url(`/approvals?taskId=t-accept-ro-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "find . -name '*.ts'" } }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
+  expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+  const { __testing } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(0);
+});
+
+test("POST /approvals — auto mode auto-allows arbitrary Bash without registering an approval", async () => {
+  // Regression: when a task was launched in `ask` mode and the user later
+  // PATCHes the mode to `auto`, the FULL hook matcher is still installed
+  // from spawn time so every PreToolUse lands on /approvals. Auto mode
+  // means "let claude's classifier decide" — we must not surface routine
+  // Bash as an approval card.
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-auto-bash",
+    ruleEntry: "Edit(/tmp/**)", // unrelated, just satisfies the seed helper
+  });
+  state.permissionMode = "auto";
+  const res = await fetch(url(`/approvals?taskId=t-auto-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      tool_name: "Bash",
+      tool_input: { command: "git diff HEAD -- file.tsx | tail -90" },
+    }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
+  expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+  const { __testing } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(0);
+});
+
+test("POST /approvals — bypassPermissions mode auto-allows arbitrary Bash too", async () => {
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-bypass-bash",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "bypassPermissions";
+  const res = await fetch(url(`/approvals?taskId=t-bypass-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf /tmp/x" } }),
+  });
+  expect(res.status).toBe(200);
+  const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
+  expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+  const { __testing } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(0);
+});
+
+test("POST /approvals — auto mode still intercepts AskUserQuestion (modal-deadlock prevention)", async () => {
+  // ALWAYS_INTERCEPT must hold regardless of mode — AskUserQuestion's
+  // tmux-internal modal would deadlock the run if we auto-allowed.
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-auto-ask",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "auto";
+  const pending = fetch(url(`/approvals?taskId=t-auto-ask`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      tool_name: "AskUserQuestion",
+      tool_input: { questions: [{ question: "pick one", header: "x", multiSelect: false, options: [{ label: "a" }, { label: "b" }] }] },
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const { __testing, listPendingForTask, answerAskQuestions } = await import("./interactions.ts");
+  expect(__testing.askQuestionsSize()).toBe(1);
+  // Drain so the fetch settles without leaking into sibling tests.
+  const list = listPendingForTask("t-auto-ask");
+  if (list[0]?.kind === "ask_questions") {
+    answerAskQuestions(list[0].id, { answers: [{ selected: ["a"] }] });
+  }
+  const res = await pending;
+  expect(res.status).toBe(200);
 });

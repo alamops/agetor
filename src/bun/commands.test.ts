@@ -97,6 +97,42 @@ test("falls back to first content line when frontmatter is missing", async () =>
   expect(bare?.description).toBe("First real line of body.");
 });
 
+test("claude-code reads user commands/skills from harnessHome when set (matches CLAUDE_CONFIG_DIR layout)", async () => {
+  // For aliased multi-account harnesses we set CLAUDE_CONFIG_DIR=<harnessHome>
+  // on spawn; the picker has to read from the same place so the autocomplete
+  // matches what claude actually sees at runtime. Under CLAUDE_CONFIG_DIR
+  // mode the user commands live directly at <harnessHome>/commands/, NOT at
+  // <harnessHome>/.claude/commands/.
+  const harness = mkdtempSync(path.join(tmpRoot, "harness-"));
+  writeCmd(path.join(harness, "commands"), "alias-only.md", "---\ndescription: Alias\n---\nbody");
+  const project = mkdtempSync(path.join(tmpRoot, "proj-alias-"));
+
+  const all = await listAvailableCommands({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const alias = all.find((c) => c.name === "/alias-only");
+  expect(alias).toBeDefined();
+  expect(alias!.source).toBe("user");
+  expect(alias!.description).toBe("Alias");
+});
+
+test("codex reads user prompts from <harnessHome>/.codex/prompts when set", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "codex-harness-"));
+  writeCmd(path.join(harness, ".codex", "prompts"), "alias-only.md", "Alias prompt body");
+  const project = mkdtempSync(path.join(tmpRoot, "proj-codex-alias-"));
+
+  const all = await listAvailableCommands({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const alias = all.find((c) => c.name === "/alias-only");
+  expect(alias).toBeDefined();
+  expect(alias!.source).toBe("user");
+});
+
 test("project entry overrides user entry with the same name", async () => {
   // Drop a same-named file under both locations and assert project wins. We
   // can't safely write into the real ~/.claude/commands here, so we synthesise

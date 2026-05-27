@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronLeft, Plus, Trash2, X } from "lucide-react";
-import { api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
+import { toast } from "sonner";
+import { ApiError, api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -90,6 +91,32 @@ function uniqueHarnessId(base: string, existing: Set<string>): string {
   let n = m ? parseInt(m[2]!, 10) + 1 : 2;
   while (existing.has(`${prefix}${n}`)) n++;
   return `${prefix}${n}`;
+}
+
+/** If `err` is the server's "harness in use" 409 (which carries a structured
+ *  `taskIds` list), resolve those ids to titles and return a human-readable
+ *  description for the failure toast. Returns null if the error isn't that
+ *  shape — caller falls back to the raw `error` message. */
+async function describeHarnessInUse(err: unknown): Promise<string | null> {
+  if (!(err instanceof ApiError)) return null;
+  const body = err.body;
+  if (!body || typeof body !== "object") return null;
+  const taskIds = (body as { taskIds?: unknown }).taskIds;
+  if (!Array.isArray(taskIds) || taskIds.length === 0) return null;
+  const ids = taskIds.filter((x): x is string => typeof x === "string");
+  if (ids.length === 0) return null;
+  let titles: string[];
+  try {
+    const tasks = await api.listTasks();
+    const byId = new Map(tasks.map((t) => [t.id, t.title]));
+    titles = ids.map((id) => byId.get(id) ?? `${id.slice(0, 8)}…`);
+  } catch {
+    // Listing tasks failed — fall back to id prefixes so the toast still
+    // identifies *which* tasks are blocking, even if not by name.
+    titles = ids.map((id) => `${id.slice(0, 8)}…`);
+  }
+  const noun = titles.length === 1 ? "task" : "tasks";
+  return `In use by ${titles.length} ${noun}: ${titles.join(", ")}`;
 }
 
 export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Props) {
@@ -189,7 +216,14 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
       await refresh();
       onChange?.();
     } catch (e) {
-      setFormError(e instanceof Error ? e.message : String(e));
+      // ListView doesn't render `formError` (only the Editor does), so a
+      // failed delete would otherwise be invisible. Surface it as a toast.
+      const message = e instanceof Error ? e.message : String(e);
+      const description = await describeHarnessInUse(e) ?? message;
+      toast.error(`Couldn't delete "${h.label}"`, {
+        description,
+        duration: Infinity,
+      });
     }
   };
 
@@ -241,7 +275,11 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
       onChange?.();
     } catch (e) {
       clearPending(h.id);
-      setFormError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      toast.error(`Couldn't ${next ? "enable" : "disable"} "${h.label}"`, {
+        description: message,
+        duration: Infinity,
+      });
     }
   };
 
@@ -728,7 +766,9 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">
-          HOME override (absolute path; optional)
+          {kind === "claude-code"
+            ? "CLAUDE_CONFIG_DIR override (absolute path; optional)"
+            : "HOME override (absolute path; optional)"}
         </label>
         <Input
           value={home}
@@ -741,9 +781,9 @@ function Editor({
         />
         <p className="text-[11px] leading-snug text-muted-foreground">
           {kind === "claude-code"
-            ? "Sets HOME on spawn — claude resolves its login & history under $HOME/.claude/, so a separate HOME gives this harness its own account."
+            ? "Sets CLAUDE_CONFIG_DIR on spawn — claude stores config, sessions, and login under this path, so a separate path gives this harness its own account. Authenticate by running: CLAUDE_CONFIG_DIR=<path> claude /login."
             : "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account."}
-          {" "}Leave empty to share the system HOME.
+          {" "}Leave empty to share the default account.
         </p>
       </div>
       <div className="space-y-1">
