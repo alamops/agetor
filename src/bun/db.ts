@@ -557,14 +557,26 @@ export const runs = {
       );
     }
   },
-  /** Return the set of JSONL line uuids already persisted for this run. Used
-   *  by reattachRun to seed an in-memory dedup set so re-tailing from offset
-   *  0 (after agetor restarts and finds the tmux session still alive) skips
-   *  events we already streamed during the previous process's lifetime. */
-  seenLineUuids(runId: string): Set<string> {
+  /** Return every JSONL line uuid already persisted across *every* run of
+   *  this task. Used by `reattachSession` to seed the in-memory dedup set so
+   *  re-tailing the per-session JSONL from offset 0 (after an agetor
+   *  restart) skips events we already streamed in the previous process.
+   *
+   *  Scoped to the task (not just the reattached run) on purpose: one tmux
+   *  session = one JSONL file = all of a task's turns. The replay from
+   *  offset 0 will encounter end_turn lines from prior, already-`succeeded`
+   *  run rows; without those uuids in the dedup set the dispatcher would
+   *  re-emit them onto the reattached (still-`running`) run's chunk
+   *  handler — corrupting its event history and, worse, firing
+   *  `onEndOfTurn` on the wrong turn and prematurely resolving the
+   *  current run. */
+  seenLineUuidsForTask(taskId: string): Set<string> {
     const rows = db.query<{ line_uuid: string }, [string]>(
-      `SELECT line_uuid FROM run_events WHERE run_id = ? AND line_uuid IS NOT NULL`,
-    ).all(runId);
+      `SELECT e.line_uuid
+       FROM run_events e
+       JOIN runs r ON r.id = e.run_id
+       WHERE r.task_id = ? AND e.line_uuid IS NOT NULL`,
+    ).all(taskId);
     return new Set(rows.map((r) => r.line_uuid));
   },
 };

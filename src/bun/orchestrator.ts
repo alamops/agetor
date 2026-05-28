@@ -226,7 +226,7 @@ export function reconcileOrphans(): number {
         sessionId: row.claude_session_id as string,
         configDir: harness?.home ?? null,
         onChunk,
-        seenLineUuids: runs.seenLineUuids(row.id),
+        seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
       });
       if (spawned) {
         registerActiveRun(row.id, row.task_id, task, spawned);
