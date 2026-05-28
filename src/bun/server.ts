@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Utils } from "electrobun/bun";
@@ -85,6 +85,33 @@ const json = (data: unknown, init?: ResponseInit) =>
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
     status: init?.status,
   });
+
+// Turn raw path strings into references: keep only existing absolute paths,
+// dedupe, and read directory-ness from the filesystem (authoritative — more
+// reliable than the webview's view). The stat filter also discards the bogus
+// fragments produced when Electrobun's native open-panel returns its picks as
+// a comma-joined string and a chosen path itself contains a comma: the split
+// pieces don't exist on disk, so they fall out here rather than reaching the
+// prompt as broken refs. (A comma path still can't be attached via the panel —
+// that's a bridge limitation — but it fails safe instead of corrupting.)
+function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
+  const refs: TaskReference[] = [];
+  const seen = new Set<string>();
+  for (const entry of rawPaths) {
+    if (typeof entry !== "string") continue;
+    const abs = entry.trim();
+    if (!abs || !path.isAbsolute(abs) || seen.has(abs)) continue;
+    let st;
+    try {
+      st = statSync(abs);
+    } catch {
+      continue; // gone / unreadable / comma-split fragment — skip rather than 500
+    }
+    seen.add(abs);
+    refs.push({ path: abs, isDirectory: st.isDirectory() });
+  }
+  return refs;
+}
 
 // We bind to 127.0.0.1 so CORS is mostly belt-and-suspenders. We still echo
 // the calling origin so the Vite HMR webview (http://localhost:5173) can call
@@ -962,6 +989,48 @@ export function startApiServer() {
           }
           const ok = Utils.openPath(abs);
           return json({ opened: ok, path: abs }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Open a native macOS open-panel and return whatever the user picked as
+      // file/folder references. This is the reliable way to get absolute
+      // paths into the prompt: WKWebView never populates the non-standard
+      // `File.path`, so an `<input type=file>` can't expose a real path — the
+      // native panel does. `mode` constrains the panel to files or
+      // directories; `refsFromPaths` stats each pick for authoritative
+      // directory-ness and drops anything that doesn't exist.
+      "/refs/pick": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            mode?: "files" | "folder";
+            startingFolder?: string;
+          };
+          const mode = body.mode === "folder" ? "folder" : "files";
+          const startingFolder =
+            typeof body.startingFolder === "string" && body.startingFolder.trim()
+              ? body.startingFolder
+              : homedir();
+          const paths = await Utils.openFileDialog({
+            startingFolder,
+            canChooseFiles: mode === "files",
+            canChooseDirectory: mode === "folder",
+            allowsMultipleSelection: true,
+          });
+          // The native bridge returns a comma-joined string; an empty first
+          // element means the user cancelled.
+          return json({ refs: refsFromPaths(paths) }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Resolve a list of absolute paths (extracted from a drag/drop's
+      // file:// URLs) into references. We stat each to set `isDirectory`
+      // authoritatively and to drop anything that no longer exists, rather
+      // than trusting the webview's view of directory-ness.
+      "/refs/resolve": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { paths?: unknown };
+          const raw = Array.isArray(body.paths) ? body.paths : [];
+          return json({ refs: refsFromPaths(raw) }, { headers: corsHeaders(req) });
         }),
       },
 

@@ -3,7 +3,8 @@ import { FilePlus, FolderPlus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { iconForRef, refBasename } from "@/lib/file-icons";
-import { captureDroppedOrPastedItems, type ElectroFile } from "@/lib/capture-refs";
+import { captureDroppedOrPastedItems } from "@/lib/capture-refs";
+import { api } from "@/lib/api";
 import type { TaskReference } from "../../../shared/types.ts";
 
 export { captureDroppedOrPastedItems, type CapturedItem, type CaptureResult } from "@/lib/capture-refs";
@@ -16,34 +17,10 @@ interface Props {
   variant: "expandable" | "inline";
   /** Label for the expandable summary. Ignored for `inline`. */
   label?: string;
+  /** Folder the native picker opens in. Usually the task's workdir. */
+  startingFolder?: string;
   /** Extra className on the outer container. */
   className?: string;
-}
-
-/**
- * Derive a folder's absolute path from a single File in a `webkitdirectory`
- * pick. `webkitRelativePath` is `<folderName>/<…>/file`; if WKWebView
- * populated `path` on the file, peel matching tail segments to expose the
- * root. Returns null if `path` isn't exposed (plain-browser fallback).
- */
-function deriveFolderRoot(file: ElectroFile): string | null {
-  const rel = file.webkitRelativePath || "";
-  const abs = file.path || "";
-  if (!abs) return null;
-  if (!rel) return abs;
-  let a = abs.replace(/[\\/]+$/, "");
-  let r = rel.replace(/[\\/]+$/, "");
-  while (a && r) {
-    const aSlash = Math.max(a.lastIndexOf("/"), a.lastIndexOf("\\"));
-    const rSlash = Math.max(r.lastIndexOf("/"), r.lastIndexOf("\\"));
-    const aSeg = aSlash >= 0 ? a.slice(aSlash + 1) : a;
-    const rSeg = rSlash >= 0 ? r.slice(rSlash + 1) : r;
-    if (aSeg !== rSeg) break;
-    a = aSlash >= 0 ? a.slice(0, aSlash) : "";
-    r = rSlash >= 0 ? r.slice(0, rSlash) : "";
-    if (!r) break;
-  }
-  return a || null;
 }
 
 /** Dedupe additions against an existing list, returning a new array. */
@@ -63,9 +40,11 @@ export function ReferencesPicker({
   onChange,
   variant,
   label = "Files / Folders",
+  startingFolder,
   className,
 }: Props) {
   const [dragging, setDragging] = useState(false);
+  const [picking, setPicking] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
   // Local open state for the expandable variant. We auto-open the section
   // the first time refs flip from empty → non-empty so adding the first
@@ -77,9 +56,6 @@ export function ReferencesPicker({
     if (wasEmptyRef.current && refs.length > 0) setOpen(true);
     wasEmptyRef.current = refs.length === 0;
   }, [refs.length]);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const dirInputRef = useRef<HTMLInputElement>(null);
-
   const append = (additions: TaskReference[]) => {
     const next = mergeRefs(refs, additions);
     if (next !== refs) onChange(next);
@@ -87,39 +63,20 @@ export function ReferencesPicker({
 
   const remove = (p: string) => onChange(refs.filter((r) => r.path !== p));
 
-  const onPickFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Native macOS open-panel. WKWebView never exposes `File.path`, so an
+  // `<input type=file>` can't give us a real path — the native panel can.
+  const pick = async (mode: "files" | "folder") => {
+    if (picking) return;
     setHint(null);
-    const files = Array.from(e.target.files ?? []) as ElectroFile[];
-    if (files.length && files.some((f) => !f.path)) {
-      setHint("File picker did not expose absolute paths — drag from Finder instead.");
+    setPicking(true);
+    try {
+      const picked = await api.pickRefs(mode, startingFolder);
+      if (picked.length) append(picked);
+    } catch (e) {
+      setHint(`Couldn't open the picker: ${(e as Error).message}`);
+    } finally {
+      setPicking(false);
     }
-    append(
-      files
-        .filter((f) => !!f.path)
-        .map((f) => ({ path: f.path!, isDirectory: false })),
-    );
-    // Reset so picking the same file twice still fires `change`.
-    e.target.value = "";
-  };
-
-  const onPickFolder = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setHint(null);
-    const files = Array.from(e.target.files ?? []) as ElectroFile[];
-    if (!files.length) { e.target.value = ""; return; }
-    // Walk every file, derive its folder root, dedupe — handles the (rare)
-    // case where webkitRelativePath is only populated on a sibling, and is
-    // future-proof if a webview ever returns multiple roots in one pick.
-    const roots = new Set<string>();
-    for (const f of files) {
-      const r = deriveFolderRoot(f);
-      if (r) roots.add(r);
-    }
-    if (!roots.size) {
-      setHint("Folder picker did not expose absolute paths — drag from Finder instead.");
-    } else {
-      append([...roots].map((p) => ({ path: p, isDirectory: true })));
-    }
-    e.target.value = "";
   };
 
   const onDrop = async (e: React.DragEvent) => {
@@ -145,11 +102,6 @@ export function ReferencesPicker({
   const onDragLeave = (e: React.DragEvent) => {
     if (e.currentTarget === e.target) setDragging(false);
   };
-
-  // Type-safe spread for non-standard HTML attributes. WKWebView and modern
-  // Chromium both honour `webkitdirectory` alone; the older `directory`
-  // attribute is dead weight.
-  const dirAttrs = { webkitdirectory: "" } as Record<string, string>;
 
   const chips = refs.length > 0 && (
     <ul className="flex flex-wrap gap-1">
@@ -182,17 +134,16 @@ export function ReferencesPicker({
   // Buttons used in both variants. The expandable variant nests them inside
   // a `<summary>`, which auto-toggles `<details>` on any click — so we have
   // to stop propagation on the button clicks, or else picking files also
-  // collapses/expands the section. The hidden file inputs share the same
-  // tree, so their `change` events shouldn't bubble to summary either; we
-  // stopPropagation there too as belt-and-braces.
+  // collapses/expands the section.
   const buttons = (
     <div className="flex items-center gap-1">
       <Button
         type="button"
         variant="ghost"
         size="sm"
+        disabled={picking}
         className="h-6 gap-1 px-2 text-[11px]"
-        onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
+        onClick={(e) => { e.stopPropagation(); void pick("files"); }}
       >
         <FilePlus className="size-3" /> Files
       </Button>
@@ -200,27 +151,12 @@ export function ReferencesPicker({
         type="button"
         variant="ghost"
         size="sm"
+        disabled={picking}
         className="h-6 gap-1 px-2 text-[11px]"
-        onClick={(e) => { e.stopPropagation(); dirInputRef.current?.click(); }}
+        onClick={(e) => { e.stopPropagation(); void pick("folder"); }}
       >
         <FolderPlus className="size-3" /> Folder
       </Button>
-      <input
-        ref={fileInputRef}
-        type="file"
-        multiple
-        className="hidden"
-        onClick={(e) => e.stopPropagation()}
-        onChange={onPickFiles}
-      />
-      <input
-        ref={dirInputRef}
-        type="file"
-        {...dirAttrs}
-        className="hidden"
-        onClick={(e) => e.stopPropagation()}
-        onChange={onPickFolder}
-      />
     </div>
   );
 
@@ -283,7 +219,7 @@ export function ReferencesPicker({
       <div className="mt-1.5 space-y-1">
         {refs.length > 0
           ? chips
-          : <p className="text-[10px] text-muted-foreground">No files attached yet — pick or drag from Finder. Paths are inlined into the prompt as text; agetor never uploads them.</p>}
+          : <p className="text-[10px] text-muted-foreground">No files attached yet — use the buttons or drag from Finder. Absolute paths are inlined into the prompt as text.</p>}
         {hint && <p className="text-[10px] text-muted-foreground">{hint}</p>}
       </div>
       {dropOverlay}
