@@ -282,6 +282,11 @@ interface UserMessage {
  */
 interface ParsedJsonlEvent {
   type?: string;
+  /** Claude 2.1.x system events carry a `subtype` discriminator — observed
+   *  values: `turn_duration` (durationMs + messageCount, emitted right after
+   *  an assistant end_turn) and `away_summary` (recap text claude generated
+   *  for resumption). Older events leave this null. */
+  subtype?: string;
   uuid?: string;
   message?: AssistantMessage & UserMessage;
   permissionMode?: string;
@@ -300,6 +305,45 @@ interface ParsedJsonlEvent {
    *  "not a real turn" marker. We demote any isMeta entry to a status
    *  breadcrumb. `origin.kind` (above) is a narrower, nicer-summarized subset. */
   isMeta?: boolean;
+  /** Claude 2.1.x `queue-operation` events carry `operation` (`enqueue` /
+   *  `remove`) and, on enqueue, a string `content` payload. This is where
+   *  background task-notifications now arrive — older versions delivered
+   *  them as synthetic `user` entries with `origin.kind: "task-notification"`. */
+  operation?: string;
+  content?: string;
+  /** `system{subtype:"turn_duration"}` carries the turn's wall-clock duration
+   *  in milliseconds — surfaced as a status breadcrumb so the user sees how
+   *  long the turn took. */
+  durationMs?: number;
+}
+
+/**
+ * True for the assistant message that ends a turn. Pulled out so the dispatch
+ * loop can decide whether a JSONL line drives queue bookkeeping (slot pop /
+ * onEndOfTurn fire) WITHOUT first running `mapParsedEventToChunks` — that
+ * matters for the dedup path, which must still pop the slot for end_turn
+ * lines we've already replayed in a prior process, but must NOT re-emit any
+ * user-visible chunks.
+ */
+function isEndOfTurnEvent(evt: ParsedJsonlEvent): boolean {
+  return evt.type === "assistant" && evt.message?.stop_reason === "end_turn";
+}
+
+/** Human-friendly millisecond formatter for `turn_duration` breadcrumbs.
+ *  Mirrors how the rest of the run panel writes durations (seconds for
+ *  short turns; minutes+seconds beyond a minute). Kept inline rather than
+ *  pulled from a shared util because this is the only consumer and the
+ *  rules are trivial. */
+function formatTurnDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  // Round to whole seconds first, then branch — otherwise 59_999ms
+  // rounds-to-print as "60s" instead of rolling over to "1m".
+  if (ms < 10_000) return `${(ms / 1000).toFixed(1)}s`;
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds - m * 60;
+  return s === 0 ? `${m}m` : `${m}m ${s}s`;
 }
 
 export function mapJsonlEventToChunks(
@@ -464,6 +508,14 @@ function mapParsedEventToChunks(
     case "permission-mode":
       if (evt.permissionMode) {
         onChunk("status", `permission-mode: ${evt.permissionMode}`, uuid);
+      } else if (evt.subtype === "turn_duration" && typeof evt.durationMs === "number") {
+        // Emitted right after the assistant end_turn. The end_turn itself
+        // already produced a "turn complete" status; this just adds the
+        // duration so the user can see at a glance whether the turn was
+        // quick or long. The `away_summary` subtype that sometimes follows
+        // stays silent — it's claude's own resumption context, not
+        // user-relevant.
+        onChunk("status", `turn duration: ${formatTurnDuration(evt.durationMs)}`, uuid);
       }
       return { endOfTurn: false, lineUuid: uuid };
 
@@ -472,6 +524,33 @@ function mapParsedEventToChunks(
       // rolled up. Useful breadcrumb in the log.
       if (evt.summary) onChunk("status", `summary: ${evt.summary}`, uuid);
       return { endOfTurn: false, lineUuid: uuid };
+
+    case "queue-operation": {
+      // Claude 2.1.x delivers background-task completion notifications via
+      // queue-operation events: `enqueue` carries the `<task-notification>`
+      // payload, `remove` is the matching pop once claude has consumed it.
+      // Older versions used a synthetic `user` event with
+      // `origin.kind: "task-notification"` (the user branch above still
+      // handles that for forward/backward compat). queue-operation lines
+      // carry `uuid: null` so they bypass the seenLineUuids dedup
+      // entirely — that's fine, each enqueue is broadcast once per
+      // process and reattach hits a different file offset.
+      if (evt.operation === "enqueue" && typeof evt.content === "string") {
+        const summary = /<summary>([\s\S]*?)<\/summary>/.exec(evt.content)?.[1]?.trim();
+        // Mirror the existing user/origin.kind handler's fallback: when a
+        // task-notification payload arrives without a `<summary>` (older
+        // claude builds, malformed content, future variants), emit a
+        // generic "completed" breadcrumb rather than dropping the event
+        // silently — something measurable happened, and the run panel
+        // shouldn't go dark on it.
+        if (summary) {
+          onChunk("status", `background task: ${summary}`, uuid);
+        } else if (evt.content.startsWith("<task-notification>")) {
+          onChunk("status", "background task completed", uuid);
+        }
+      }
+      return { endOfTurn: false, lineUuid: uuid };
+    }
 
     default:
       // attachment, last-prompt, ai-title, agent-name, file-history-snapshot,
@@ -564,14 +643,22 @@ export function getCurrentPermissionMode(taskId: string): string | null {
  * Returns true on apparent success (tmux command exited 0). Silently
  * returns false when no session is registered.
  */
-export function dismissTmuxPrompt(taskId: string, key: string): boolean {
+export async function dismissTmuxPrompt(taskId: string, key: string): Promise<boolean> {
   const state = sessions.get(taskId);
   if (!state) return false;
-  // send-keys interprets every positional arg as a tmux key spec — pass
-  // the literal first, then "Enter" as a separate token so claude sees
-  // an actual carriage return.
-  const res = tmux(["send-keys", "-t", state.sessionName, key, "Enter"]);
-  return res.ok;
+  // Two SEPARATE send-keys calls — not "key Enter" in one. A combined
+  // invocation makes tmux deliver "1\r" as a single read chunk, and
+  // claude's Ink select consumes only the digit (moves/highlights the
+  // choice) while the trailing carriage return is dropped — so the choice
+  // is never confirmed and the modal just sits there. Splitting them
+  // (mirrors pastePrompt's separate Enter) lets the digit register first,
+  // then the Enter confirms. The brief gap guarantees the two keystrokes
+  // land in distinct reads on claude's stdin; `await Bun.sleep` (not the
+  // sync variant) keeps the gap off the SSE/scrape event loop.
+  const sent = tmux(["send-keys", "-t", state.sessionName, key]);
+  if (!sent.ok) return false;
+  await Bun.sleep(50);
+  return tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -836,7 +923,19 @@ function dispatchLine(state: SessionState, line: string): void {
     }
   }
 
-  if (uuid && state.seenLineUuids.has(uuid)) return;
+  // Already-seen lines (the reattach replay-from-offset-0 path is the
+  // common case) skip chunk emission so the UI doesn't see duplicate
+  // events. But we still have to drive queue bookkeeping for an end_turn
+  // here: when agetor crashed in the narrow window between persisting
+  // the end_turn line to `run_events` and updating `runs.status =
+  // 'succeeded'`, the line is in seenLineUuids on restart but the run
+  // row is still 'running'. Without this branch, the replay'd end_turn
+  // would be dropped before `onEndOfTurn` could fire, and the run would
+  // stay 'running' (and the UI "in progress") forever.
+  if (uuid && state.seenLineUuids.has(uuid)) {
+    if (isEndOfTurnEvent(evt)) popEndOfTurn(state);
+    return;
+  }
 
   const slot = state.turnQueue[0];
   // Active turn → its handler. No active turn → fall back to the most
@@ -847,23 +946,33 @@ function dispatchLine(state: SessionState, line: string): void {
   const onChunk: ChunkHandler = slot?.onChunk ?? state.lastChunk ?? (() => {});
   const { endOfTurn } = mapParsedEventToChunks(evt, onChunk);
   if (uuid) state.seenLineUuids.add(uuid);
-  if (endOfTurn) {
-    if (slot) {
-      state.turnQueue.shift();
-      state.lastChunk = slot.onChunk;
-      const resolve = slot.resolve;
-      slot.resolve = null;
-      slot.reject = null;
-      resolve?.(0);
-    } else if (state.onEndOfTurn) {
-      // Reattached run: no in-process promise to resolve, but the orchestrator
-      // still needs to flip the run row to `succeeded`. Fire-once: clear
-      // before calling so a follow-up turn on the same session (which would
-      // never happen without a new slot being pushed first) can't re-trigger.
-      const handler = state.onEndOfTurn;
-      state.onEndOfTurn = null;
-      handler();
-    }
+  if (endOfTurn) popEndOfTurn(state);
+}
+
+/** Advance the turn queue on end_turn — either pop the head slot and
+ *  resolve its `done` promise (fresh-spawn / live-stream path), or fire the
+ *  one-shot `onEndOfTurn` listener (reattach path, where there's no slot
+ *  but the orchestrator still needs to know the run completed). Shared by
+ *  the dedup-skip and normal-dispatch branches of `dispatchLine` so a
+ *  replayed end_turn whose chunk emission was suppressed still drives the
+ *  run-row state transition. */
+function popEndOfTurn(state: SessionState): void {
+  const slot = state.turnQueue[0];
+  if (slot) {
+    state.turnQueue.shift();
+    state.lastChunk = slot.onChunk;
+    const resolve = slot.resolve;
+    slot.resolve = null;
+    slot.reject = null;
+    resolve?.(0);
+  } else if (state.onEndOfTurn) {
+    // Reattached run: no in-process promise to resolve, but the orchestrator
+    // still needs to flip the run row to `succeeded`. Fire-once: clear
+    // before calling so a follow-up turn on the same session (which would
+    // never happen without a new slot being pushed first) can't re-trigger.
+    const handler = state.onEndOfTurn;
+    state.onEndOfTurn = null;
+    handler();
   }
 }
 
@@ -1403,9 +1512,12 @@ export interface ReattachOptions {
   /** Per-run chunk handler that persists to run_events + broadcasts on SSE.
    *  Built by the orchestrator the same way it does for fresh runs. */
   onChunk: ChunkHandler;
-  /** Dedup set seeded from `runs.seenLineUuids(runId)`. The dispatcher skips
-   *  any line whose uuid is already in this set, preventing double-emission
-   *  of events that the previous process already streamed and persisted. */
+  /** Dedup set seeded from `runs.seenLineUuidsForTask(taskId)` — every uuid
+   *  the previous process persisted across *every* run of this task. The
+   *  dispatcher skips any line whose uuid is already in this set, so the
+   *  replay from offset 0 doesn't double-emit events and doesn't fire
+   *  `onEndOfTurn` on end_turn lines belonging to long-completed prior
+   *  turns. */
   seenLineUuids: Set<string>;
 }
 

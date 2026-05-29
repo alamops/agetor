@@ -44,6 +44,7 @@ function makeTask(workdir: string, extra: Partial<Task> = {}): Task {
     hasOpenableRun: false,
     pendingInteractionCount: 0,
     openTerminalCount: 0,
+    archivedAt: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     ...extra,

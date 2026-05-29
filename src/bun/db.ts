@@ -62,6 +62,7 @@ type TaskRow = {
   mode: string | null; model: string | null; effort: string | null;
   refs: string;
   run_id: string | null; created_at: number; updated_at: number;
+  archived_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
    *  a correlated subquery in `list` / `get` — see those for the full SQL. */
   has_openable_run?: number;
@@ -113,6 +114,7 @@ const toTask = (r: TaskRow): Task => ({
   openTerminalCount: countTerminals(r.id),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
+  archivedAt: r.archived_at,
 });
 
 // LEFT JOIN + aggregation, so the runs scan happens once instead of once
@@ -146,19 +148,19 @@ export const tasks = {
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation,
           branch, worktree_path, base_ref, mode, model, effort, refs,
-          run_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          run_id, created_at, updated_at, archived_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.branch, t.worktreePath, t.baseRef, t.mode, t.model, t.effort,
         JSON.stringify(t.references ?? []),
-        t.runId, t.createdAt, t.updatedAt,
+        t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
       ],
     );
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0 };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -168,13 +170,13 @@ export const tasks = {
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?,
          branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?,
-         run_id=?, updated_at=?
+         run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
         next.branch, next.worktreePath, next.baseRef, next.mode, next.model, next.effort,
         JSON.stringify(next.references ?? []),
-        next.runId, next.updatedAt, id,
+        next.runId, next.updatedAt, next.archivedAt ?? null, id,
       ],
     );
     // Re-fetch so hasOpenableRun reflects the row state immediately after
@@ -562,14 +564,26 @@ export const runs = {
       );
     }
   },
-  /** Return the set of JSONL line uuids already persisted for this run. Used
-   *  by reattachRun to seed an in-memory dedup set so re-tailing from offset
-   *  0 (after agetor restarts and finds the tmux session still alive) skips
-   *  events we already streamed during the previous process's lifetime. */
-  seenLineUuids(runId: string): Set<string> {
+  /** Return every JSONL line uuid already persisted across *every* run of
+   *  this task. Used by `reattachSession` to seed the in-memory dedup set so
+   *  re-tailing the per-session JSONL from offset 0 (after an agetor
+   *  restart) skips events we already streamed in the previous process.
+   *
+   *  Scoped to the task (not just the reattached run) on purpose: one tmux
+   *  session = one JSONL file = all of a task's turns. The replay from
+   *  offset 0 will encounter end_turn lines from prior, already-`succeeded`
+   *  run rows; without those uuids in the dedup set the dispatcher would
+   *  re-emit them onto the reattached (still-`running`) run's chunk
+   *  handler — corrupting its event history and, worse, firing
+   *  `onEndOfTurn` on the wrong turn and prematurely resolving the
+   *  current run. */
+  seenLineUuidsForTask(taskId: string): Set<string> {
     const rows = db.query<{ line_uuid: string }, [string]>(
-      `SELECT line_uuid FROM run_events WHERE run_id = ? AND line_uuid IS NOT NULL`,
-    ).all(runId);
+      `SELECT e.line_uuid
+       FROM run_events e
+       JOIN runs r ON r.id = e.run_id
+       WHERE r.task_id = ? AND e.line_uuid IS NOT NULL`,
+    ).all(taskId);
     return new Set(rows.map((r) => r.line_uuid));
   },
 };

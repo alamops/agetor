@@ -45,6 +45,7 @@ function makeTask() {
     hasOpenableRun: false,
     pendingInteractionCount: 0,
     openTerminalCount: 0,
+    archivedAt: null,
     createdAt: now,
     updatedAt: now,
   });

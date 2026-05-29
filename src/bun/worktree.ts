@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { dataDir } from "./db.ts";
-import type { Task } from "../shared/types.ts";
+import type { DiffFile, Task, TaskDiff } from "../shared/types.ts";
 
 const WORKTREES_DIR = path.join(dataDir, "worktrees");
 
@@ -46,6 +46,20 @@ export async function isGitRepo(dir: string): Promise<boolean> {
   if (!existsSync(dir)) return false;
   const res = await git(["rev-parse", "--is-inside-work-tree"], dir);
   return res.ok && res.stdout === "true";
+}
+
+/**
+ * Whether `dir` has uncommitted changes (staged, unstaged, or untracked).
+ * Returns null when we can't tell — missing dir, not a git repo, or a git
+ * command failure. Callers should treat null as "unknown" rather than false
+ * so we never claim "clean" for a working tree we couldn't actually inspect.
+ */
+export async function hasUncommittedChanges(dir: string): Promise<boolean | null> {
+  if (!existsSync(dir)) return null;
+  if (!(await isGitRepo(dir))) return null;
+  const res = await git(["status", "--porcelain"], dir);
+  if (!res.ok) return null;
+  return res.stdout.trim().length > 0;
 }
 
 /**
@@ -260,6 +274,161 @@ export async function prepareWorkdir(task: Task): Promise<PrepareResult> {
     worktreePath: wt,
     note: `created worktree at ${wt} on ${branch} (${baseLabel})`,
   };
+}
+
+// Hunks larger than this (per file) are truncated before crossing the API so
+// a generated lockfile or vendored blob can't bloat the payload / freeze the
+// renderer. The viewer surfaces the truncation.
+const PER_FILE_HUNK_CAP = 200_000;
+// Process at most this many newly-created (untracked) files. Each costs a
+// `git diff --no-index` spawn, so cap to keep a runaway scratch dir cheap.
+const MAX_UNTRACKED = 200;
+// Cap the total number of changed files crossing the API. A reformat-the-world
+// or accidentally-committed build dir shouldn't ship a multi-MB payload the
+// renderer then has to mount. The viewer surfaces the omission via `note`.
+const MAX_FILES = 500;
+
+/** Strip a leading `a/` or `b/` prefix and un-quote git's C-style path. */
+function cleanPath(raw: string): string | null {
+  let p = raw.trim();
+  if (p === "/dev/null") return null;
+  if (p.startsWith('"') && p.endsWith('"')) {
+    // git quotes paths containing unusual bytes; the escaping overlaps with
+    // JSON for the common cases (spaces, unicode). Best-effort un-quote.
+    try { p = JSON.parse(p) as string; } catch { /* keep quoted form */ }
+  }
+  if (p.startsWith("a/") || p.startsWith("b/")) p = p.slice(2);
+  return p;
+}
+
+/**
+ * Parse `git diff` (unified, --no-color) output into one entry per file.
+ * Sections start at each `diff --git …` line; the body keeps the extended
+ * header (`new file mode`, `rename to`, `Binary files …`) plus the `@@` hunks.
+ */
+function parseGitDiff(raw: string): DiffFile[] {
+  const files: DiffFile[] = [];
+  const headerRe = /^diff --git .*$/gm;
+  const starts: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = headerRe.exec(raw))) starts.push(m.index);
+
+  for (let i = 0; i < starts.length; i++) {
+    const section = raw.slice(starts[i], starts[i + 1] ?? raw.length);
+    const lines = section.split("\n");
+    let status: DiffFile["status"] = "modified";
+    let binary = false;
+    let oldPath: string | null = null;
+    let newPath: string | null = null;
+    let renameFrom: string | null = null;
+    let renameTo: string | null = null;
+    let hunkStart = -1;
+
+    for (let j = 1; j < lines.length; j++) {
+      const l = lines[j]!;
+      if (l.startsWith("new file mode")) status = "added";
+      else if (l.startsWith("deleted file mode")) status = "deleted";
+      else if (l.startsWith("rename from ")) { renameFrom = cleanPath(l.slice(12)); status = "renamed"; }
+      else if (l.startsWith("rename to ")) { renameTo = cleanPath(l.slice(10)); status = "renamed"; }
+      else if (l.startsWith("Binary files") || l.startsWith("GIT binary patch")) binary = true;
+      else if (l.startsWith("--- ")) oldPath = cleanPath(l.slice(4));
+      else if (l.startsWith("+++ ")) newPath = cleanPath(l.slice(4));
+      else if (l.startsWith("@@")) { hunkStart = j; break; }
+    }
+
+    const fullHunks = hunkStart >= 0 ? lines.slice(hunkStart).join("\n") : "";
+
+    // Count from the full hunks before any truncation so the summary line
+    // stays honest even when the rendered body is cut. (`+++`/`---` headers
+    // sit before the first `@@`, so they're never in `fullHunks` — the guards
+    // are belt-and-suspenders.)
+    let additions = 0;
+    let deletions = 0;
+    for (const l of fullHunks.split("\n")) {
+      if (l.startsWith("+") && !l.startsWith("+++")) additions++;
+      else if (l.startsWith("-") && !l.startsWith("---")) deletions++;
+    }
+
+    // Cap the rendered body, slicing at a line boundary so the last visible
+    // row isn't a partial line.
+    let hunks = fullHunks;
+    let truncated = false;
+    if (fullHunks.length > PER_FILE_HUNK_CAP) {
+      const cut = fullHunks.lastIndexOf("\n", PER_FILE_HUNK_CAP);
+      hunks = fullHunks.slice(0, cut > 0 ? cut : PER_FILE_HUNK_CAP);
+      truncated = true;
+    }
+
+    files.push({
+      path: renameTo ?? newPath ?? oldPath ?? "(unknown)",
+      oldPath: status === "renamed" ? renameFrom ?? oldPath : null,
+      status,
+      additions,
+      deletions,
+      binary,
+      hunks: binary ? "" : hunks,
+      truncated,
+    });
+  }
+  return files;
+}
+
+/**
+ * Compute everything a task's worktree changed relative to its pinned base ref
+ * — committed AND uncommitted changes to tracked files, plus newly created
+ * (untracked) files synthesized as full additions. Returns a friendly `note`
+ * (and empty `files`) when there's nothing to show: no worktree yet, isolation
+ * off, or a clean tree. Never throws.
+ */
+export async function getTaskDiff(task: Task): Promise<TaskDiff> {
+  if (task.isolation !== "worktree") {
+    return { base: null, files: [], note: "Diff isn't available for tasks running without worktree isolation." };
+  }
+  if (!task.worktreePath || !existsSync(task.worktreePath)) {
+    return { base: null, files: [], note: "This task hasn't created a worktree yet — run it to see its changes here." };
+  }
+
+  const cwd = task.worktreePath;
+  const base = task.baseRef ?? "HEAD";
+  const shortBase = task.baseRef ? task.baseRef.slice(0, 7) : null;
+
+  // Tracked changes (committed + working-tree) vs the pinned base.
+  const tracked = await git(["diff", "--no-color", base], cwd);
+  if (!tracked.ok) {
+    return { base: shortBase, files: [], note: `Could not compute diff: ${tracked.stderr || tracked.stdout || "git diff failed"}` };
+  }
+  const files = parseGitDiff(tracked.stdout);
+
+  // Newly created files aren't part of `git diff <base>`; surface them as
+  // full additions via --no-index (which exits 1 when content differs).
+  const listed = await git(["ls-files", "--others", "--exclude-standard", "-z"], cwd);
+  if (listed.ok) {
+    const rels = listed.stdout.split("\0").filter(Boolean).slice(0, MAX_UNTRACKED);
+    for (const rel of rels) {
+      const res = await git(["diff", "--no-color", "--no-index", "--", "/dev/null", rel], cwd);
+      if (res.exitCode !== 0 && res.exitCode !== 1) continue;
+      const [parsed] = parseGitDiff(res.stdout);
+      files.push(
+        parsed
+          ? { ...parsed, status: "added", path: rel, oldPath: null }
+          : { path: rel, oldPath: null, status: "added", additions: 0, deletions: 0, binary: false, hunks: "", truncated: false },
+      );
+    }
+  }
+
+  if (files.length === 0) {
+    return { base: shortBase, files: [], note: "No changes yet — the worktree matches its base." };
+  }
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  if (files.length > MAX_FILES) {
+    const total = files.length;
+    return {
+      base: shortBase,
+      files: files.slice(0, MAX_FILES),
+      note: `Showing the first ${MAX_FILES} of ${total} changed files — the rest are omitted to keep the viewer responsive.`,
+    };
+  }
+  return { base: shortBase, files };
 }
 
 /**

@@ -45,6 +45,7 @@ export interface AgentRunOptions {
 // curated list doesn't know about yet). Codex accepts the friendly ids as-is
 // so it doesn't need a translation table.
 const CLAUDE_MODEL_FLAG: Record<string, string> = {
+  "opus-4.8": "claude-opus-4-8",
   "opus-4.7": "claude-opus-4-7",
   "sonnet-4.6": "claude-sonnet-4-6",
   "haiku-4.5": "claude-haiku-4-5",

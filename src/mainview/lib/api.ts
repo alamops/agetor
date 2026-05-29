@@ -12,6 +12,7 @@ import type {
   Run,
   RunEvent,
   Task,
+  TaskDiff,
   TaskReference,
   TerminalTab,
   UpdateStatus,
@@ -119,9 +120,13 @@ export type PendingInteraction =
 declare global {
   interface Window { __AGETOR?: { port: string; token: string } }
 }
-const injected = window.__AGETOR;
+// Guard `window` access for the test runtime (`bun test` runs this module
+// outside a browser). Production paths always have a real window, so the
+// `?? undefined` fallback never trips at runtime in the app.
+const _win = typeof window !== "undefined" ? window : undefined;
+const injected = _win?.__AGETOR;
 const params = new URLSearchParams(
-  (window.location.hash || window.location.search).replace(/^[#?]/, ""),
+  ((_win?.location.hash || _win?.location.search) ?? "").replace(/^[#?]/, ""),
 );
 const API_PORT = injected?.port ?? params.get("api") ?? "4317";
 const API_TOKEN = injected?.token ?? params.get("token") ?? "";
@@ -225,6 +230,23 @@ export const api = {
     }),
   deleteProject: (p: string) =>
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
+  /** Open a native file/folder picker and return the chosen references.
+   *  WKWebView never exposes `File.path`, so this native panel is the only
+   *  reliable way to turn a user pick into an absolute path. Returns `[]` on
+   *  cancel. `isDirectory` follows `mode`. */
+  pickRefs: (mode: "files" | "folder", startingFolder?: string) =>
+    j<{ refs: TaskReference[] }>("/refs/pick", {
+      method: "POST",
+      body: JSON.stringify({ mode, startingFolder }),
+    }).then((r) => r.refs),
+  /** Resolve absolute paths (pulled from a drag/drop's file:// URLs) into
+   *  references — the server stats each for directory-ness and drops any
+   *  that no longer exist. */
+  resolveRefs: (paths: string[]) =>
+    j<{ refs: TaskReference[] }>("/refs/resolve", {
+      method: "POST",
+      body: JSON.stringify({ paths }),
+    }).then((r) => r.refs),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
   getTmuxSource: () =>
@@ -277,6 +299,8 @@ export const api = {
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ column }) }),
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
   startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
+  archiveTask: (id: string) => j<Task>(`/tasks/${id}/archive`, { method: "POST" }),
+  unarchiveTask: (id: string) => j<Task>(`/tasks/${id}/unarchive`, { method: "POST" }),
 
   // Terminal tabs. State is in-memory on the bun side; the live byte stream
   // runs over the WebSocket whose URL `terminalSocketUrl` builds.
@@ -289,6 +313,11 @@ export const api = {
   terminalSocketUrl: (id: string) =>
     `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?token=${encodeURIComponent(API_TOKEN)}`,
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
+  /** Everything the task's worktree changed vs its pinned base. Empty `files`
+   *  + a `note` when there's no worktree or no diff. */
+  getTaskDiff: (taskId: string) => j<TaskDiff>(`/tasks/${taskId}/diff`),
+  getTaskGitStatus: (taskId: string) =>
+    j<{ hasChanges: boolean; ignored: boolean }>(`/tasks/${taskId}/git-status`),
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
   sendRunInput: (runId: string, line: string) =>
@@ -306,6 +335,38 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+
+  /**
+   * Open the claude-code task's tmux session in a new Terminal.app window.
+   * Returns the session name on success. Server-side checks the session is
+   * actually live and that the task uses a claude-code harness.
+   */
+  openTmux: (taskId: string) =>
+    j<{ ok: true; sessionName: string }>(`/tasks/${taskId}/open-tmux`, {
+      method: "POST",
+    }),
+
+  /** Persist an in-memory image (clipboard paste or macOS floating-thumbnail
+   *  drag) to disk and get back its absolute path. Bypasses `j()` because the
+   *  body is raw bytes, not JSON. */
+  uploadScreenshot: async (blob: Blob): Promise<{ path: string; basename: string }> => {
+    const res = await fetch(`${BASE}/screenshots`, {
+      method: "POST",
+      headers: {
+        "content-type": blob.type || "application/octet-stream",
+        "authorization": `Bearer ${API_TOKEN}`,
+      },
+      body: blob,
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const msg = body && typeof body === "object" && "error" in body && body.error
+        ? String((body as { error: unknown }).error)
+        : `${res.status} ${res.statusText}`;
+      throw new Error(msg);
+    }
+    return body as { path: string; basename: string };
+  },
 
   /** Interactions: tool-call approvals and clarifying questions. */
   answerApproval: (

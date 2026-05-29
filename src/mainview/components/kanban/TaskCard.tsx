@@ -1,6 +1,6 @@
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { ArrowRight, FolderOpen, GitBranch, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,11 +15,19 @@ interface Props {
   onCancel: (t: Task) => void;
   onDelete: (t: Task) => void;
   onOpen: (t: Task) => void;
+  onDiff: (t: Task) => void;
+  onMarkDone: (t: Task) => void;
+  onArchive: (t: Task) => void;
+  onUnarchive: (t: Task) => void;
 }
 
-export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }: Props) {
+export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
+  const archived = task.archivedAt != null;
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
+    // Archived cards are immutable until unarchived — block drag-to-column so
+    // the user has to take the explicit unarchive action first.
+    disabled: archived,
   });
 
   const style = transform
@@ -59,6 +67,7 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }:
         "cursor-grab select-none border-border/60 hover:border-border transition-colors",
         isDragging && "opacity-50",
         awaiting && "ring-2 ring-amber-500/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
+        archived && "cursor-default opacity-60",
       )}
       onClick={() => onOpen(task)}
       {...listeners}
@@ -110,7 +119,11 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }:
           </div>
         )}
         <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
-          {awaiting ? (
+          {archived ? (
+            <Button size="sm" variant="secondary" onClick={() => onOpen(task)}>
+              <FolderOpen className="size-3" /> Open
+            </Button>
+          ) : awaiting ? (
             <Button
               size="sm"
               className="gap-1 bg-amber-500 text-amber-950 hover:bg-amber-500/90 focus-visible:ring-amber-500"
@@ -134,11 +147,29 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen }:
               <Play className="size-3" /> Run
             </Button>
           )}
-          {awaiting && active && (
+          {!archived && awaiting && active && (
             <Button size="icon" variant="ghost" onClick={() => onCancel(task)} title="Stop">
               <Square className="size-3" />
             </Button>
           )}
+          {!archived && task.column === "review" && (
+            <Button size="sm" variant="outline" onClick={() => onMarkDone(task)} title="Mark this task as done">
+              <CheckCircle2 className="mr-1 size-3" /> Done
+            </Button>
+          )}
+          {!archived && task.column === "done" && (
+            <Button size="icon" variant="ghost" onClick={() => onArchive(task)} title="Archive task">
+              <Archive className="size-3" />
+            </Button>
+          )}
+          {archived && (
+            <Button size="icon" variant="ghost" onClick={() => onUnarchive(task)} title="Unarchive task">
+              <ArchiveRestore className="size-3" />
+            </Button>
+          )}
+          <Button size="icon" variant="ghost" onClick={() => onDiff(task)} title="View changes (git diff)">
+            <GitCompare className="size-3" />
+          </Button>
           <Button size="icon" variant="ghost" onClick={() => onDelete(task)} title="Delete task">
             <Trash2 className="size-3" />
           </Button>

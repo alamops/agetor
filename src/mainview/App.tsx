@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
+import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -72,11 +73,14 @@ export default function App() {
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [] });
   const [selected, setSelected] = useState<Task | null>(null);
+  const [diffTask, setDiffTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [textQuery, setTextQuery] = useState("");
   const [repoFilter, setRepoFilter] = useState<string[]>([]);
   const [statusFilter, setStatusFilter] = useState<ColumnId[]>([]);
+  const [archivedView, setArchivedView] = useState<"active" | "all" | "archived">("active");
+  const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
@@ -104,7 +108,9 @@ export default function App() {
     return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
   }, []);
 
-  const refresh = async () => setTasks(await api.listTasks());
+  const refresh = async () => {
+    try { setTasks(await api.listTasks()); } catch { /* keep last good snapshot; retry next tick */ }
+  };
   const refreshAgents = async () => {
     try {
       const payload = await api.listHarnesses();
@@ -275,7 +281,15 @@ export default function App() {
         // `cancelled` is intentionally silent — the user issued the cancel.
         return;
       }
-      // column transitions
+      // column transitions. Patch `tasks` optimistically so the board and any
+      // open run panel (via the selected-sync effect) reflect the new column
+      // the instant the backend pushes it — rather than waiting up to 2s for
+      // the next poll (and staying stale indefinitely if that poll lags). This
+      // is what keeps the panel header + Stop button from lingering on a
+      // `running` snapshot after the turn has actually finished.
+      setTasks((cur) =>
+        cur.map((t) => (t.id === ev.taskId ? { ...t, column: ev.column } : t)),
+      );
       if (ev.column === "blocked") {
         toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
       } else if (ev.prev === "blocked") {
@@ -299,13 +313,23 @@ export default function App() {
         if (!hay.includes(q)) return false;
       }
       if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
+      if (harnessFilter.length > 0 && !harnessFilter.includes(t.agent)) return false;
+      if (archivedView === "active" && t.archivedAt != null) return false;
+      if (archivedView === "archived" && t.archivedAt == null) return false;
       return true;
     });
-  }, [tasks, textQuery, repoFilter]);
+  }, [tasks, textQuery, repoFilter, harnessFilter, archivedView]);
 
   const visibleColumns = useMemo(
     () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
     [statusFilter],
+  );
+
+  // Distinct harness ids referenced by any task — feeds the harness filter so
+  // ids belonging to removed harnesses still show up as filter options.
+  const taskAgentIds = useMemo(
+    () => Array.from(new Set(tasks.map((t) => t.agent))),
+    [tasks],
   );
 
   const surfaceError = (e: unknown) =>
@@ -352,6 +376,40 @@ export default function App() {
       await api.cancelRun(t.runId);
     } catch (e) {
       surfaceError(e);
+    }
+  };
+  const markDone = async (t: Task) => {
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, column: "done" } : x)));
+    try {
+      setError(null);
+      await api.moveTask(t.id, "done");
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  };
+  const archive = async (t: Task) => {
+    const now = Date.now();
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: now } : x)));
+    try {
+      setError(null);
+      await api.archiveTask(t.id);
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  };
+  const unarchive = async (t: Task) => {
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: null } : x)));
+    try {
+      setError(null);
+      await api.unarchiveTask(t.id);
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
     }
   };
   const del = async (t: Task) => {
@@ -494,7 +552,13 @@ export default function App() {
             onRepoFilterChange={setRepoFilter}
             statusFilter={statusFilter}
             onStatusFilterChange={setStatusFilter}
+            archivedView={archivedView}
+            onArchivedViewChange={setArchivedView}
+            harnessFilter={harnessFilter}
+            onHarnessFilterChange={setHarnessFilter}
             projects={projects}
+            harnesses={harnesses}
+            taskAgentIds={taskAgentIds}
           />
           <ErrorToast error={error} onDismiss={() => setError(null)} />
           <Toaster panelOpen={panelMounted} />
@@ -515,6 +579,10 @@ export default function App() {
                     onCancel={cancel}
                     onDelete={del}
                     onOpen={setSelected}
+                    onDiff={setDiffTask}
+                    onMarkDone={markDone}
+                    onArchive={archive}
+                    onUnarchive={unarchive}
                   />
                 ))}
               </div>
@@ -529,6 +597,15 @@ export default function App() {
         agentModels={agentModels}
         homeDir={homeDir}
         onClose={() => setSelected(null)}
+        onShowDiff={setDiffTask}
+        onArchive={archive}
+        onUnarchive={unarchive}
+      />
+      <DiffDialog
+        open={!!diffTask}
+        taskId={diffTask?.id ?? null}
+        taskTitle={diffTask?.title}
+        onClose={() => setDiffTask(null)}
       />
       <SettingsDialog
         open={settingsOpen}

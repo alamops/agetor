@@ -61,6 +61,7 @@ function makeTaskRow(taskId: string, agent: Task["agent"] = "claude-code"): Task
     hasOpenableRun: false,
     pendingInteractionCount: 0,
     openTerminalCount: 0,
+    archivedAt: null,
   };
 }
 
