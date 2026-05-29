@@ -113,6 +113,16 @@ export function publishGlobalEvent(e: GlobalEvent): void {
   emitGlobal(e);
 }
 
+/** Canonicalize CR/LF in user-supplied text before it's emitted as a
+ *  `user` stream event. The JSONL emit path in claude-tmux.ts does the
+ *  same — keeping both sides symmetric guarantees the panel's dedup
+ *  (keyed on `data.slice(0,200)`) collapses live + JSONL into one
+ *  bubble even when the input arrived with Windows line endings
+ *  (`\r\n`) from a clipboard paste. */
+function normalizeUserText(s: string): string {
+  return s.replace(/\r\n?/g, "\n");
+}
+
 /**
  * Update a task's column and broadcast the transition. Reads the row's
  * current column first so the global event carries `prev` — saves the UI
@@ -379,7 +389,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // path will emit the same line again once claude writes it; the run
   // panel's dedup keys user events on (runId, data) so we don't double
   // up.
-  onChunk("user", promptWithRefs);
+  onChunk("user", normalizeUserText(promptWithRefs));
 
   const agent = spawnAgent({
     taskId,
@@ -730,8 +740,9 @@ export function sendInput(runId: string, line: string): SendInputResult {
   const ok = h.writeInput(line);
   if (ok) {
     const ts = Date.now();
-    runs.appendEvent(runId, "user", line);
-    emit({ runId, taskId: row.task_id, stream: "user", data: line, ts });
+    const data = normalizeUserText(line);
+    runs.appendEvent(runId, "user", data);
+    emit({ runId, taskId: row.task_id, stream: "user", data, ts });
     return { delivered: true, runId };
   }
   return { delivered: false, reason: "stdin write failed" };
@@ -791,7 +802,7 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
   const harness = resolveHarness(task.agent);
   const kind: AgentKind = harness?.kind ?? "claude-code";
   const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
-  onChunk("user", line);
+  onChunk("user", normalizeUserText(line));
 
   const agent = sendTurn(taskId, line, onChunk);
   registerActiveRun(newRunId, taskId, task, agent);
@@ -839,7 +850,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
   const harness = resolveHarness(task.agent);
   const kind: AgentKind = harness?.kind ?? "claude-code";
   const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
-  onChunk("user", line);
+  onChunk("user", normalizeUserText(line));
   onChunk(
     "status",
     priorSessionId
