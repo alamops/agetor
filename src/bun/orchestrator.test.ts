@@ -75,3 +75,65 @@ test("createTask + startTask runs to completion and emits stdout", async () => {
   expect(out.join("")).toContain("hello world");
   expect(statuses.some((s) => s.startsWith("exit:"))).toBe(true);
 });
+
+test("archiveTask refuses tasks that aren't in the Done column", async () => {
+  const { createTask, archiveTask } = await import("./orchestrator.ts");
+  const { db } = await import("./db.ts");
+
+  const created = await createTask({
+    title: "not done yet",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+  });
+  if ("error" in created) throw new Error(created.error);
+  try {
+    const res = archiveTask(created.task.id);
+    expect("error" in res).toBe(true);
+    if ("error" in res) expect(res.error).toMatch(/done/i);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [created.task.id]);
+  }
+});
+
+test("archiveTask stamps archivedAt and unarchiveTask clears it", async () => {
+  const { createTask, archiveTask, unarchiveTask } = await import("./orchestrator.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const created = await createTask({
+    title: "wind-down",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+  });
+  if ("error" in created) throw new Error(created.error);
+  // Move to Done so archive is allowed. updateColumn is internal, but the
+  // PATCH allow-list lets `column` through — use tasks.update directly here
+  // to keep the test focused on archive semantics.
+  tasks.update(created.task.id, { column: "done" });
+  try {
+    const before = tasks.get(created.task.id);
+    expect(before?.archivedAt).toBeNull();
+
+    const archived = archiveTask(created.task.id);
+    expect("task" in archived).toBe(true);
+    if ("task" in archived) {
+      expect(archived.task.archivedAt).not.toBeNull();
+      expect(typeof archived.task.archivedAt).toBe("number");
+    }
+
+    // Idempotent: archiving twice is a no-op success.
+    const archivedAgain = archiveTask(created.task.id);
+    expect("task" in archivedAgain).toBe(true);
+
+    const restored = unarchiveTask(created.task.id);
+    expect("task" in restored).toBe(true);
+    if ("task" in restored) {
+      expect(restored.task.archivedAt).toBeNull();
+    }
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [created.task.id]);
+  }
+});

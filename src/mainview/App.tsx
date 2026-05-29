@@ -77,6 +77,7 @@ export default function App() {
   const [textQuery, setTextQuery] = useState("");
   const [repoFilter, setRepoFilter] = useState<string[]>([]);
   const [statusFilter, setStatusFilter] = useState<ColumnId[]>([]);
+  const [archivedView, setArchivedView] = useState<"active" | "all" | "archived">("active");
   const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
@@ -311,9 +312,11 @@ export default function App() {
       }
       if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
       if (harnessFilter.length > 0 && !harnessFilter.includes(t.agent)) return false;
+      if (archivedView === "active" && t.archivedAt != null) return false;
+      if (archivedView === "archived" && t.archivedAt == null) return false;
       return true;
     });
-  }, [tasks, textQuery, repoFilter, harnessFilter]);
+  }, [tasks, textQuery, repoFilter, harnessFilter, archivedView]);
 
   const visibleColumns = useMemo(
     () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
@@ -371,6 +374,40 @@ export default function App() {
       await api.cancelRun(t.runId);
     } catch (e) {
       surfaceError(e);
+    }
+  };
+  const markDone = async (t: Task) => {
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, column: "done" } : x)));
+    try {
+      setError(null);
+      await api.moveTask(t.id, "done");
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  };
+  const archive = async (t: Task) => {
+    const now = Date.now();
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: now } : x)));
+    try {
+      setError(null);
+      await api.archiveTask(t.id);
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  };
+  const unarchive = async (t: Task) => {
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: null } : x)));
+    try {
+      setError(null);
+      await api.unarchiveTask(t.id);
+      await refresh();
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
     }
   };
   const del = async (t: Task) => {
@@ -513,6 +550,8 @@ export default function App() {
             onRepoFilterChange={setRepoFilter}
             statusFilter={statusFilter}
             onStatusFilterChange={setStatusFilter}
+            archivedView={archivedView}
+            onArchivedViewChange={setArchivedView}
             harnessFilter={harnessFilter}
             onHarnessFilterChange={setHarnessFilter}
             projects={projects}
@@ -538,6 +577,9 @@ export default function App() {
                     onCancel={cancel}
                     onDelete={del}
                     onOpen={setSelected}
+                    onMarkDone={markDone}
+                    onArchive={archive}
+                    onUnarchive={unarchive}
                   />
                 ))}
               </div>
@@ -552,6 +594,8 @@ export default function App() {
         agentModels={agentModels}
         homeDir={homeDir}
         onClose={() => setSelected(null)}
+        onArchive={archive}
+        onUnarchive={unarchive}
       />
       <SettingsDialog
         open={settingsOpen}
