@@ -994,8 +994,10 @@ export async function createTask(
 
 /**
  * Archive a finished task: stamp `archivedAt`, kill its claude tmux session
- * (best-effort) so a background REPL doesn't outlive the user's interest in
- * the task. Worktree, run history, and prompt stay intact for later reference.
+ * AND any open terminal tabs (both best-effort) so no background shell outlives
+ * the user's interest in the task — once archived the card is hidden, so the
+ * user can no longer reach those shells to close them. Worktree, run history,
+ * and prompt stay intact for later reference.
  *
  * Only allowed when the task is in the `done` column — archive is the
  * terminal step of the explicit review → done → archive flow.
@@ -1023,6 +1025,12 @@ export function archiveTask(taskId: string): { task: Task } | { error: string } 
   // tmux teardown internally). Don't wrap — a silent catch would hide a
   // regression in claude-tmux from the next reviewer.
   if (resolveHarness(task.agent)?.kind === "claude-code") dropSession(taskId);
+  // Tear down terminal tabs too — same rationale as the tmux session above.
+  // Fire-and-forget (archive keeps the worktree, so there's no removal race);
+  // the synchronous part of killTerminalsForTask drops the tabs immediately,
+  // the awaited part just reaps the shells. `.catch` keeps the async function's
+  // best-effort failures from surfacing as an unhandled rejection.
+  void killTerminalsForTask(taskId).catch(() => { /* best-effort */ });
   return { task: updated };
 }
 

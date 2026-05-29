@@ -257,7 +257,7 @@ export function closeTerminal(id: string): boolean {
   }
   e.sockets.clear();
   try { e.term.close(); } catch { /* already closed */ }
-  e.proc.kill();
+  try { e.proc.kill(); } catch { /* already exited */ }
   terminals.delete(id);
   return true;
 }

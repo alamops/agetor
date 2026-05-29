@@ -137,6 +137,25 @@ test("createTerminal enforces the per-task limit", async () => {
   expect(countTerminals(task.id)).toBe(8);
 });
 
+test("archiving a task closes its terminals", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-term-archive-"));
+  // archiveTask only acts on `done` tasks with no live run.
+  const task = makeTask(dir, { column: "done" });
+
+  await createTerminal(task.id);
+  await createTerminal(task.id);
+  expect(countTerminals(task.id)).toBe(2);
+
+  const { archiveTask } = await import("./orchestrator.ts");
+  const res = archiveTask(task.id);
+  expect("task" in res).toBe(true);
+
+  // killTerminalsForTask runs its teardown synchronously (only the shell-reap
+  // is deferred), so the tabs are gone the moment archiveTask returns.
+  expect(countTerminals(task.id)).toBe(0);
+  expect(tasks.get(task.id)!.openTerminalCount).toBe(0);
+});
+
 test("killTerminalsForTask tears down every tab for a task", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-term-kill-"));
   const task = makeTask(dir);
