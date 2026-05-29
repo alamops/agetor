@@ -44,6 +44,7 @@ function makeTask() {
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,
+    archivedAt: null,
     createdAt: now,
     updatedAt: now,
   });

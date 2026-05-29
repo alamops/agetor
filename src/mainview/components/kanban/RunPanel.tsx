@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Bot, ClipboardList, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  Archive, ArchiveRestore, Bot, ClipboardList, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
   GitCommit, Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
@@ -60,6 +60,8 @@ interface Props {
   agentModels: AgentModelMap;
   homeDir: string;
   onClose: () => void;
+  onArchive: (t: Task) => void;
+  onUnarchive: (t: Task) => void;
 }
 
 const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" | "destructive"> = {
@@ -97,7 +99,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose }: Props) {
+export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onArchive, onUnarchive }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -181,6 +183,8 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           agentModels={agentModels}
           homeDir={homeDir}
           onClose={onClose}
+          onArchive={onArchive}
+          onUnarchive={onUnarchive}
         />
       </aside>
     </>
@@ -198,6 +202,8 @@ function RunPanelBody({
   agentModels,
   homeDir,
   onClose,
+  onArchive,
+  onUnarchive,
 }: {
   task: Task;
   agents: AgentStatus[];
@@ -205,7 +211,10 @@ function RunPanelBody({
   agentModels: AgentModelMap;
   homeDir: string;
   onClose: () => void;
+  onArchive: (t: Task) => void;
+  onUnarchive: (t: Task) => void;
 }) {
+  const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
   const [runs, setRuns] = useState<Run[]>([]);
   /** Structured event stream — one entry per claude JSONL block or per
@@ -734,9 +743,19 @@ function RunPanelBody({
           >
             <FolderOpen className="mr-1 size-3" /> Open
           </Button>
-          {canControl && (
+          {!archived && canControl && (
             <Button size="sm" variant="destructive" onClick={stop}>
               <Square className="mr-1 size-3" /> Stop
+            </Button>
+          )}
+          {!archived && task.column === "done" && (
+            <Button size="sm" variant="outline" onClick={() => onArchive(task)} title="Archive task">
+              <Archive className="mr-1 size-3" /> Archive
+            </Button>
+          )}
+          {archived && (
+            <Button size="sm" variant="outline" onClick={() => onUnarchive(task)} title="Unarchive task">
+              <ArchiveRestore className="mr-1 size-3" /> Unarchive
             </Button>
           )}
           <Button size="icon" variant="ghost" onClick={onClose}>
@@ -820,102 +839,108 @@ function RunPanelBody({
           one drop zone so dragging a screenshot anywhere over the input area
           (chips, textarea, send button gap) routes through the same capture
           path. */}
-      <div
-        className={cn(
-          "relative shrink-0 space-y-1.5 border-t border-border/60 p-2",
-          sendDragging && "ring-2 ring-inset ring-primary",
-        )}
-        onDragOver={onSendDragOver}
-        onDragLeave={onSendDragLeave}
-        onDrop={onSendDrop}
-      >
-        {canSend && (
-          <ReferencesPicker
-            variant="inline"
-            refs={sendRefs}
-            onChange={setSendRefs}
-          />
-        )}
-        {canSend && latestRun?.status === "succeeded" && hasChanges && !sending && (
-          <div>
+      {archived ? (
+        <div className="shrink-0 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
+          This task is archived. Unarchive it to send messages.
+        </div>
+      ) : (
+        <div
+          className={cn(
+            "relative shrink-0 space-y-1.5 border-t border-border/60 p-2",
+            sendDragging && "ring-2 ring-inset ring-primary",
+          )}
+          onDragOver={onSendDragOver}
+          onDragLeave={onSendDragLeave}
+          onDrop={onSendDrop}
+        >
+          {canSend && (
+            <ReferencesPicker
+              variant="inline"
+              refs={sendRefs}
+              onChange={setSendRefs}
+            />
+          )}
+          {canSend && latestRun?.status === "succeeded" && hasChanges && !sending && (
+            <div>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void sendCommitPush()}
+                title="Ask the agent to commit the working-tree changes and push the current branch to origin."
+              >
+                <GitCommit className="mr-1 size-3" /> Commit &amp; push
+              </Button>
+            </div>
+          )}
+          <div className="flex items-stretch gap-2">
+            <div className="relative flex-1">
+              <Textarea
+                ref={sendRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onPaste={onSendPaste}
+                onKeyDown={(e) => {
+                  // Enter to send; Shift+Enter for a newline. SlashAutocomplete
+                  // attaches a native keydown listener that calls preventDefault
+                  // when it picks a suggestion — bail here so we don't *also*
+                  // send the message in the same keystroke. React fires the
+                  // synthetic handler even when the native default was
+                  // prevented; `defaultPrevented` is the discriminator.
+                  if (e.defaultPrevented) return;
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void send();
+                  }
+                }}
+                placeholder={
+                  canSend
+                    ? task.column === "running"
+                      ? "Agent is working — your message will queue as the next turn. Type / for commands."
+                      : task.column === "blocked"
+                        ? "Answer the question, or send any follow-up. Type / for commands."
+                        : "Send a message — resumes the conversation in a fresh session. Type / for commands."
+                    : "Press Run task first to start a conversation."
+                }
+                rows={2}
+                disabled={!canSend || sending}
+                className="h-16 min-h-0 w-full resize-none text-xs"
+              />
+              <SlashAutocomplete
+                commands={sendCommands}
+                value={input}
+                onChange={setInput}
+                textareaRef={sendRef}
+                // Send field is pinned to the bottom of the panel — anchor
+                // the popover above the textarea so it doesn't render below
+                // the visible window.
+                placement="above"
+              />
+            </div>
             <Button
-              size="sm"
-              variant="secondary"
-              onClick={() => void sendCommitPush()}
-              title="Ask the agent to commit the working-tree changes and push the current branch to origin."
+              size="icon"
+              onClick={() => void send()}
+              disabled={!canSend || sending || (!input.trim() && sendRefs.length === 0)}
+              title={
+                // Distinguish "live session exists" from "needs resume" — not
+                // "turn in flight". `liveRunId` (task.runId) stays set while the
+                // tmux session is alive (including between turns) and is only
+                // null once the session is gone (orphan-reconciled), which is the
+                // resume path. Keying off `canControl` here would mislabel the
+                // common "session alive, no turn in flight" state as a resume.
+                liveRunId
+                  ? "Send to the live agent"
+                  : "Resume the conversation with this message"
+              }
+              className="h-16 w-12 shrink-0"
             >
-              <GitCommit className="mr-1 size-3" /> Commit &amp; push
+              <Send className="size-4" />
             </Button>
           </div>
-        )}
-        <div className="flex items-stretch gap-2">
-          <div className="relative flex-1">
-            <Textarea
-              ref={sendRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onPaste={onSendPaste}
-              onKeyDown={(e) => {
-                // Enter to send; Shift+Enter for a newline. SlashAutocomplete
-                // attaches a native keydown listener that calls preventDefault
-                // when it picks a suggestion — bail here so we don't *also*
-                // send the message in the same keystroke. React fires the
-                // synthetic handler even when the native default was
-                // prevented; `defaultPrevented` is the discriminator.
-                if (e.defaultPrevented) return;
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void send();
-                }
-              }}
-              placeholder={
-                canSend
-                  ? task.column === "running"
-                    ? "Agent is working — your message will queue as the next turn. Type / for commands."
-                    : task.column === "blocked"
-                      ? "Answer the question, or send any follow-up. Type / for commands."
-                      : "Send a message — resumes the conversation in a fresh session. Type / for commands."
-                  : "Press Run task first to start a conversation."
-              }
-              rows={2}
-              disabled={!canSend || sending}
-              className="h-16 min-h-0 w-full resize-none text-xs"
-            />
-            <SlashAutocomplete
-              commands={sendCommands}
-              value={input}
-              onChange={setInput}
-              textareaRef={sendRef}
-              // Send field is pinned to the bottom of the panel — anchor
-              // the popover above the textarea so it doesn't render below
-              // the visible window.
-              placement="above"
-            />
-          </div>
-          <Button
-            size="icon"
-            onClick={() => void send()}
-            disabled={!canSend || sending || (!input.trim() && sendRefs.length === 0)}
-            title={
-              // Distinguish "live session exists" from "needs resume" — not
-              // "turn in flight". `liveRunId` (task.runId) stays set while the
-              // tmux session is alive (including between turns) and is only
-              // null once the session is gone (orphan-reconciled), which is the
-              // resume path. Keying off `canControl` here would mislabel the
-              // common "session alive, no turn in flight" state as a resume.
-              liveRunId
-                ? "Send to the live agent"
-                : "Resume the conversation with this message"
-            }
-            className="h-16 w-12 shrink-0"
-          >
-            <Send className="size-4" />
-          </Button>
+          {sendHint && (
+            <p className="mt-1 text-[10px] text-muted-foreground">{sendHint}</p>
+          )}
         </div>
-        {sendHint && (
-          <p className="mt-1 text-[10px] text-muted-foreground">{sendHint}</p>
-        )}
-      </div>
+      )}
     </>
   );
 }

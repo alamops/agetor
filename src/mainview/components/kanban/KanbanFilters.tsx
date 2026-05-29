@@ -3,7 +3,10 @@ import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { MultiSearchSelect } from "@/components/ui/multi-search-select";
+import { Select } from "@/components/ui/select";
 import { COLUMNS, type ColumnId, type Harness, type Project } from "../../../shared/types.ts";
+
+export type ArchivedView = "active" | "all" | "archived";
 
 interface Props {
   textQuery: string;
@@ -12,6 +15,8 @@ interface Props {
   onRepoFilterChange: (v: string[]) => void;
   statusFilter: ColumnId[];
   onStatusFilterChange: (v: ColumnId[]) => void;
+  archivedView: ArchivedView;
+  onArchivedViewChange: (v: ArchivedView) => void;
   harnessFilter: string[];
   onHarnessFilterChange: (v: string[]) => void;
   projects: Project[];
@@ -36,6 +41,8 @@ export function KanbanFilters({
   onRepoFilterChange,
   statusFilter,
   onStatusFilterChange,
+  archivedView,
+  onArchivedViewChange,
   harnessFilter,
   onHarnessFilterChange,
   projects,
@@ -71,6 +78,7 @@ export function KanbanFilters({
     textQuery !== ""
     || repoFilter.length > 0
     || statusFilter.length > 0
+    || archivedView !== "active"
     || harnessFilter.length > 0;
 
   return (
@@ -111,6 +119,16 @@ export function KanbanFilters({
         leadingIcon={<Tag className="size-3.5" />}
         className="w-48"
       />
+      <Select
+        value={archivedView}
+        onChange={(e) => onArchivedViewChange(e.target.value as ArchivedView)}
+        className="w-36"
+        title="Filter by archive state"
+      >
+        <option value="active">Active only</option>
+        <option value="all">All</option>
+        <option value="archived">Archived only</option>
+      </Select>
       {anyActive && (
         <Button
           variant="ghost"
@@ -119,6 +137,7 @@ export function KanbanFilters({
             onTextQueryChange("");
             onRepoFilterChange([]);
             onStatusFilterChange([]);
+            onArchivedViewChange("active");
             onHarnessFilterChange([]);
           }}
         >

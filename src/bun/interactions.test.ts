@@ -55,6 +55,7 @@ async function makeTaskWithCwd(id: string): Promise<string> {
     updatedAt: Date.now(),
     hasOpenableRun: false,
     pendingInteractionCount: 0,
+    archivedAt: null,
   });
   return cwd;
 }

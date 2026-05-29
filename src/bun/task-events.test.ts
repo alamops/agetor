@@ -60,6 +60,7 @@ function makeTaskRow(taskId: string, agent: Task["agent"] = "claude-code"): Task
     updatedAt: Date.now(),
     hasOpenableRun: false,
     pendingInteractionCount: 0,
+    archivedAt: null,
   };
 }
 
