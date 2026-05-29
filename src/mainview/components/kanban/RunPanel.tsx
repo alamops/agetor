@@ -39,6 +39,7 @@ import {
 } from "./ReferencesPicker";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 import { SlashAutocomplete } from "./SlashAutocomplete";
+import { TerminalView } from "./TerminalView";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -794,6 +795,8 @@ function RunPanelBody({
 
       <RunsList runs={runs} />
 
+      <TerminalsSection task={task} />
+
       <div
         ref={logRef}
         onScroll={(e) => {
@@ -1138,6 +1141,37 @@ function FileMentions({ task, events }: { task: Task; events: RunEvent[] }) {
             <span className="truncate font-mono">{basename(f)}</span>
           </button>
         ))}
+      </div>
+    </details>
+  );
+}
+
+/**
+ * Collapsible terminal section. Mounts {@link TerminalView} for the lifetime of
+ * the panel so background tabs keep streaming even while collapsed; the PTYs
+ * themselves live on the bun side and survive the panel closing entirely.
+ * Defaults open when the task already has terminals (`openTerminalCount`).
+ */
+function TerminalsSection({ task }: { task: Task }) {
+  const count = task.openTerminalCount;
+  // Seed open from the count at mount, then let the user own the toggle —
+  // binding `open` to the polled count would re-expand the section whenever
+  // the count changes (e.g. closing one of two terminals). RunPanel remounts
+  // on task switch (keyed by id), so this re-seeds per task.
+  const [open, setOpen] = useState(count > 0);
+  return (
+    <details
+      className="border-b border-border/60"
+      open={open}
+      onToggle={(e) => setOpen(e.currentTarget.open)}
+    >
+      <summary className="cursor-pointer px-3 py-2 text-muted-foreground">
+        <span className="text-[10px] uppercase tracking-wide">
+          Terminal{count > 0 && <span className="font-mono normal-case"> ({count})</span>}
+        </span>
+      </summary>
+      <div className="h-80 border-t border-border/60">
+        <TerminalView taskId={task.id} />
       </div>
     </details>
   );

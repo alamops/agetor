@@ -55,6 +55,7 @@ async function seedPendingApproval(args: {
     updatedAt: Date.now(),
     hasOpenableRun: false,
     pendingInteractionCount: 0,
+    openTerminalCount: 0,
     archivedAt: null,
   });
   const { registerApproval } = await import("./interactions.ts");
@@ -188,6 +189,7 @@ async function seedTaskWithSavedRule(args: {
     updatedAt: Date.now(),
     hasOpenableRun: false,
     pendingInteractionCount: 0,
+    openTerminalCount: 0,
     archivedAt: null,
   });
   // Pre-write the allow-rule directly to the task's settings file so the

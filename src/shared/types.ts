@@ -241,6 +241,15 @@ export interface Task {
    * not this counter — the card combines both at render time.
    */
   pendingInteractionCount: number;
+  /**
+   * Number of live terminal tabs open for this task. Each tab is an
+   * interactive shell spawned via Bun's PTY (`Bun.spawn(..., { terminal })`)
+   * and tracked in-memory by `src/bun/terminals.ts` — never persisted, since
+   * the PTYs die with the app. Computed in `tasks.list()` / `tasks.get()` via
+   * `countTerminals`, exactly like `pendingInteractionCount`. Drives the
+   * kanban card's terminal badge (hidden when zero).
+   */
+  openTerminalCount: number;
   createdAt: number;
   updatedAt: number;
   /**
@@ -250,6 +259,18 @@ export interface Task {
    * default kanban filter and rendered read-only in the run panel.
    */
   archivedAt: number | null;
+}
+
+/** A live terminal tab for a task. Returned by the terminal REST endpoints;
+ *  state lives only in memory in `src/bun/terminals.ts`. */
+export interface TerminalTab {
+  id: string;
+  taskId: string;
+  /** Display label for the tab (e.g. "Terminal 1"). */
+  title: string;
+  /** Working directory the shell was spawned in (worktree path or workdir). */
+  cwd: string;
+  createdAt: number;
 }
 
 /**
