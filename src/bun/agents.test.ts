@@ -135,6 +135,16 @@ test("claude-code 'opus-4.7' + 'auto' translates to --model and --permission-mod
   ]);
 });
 
+test("claude-code 'opus-4.8' maps to --model claude-opus-4-8", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "opus-4.8", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-opus-4-8",
+    "--permission-mode", "auto",
+    "do thing",
+  ]);
+});
+
 test("claude-code 'bypass' mode emits --dangerously-skip-permissions", () => {
   const { cmd } = buildCommand(builtin("claude-code"), "x", { ...claudeDefaults, mode: "bypass" });
   expect(cmd).toContain("--dangerously-skip-permissions");
@@ -272,6 +282,17 @@ test("codex 'ask' mode drops --full-auto so codex prompts as usual", () => {
     "codex", "exec",
     "--model", "gpt-5-codex",
     "-c", "model_reasoning_effort=high",
+    "hi",
+  ]);
+});
+
+test("codex model 'gpt-5.5' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5.5", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-5.5",
+    "-c", "model_reasoning_effort=high",
+    "--full-auto",
     "hi",
   ]);
 });

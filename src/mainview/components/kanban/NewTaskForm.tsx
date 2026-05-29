@@ -221,7 +221,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   const selectedStatus = agents.find((a) => a.harnessId === agent);
   const { models: staticModels } = AGENT_OPTIONS[kind];
   // `auto` is only valid on models that support real `--permission-mode auto`
-  // (Opus 4.7 today); other models would error at spawn. supportedModes
+  // (all current claude models); other models would error at spawn. supportedModes
   // filters the dropdown so the user can't pick an incompatible combo.
   const modes = supportedModes(kind, model);
   // Merge in any models the agent's CLI surfaced at boot. We dedup by id and
