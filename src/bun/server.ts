@@ -34,7 +34,7 @@ import {
   sessionExists,
   sessionNameFor,
 } from "./claude-tmux.ts";
-import { listBranches, hasUncommittedChanges } from "./worktree.ts";
+import { getTaskDiff, hasUncommittedChanges, listBranches } from "./worktree.ts";
 import { listAvailableCommands } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
@@ -844,6 +844,16 @@ export function startApiServer() {
 
       "/tasks/:id/runs": {
         GET: authed((req) => json(runs.listForTask(req.params.id), { headers: corsHeaders(req) })),
+      },
+
+      // Everything the task's worktree changed vs its pinned base ref. Returns
+      // a friendly `note` (empty `files`) when there's no worktree or no diff.
+      "/tasks/:id/diff": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          return json(await getTaskDiff(t), { headers: corsHeaders(req) });
+        }),
       },
 
       // Open the task's claude-code tmux session in a new Terminal.app window.

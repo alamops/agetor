@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, Bot, ClipboardList, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
+  GitCommit, GitCompare, Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type PendingInteraction } from "@/lib/api";
@@ -60,6 +60,8 @@ interface Props {
   agentModels: AgentModelMap;
   homeDir: string;
   onClose: () => void;
+  /** Open the git diff viewer for the given task. */
+  onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
 }
@@ -99,7 +101,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onArchive, onUnarchive }: Props) {
+export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -183,6 +185,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           agentModels={agentModels}
           homeDir={homeDir}
           onClose={onClose}
+          onShowDiff={onShowDiff}
           onArchive={onArchive}
           onUnarchive={onUnarchive}
         />
@@ -202,6 +205,7 @@ function RunPanelBody({
   agentModels,
   homeDir,
   onClose,
+  onShowDiff,
   onArchive,
   onUnarchive,
 }: {
@@ -211,6 +215,7 @@ function RunPanelBody({
   agentModels: AgentModelMap;
   homeDir: string;
   onClose: () => void;
+  onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
 }) {
@@ -726,6 +731,14 @@ function RunPanelBody({
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => onShowDiff(task)}
+            title="View this task's changes (git diff)"
+          >
+            <GitCompare className="mr-1 size-3" /> Diff
+          </Button>
           <Button
             size="sm"
             variant="outline"

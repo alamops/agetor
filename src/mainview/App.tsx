@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
+import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -72,6 +73,7 @@ export default function App() {
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [] });
   const [selected, setSelected] = useState<Task | null>(null);
+  const [diffTask, setDiffTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [textQuery, setTextQuery] = useState("");
@@ -577,6 +579,7 @@ export default function App() {
                     onCancel={cancel}
                     onDelete={del}
                     onOpen={setSelected}
+                    onDiff={setDiffTask}
                     onMarkDone={markDone}
                     onArchive={archive}
                     onUnarchive={unarchive}
@@ -594,8 +597,15 @@ export default function App() {
         agentModels={agentModels}
         homeDir={homeDir}
         onClose={() => setSelected(null)}
+        onShowDiff={setDiffTask}
         onArchive={archive}
         onUnarchive={unarchive}
+      />
+      <DiffDialog
+        open={!!diffTask}
+        taskId={diffTask?.id ?? null}
+        taskTitle={diffTask?.title}
+        onClose={() => setDiffTask(null)}
       />
       <SettingsDialog
         open={settingsOpen}
