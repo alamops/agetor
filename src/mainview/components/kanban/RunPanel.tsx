@@ -858,6 +858,7 @@ function RunPanelBody({
               variant="inline"
               refs={sendRefs}
               onChange={setSendRefs}
+              startingFolder={task.worktreePath ?? task.workdir}
             />
           )}
           {canSend && latestRun?.status === "succeeded" && hasChanges && !sending && (

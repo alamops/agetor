@@ -228,6 +228,23 @@ export const api = {
     }),
   deleteProject: (p: string) =>
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
+  /** Open a native file/folder picker and return the chosen references.
+   *  WKWebView never exposes `File.path`, so this native panel is the only
+   *  reliable way to turn a user pick into an absolute path. Returns `[]` on
+   *  cancel. `isDirectory` follows `mode`. */
+  pickRefs: (mode: "files" | "folder", startingFolder?: string) =>
+    j<{ refs: TaskReference[] }>("/refs/pick", {
+      method: "POST",
+      body: JSON.stringify({ mode, startingFolder }),
+    }).then((r) => r.refs),
+  /** Resolve absolute paths (pulled from a drag/drop's file:// URLs) into
+   *  references — the server stats each for directory-ness and drops any
+   *  that no longer exist. */
+  resolveRefs: (paths: string[]) =>
+    j<{ refs: TaskReference[] }>("/refs/resolve", {
+      method: "POST",
+      body: JSON.stringify({ paths }),
+    }).then((r) => r.refs),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
   getTmuxSource: () =>

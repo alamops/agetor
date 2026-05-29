@@ -434,6 +434,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
           label="Files / Folders"
           refs={references}
           onChange={setReferences}
+          startingFolder={workdir || undefined}
         />
 
         <div className="grid grid-cols-2 gap-2">
