@@ -1,6 +1,15 @@
 import { test, expect } from "bun:test";
 import { DEFAULT_MODEL, supportedEfforts } from "../shared/types.ts";
 
+test("claude opus-4.8 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "opus-4.8").map((o) => o.id);
+  expect(ids).toContain("max");
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("high");
+  expect(ids).toContain("medium");
+  expect(ids).toContain("low");
+});
+
 test("claude opus-4.7 supports xhigh + max", () => {
   const ids = supportedEfforts("claude-code", "opus-4.7").map((o) => o.id);
   expect(ids).toContain("max");
@@ -24,14 +33,23 @@ test("claude haiku-4.5 exposes no effort options (CLI doesn't accept the flag)",
   expect(ids).toEqual([]);
 });
 
-test("claude null model falls back to DEFAULT_MODEL support set (opus-4.7)", () => {
+test("claude null model falls back to DEFAULT_MODEL support set (opus-4.8)", () => {
   // No model specified → use the agent's default model's support set. Since
-  // claude-code's DEFAULT_MODEL is opus-4.7, xhigh + max are both available.
-  expect(DEFAULT_MODEL["claude-code"]).toBe("opus-4.7");
+  // claude-code's DEFAULT_MODEL is opus-4.8, xhigh + max are both available.
+  expect(DEFAULT_MODEL["claude-code"]).toBe("opus-4.8");
   const ids = supportedEfforts("claude-code", null).map((o) => o.id);
   expect(ids).toContain("xhigh");
   expect(ids).toContain("max");
   expect(ids).toContain("high");
+});
+
+test("codex gpt-5.5 supports xhigh but not max", () => {
+  const ids = supportedEfforts("codex", "gpt-5.5").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("high");
+  expect(ids).toContain("medium");
+  expect(ids).toContain("low");
+  expect(ids).not.toContain("max");
 });
 
 test("codex gpt-5 supports xhigh but not max", () => {
@@ -41,7 +59,7 @@ test("codex gpt-5 supports xhigh but not max", () => {
 });
 
 test("unknown model falls back to the agent's DEFAULT_MODEL support set", () => {
-  // codex's default is gpt-5-codex which has the same set as gpt-5.
+  // codex's default is gpt-5.5 which has the same set as gpt-5.
   const ids = supportedEfforts("codex", "future-codex-9000").map((o) => o.id);
   expect(ids).toContain("xhigh");
   expect(ids).not.toContain("max");
