@@ -154,6 +154,125 @@ test("mapJsonlEventToChunks: assistant with stop_reason=end_turn signals endOfTu
   expect(status?.data).toBe("turn complete");
 });
 
+test("mapJsonlEventToChunks: system{subtype:turn_duration} emits the duration as a status breadcrumb", () => {
+  // Claude 2.1.x writes a `system{subtype:"turn_duration"}` line right
+  // after the assistant end_turn. The end_turn itself already produced
+  // "turn complete"; this just adds the duration so the user sees at a
+  // glance whether the turn was quick or long.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "system",
+    subtype: "turn_duration",
+    durationMs: 52647,
+    uuid: "9e139a67-4473-4578-bae0-9ce18c651c76",
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(false);
+  expect(out).toEqual([{ stream: "status", data: "turn duration: 53s" }]);
+});
+
+test("mapJsonlEventToChunks: system{subtype:away_summary} stays silent (resumption context, not user-relevant)", () => {
+  // away_summary is claude's own recap of what just happened, written for
+  // its future-self on resume. Surfacing it as a breadcrumb would just
+  // duplicate the assistant text the user already read.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "system",
+    subtype: "away_summary",
+    content: "Goal was building the X feature; finished applying review fixes.",
+    uuid: "f85ee077-f89c-494e-9c50-951d29c76ddd",
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("mapJsonlEventToChunks: queue-operation enqueue with a task-notification payload becomes a background-task breadcrumb", () => {
+  // Claude 2.1.x delivers background-task completion notifications via
+  // `queue-operation` events; older versions delivered the same content
+  // as synthetic `user` entries with `origin.kind: "task-notification"`.
+  // The user-facing breadcrumb is the same — extract the `<summary>` and
+  // prefix with `background task:`.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "queue-operation",
+    operation: "enqueue",
+    content: "<task-notification>\n<task-id>bt7k1k0qf</task-id>\n<summary>Background command \"Wait for dev server ready\" completed (exit code 0)</summary>\n</task-notification>",
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{
+    stream: "status",
+    data: `background task: Background command "Wait for dev server ready" completed (exit code 0)`,
+  }]);
+});
+
+test("mapJsonlEventToChunks: queue-operation remove stays silent (just the dequeue half of an enqueue/remove pair)", () => {
+  // The `remove` half is claude popping the notification off its input
+  // queue once it's been processed — it carries no content the user
+  // hasn't already seen from the matching `enqueue`.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "queue-operation", operation: "remove" });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("mapJsonlEventToChunks: queue-operation enqueue with a task-notification but no <summary> emits a generic 'completed' breadcrumb", () => {
+  // Mirrors the existing user/origin.kind handler's fallback so both
+  // delivery paths (synthetic user entry vs. queue-operation) produce
+  // the same UX for the same logical event. Without this, a 2.1.x
+  // task-notification payload missing its `<summary>` would go dark in
+  // the run panel even though something measurable completed.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "queue-operation",
+    operation: "enqueue",
+    content: "<task-notification>\n<task-id>abc</task-id>\n<status>completed</status>\n</task-notification>",
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "status", data: "background task completed" }]);
+});
+
+test("mapJsonlEventToChunks: queue-operation enqueue of an unrecognised payload type stays silent (no raw XML in the panel)", () => {
+  // Non-task-notification enqueues (future event kinds claude might
+  // queue) shouldn't dump arbitrary content into the user's run panel.
+  // The task-notification prefix check is the only allow-listed
+  // generic fallback.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "queue-operation",
+    operation: "enqueue",
+    content: "<some-future-payload>opaque content</some-future-payload>",
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("formatTurnDuration: rolls 59999ms over to '1m' rather than printing '60s'", async () => {
+  // Round-then-branch boundary check. With a naive `(ms/1000).toFixed(0)`
+  // inside the `< 60_000` branch, 59999ms would render as "60s" — visually
+  // jarring next to a turn that's clearly already a minute. The roll-over
+  // matters for any duration that lands within 500ms of a minute boundary.
+  const { mapJsonlEventToChunks } = await import("./claude-tmux.ts");
+  const cases: Array<{ ms: number; expected: string }> = [
+    { ms: 250, expected: "250ms" },
+    { ms: 1500, expected: "1.5s" },
+    { ms: 9999, expected: "10.0s" },
+    { ms: 52647, expected: "53s" },
+    { ms: 59_499, expected: "59s" },
+    { ms: 59_999, expected: "1m" },
+    { ms: 60_000, expected: "1m" },
+    { ms: 90_500, expected: "1m 31s" },
+    { ms: 3_600_000, expected: "60m" },
+  ];
+  for (const { ms, expected } of cases) {
+    const out: { stream: string; data: string }[] = [];
+    mapJsonlEventToChunks(
+      JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: ms, uuid: `dur-${ms}` }),
+      (stream, data) => out.push({ stream, data }),
+    );
+    expect(out[0]?.data).toBe(`turn duration: ${expected}`);
+  }
+});
+
 test("mapJsonlEventToChunks: user.content[].tool_result → `tool_result` stream with JSON payload", () => {
   const { out, onChunk } = recorder();
   const line = JSON.stringify({
@@ -265,6 +384,109 @@ test("mapJsonlEventToChunks: user.content[].text → `user` stream (array-form p
   });
   mapJsonlEventToChunks(line, onChunk);
   expect(out).toEqual([{ stream: "user", data: "hello there" }]);
+});
+
+test("mapJsonlEventToChunks: task-notification user message → `status` breadcrumb, not a user bubble", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    origin: { kind: "task-notification" },
+    message: {
+      content:
+        "<task-notification>\n<task-id>b21qu207r</task-id>\n<status>completed</status>\n<summary>Background command \"Find bun executable\" completed (exit code 0)</summary>\n</task-notification>",
+    },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: 'background task: Background command "Find bun executable" completed (exit code 0)' },
+  ]);
+});
+
+test("mapJsonlEventToChunks: task-notification without a summary still emits a generic status", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    origin: { kind: "task-notification" },
+    message: { content: "<task-notification><status>completed</status></task-notification>" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "status", data: "background task completed" }]);
+});
+
+test("mapJsonlEventToChunks: malformed-tool-call retry (isMeta) → status breadcrumb, not a user bubble", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: "Your tool call was malformed and could not be parsed. Please retry." },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: "Your tool call was malformed and could not be parsed. Please retry." },
+  ]);
+});
+
+test("mapJsonlEventToChunks: large multi-line isMeta blob is truncated to one capped line", () => {
+  const { out, onChunk } = recorder();
+  const longFirstLine = "x".repeat(200);
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: [{ type: "text", text: `${longFirstLine}\nsecond line\nthird line` }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out.length).toBe(1);
+  expect(out[0]!.stream).toBe("status");
+  expect(out[0]!.data).toBe("x".repeat(137) + "…");
+});
+
+test("mapJsonlEventToChunks: isMeta breadcrumb strips a leading wrapper tag", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: "<local-command-caveat>Caveat: generated while running local commands.</local-command-caveat>" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([
+    { stream: "status", data: "Caveat: generated while running local commands.</local-command-caveat>" },
+  ]);
+});
+
+test("mapJsonlEventToChunks: isMeta entry with only non-text blocks falls back to a generic label", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    isMeta: true,
+    message: { content: [{ type: "image", source: {} }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "status", data: "synthetic message" }]);
+});
+
+test("mapJsonlEventToChunks: empty isMeta content stays silent", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "user", isMeta: true, message: { content: "" } });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([]);
+});
+
+test("mapJsonlEventToChunks: genuine human turn (no isMeta) still emits a user bubble", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "user", message: { content: "ship the fix please" } });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out).toEqual([{ stream: "user", data: "ship the fix please" }]);
+});
+
+test("mapJsonlEventToChunks: tool_result user entry (no isMeta) still emits tool_result, not a breadcrumb", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "tu_1", content: "ok", is_error: false }] },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(out.length).toBe(1);
+  expect(out[0]!.stream).toBe("tool_result");
 });
 
 test("mapJsonlEventToChunks: empty user string content stays silent", () => {
@@ -410,6 +632,109 @@ test("system event updates state.permissionMode (dispatchLine path)", async () =
     JSON.stringify({ type: "permission-mode", permissionMode: "auto" }),
   );
   expect(state.permissionMode).toBe("auto");
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: already-seen end_turn still fires onEndOfTurn (reattach + crashed-before-status-update path)", async () => {
+  // Reattach scenario where agetor died in the narrow window between
+  // persisting the end_turn line to `run_events` and updating the run
+  // row to `succeeded`: on restart, seenLineUuids is pre-seeded from
+  // run_events, so the JSONL replay's end_turn line hits the dedup
+  // path. Without the popEndOfTurn carve-out, the slot/onEndOfTurn
+  // bookkeeping never runs and the run stays `running` forever — the
+  // exact UI symptom (badge stuck on "in progress" while the agent
+  // is actually done) that motivated this fix.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-end-turn-dedup-reattach";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+
+  // Seed the dedup set so the end_turn line is treated as already-seen,
+  // matching what `runs.seenLineUuids(runId)` would return on restart.
+  state.seenLineUuids.add("end-turn-uuid-1");
+
+  // Also: emitted chunks must NOT include this line's content — the prior
+  // process already broadcast it to SSE + persisted it to run_events.
+  const emitted: { stream: string; data: string }[] = [];
+  state.lastChunk = (stream, data) => emitted.push({ stream, data });
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "end-turn-uuid-1",
+    message: { role: "assistant", content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
+  }));
+
+  expect(endOfTurnFired).toBe(true);
+  // No duplicate "turn complete" / "done" — the prior process already
+  // emitted those.
+  expect(emitted).toEqual([]);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: already-seen NON-end_turn line does NOT touch the turn queue or fire onEndOfTurn", async () => {
+  // Inverse of the end_turn carve-out: only end_turn lines should drive
+  // queue bookkeeping on the dedup path. A replayed tool_use or text
+  // assistant line must skip cleanly, leaving turnQueue + onEndOfTurn
+  // untouched. Guards against accidental over-trigger if isEndOfTurnEvent
+  // ever gets widened (e.g. to other stop_reason values).
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-non-end-turn-dedup";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  // Push a slot and install an onEndOfTurn — both should survive the dispatch.
+  const recorded: { stream: string; data: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data) => {
+    recorded.push({ stream, data });
+  });
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+
+  state.seenLineUuids.add("tool-use-uuid");
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "tool-use-uuid",
+    message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }], stop_reason: "tool_use" },
+  }));
+
+  // Slot still queued, listener still armed, no chunk re-emitted.
+  expect(state.turnQueue.length).toBe(1);
+  expect(state.onEndOfTurn).not.toBeNull();
+  expect(endOfTurnFired).toBe(false);
+  expect(recorded).toEqual([]);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: already-seen end_turn pops the head turn slot (mid-pipeline dedup edge case)", async () => {
+  // Same carve-out, but for the live-stream path: if for any reason a
+  // duplicate end_turn line gets dispatched (e.g. a watcher fired and a
+  // sync flush both reached the same offset across an unlucky await
+  // suspension), we still want to advance the queue exactly once and
+  // resolve the head slot's `done` — not leak the slot.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-end-turn-dedup-live";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  const donePromise = __forTest.pushTurnSlot(state, (stream, data) => {
+    recorded.push({ stream, data });
+  });
+
+  state.seenLineUuids.add("end-turn-uuid-2");
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "end-turn-uuid-2",
+    message: { role: "assistant", content: [], stop_reason: "end_turn" },
+  }));
+
+  // Slot popped, no chunks re-emitted on the slot's handler.
+  expect(state.turnQueue.length).toBe(0);
+  expect(recorded).toEqual([]);
+  // The slot's `done` promise resolves with exit code 0 (the dedup'd
+  // line was a real end_turn, just one we already saw).
+  expect(await donePromise).toBe(0);
   __forTest.uninstallSession(taskId);
 });
 

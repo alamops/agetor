@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Utils } from "electrobun/bun";
@@ -14,7 +14,7 @@ import {
   HarnessInUseError,
   dataDir,
 } from "./db.ts";
-import { createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import {
@@ -32,8 +32,9 @@ import {
   mapJsonlEventToChunks,
   markTmuxPromptAnswered,
   sessionExists,
+  sessionNameFor,
 } from "./claude-tmux.ts";
-import { getTaskDiff, listBranches } from "./worktree.ts";
+import { getTaskDiff, hasUncommittedChanges, listBranches } from "./worktree.ts";
 import { listAvailableCommands } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
@@ -61,6 +62,7 @@ import {
   type QuestionAnswer,
 } from "./interactions.ts";
 import { MODEL_EFFORT_SUPPORT } from "../shared/types.ts";
+import { isReadOnlyBashCommand } from "../shared/claude-permissions.ts";
 import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 
@@ -83,6 +85,33 @@ const json = (data: unknown, init?: ResponseInit) =>
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
     status: init?.status,
   });
+
+// Turn raw path strings into references: keep only existing absolute paths,
+// dedupe, and read directory-ness from the filesystem (authoritative — more
+// reliable than the webview's view). The stat filter also discards the bogus
+// fragments produced when Electrobun's native open-panel returns its picks as
+// a comma-joined string and a chosen path itself contains a comma: the split
+// pieces don't exist on disk, so they fall out here rather than reaching the
+// prompt as broken refs. (A comma path still can't be attached via the panel —
+// that's a bridge limitation — but it fails safe instead of corrupting.)
+function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
+  const refs: TaskReference[] = [];
+  const seen = new Set<string>();
+  for (const entry of rawPaths) {
+    if (typeof entry !== "string") continue;
+    const abs = entry.trim();
+    if (!abs || !path.isAbsolute(abs) || seen.has(abs)) continue;
+    let st;
+    try {
+      st = statSync(abs);
+    } catch {
+      continue; // gone / unreadable / comma-split fragment — skip rather than 500
+    }
+    seen.add(abs);
+    refs.push({ path: abs, isDirectory: st.isDirectory() });
+  }
+  return refs;
+}
 
 // We bind to 127.0.0.1 so CORS is mostly belt-and-suspenders. We still echo
 // the calling origin so the Vite HMR webview (http://localhost:5173) can call
@@ -698,6 +727,17 @@ export function startApiServer() {
           if (!before) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
+          // Archived rows are frozen — the UI hides every mutator (drag is
+          // disabled, action buttons are stripped, the composer is replaced
+          // by a footer). Enforce it server-side too so a direct API caller
+          // (or a stale tab racing the timestamp flip) can't drag the row
+          // back to a live column and re-trigger session reconciliation.
+          if (before.archivedAt != null) {
+            return json(
+              { error: "task is archived — unarchive it before editing" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
           const patch = filterPatch(await req.json());
           // Prevent workdir from being swapped after a worktree has been
           // materialized. The worktree is registered against the original repo;
@@ -784,6 +824,24 @@ export function startApiServer() {
         }),
       },
 
+      "/tasks/:id/archive": {
+        POST: authed((req) => {
+          const result = archiveTask(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(result.task, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/unarchive": {
+        POST: authed((req) => {
+          const result = unarchiveTask(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : json(result.task, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/runs": {
         GET: authed((req) => json(runs.listForTask(req.params.id), { headers: corsHeaders(req) })),
       },
@@ -795,6 +853,104 @@ export function startApiServer() {
           const t = tasks.get(req.params.id);
           if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           return json(await getTaskDiff(t), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Open the task's claude-code tmux session in a new Terminal.app window.
+      // The session name is deterministic (`agetor-<taskId-prefix>`) so we can
+      // look it up without consulting the run row. We probe tmux availability
+      // and session liveness up-front so the UI gets a clear, distinct error
+      // for each failure mode instead of an empty Terminal that immediately
+      // errors with "can't find session".
+      "/tasks/:id/open-tmux": {
+        POST: authed((req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) {
+            return json({ error: "task not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const harness = harnesses.getByIdOrKind(task.agent);
+          if (harness?.kind !== "claude-code") {
+            return json(
+              { error: "tmux attach is only available for claude-code tasks" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const sessionName = sessionNameFor(task.id);
+          // Distinguish "tmux missing" from "session missing" — both would
+          // otherwise look like sessionExists() === false and tell the user
+          // to restart the task, which doesn't help when the real problem
+          // is the tmux binary itself. Mirror the resolution path used by
+          // checkHarness so the same install hint applies.
+          const tmuxBin = resolveTmuxBin();
+          const tmuxPath = path.isAbsolute(tmuxBin)
+            ? (existsSync(tmuxBin) ? tmuxBin : null)
+            : Bun.which(tmuxBin, { PATH: process.env.PATH });
+          if (!tmuxPath) {
+            return json(
+              {
+                error: "tmux binary not found — install tmux (brew install tmux) or enable the bundled tmux in Settings",
+                sessionName,
+                reason: "tmux-missing",
+              },
+              { status: 503, headers: corsHeaders(req) },
+            );
+          }
+          if (!sessionExists(task.id)) {
+            return json(
+              {
+                error: `no live tmux session "${sessionName}" — start (or send a message to) the task first`,
+                sessionName,
+                reason: "session-missing",
+              },
+              { status: 404, headers: corsHeaders(req) },
+            );
+          }
+          // AppleScript `do script` runs the string through `/bin/bash`, so
+          // we escape anything bash would interpret inside double-quotes:
+          // backslash, dollar, backtick, and the double-quote itself. Without
+          // this, a tmux bin path containing `$` (legal but unusual) would
+          // silently misbehave. Session names are server-generated and only
+          // contain `agetor-<hex>` so they don't strictly need escaping, but
+          // we apply the same helper for symmetry.
+          const shellEscape = (s: string) => s.replace(/(["\\$`])/g, "\\$1");
+          const script =
+            `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\" attach -t \\"${shellEscape(sessionName)}\\""\n` +
+            `activate application "Terminal"`;
+          const proc = Bun.spawn(["osascript", "-e", script], {
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+          // Don't block on the AppleScript — Terminal.app opening shouldn't
+          // hold the HTTP response open. Log non-zero exits so users with
+          // Automation permissions revoked have a breadcrumb in the console.
+          void proc.exited.then((code) => {
+            if (code !== 0) {
+              console.warn(
+                `[agetor] osascript exited ${code} while attaching to tmux session "${sessionName}" — check System Settings → Privacy & Security → Automation`,
+              );
+            }
+          });
+          return json({ ok: true, sessionName }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Whether the task's working tree has uncommitted changes. Drives the
+      // "Commit & push" action in the run panel, which only makes sense to
+      // show when there's actually something to commit. `ignored: true` means
+      // we couldn't tell (not a git repo, dir missing, git failed) — the UI
+      // treats that as "don't offer the action" rather than guessing.
+      "/tasks/:id/git-status": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const dir = t.worktreePath ?? t.workdir;
+          const result = await hasUncommittedChanges(dir);
+          if (result === null) {
+            return json({ hasChanges: false, ignored: true }, { headers: corsHeaders(req) });
+          }
+          return json({ hasChanges: result, ignored: false }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -846,6 +1002,102 @@ export function startApiServer() {
         }),
       },
 
+      // Open a native macOS open-panel and return whatever the user picked as
+      // file/folder references. This is the reliable way to get absolute
+      // paths into the prompt: WKWebView never populates the non-standard
+      // `File.path`, so an `<input type=file>` can't expose a real path — the
+      // native panel does. `mode` constrains the panel to files or
+      // directories; `refsFromPaths` stats each pick for authoritative
+      // directory-ness and drops anything that doesn't exist.
+      "/refs/pick": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            mode?: "files" | "folder";
+            startingFolder?: string;
+          };
+          const mode = body.mode === "folder" ? "folder" : "files";
+          const startingFolder =
+            typeof body.startingFolder === "string" && body.startingFolder.trim()
+              ? body.startingFolder
+              : homedir();
+          const paths = await Utils.openFileDialog({
+            startingFolder,
+            canChooseFiles: mode === "files",
+            canChooseDirectory: mode === "folder",
+            allowsMultipleSelection: true,
+          });
+          // The native bridge returns a comma-joined string; an empty first
+          // element means the user cancelled.
+          return json({ refs: refsFromPaths(paths) }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Resolve a list of absolute paths (extracted from a drag/drop's
+      // file:// URLs) into references. We stat each to set `isDirectory`
+      // authoritatively and to drop anything that no longer exists, rather
+      // than trusting the webview's view of directory-ness.
+      "/refs/resolve": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { paths?: unknown };
+          const raw = Array.isArray(body.paths) ? body.paths : [];
+          return json({ refs: refsFromPaths(raw) }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Persist a screenshot blob to `${dataDir}/screenshots/` and return its
+      // absolute path. Backs the textarea drag/drop + paste flows on the
+      // webview — macOS floating-thumbnail drags and clipboard pastes carry
+      // an image blob with no filesystem path, so the only way to give an
+      // agent an absolute path to read is to write the bytes out first.
+      "/screenshots": {
+        POST: authed(async (req) => {
+          const ctype = (req.headers.get("content-type") ?? "").toLowerCase();
+          const allowed: Record<string, string> = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/gif": "gif",
+            "image/webp": "webp",
+          };
+          const ext = allowed[ctype.split(";")[0].trim()];
+          if (!ext) {
+            return json(
+              { error: `unsupported content-type: ${ctype || "(missing)"}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+          const MAX = 25 * 1024 * 1024;
+          // Reject oversized uploads via Content-Length before allocating
+          // the body — a buggy client shouldn't be able to pin RAM by
+          // streaming gigabytes only to see a 413 at the end. Clients
+          // omitting the header still hit the post-read check below.
+          const claimed = Number(req.headers.get("content-length") ?? "");
+          if (Number.isFinite(claimed) && claimed > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          const buf = await req.arrayBuffer();
+          if (buf.byteLength > MAX) {
+            return json(
+              { error: `image exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          if (buf.byteLength === 0) {
+            return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const dir = path.join(dataDir, "screenshots");
+          mkdirSync(dir, { recursive: true });
+          const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+          const id = crypto.randomUUID().slice(0, 8);
+          const basename = `screenshot-${ts}-${id}.${ext}`;
+          const abs = path.join(dir, basename);
+          await Bun.write(abs, buf);
+          return json({ path: abs, basename }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // ─── Interactions: tool-call approvals (from the PreToolUse hook) ───
       "/approvals": {
         POST: authed(async (req) => {
@@ -890,8 +1142,19 @@ export function startApiServer() {
           const PLAN_MODE_INTERCEPT = new Set([
             "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash",
           ]);
+          // A `Bash` call whose command is confidently read-only (grep/find/
+          // ls/cat/…) is treated like the dedicated read-only tools: it can't
+          // mutate the workspace, so it auto-allows even in ask/acceptEdits
+          // and is exempt from the plan-mode force-intercept below. Mutating
+          // Bash (rm, git push, an Edit-equivalent shell write…) classifies
+          // false and still draws a card.
+          const ti = payload.tool_input as { command?: unknown } | null | undefined;
+          const bashCommand = ti && typeof ti.command === "string" ? ti.command : "";
+          const readOnlyBash = toolName === "Bash" && bashCommand !== "" &&
+            isReadOnlyBashCommand(bashCommand);
           const currentMode = getCurrentPermissionMode(taskId);
-          const planModeForce = currentMode === "plan" && PLAN_MODE_INTERCEPT.has(toolName);
+          const planModeForce = currentMode === "plan" &&
+            PLAN_MODE_INTERCEPT.has(toolName) && !readOnlyBash;
           // Auto / bypass fast-path: claude's own classifier has already
           // decided this tool is safe to run (auto = "let claude decide",
           // bypassPermissions = "don't ask me anything"). Second-guessing
@@ -912,7 +1175,7 @@ export function startApiServer() {
           // now reads `.claude/settings.local.json` `permissions.allow` and
           // matches per the claude pattern syntax (see claude-permissions.ts).
           if (!ALWAYS_INTERCEPT.has(toolName) && !planModeForce &&
-              (SAFE_TOOLS.has(toolName) ||
+              (SAFE_TOOLS.has(toolName) || readOnlyBash ||
                lookupAllowRule({ taskId, toolName, toolInput: payload.tool_input }) === "allow")) {
             return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
           }
@@ -1113,7 +1376,7 @@ export function startApiServer() {
               { status: 410, headers: corsHeaders(req) },
             );
           }
-          const delivered = dismissTmuxPrompt(pending.taskId, key);
+          const delivered = await dismissTmuxPrompt(pending.taskId, key);
           if (!delivered) {
             return json(
               { ok: false, error: "failed to deliver keystroke to tmux" },

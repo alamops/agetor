@@ -49,6 +49,20 @@ export async function isGitRepo(dir: string): Promise<boolean> {
 }
 
 /**
+ * Whether `dir` has uncommitted changes (staged, unstaged, or untracked).
+ * Returns null when we can't tell — missing dir, not a git repo, or a git
+ * command failure. Callers should treat null as "unknown" rather than false
+ * so we never claim "clean" for a working tree we couldn't actually inspect.
+ */
+export async function hasUncommittedChanges(dir: string): Promise<boolean | null> {
+  if (!existsSync(dir)) return null;
+  if (!(await isGitRepo(dir))) return null;
+  const res = await git(["status", "--porcelain"], dir);
+  if (!res.ok) return null;
+  return res.stdout.trim().length > 0;
+}
+
+/**
  * Return the absolute path of the repo root for `dir`, or null if `dir`
  * isn't a git working tree. We base worktrees off the root, not subdirectories.
  */

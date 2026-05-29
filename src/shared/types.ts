@@ -200,7 +200,7 @@ export interface Task {
    */
   mode: string | null;
   /**
-   * Friendly model id ("opus-4.7", "sonnet-4.6", "haiku-4.5", "gpt-5", …).
+   * Friendly model id ("opus-4.8", "sonnet-4.6", "haiku-4.5", "gpt-5", …).
    * Mapped to a `--model <name>` flag in `src/bun/agents.ts`. NULL means
    * "use the agent's default model" (no flag passed).
    */
@@ -243,6 +243,13 @@ export interface Task {
   pendingInteractionCount: number;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Unix ms timestamp when the task was archived; null when not archived.
+   * Archived tasks remain in their column (always `done` in practice — the
+   * server rejects archive from other columns) but are hidden from the
+   * default kanban filter and rendered read-only in the run panel.
+   */
+  archivedAt: number | null;
 }
 
 /**
@@ -286,8 +293,8 @@ export interface AgentOptions {
  * CLI happens to default to.
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
-  "claude-code": "opus-4.7",
-  "codex": "gpt-5-codex",
+  "claude-code": "opus-4.8",
+  "codex": "gpt-5.5",
 };
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
@@ -338,7 +345,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "max", label: "Max", hint: "Absolute maximum effort. Slowest, most thorough." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Opus 4.7 / codex only." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Opus 4.8 / 4.7 / codex only." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
@@ -354,7 +361,8 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  *     Haiku 4.5 → effort parameter NOT supported
  *   - Codex `model_reasoning_effort`:
  *       https://developers.openai.com/codex/config-advanced
- *     gpt-5 / gpt-5-codex → low/medium/high/xhigh (minimal kept out of UI)
+ *     gpt-5.5 / gpt-5 / gpt-5-codex → low/medium/high/xhigh
+ *     (minimal kept out of UI)
  *
  * An empty list means "this model does not accept the effort flag at all"
  * (e.g. Haiku 4.5) — the UI collapses the dropdown and `buildCommand` emits
@@ -362,12 +370,13 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  */
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
-  // effort parameter is API-supported only on Opus 4.7 / Opus 4.6 / Sonnet 4.6
-  // / Opus 4.5 (xhigh is Opus-4.7-only; Sonnet 4.6 has no xhigh; Haiku 4.5
+  // effort parameter is API-supported on Opus 4.8 / 4.7 / 4.6 / Sonnet 4.6
+  // / Opus 4.5 (xhigh is Opus-only; Sonnet 4.6 has no xhigh; Haiku 4.5
   // doesn't support effort at all). The `/effort` CLI command accepts more
   // levels but the underlying API request would fail for unsupported pairs,
   // so we filter at the picker rather than letting the user fire bad runs.
   "claude-code": {
+    "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.7": ["max", "xhigh", "high", "medium", "low"],
     "sonnet-4.6": ["max", "high", "medium", "low"],
     // Haiku 4.5 doesn't support the effort parameter — `supportedEfforts`
@@ -375,6 +384,7 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "haiku-4.5": [],
   },
   codex: {
+    "gpt-5.5": ["xhigh", "high", "medium", "low"],
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
   },
@@ -403,12 +413,13 @@ export function supportedEfforts(agent: AgentKind, model: string | null): AgentO
  * directly) every mode agetor surfaces is universally supported across
  * claude models, so the deny list is empty. Kept as a structure rather
  * than removed so the picker stays ready for a future model-specific
- * carve-out (historic case: `--permission-mode auto` was Opus-only on
+ * carve-out (historic case: `--permission-mode auto` was Opus-4.7-only on
  * earlier releases). Unknown model ids fall back to the default model's
  * deny set — better than spawning a CLI-arg error mid-run.
  */
 const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   "claude-code": {
+    "opus-4.8": [],
     "opus-4.7": [],
     "sonnet-4.6": [],
     "haiku-4.5": [],
@@ -429,7 +440,8 @@ export function supportedModes(agent: AgentKind, model: string | null): AgentOpt
 export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   "claude-code": {
     models: [
-      { id: "opus-4.7", label: "Opus 4.7", hint: "Most capable; slower." },
+      { id: "opus-4.8", label: "Opus 4.8", hint: "Most capable; slower." },
+      { id: "opus-4.7", label: "Opus 4.7", hint: "Previous flagship." },
       { id: "sonnet-4.6", label: "Sonnet 4.6", hint: "Balanced." },
       { id: "haiku-4.5", label: "Haiku 4.5", hint: "Fast and cheap." },
     ],
@@ -448,8 +460,9 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
-      { id: "gpt-5", label: "GPT-5" },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Most capable; recommended default." },
       { id: "gpt-5-codex", label: "GPT-5 Codex" },
+      { id: "gpt-5", label: "GPT-5" },
     ],
     modes: [
       { id: "auto", label: "Auto (--full-auto)", hint: "Run without approval prompts." },
