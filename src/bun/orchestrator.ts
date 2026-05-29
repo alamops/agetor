@@ -42,6 +42,7 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName } from "./worktree.ts";
+import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
   ColumnId,
@@ -981,6 +982,9 @@ export async function createTask(
     // Derived from the in-memory interactions Maps in `interactions.ts`; a
     // brand-new task has no pending interactions, so 0 is the correct seed.
     pendingInteractionCount: 0,
+    // Derived from the in-memory terminal manager in `terminals.ts`; a
+    // brand-new task has no open terminals, so 0 is the correct seed.
+    openTerminalCount: 0,
     createdAt: now,
     updatedAt: now,
     archivedAt: null,
@@ -990,8 +994,10 @@ export async function createTask(
 
 /**
  * Archive a finished task: stamp `archivedAt`, kill its claude tmux session
- * (best-effort) so a background REPL doesn't outlive the user's interest in
- * the task. Worktree, run history, and prompt stay intact for later reference.
+ * AND any open terminal tabs (both best-effort) so no background shell outlives
+ * the user's interest in the task — once archived the card is hidden, so the
+ * user can no longer reach those shells to close them. Worktree, run history,
+ * and prompt stay intact for later reference.
  *
  * Only allowed when the task is in the `done` column — archive is the
  * terminal step of the explicit review → done → archive flow.
@@ -1019,6 +1025,12 @@ export function archiveTask(taskId: string): { task: Task } | { error: string } 
   // tmux teardown internally). Don't wrap — a silent catch would hide a
   // regression in claude-tmux from the next reviewer.
   if (resolveHarness(task.agent)?.kind === "claude-code") dropSession(taskId);
+  // Tear down terminal tabs too — same rationale as the tmux session above.
+  // Fire-and-forget (archive keeps the worktree, so there's no removal race);
+  // the synchronous part of killTerminalsForTask drops the tabs immediately,
+  // the awaited part just reaps the shells. `.catch` keeps the async function's
+  // best-effort failures from surfacing as an unhandled rejection.
+  void killTerminalsForTask(taskId).catch(() => { /* best-effort */ });
   return { task: updated };
 }
 
@@ -1050,6 +1062,10 @@ export async function deleteTask(taskId: string): Promise<void> {
   // here before tearing down the worktree so we don't leave an orphaned
   // session behind. No-op when the task is codex or no session exists.
   if (resolveHarness(task.agent)?.kind === "claude-code") dropSession(taskId);
+  // Kill any open terminal tabs before removing the worktree — a live shell
+  // sitting in the worktree dir would block `git worktree remove`. Awaited so
+  // the shells are actually gone before we tear the directory down.
+  await killTerminalsForTask(taskId);
   await removeWorktree(task);
   // No per-task attachments directory to clean up — refs are path-only,
   // agetor never copied anything to disk.

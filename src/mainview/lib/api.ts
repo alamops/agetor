@@ -14,6 +14,7 @@ import type {
   Task,
   TaskDiff,
   TaskReference,
+  TerminalTab,
   UpdateStatus,
 } from "../../shared/types.ts";
 
@@ -300,6 +301,17 @@ export const api = {
   startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
   archiveTask: (id: string) => j<Task>(`/tasks/${id}/archive`, { method: "POST" }),
   unarchiveTask: (id: string) => j<Task>(`/tasks/${id}/unarchive`, { method: "POST" }),
+
+  // Terminal tabs. State is in-memory on the bun side; the live byte stream
+  // runs over the WebSocket whose URL `terminalSocketUrl` builds.
+  listTerminals: (taskId: string) => j<TerminalTab[]>(`/tasks/${taskId}/terminals`),
+  createTerminal: (taskId: string) =>
+    j<TerminalTab>(`/tasks/${taskId}/terminals`, { method: "POST" }),
+  closeTerminal: (id: string) => j<void>(`/terminals/${id}`, { method: "DELETE" }),
+  /** ws:// URL for a terminal's duplex stream. EventSource-style token in the
+   *  query string since WebSockets can't set the Authorization header. */
+  terminalSocketUrl: (id: string) =>
+    `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?token=${encodeURIComponent(API_TOKEN)}`,
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
   /** Everything the task's worktree changed vs its pinned base. Empty `files`
    *  + a `note` when there's no worktree or no diff. */

@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Utils } from "electrobun/bun";
+import type { WebSocketHandler } from "bun";
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, getApiPort } from "./api-config.ts";
 import {
@@ -35,6 +36,17 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { getTaskDiff, hasUncommittedChanges, listBranches } from "./worktree.ts";
+import {
+  attachSocket,
+  closeTerminal,
+  createTerminal,
+  detachSocket,
+  getTerminal,
+  listTerminals,
+  writeTerminal,
+  resizeTerminal,
+  type TerminalSocketData,
+} from "./terminals.ts";
 import { listAvailableCommands } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
@@ -223,10 +235,39 @@ export function startApiServer() {
   // The auth token still gates the actual request body.
   ALLOWED_ORIGINS.add("views://mainview");
 
+  // Terminal-tab byte stream. Typed explicitly so `Bun.serve` infers the
+  // socket's `data` shape (TerminalSocketData) — that's what makes
+  // `server.upgrade(req, { data })` and `ws.data.terminalId` type-check.
+  // Text frames are JSON control messages (resize); binary frames are raw
+  // keystrokes fed straight to the PTY's stdin.
+  const terminalWebSocket: WebSocketHandler<TerminalSocketData> = {
+    open(ws) {
+      // Replay recent output, then stream live. If the terminal is already
+      // gone (closed/exited between upgrade and open), drop the socket.
+      if (!attachSocket(ws.data.terminalId, ws)) ws.close();
+    },
+    message(ws, message) {
+      if (typeof message === "string") {
+        try {
+          const msg = JSON.parse(message) as { t?: string; cols?: number; rows?: number };
+          if (msg.t === "resize" && typeof msg.cols === "number" && typeof msg.rows === "number") {
+            resizeTerminal(ws.data.terminalId, msg.cols, msg.rows);
+          }
+        } catch { /* ignore malformed control frames */ }
+        return;
+      }
+      writeTerminal(ws.data.terminalId, message as Uint8Array);
+    },
+    close(ws) {
+      detachSocket(ws.data.terminalId, ws);
+    },
+  };
+
   const server = Bun.serve({
     port: PORT,
     hostname: "127.0.0.1",
     development: false,
+    websocket: terminalWebSocket,
     routes: {
       // Unauthenticated probes only — never returns data.
       // `app: "agetor"` is a self-identifier the PreToolUse hook script
@@ -1646,6 +1687,31 @@ export function startApiServer() {
         }),
       },
 
+      // Terminal tabs for a task. State lives in-memory in terminals.ts; the
+      // live byte stream runs over the WebSocket at /terminals/:id/ws (handled
+      // in `fetch` below, since Bun's routes API doesn't do upgrades).
+      "/tasks/:id/terminals": {
+        GET: authed((req) => json(listTerminals(req.params.id), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const result = await createTerminal(req.params.id);
+          if ("error" in result) {
+            return json(
+              { error: result.error },
+              { status: result.notFound ? 404 : 400, headers: corsHeaders(req) },
+            );
+          }
+          return json(result, { status: 201, headers: corsHeaders(req) });
+        }),
+      },
+      "/terminals/:id": {
+        DELETE: authed((req) => {
+          const ok = closeTerminal(req.params.id);
+          return ok
+            ? new Response(null, { status: 204, headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/events": authed((req) => {
         const taskId = req.params.id;
         const stream = new ReadableStream({
@@ -1692,8 +1758,26 @@ export function startApiServer() {
         });
       }),
     },
-    fetch(req) {
+    fetch(req, server) {
       if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders(req) });
+      // WebSocket upgrade for a terminal tab's live byte stream. The routes API
+      // can't upgrade, so we match it here. Token-gated via `?token=` like the
+      // SSE endpoints (WebSockets can't set the Authorization header).
+      const url = new URL(req.url);
+      const wsMatch = url.pathname.match(/^\/terminals\/([^/]+)\/ws$/);
+      if (wsMatch) {
+        if (!isAuthorized(req)) return unauthorized(req);
+        const terminalId = decodeURIComponent(wsMatch[1]!);
+        // Reject unknown ids before upgrading, rather than upgrading then
+        // immediately closing the socket in the `open` handler.
+        if (!getTerminal(terminalId)) {
+          return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }
+        const upgraded = server.upgrade(req, { data: { terminalId } });
+        // `upgrade` returns true and assumes responsibility for the response.
+        if (upgraded) return undefined;
+        return json({ error: "websocket upgrade failed" }, { status: 426, headers: corsHeaders(req) });
+      }
       return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
     },
   });
