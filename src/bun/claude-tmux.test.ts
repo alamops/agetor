@@ -386,6 +386,30 @@ test("mapJsonlEventToChunks: user.content[].text → `user` stream (array-form p
   expect(out).toEqual([{ stream: "user", data: "hello there" }]);
 });
 
+test("mapJsonlEventToChunks: CR/LF in user content is normalized to \\n (tmux paste-buffer delivers \\n as \\r, dedup keys on bytes)", () => {
+  // String-form: claude transcribes the pasted prompt verbatim, including
+  // the `\r` characters tmux substituted for our `\n`s. Without normalization
+  // the JSONL emit's data differs byte-for-byte from the live `sendInput`
+  // emit (which has the original `\n`s), breaking the run panel's dedup.
+  const s = recorder();
+  mapJsonlEventToChunks(
+    JSON.stringify({ type: "user", message: { content: "line one\r\rline two\r\nline three" } }),
+    s.onChunk,
+  );
+  expect(s.out).toEqual([{ stream: "user", data: "line one\n\nline two\nline three" }]);
+
+  // Array-form: same normalization applies to every text block.
+  const a = recorder();
+  mapJsonlEventToChunks(
+    JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "text", text: "para one\r\rpara two" }] },
+    }),
+    a.onChunk,
+  );
+  expect(a.out).toEqual([{ stream: "user", data: "para one\n\npara two" }]);
+});
+
 test("mapJsonlEventToChunks: task-notification user message → `status` breadcrumb, not a user bubble", () => {
   const { out, onChunk } = recorder();
   const line = JSON.stringify({
