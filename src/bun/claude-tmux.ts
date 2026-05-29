@@ -409,8 +409,12 @@ function mapParsedEventToChunks(
               : "";
         // Strip a leading wrapper tag (`<local-command-caveat>`, `<task-notification>`,
         // …) so the breadcrumb reads as prose rather than raw markup.
+        // Split on any newline form — tmux/claude can leak `\r`-only
+        // separators into synthetic entries (same root cause as the
+        // human-turn CR normalization above), and `split("\n")` alone
+        // would leave the whole blob as one mashed line.
         const firstLine =
-          text.replace(/^\s*<[^>]+>/, "").split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+          text.replace(/^\s*<[^>]+>/, "").split(/\r\n?|\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
         const summary = firstLine.length > 140 ? firstLine.slice(0, 137) + "…" : firstLine;
         // Never let a synthetic entry vanish without a trace: if it had content
         // but yielded no text line (e.g. a non-text block), emit a generic label
@@ -427,8 +431,16 @@ function mapParsedEventToChunks(
       // prompt the same way; the run panel's dedup keys user events on
       // (runId, data) only (ignoring ts), so the live + JSONL paths
       // collapse into one bubble per message.
+      //
+      // Normalize CR-only / CRLF newlines to `\n` before emitting. tmux's
+      // paste-buffer delivers our `\n`-separated prompt to claude's TUI as
+      // `\r`, and claude transcribes those `\r` characters into the JSONL
+      // verbatim. The live emit uses `\n`, so without this normalization
+      // the live and JSONL `data` strings differ byte-for-byte and the
+      // panel's dedup (keyed on `data.slice(0,200)`) misses → duplicate
+      // bubble for every multi-line user message.
       if (typeof content === "string") {
-        if (content) onChunk("user", content, uuid);
+        if (content) onChunk("user", content.replace(/\r\n?/g, "\n"), uuid);
       } else if (Array.isArray(content)) {
         for (const block of content) {
           if (block?.type === "tool_result") {
@@ -442,7 +454,7 @@ function mapParsedEventToChunks(
               isError,
             }), uuid);
           } else if (block?.type === "text" && block.text) {
-            onChunk("user", block.text, uuid);
+            onChunk("user", block.text.replace(/\r\n?/g, "\n"), uuid);
           }
           // Image / unknown blocks intentionally silent.
         }

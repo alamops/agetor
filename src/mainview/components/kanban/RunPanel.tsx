@@ -325,11 +325,18 @@ function RunPanelBody({
     // clock) and once from the JSONL parser when claude transcribes it
     // (ts=Date.now() at flush time, or synthetic baseTs+i during a
     // rebuild). Drop ts from the key for user events so the two paths
-    // collapse to one bubble per message.
+    // collapse to one bubble per message. Also normalize CR/LF in the
+    // key: tmux's paste-buffer delivers our `\n`-separated prompt to
+    // claude as `\r`, and the JSONL stores those `\r`s verbatim — so
+    // without normalization the live (`\n`) and JSONL (`\r`) copies
+    // differ byte-for-byte in the first 200 chars and slip past dedup.
+    // The bun side normalizes too (claude-tmux.ts); this is belt-and-
+    // suspenders for any other path that might leak a CR through.
     const seen = new Set<string>();
+    const normalizeForKey = (s: string) => s.replace(/\r\n?/g, "\n");
     const keyFor = (e: RunEvent) =>
       e.stream === "user"
-        ? `user|${e.runId}|${(e.data ?? "").slice(0, 200)}`
+        ? `user|${e.runId}|${normalizeForKey(e.data ?? "").slice(0, 200)}`
         : `${e.ts}|${e.runId}|${e.stream}|${(e.data ?? "").slice(0, 200)}`;
     const unsub = api.subscribeTask(task.id, (e) => {
       const key = keyFor(e);
