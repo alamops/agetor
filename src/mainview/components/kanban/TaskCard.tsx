@@ -1,6 +1,6 @@
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, CheckCircle2, FolderOpen, GitBranch, MessageCircleQuestion, Play, Square, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, Square, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,12 +15,13 @@ interface Props {
   onCancel: (t: Task) => void;
   onDelete: (t: Task) => void;
   onOpen: (t: Task) => void;
+  onDiff: (t: Task) => void;
   onMarkDone: (t: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
 }
 
-export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, onMarkDone, onArchive, onUnarchive }: Props) {
+export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
   const archived = task.archivedAt != null;
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
@@ -156,6 +157,9 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, o
               <ArchiveRestore className="size-3" />
             </Button>
           )}
+          <Button size="icon" variant="ghost" onClick={() => onDiff(task)} title="View changes (git diff)">
+            <GitCompare className="size-3" />
+          </Button>
           <Button size="icon" variant="ghost" onClick={() => onDelete(task)} title="Delete task">
             <Trash2 className="size-3" />
           </Button>

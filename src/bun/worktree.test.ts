@@ -173,6 +173,83 @@ test("prepareWorkdir re-attaches existing branch when worktree dir was manually 
   expect(log).toContain("agent work");
 });
 
+test("getTaskDiff returns a friendly note when the task has no worktree", async () => {
+  const { getTaskDiff } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const off = await getTaskDiff(fakeTask({ workdir: repo, isolation: "none" }));
+  expect(off.files).toEqual([]);
+  expect(off.note).toContain("worktree isolation");
+
+  const notYet = await getTaskDiff(fakeTask({ workdir: repo, worktreePath: null }));
+  expect(notYet.files).toEqual([]);
+  expect(notYet.note).toContain("hasn't created a worktree");
+});
+
+test("getTaskDiff reports a clean worktree", async () => {
+  const { prepareWorkdir, getTaskDiff, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  const diff = await getTaskDiff({ ...task, worktreePath: prepared.worktreePath, branch: prepared.branch });
+  expect(diff.files).toEqual([]);
+  expect(diff.note).toContain("No changes");
+  if (base) expect(diff.base).toBe(base.slice(0, 7));
+});
+
+test("getTaskDiff surfaces modified, committed, and newly-created files", async () => {
+  const { prepareWorkdir, getTaskDiff, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+  const cwd = prepared.cwd;
+
+  // Committed change to the tracked README.
+  writeFileSync(path.join(cwd, "README"), "hi\nthere\n");
+  await git(["commit", "-am", "edit readme"], cwd);
+  // Uncommitted new file (untracked).
+  writeFileSync(path.join(cwd, "fresh.txt"), "brand new\n");
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+  const diff = await getTaskDiff(live);
+
+  const readme = diff.files.find((f) => f.path === "README");
+  expect(readme).toBeDefined();
+  expect(readme!.status).toBe("modified");
+  expect(readme!.additions).toBeGreaterThan(0);
+  expect(readme!.hunks).toContain("there");
+
+  const fresh = diff.files.find((f) => f.path === "fresh.txt");
+  expect(fresh).toBeDefined();
+  expect(fresh!.status).toBe("added");
+  expect(fresh!.hunks).toContain("brand new");
+});
+
+test("getTaskDiff truncates a huge file's body but keeps honest line counts", async () => {
+  const { prepareWorkdir, getTaskDiff, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // ~30k lines easily clears the 200 KB per-file cap.
+  const lineCount = 30_000;
+  writeFileSync(path.join(prepared.cwd, "huge.txt"), Array.from({ length: lineCount }, (_, i) => `line ${i}`).join("\n") + "\n");
+
+  const diff = await getTaskDiff({ ...task, worktreePath: prepared.worktreePath, branch: prepared.branch });
+  const huge = diff.files.find((f) => f.path === "huge.txt");
+  expect(huge).toBeDefined();
+  expect(huge!.truncated).toBe(true);
+  // Body is capped, but the additions count reflects the full file, not 0.
+  expect(huge!.hunks.length).toBeLessThanOrEqual(200_000);
+  expect(huge!.additions).toBe(lineCount);
+});
+
 test("removeWorktree tears down both the worktree and the branch", async () => {
   const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
   const repo = await makeRepo();
