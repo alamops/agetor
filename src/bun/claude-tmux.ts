@@ -235,6 +235,12 @@ interface ContentBlock {
 }
 
 interface AssistantMessage {
+  /** Per-assistant-message id claude stamps so a turn split across multiple
+   *  JSONL lines (text → tool_use → text … all with the same `message.id`)
+   *  can be coalesced. `isEndTurnContinuation` matches against this to
+   *  defer firing a staged end_turn while same-message lines are still
+   *  arriving. */
+  id?: string;
   content?: ContentBlock[];
   stop_reason?: string;
 }
@@ -318,15 +324,41 @@ interface ParsedJsonlEvent {
 }
 
 /**
- * True for the assistant message that ends a turn. Pulled out so the dispatch
- * loop can decide whether a JSONL line drives queue bookkeeping (slot pop /
- * onEndOfTurn fire) WITHOUT first running `mapParsedEventToChunks` — that
- * matters for the dedup path, which must still pop the slot for end_turn
- * lines we've already replayed in a prior process, but must NOT re-emit any
- * user-visible chunks.
+ * True for an assistant JSONL line that claims to end a turn. Used by
+ * `dispatchLine` to decide whether to stage a pending end_turn. The claim
+ * may be spurious — claude stamps `stop_reason: "end_turn"` on *every* split
+ * line of a response (thinking, text, tool_use) even when the message is
+ * still mid-flight calling tools. `isEndTurnContinuation` in `dispatchLine`
+ * cancels the staged pending when the next line proves the turn isn't over.
  */
 function isEndOfTurnEvent(evt: ParsedJsonlEvent): boolean {
   return evt.type === "assistant" && evt.message?.stop_reason === "end_turn";
+}
+
+/**
+ * True when `next` proves that a staged end_turn was spurious — i.e. the
+ * turn is still in progress. Two cases:
+ *
+ * 1. Another split line of the *same* API-response message — claude stamped
+ *    `end_turn` on every block of the response, not just the last one.
+ *    Detected by matching `message.id` on both the staged and new lines.
+ *
+ * 2. A `user` line carrying `tool_result` blocks — the staged end_turn line
+ *    contained a tool_use, and this is the result coming back. The turn
+ *    cannot be over if a tool call is still being serviced.
+ */
+function isEndTurnContinuation(
+  next: ParsedJsonlEvent,
+  stagedMessageId: string | null,
+): boolean {
+  if (next.type === "assistant"
+      && stagedMessageId !== null
+      && next.message?.id === stagedMessageId) return true;
+  if (next.type === "user") {
+    const content = next.message?.content;
+    if (Array.isArray(content) && content.some((b) => b?.type === "tool_result")) return true;
+  }
+  return false;
 }
 
 /** Human-friendly millisecond formatter for `turn_duration` breadcrumbs.
@@ -509,8 +541,13 @@ function mapParsedEventToChunks(
             break;
         }
       }
+      // Signal a candidate turn-end. `dispatchLine` stages this and confirms
+      // it's real only when the *next* line is not a same-message continuation
+      // or a tool_result — see `isEndTurnContinuation`. The "turn complete"
+      // banner is emitted there, not here, so it never fires for spurious
+      // mid-flight splits (claude stamps end_turn on every content block of
+      // a response, not just the last one).
       if (msg.stop_reason === "end_turn") {
-        onChunk("status", "turn complete", uuid);
         return { endOfTurn: true, lineUuid: uuid };
       }
       return { endOfTurn: false, lineUuid: uuid };
@@ -803,6 +840,30 @@ interface SessionState {
    *  pending map, and we'd register a ghost duplicate before
    *  tmux/claude actually repainted. */
   recentlyAnsweredFingerprints: Map<string, number>;
+  /**
+   * A turn-end (`stop_reason: "end_turn"`) that has been observed but not yet
+   * confirmed as real. Claude stamps `end_turn` on *every* split line of a
+   * response (thinking, text, tool_use blocks) even when the message is still
+   * mid-flight. We stage the signal here and fire it — calling `popEndOfTurn`
+   * and emitting "turn complete" — only when the *next* JSONL line is not a
+   * same-message continuation or a `tool_result` (`isEndTurnContinuation`).
+   * Null when no end_turn is pending.
+   */
+  pendingEndTurn: {
+    /** `message.id` of the staged line — used to recognise same-response
+     *  split continuations (another content block of the same API call). */
+    messageId: string | null;
+    /** JSONL `uuid` of the staged line — forwarded as the dedup key on the
+     *  "turn complete" status event. */
+    uuid: string | undefined;
+    /** Whether to emit the "turn complete" banner when firing. False on the
+     *  reattach / dedup path where the prior process already broadcast it. */
+    emitBanner: boolean;
+    /** `Date.now()` when the pending was staged. Lets the idle path in
+     *  `flush` fire the pending after a short grace period when no further
+     *  JSONL data arrives (e.g., the end_turn line is truly the last write). */
+    stagedAt: number;
+  } | null;
 }
 
 interface TurnSlot {
@@ -841,6 +902,56 @@ const sessions = new Map<string, SessionState>(); // taskId → state
  * for long-lived sessions.
  */
 const pasteChains = new Map<string, Promise<void>>(); // taskId → in-flight chain tail
+
+/**
+ * Build a SessionState. Caller supplies the path-/launch-specific fields and
+ * any non-default initial state; the factory fills in the timer / scrape /
+ * staging defaults consistently. Centralising this keeps the four
+ * construction sites (`spawnClaudeViaTmux`, `reattachSession`,
+ * `rebuildEventsFromJsonl`, `__forTest.installSession`) from drifting when a
+ * new SessionState field is added — the previous reviews caught two cases
+ * where the field list got out of sync.
+ *
+ * Does NOT touch the global `sessions` map — callers register themselves.
+ */
+interface MakeSessionStateOpts {
+  taskId: string;
+  sessionName: string;
+  cwd: string;
+  jsonlPath: string;
+  offset?: number;
+  turnQueue?: TurnSlot[];
+  lastChunk?: ChunkHandler | null;
+  seenLineUuids?: Set<string>;
+  onEndOfTurn?: (() => void) | null;
+  permissionMode?: string | null;
+  bypassEnabled?: boolean;
+}
+
+function makeSessionState(o: MakeSessionStateOpts): SessionState {
+  return {
+    taskId: o.taskId,
+    sessionName: o.sessionName,
+    cwd: o.cwd,
+    jsonlPath: o.jsonlPath,
+    offset: o.offset ?? 0,
+    turnQueue: o.turnQueue ?? [],
+    lastChunk: o.lastChunk ?? null,
+    seenLineUuids: o.seenLineUuids ?? new Set(),
+    onEndOfTurn: o.onEndOfTurn ?? null,
+    permissionMode: o.permissionMode ?? null,
+    bypassEnabled: o.bypassEnabled ?? false,
+    // Defaults shared by every site — timers, scrape state, staging buffers.
+    watcher: null,
+    pollTimer: null,
+    onPermissionMode: null,
+    scrapeTimer: null,
+    scrapeLastFingerprint: null,
+    lastJsonlAppendAt: 0,
+    recentlyAnsweredFingerprints: new Map(),
+    pendingEndTurn: null,
+  };
+}
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * JSONL discovery + tail.
@@ -932,91 +1043,16 @@ function resumeJsonlOffset(jsonlPath: string): number {
   }
 }
 
-/** Dispatch one parsed JSONL line through the active turn slot's handler,
- *  advancing the queue when the line ends a turn. Shared between the
- *  async `flush` (file watcher / poll) and the sync `flushSync` (called
- *  from `sendTurn` so we drain leftover content before queueing a new
- *  turn). */
-function dispatchLine(state: SessionState, line: string): void {
-  // Parse once, then route. The parsed event carries `uuid` (claude stamps
-  // one per JSONL line); we use it as the dedup key — if we've already
-  // dispatched this line in a previous process (and it's still in
-  // run_events), skip the whole line so SSE-broadcast and run_events stay
-  // idempotent across an agetor restart.
-  let evt: ParsedJsonlEvent;
-  try {
-    evt = JSON.parse(line);
-  } catch (e) {
-    // Surface the parse error through whichever handler would have received
-    // a normal chunk — same routing as mapJsonlEventToChunks's own catch.
-    const handler = state.turnQueue[0]?.onChunk ?? state.lastChunk;
-    handler?.("stderr", `jsonl parse error: ${(e as Error).message}`);
-    return;
-  }
-  const uuid = typeof evt.uuid === "string" ? evt.uuid : undefined;
-
-  // Mirror the latest mode-bearing JSONL event into SessionState. Two
-  // consumers depend on this being current: `cycleToMode` (Shift+Tab
-  // press math against the live mode) and the `/approvals` route's
-  // plan-mode safety net (skip the saved-rule fast-path when claude is
-  // in `plan`, regardless of what the saved rule says).
-  //
-  // IMPORTANT: this update MUST stay above the seenLineUuids early-
-  // return below. On reattach the dedup set is pre-seeded from
-  // run_events, so every replayed line — including the mode event the
-  // prior process recorded — would otherwise be silently skipped and
-  // state.permissionMode would stay null. The mode is session metadata,
-  // not a per-line chunk the user sees twice, so re-applying it on a
-  // dedup hit is cheap and idempotent. Both event types carry the mode
-  // string (claude emits `system` at session start with the launch mode,
-  // then `permission-mode` for every mid-session change).
-  if ((evt.type === "system" || evt.type === "permission-mode")
-    && typeof evt.permissionMode === "string") {
-    state.permissionMode = evt.permissionMode;
-    // Fire any one-shot verification listener installed by `cycleToMode`.
-    // Snapshot+clear before invoking so a retry inside the listener can
-    // install a fresh listener for the next press without this fire
-    // clobbering it.
-    if (state.onPermissionMode) {
-      const cb = state.onPermissionMode;
-      state.onPermissionMode = null;
-      cb(evt.permissionMode);
-    }
-  }
-
-  // Already-seen lines (the reattach replay-from-offset-0 path is the
-  // common case) skip chunk emission so the UI doesn't see duplicate
-  // events. But we still have to drive queue bookkeeping for an end_turn
-  // here: when agetor crashed in the narrow window between persisting
-  // the end_turn line to `run_events` and updating `runs.status =
-  // 'succeeded'`, the line is in seenLineUuids on restart but the run
-  // row is still 'running'. Without this branch, the replay'd end_turn
-  // would be dropped before `onEndOfTurn` could fire, and the run would
-  // stay 'running' (and the UI "in progress") forever.
-  if (uuid && state.seenLineUuids.has(uuid)) {
-    if (isEndOfTurnEvent(evt)) popEndOfTurn(state);
-    return;
-  }
-
-  const slot = state.turnQueue[0];
-  // Active turn → its handler. No active turn → fall back to the most
-  // recently popped slot's handler so trailing metadata (permission-mode,
-  // summary, etc.) still threads onto the turn it belongs to instead of
-  // disappearing. If neither exists (session just opened, nothing emitted
-  // yet) it's safe to drop.
-  const onChunk: ChunkHandler = slot?.onChunk ?? state.lastChunk ?? (() => {});
-  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk);
-  if (uuid) state.seenLineUuids.add(uuid);
-  if (endOfTurn) popEndOfTurn(state);
-}
+/** How long a staged end_turn waits with no new JSONL data before we fire
+ *  it anyway. Covers the edge case where the end_turn line is the very last
+ *  write to the file (i.e., claude wrote nothing after it — no last-prompt,
+ *  no mode event). Two poll cycles at the 400ms pollTimer interval. */
+const END_TURN_IDLE_FIRE_MS = 800;
 
 /** Advance the turn queue on end_turn — either pop the head slot and
  *  resolve its `done` promise (fresh-spawn / live-stream path), or fire the
  *  one-shot `onEndOfTurn` listener (reattach path, where there's no slot
- *  but the orchestrator still needs to know the run completed). Shared by
- *  the dedup-skip and normal-dispatch branches of `dispatchLine` so a
- *  replayed end_turn whose chunk emission was suppressed still drives the
- *  run-row state transition. */
+ *  but the orchestrator still needs to know the run completed). */
 function popEndOfTurn(state: SessionState): void {
   const slot = state.turnQueue[0];
   if (slot) {
@@ -1035,6 +1071,145 @@ function popEndOfTurn(state: SessionState): void {
     state.onEndOfTurn = null;
     handler();
   }
+}
+
+/** Fire the staged `pendingEndTurn` — emit the "turn complete" banner (if
+ *  appropriate) and advance the turn queue. Called from `dispatchLine` when
+ *  the next line confirms the pending was a real turn-end, from `flushSync`
+ *  when a new prompt is being queued (new prompt = previous turn is over), and
+ *  from `flush` when no new data has arrived for long enough to rule out a
+ *  same-message continuation. */
+function firePendingEndTurn(state: SessionState): void {
+  const pending = state.pendingEndTurn;
+  if (!pending) return;
+  state.pendingEndTurn = null;
+  if (pending.emitBanner) {
+    // Emit through whichever handler is active. The slot hasn't been popped
+    // yet, so the active slot is still the right target.
+    const onChunk = state.turnQueue[0]?.onChunk ?? state.lastChunk ?? (() => {});
+    onChunk("status", "turn complete", pending.uuid);
+  }
+  popEndOfTurn(state);
+}
+
+/** Dispatch one parsed JSONL line through the active turn slot's handler,
+ *  advancing the queue when the line ends a turn. Shared between the
+ *  async `flush` (file watcher / poll) and the sync `flushSync` (called
+ *  from `sendTurn` so we drain leftover content before queueing a new
+ *  turn).
+ *
+ * Turn-end detection uses one-line staging to handle a claude streaming
+ * quirk: claude stamps `stop_reason: "end_turn"` on *every* split line of a
+ * response (thinking, text, tool_use blocks), not just the last. We stage the
+ * end_turn signal here and confirm — firing `popEndOfTurn` + "turn complete"
+ * — only when the NEXT line is not a same-message continuation or a
+ * tool_result. This prevents both the "run flips to succeeded mid-turn" bug
+ * and the spurious "TURN COMPLETE" divider spam it caused. */
+function dispatchLine(state: SessionState, line: string): void {
+  let evt: ParsedJsonlEvent;
+  try {
+    evt = JSON.parse(line);
+  } catch (e) {
+    const handler = state.turnQueue[0]?.onChunk ?? state.lastChunk;
+    handler?.("stderr", `jsonl parse error: ${(e as Error).message}`);
+    return;
+  }
+  const uuid = typeof evt.uuid === "string" ? evt.uuid : undefined;
+
+  // Mirror the latest mode-bearing JSONL event into SessionState.
+  // IMPORTANT: this update MUST stay above the seenLineUuids early-return.
+  // On reattach the dedup set is pre-seeded from run_events, so every
+  // replayed line — including mode events the prior process recorded — would
+  // otherwise be silently skipped and state.permissionMode would stay null.
+  if ((evt.type === "system" || evt.type === "permission-mode")
+    && typeof evt.permissionMode === "string") {
+    state.permissionMode = evt.permissionMode;
+    if (state.onPermissionMode) {
+      const cb = state.onPermissionMode;
+      state.onPermissionMode = null;
+      cb(evt.permissionMode);
+    }
+  }
+
+  // Staging step: the new line either confirms or cancels the pending end_turn.
+  // This must run before the dedup check so replayed lines also drive staging.
+  if (state.pendingEndTurn) {
+    if (isEndTurnContinuation(evt, state.pendingEndTurn.messageId)) {
+      // Same message still going, or tool_result for a tool_use in that
+      // message → the staged end_turn was spurious. Discard it.
+      state.pendingEndTurn = null;
+    } else {
+      // Something unrelated started → the previous turn truly ended. Fire.
+      firePendingEndTurn(state);
+    }
+  }
+
+  // Already-seen lines (reattach replay-from-offset-0) skip chunk emission
+  // but still stage an end_turn so the run-row status transition can fire
+  // when the next line confirms it. The banner is suppressed (emitBanner:
+  // false) because the prior process already broadcast it.
+  if (uuid && state.seenLineUuids.has(uuid)) {
+    if (isEndOfTurnEvent(evt)) {
+      state.pendingEndTurn = {
+        messageId: evt.message?.id ?? null,
+        uuid,
+        emitBanner: false,
+        stagedAt: Date.now(),
+      };
+    }
+    return;
+  }
+
+  const slot = state.turnQueue[0];
+  // Active turn → its handler. No active turn → fall back to the most
+  // recently popped slot's handler so trailing metadata still reaches the
+  // correct run. If neither exists it's safe to drop.
+  const onChunk: ChunkHandler = slot?.onChunk ?? state.lastChunk ?? (() => {});
+  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk);
+  if (uuid) state.seenLineUuids.add(uuid);
+  if (endOfTurn) {
+    // Stage: don't resolve the turn yet. The banner and slot-pop happen in
+    // `firePendingEndTurn` once the next line confirms this isn't a mid-flight
+    // split. If the file ends here, `flush` fires it after END_TURN_IDLE_FIRE_MS.
+    state.pendingEndTurn = {
+      messageId: evt.message?.id ?? null,
+      uuid,
+      emitBanner: true,
+      stagedAt: Date.now(),
+    };
+  }
+}
+
+/**
+ * Re-emit a finished session's JSONL as a chunk stream, using the same
+ * staging logic the live tailer uses. Drives `dispatchLine` against a
+ * synthetic single-slot SessionState — the slot's handler is `onChunk`, so
+ * every event (including "turn complete" banners that `firePendingEndTurn`
+ * emits when a turn is confirmed) flows through to the caller in the same
+ * shape the live SSE path produces. Fires any pending end_turn at EOF, since
+ * no further line can ever arrive to confirm it.
+ *
+ * Used by the `/runs/:id/rebuild-events` endpoint. Must NOT touch the live
+ * `sessions` map — the synthetic state is local and discarded on return.
+ */
+export function rebuildEventsFromJsonl(text: string, onChunk: ChunkHandler): void {
+  // Single synthetic slot routes every chunk to the caller's onChunk.
+  // Resolve/reject are no-ops — popEndOfTurn calls resolve?.(0) which is
+  // fine; the slot exists purely to carry the handler.
+  const state = makeSessionState({
+    taskId: "__rebuild__",
+    sessionName: "__rebuild__",
+    cwd: "/",
+    jsonlPath: "/__rebuild__",
+    turnQueue: [{ onChunk, resolve: null, reject: null }],
+    lastChunk: onChunk,
+  });
+  for (const line of text.split("\n")) {
+    if (line.trim()) dispatchLine(state, line);
+  }
+  // EOF — no continuation can ever arrive. Fire any staged pending so the
+  // last turn's "turn complete" banner makes it into the output.
+  if (state.pendingEndTurn) firePendingEndTurn(state);
 }
 
 /**
@@ -1065,6 +1240,11 @@ function flushSync(state: SessionState): void {
     if (!line) continue;
     dispatchLine(state, line);
   }
+  // flushSync is called from sendTurn before pushing a new prompt slot.
+  // A new human prompt is definitive proof the previous turn ended — fire any
+  // staged end_turn now so it resolves on the correct (old) slot, not the one
+  // we're about to push.
+  if (state.pendingEndTurn) firePendingEndTurn(state);
 }
 
 /** Read the file from `offset` to EOF, advancing the cursor. */
@@ -1105,7 +1285,17 @@ async function flush(state: SessionState): Promise<void> {
     state.turnQueue[0]?.onChunk("stderr", `jsonl read error: ${(e as Error).message}`);
     return;
   }
-  if (!chunk.text) return;
+  if (!chunk.text) {
+    // No new data. Fire any staged end_turn that has been waiting long enough
+    // for a continuation to arrive — if none came, the turn is over. The
+    // threshold is two poll cycles so a same-batch continuation arriving in
+    // the immediately next flush doesn't trigger a false fire.
+    if (state.pendingEndTurn
+        && Date.now() - state.pendingEndTurn.stagedAt >= END_TURN_IDLE_FIRE_MS) {
+      firePendingEndTurn(state);
+    }
+    return;
+  }
   // A sync flush already consumed (some of) what we just read. The bytes
   // we'd dispatch are duplicates → drop them. The next watcher / poll
   // tick will pick up anything appended after the sync flush from the
@@ -1482,18 +1672,12 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   const initialOffset = resumeJsonlOffset(jsonlPath);
 
   // Allocate the per-session state up front so flush() can find it.
-  const state: SessionState = {
+  const state = makeSessionState({
     taskId: opts.taskId,
     sessionName,
     cwd: opts.cwd,
     jsonlPath,
     offset: initialOffset,
-    watcher: null,
-    pollTimer: null,
-    turnQueue: [],
-    lastChunk: null,
-    seenLineUuids: new Set(),
-    onEndOfTurn: null,
     // Canonical claude mode string (e.g. "plan", "bypassPermissions"),
     // not the agetor-internal id ("plan", "bypass"). Seeding here means
     // the plan-mode safety check in `/approvals` works from the very
@@ -1505,16 +1689,11 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
     // task.mode since the prior session, in which case the launch flags
     // are the truth and the JSONL is stale.
     permissionMode: opts.mode ? toClaudeModeString(opts.mode) : null,
-    onPermissionMode: null,
     // `bypass` is the only agetor mode that emits the launch flag
     // (--dangerously-skip-permissions) — that's what puts
     // `bypassPermissions` into the Shift+Tab cycle.
     bypassEnabled: opts.mode === "bypass",
-    scrapeTimer: null,
-    scrapeLastFingerprint: null,
-    lastJsonlAppendAt: 0,
-    recentlyAnsweredFingerprints: new Map(),
-  };
+  });
   sessions.set(opts.taskId, state);
 
   const done = new Promise<number>((resolve, reject) => {
@@ -1551,8 +1730,12 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
       opts.onChunk("stderr", `--- tmux pane ---\n${pane}\n--- end pane ---`);
       killTaskSession(opts.taskId);
       sessions.delete(opts.taskId);
-      // Reject every queued turn so all dependent promises settle.
+      // Reject every queued turn so all dependent promises settle. Drop any
+      // staged end_turn — without claude's JSONL we can't confirm it, and
+      // letting it fire later would emit a "turn complete" for a turn that
+      // never actually completed.
       const err = new Error("jsonl-discovery-timeout");
+      state.pendingEndTurn = null;
       for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
       return;
     }
@@ -1606,39 +1789,30 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
     rejectDone = rej;
   });
 
-  const state: SessionState = {
+  // Replaying the JSONL from offset 0 re-runs every historical
+  // `system` / `permission-mode` line through `dispatchLine`. The
+  // permissionMode update there sits above the seenLineUuids dedup
+  // check, so even when the line's uuid is already in the dedup set
+  // (pre-seeded from run_events on reattach) the field still gets
+  // overwritten with whatever mode claude is currently in.
+  //
+  // The launch flag isn't persisted across agetor restarts, so we can't
+  // tell whether bypassPermissions is in the cycle on this reattach.
+  // Conservatively assume not (bypassEnabled defaults to false) — cycling
+  // to bypass after a restart needs a respawn (claude requires the flag
+  // at launch anyway).
+  const state = makeSessionState({
     taskId: opts.taskId,
     sessionName,
     cwd: opts.cwd,
     jsonlPath,
-    offset: 0,
-    watcher: null,
-    pollTimer: null,
-    turnQueue: [],
     // Trailing metadata that lands before the first new turn slot still
     // wants to flow to run_events — route it through the reattach handler
     // by seeding lastChunk, same pattern as spawnClaudeViaTmux.
     lastChunk: opts.onChunk,
     seenLineUuids: opts.seenLineUuids,
     onEndOfTurn: () => resolveDone?.(0),
-    // Replaying the JSONL from offset 0 re-runs every historical
-    // `system` / `permission-mode` line through `dispatchLine`. The
-    // permissionMode update there sits above the seenLineUuids dedup
-    // check, so even when the line's uuid is already in the dedup set
-    // (pre-seeded from run_events on reattach) the field still gets
-    // overwritten with whatever mode claude is currently in.
-    permissionMode: null,
-    onPermissionMode: null,
-    // The launch flag isn't persisted across agetor restarts, so we can't
-    // tell whether bypassPermissions is in the cycle on this reattach.
-    // Conservatively assume not — cycling to bypass after a restart needs
-    // a respawn (claude requires the flag at launch anyway).
-    bypassEnabled: false,
-    scrapeTimer: null,
-    scrapeLastFingerprint: null,
-    lastJsonlAppendAt: 0,
-    recentlyAnsweredFingerprints: new Map(),
-  };
+  });
   // Belt to reconcileOrphans's sort-and-dedup suspender: if some prior
   // reattach (or other code path) already left a SessionState in the map
   // for this taskId, dispose its watcher + pollTimer before we overwrite
@@ -1656,8 +1830,11 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
       // Stop-the-turn semantics match `makeAgent`: send Ctrl+C, reject any
       // queued slots (none here, but future-proof), reject the reattach
       // done promise so the orchestrator's done-handler records `cancelled`.
+      // Drop any staged end_turn so a late-arriving JSONL line can't fire it
+      // post-cancel and emit a spurious "turn complete" banner.
       tmux(["send-keys", "-t", s.sessionName, "C-c"]);
       const err = new Error("cancelled");
+      s.pendingEndTurn = null;
       for (const slot of s.turnQueue.splice(0)) slot.reject?.(err);
       s.onEndOfTurn = null;
       rejectDone?.(err);
@@ -1921,6 +2098,7 @@ function disposeSessionState(state: SessionState | undefined): void {
   state.scrapeLastFingerprint = null;
   state.onEndOfTurn = null;
   state.onPermissionMode = null;
+  state.pendingEndTurn = null;
   const err = new Error("session killed");
   for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
   // Drop the chain map entry — the identity gate inside `queueTmuxOp`
@@ -1937,11 +2115,14 @@ function makeAgent(taskId: string, done: Promise<number>): SpawnedAgent {
       // Interrupt every queued turn for this task. Ctrl+C aborts whatever
       // claude is doing in the TUI and clears its queued-input buffer
       // (anything we'd pasted while it was thinking). Reject the full
-      // queue so each run's done settles with "cancelled".
+      // queue so each run's done settles with "cancelled". Drop any staged
+      // end_turn so a late-arriving JSONL line can't fire it post-cancel
+      // and emit a spurious "turn complete" banner on the cancelled run.
       const state = sessions.get(taskId);
       if (!state) return;
       tmux(["send-keys", "-t", state.sessionName, "C-c"]);
       const err = new Error("cancelled");
+      state.pendingEndTurn = null;
       for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
     },
     writeInput: (line) => {
@@ -1969,26 +2150,12 @@ export const __forTest = {
   /** Register a synthetic session keyed on taskId, returning the queue
    *  + offset surface for assertions. */
   installSession(taskId: string, jsonlPath: string): SessionState {
-    const state: SessionState = {
+    const state = makeSessionState({
       taskId,
       sessionName: `agetor-test-${taskId}`,
       cwd: "/tmp",
       jsonlPath,
-      offset: 0,
-      watcher: null,
-      pollTimer: null,
-      turnQueue: [],
-      lastChunk: null,
-      seenLineUuids: new Set(),
-      onEndOfTurn: null,
-      permissionMode: null,
-      onPermissionMode: null,
-      bypassEnabled: false,
-      scrapeTimer: null,
-      scrapeLastFingerprint: null,
-      lastJsonlAppendAt: 0,
-      recentlyAnsweredFingerprints: new Map(),
-    };
+    });
     sessions.set(taskId, state);
     return state;
   },
@@ -2001,6 +2168,7 @@ export const __forTest = {
   flushSync,
   flush,
   dispatchLine,
+  firePendingEndTurn,
   matchNumberedModal,
   matchYesNoModal,
   resumeJsonlOffset,
