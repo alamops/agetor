@@ -314,7 +314,7 @@ export interface AgentOptions {
  * CLI happens to default to.
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
-  "claude-code": "opus-4.8",
+  "claude-code": "opus-4.7",
   "codex": "gpt-5.5",
 };
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
@@ -366,7 +366,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "max", label: "Max", hint: "Absolute maximum effort. Slowest, most thorough." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Opus 4.8 / 4.7 / codex only." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Opus 4.8 / 4.7 / 4.6 / codex only." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
@@ -399,6 +399,7 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   "claude-code": {
     "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.7": ["max", "xhigh", "high", "medium", "low"],
+    "opus-4.6": ["max", "xhigh", "high", "medium", "low"],
     "sonnet-4.6": ["max", "high", "medium", "low"],
     // Haiku 4.5 doesn't support the effort parameter — `supportedEfforts`
     // returns `[]` and the picker disables itself.
@@ -442,6 +443,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   "claude-code": {
     "opus-4.8": [],
     "opus-4.7": [],
+    "opus-4.6": [],
     "sonnet-4.6": [],
     "haiku-4.5": [],
   },
@@ -462,7 +464,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   "claude-code": {
     models: [
       { id: "opus-4.8", label: "Opus 4.8", hint: "Most capable; slower." },
-      { id: "opus-4.7", label: "Opus 4.7", hint: "Previous flagship." },
+      { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
+      { id: "opus-4.6", label: "Opus 4.6", hint: "Earlier Opus generation." },
       { id: "sonnet-4.6", label: "Sonnet 4.6", hint: "Balanced." },
       { id: "haiku-4.5", label: "Haiku 4.5", hint: "Fast and cheap." },
     ],
