@@ -654,6 +654,13 @@ export function getCurrentPermissionMode(taskId: string): string | null {
  *
  * Returns true on apparent success (tmux command exited 0). Silently
  * returns false when no session is registered.
+ *
+ * Latency: serialized behind any in-flight tmux op for the same task
+ * (paste-prompts included), so a click that lands while a `/model X`
+ * settle window is still elapsing waits up to `slashCommandSettleMs`
+ * (default 700ms) before the digit goes out. The server route at
+ * `server.ts:1420` awaits this Promise, so the modal-click HTTP
+ * response inherits the wait.
  */
 export async function dismissTmuxPrompt(taskId: string, key: string): Promise<boolean> {
   const state = sessions.get(taskId);
@@ -667,10 +674,25 @@ export async function dismissTmuxPrompt(taskId: string, key: string): Promise<bo
   // then the Enter confirms. The brief gap guarantees the two keystrokes
   // land in distinct reads on claude's stdin; `await Bun.sleep` (not the
   // sync variant) keeps the gap off the SSE/scrape event loop.
-  const sent = tmux(["send-keys", "-t", state.sessionName, key]);
-  if (!sent.ok) return false;
-  await Bun.sleep(50);
-  return tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok;
+  //
+  // Routed through `queueTmuxOp` so the digit + Enter pair can't
+  // interleave with an in-flight `queuePaste` for the same session — a
+  // racing user paste's `paste-buffer + Enter` between our digit and our
+  // Enter would land the paste text in the modal's input and confirm
+  // garbage. Sharing the chain serializes us behind any pending paste
+  // (and its settle window) before our keys go out.
+  let ok = false;
+  await queueTmuxOp(taskId, async (stillCurrent) => {
+    const sent = tmux(["send-keys", "-t", state.sessionName, key]);
+    if (!sent.ok) return;
+    await Bun.sleep(50);
+    // Re-gate before the trailing Enter: a `dropSession` during the
+    // 50ms gap (with a same-taskId respawn) would otherwise land the
+    // Enter in the new session's pane as a stray confirmation.
+    if (!stillCurrent()) return;
+    ok = tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok;
+  }, state);
+  return ok;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -792,6 +814,33 @@ interface TurnSlot {
 }
 
 const sessions = new Map<string, SessionState>(); // taskId → state
+
+/**
+ * Per-task FIFO of tmux operations (paste-prompt + modal-dismissal).
+ *
+ * Why this matters: PATCH /tasks/:id (model/effort change) and POST
+ * /runs/:id/input arrive as independent HTTP requests on localhost and
+ * can race to the orchestrator's tmux helpers. The webview can fire the
+ * input the instant PATCH resolves, while `reconcileTaskSession` is still
+ * pasting `/model X` into the pane. Without serialization the two
+ * `load-buffer` + `paste-buffer` + Enter sequences land back-to-back in
+ * tmux but reach claude's TUI while it's in a transient post-slash-command
+ * state — the user's paste was confirmed to vanish silently for ~49s in
+ * a real session (see "Turn Ended Bug" repro), then only re-appeared
+ * after a manual retry.
+ *
+ * The fix: a per-task lock that holds the next operation until the
+ * previous one's settle window has elapsed. Modal dismissals
+ * (`dismissTmuxPrompt`) share the same chain so a click on a numbered
+ * choice can't interleave its `"1"` + Enter keystrokes with an in-flight
+ * paste-buffer + Enter from `queuePaste`.
+ *
+ * The map's value is the tail promise of the in-flight chain; new ops
+ * append via `queueTmuxOp`. Entries self-evict on completion when no
+ * follow-up has chained behind them, so the map doesn't grow unbounded
+ * for long-lived sessions.
+ */
+const pasteChains = new Map<string, Promise<void>>(); // taskId → in-flight chain tail
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * JSONL discovery + tail.
@@ -1616,7 +1665,7 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
     writeInput: (line) => {
       const s = sessions.get(opts.taskId);
       if (!s) return false;
-      pastePrompt(s.sessionName, line);
+      void queuePaste(opts.taskId, s.sessionName, line, 0, s);
       return true;
     },
     done,
@@ -1649,7 +1698,7 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
   // replayed as a new user turn once the current one finishes. Our
   // `turnQueue` mirrors that: subsequent end_turn events pop slots in
   // FIFO order.
-  pastePrompt(state.sessionName, prompt);
+  void queuePaste(taskId, state.sessionName, prompt, 0, state);
   return makeAgent(taskId, done);
 }
 
@@ -1668,7 +1717,13 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
 export function sendSlashCommand(taskId: string, line: string): boolean {
   const state = sessions.get(taskId);
   if (!state) return false;
-  pastePrompt(state.sessionName, line);
+  // Settle delay after slash commands: claude's TUI takes ~hundreds of ms
+  // to process `/model` / `/effort` and return to a ready input prompt.
+  // Without the wait, a follow-up user paste (e.g. the next `sendTurn`
+  // racing on localhost) lands during the transient state and gets
+  // silently dropped — see the `Turn Ended Bug` repro where a
+  // `/code-review` paste sat invisible for 49s after a model change.
+  void queuePaste(taskId, state.sessionName, line, slashCommandSettleMs, state);
   return true;
 }
 
@@ -1740,13 +1795,14 @@ export async function cycleToMode(taskId: string, targetAgetorMode: string): Pro
   const target = toClaudeModeString(targetAgetorMode);
 
   // `/plan` works from any state, no cycle math needed. Prefer it.
-  // Fire-and-forget — `pastePrompt`'s tmux load-buffer / paste-buffer /
+  // Fire-and-forget — `queuePaste`'s tmux load-buffer / paste-buffer /
   // send-keys helpers swallow errors, and verifying via the JSONL would
   // require the same listener machinery the Shift+Tab path uses; for
   // `plan` the slash command is reliable enough that the added complexity
-  // doesn't pay for itself.
+  // doesn't pay for itself. Uses the slash-command settle window so a
+  // racing user paste lands after claude has processed the mode switch.
   if (target === CLAUDE_MODE_PLAN) {
-    pastePrompt(state.sessionName, "/plan");
+    void queuePaste(taskId, state.sessionName, "/plan", slashCommandSettleMs, state);
     return { ok: true, presses: 0, via: "slash-plan" };
   }
 
@@ -1867,6 +1923,12 @@ function disposeSessionState(state: SessionState | undefined): void {
   state.onPermissionMode = null;
   const err = new Error("session killed");
   for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
+  // Drop the chain map entry — the identity gate inside `queueTmuxOp`
+  // will already skip any in-flight thunks that captured the now-disposed
+  // `state` (they won't run their bodies), so this delete is just
+  // hygiene to release the map slot eagerly instead of waiting for the
+  // chain's self-evict `.finally` to fire.
+  pasteChains.delete(state.taskId);
 }
 
 function makeAgent(taskId: string, done: Promise<number>): SpawnedAgent {
@@ -1885,7 +1947,7 @@ function makeAgent(taskId: string, done: Promise<number>): SpawnedAgent {
     writeInput: (line) => {
       const state = sessions.get(taskId);
       if (!state) return false;
-      pastePrompt(state.sessionName, line);
+      void queuePaste(taskId, state.sessionName, line, 0, state);
       return true;
     },
     done,
@@ -1956,6 +2018,21 @@ export const __forTest = {
    *  mismatch`. Exposed so tests can assert against the constant rather
    *  than hardcoding "3". */
   MAX_VERIFY_ATTEMPTS,
+  /** Override the slash-command settle window. Tests shrink it to ~0
+   *  to avoid sleeping on every paste-queue assertion. Returns the
+   *  previous value so the test can restore it in `afterEach`. */
+  setSlashCommandSettleMs(ms: number): number {
+    const prev = slashCommandSettleMs;
+    slashCommandSettleMs = ms;
+    return prev;
+  },
+  getSlashCommandSettleMs(): number { return slashCommandSettleMs; },
+  /** Direct access to the paste queue for assertions. Read-only — tests
+   *  inspect ordering by observing tmux side effects, not by mutating
+   *  the chain. */
+  pasteChains,
+  queuePaste,
+  queueTmuxOp,
 };
 
 /**
@@ -1963,8 +2040,11 @@ export const __forTest = {
  * `load-buffer -` to avoid shell-quoting issues (the prompt may contain
  * newlines, dollar signs, quotes, …), paste it into the active window, then
  * press Enter to submit.
+ *
+ * Sync core — callers go through `queuePaste` so back-to-back pastes for the
+ * same task can't interleave at the tmux layer. See `queuePaste` for why.
  */
-function pastePrompt(sessionName: string, text: string): void {
+function pastePromptSync(sessionName: string, text: string): void {
   // load-buffer reads from stdin; -b names a tmux buffer we can target.
   const buf = `agetor-${sessionName}`;
   const load = tmux(["load-buffer", "-b", buf, "-"], { stdinText: text });
@@ -1972,4 +2052,135 @@ function pastePrompt(sessionName: string, text: string): void {
   tmux(["paste-buffer", "-b", buf, "-t", sessionName]);
   tmux(["delete-buffer", "-b", buf]);
   tmux(["send-keys", "-t", sessionName, "Enter"]);
+}
+
+/**
+ * Settle window after a slash-command paste before releasing the chain.
+ *
+ * Picked conservatively at 700ms — comfortably above the ~hundreds of ms
+ * claude's TUI takes to consume a `/model` / `/effort` / `/plan` line
+ * and repaint a ready prompt on an idle session. The original repro
+ * ("Turn Ended Bug") showed 0ms is wrong; the exact upper bound hasn't
+ * been measured under load, so the choice favors "definitely safe" over
+ * "minimum perceptible latency." The cost is one delay per slash command,
+ * applied before the *next* operation — never before the slash itself.
+ *
+ * Important caveat about what this delay actually buys: the timer starts
+ * when `pastePromptSync` returns (i.e. when tmux's `send-keys Enter`
+ * exits), NOT when claude has finished processing the slash command. On
+ * an idle REPL these are close enough that 700ms covers consumption +
+ * repaint. When claude is mid-turn, the slash command queues inside
+ * claude's input buffer; the timer expires while claude is still on the
+ * prior turn, but order is preserved by claude's own FIFO buffer — so
+ * the next paste lands behind the slash command anyway. The fragile case
+ * the lock plugs is the idle-REPL transient state, which the original
+ * bug exposed.
+ *
+ * Tests shrink the value to keep the queue suite fast.
+ */
+let slashCommandSettleMs = 700;
+
+/**
+ * Append a tmux operation to the per-task chain. The `fn` thunk runs
+ * after every prior op for the same task has settled. Errors thrown by
+ * `fn` are logged but never rejected onto the returned promise — one
+ * transient tmux failure shouldn't poison every subsequent op for the
+ * session. The returned promise resolves once `fn` (including any internal
+ * delays it awaits) has settled, which is when the *next* chained op
+ * becomes eligible to run. Callers fire-and-forget unless they need to
+ * synchronize with the op's completion (e.g. `dismissTmuxPrompt`, which
+ * needs to read the result of the final `send-keys Enter`).
+ *
+ * Used directly for ops that aren't a simple `paste-buffer + Enter`
+ * (modal dismissals send individual `send-keys` with their own internal
+ * gap). `queuePaste` is the convenience wrapper for the common case.
+ *
+ * `expectedState`, when provided, is captured at scheduling time and
+ * compared against `sessions.get(taskId)` right before `fn` runs (the
+ * one-shot entry gate) AND surfaced to `fn` as the `stillCurrent()`
+ * predicate so thunks with internal awaits can re-check between tmux
+ * calls. This closes the narrow race where `sessionNameFor(taskId)` is
+ * deterministic, so a re-spawn for the same task reuses the same tmux
+ * session name and a previously-queued op would otherwise send
+ * keystrokes into the *new* session — including the case where
+ * `dropSession` lands DURING `fn`'s `Bun.sleep` gap, leaving the
+ * trailing tmux call to leak into the respawned pane.
+ *
+ * ⚠️ Production callers MUST pass `expectedState`. The parameter is
+ * optional only because the unit test suite (`claude-tmux-queue.test.ts`)
+ * needs to drive the chain without installing a full SessionState for
+ * every ordering assertion; omitting it disables the gate entirely. If
+ * you're wiring up a new tmux op from any non-test code, pass the
+ * `SessionState` you got from `sessions.get(taskId)` — that's what
+ * makes the gate fire. The `expectedState`-less form behaves as if the
+ * gate is permanently open.
+ *
+ * `fn` receives a `stillCurrent()` predicate it can call before any
+ * post-await tmux work. When `expectedState` is omitted the predicate
+ * is always `true` (consistent with no-gate behavior).
+ */
+function queueTmuxOp(
+  taskId: string,
+  fn: (stillCurrent: () => boolean) => void | Promise<void>,
+  expectedState?: SessionState,
+): Promise<void> {
+  const stillCurrent = (): boolean =>
+    expectedState === undefined || sessions.get(taskId) === expectedState;
+  const prev = pasteChains.get(taskId) ?? Promise.resolve();
+  const next = prev.then(async () => {
+    // Identity-gate at body entry. `sessions.get(taskId) !== expectedState`
+    // means the session this op was queued against is gone — either
+    // disposed without a respawn (sessions.get returns undefined) or
+    // disposed and respawned as a fresh SessionState reusing the
+    // taskId. In both cases the right behavior is to drop the op.
+    // `fn` itself can re-check via the same predicate between awaits.
+    if (!stillCurrent()) return;
+    await fn(stillCurrent);
+  }).catch((e) => {
+    console.error(`tmux op chain error for task ${taskId}:`, e);
+  });
+  pasteChains.set(taskId, next);
+  // Self-evict when this is still the tail — keeps the map from
+  // accumulating entries for tasks that have gone idle. If something
+  // chained after us, the newer entry now owns the slot and we leave
+  // it alone. Identity check guards against the racy ordering where
+  // a follow-up op's `set(taskId, newer)` runs before our finally fires.
+  void next.finally(() => {
+    if (pasteChains.get(taskId) === next) pasteChains.delete(taskId);
+  });
+  return next;
+}
+
+/**
+ * Convenience wrapper over `queueTmuxOp` for the common case: paste
+ * `text` into `sessionName` and (optionally) hold the chain for
+ * `settleMs` afterwards so claude's TUI has time to finish processing
+ * the line before the next op runs.
+ *
+ * The returned promise resolves AFTER the paste AND the settle delay —
+ * i.e. when the next chained op becomes eligible, NOT when tmux has
+ * received the paste. Callers awaiting "did tmux get the keystrokes"
+ * should not infer that from this promise; the only thing the promise
+ * guarantees is chain ordering.
+ *
+ * Pass `expectedState` to gate the paste on the session still being
+ * the one this paste was scheduled against — see `queueTmuxOp` for the
+ * race this closes.
+ */
+function queuePaste(
+  taskId: string,
+  sessionName: string,
+  text: string,
+  settleMs: number,
+  expectedState?: SessionState,
+): Promise<void> {
+  // No mid-body re-gate needed: pastePromptSync delivers all four tmux
+  // calls (load-buffer + paste-buffer + delete-buffer + send-keys Enter)
+  // synchronously before the optional settle sleep. The settle is pure
+  // waiting — no tmux calls happen after it within this body — so a
+  // dispose during the sleep can't leak keystrokes.
+  return queueTmuxOp(taskId, async () => {
+    pastePromptSync(sessionName, text);
+    if (settleMs > 0) await Bun.sleep(settleMs);
+  }, expectedState);
 }
