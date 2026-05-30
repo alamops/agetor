@@ -1043,6 +1043,29 @@ export function startApiServer() {
         }),
       },
 
+      // Open a URL in the OS default browser via Electrobun's native bridge.
+      // Restricted to http(s)/mailto so an attacker-controlled prompt can't
+      // launch `file://` or custom-scheme handlers from a webview click.
+      "/open-external": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { url?: string };
+          const raw = typeof body.url === "string" ? body.url.trim() : "";
+          if (!raw) {
+            return json({ error: "url required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!/^(https?|mailto):/i.test(raw)) {
+            // Don't echo the raw URL — keeps user-supplied content out of any
+            // downstream log line that might pick the response body up.
+            return json(
+              { error: "unsupported url scheme (only http, https, mailto)" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const ok = Utils.openExternal(raw);
+          return json({ opened: ok, url: raw }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // Open a native macOS open-panel and return whatever the user picked as
       // file/folder references. This is the reliable way to get absolute
       // paths into the prompt: WKWebView never populates the non-standard

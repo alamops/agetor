@@ -337,6 +337,17 @@ export const api = {
     }),
 
   /**
+   * Open an http(s) or mailto URL in the OS default browser. The webview is
+   * sandboxed; `target="_blank"` does nothing, so anchor clicks need to
+   * round-trip through the Bun main process to reach `Utils.openExternal`.
+   */
+  openExternal: (url: string) =>
+    j<{ opened: boolean; url: string }>(`/open-external`, {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    }),
+
+  /**
    * Open the claude-code task's tmux session in a new Terminal.app window.
    * Returns the session name on success. Server-side checks the session is
    * actually live and that the task uses a claude-code harness.
