@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-queue-"));
 
-const { __forTest } = await import("./claude-tmux.ts");
+const { __forTest, dismissTmuxPrompt } = await import("./claude-tmux.ts");
 
 // Each test gets its own taskId + JSONL file so they can't trample each
 // other. The dispatch logic is purely synchronous on flushSync (we don't
@@ -247,4 +247,271 @@ test("partial trailing line is left for the next flush", async () => {
   } finally {
     __forTest.uninstallSession(taskId);
   }
+});
+
+// ─── pasteChain ordering (regression for the "Turn Ended Bug" — model
+// change races a follow-up user paste, the user's message lands during
+// claude's transient slash-command processing and vanishes silently).
+// The fix is `queueTmuxOp` (and its `queuePaste` wrapper), which
+// serializes all tmux ops for a task behind a single chain and holds
+// the slot for the slash command's settle window so the next op lands
+// on a ready prompt. These tests drive the chain directly and assert
+// ordering + timing. ───
+
+/**
+ * Snapshot + restore the `AGETOR_TMUX_BIN` env var around a test body.
+ * The chain calls `pastePromptSync` → `tmux()` → `Bun.spawnSync(bin, …)`;
+ * pointing the bin at a no-op `true` lets the chain advance without
+ * needing a real tmux. Restoring on exit keeps the env clean for later
+ * tests in the same process (tmux probes elsewhere read this var).
+ *
+ * `/usr/bin/true` works on both macOS (where `/bin/true` doesn't exist)
+ * and most Linux distros. Choosing the path matters — a missing binary
+ * makes `Bun.spawnSync` throw `ENOENT`, which the `tmux()` helper catches
+ * and surfaces as `{ok: false}`. That silently degrades tests that need
+ * the tmux calls to "succeed" (e.g. `dismissTmuxPrompt` returning true).
+ */
+const FAKE_TMUX_BIN = "/usr/bin/true";
+
+function withFakeTmuxBin<T>(fn: () => Promise<T>): Promise<T> {
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = FAKE_TMUX_BIN;
+  return fn().finally(() => {
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  });
+}
+
+test("queuePaste: chained pastes run in FIFO order", async () => {
+  await withFakeTmuxBin(async () => {
+    const prev = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const taskId = randomUUID();
+      const log: string[] = [];
+
+      // Resolve order observed via the .then chain on each returned promise.
+      const a = __forTest.queuePaste(taskId, "sess-x", "first", 0).then(() => log.push("a"));
+      const b = __forTest.queuePaste(taskId, "sess-x", "second", 0).then(() => log.push("b"));
+      const c = __forTest.queuePaste(taskId, "sess-x", "third", 0).then(() => log.push("c"));
+
+      await Promise.all([a, b, c]);
+      expect(log).toEqual(["a", "b", "c"]);
+      // Chain self-evicts when no follow-ups are pending.
+      expect(__forTest.pasteChains.has(taskId)).toBe(false);
+    } finally {
+      __forTest.setSlashCommandSettleMs(prev);
+    }
+  });
+});
+
+test("queuePaste: settle window holds the next paste for slash commands", async () => {
+  // Settle window chosen large enough that a 30ms scheduling tolerance
+  // still keeps the assertion meaningful (settle MUST add ≥ SETTLE−TOLERANCE
+  // vs. the 0ms baseline). Loose enough that a busy CI runner that wakes
+  // the timer a few ms early won't flake the test.
+  const SETTLE = 120;
+  const TOLERANCE = 30;
+  await withFakeTmuxBin(async () => {
+    const prev = __forTest.setSlashCommandSettleMs(SETTLE);
+    try {
+      const taskId = randomUUID();
+      const t0 = performance.now();
+      // First paste claims the slash-command settle window.
+      const slash = __forTest.queuePaste(
+        taskId,
+        "sess-x",
+        "/model claude-opus-4-7",
+        __forTest.getSlashCommandSettleMs(),
+      );
+      // Follow-up user paste: zero settle, but must wait behind the slash
+      // command's window before it runs.
+      const userPaste = __forTest.queuePaste(taskId, "sess-x", "real user msg", 0);
+
+      let slashResolvedAt: number | null = null;
+      let userResolvedAt: number | null = null;
+      void slash.then(() => { slashResolvedAt = performance.now() - t0; });
+      void userPaste.then(() => { userResolvedAt = performance.now() - t0; });
+
+      await userPaste;
+
+      // The slash paste resolves first, after ~SETTLE ms (the settle window).
+      expect(slashResolvedAt).not.toBeNull();
+      expect(slashResolvedAt!).toBeGreaterThanOrEqual(SETTLE - TOLERANCE);
+      // The user paste resolves AFTER the slash paste — never before.
+      expect(userResolvedAt).not.toBeNull();
+      expect(userResolvedAt!).toBeGreaterThanOrEqual(slashResolvedAt!);
+    } finally {
+      __forTest.setSlashCommandSettleMs(prev);
+    }
+  });
+});
+
+test("queuePaste: pastes for different taskIds don't block each other", async () => {
+  await withFakeTmuxBin(async () => {
+    const SETTLE = 120;
+    const prev = __forTest.setSlashCommandSettleMs(SETTLE);
+    try {
+      const taskA = randomUUID();
+      const taskB = randomUUID();
+
+      // Task A's slash command holds a 120ms settle window.
+      const slashA = __forTest.queuePaste(taskA, "sess-a", "/model X", SETTLE);
+      const t0 = performance.now();
+      // Task B's paste should be able to run immediately — independent
+      // chain. If we accidentally globalized the lock, this would wait
+      // ~SETTLE ms.
+      await __forTest.queuePaste(taskB, "sess-b", "user msg", 0);
+      const elapsed = performance.now() - t0;
+
+      // Generous upper bound — proves task-B is NOT serialized behind
+      // task-A's settle. On a healthy run elapsed is ~0–5ms.
+      expect(elapsed).toBeLessThan(SETTLE / 2);
+      await slashA;
+    } finally {
+      __forTest.setSlashCommandSettleMs(prev);
+    }
+  });
+});
+
+test("queueTmuxOp: dismissTmuxPrompt-style op serializes behind a queued paste", async () => {
+  // Regression for the dismiss/paste interleave: a modal click's `"1"`
+  // + Enter must not land between an in-flight paste's `paste-buffer`
+  // and its `Enter`. Both operations share the same chain, so the
+  // dismissal can only run after the paste's chain slot has settled.
+  await withFakeTmuxBin(async () => {
+    const prev = __forTest.setSlashCommandSettleMs(60);
+    try {
+      const taskId = randomUUID();
+      const order: string[] = [];
+
+      // A slash paste with settle holds the chain briefly.
+      const slash = __forTest.queuePaste(taskId, "sess-x", "/model X", 60)
+        .then(() => order.push("paste-done"));
+      // Dismissal queued behind it via the generic op primitive.
+      const dismiss = __forTest.queueTmuxOp(taskId, async () => {
+        // Sentinel inside the op body so we can confirm it ran after
+        // the paste's chain slot settled, not interleaved with it.
+        order.push("dismiss-body");
+      }).then(() => order.push("dismiss-done"));
+
+      await Promise.all([slash, dismiss]);
+      // The dismissal body MUST run after the paste's chain slot
+      // resolved — never between paste-buffer and Enter.
+      expect(order).toEqual(["paste-done", "dismiss-body", "dismiss-done"]);
+    } finally {
+      __forTest.setSlashCommandSettleMs(prev);
+    }
+  });
+});
+
+test("dismissTmuxPrompt waits behind an in-flight paste on the same task", async () => {
+  // Direct test of the user-facing function (not just the underlying
+  // queueTmuxOp primitive): a modal click that lands while a slash
+  // command is mid-settle must be held by the chain. This is what
+  // prevents the original "Turn Ended Bug" race from re-opening at the
+  // dismissal path.
+  await withFakeTmuxBin(async () => {
+    const SETTLE = 100;
+    const TOLERANCE = 30;
+    const prev = __forTest.setSlashCommandSettleMs(SETTLE);
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    try {
+      const t0 = performance.now();
+      // Slash command holds the chain for SETTLE ms.
+      const pastePromise = __forTest.queuePaste(
+        taskId,
+        state.sessionName,
+        "/model X",
+        SETTLE,
+        state,
+      );
+      // Modal dismissal queued behind it. With the chain wired up
+      // through dismissTmuxPrompt, this can only resolve after the
+      // paste's settle window has elapsed.
+      const dismissedAtPromise = dismissTmuxPrompt(taskId, "1").then((ok) => ({
+        elapsed: performance.now() - t0,
+        ok,
+      }));
+      await pastePromise;
+      const { elapsed, ok } = await dismissedAtPromise;
+      // Assert the body actually ran — a silently identity-gated body
+      // would still satisfy the timing bound below, so we need this
+      // first. `ok` is only set inside the body, after the second
+      // `send-keys`, so `true` proves the dismissal reached completion.
+      expect(ok).toBe(true);
+      expect(elapsed).toBeGreaterThanOrEqual(SETTLE - TOLERANCE);
+    } finally {
+      __forTest.setSlashCommandSettleMs(prev);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("dismissTmuxPrompt mid-body re-gate: trailing Enter skipped when session is disposed during the gap", async () => {
+  // Covers the residual race the entry-only identity gate left open:
+  // a `dropSession` lands during the 50ms gap between digit and Enter,
+  // and the trailing `send-keys Enter` would otherwise leak into the
+  // respawned pane as a stray confirmation. The thunk's `stillCurrent()`
+  // re-check before the second tmux call closes it.
+  await withFakeTmuxBin(async () => {
+    const prev = __forTest.setSlashCommandSettleMs(0);
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    try {
+      // Kick off the dismissal — its first send-keys runs synchronously
+      // before the 50ms sleep starts.
+      const dismissPromise = dismissTmuxPrompt(taskId, "1");
+      // After the first send-keys is on the wire but during the gap,
+      // drop and respawn the session for the same taskId. Wait ~20ms
+      // to land squarely inside the dismissal's 50ms internal sleep.
+      await Bun.sleep(20);
+      __forTest.uninstallSession(taskId);
+      __forTest.installSession(taskId, jsonlPath);
+
+      const ok = await dismissPromise;
+      // With the mid-body re-gate, the second send-keys is skipped, so
+      // `ok` (set only on the trailing send-keys success) stays false.
+      // Without the re-gate this test would observe `ok === true` AND
+      // the new session's pane would have received a stray Enter.
+      expect(ok).toBe(false);
+    } finally {
+      __forTest.uninstallSession(taskId);
+      __forTest.setSlashCommandSettleMs(prev);
+    }
+  });
+});
+
+test("queueTmuxOp: skips its body if the session was disposed between scheduling and execution", async () => {
+  // Closes the race where `sessionNameFor(taskId)` is deterministic, so
+  // a same-taskId respawn reuses the tmux session name — a previously-
+  // queued op would otherwise send keystrokes into the *new* session.
+  // The `expectedState` identity guard inside queueTmuxOp prevents that.
+  await withFakeTmuxBin(async () => {
+    const prev = __forTest.setSlashCommandSettleMs(0);
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    try {
+      let ranOldChainOp = false;
+      // Schedule an op against the ORIGINAL state. Use a microtask gap
+      // (Promise.resolve()) so the dispose below lands before the
+      // thunk would otherwise run.
+      const gated = __forTest.queueTmuxOp(taskId, async () => {
+        ranOldChainOp = true;
+      }, state);
+      // Dispose the original session and install a fresh one for the
+      // same taskId — simulates dropSession + a follow-up
+      // spawnClaudeViaTmux reusing the task.
+      __forTest.uninstallSession(taskId);
+      __forTest.installSession(taskId, jsonlPath);
+
+      await gated;
+      // The thunk MUST have been skipped — the session it was queued
+      // against is gone.
+      expect(ranOldChainOp).toBe(false);
+    } finally {
+      __forTest.uninstallSession(taskId);
+      __forTest.setSlashCommandSettleMs(prev);
+    }
+  });
 });
