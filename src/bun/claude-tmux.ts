@@ -1842,7 +1842,7 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
     writeInput: (line) => {
       const s = sessions.get(opts.taskId);
       if (!s) return false;
-      void queuePaste(opts.taskId, s.sessionName, line, 0, s);
+      void queuePaste(opts.taskId, s.sessionName, line, 0, s, { bracketed: true });
       return true;
     },
     done,
@@ -1875,7 +1875,7 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
   // replayed as a new user turn once the current one finishes. Our
   // `turnQueue` mirrors that: subsequent end_turn events pop slots in
   // FIFO order.
-  void queuePaste(taskId, state.sessionName, prompt, 0, state);
+  void queuePaste(taskId, state.sessionName, prompt, 0, state, { bracketed: true });
   return makeAgent(taskId, done);
 }
 
@@ -2128,7 +2128,7 @@ function makeAgent(taskId: string, done: Promise<number>): SpawnedAgent {
     writeInput: (line) => {
       const state = sessions.get(taskId);
       if (!state) return false;
-      void queuePaste(taskId, state.sessionName, line, 0, state);
+      void queuePaste(taskId, state.sessionName, line, 0, state, { bracketed: true });
       return true;
     },
     done,
@@ -2212,12 +2212,22 @@ export const __forTest = {
  * Sync core — callers go through `queuePaste` so back-to-back pastes for the
  * same task can't interleave at the tmux layer. See `queuePaste` for why.
  */
-function pastePromptSync(sessionName: string, text: string): void {
+function pastePromptSync(sessionName: string, text: string, opts: { bracketed?: boolean } = {}): void {
   // load-buffer reads from stdin; -b names a tmux buffer we can target.
   const buf = `agetor-${sessionName}`;
   const load = tmux(["load-buffer", "-b", buf, "-"], { stdinText: text });
   if (!load.ok) return;
-  tmux(["paste-buffer", "-b", buf, "-t", sessionName]);
+  // `-p` wraps the paste in bracketed-paste codes (ESC[200~ … ESC[201~) when
+  // the app has requested bracketed-paste mode (claude's Ink TUI does). Long
+  // prompts otherwise arrive across multiple terminal reads, claude's paste
+  // heuristic fires per chunk (multiple `[Pasted text +N lines]` blocks) and
+  // the trailing Enter gets absorbed instead of submitting. Gated on
+  // `bracketed` so single-line slash commands (`/model`, `/effort`, `/plan`)
+  // still arrive as plain typed input — bracketed-paste readline handlers
+  // typically insert pasted text verbatim instead of dispatching it as a
+  // command, which would silently break the mode/model switchers.
+  const pasteFlags = opts.bracketed ? ["-p"] : [];
+  tmux(["paste-buffer", ...pasteFlags, "-b", buf, "-t", sessionName]);
   tmux(["delete-buffer", "-b", buf]);
   tmux(["send-keys", "-t", sessionName, "Enter"]);
 }
@@ -2341,6 +2351,7 @@ function queuePaste(
   text: string,
   settleMs: number,
   expectedState?: SessionState,
+  opts: { bracketed?: boolean } = {},
 ): Promise<void> {
   // No mid-body re-gate needed: pastePromptSync delivers all four tmux
   // calls (load-buffer + paste-buffer + delete-buffer + send-keys Enter)
@@ -2348,7 +2359,7 @@ function queuePaste(
   // waiting — no tmux calls happen after it within this body — so a
   // dispose during the sleep can't leak keystrokes.
   return queueTmuxOp(taskId, async () => {
-    pastePromptSync(sessionName, text);
+    pastePromptSync(sessionName, text, opts);
     if (settleMs > 0) await Bun.sleep(settleMs);
   }, expectedState);
 }
