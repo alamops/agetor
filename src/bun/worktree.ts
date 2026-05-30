@@ -374,25 +374,50 @@ function parseGitDiff(raw: string): DiffFile[] {
 }
 
 /**
- * Compute everything a task's worktree changed relative to its pinned base ref
- * — committed AND uncommitted changes to tracked files, plus newly created
- * (untracked) files synthesized as full additions. Returns a friendly `note`
- * (and empty `files`) when there's nothing to show: no worktree yet, isolation
- * off, or a clean tree. Never throws.
+ * Compute everything a task changed in its working directory — committed AND
+ * uncommitted changes to tracked files, plus newly created (untracked) files
+ * synthesized as full additions.
+ *
+ * For worktree-isolated tasks the diff is against the pinned `baseRef`; for
+ * isolation=none tasks it's against the workdir's current `HEAD` (so the user
+ * still gets uncommitted changes + untracked files, just without a stable
+ * pinned base — there isn't one without isolation).
+ *
+ * Returns a friendly `note` (and empty `files`) when there's nothing to show.
+ * Never throws.
  */
 export async function getTaskDiff(task: Task): Promise<TaskDiff> {
-  if (task.isolation !== "worktree") {
-    return { base: null, files: [], note: "Diff isn't available for tasks running without worktree isolation." };
-  }
-  if (!task.worktreePath || !existsSync(task.worktreePath)) {
-    return { base: null, files: [], note: "This task hasn't created a worktree yet — run it to see its changes here." };
+  let cwd: string;
+  let base: string;
+  let shortBase: string | null;
+  let emptyNote: string;
+
+  if (task.isolation === "worktree") {
+    if (!task.worktreePath || !existsSync(task.worktreePath)) {
+      return { base: null, files: [], note: "This task hasn't created a worktree yet — run it to see its changes here." };
+    }
+    cwd = task.worktreePath;
+    base = task.baseRef ?? "HEAD";
+    shortBase = task.baseRef ? task.baseRef.slice(0, 7) : null;
+    emptyNote = "No changes yet — the worktree matches its base.";
+  } else {
+    if (!existsSync(task.workdir) || !(await isGitRepo(task.workdir))) {
+      return { base: null, files: [], note: "Diff isn't available — the task's workdir isn't a git repo." };
+    }
+    // A fresh `git init` has no HEAD yet — `git diff HEAD` would fail with
+    // "ambiguous argument 'HEAD'". Short-circuit with a friendlier note
+    // instead of leaking the raw git error.
+    const head = await git(["rev-parse", "--verify", "HEAD"], task.workdir, 5_000);
+    if (!head.ok) {
+      return { base: null, files: [], note: "Diff isn't available yet — the workdir has no commits to diff against." };
+    }
+    cwd = task.workdir;
+    base = "HEAD";
+    shortBase = null;
+    emptyNote = "No changes yet — the workdir matches HEAD.";
   }
 
-  const cwd = task.worktreePath;
-  const base = task.baseRef ?? "HEAD";
-  const shortBase = task.baseRef ? task.baseRef.slice(0, 7) : null;
-
-  // Tracked changes (committed + working-tree) vs the pinned base.
+  // Tracked changes (committed + working-tree) vs the base.
   const tracked = await git(["diff", "--no-color", base], cwd);
   if (!tracked.ok) {
     return { base: shortBase, files: [], note: `Could not compute diff: ${tracked.stderr || tracked.stdout || "git diff failed"}` };
@@ -417,7 +442,7 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
   }
 
   if (files.length === 0) {
-    return { base: shortBase, files: [], note: "No changes yet — the worktree matches its base." };
+    return { base: shortBase, files: [], note: emptyNote };
   }
   files.sort((a, b) => a.path.localeCompare(b.path));
   if (files.length > MAX_FILES) {

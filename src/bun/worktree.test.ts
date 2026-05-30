@@ -177,13 +177,49 @@ test("prepareWorkdir re-attaches existing branch when worktree dir was manually 
 test("getTaskDiff returns a friendly note when the task has no worktree", async () => {
   const { getTaskDiff } = await import("./worktree.ts");
   const repo = await makeRepo();
+  // isolation=none against a clean repo reports no changes vs HEAD.
   const off = await getTaskDiff(fakeTask({ workdir: repo, isolation: "none" }));
   expect(off.files).toEqual([]);
-  expect(off.note).toContain("worktree isolation");
+  expect(off.note).toContain("matches HEAD");
 
   const notYet = await getTaskDiff(fakeTask({ workdir: repo, worktreePath: null }));
   expect(notYet.files).toEqual([]);
   expect(notYet.note).toContain("hasn't created a worktree");
+});
+
+test("getTaskDiff surfaces workdir changes for isolation=none tasks", async () => {
+  const { getTaskDiff } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "README"), "hi\nthere\n");
+  writeFileSync(path.join(repo, "fresh.txt"), "brand new\n");
+
+  const diff = await getTaskDiff(fakeTask({ workdir: repo, isolation: "none" }));
+  const readme = diff.files.find((f) => f.path === "README");
+  expect(readme).toBeDefined();
+  expect(readme!.status).toBe("modified");
+  expect(readme!.hunks).toContain("there");
+
+  const fresh = diff.files.find((f) => f.path === "fresh.txt");
+  expect(fresh).toBeDefined();
+  expect(fresh!.status).toBe("added");
+  expect(fresh!.hunks).toContain("brand new");
+});
+
+test("getTaskDiff reports a friendly note when isolation=none workdir isn't a git repo", async () => {
+  const { getTaskDiff } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-diff-"));
+  const diff = await getTaskDiff(fakeTask({ workdir: dir, isolation: "none" }));
+  expect(diff.files).toEqual([]);
+  expect(diff.note).toContain("isn't a git repo");
+});
+
+test("getTaskDiff reports a friendly note when isolation=none workdir has no commits", async () => {
+  const { getTaskDiff } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-empty-repo-"));
+  await git(["init", "-b", "main"], dir);
+  const diff = await getTaskDiff(fakeTask({ workdir: dir, isolation: "none" }));
+  expect(diff.files).toEqual([]);
+  expect(diff.note).toContain("no commits");
 });
 
 test("getTaskDiff reports a clean worktree", async () => {
