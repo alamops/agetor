@@ -20,6 +20,7 @@ import {
   isAgetorInterceptReply,
   jsonlPathFor,
   mapJsonlEventToChunks,
+  rebuildEventsFromJsonl,
   sessionNameFor,
   toClaudeModeString,
 } from "./claude-tmux.ts";
@@ -142,7 +143,12 @@ test("mapJsonlEventToChunks: image content block surfaces as a placeholder so th
   expect(out[0]).toEqual({ stream: "assistant", data: "[image]" });
 });
 
-test("mapJsonlEventToChunks: assistant with stop_reason=end_turn signals endOfTurn + status", () => {
+test("mapJsonlEventToChunks: assistant with stop_reason=end_turn signals endOfTurn (no banner — banner is emitted by dispatchLine on confirmation)", () => {
+  // mapJsonlEventToChunks now returns endOfTurn:true as a STAGING signal, not
+  // a fire signal. The "turn complete" banner is emitted by firePendingEndTurn
+  // in dispatchLine once the next line confirms the turn is really over. This
+  // prevents spurious banners when claude stamps end_turn on every split line
+  // of a response (thinking, text, tool_use) including mid-flight ones.
   const { out, onChunk } = recorder();
   const line = JSON.stringify({
     type: "assistant",
@@ -150,8 +156,50 @@ test("mapJsonlEventToChunks: assistant with stop_reason=end_turn signals endOfTu
   });
   const res = mapJsonlEventToChunks(line, onChunk);
   expect(res.endOfTurn).toBe(true);
-  const status = out.find((r) => r.stream === "status");
-  expect(status?.data).toBe("turn complete");
+  // Text chunk emitted normally.
+  expect(out.some((r) => r.stream === "assistant" && r.data === "done")).toBe(true);
+  // Banner NOT emitted here — dispatchLine emits it when confirmed.
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+});
+
+test("mapJsonlEventToChunks: stop_reason=end_turn with a tool_use block returns endOfTurn:true (staging signal) but no banner", () => {
+  // All end_turn lines — regardless of content type — return endOfTurn:true as
+  // a staging signal for dispatchLine. The "turn complete" banner is NOT emitted
+  // here; dispatchLine suppresses it until the next line confirms the turn is
+  // over (i.e., is not a same-message continuation or a tool_result). The
+  // tool_use chunk itself is still streamed normally.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: {
+      content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } }],
+      stop_reason: "end_turn",
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  // tool_use chunk still emitted — it carries real work.
+  expect(out.some((r) => r.stream === "tool_use")).toBe(true);
+  // Banner NOT emitted; dispatchLine emits it when confirmed.
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+});
+
+test("mapJsonlEventToChunks: stop_reason=end_turn with text+tool_use still returns endOfTurn:true (staging) with no banner", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    message: {
+      content: [
+        { type: "text", text: "let me check that" },
+        { type: "tool_use", id: "t2", name: "Read", input: {} },
+      ],
+      stop_reason: "end_turn",
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  expect(out.some((r) => r.stream === "assistant" && r.data === "let me check that")).toBe(true);
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
 });
 
 test("mapJsonlEventToChunks: system{subtype:turn_duration} emits the duration as a status breadcrumb", () => {
@@ -571,7 +619,10 @@ test("mapJsonlEventToChunks: forwards the JSONL line uuid as the third onChunk a
   expect(seen[0]?.uuid).toBe("line-uuid-123");
 });
 
-test("mapJsonlEventToChunks: end-of-turn marker also carries the line uuid", () => {
+test("mapJsonlEventToChunks: end-of-turn marker carries the line uuid on the return value", () => {
+  // The banner no longer comes from mapJsonlEventToChunks (it's emitted by
+  // dispatchLine's firePendingEndTurn when the turn is confirmed). The uuid is
+  // still accessible via res.lineUuid for the caller to stage correctly.
   const seen: { stream: string; uuid?: string }[] = [];
   const onChunk = (s: string, _d: string, uuid?: string) => seen.push({ stream: s, uuid });
   const line = JSON.stringify({
@@ -581,7 +632,9 @@ test("mapJsonlEventToChunks: end-of-turn marker also carries the line uuid", () 
   });
   const res = mapJsonlEventToChunks(line, onChunk);
   expect(res.endOfTurn).toBe(true);
-  expect(seen.find((s) => s.stream === "status")?.uuid).toBe("end-line");
+  expect(res.lineUuid).toBe("end-line");
+  // No "status" chunk from this function — the banner is emitted later by dispatchLine.
+  expect(seen.find((s) => s.stream === "status")).toBeUndefined();
 });
 
 test("toClaudeModeString translates agetor shorthand to canonical claude strings", () => {
@@ -660,40 +713,212 @@ test("system event updates state.permissionMode (dispatchLine path)", async () =
 });
 
 test("dispatchLine: already-seen end_turn still fires onEndOfTurn (reattach + crashed-before-status-update path)", async () => {
-  // Reattach scenario where agetor died in the narrow window between
-  // persisting the end_turn line to `run_events` and updating the run
-  // row to `succeeded`: on restart, seenLineUuids is pre-seeded from
-  // run_events, so the JSONL replay's end_turn line hits the dedup
-  // path. Without the popEndOfTurn carve-out, the slot/onEndOfTurn
-  // bookkeeping never runs and the run stays `running` forever — the
-  // exact UI symptom (badge stuck on "in progress" while the agent
-  // is actually done) that motivated this fix.
+  // Reattach scenario where agetor died in the narrow window between persisting
+  // the end_turn to `run_events` and updating the run row to `succeeded`. On
+  // restart seenLineUuids is pre-seeded, so the replayed end_turn hits the
+  // dedup path. It must STILL drive popEndOfTurn (via staging + firing on the
+  // next non-continuation line) so the run row transitions. Without this the
+  // run stays `running` (badge stuck "in progress") forever.
   const { __forTest } = await import("./claude-tmux.ts");
   const taskId = "task-end-turn-dedup-reattach";
   const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
 
   let endOfTurnFired = false;
   state.onEndOfTurn = () => { endOfTurnFired = true; };
-
-  // Seed the dedup set so the end_turn line is treated as already-seen,
-  // matching what `runs.seenLineUuids(runId)` would return on restart.
   state.seenLineUuids.add("end-turn-uuid-1");
 
-  // Also: emitted chunks must NOT include this line's content — the prior
-  // process already broadcast it to SSE + persisted it to run_events.
   const emitted: { stream: string; data: string }[] = [];
   state.lastChunk = (stream, data) => emitted.push({ stream, data });
 
   __forTest.dispatchLine(state, JSON.stringify({
     type: "assistant",
     uuid: "end-turn-uuid-1",
-    message: { role: "assistant", content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
+    message: { id: "msg-R", role: "assistant", content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
   }));
 
+  // Staged, not yet fired — needs a confirming next line.
+  expect(endOfTurnFired).toBe(false);
+  expect(state.pendingEndTurn?.messageId).toBe("msg-R");
+
+  // Non-continuation line fires it.  emitBanner:false so no "turn complete" emitted.
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1000 }));
   expect(endOfTurnFired).toBe(true);
-  // No duplicate "turn complete" / "done" — the prior process already
-  // emitted those.
-  expect(emitted).toEqual([]);
+  // Prior process already emitted "turn complete" — no duplicate.
+  expect(emitted.some((e) => e.data === "turn complete")).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: end_turn staging — tool_use line stages but tool_result cancels, slot never popped", async () => {
+  // The core of the fix: claude stamps end_turn on a tool_use split line.
+  // dispatchLine STAGES the pending end_turn (doesn't pop the slot yet).
+  // When the tool_result arrives on the next dispatchLine call, isEndTurnContinuation
+  // returns true → the pending is cancelled. The slot stays alive — the turn isn't over.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-staging-tooluse-cancel";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  // The buggy end_turn+tool_use line — should stage, not fire.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant",
+    uuid: "et-tu",
+    message: { id: "msg-abc", role: "assistant",
+      content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }],
+      stop_reason: "end_turn" },
+  }));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-abc");
+  expect(state.turnQueue.length).toBe(1); // not popped yet
+
+  // tool_result arrives → continuation → cancel the pending
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user",
+    uuid: "tr-1",
+    message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+  }));
+  expect(state.pendingEndTurn).toBeNull();
+  expect(state.turnQueue.length).toBe(1); // still alive
+  expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: end_turn staging — thinking/text split lines stage+cancel, real end fires on confirmation", async () => {
+  // Reproduces the EXACT Guest Mode failure sequence:
+  // line 120: end_turn [thinking]  → stage (was previously STILL_FIRES with hasPendingToolUse fix)
+  // line 121: end_turn [text]      → same message.id → cancel staged, re-stage
+  // line 122: end_turn [tool_use]  → same message.id → cancel, re-stage
+  // line 123: user [tool_result]   → continuation    → cancel
+  // No slot pop at any point — the turn is still in progress.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-staging-thinking-cancel";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  const donePromise = __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  const mkLine = (blk: object, uuid: string) => JSON.stringify({
+    type: "assistant", uuid,
+    message: { id: "msg-XYZ", role: "assistant", content: [blk], stop_reason: "end_turn" },
+  });
+
+  __forTest.dispatchLine(state, mkLine({ type: "thinking", thinking: "hmm" }, "u1"));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-XYZ");
+  expect(state.turnQueue.length).toBe(1);
+
+  __forTest.dispatchLine(state, mkLine({ type: "text", text: "I'll check" }, "u2"));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-XYZ"); // re-staged
+  expect(state.turnQueue.length).toBe(1);
+
+  __forTest.dispatchLine(state, mkLine({ type: "tool_use", id: "t1", name: "Bash", input: {} }, "u3"));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-XYZ"); // re-staged
+  expect(state.turnQueue.length).toBe(1);
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user", uuid: "u4",
+    message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] },
+  }));
+  expect(state.pendingEndTurn).toBeNull(); // cancelled
+  expect(state.turnQueue.length).toBe(1); // still alive
+
+  // Now a new different message arrives (a real turn end) → pending is null already,
+  // so no spurious fire. Verify no banner was emitted throughout.
+  expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+
+  // Cleanup: the donePromise never resolves (turn didn't end); that's correct.
+  // Reject it to avoid test hanging.
+  state.turnQueue[0]?.reject?.(new Error("cleanup"));
+  await donePromise.catch(() => {});
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: pending end_turn fires when next line is a non-continuation (real turn end confirmed)", async () => {
+  // When a real end_turn is followed by a non-tool_result, non-same-message
+  // line (e.g. a new user text prompt, or a last-prompt event), the pending
+  // fires: emits "turn complete" banner and pops the slot.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-staging-fires-on-confirm";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  const donePromise = __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant", uuid: "et-real",
+    message: { id: "msg-REAL", role: "assistant",
+      content: [{ type: "text", text: "all done!" }], stop_reason: "end_turn" },
+  }));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-REAL");
+  expect(state.turnQueue.length).toBe(1); // not popped yet
+
+  // Non-continuation line (a system event — different type, no same message.id)
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "sys-1", subtype: "turn_duration", durationMs: 5000,
+  }));
+
+  // Pending fired: banner emitted, slot popped
+  expect(state.pendingEndTurn).toBeNull();
+  expect(state.turnQueue.length).toBe(0);
+  expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
+  expect(await donePromise).toBe(0);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: already-seen end_turn (reattach/dedup) is staged and fires on next non-continuation line", async () => {
+  // The crash-between-persist-and-status-update case: an already-seen end_turn
+  // is staged (not fired immediately). On the next call with a non-continuation
+  // line, it fires — no banner (emitBanner:false), but popEndOfTurn runs so
+  // the run-row transitions correctly.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-dedup-et-staged";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+  state.seenLineUuids.add("seen-et-uuid");
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant", uuid: "seen-et-uuid",
+    message: { id: "msg-SEEN", role: "assistant",
+      content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
+  }));
+  // Staged, not fired yet.
+  expect(state.pendingEndTurn?.messageId).toBe("msg-SEEN");
+  expect(endOfTurnFired).toBe(false);
+
+  // Next non-continuation line fires it (emitBanner:false since it was dedup).
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1000 }));
+  expect(state.pendingEndTurn).toBeNull();
+  expect(endOfTurnFired).toBe(true);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: already-seen end_turn tool_use (dedup) cancelled by next tool_result — onEndOfTurn never fires", async () => {
+  // Dedup + tool_use: the pending is staged with emitBanner:false. If the
+  // next line is a tool_result (continuation), the pending is cancelled and
+  // onEndOfTurn never fires. The run SHOULD NOT be marked done here.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-dedup-tooluse-cancel";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  let endOfTurnFired = false;
+  state.onEndOfTurn = () => { endOfTurnFired = true; };
+  state.seenLineUuids.add("seen-tu-uuid");
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant", uuid: "seen-tu-uuid",
+    message: { id: "msg-TU", role: "assistant",
+      content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }],
+      stop_reason: "end_turn" },
+  }));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-TU");
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] },
+  }));
+  expect(state.pendingEndTurn).toBeNull();
+  expect(endOfTurnFired).toBe(false);
   __forTest.uninstallSession(taskId);
 });
 
@@ -730,12 +955,11 @@ test("dispatchLine: already-seen NON-end_turn line does NOT touch the turn queue
   __forTest.uninstallSession(taskId);
 });
 
-test("dispatchLine: already-seen end_turn pops the head turn slot (mid-pipeline dedup edge case)", async () => {
-  // Same carve-out, but for the live-stream path: if for any reason a
-  // duplicate end_turn line gets dispatched (e.g. a watcher fired and a
-  // sync flush both reached the same offset across an unlucky await
-  // suspension), we still want to advance the queue exactly once and
-  // resolve the head slot's `done` — not leak the slot.
+test("dispatchLine: already-seen end_turn pops the head turn slot after next confirming line (mid-pipeline dedup edge case)", async () => {
+  // Duplicate end_turn (watcher + sync-flush reaching same offset): the slot
+  // must be popped exactly once after the confirming next line. With staging,
+  // the dedup'd end_turn stages the pending (emitBanner:false), and the next
+  // non-continuation line fires it — resolving done and popping the slot.
   const { __forTest } = await import("./claude-tmux.ts");
   const taskId = "task-end-turn-dedup-live";
   const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
@@ -750,16 +974,161 @@ test("dispatchLine: already-seen end_turn pops the head turn slot (mid-pipeline 
   __forTest.dispatchLine(state, JSON.stringify({
     type: "assistant",
     uuid: "end-turn-uuid-2",
-    message: { role: "assistant", content: [], stop_reason: "end_turn" },
+    message: { id: "msg-D2", role: "assistant", content: [], stop_reason: "end_turn" },
   }));
 
-  // Slot popped, no chunks re-emitted on the slot's handler.
+  // Staged — not popped yet.
+  expect(state.turnQueue.length).toBe(1);
+  expect(state.pendingEndTurn?.messageId).toBe("msg-D2");
+
+  // Confirming next line (a system event — not a continuation).
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 100 }));
+
+  // Slot now popped; no duplicate chunks; done resolves.
   expect(state.turnQueue.length).toBe(0);
-  expect(recorded).toEqual([]);
-  // The slot's `done` promise resolves with exit code 0 (the dedup'd
-  // line was a real end_turn, just one we already saw).
+  expect(state.pendingEndTurn).toBeNull();
+  // No "turn complete" re-emitted (emitBanner:false on the dedup path).
+  expect(recorded.some((r) => r.data === "turn complete")).toBe(false);
   expect(await donePromise).toBe(0);
   __forTest.uninstallSession(taskId);
+});
+
+test("flush: fires a staged end_turn after END_TURN_IDLE_FIRE_MS with no new data (idle path)", async () => {
+  // Edge case: end_turn is the very last write to the JSONL — no following
+  // last-prompt, mode event, or tool_result arrives to trigger the fire
+  // via normal continuation logic. flush() detects idle (no new bytes +
+  // stagedAt age ≥ END_TURN_IDLE_FIRE_MS) and fires the pending directly.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync("/tmp/agetor-flush-idle-test-");
+  const jsonlPath = join(dir, "session.jsonl");
+  // Write a single end_turn line — this is the whole file.
+  writeFileSync(jsonlPath, JSON.stringify({
+    type: "assistant", uuid: "et-idle",
+    message: { id: "msg-IDLE", role: "assistant",
+      content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
+  }) + "\n");
+
+  const taskId = "task-flush-idle";
+  const state = __forTest.installSession(taskId, jsonlPath);
+  const recorded: { stream: string; data: string }[] = [];
+  const donePromise = __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  // First flush: reads the end_turn line, stages the pending.
+  await __forTest.flush(state);
+  expect(state.pendingEndTurn?.messageId).toBe("msg-IDLE");
+  expect(state.turnQueue.length).toBe(1); // not popped yet
+
+  // Second flush with no new data but NOT yet past the idle threshold — still pending.
+  await __forTest.flush(state);
+  expect(state.pendingEndTurn).not.toBeNull(); // still waiting
+
+  // Backdate stagedAt past the idle threshold, then flush again with no data.
+  const pending = state.pendingEndTurn;
+  if (!pending) throw new Error("expected pending end_turn before idle backdate");
+  pending.stagedAt -= 1000; // older than END_TURN_IDLE_FIRE_MS (800ms)
+  await __forTest.flush(state);
+
+  // Idle path fires: pending cleared, slot popped, banner emitted, done resolves.
+  expect(state.pendingEndTurn).toBeNull();
+  expect(state.turnQueue.length).toBe(0);
+  expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
+  expect(await donePromise).toBe(0);
+  __forTest.uninstallSession(taskId);
+});
+
+test("staging: a cancelled run drops its pending end_turn so a late JSONL line cannot fire a stale banner", async () => {
+  // Race condition the prior review flagged: after the staging refactor,
+  // there's a window between staging an end_turn and the next line confirming
+  // it. If the user cancels in that window, the kill paths must drop
+  // state.pendingEndTurn — otherwise the late line fires firePendingEndTurn,
+  // emitting a "turn complete" banner via state.lastChunk on a run the
+  // orchestrator has already marked `cancelled`.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-cancel-clears-pending";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const recorded: { stream: string; data: string }[] = [];
+  state.lastChunk = (stream, data) => recorded.push({ stream, data });
+
+  // Stage a pending end_turn manually (mirrors what dispatchLine does after
+  // an end_turn line arrives but before the next line confirms it).
+  state.pendingEndTurn = {
+    messageId: "msg-CANCEL",
+    uuid: "uuid-cancelled",
+    emitBanner: true,
+    stagedAt: Date.now(),
+  };
+
+  // Simulate the cancel cleanup the kill paths do.
+  state.pendingEndTurn = null;
+  for (const slot of state.turnQueue.splice(0)) slot.reject?.(new Error("cancelled"));
+
+  // Now a late JSONL line arrives (e.g., claude's response to Ctrl+C, or the
+  // idle-fire path in flush). Without the cleanup the staged pending would
+  // fire here; with it, firePendingEndTurn becomes a no-op.
+  __forTest.firePendingEndTurn(state);
+  __forTest.dispatchLine(state, JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 100 }));
+
+  // No "turn complete" banner emitted on the cancelled run.
+  expect(recorded.some((r) => r.data === "turn complete")).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("rebuildEventsFromJsonl: emits 'turn complete' for a real turn end (rebuild endpoint parity)", () => {
+  // The /runs/:id/rebuild-events endpoint must produce the SAME event shape
+  // as the live SSE path — including "turn complete" banners. Looping
+  // mapJsonlEventToChunks per-line would emit zero banners after the staging
+  // refactor (banner moved to firePendingEndTurn). rebuildEventsFromJsonl
+  // drives a synthetic SessionState through the same dispatch pipeline so the
+  // banner survives.
+  const lines = [
+    JSON.stringify({ type: "assistant", uuid: "u1",
+      message: { id: "msg-A", role: "assistant", content: [{ type: "text", text: "hello" }], stop_reason: "end_turn" } }),
+    JSON.stringify({ type: "system", subtype: "turn_duration", durationMs: 1000 }),
+  ].join("\n");
+  const out: { stream: string; data: string }[] = [];
+  rebuildEventsFromJsonl(lines, (stream, data) => out.push({ stream, data }));
+  // Text emitted, banner emitted (in correct order: text then turn complete then duration).
+  expect(out.some((r) => r.stream === "assistant" && r.data === "hello")).toBe(true);
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
+  expect(out.some((r) => r.stream === "status" && r.data === "turn duration: 1.0s")).toBe(true);
+});
+
+test("rebuildEventsFromJsonl: suppresses spurious 'turn complete' for split-line end_turn (Guest Mode quirk)", () => {
+  // Same staging guarantee on the rebuild path: an end_turn line followed by
+  // a tool_result (continuation) must NOT produce a "turn complete" banner.
+  // Without this the rebuild would emit the same spurious dividers the live
+  // tailer used to emit before the staging fix.
+  const lines = [
+    JSON.stringify({ type: "assistant", uuid: "u1",
+      message: { id: "msg-A", role: "assistant",
+        content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }],
+        stop_reason: "end_turn" } }),
+    JSON.stringify({ type: "user", uuid: "u2",
+      message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] } }),
+  ].join("\n");
+  const out: { stream: string; data: string }[] = [];
+  rebuildEventsFromJsonl(lines, (stream, data) => out.push({ stream, data }));
+  expect(out.some((r) => r.stream === "tool_use")).toBe(true);
+  expect(out.some((r) => r.stream === "tool_result")).toBe(true);
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+});
+
+test("rebuildEventsFromJsonl: fires staged end_turn at EOF (last line is the turn end)", () => {
+  // Edge case mirrors flush()'s idle-fire path: if the JSONL's last line is
+  // an end_turn (no following line to confirm via continuation check), the
+  // EOF fire in rebuildEventsFromJsonl must still emit the banner so the
+  // rebuilt stream isn't missing the closing divider.
+  const lines = [
+    JSON.stringify({ type: "assistant", uuid: "u1",
+      message: { id: "msg-A", role: "assistant",
+        content: [{ type: "text", text: "all done" }], stop_reason: "end_turn" } }),
+  ].join("\n");
+  const out: { stream: string; data: string }[] = [];
+  rebuildEventsFromJsonl(lines, (stream, data) => out.push({ stream, data }));
+  expect(out.some((r) => r.stream === "assistant" && r.data === "all done")).toBe(true);
+  expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
 });
 
 test("dispatchLine: permissionMode still updates when the event's uuid is already in seenLineUuids (reattach path)", async () => {
