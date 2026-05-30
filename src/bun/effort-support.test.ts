@@ -33,10 +33,10 @@ test("claude haiku-4.5 exposes no effort options (CLI doesn't accept the flag)",
   expect(ids).toEqual([]);
 });
 
-test("claude null model falls back to DEFAULT_MODEL support set (opus-4.8)", () => {
+test("claude null model falls back to DEFAULT_MODEL support set (opus-4.7)", () => {
   // No model specified → use the agent's default model's support set. Since
-  // claude-code's DEFAULT_MODEL is opus-4.8, xhigh + max are both available.
-  expect(DEFAULT_MODEL["claude-code"]).toBe("opus-4.8");
+  // claude-code's DEFAULT_MODEL is opus-4.7, xhigh + max are both available.
+  expect(DEFAULT_MODEL["claude-code"]).toBe("opus-4.7");
   const ids = supportedEfforts("claude-code", null).map((o) => o.id);
   expect(ids).toContain("xhigh");
   expect(ids).toContain("max");
