@@ -30,7 +30,7 @@ import {
   dismissTmuxPrompt,
   getCurrentPermissionMode,
   jsonlPathFor,
-  mapJsonlEventToChunks,
+  rebuildEventsFromJsonl,
   markTmuxPromptAnswered,
   sessionExists,
   sessionNameFor,
@@ -1489,8 +1489,11 @@ export function startApiServer() {
           if (!existsSync(jsonlPath)) {
             return json({ events: [], reason: `JSONL not found at ${jsonlPath}` }, { headers: corsHeaders(req) });
           }
-          // Parse every line via the same mapper live tailing uses so the
-          // output shape is identical to streamed events.
+          // Drive the JSONL through the same staging pipeline live tailing
+          // uses, so the rebuilt event stream contains "turn complete"
+          // banners (emitted by firePendingEndTurn when a turn is confirmed
+          // real) in the same positions the live stream produced them. Going
+          // through mapJsonlEventToChunks directly would emit zero banners.
           const baseTs = run.startedAt;
           let i = 0;
           const events: RunEvent[] = [];
@@ -1506,10 +1509,7 @@ export function startApiServer() {
               ts: baseTs + i++,
             });
           };
-          const text = readFileSync(jsonlPath, "utf8");
-          for (const line of text.split("\n")) {
-            if (line.trim()) mapJsonlEventToChunks(line, onChunk);
-          }
+          rebuildEventsFromJsonl(readFileSync(jsonlPath, "utf8"), onChunk);
           return json({ events, source: jsonlPath }, { headers: corsHeaders(req) });
         } catch (e) {
           const msg = (e as Error).message ?? String(e);
