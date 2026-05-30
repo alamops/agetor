@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, Bot, ClipboardList, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  Archive, ArchiveRestore, Bot, Check, ClipboardList, Copy, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
   GitCommit, GitCompare, Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
@@ -1565,13 +1565,8 @@ function UserMessageBlock({ text }: { text: string }) {
                   </code>
                 );
               },
-              pre: ({ children, ...props }) => (
-                <pre
-                  className="my-2 overflow-auto rounded-md border border-border/40 bg-background/60 p-2 font-mono text-[11px] leading-relaxed"
-                  {...props}
-                >
-                  {children}
-                </pre>
+              pre: ({ children }) => (
+                <CodeBlock bgClassName="bg-background/60">{children}</CodeBlock>
               ),
             }}
           >
@@ -1628,18 +1623,65 @@ function AssistantBlock({ text }: { text: string }) {
               </code>
             );
           },
-          pre: ({ children, ...props }) => (
-            <pre
-              className="my-2 overflow-auto rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-relaxed"
-              {...props}
-            >
-              {children}
-            </pre>
+          pre: ({ children }) => (
+            <CodeBlock bgClassName="bg-muted/40">{children}</CodeBlock>
           ),
         }}
       >
         {text}
       </ReactMarkdown>
+    </div>
+  );
+}
+
+function nodeToText(node: unknown): string {
+  if (node === null || node === undefined) return "";
+  if (typeof node === "string") return node;
+  if (typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(nodeToText).join("");
+  if (typeof node === "object" && "props" in (node as Record<string, unknown>)) {
+    return nodeToText((node as { props: { children: unknown } }).props.children);
+  }
+  return "";
+}
+
+function CodeBlock({
+  children,
+  bgClassName,
+}: {
+  children: React.ReactNode;
+  bgClassName: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = async () => {
+    const text = nodeToText(children).replace(/\n$/, "");
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      toast.error("Couldn't copy to clipboard");
+    }
+  };
+  return (
+    <div className="group relative my-2">
+      <pre
+        className={cn(
+          "overflow-auto rounded-md border border-border/40 p-2 pr-9 font-mono text-[11px] leading-relaxed",
+          bgClassName,
+        )}
+      >
+        {children}
+      </pre>
+      <button
+        type="button"
+        onClick={onCopy}
+        aria-label={copied ? "Copied" : "Copy code"}
+        title={copied ? "Copied" : "Copy"}
+        className="absolute right-1.5 top-1.5 inline-flex h-6 w-6 items-center justify-center rounded border border-border/60 bg-background/80 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+      >
+        {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+      </button>
     </div>
   );
 }
