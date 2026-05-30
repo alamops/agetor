@@ -1537,15 +1537,9 @@ function UserMessageBlock({ text }: { text: string }) {
             remarkPlugins={[remarkGfm]}
             components={{
               a: ({ href, children, ...rest }) => (
-                <a
-                  {...rest}
-                  href={href}
-                  target="_blank"
-                  rel="noreferrer noopener"
-                  className="text-primary underline-offset-2 hover:underline"
-                >
+                <ExternalLink {...rest} href={href}>
                   {children}
-                </a>
+                </ExternalLink>
               ),
               code: ({ className, children, ...props }) => {
                 const isBlock = /language-/.test(className ?? "");
@@ -1600,15 +1594,9 @@ function AssistantBlock({ text }: { text: string }) {
         components={{
           // External links open in the system browser via the OS handler.
           a: ({ href, children, ...rest }) => (
-            <a
-              {...rest}
-              href={href}
-              target="_blank"
-              rel="noreferrer noopener"
-              className="text-primary underline-offset-2 hover:underline"
-            >
+            <ExternalLink {...rest} href={href}>
               {children}
-            </a>
+            </ExternalLink>
           ),
           code: ({ className, children, ...props }) => {
             const isBlock = /language-/.test(className ?? "");
@@ -1753,6 +1741,37 @@ function ToolResultBlock({ result }: { result: ParsedToolResult | null }) {
       </div>
       <ToolResultBody result={result} />
     </div>
+  );
+}
+
+/**
+ * Anchor that hands off http(s)/mailto navigation to the OS default browser
+ * via Electrobun's `Utils.openExternal`. The webview is sandboxed —
+ * `target="_blank"` is a no-op there — so every link in agent output has to
+ * round-trip through the main process to reach a real browser.
+ */
+function ExternalLink({
+  href,
+  className,
+  children,
+  ...rest
+}: React.AnchorHTMLAttributes<HTMLAnchorElement>) {
+  const safe = typeof href === "string" && /^(https?|mailto):/i.test(href) ? href : null;
+  return (
+    <a
+      {...rest}
+      href={safe ?? "#"}
+      onClick={(e) => {
+        e.preventDefault();
+        if (!safe) return;
+        void api.openExternal(safe).catch((err: unknown) => {
+          toast.error(err instanceof Error ? err.message : "Could not open link");
+        });
+      }}
+      className={cn("text-primary underline-offset-2 hover:underline", className)}
+    >
+      {children}
+    </a>
   );
 }
 
@@ -1974,7 +1993,7 @@ function ToolInputBody({ name, input }: { name: string; input: unknown }) {
         {rawUrl && (
           <Field label="url">
             {safeUrl ? (
-              <a className="font-mono text-primary underline-offset-2 hover:underline" href={safeUrl} target="_blank" rel="noreferrer">{safeUrl}</a>
+              <ExternalLink className="font-mono" href={safeUrl}>{safeUrl}</ExternalLink>
             ) : (
               <span className="font-mono text-muted-foreground" title="non-http(s) URL — rendered as plain text for safety">{rawUrl}</span>
             )}
