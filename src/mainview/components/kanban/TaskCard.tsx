@@ -75,7 +75,7 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, o
     >
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
-          <CardTitle className="text-sm">{task.title}</CardTitle>
+          <CardTitle className="text-sm min-w-0 flex-1 break-words">{task.title}</CardTitle>
           <div className="flex shrink-0 flex-col items-end gap-1">
             <Badge variant="secondary" className="gap-1">
               <AgentIcon kind={task.agent} className="size-3" />
