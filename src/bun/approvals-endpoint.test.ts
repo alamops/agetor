@@ -364,6 +364,58 @@ test("POST /approvals — acceptEdits mode auto-allows read-only Bash", async ()
   expect(__testing.approvalsSize()).toBe(0);
 });
 
+test("POST /approvals — acceptEdits mode auto-allows edit tools (Edit/Write/MultiEdit/NotebookEdit)", async () => {
+  // Honors the badge contract: when task.mode is acceptEdits (set via
+  // PATCH or via "Approve & implement" on a plan card), edit tools must
+  // flow without a card. Bash and other non-edit tools still ask.
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-accept-edits",
+    ruleEntry: "Edit(/tmp/**)", // unrelated; just satisfies the seed helper
+  });
+  state.permissionMode = "acceptEdits";
+  for (const toolName of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) {
+    const res = await fetch(url(`/approvals?taskId=t-accept-edits`), {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        tool_name: toolName,
+        tool_input: { file_path: "/anywhere/else.ts", old_string: "a", new_string: "b" },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
+    expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+  }
+  const { __testing } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(0);
+});
+
+test("POST /approvals — acceptEdits mode still intercepts mutating Bash (rm)", async () => {
+  // The flip side of the edit-tools fast-path: Bash is not in
+  // ACCEPT_EDITS_TOOLS, so a destructive shell call still draws a card.
+  const { __testing: pre } = await import("./interactions.ts");
+  pre.reset();
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-accept-mut-bash",
+    ruleEntry: "Edit(/tmp/**)",
+  });
+  state.permissionMode = "acceptEdits";
+  const pending = fetch(url(`/approvals?taskId=t-accept-mut-bash`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf /tmp/x" } }),
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  const { __testing, listPendingForTask, answerApproval } = await import("./interactions.ts");
+  expect(__testing.approvalsSize()).toBe(1);
+  const list = listPendingForTask("t-accept-mut-bash");
+  if (list[0]?.kind === "approval") answerApproval(list[0].id, { decision: "allow" });
+  const res = await pending;
+  expect(res.status).toBe(200);
+});
+
 test("POST /approvals — auto mode auto-allows arbitrary Bash without registering an approval", async () => {
   // Regression: when a task was launched in `ask` mode and the user later
   // PATCHes the mode to `auto`, the FULL hook matcher is still installed

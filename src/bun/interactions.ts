@@ -131,11 +131,12 @@ export interface PlanApprovalRequest {
 }
 
 export interface PlanApprovalAnswer {
-  /** approve_implement → auto-accept edits and proceed
+  /** approve_auto      → proceed in auto mode (bypass all approval prompts)
+   *  approve_implement → auto-accept edits and proceed
    *  approve_ask       → proceed but ask before each edit
    *  reject            → don't proceed; let claude revise (`revision` carries
    *                      the user's free-text feedback) */
-  choice: "approve_implement" | "approve_ask" | "reject";
+  choice: "approve_auto" | "approve_implement" | "approve_ask" | "reject";
   revision?: string;
 }
 
@@ -480,8 +481,26 @@ export function answerPlanApproval(id: string, answer: PlanApprovalAnswer): bool
 /** Map a plan-approval choice into the natural-language string claude reads
  *  as the deny reason. Phrased as the user's response so claude can adapt
  *  its next turn without further prompting. */
+/** Map a plan-approval choice to the agetor-canonical `task.mode` value
+ *  that should be applied to the live session (and persisted to the task
+ *  row) when the user approves. Returns `null` for `reject` — the task
+ *  stays in plan mode while claude revises. Strings here MUST match
+ *  AGENT_OPTIONS["claude-code"].modes ids in `shared/types.ts`; the
+ *  `toClaudeModeString` mapping in claude-tmux.ts handles the agetor →
+ *  claude string remap (e.g. `ask → default`). */
+export function planApprovalTargetMode(ans: PlanApprovalAnswer): string | null {
+  switch (ans.choice) {
+    case "approve_auto":      return "auto";
+    case "approve_implement": return "acceptEdits";
+    case "approve_ask":       return "ask";
+    case "reject":            return null;
+  }
+}
+
 export function formatPlanApprovalReason(ans: PlanApprovalAnswer): string {
   switch (ans.choice) {
+    case "approve_auto":
+      return `${PLAN_APPROVED_REPLY_PREFIX} and wants you to proceed in auto mode. Implement it now — do not pause for any approvals, including Bash and other tool calls.`;
     case "approve_implement":
       return `${PLAN_APPROVED_REPLY_PREFIX} and wants you to implement it now. Proceed with the edits — auto-accept changes (do not pause for per-edit approvals).`;
     case "approve_ask":

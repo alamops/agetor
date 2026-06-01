@@ -350,14 +350,30 @@ test("registerPlanApproval resolves with the choice from answerPlanApproval", as
   expect((await answer).choice).toBe("approve_implement");
 });
 
+test("planApprovalTargetMode returns agetor-canonical mode ids for each approve choice", async () => {
+  const { planApprovalTargetMode } = await import("./interactions.ts");
+  // Strings here MUST match AGENT_OPTIONS["claude-code"].modes ids in
+  // shared/types.ts — they're persisted directly to `task.mode` and feed
+  // the UI's mode dropdown. Regression guard against the "default" vs
+  // "ask" typo (claude's internal string vs agetor's mode id).
+  expect(planApprovalTargetMode({ choice: "approve_auto" })).toBe("auto");
+  expect(planApprovalTargetMode({ choice: "approve_implement" })).toBe("acceptEdits");
+  expect(planApprovalTargetMode({ choice: "approve_ask" })).toBe("ask");
+  expect(planApprovalTargetMode({ choice: "reject" })).toBeNull();
+});
+
 test("formatPlanApprovalReason maps each choice to a distinct natural-language instruction", async () => {
-  const { formatPlanApprovalReason } = await import("./interactions.ts");
+  const { formatPlanApprovalReason, PLAN_APPROVED_REPLY_PREFIX } = await import("./interactions.ts");
+  const auto = formatPlanApprovalReason({ choice: "approve_auto" });
   const impl = formatPlanApprovalReason({ choice: "approve_implement" });
   const ask = formatPlanApprovalReason({ choice: "approve_ask" });
   const reject = formatPlanApprovalReason({ choice: "reject", revision: "use option B instead" });
+  expect(auto).toContain("auto mode");
+  expect(auto.startsWith(PLAN_APPROVED_REPLY_PREFIX)).toBe(true);
   expect(impl).toContain("auto-accept");
   expect(ask).toContain("confirm before");
   expect(reject).toContain("option B instead");
+  expect(auto).not.toEqual(impl);
   expect(impl).not.toEqual(ask);
   expect(impl).not.toEqual(reject);
 });
