@@ -17,7 +17,7 @@ import { UpdateBanner } from "@/components/updater/UpdateBanner";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, toastError, toastPending, toastSuccess } from "@/lib/toasts";
+import { dismissPending, toastApiError, toastError, toastPending, toastSuccess } from "@/lib/toasts";
 import { cn } from "@/lib/utils";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
@@ -291,7 +291,11 @@ export default function App() {
         cur.map((t) => (t.id === ev.taskId ? { ...t, column: ev.column } : t)),
       );
       if (ev.column === "blocked") {
-        toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        if (ev.reason === "api-error") {
+          toastApiError({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else {
+          toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        }
       } else if (ev.prev === "blocked") {
         // Auto-clear the pending toast once the agent unblocks (the user
         // answered, the run was cancelled, etc.).

@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 
 import {
+  CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_MODE_ACCEPT_EDITS,
   CLAUDE_MODE_AUTO,
   CLAUDE_MODE_BYPASS,
@@ -200,6 +201,66 @@ test("mapJsonlEventToChunks: stop_reason=end_turn with text+tool_use still retur
   expect(res.endOfTurn).toBe(true);
   expect(out.some((r) => r.stream === "assistant" && r.data === "let me check that")).toBe(true);
   expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+});
+
+test("mapJsonlEventToChunks: synthetic isApiErrorMessage line emits an api-error status and signals endOfTurn so the run resolves", () => {
+  // Without this branch the run would sit in `running` forever — claude
+  // stamps stop_reason: "stop_sequence" (not end_turn) on API-error
+  // messages, so the regular end_turn detection misses them. The
+  // orchestrator's chunk handler pattern-matches on the api-error status
+  // prefix to flip the task to the `blocked` column.
+  //
+  // Uses a uuid-aware recorder (the shared `recorder()` drops the third
+  // arg) because this test specifically asserts that the status chunk is
+  // emitted with `uuid: undefined` so the partial unique index on
+  // `(run_id, line_uuid)` doesn't drop the row.
+  const out: { stream: string; data: string; uuid: string | undefined }[] = [];
+  const onChunk = (stream: Record["stream"], data: string, uuid?: string) => out.push({ stream, data, uuid });
+  const line = JSON.stringify({
+    type: "assistant",
+    uuid: "err-1",
+    isApiErrorMessage: true,
+    apiErrorStatus: 529,
+    message: {
+      stop_reason: "stop_sequence",
+      content: [{ type: "text", text: "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment." }],
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  // The user-facing error text still rides the regular assistant stream
+  // with the JSONL line uuid (so it dedups on reattach).
+  const assistantRow = out.find((r) => r.stream === "assistant" && r.data.startsWith("API Error: 529"));
+  expect(assistantRow).toBeDefined();
+  expect(assistantRow!.uuid).toBe("err-1");
+  // Sentinel status chunk the orchestrator pattern-matches on. Must start
+  // with the full prefix (trailing space/colon rules out a hypothetical
+  // future status that begins with the word "api").
+  const status = out.find((r) => r.stream === "status" && r.data.startsWith(CLAUDE_API_ERROR_STATUS_PREFIX));
+  expect(status).toBeDefined();
+  expect(status!.data).toContain("HTTP 529");
+  // Critically: emitted with uuid:undefined. If we reused the assistant
+  // line's uuid the partial unique index would silently drop this row via
+  // INSERT OR IGNORE and the breadcrumb would vanish on panel reload.
+  expect(status!.uuid).toBeUndefined();
+});
+
+test("mapJsonlEventToChunks: isApiErrorMessage without apiErrorStatus still emits a sentinel status (HTTP suffix omitted)", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({
+    type: "assistant",
+    uuid: "err-2",
+    isApiErrorMessage: true,
+    message: {
+      stop_reason: "stop_sequence",
+      content: [{ type: "text", text: "API Error: connection reset" }],
+    },
+  });
+  const res = mapJsonlEventToChunks(line, onChunk);
+  expect(res.endOfTurn).toBe(true);
+  const status = out.find((r) => r.stream === "status" && r.data.startsWith(CLAUDE_API_ERROR_STATUS_PREFIX));
+  expect(status).toBeDefined();
+  expect(status!.data).not.toContain("HTTP");
 });
 
 test("mapJsonlEventToChunks: system{subtype:turn_duration} emits the duration as a status breadcrumb", () => {

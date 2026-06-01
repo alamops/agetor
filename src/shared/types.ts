@@ -629,6 +629,13 @@ export type GlobalEvent =
       column: ColumnId;
       prev: ColumnId | null;
       ts: number;
+      /** Why the transition fired, when the column alone is ambiguous.
+       *  Lets the UI pick a more accurate toast copy — e.g. an
+       *  `api-error`-driven `blocked` reads as "API error — retry" rather
+       *  than the generic "waiting on you" used for permission prompts.
+       *  Unset for transitions whose reason is fully implied by the
+       *  (prev, column) pair (e.g. plain success → review). */
+      reason?: "api-error" | "approval";
     }
   | {
       kind: "update";

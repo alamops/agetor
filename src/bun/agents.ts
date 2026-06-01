@@ -1,6 +1,7 @@
 import path from "node:path";
 import { MODEL_EFFORT_SUPPORT, type AgentKind, type Harness } from "../shared/types.ts";
 import {
+  CLAUDE_API_ERROR_STATUS_PREFIX,
   spawnClaudeViaTmux,
   toClaudeModeString,
   type ChunkHandler,
@@ -286,8 +287,31 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
   const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
   const done = new Promise<number>((res) => { resolveDone = res; });
-  setTimeout(() => onChunk("stdout", `fake response to: ${prompt}`), 5);
-  setTimeout(() => { onChunk("status", "turn complete"); resolveDone(0); }, 20);
+  // Test hook: simulate a claude code API error mid-turn so orchestrator
+  // tests can exercise the api-error → `blocked` column flip without having
+  // to plumb a real synthetic-message JSONL through the driver. Mirrors what
+  // claude-tmux.ts emits on an `isApiErrorMessage` line: the user-facing
+  // text on the assistant stream + the sentinel api-error status chunk that
+  // makeChunkHandler pattern-matches on. Resolves the turn with code 0
+  // because that's what popEndOfTurn does — the orchestrator distinguishes
+  // it from a real success via the handle.apiError flag, not exit code.
+  if (process.env.AGETOR_FAKE_CLAUDE_API_ERROR === "1") {
+    // Emit the chunks promptly (this is what flips the column to `blocked`
+    // in the live path), but allow an optional resolve delay so
+    // cancellation-precedence tests have a window to fire `cancelRun`
+    // between the column flip and the done resolution. Without the delay
+    // both events would land within the same tick and there'd be nowhere
+    // to insert the cancel.
+    const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
+    setTimeout(() => {
+      onChunk("assistant", "API Error: 529 Overloaded. This is a server-side issue, usually temporary.");
+      onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}HTTP 529 — turn aborted; blocked for manual retry`);
+    }, 5);
+    setTimeout(() => { resolveDone(0); }, resolveDelayMs);
+  } else {
+    setTimeout(() => onChunk("stdout", `fake response to: ${prompt}`), 5);
+    setTimeout(() => { onChunk("status", "turn complete"); resolveDone(0); }, 20);
+  }
   const inst: FakeDriverInstance = {
     _record: record,
     kill: () => { record.push("kill"); },
