@@ -429,7 +429,10 @@ test("dismissTmuxPrompt waits behind an in-flight paste on the same task", async
       // Modal dismissal queued behind it. With the chain wired up
       // through dismissTmuxPrompt, this can only resolve after the
       // paste's settle window has elapsed.
-      const dismissedAtPromise = dismissTmuxPrompt(taskId, "1").then((ok) => ({
+      const dismissedAtPromise = dismissTmuxPrompt(taskId, "1", {
+        choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+        cursorIndex: 0,
+      }).then((ok) => ({
         elapsed: performance.now() - t0,
         ok,
       }));
@@ -448,29 +451,40 @@ test("dismissTmuxPrompt waits behind an in-flight paste on the same task", async
   });
 });
 
-test("dismissTmuxPrompt mid-body re-gate: trailing Enter skipped when session is disposed during the gap", async () => {
+test("dismissTmuxPrompt mid-body re-gate (key '2', one Down + Enter): trailing Enter skipped on dispose mid-gap", async () => {
   // Covers the residual race the entry-only identity gate left open:
-  // a `dropSession` lands during the 50ms gap between digit and Enter,
-  // and the trailing `send-keys Enter` would otherwise leak into the
-  // respawned pane as a stray confirmation. The thunk's `stillCurrent()`
-  // re-check before the second tmux call closes it.
+  // a `dropSession` lands during the gap between the navigation arrow
+  // and the trailing Enter, and `send-keys Enter` would otherwise leak
+  // into the respawned pane as a stray confirmation. The thunk's
+  // `stillCurrent()` re-check before the Enter call closes it.
+  //
+  // Uses key "2" with cursorIndex=0 (delta = 1 → one Down) so there's a
+  // real inter-keystroke gap to test. Key "1" with cursorIndex=0 maps
+  // to "no navigation, just Enter" and would skip the gap entirely.
   await withFakeTmuxBin(async () => {
     const prev = __forTest.setSlashCommandSettleMs(0);
     const { taskId, jsonlPath } = freshSession();
     const state = __forTest.installSession(taskId, jsonlPath);
     try {
-      // Kick off the dismissal — its first send-keys runs synchronously
-      // before the 50ms sleep starts.
-      const dismissPromise = dismissTmuxPrompt(taskId, "1");
-      // After the first send-keys is on the wire but during the gap,
-      // drop and respawn the session for the same taskId. Wait ~20ms
-      // to land squarely inside the dismissal's 50ms internal sleep.
-      await Bun.sleep(20);
+      // Kick off the dismissal — its first send-keys (a Down) runs
+      // synchronously before the 30ms sleep starts.
+      const dismissPromise = dismissTmuxPrompt(taskId, "2", {
+        choices: [
+          { key: "1", label: "Yes" },
+          { key: "2", label: "Yes, allow all" },
+          { key: "3", label: "No" },
+        ],
+        cursorIndex: 0,
+      });
+      // After the Down is on the wire but during the gap, drop and
+      // respawn the session for the same taskId. ~15ms lands squarely
+      // inside the dismissal's 30ms internal sleep.
+      await Bun.sleep(15);
       __forTest.uninstallSession(taskId);
       __forTest.installSession(taskId, jsonlPath);
 
       const ok = await dismissPromise;
-      // With the mid-body re-gate, the second send-keys is skipped, so
+      // With the mid-body re-gate, the trailing Enter is skipped, so
       // `ok` (set only on the trailing send-keys success) stays false.
       // Without the re-gate this test would observe `ok === true` AND
       // the new session's pane would have received a stray Enter.
