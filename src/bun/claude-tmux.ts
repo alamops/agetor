@@ -1546,6 +1546,125 @@ function sha1(s: string): string {
   return createHash("sha1").update(s).digest("hex").slice(0, 16);
 }
 
+/**
+ * One-time *startup consent* dialogs claude can draw before it ever reaches
+ * the REPL. These are special because they block JSONL creation entirely:
+ * the normal scraper only arms after the JSONL exists (`attachTailer`), so it
+ * never sees a dialog that's preventing the JSONL from existing in the first
+ * place. Left unhandled, the session sits at the dialog until the 30s boot
+ * timeout fires and the run is killed — exactly the "claude session JSONL
+ * never appeared … (empty — claude has not drawn any TUI output yet)" failure
+ * a claude version bump (which re-shows the bypass acceptance) reliably
+ * produces.
+ *
+ * Each entry here is tied to a choice the user has *already made*, so
+ * auto-confirming the affirmative option at boot matches intent rather than
+ * deciding anything on the user's behalf:
+ *   - bypass-permissions: only shown when claude was launched with
+ *     `--dangerously-skip-permissions`, which agetor only emits for the
+ *     `bypass` mode the user explicitly selected.
+ *   - trust-folder: shown the first time claude opens a directory; agetor
+ *     owns the worktree and the user pointed the task's workdir at it.
+ *
+ * We deliberately scope auto-confirm to these two recognised consent screens
+ * (matched by a marker string AND an affirmative choice label). Every other
+ * modal — real per-tool permission prompts, the model picker, `/login` — is
+ * left for the interactive scraper so the user decides.
+ */
+const STARTUP_CONSENT_DIALOGS: Array<{ name: string; marker: RegExp; affirmative: RegExp }> = [
+  // `claude --dangerously-skip-permissions` first-run warning:
+  //   WARNING: Claude Code running in Bypass Permissions mode
+  //   ❯ 1. No, exit
+  //     2. Yes, I accept
+  { name: "bypass-permissions", marker: /bypass permissions mode/i, affirmative: /\baccept\b/i },
+  // BEST-EFFORT / UNVERIFIED: the first-run trust prompt claude shows for a
+  // never-before-opened directory:
+  //   Do you trust the files in this folder?
+  //   ❯ 1. Yes, proceed
+  //     2. No, exit
+  // The exact wording/options here are assumed, not observed — `bypass` mode
+  // suppresses this prompt entirely, and auto-mode launches in agetor's
+  // worktrees have not been seen to trigger it. Kept as safe defence: the
+  // `affirmative` is deliberately the narrow `/\bproceed\b/i` (NOT `/trust/`,
+  // which a "No, don't trust" option would also match → wrong keypress). If
+  // claude's real affirmative isn't "…proceed", this entry simply no-ops and
+  // we fall back to the boot-timeout path — never a wrong action. Confirm the
+  // real TUI text before relying on it.
+  { name: "trust-folder", marker: /trust the files in this (folder|directory)/i, affirmative: /\bproceed\b/i },
+];
+
+export interface StartupDialogMatch {
+  /** Which consent dialog matched (for the status breadcrumb + dedup key). */
+  name: string;
+  choices: TmuxPromptChoice[];
+  /** 0-based index the `❯`/`›` cursor sits on right now. */
+  cursorIndex: number;
+  /** 0-based index of the affirmative ("accept" / "proceed") choice we want
+   *  to land on before pressing Enter. */
+  acceptIndex: number;
+  /** Stable hash of the matched dialog — lets the boot poller confirm a given
+   *  on-screen dialog exactly once while still acting on a *different*
+   *  subsequent dialog (e.g. trust-folder appearing after bypass). */
+  fingerprint: string;
+}
+
+/**
+ * Pure: identify a known startup *consent* dialog on the pane and the index
+ * of its affirmative choice. Returns null for anything that isn't one of
+ * `STARTUP_CONSENT_DIALOGS` with a parseable numbered choice list and a
+ * recognisable affirmative option — when in doubt we do nothing and let the
+ * boot timeout surface the raw pane to the user instead of guessing.
+ */
+export function matchStartupConsentDialog(pane: string): StartupDialogMatch | null {
+  const dialog = STARTUP_CONSENT_DIALOGS.find((d) => d.marker.test(pane));
+  if (!dialog) return null;
+  // Reuse the numbered-modal parser so the choice list / cursor handling
+  // stays identical to the runtime scraper. It requires a cursor marker,
+  // which every one of these dialogs draws.
+  const modal = matchNumberedModal(pane);
+  if (!modal || modal.cursorIndex === undefined) return null;
+  const acceptIndex = modal.choices.findIndex((c) => dialog.affirmative.test(c.label));
+  if (acceptIndex < 0) return null;
+  return {
+    name: dialog.name,
+    choices: modal.choices,
+    cursorIndex: modal.cursorIndex,
+    acceptIndex,
+    fingerprint: sha1(`startup:${dialog.name}:${modal.fingerprint}`),
+  };
+}
+
+/**
+ * Send the keystrokes that confirm a startup consent dialog: arrow from the
+ * cursor's current position to the affirmative option, then Enter. Talks to
+ * tmux directly (not via `queueTmuxOp`) because this runs during the boot
+ * window — before any turn slot or paste chain exists for the session. Each
+ * arrow is its own `send-keys` with a small gap, mirroring `dismissTmuxPrompt`
+ * so a bursted `Down Enter` can't coalesce in Ink's stdin reducer and confirm
+ * the wrong line.
+ *
+ * Returns true only when every keystroke (arrows + the final Enter) was
+ * delivered. The caller latches the dialog's fingerprint on a `true` so a
+ * transient `send-keys` failure leaves the fingerprint UN-latched and the next
+ * poll tick retries — otherwise a half-sent confirm would silently strand the
+ * dialog until the boot timeout.
+ */
+async function confirmStartupDialog(sessionName: string, m: StartupDialogMatch): Promise<boolean> {
+  const delta = m.acceptIndex - m.cursorIndex;
+  const arrow = delta >= 0 ? "Down" : "Up";
+  for (let i = 0; i < Math.abs(delta); i++) {
+    if (!tmux(["send-keys", "-t", sessionName, arrow]).ok) return false;
+    await Bun.sleep(30);
+  }
+  return tmux(["send-keys", "-t", sessionName, "Enter"]).ok;
+}
+
+/** How often the boot-time consent poller re-checks the pane. Fast enough
+ *  that a dialog blocking JSONL creation is cleared within a fraction of a
+ *  second; cheap because it's one `capture-pane` per tick and only runs
+ *  during the bounded boot window. */
+const STARTUP_DIALOG_POLL_MS = 350;
+
 /** TTL on the "just answered this fingerprint" suppression. Has to
  *  comfortably exceed the worst-case lag between sending Enter into
  *  tmux and claude repainting the pane without the modal. 3s is
@@ -1828,7 +1947,52 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // soon as it appears regardless.
   const BOOT_TIMEOUT_MS = 30_000;
   (async () => {
+    // Concurrently watch for a one-time startup consent dialog (the
+    // `--dangerously-skip-permissions` bypass warning, or the trust-folder
+    // prompt) blocking claude from ever writing its JSONL. Auto-confirm it —
+    // each maps to a choice the user already made (see STARTUP_CONSENT_DIALOGS).
+    // Without this the dialog sits unanswered until BOOT_TIMEOUT_MS and the run
+    // dies with an empty pane; this is the failure a claude version bump that
+    // re-shows the bypass acceptance reliably triggers. The poller self-stops
+    // the moment the JSONL appears, the session dies, or boot settles.
+    let bootSettled = false;
+    let lastConfirmedFingerprint: string | null = null;
+    void (async () => {
+      // Wrapped so a stray throw can never become an unhandled rejection on
+      // the fire-and-forget IIFE (mirrors `startScraper`'s try/catch posture);
+      // in practice none of the calls below throw.
+      try {
+        while (!bootSettled) {
+          await Bun.sleep(STARTUP_DIALOG_POLL_MS);
+          // Resume path: when the JSONL already exists at spawn (`--resume`),
+          // this short-circuits on the first tick so the poller is a no-op —
+          // a re-shown consent dialog on resume is out of scope (bypass
+          // acceptance is global + persistent once accepted).
+          if (bootSettled || existsSync(jsonlPath)) return;
+          if (!tmux(["has-session", "-t", sessionName]).ok) return;
+          const pane = tmux(["capture-pane", "-p", "-t", sessionName]).stdout;
+          const m = matchStartupConsentDialog(pane);
+          // Single-tick action is deliberate (unlike the runtime scraper's
+          // two-tick stability gate): this only runs during the bounded boot
+          // window and is gated on a marker string AND a parseable affirmative
+          // choice, so a half-drawn frame can't trigger a stray confirm.
+          // Confirm a given on-screen dialog at most once — the fingerprint is
+          // latched ONLY after `confirmStartupDialog` reports every keystroke
+          // landed, so a transient send-keys failure retries next tick instead
+          // of stranding the dialog. A genuinely different follow-up dialog
+          // (new fingerprint) is still acted on.
+          if (m && m.fingerprint !== lastConfirmedFingerprint) {
+            if (await confirmStartupDialog(sessionName, m)) {
+              lastConfirmedFingerprint = m.fingerprint;
+              opts.onChunk("status", `claude startup dialog auto-confirmed (${m.name})`);
+            }
+          }
+        }
+      } catch { /* never let the boot poller crash the spawn */ }
+    })();
+
     const found = await waitForJsonlAt(jsonlPath, BOOT_TIMEOUT_MS);
+    bootSettled = true;
     if (!found) {
       const stillAlive = tmux(["has-session", "-t", sessionName]).ok;
       // Capture whatever claude actually printed inside the pane so the user
@@ -2287,6 +2451,7 @@ export const __forTest = {
   firePendingEndTurn,
   matchNumberedModal,
   matchYesNoModal,
+  matchStartupConsentDialog,
   resumeJsonlOffset,
   /** Override the JSONL verification timeout used by `cycleToMode`. Tests
    *  shrink it to keep "timeout" cases fast. Returns the previous value
