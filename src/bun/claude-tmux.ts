@@ -2307,6 +2307,23 @@ export const __forTest = {
     return prev;
   },
   getSlashCommandSettleMs(): number { return slashCommandSettleMs; },
+  /** Override the image-attach settle window — the delay between the
+   *  bracketed paste and the trailing Enter when the paste contains an
+   *  image file path. Tests shrink it to ~0 to avoid sleeping per
+   *  image-path assertion. Returns the previous value for restore. */
+  setImageAttachSettleMs(ms: number): number {
+    const prev = imageAttachSettleMs;
+    imageAttachSettleMs = ms;
+    return prev;
+  },
+  getImageAttachSettleMs(): number { return imageAttachSettleMs; },
+  /** Image-path detection used by `pastePrompt` to decide whether to
+   *  take the slow (post-paste settle) path. Re-exported for unit tests
+   *  so the rule can be asserted without reaching into the regex literal. */
+  pasteContainsImagePath,
+  /** Count the image paths the regex finds. Used internally to scale the
+   *  settle window by image count; exposed so tests can pin the heuristic. */
+  countImagePaths,
   /** Direct access to the paste queue for assertions. Read-only — tests
    *  inspect ordering by observing tmux side effects, not by mutating
    *  the chain. */
@@ -2316,15 +2333,98 @@ export const __forTest = {
 };
 
 /**
+ * Match a file path whose basename ends in a common image extension. The
+ * pattern requires a word character immediately before the `.ext` so a
+ * bare `.png` token in prose ("save as .png next") or accidental ones
+ * like `..png` / `,.png` don't trigger the image-attach slow path. The
+ * extension list is kept in sync with `IMAGE` in
+ * `src/mainview/lib/file-icons.tsx` — when adding a new extension there,
+ * add it here too.
+ */
+const IMAGE_PATH_RE =
+  /[\w.\-/]*\w\.(png|jpe?g|gif|webp|svg|bmp|ico|avif|heic)\b/gi;
+
+/** True iff `text` carries at least one image-file path. Exported via
+ *  `__forTest` so the unit suite can assert the detection rule without
+ *  reaching into the regex literal. */
+export function pasteContainsImagePath(text: string): boolean {
+  // Reset state on the global regex before .test() — without it, .test()
+  // resumes from lastIndex and a repeat call on the same string returns
+  // alternating true/false.
+  IMAGE_PATH_RE.lastIndex = 0;
+  return IMAGE_PATH_RE.test(text);
+}
+
+/** Number of image-file paths in `text`. Used to scale the settle window
+ *  so multi-image pastes get proportional time for claude's bracketed-
+ *  paste handler to read, encode, and attach each one. */
+export function countImagePaths(text: string): number {
+  return text.match(IMAGE_PATH_RE)?.length ?? 0;
+}
+
+/**
+ * Per-image settle window. Claude's TUI reads the image synchronously on
+ * its input thread when it sees a path in a bracketed paste — it replaces
+ * the path with an `[Image #N]` placeholder, reads the file, and base64-
+ * encodes it. A `send-keys Enter` that arrives mid-flight is consumed by
+ * the attachment flow instead of submitting the message, leaving the
+ * text + placeholder sitting in the input forever. 600 ms comfortably
+ * exceeds the time observed for ~MB-sized screenshots; the cost is paid
+ * only when the heuristic fires, and is scaled by the number of image
+ * paths in the paste (Retina screenshots are routinely 3-5 MB and four
+ * of them in one message would exceed a single 600 ms budget).
+ *
+ * The scaled total is capped at `IMAGE_ATTACH_SETTLE_MAX_MS` so a paste
+ * that accidentally trips the detector many times (e.g. a doc dump that
+ * mentions many `.png` files) doesn't stall the queue for seconds.
+ *
+ * Tests shrink the per-image value to ~0 to keep the queue suite fast.
+ */
+let imageAttachSettleMs = 600;
+
+/** Absolute upper bound on the scaled settle window. Picked at 3 s —
+ *  beyond the slowest observed multi-image attach in practice while still
+ *  bounding the worst-case stall a paste can introduce. */
+const IMAGE_ATTACH_SETTLE_MAX_MS = 3_000;
+
+/**
  * Send `text` as a single user turn to the named tmux session. We pipe via
  * `load-buffer -` to avoid shell-quoting issues (the prompt may contain
  * newlines, dollar signs, quotes, …), paste it into the active window, then
  * press Enter to submit.
  *
- * Sync core — callers go through `queuePaste` so back-to-back pastes for the
- * same task can't interleave at the tmux layer. See `queuePaste` for why.
+ * When the paste contains image file paths, sleep before sending the
+ * trailing Enter so claude's bracketed-paste handler can finish attaching
+ * each image. Without the wait, the single Enter we send arrives mid-
+ * flight in the attachment flow and gets consumed instead of submitting
+ * the message — the symptom is the agetor UI showing the message as sent
+ * while the JSONL has no corresponding user-message row, with the text
+ * stuck in claude's input behind an `[Image #N]` placeholder.
+ *
+ * We send exactly one Enter — the same as the non-image path. Earlier
+ * iterations of this fix sent two Enters (the first to dismiss a
+ * suspected attach-confirm modal, the second to submit) but there is no
+ * direct evidence such a modal exists in the bracketed-paste flow, and
+ * the JSONL repro confirmed at least one image-bearing paste DID submit
+ * with a single Enter — so the second Enter would risk a stray empty
+ * submit / interrupt against an idle pane.
+ *
+ * The `stillCurrent` predicate is consulted before the trailing Enter so
+ * a session dispose that lands during the image-settle sleep can't leak
+ * the keystroke into a respawned pane reusing the same tmux session name.
+ * The non-image fast path stays fully sync so the original `queueTmuxOp`
+ * invariant (no awaits between tmux calls) is preserved for the common
+ * case.
+ *
+ * Callers go through `queuePaste` so back-to-back pastes for the same
+ * task can't interleave at the tmux layer. See `queuePaste` for why.
  */
-function pastePromptSync(sessionName: string, text: string, opts: { bracketed?: boolean } = {}): void {
+async function pastePrompt(
+  sessionName: string,
+  text: string,
+  opts: { bracketed?: boolean } = {},
+  stillCurrent: () => boolean = () => true,
+): Promise<void> {
   // load-buffer reads from stdin; -b names a tmux buffer we can target.
   const buf = `agetor-${sessionName}`;
   const load = tmux(["load-buffer", "-b", buf, "-"], { stdinText: text });
@@ -2341,6 +2441,17 @@ function pastePromptSync(sessionName: string, text: string, opts: { bracketed?: 
   const pasteFlags = opts.bracketed ? ["-p"] : [];
   tmux(["paste-buffer", ...pasteFlags, "-b", buf, "-t", sessionName]);
   tmux(["delete-buffer", "-b", buf]);
+  if (opts.bracketed) {
+    const imageCount = countImagePaths(text);
+    if (imageCount > 0) {
+      // Slow path: claude is reading + attaching one or more images. Wait,
+      // then re-gate before the Enter so a dispose during the sleep can't
+      // leak the keystroke into a respawned pane.
+      const settle = Math.min(imageAttachSettleMs * imageCount, IMAGE_ATTACH_SETTLE_MAX_MS);
+      await Bun.sleep(settle);
+      if (!stillCurrent()) return;
+    }
+  }
   tmux(["send-keys", "-t", sessionName, "Enter"]);
 }
 
@@ -2356,7 +2467,7 @@ function pastePromptSync(sessionName: string, text: string, opts: { bracketed?: 
  * applied before the *next* operation — never before the slash itself.
  *
  * Important caveat about what this delay actually buys: the timer starts
- * when `pastePromptSync` returns (i.e. when tmux's `send-keys Enter`
+ * when `pastePrompt` returns (i.e. when tmux's `send-keys Enter`
  * exits), NOT when claude has finished processing the slash command. On
  * an idle REPL these are close enough that 700ms covers consumption +
  * repaint. When claude is mid-turn, the slash command queues inside
@@ -2465,13 +2576,14 @@ function queuePaste(
   expectedState?: SessionState,
   opts: { bracketed?: boolean } = {},
 ): Promise<void> {
-  // No mid-body re-gate needed: pastePromptSync delivers all four tmux
-  // calls (load-buffer + paste-buffer + delete-buffer + send-keys Enter)
-  // synchronously before the optional settle sleep. The settle is pure
-  // waiting — no tmux calls happen after it within this body — so a
-  // dispose during the sleep can't leak keystrokes.
-  return queueTmuxOp(taskId, async () => {
-    pastePromptSync(sessionName, text, opts);
+  // Forward `stillCurrent` into pastePrompt — its image-attach slow path
+  // awaits between the bracketed paste and the trailing Enter, so it
+  // needs the same dispose-during-gap re-gate that the modal-dismissal
+  // path uses. The fast (non-image) path inside pastePrompt stays fully
+  // synchronous, so the original "no tmux calls after the await"
+  // invariant still holds for the common case.
+  return queueTmuxOp(taskId, async (stillCurrent) => {
+    await pastePrompt(sessionName, text, opts, stillCurrent);
     if (settleMs > 0) await Bun.sleep(settleMs);
   }, expectedState);
 }
