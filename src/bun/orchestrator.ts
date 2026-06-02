@@ -29,6 +29,7 @@ import {
   type InteractionResolved,
 } from "./interactions.ts";
 import {
+  CLAUDE_API_ERROR_STATUS_PREFIX,
   cycleToMode,
   type CycleResult,
   dropSession,
@@ -76,6 +77,12 @@ interface ActiveRun {
    *  heuristic match. Stays unset on claude-code — interactive claude doesn't
    *  surface narrative through stdout that would false-positive. */
   blocked: boolean;
+  /** Set when claude code emitted an `isApiErrorMessage` line during this
+   *  run (e.g. 529 Overloaded). The chunk handler flips the column to
+   *  `blocked` immediately; the done handler reads this on resolution to
+   *  keep the column at `blocked` (instead of bouncing to `ready`) and
+   *  record the run as `failed`. */
+  apiError: boolean;
 }
 const active = new Map<string, ActiveRun>(); // runId -> handle
 
@@ -129,12 +136,17 @@ function normalizeUserText(s: string): string {
  * from keeping its own diff state. Pass `null` for `runId` when the change
  * isn't tied to a specific run (e.g. orphan reconciliation).
  */
-function updateColumn(taskId: string, runId: string | null, next: ColumnId): void {
+function updateColumn(
+  taskId: string,
+  runId: string | null,
+  next: ColumnId,
+  reason?: "api-error" | "approval",
+): void {
   const before = tasks.get(taskId);
   const prev: ColumnId | null = before?.column ?? null;
   tasks.update(taskId, { column: next });
   if (prev !== next) {
-    emitGlobal({ kind: "column", taskId, runId, column: next, prev, ts: Date.now() });
+    emitGlobal({ kind: "column", taskId, runId, column: next, prev, ts: Date.now(), reason });
   }
 }
 
@@ -241,6 +253,25 @@ export function reconcileOrphans(): number {
       });
       if (spawned) {
         registerActiveRun(row.id, row.task_id, task, spawned);
+        // Pre-seed `handle.apiError` when the prior process had already
+        // emitted the api-error status to run_events for this run. The
+        // reattach replay can't re-emit it — the assistant-line uuid is in
+        // seenLineUuids, so `dispatchLine` short-circuits before the
+        // mapper runs — so without this seed `attachDoneHandler` would
+        // resolve with `wasApiError=false` and bounce the column from the
+        // (correctly-persisted) `blocked` back to `review` on the first
+        // pending-end-turn fire. `EXISTS` short-circuits on first match
+        // and reads more clearly than `COUNT(*) > 0`.
+        const priorApiError = db.query<{ found: 0 | 1 }, [string, string]>(
+          `SELECT EXISTS(
+             SELECT 1 FROM run_events
+             WHERE run_id = ? AND stream = 'status' AND data LIKE ?
+           ) AS found`,
+        ).get(row.id, `${CLAUDE_API_ERROR_STATUS_PREFIX}%`)?.found ?? 0;
+        if (priorApiError === 1) {
+          const handle = active.get(row.id);
+          if (handle) handle.apiError = true;
+        }
         attachDoneHandler(row.id, row.task_id, spawned);
         reattachedTaskIds.add(row.task_id);
         // Visible seam in the run panel so the user can tell where the
@@ -433,6 +464,26 @@ function makeChunkHandler(
   return (stream: RunEvent["stream"], data: string, lineUuid?: string) => {
     runs.appendEvent(runId, stream, data, lineUuid);
     emit({ runId, taskId, stream, data, ts: Date.now() });
+    // Claude API-error path: claude-tmux emits a sentinel status chunk on
+    // synthetic `isApiErrorMessage` lines (529, 400, …) and resolves the
+    // turn. Flip to `blocked` here so the card stops sitting in `running`,
+    // and mark the handle so `attachDoneHandler` doesn't bounce it back to
+    // `ready` when the resolution lands a moment later.
+    if (
+      kind === "claude-code"
+      && stream === "status"
+      && data.startsWith(CLAUDE_API_ERROR_STATUS_PREFIX)
+    ) {
+      const handle = active.get(runId);
+      if (handle && !handle.apiError) {
+        handle.apiError = true;
+        const task = tasks.get(taskId);
+        if (task && task.runId === runId) {
+          updateColumn(taskId, runId, "blocked", "api-error");
+        }
+      }
+      return;
+    }
     if (kind !== "codex") return;
     const handle = active.get(runId);
     const promptingMode = mode && mode !== "auto";
@@ -444,7 +495,7 @@ function makeChunkHandler(
       && isApprovalPrompt(data)
     ) {
       handle.blocked = true;
-      updateColumn(taskId, runId, "blocked");
+      updateColumn(taskId, runId, "blocked", "approval");
       emit({
         runId,
         taskId,
@@ -468,6 +519,7 @@ function registerActiveRun(
     kill: () => agent.kill(),
     cancelled: false,
     blocked: false,
+    apiError: false,
     writeInput: (line) => agent.writeInput(line),
   });
 }
@@ -486,10 +538,16 @@ function attachDoneHandler(
     .then((code) => {
       const handle = active.get(runId);
       const wasCancelled = handle?.cancelled ?? false;
+      const wasApiError = handle?.apiError ?? false;
       active.delete(runId);
 
+      // API error overrides the exit-code mapping: claude resolves the turn
+      // with code 0 (the synthetic message stages a clean end_turn), but the
+      // run really failed — record it as such so the badge and history are
+      // honest.
       const newStatus: RunStatus = wasCancelled
         ? "cancelled"
+        : wasApiError ? "failed"
         : code === 0 ? "succeeded" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: code });
       // Only flip the task's column when the run that just resolved is
@@ -503,7 +561,14 @@ function attachDoneHandler(
       const task = tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
-        updateColumn(taskId, runId, newStatus === "succeeded" ? "review" : "ready");
+        // Cancellation wins over api-error here, matching the newStatus
+        // resolution above — a user-cancelled run shouldn't land in
+        // `blocked` just because it had previously hit an API error.
+        const nextColumn: ColumnId = wasCancelled
+          ? "ready"
+          : wasApiError ? "blocked"
+          : newStatus === "succeeded" ? "review" : "ready";
+        updateColumn(taskId, runId, nextColumn);
       }
       emit({
         runId,

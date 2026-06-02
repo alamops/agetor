@@ -321,7 +321,23 @@ interface ParsedJsonlEvent {
    *  in milliseconds — surfaced as a status breadcrumb so the user sees how
    *  long the turn took. */
   durationMs?: number;
+  /** Claude code stamps `isApiErrorMessage: true` (with `model: "<synthetic>"`
+   *  and `stop_reason: "stop_sequence"`) on assistant lines it synthesises to
+   *  surface an Anthropic API failure to the user (e.g. 529 Overloaded, 400
+   *  validation errors). The text block carries the user-facing error string.
+   *  These never get a real `end_turn`, so without special-casing them the
+   *  run would sit in `running` forever. */
+  isApiErrorMessage?: boolean;
+  /** HTTP status of the underlying API failure (paired with isApiErrorMessage). */
+  apiErrorStatus?: number;
 }
+
+/** Status-chunk prefix the orchestrator looks for to flip a claude task into
+ *  the `blocked` column when the agent hit an API error mid-turn. The colon +
+ *  space act as a separator so a future status starting with the word "api"
+ *  can't accidentally match. Centralised so the producer (claude-tmux) and
+ *  consumer (orchestrator) can't drift. */
+export const CLAUDE_API_ERROR_STATUS_PREFIX = "api error: ";
 
 /**
  * True for an assistant JSONL line that claims to end a turn. Used by
@@ -332,7 +348,14 @@ interface ParsedJsonlEvent {
  * cancels the staged pending when the next line proves the turn isn't over.
  */
 function isEndOfTurnEvent(evt: ParsedJsonlEvent): boolean {
-  return evt.type === "assistant" && evt.message?.stop_reason === "end_turn";
+  if (evt.type !== "assistant") return false;
+  // API-error messages never carry stop_reason: "end_turn" (they're
+  // synthetic — claude stamps stop_reason: "stop_sequence"), but they
+  // terminate the turn just as definitively from the orchestrator's
+  // perspective. Treat them as turn-ends here so the reattach replay path
+  // also stages them; the live path is covered by mapParsedEventToChunks
+  // returning endOfTurn:true on the same predicate.
+  return evt.message?.stop_reason === "end_turn" || evt.isApiErrorMessage === true;
 }
 
 /**
@@ -540,6 +563,26 @@ function mapParsedEventToChunks(
             // here as we grow renderers.
             break;
         }
+      }
+      // Synthetic API-error message — claude code injects these when the
+      // Anthropic API call fails (529 Overloaded, 400 validation, etc.).
+      // The text block above already surfaced the user-facing error string;
+      // emit a sentinel `status` chunk the orchestrator can pattern-match on
+      // to flip the task into the `blocked` column, and signal endOfTurn so
+      // the run row resolves instead of sitting in `running` forever.
+      //
+      // Emitted with `uuid: undefined` (not the JSONL line uuid) on purpose:
+      // the assistant text block above was just appended to run_events with
+      // that uuid, and the partial unique index on `(run_id, line_uuid)`
+      // would silently drop this status via INSERT OR IGNORE if we reused
+      // it. The NULL key path inserts unconditionally, so the breadcrumb
+      // also shows up on panel reload — not just live SSE.
+      if (evt.isApiErrorMessage === true) {
+        const detail = typeof evt.apiErrorStatus === "number"
+          ? `HTTP ${evt.apiErrorStatus} — turn aborted; blocked for manual retry`
+          : "turn aborted; blocked for manual retry";
+        onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}${detail}`);
+        return { endOfTurn: true, lineUuid: uuid };
       }
       // Signal a candidate turn-end. `dispatchLine` stages this and confirms
       // it's real only when the *next* line is not a same-message continuation
