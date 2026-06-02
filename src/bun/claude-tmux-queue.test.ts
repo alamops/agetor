@@ -1,5 +1,14 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  appendFileSync,
+  openSync,
+  writeSync,
+  closeSync,
+  readFileSync,
+  chmodSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -282,6 +291,54 @@ function withFakeTmuxBin<T>(fn: () => Promise<T>): Promise<T> {
   });
 }
 
+/**
+ * Recording variant of `withFakeTmuxBin`: writes a small bun script as the
+ * tmux bin that appends one `{ ns, argv }` JSON line per invocation to a
+ * log file. Lets tests assert both the *order* of tmux calls (load-buffer
+ * → paste-buffer → delete-buffer → send-keys Enter) AND the wall-clock
+ * gap between them (e.g. the bracketed-paste → Enter gap inserted by
+ * `queuePaste`). The shebang points at `process.execPath` — the bun
+ * binary that's running the suite — so the script works without `bun`
+ * being on `PATH`.
+ *
+ * `ms` is `Date.now()` (wall clock) sampled at the start of each
+ * invocation — NOT `Bun.nanoseconds()`, which is process-local and
+ * resets per sub-bun spawn. Subtract two log lines' `ms` for the gap.
+ * Cold-start of the sub-bun process is included in the delta, so use
+ * only for `>= GAP` lower bounds; the cold start can easily widen the
+ * observed delta past any tight upper bound.
+ */
+function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-rec-"));
+  const binPath = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  writeFileSync(
+    binPath,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync } from "node:fs";\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv: process.argv.slice(2) }) + "\\n");\n`,
+  );
+  chmodSync(binPath, 0o755);
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = binPath;
+  return fn(logPath).finally(() => {
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  });
+}
+
+function readTmuxLog(logPath: string): Array<{ ms: number; argv: string[] }> {
+  // The log may not exist if no tmux calls ran (e.g. a chain that
+  // short-circuited on stillCurrent before the first invocation).
+  let raw: string;
+  try {
+    raw = readFileSync(logPath, "utf8");
+  } catch {
+    return [];
+  }
+  return raw.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
+
 test("queuePaste: chained pastes run in FIFO order", async () => {
   await withFakeTmuxBin(async () => {
     const prev = __forTest.setSlashCommandSettleMs(0);
@@ -526,6 +583,134 @@ test("queueTmuxOp: skips its body if the session was disposed between scheduling
     } finally {
       __forTest.uninstallSession(taskId);
       __forTest.setSlashCommandSettleMs(prev);
+    }
+  });
+});
+
+// ─── bracketed-paste → Enter gap (regression for "[Pasted text +N lines]
+// renders but never submits" — the Enter that follows `paste-buffer -p`
+// gets absorbed as part of the bracketed paste event if it arrives in the
+// same input read). The fix splits the trailing Enter out of
+// `pastePromptSync` and inserts a gap inside `queuePaste`'s bracketed
+// branch, re-gating the Enter through `stillCurrent()` so a dispose during
+// the gap can't leak the keystroke into a respawned pane. ───
+
+test("queuePaste(bracketed): emits load-buffer → paste-buffer -p → delete-buffer → (gap) → send-keys Enter", async () => {
+  // Order proves the bracketed split was wired correctly; the timing
+  // floor on the send-keys Enter proves the gap was honored. Cold-start
+  // of the sub-bun tmux process is additive on top of the gap, so the
+  // delta-ms assertion is a lower bound — tolerance only guards against
+  // a slow timer wake-up, never against the sleep being skipped.
+  const GAP = 60;
+  const TOLERANCE = 30;
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevGap = __forTest.setBracketedEnterGapMs(GAP);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const taskId = randomUUID();
+      await __forTest.queuePaste(
+        taskId,
+        "sess-x",
+        "hello\nworld",
+        0,
+        undefined,
+        { bracketed: true },
+      );
+      const entries = readTmuxLog(logPath);
+      const cmds = entries.map((e) => e.argv[0]);
+      expect(cmds).toEqual([
+        "load-buffer",
+        "paste-buffer",
+        "delete-buffer",
+        "send-keys",
+      ]);
+      // paste-buffer carries the `-p` (bracketed-paste) flag.
+      const pasteBuffer = entries[1]!;
+      const deleteBuffer = entries[2]!;
+      const sendKeys = entries[3]!;
+      expect(pasteBuffer.argv).toContain("-p");
+      // The trailing send-keys is the Enter, not a stray modal keystroke.
+      expect(sendKeys.argv[sendKeys.argv.length - 1]).toBe("Enter");
+      // Gap floor: delete-buffer → send-keys Enter spans at least
+      // `GAP - TOLERANCE` ms. The actual delta also includes one
+      // sub-bun cold start, which only widens the gap.
+      const deltaMs = sendKeys.ms - deleteBuffer.ms;
+      expect(deltaMs).toBeGreaterThanOrEqual(GAP - TOLERANCE);
+    } finally {
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+test("queuePaste(bracketed): trailing Enter is skipped when the session is disposed mid-gap", async () => {
+  // Mid-body re-gate symmetry with the dismissTmuxPrompt test above:
+  // `dropSession` lands during the post-paste sleep, the bracketed
+  // branch's `stillCurrent()` check fires false, and the trailing
+  // send-keys Enter never spawns. Without the re-gate, the new session
+  // installed under the same taskId would inherit a stray Enter.
+  const GAP = 120;
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevGap = __forTest.setBracketedEnterGapMs(GAP);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    try {
+      const paste = __forTest.queuePaste(
+        taskId,
+        state.sessionName,
+        "msg",
+        0,
+        state,
+        { bracketed: true },
+      );
+      // Land squarely inside the gap — late enough that the paste body's
+      // three sync tmux calls have written, early enough that the Enter
+      // is still pending.
+      await Bun.sleep(GAP / 3);
+      __forTest.uninstallSession(taskId);
+      __forTest.installSession(taskId, jsonlPath);
+      await paste;
+      const cmds = readTmuxLog(logPath).map((e) => e.argv[0]);
+      // Paste body landed; Enter was dropped by the re-gate.
+      expect(cmds).toEqual(["load-buffer", "paste-buffer", "delete-buffer"]);
+      expect(cmds).not.toContain("send-keys");
+    } finally {
+      __forTest.uninstallSession(taskId);
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+test("queuePaste(non-bracketed): keeps the original synchronous load-buffer → paste-buffer → delete-buffer → send-keys Enter shape (no gap)", async () => {
+  // Slash-command path must NOT regress to the split-Enter form — the
+  // gap is bracketed-only. This pins the non-bracketed argv ordering
+  // AND confirms paste-buffer has no `-p` flag. A separate timing test
+  // would be brittle here — sub-bun cold start × 4 invocations can
+  // dominate wall-clock and mask any actual gap difference — so the
+  // structural assertion stands on its own.
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevGap = __forTest.setBracketedEnterGapMs(200);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const taskId = randomUUID();
+      await __forTest.queuePaste(taskId, "sess-x", "/model X", 0);
+      const entries = readTmuxLog(logPath);
+      expect(entries.map((e) => e.argv[0])).toEqual([
+        "load-buffer",
+        "paste-buffer",
+        "delete-buffer",
+        "send-keys",
+      ]);
+      // No `-p`: this is a typed-input slash command, not a paste event.
+      expect(entries[1]!.argv).not.toContain("-p");
+      // The trailing send-keys is the Enter, just as in bracketed mode.
+      const sendKeys = entries[3]!;
+      expect(sendKeys.argv[sendKeys.argv.length - 1]).toBe("Enter");
+    } finally {
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
     }
   });
 });
