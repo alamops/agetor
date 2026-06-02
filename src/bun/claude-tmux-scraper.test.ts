@@ -27,6 +27,7 @@ test("matchNumberedModal — claude plan-mode dialog (cursor on choice 1)", () =
   expect(m!.choices[0]!.label).toBe("Yes");
   expect(m!.choices[1]!.label).toBe("Yes, allow all");
   expect(m!.choices[2]!.label).toBe("No");
+  expect(m!.cursorIndex).toBe(0);
 });
 
 test("matchNumberedModal — alt cursor glyph (›)", () => {
@@ -35,6 +36,36 @@ test("matchNumberedModal — alt cursor glyph (›)", () => {
   2. Pick B`;
   const m = matchNumberedModal(pane);
   expect(m?.choices.length).toBe(2);
+  expect(m?.cursorIndex).toBe(0);
+});
+
+test("matchNumberedModal — cursor on non-first choice (model picker shape)", () => {
+  // Regression for the "Allow all edits silently picks Yes" class of
+  // bug: selection modals (model picker, /login) open with the cursor
+  // on the *current* value, not option 1. The cursor index must
+  // reflect that so the dismissal path can navigate from the right
+  // starting position.
+  const pane = `Pick a model
+  1. Opus 4.7
+❯ 2. Sonnet 4.6
+  3. Haiku 4.5`;
+  const m = matchNumberedModal(pane);
+  expect(m).not.toBeNull();
+  expect(m!.cursorIndex).toBe(1);
+});
+
+test("matchNumberedModal — same labels with different cursor position yield different fingerprints", () => {
+  // Cursor position is part of the fingerprint so that an in-progress
+  // modal whose selection changed (e.g., user arrowed via real tmux
+  // attach) re-registers with the new starting position. Without
+  // this, the second-tick stability check would silently match the old
+  // fingerprint and the dismissal path would navigate from a stale
+  // cursor index.
+  const a = matchNumberedModal(`❯ 1. A\n  2. B\n  3. C`)!;
+  const b = matchNumberedModal(`  1. A\n❯ 2. B\n  3. C`)!;
+  expect(a.cursorIndex).toBe(0);
+  expect(b.cursorIndex).toBe(1);
+  expect(a.fingerprint).not.toBe(b.fingerprint);
 });
 
 test("matchNumberedModal — no cursor anywhere means it's a printed list, not a modal", () => {

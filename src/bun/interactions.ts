@@ -174,6 +174,16 @@ export interface TmuxPromptRequest {
    *  what claude is asking. */
   paneText: string;
   choices: TmuxPromptChoice[];
+  /** 0-based index of the choice the scraper saw as currently selected
+   *  (the `❯`/`›` cursor line) at registration time. The dismissal path
+   *  uses this to compute how many `Down`/`Up` arrow presses to send
+   *  before Enter — claude's Ink select-input only responds to arrow
+   *  keys, not digit hotkeys. Permission modals default the cursor to
+   *  option 1 (index 0), but selection modals (model picker, auth re-
+   *  prompts) open with the cursor on the *current* value, which can be
+   *  anywhere. Undefined for prompts where arrow nav doesn't apply
+   *  (y/N modals — the literal `y`/`n` keystroke goes in directly). */
+  cursorIndex?: number;
   /** Stable hash of the matched block — used to debounce duplicate
    *  registrations across consecutive scrapes and to detect external
    *  dismissal (the prompt disappeared from the pane). */
@@ -504,6 +514,7 @@ export function registerTmuxPrompt(args: {
   runId: string;
   paneText: string;
   choices: TmuxPromptChoice[];
+  cursorIndex?: number;
   fingerprint: string;
 }): { id: string; req: TmuxPromptRequest; answer: Promise<TmuxPromptAnswer> } {
   // Defend the reserved-key namespace — `__external__` / `__cancelled__`
@@ -523,6 +534,7 @@ export function registerTmuxPrompt(args: {
     runId: args.runId,
     paneText: args.paneText,
     choices: args.choices,
+    cursorIndex: args.cursorIndex,
     fingerprint: args.fingerprint,
     createdAt: Date.now(),
   };

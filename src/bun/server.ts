@@ -1440,7 +1440,10 @@ export function startApiServer() {
               { status: 410, headers: corsHeaders(req) },
             );
           }
-          const delivered = await dismissTmuxPrompt(pending.taskId, key);
+          const delivered = await dismissTmuxPrompt(pending.taskId, key, {
+            choices: pending.choices,
+            cursorIndex: pending.cursorIndex,
+          });
           if (!delivered) {
             return json(
               { ok: false, error: "failed to deliver keystroke to tmux" },
