@@ -243,7 +243,7 @@ test("POST /approvals — saved Edit rule still auto-allows in non-plan mode (re
   expect(__testing.approvalsSize()).toBe(0);
 });
 
-test("POST /approvals — plan mode skips the saved-rule fast-path and registers an approval", async () => {
+test("POST /approvals — plan mode honors saved rules (Allow always trumps plan mode)", async () => {
   const { state } = await seedTaskWithSavedRule({
     taskId: "t-saved-rule-plan",
     ruleEntry: "Edit(/tmp/**)",
@@ -251,11 +251,7 @@ test("POST /approvals — plan mode skips the saved-rule fast-path and registers
   state.permissionMode = "plan";
   const { __testing } = await import("./interactions.ts");
   __testing.reset();
-  // Don't await — the route blocks until the interaction answers, which
-  // is the *point*: in plan mode we want to surface to the UI, not
-  // short-circuit. Race the fetch against a short delay; the registry
-  // size assertion proves the interaction landed.
-  const pending = fetch(url(`/approvals?taskId=t-saved-rule-plan`), {
+  const res = await fetch(url(`/approvals?taskId=t-saved-rule-plan`), {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({
@@ -263,13 +259,37 @@ test("POST /approvals — plan mode skips the saved-rule fast-path and registers
       tool_input: { file_path: "/tmp/y", old_string: "c", new_string: "d" },
     }),
   });
-  // Give the server a tick to register before we assert.
+  // Saved rule short-circuits even in plan mode: "Allow always" is the
+  // user's explicit trust signal and holds across mode changes.
+  expect(res.status).toBe(200);
+  const body = await res.json() as { hookSpecificOutput?: { permissionDecision?: string } };
+  expect(body.hookSpecificOutput?.permissionDecision).toBe("allow");
+  expect(__testing.approvalsSize()).toBe(0);
+});
+
+test("POST /approvals — plan mode still intercepts mutating tools without a saved rule", async () => {
+  const { state } = await seedTaskWithSavedRule({
+    taskId: "t-plan-no-rule",
+    ruleEntry: "Edit(/some/other/path/**)",
+  });
+  state.permissionMode = "plan";
+  const { __testing } = await import("./interactions.ts");
+  __testing.reset();
+  // Don't await — the route blocks until the interaction answers, which
+  // is the *point*: in plan mode without a matching rule we want to
+  // surface to the UI, not short-circuit.
+  const pending = fetch(url(`/approvals?taskId=t-plan-no-rule`), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      tool_name: "Edit",
+      tool_input: { file_path: "/tmp/y", old_string: "c", new_string: "d" },
+    }),
+  });
   await new Promise((r) => setTimeout(r, 50));
   expect(__testing.approvalsSize()).toBe(1);
-  // Resolve via the answer endpoint so the awaiting fetch settles and
-  // doesn't leak across tests.
   const { listPendingForTask, answerApproval } = await import("./interactions.ts");
-  const list = listPendingForTask("t-saved-rule-plan");
+  const list = listPendingForTask("t-plan-no-rule");
   expect(list[0]?.kind).toBe("approval");
   if (list[0]?.kind === "approval") {
     answerApproval(list[0].id, { decision: "allow" });
