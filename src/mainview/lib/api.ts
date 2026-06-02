@@ -410,7 +410,7 @@ export const api = {
   /** Answer claude's ExitPlanMode (intercepted via PreToolUse hook). */
   answerPlanApproval: (
     id: string,
-    body: { choice: "approve_implement" | "approve_ask" | "reject"; revision?: string },
+    body: { choice: "approve_auto" | "approve_implement" | "approve_ask" | "reject"; revision?: string },
   ) =>
     j<{ ok: boolean }>(`/plan-approvals/${id}/answer`, {
       method: "POST",

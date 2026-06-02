@@ -63,6 +63,7 @@ import {
   listPendingForTask,
   lookupAllowRule,
   makeHookResponse,
+  planApprovalTargetMode,
   registerApproval,
   registerAskQuestions,
   registerPlanApproval,
@@ -1203,6 +1204,11 @@ export function startApiServer() {
           const PLAN_MODE_INTERCEPT = new Set([
             "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash",
           ]);
+          // File-edit tools that auto-allow under acceptEdits — mirrors
+          // claude's own acceptEdits scope (edits flow, Bash still asks).
+          const ACCEPT_EDITS_TOOLS = new Set([
+            "Edit", "Write", "MultiEdit", "NotebookEdit",
+          ]);
           // A `Bash` call whose command is confidently read-only (grep/find/
           // ls/cat/…) is treated like the dedicated read-only tools: it can't
           // mutate the workspace, so it auto-allows even in ask/acceptEdits
@@ -1229,6 +1235,18 @@ export function startApiServer() {
           // approval cards for routine Bash even after switching to auto.
           if (!ALWAYS_INTERCEPT.has(toolName) &&
               (currentMode === "auto" || currentMode === "bypassPermissions")) {
+            return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
+          }
+          // acceptEdits fast-path: edit tools auto-allow (matches claude's
+          // own acceptEdits semantics — file edits flow without prompts,
+          // everything else still asks). Without this, a task in acceptEdits
+          // mode (either set via PATCH or via "Approve & implement" on a
+          // plan-mode card) still draws an approval card for every Edit,
+          // contradicting the badge. Bash and other non-edit tools fall
+          // through to the standard interactive flow.
+          if (!ALWAYS_INTERCEPT.has(toolName) &&
+              currentMode === "acceptEdits" &&
+              ACCEPT_EDITS_TOOLS.has(toolName)) {
             return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
           }
           // Fast paths: safe tools and previously-saved rules auto-allow,
@@ -1272,6 +1290,36 @@ export function startApiServer() {
             const plan = parseExitPlanInput(payload.tool_input);
             const { answer } = registerPlanApproval({ taskId, runId, plan });
             const ans = await answer;
+            // Approve choices also flip the live claude session's permission
+            // mode (and persist `task.mode`) so the PreToolUse hook's
+            // auto/bypass fast-path kicks in for subsequent tools and the
+            // kanban badge reflects reality. Without this, claude stays in
+            // `plan` mode and every Bash/Edit still draws a card even after
+            // "Approve & auto". Reuses the same reconciliation helper that
+            // PATCH /tasks/:id uses for mode edits.
+            const targetMode = planApprovalTargetMode(ans);
+            if (targetMode) {
+              const before = tasks.get(taskId);
+              if (before && before.mode !== targetMode) {
+                const updated = tasks.update(taskId, { mode: targetMode });
+                if (updated) {
+                  // Block the hook response on cycle-and-verify (unlike PATCH
+                  // /tasks/:id, which is fire-and-forget). The deny+reason we
+                  // return here unblocks claude to issue its next tool call
+                  // immediately, but `getCurrentPermissionMode` only flips
+                  // once the JSONL `permission-mode` event arrives — so a
+                  // fire-and-forget here lets claude's next Bash hit the
+                  // PreToolUse hook with `currentMode` still "plan" and draw
+                  // an approval card the user just opted out of. Cycle
+                  // verification takes ~100–400ms in the happy path, up to
+                  // 4.5s on retry — an acceptable wait on a button-click
+                  // boundary the user is already engaged with.
+                  await reconcileTaskSession(taskId, before, updated).catch((err: unknown) => {
+                    console.error("reconcileTaskSession (plan approval) failed:", err);
+                  });
+                }
+              }
+            }
             return json(
               makeHookResponse({ decision: "deny", reason: formatPlanApprovalReason(ans) }),
               { headers: corsHeaders(req) },

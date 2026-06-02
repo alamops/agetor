@@ -2976,15 +2976,18 @@ function AskQuestionsCard({
 
 /**
  * Card for claude's built-in ExitPlanMode (intercepted via PreToolUse
- * hook). Renders the plan body verbatim plus three action buttons:
+ * hook). Renders the plan body verbatim plus four action buttons:
  *
- *   • Approve & implement      — claude auto-accepts edits going forward
- *   • Approve, ask before each — claude asks before each file change
+ *   • Approve & auto           — switches task to auto, no further prompts
+ *   • Approve & implement      — switches task to acceptEdits (auto-accept
+ *                                edits, ask for Bash etc.)
+ *   • Approve, ask before each — switches task to default (ask each change)
  *   • Reject / revise          — claude rewrites the plan with feedback
  *
  * The chosen action becomes a natural-language string the server emits as
- * the hook's `permissionDecisionReason`. Claude reads it as if its TUI
- * modal had returned that choice and proceeds.
+ * the hook's `permissionDecisionReason`, and the server also calls
+ * cycleToMode + tasks.update so the live session and the kanban badge
+ * follow.
  */
 function PlanApprovalCard({
   req,
@@ -2995,11 +2998,16 @@ function PlanApprovalCard({
 }) {
   const [revising, setRevising] = useState(false);
   const [revision, setRevision] = useState("");
-  const [submitting, setSubmitting] = useState(false);
+  // `submittingChoice` tracks which button was clicked so we can render
+  // "Sending…" on that specific button. `submitting` is the boolean any
+  // disabled={} predicate should read.
+  type Choice = "approve_auto" | "approve_implement" | "approve_ask" | "reject";
+  const [submittingChoice, setSubmittingChoice] = useState<Choice | null>(null);
+  const submitting = submittingChoice !== null;
 
-  const decide = async (choice: "approve_implement" | "approve_ask" | "reject") => {
+  const decide = async (choice: Choice) => {
     if (submitting) return;
-    setSubmitting(true);
+    setSubmittingChoice(choice);
     try {
       await api.answerPlanApproval(req.id, {
         choice,
@@ -3007,9 +3015,11 @@ function PlanApprovalCard({
       });
       onResolved(req.id);
     } finally {
-      setSubmitting(false);
+      setSubmittingChoice(null);
     }
   };
+  const labelFor = (choice: Choice, fallback: string) =>
+    submittingChoice === choice ? "Sending…" : fallback;
 
   return (
     <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
@@ -3047,7 +3057,7 @@ function PlanApprovalCard({
               size="sm"
               disabled={submitting}
             >
-              {submitting ? "Sending…" : "Send revision request"}
+              {labelFor("reject", "Send revision request")}
             </Button>
           </>
         ) : (
@@ -3066,14 +3076,22 @@ function PlanApprovalCard({
               size="sm"
               disabled={submitting}
             >
-              Approve, ask each edit
+              {labelFor("approve_ask", "Approve, ask each edit")}
+            </Button>
+            <Button
+              onClick={() => void decide("approve_auto")}
+              variant="secondary"
+              size="sm"
+              disabled={submitting}
+            >
+              {labelFor("approve_auto", "Approve & auto")}
             </Button>
             <Button
               onClick={() => void decide("approve_implement")}
               size="sm"
               disabled={submitting}
             >
-              {submitting ? "Sending…" : "Approve & implement"}
+              {labelFor("approve_implement", "Approve & implement")}
             </Button>
           </>
         )}
