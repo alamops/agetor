@@ -230,8 +230,16 @@ export function buildCommand(
 
     // Initial prompt as the final argv element — claude's documented form is
     // `claude "query"` to start an interactive session with that prompt
-    // already submitted.
-    if (prompt) args.push(prompt);
+    // already submitted. Prefix it with the `--` option terminator so a
+    // prompt that STARTS WITH `-` (e.g. a markdown checklist item
+    // "- [ ] do the thing", or any "--flag-like" instruction) is treated as a
+    // positional and not misparsed by claude's CLI as an unknown option.
+    // Without `--`, claude errors `unknown option '<prompt>'` and exits
+    // before writing any JSONL — which the tmux driver only observes as a
+    // dead session + empty pane + 30s boot timeout (the run just fails with
+    // no visible cause). `--` is a no-op for prompts that don't lead with a
+    // dash.
+    if (prompt) args.push("--", prompt);
 
     // Effort is required unless the chosen model doesn't accept the flag
     // (Haiku 4.5 today). Unknown effort ids are dropped rather than passed
@@ -267,7 +275,11 @@ export function buildCommand(
   const mode = opts.mode ?? "auto";
   if (mode === "auto") args.push("--full-auto");
 
-  args.push(...extra, prompt);
+  // `--` terminates option parsing so a prompt starting with `-` (markdown
+  // checklist, "--flag-like" text) is taken as the positional prompt rather
+  // than misparsed as an option — same failure class as the claude path
+  // above. Standard in clap-based CLIs like codex.
+  args.push(...extra, "--", prompt);
   return { cmd: args, env: Object.keys(env).length ? env : undefined };
 }
 

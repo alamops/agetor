@@ -119,7 +119,7 @@ test("claude-code with defaults launches interactive REPL with --model opus-4.7 
     "claude",
     "--model", "claude-opus-4-7",
     "--permission-mode", "auto",
-    "the prompt",
+    "--", "the prompt",
   ]);
   expect(cmd).not.toContain("--print");
   expect(cmd).not.toContain("--dangerously-skip-permissions");
@@ -131,7 +131,7 @@ test("claude-code 'opus-4.7' + 'auto' translates to --model and --permission-mod
     "claude",
     "--model", "claude-opus-4-7",
     "--permission-mode", "auto",
-    "do thing",
+    "--", "do thing",
   ]);
 });
 
@@ -141,8 +141,25 @@ test("claude-code 'opus-4.8' maps to --model claude-opus-4-8", () => {
     "claude",
     "--model", "claude-opus-4-8",
     "--permission-mode", "auto",
-    "do thing",
+    "--", "do thing",
   ]);
+});
+
+test("claude-code prefixes the prompt with `--` so a leading-dash prompt isn't parsed as a flag", () => {
+  // Regression: a prompt like a markdown checklist item starts with `-`.
+  // Without the `--` terminator claude's CLI errors `unknown option` and
+  // exits before writing any JSONL — the tmux driver then only sees a dead
+  // session + empty pane + 30s timeout. The `--` must sit immediately before
+  // the prompt and after every flag.
+  const { cmd } = buildCommand(
+    builtin("claude-code"),
+    "- [ ] Add a button",
+    { ...claudeDefaults, mode: "auto" },
+  );
+  expect(cmd[cmd.length - 2]).toBe("--");
+  expect(cmd[cmd.length - 1]).toBe("- [ ] Add a button");
+  // `--` comes after the permission flag, not before it.
+  expect(cmd.indexOf("--")).toBeGreaterThan(cmd.indexOf("--permission-mode"));
 });
 
 test("claude-code 'bypass' mode emits --dangerously-skip-permissions", () => {
@@ -271,7 +288,7 @@ test("codex with defaults emits --model gpt-5-codex + reasoning effort + --full-
     "--model", "gpt-5-codex",
     "-c", "model_reasoning_effort=high",
     "--full-auto",
-    "hi",
+    "--", "hi",
   ]);
 });
 
@@ -282,7 +299,7 @@ test("codex 'ask' mode drops --full-auto so codex prompts as usual", () => {
     "codex", "exec",
     "--model", "gpt-5-codex",
     "-c", "model_reasoning_effort=high",
-    "hi",
+    "--", "hi",
   ]);
 });
 
@@ -293,7 +310,7 @@ test("codex model 'gpt-5.5' passes through verbatim as --model", () => {
     "--model", "gpt-5.5",
     "-c", "model_reasoning_effort=high",
     "--full-auto",
-    "hi",
+    "--", "hi",
   ]);
 });
 
@@ -304,7 +321,7 @@ test("codex model 'gpt-5' adds --model gpt-5 before the prompt", () => {
     "--model", "gpt-5",
     "-c", "model_reasoning_effort=high",
     "--full-auto",
-    "hi",
+    "--", "hi",
   ]);
 });
 
@@ -346,16 +363,16 @@ test("claude-code unknown effort id is dropped (no env)", () => {
   expect(result.env).toBeUndefined();
 });
 
-test("AGETOR_CLAUDE_ARGS extra args land before the prompt", () => {
+test("AGETOR_CLAUDE_ARGS extra args land before the prompt (and before the `--` terminator)", () => {
   process.env.AGETOR_CLAUDE_ARGS = "--verbose --foo";
   const { cmd } = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults });
-  expect(cmd.slice(-3)).toEqual(["--verbose", "--foo", "p"]);
+  expect(cmd.slice(-4)).toEqual(["--verbose", "--foo", "--", "p"]);
 });
 
-test("AGETOR_CODEX_ARGS extra args still land before the prompt", () => {
+test("AGETOR_CODEX_ARGS extra args still land before the prompt (and before the `--` terminator)", () => {
   process.env.AGETOR_CODEX_ARGS = "--verbose --foo";
   const { cmd } = buildCommand(builtin("codex"), "p", { ...codexDefaults });
-  expect(cmd.slice(-3)).toEqual(["--verbose", "--foo", "p"]);
+  expect(cmd.slice(-4)).toEqual(["--verbose", "--foo", "--", "p"]);
 });
 
 // Invariant test for AGENT_OPTIONS — guards against re-introducing the
