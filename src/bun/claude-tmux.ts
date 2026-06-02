@@ -984,7 +984,11 @@ const sessions = new Map<string, SessionState>(); // taskId → state
  * previous one's settle window has elapsed. Modal dismissals
  * (`dismissTmuxPrompt`) share the same chain so a click on a numbered
  * choice can't interleave its `"1"` + Enter keystrokes with an in-flight
- * paste-buffer + Enter from `queuePaste`.
+ * paste from `queuePaste`. (The exact tmux payload is mode-dependent —
+ * non-bracketed slash commands send `load-buffer + paste-buffer +
+ * delete-buffer + send-keys Enter` synchronously, while bracketed user
+ * pastes split the trailing Enter out with a small `bracketedEnterGapMs`
+ * sleep in between. See `queuePaste`.)
  *
  * The map's value is the tail promise of the in-flight chain; new ops
  * append via `queueTmuxOp`. Entries self-evict on completion when no
@@ -2307,6 +2311,15 @@ export const __forTest = {
     return prev;
   },
   getSlashCommandSettleMs(): number { return slashCommandSettleMs; },
+  /** Override the bracketed-paste → Enter gap. Tests shrink it to ~0 to
+   *  avoid sleeping on every paste-queue assertion. Returns the previous
+   *  value so the test can restore it in `afterEach`. */
+  setBracketedEnterGapMs(ms: number): number {
+    const prev = bracketedEnterGapMs;
+    bracketedEnterGapMs = ms;
+    return prev;
+  },
+  getBracketedEnterGapMs(): number { return bracketedEnterGapMs; },
   /** Direct access to the paste queue for assertions. Read-only — tests
    *  inspect ordering by observing tmux side effects, not by mutating
    *  the chain. */
@@ -2324,7 +2337,11 @@ export const __forTest = {
  * Sync core — callers go through `queuePaste` so back-to-back pastes for the
  * same task can't interleave at the tmux layer. See `queuePaste` for why.
  */
-function pastePromptSync(sessionName: string, text: string, opts: { bracketed?: boolean } = {}): void {
+function pastePromptSync(
+  sessionName: string,
+  text: string,
+  opts: { bracketed?: boolean; skipEnter?: boolean } = {},
+): void {
   // load-buffer reads from stdin; -b names a tmux buffer we can target.
   const buf = `agetor-${sessionName}`;
   const load = tmux(["load-buffer", "-b", buf, "-"], { stdinText: text });
@@ -2341,7 +2358,13 @@ function pastePromptSync(sessionName: string, text: string, opts: { bracketed?: 
   const pasteFlags = opts.bracketed ? ["-p"] : [];
   tmux(["paste-buffer", ...pasteFlags, "-b", buf, "-t", sessionName]);
   tmux(["delete-buffer", "-b", buf]);
-  tmux(["send-keys", "-t", sessionName, "Enter"]);
+  // `skipEnter` defers the trailing Enter to the caller so it can sleep
+  // between the bracketed paste and the Enter — see `queuePaste`. Without
+  // that gap, a follow-up turn pasted mid-stream gets rendered as `[Pasted
+  // text +N lines]` in claude's TUI but the immediately-following `\r` is
+  // absorbed as part of the same paste event, so the queued bubble sits
+  // unsubmitted until the user (or a later Enter) commits it.
+  if (!opts.skipEnter) tmux(["send-keys", "-t", sessionName, "Enter"]);
 }
 
 /**
@@ -2369,6 +2392,31 @@ function pastePromptSync(sessionName: string, text: string, opts: { bracketed?: 
  * Tests shrink the value to keep the queue suite fast.
  */
 let slashCommandSettleMs = 700;
+
+/**
+ * Gap between the bracketed-paste body (`paste-buffer -p`) and the trailing
+ * `send-keys Enter` for follow-up turns. Without a gap, claude's Ink TUI
+ * sees the `ESC[201~` end marker and the immediately-following `\r` as part
+ * of the same input read; the `\r` is absorbed as part of the paste event
+ * and the `[Pasted text +N lines]` bubble sits unsubmitted until something
+ * else commits it. 80ms comfortably exceeds the few-ms claude's reader
+ * takes to process the end marker on an idle session; the cost is one
+ * delay per follow-up paste, observable only as a brief queueing window.
+ *
+ * Only applied in bracketed mode — non-bracketed pastes (slash commands)
+ * stream as plain keystrokes and don't have the paste-event coalescing
+ * window. Tests shrink the value to keep the queue suite fast.
+ *
+ * Failure mode is asymmetric: too low silently regresses to the "paste
+ * shown, never submitted" bug with no log signal (the queued bubble
+ * just sits in the TUI input until something else commits it), while
+ * too high only adds perceived latency to follow-up turns. Prefer
+ * raising over lowering when in doubt. A real-world ceiling under load
+ * (e.g. claude paused on a tool call, reader latency higher) has not
+ * been measured — if you observe the regression returning, bump this
+ * first before assuming a structural fix is needed.
+ */
+let bracketedEnterGapMs = 80;
 
 /**
  * Append a tmux operation to the per-task chain. The `fn` thunk runs
@@ -2456,6 +2504,15 @@ function queueTmuxOp(
  * Pass `expectedState` to gate the paste on the session still being
  * the one this paste was scheduled against — see `queueTmuxOp` for the
  * race this closes.
+ *
+ * When `opts.bracketed` is true, the trailing `Enter` is split out of
+ * the synchronous paste body and sent after a small internal gap
+ * (`bracketedEnterGapMs`) so claude's Ink TUI commits the `ESC[200~ …
+ * ESC[201~` paste event before the `\r` arrives — without that gap the
+ * Enter is absorbed as part of the paste event and the queued bubble
+ * sits unsubmitted. The deferred Enter is re-gated through
+ * `stillCurrent()` so a `dropSession` landing during the gap can't
+ * leak the keystroke into a respawned pane.
  */
 function queuePaste(
   taskId: string,
@@ -2465,13 +2522,29 @@ function queuePaste(
   expectedState?: SessionState,
   opts: { bracketed?: boolean } = {},
 ): Promise<void> {
-  // No mid-body re-gate needed: pastePromptSync delivers all four tmux
-  // calls (load-buffer + paste-buffer + delete-buffer + send-keys Enter)
-  // synchronously before the optional settle sleep. The settle is pure
-  // waiting — no tmux calls happen after it within this body — so a
-  // dispose during the sleep can't leak keystrokes.
-  return queueTmuxOp(taskId, async () => {
-    pastePromptSync(sessionName, text, opts);
+  // Non-bracketed path: load-buffer + paste-buffer + delete-buffer +
+  // send-keys Enter all happen synchronously inside pastePromptSync, so
+  // the only await is the optional settle — no tmux calls land after the
+  // sleep, and a dispose during the sleep can't leak keystrokes.
+  //
+  // Bracketed path: we split the trailing Enter out and insert a small
+  // gap so claude's Ink TUI has time to consume `ESC[201~` and commit
+  // the paste before the `\r` arrives. Without the gap the Enter is
+  // absorbed as part of the paste event and the queued bubble sits
+  // unsubmitted (especially when the previous turn is still streaming
+  // or has a background tool in flight — see the "[Pasted text #N +M
+  // lines] never submits" repro). The deferred Enter is re-gated through
+  // `stillCurrent()` so a `dropSession` landing in the gap can't leak the
+  // Enter into a respawned pane.
+  return queueTmuxOp(taskId, async (stillCurrent) => {
+    if (opts.bracketed) {
+      pastePromptSync(sessionName, text, { ...opts, skipEnter: true });
+      if (bracketedEnterGapMs > 0) await Bun.sleep(bracketedEnterGapMs);
+      if (!stillCurrent()) return;
+      tmux(["send-keys", "-t", sessionName, "Enter"]);
+    } else {
+      pastePromptSync(sessionName, text, opts);
+    }
     if (settleMs > 0) await Bun.sleep(settleMs);
   }, expectedState);
 }
