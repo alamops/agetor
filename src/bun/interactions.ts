@@ -642,6 +642,7 @@ export function countPendingForTask(taskId: string): number {
   for (const e of questions.values()) if (e.req.taskId === taskId) n++;
   for (const e of askQuestions.values()) if (e.req.taskId === taskId) n++;
   for (const e of planApprovals.values()) if (e.req.taskId === taskId) n++;
+  for (const e of tmuxPrompts.values()) if (e.req.taskId === taskId) n++;
   return n;
 }
 

@@ -384,13 +384,13 @@ test("tasks.get / tasks.list expose pendingInteractionCount reflecting open inte
   const { tasks } = await import("./db.ts");
   const {
     registerApproval, registerQuestion, registerAskQuestions, registerPlanApproval,
-    answerApproval, answerQuestion,
+    registerTmuxPrompt, answerApproval, answerQuestion,
   } = await import("./interactions.ts");
 
   // No interactions yet → 0.
   expect(tasks.get("tCount")!.pendingInteractionCount).toBe(0);
 
-  // One of each kind from the four in-memory maps; counter should reflect all.
+  // One of each kind from the five in-memory maps; counter should reflect all.
   const ap = registerApproval({ taskId: "tCount", runId: "r1", toolName: "Bash", toolInput: { command: "ls" } });
   registerQuestion({ taskId: "tCount", runId: "r1", question: "?" });
   registerAskQuestions({
@@ -398,15 +398,21 @@ test("tasks.get / tasks.list expose pendingInteractionCount reflecting open inte
     questions: [{ question: "?", options: [{ label: "A" }] }],
   });
   registerPlanApproval({ taskId: "tCount", runId: "r1", plan: "P" });
-  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(4);
+  registerTmuxPrompt({
+    taskId: "tCount", runId: "r1",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "fp-count",
+  });
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(5);
   // And the same count surfaces via tasks.list (the kanban's polling path).
   const fromList = tasks.list().find((t) => t.id === "tCount");
-  expect(fromList?.pendingInteractionCount).toBe(4);
+  expect(fromList?.pendingInteractionCount).toBe(5);
 
   // Answering removes the entry from its map and decrements the count.
   answerApproval(ap.id, { decision: "allow" });
   await ap.answer;
-  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(3);
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(4);
 
   // Counter is scoped to the task: a sibling task with no interactions reads 0.
   await makeTaskWithCwd("tCountSibling");
@@ -414,10 +420,10 @@ test("tasks.get / tasks.list expose pendingInteractionCount reflecting open inte
 
   // Answer the bare question too; counter keeps dropping.
   const q2 = registerQuestion({ taskId: "tCount", runId: "r1", question: "?" });
-  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(4);
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(5);
   answerQuestion(q2.id, { selected: ["ok"] });
   await q2.answer;
-  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(3);
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(4);
 });
 
 test("registerTmuxPrompt + answerTmuxPrompt round-trips a key", async () => {

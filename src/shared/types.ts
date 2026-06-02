@@ -233,9 +233,10 @@ export interface Task {
   /**
    * Number of pending interactions waiting on the user for this task —
    * `ask_user` MCP calls, `AskUserQuestion` / `ExitPlanMode` Claude built-ins,
-   * and tool-call approval requests. Computed in `tasks.list()` / `tasks.get()`
-   * via `countPendingForTask` (interactions live in memory; not persisted).
-   * Drives the kanban card's "Answer →" call-to-action.
+   * tool-call approval requests, and unstructured in-REPL tmux prompts
+   * (the "CLAUDE IS PAUSED ON A PROMPT" card). Computed in `tasks.list()` /
+   * `tasks.get()` via `countPendingForTask` (interactions live in memory;
+   * not persisted). Drives the kanban card's "Answer →" call-to-action.
    *
    * Codex's narrative `column='blocked'` signal is reflected via `task.column`,
    * not this counter — the card combines both at render time.
