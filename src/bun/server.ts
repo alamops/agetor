@@ -1196,13 +1196,10 @@ export function startApiServer() {
           // generic ApprovalCard) shouldn't be able to disable the safety.
           const ALWAYS_INTERCEPT = new Set(["AskUserQuestion", "ExitPlanMode"]);
           // Plan mode is the user explicitly opting into "stop and ask
-          // before any write". A saved allow-rule from a prior non-plan
-          // run must not silently bypass that — otherwise the kanban
-          // shows "Agent is working…" while claude is actually paused on
-          // its plan-mode confirmation dialog inside tmux (see
-          // docs/can-we-apply-both-* plan). Read-only tools keep their
-          // fast-path even here: they can't mutate the workspace, so
-          // the plan-mode safety doesn't apply.
+          // before any write". Tools without a saved allow-rule still get
+          // intercepted; saved rules (created via "Allow always") are
+          // honored everywhere — "always" means always, including in
+          // plan mode. Read-only tools keep their fast-path either way.
           const PLAN_MODE_INTERCEPT = new Set([
             "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash",
           ]);
@@ -1235,12 +1232,19 @@ export function startApiServer() {
             return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
           }
           // Fast paths: safe tools and previously-saved rules auto-allow,
-          // except for the always-intercept set above. The allow-rule lookup
-          // now reads `.claude/settings.local.json` `permissions.allow` and
-          // matches per the claude pattern syntax (see claude-permissions.ts).
+          // except for the always-intercept set above. Order matters —
+          // the cheap, plan-gated safe/readOnlyBash check runs first so
+          // the common case (every grep/find/ls) skips the disk read in
+          // lookupAllowRule. The saved-rule path runs second and bypasses
+          // planModeForce: "Allow always" is the user's explicit trust
+          // signal and holds across mode changes. To revoke a rule,
+          // delete it from the Rules manager.
           if (!ALWAYS_INTERCEPT.has(toolName) && !planModeForce &&
-              (SAFE_TOOLS.has(toolName) || readOnlyBash ||
-               lookupAllowRule({ taskId, toolName, toolInput: payload.tool_input }) === "allow")) {
+              (SAFE_TOOLS.has(toolName) || readOnlyBash)) {
+            return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
+          }
+          if (!ALWAYS_INTERCEPT.has(toolName) &&
+              lookupAllowRule({ taskId, toolName, toolInput: payload.tool_input }) === "allow") {
             return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
           }
           // ─── Claude built-in interactive tools ─────────────────────────
