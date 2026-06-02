@@ -679,53 +679,100 @@ export function getCurrentPermissionMode(taskId: string): string | null {
 }
 
 /**
- * Send a literal keystroke (or short sequence) to a task's tmux session
- * followed by Enter. Used by the `/tmux-prompts/:id/answer` route to
- * dismiss a Claude REPL modal the scraper detected — typing `"1"` then
- * Enter into the pane is how the user would manually pick choice 1.
+ * Dismiss a Claude REPL modal the scraper detected by sending keystrokes
+ * into the task's tmux session.
+ *
+ * Numbered modals: claude's modal is rendered by Ink's select-input,
+ * which navigates with arrow keys and confirms with Enter. **Digit
+ * keypresses do not move the cursor or confirm a choice** — they're
+ * silently dropped. Sending `"2"` + Enter therefore behaves like Enter
+ * alone: confirms whatever the cursor was on. The fix: arrow-key from
+ * the scraper-observed `cursorIndex` to the index of the target choice,
+ * then Enter. Positive delta → `Down`; negative → `Up`. This matters
+ * because the scraper catches a wider set of modals than permission
+ * prompts — the model picker and `/login` open with the cursor on the
+ * *current* value, not necessarily option 1.
+ *
+ * Y/N modals: pass `cursorIndex` as undefined — the function falls back
+ * to sending the literal `y`/`n` keystroke, which claude's confirm
+ * helper handles directly.
+ *
+ * Each arrow press is its own `send-keys` invocation with a small sleep
+ * between them. A bursted `Down Down Enter` lands as one read on
+ * claude's stdin and the trailing Enter can be consumed before the
+ * second Down propagates through the Ink reducer — the same race the
+ * original `digit + Enter` split was working around.
  *
  * NOT a chat message: we deliberately bypass the `load-buffer +
  * paste-buffer` flow `pastePrompt` uses, because that path delivers the
  * text into claude's input buffer to become the next prompt. The modal
- * wants a direct keypress, not a queued message.
+ * wants direct keypresses, not a queued message.
  *
- * Returns true on apparent success (tmux command exited 0). Silently
- * returns false when no session is registered.
+ * Returns true on apparent success (every tmux command exited 0).
+ * Silently returns false when no session is registered, when the target
+ * key isn't present in the supplied choices, or when the session is
+ * disposed mid-body (a `dropSession` + respawn during the inter-
+ * keystroke gap would otherwise leak the trailing Enter into the fresh
+ * pane as a stray confirmation).
  *
  * Latency: serialized behind any in-flight tmux op for the same task
  * (paste-prompts included), so a click that lands while a `/model X`
  * settle window is still elapsing waits up to `slashCommandSettleMs`
- * (default 700ms) before the digit goes out. The server route at
- * `server.ts:1420` awaits this Promise, so the modal-click HTTP
+ * (default 700ms) before the first keystroke goes out. The server route
+ * at `server.ts:1420` awaits this Promise, so the modal-click HTTP
  * response inherits the wait.
  */
-export async function dismissTmuxPrompt(taskId: string, key: string): Promise<boolean> {
+export async function dismissTmuxPrompt(
+  taskId: string,
+  key: string,
+  ctx: { choices: TmuxPromptChoice[]; cursorIndex?: number },
+): Promise<boolean> {
   const state = sessions.get(taskId);
   if (!state) return false;
-  // Two SEPARATE send-keys calls — not "key Enter" in one. A combined
-  // invocation makes tmux deliver "1\r" as a single read chunk, and
-  // claude's Ink select consumes only the digit (moves/highlights the
-  // choice) while the trailing carriage return is dropped — so the choice
-  // is never confirmed and the modal just sits there. Splitting them
-  // (mirrors pastePrompt's separate Enter) lets the digit register first,
-  // then the Enter confirms. The brief gap guarantees the two keystrokes
-  // land in distinct reads on claude's stdin; `await Bun.sleep` (not the
-  // sync variant) keeps the gap off the SSE/scrape event loop.
-  //
-  // Routed through `queueTmuxOp` so the digit + Enter pair can't
+  // Map the choice key to its 0-based position in the registered list.
+  // We use the *list* (not `parseInt(key) - 1`) so leading-zero or
+  // unexpected key shapes can never silently mis-navigate — and so a
+  // future modal that uses non-digit keys with arrow navigation would
+  // still work without changing this function.
+  const targetIndex = ctx.choices.findIndex((c) => c.key === key);
+  if (targetIndex < 0) return false;
+  const useArrowNav = typeof ctx.cursorIndex === "number";
+  const delta = useArrowNav ? targetIndex - ctx.cursorIndex! : 0;
+  const arrow = delta >= 0 ? "Down" : "Up";
+  const stepCount = Math.abs(delta);
+  // Routed through `queueTmuxOp` so our navigation + Enter sequence can't
   // interleave with an in-flight `queuePaste` for the same session — a
-  // racing user paste's `paste-buffer + Enter` between our digit and our
+  // racing user paste's `paste-buffer + Enter` between our arrow and our
   // Enter would land the paste text in the modal's input and confirm
   // garbage. Sharing the chain serializes us behind any pending paste
   // (and its settle window) before our keys go out.
   let ok = false;
   await queueTmuxOp(taskId, async (stillCurrent) => {
-    const sent = tmux(["send-keys", "-t", state.sessionName, key]);
-    if (!sent.ok) return;
-    await Bun.sleep(50);
-    // Re-gate before the trailing Enter: a `dropSession` during the
-    // 50ms gap (with a same-taskId respawn) would otherwise land the
-    // Enter in the new session's pane as a stray confirmation.
+    if (useArrowNav) {
+      // Numbered modal: arrow-key from cursorIndex to targetIndex.
+      // delta === 0 → no arrow at all, the trailing Enter alone
+      // confirms the current selection.
+      for (let i = 0; i < stepCount; i++) {
+        if (!tmux(["send-keys", "-t", state.sessionName, arrow]).ok) return;
+        // Small gap between arrow presses — defensive splitting that
+        // mirrors what the original `digit + Enter` path needed:
+        // bursting two arrow events as a single read into Ink's stdin
+        // has been observed (rarely) to coalesce into one cursor
+        // advance. The gap also lets the per-keystroke `stillCurrent()`
+        // re-gate fire if a `dropSession` lands mid-navigation.
+        await Bun.sleep(30);
+        if (!stillCurrent()) return;
+      }
+    } else {
+      // y/n style: send the literal keystroke.
+      if (!tmux(["send-keys", "-t", state.sessionName, key]).ok) return;
+      await Bun.sleep(50);
+      if (!stillCurrent()) return;
+    }
+    // Explicit re-gate before the trailing Enter — symmetric with the
+    // per-arrow check inside the loop and the y/n path above. Future
+    // edits that insert an `await` between the loop end and this Enter
+    // would otherwise reopen the dispose-during-gap race.
     if (!stillCurrent()) return;
     ok = tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok;
   }, state);
@@ -1354,6 +1401,13 @@ interface ScrapeMatch {
   paneText: string;
   /** Buttons to render — `key` is what we send to tmux on click. */
   choices: TmuxPromptChoice[];
+  /** 0-based index of the choice marked by the `❯`/`›` cursor at scrape
+   *  time. Undefined when arrow navigation does not apply (y/N modals).
+   *  Threaded through to `dismissTmuxPrompt` so it knows how far to
+   *  navigate from the current selection — permission modals default to
+   *  index 0 (option 1), but the model picker / auth re-prompts open
+   *  with the cursor on the *current* value, anywhere in the list. */
+  cursorIndex?: number;
   /** Stable hash that survives across consecutive scrapes as long as the
    *  modal stays on screen unchanged. */
   fingerprint: string;
@@ -1397,13 +1451,27 @@ function matchNumberedModal(tail: string): ScrapeMatch | null {
     if (i > 0 && Number(numbered[i - 1]!.key) + 1 !== Number(numbered[i]!.key)) break;
   }
   if (tailRun.length < 2) return null;
+  // Cursor MUST land inside tailRun for the modal to be dismissible —
+  // otherwise the `❯` is on a printed list above the actual choice set
+  // (we'd send arrow keys into a phantom selector). Bail rather than
+  // register a half-known modal.
+  const cursorIndex = tailRun.findIndex((n) => n.cursorHere);
+  if (cursorIndex < 0) return null;
   const choices: TmuxPromptChoice[] = tailRun.map((n) => ({ key: n.key, label: n.label }));
   // Use the last ~12 lines for the displayed pane snippet so the user
   // sees the question text + the choices, not 40 lines of unrelated
   // context above.
   const paneText = lines.slice(-12).join("\n").trimEnd();
-  const fingerprint = sha1(`numbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}`);
-  return { paneText, choices, fingerprint };
+  // Cursor position is part of the fingerprint: if claude moves the
+  // highlight while the modal is on screen (e.g., user arrows around
+  // via a real tmux attach), we want to re-register so the dismissal
+  // path picks up the new starting position. Without this the second-
+  // tick stability check would silently match the old position and
+  // navigate from a stale index.
+  const fingerprint = sha1(
+    `numbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}|@${cursorIndex}`,
+  );
+  return { paneText, choices, cursorIndex, fingerprint };
 }
 
 /** Recognise `(y/N)` / `(Y/n)` / `[y/n]` confirmation prompts on the
@@ -1543,6 +1611,7 @@ function scrapeOnce(state: SessionState): void {
     runId,
     paneText: match.paneText,
     choices: match.choices,
+    cursorIndex: match.cursorIndex,
     fingerprint: match.fingerprint,
   });
 }
