@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Bug, ClipboardList, Code2, FlaskConical, GitBranch, Inbox } from "lucide-react";
+import { ClipboardList, Code2, GitBranch } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { taskTypeIcon } from "@/lib/task-type-icon";
 import {
   AGENT_OPTIONS,
   CODE_PLAN_MODE,
@@ -35,14 +36,6 @@ import { SlashAutocomplete } from "./SlashAutocomplete";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 
 const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
-
-// Map the `TaskTypeMeta.icon` string ids to actual lucide components.
-// Defined module-scope so the lookup doesn't re-allocate per render.
-const TASK_TYPE_ICONS = {
-  Inbox,
-  Bug,
-  FlaskConical,
-} as const;
 
 interface Props {
   onSubmit: (
@@ -414,7 +407,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
           <label className="text-muted-foreground">Type</label>
           <div className="grid grid-cols-3 gap-1">
             {TASK_TYPES.map((t) => {
-              const Icon = TASK_TYPE_ICONS[t.icon];
+              const Icon = taskTypeIcon(t.icon);
               const selected = taskType === t.id;
               return (
                 <Button
