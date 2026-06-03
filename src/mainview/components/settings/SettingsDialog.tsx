@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronLeft, Plus, Trash2, X } from "lucide-react";
+import { ChevronLeft, Plus, Terminal, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError, api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -227,6 +227,18 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
     }
   };
 
+  const onOpenTerminal = async (h: Harness) => {
+    try {
+      await api.openHarnessTerminal(h.id);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      toast.error(`Couldn't open a terminal for "${h.label}"`, {
+        description: message,
+        duration: Infinity,
+      });
+    }
+  };
+
   const clearPending = (id: string) =>
     setPendingToggle((m) => {
       if (!(id in m)) return m;
@@ -351,6 +363,7 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
           }
           onDelete={onDeleteHarness}
           onToggleEnabled={onToggleEnabled}
+          onOpenTerminal={onOpenTerminal}
           pendingToggle={pendingToggle}
         />
       )}
@@ -420,6 +433,7 @@ function ListView({
   onEdit,
   onDelete,
   onToggleEnabled,
+  onOpenTerminal,
   pendingToggle,
 }: {
   payload: HarnessesPayload;
@@ -438,6 +452,9 @@ function ListView({
   onEdit: (h: Harness) => void;
   onDelete: (h: Harness) => void;
   onToggleEnabled: (h: Harness) => void;
+  /** Open a new Terminal.app window with this harness's env loaded so the
+   *  user can authenticate or inspect it (e.g. `claude /login`). */
+  onOpenTerminal: (h: Harness) => void;
   /** Optimistic toggle state — keyed by harness id, value is what the user
    *  clicked toward. Lets the Switch animate before the confirm/round-trip
    *  resolves. Missing keys mean "use the server's `h.enabled`". */
@@ -552,6 +569,15 @@ function ListView({
                     aria-label={h.enabled ? `Disable ${h.label}` : `Enable ${h.label}`}
                   />
                 )}
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={() => onOpenTerminal(h)}
+                  aria-label={`Open ${h.label} in Terminal`}
+                  title="Open in Terminal — load this harness's env to log in or inspect it"
+                >
+                  <Terminal className="size-4" />
+                </Button>
                 {!h.isBuiltin && (
                   <>
                     <Button size="sm" variant="ghost" onClick={() => onEdit(h)}>

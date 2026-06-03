@@ -220,6 +220,10 @@ export const api = {
     }),
   getHarnessUsage: (id: string) =>
     j<HarnessUsage>(`/harnesses/${encodeURIComponent(id)}/usage`),
+  openHarnessTerminal: (id: string) =>
+    j<{ ok: true }>(`/harnesses/${encodeURIComponent(id)}/open-terminal`, {
+      method: "POST",
+    }),
   listAgentModels: () => j<AgentModelMap>("/agent-models"),
   refreshAgentModels: () => j<AgentModelMap>("/agent-models", { method: "POST" }),
   listProjects: () => j<Project[]>("/projects"),

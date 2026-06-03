@@ -1,5 +1,10 @@
 import { test, expect, beforeEach } from "bun:test";
-import { buildCommand } from "./agents.ts";
+import {
+  buildCommand,
+  buildHarnessTerminalCommand,
+  isValidEnvKey,
+  toTerminalAppleScript,
+} from "./agents.ts";
 import { AGENT_OPTIONS, type AgentKind, type Harness } from "../shared/types.ts";
 
 beforeEach(() => {
@@ -395,4 +400,76 @@ test.each(AGENTS)("AGENT_OPTIONS[%s] has unique ids and no 'default' placeholder
   expect(effortIds.length).toBeGreaterThan(0);
   expect(new Set(effortIds).size).toBe(effortIds.length);
   expect(effortIds).not.toContain("default");
+});
+
+// --- isValidEnvKey -----------------------------------------------------------
+
+test("isValidEnvKey accepts POSIX identifiers and rejects everything else", () => {
+  for (const ok of ["FOO", "_x", "A1_B2", "CLAUDE_CONFIG_DIR"]) {
+    expect(isValidEnvKey(ok)).toBe(true);
+  }
+  for (const bad of ["1FOO", "FOO BAR", "FOO=BAR", "X; rm -rf ~", "FOO-BAR", "", "a.b"]) {
+    expect(isValidEnvKey(bad)).toBe(false);
+  }
+});
+
+// --- buildHarnessTerminalCommand ---------------------------------------------
+
+test("terminal command for a built-in claude-code: no config/PATH exports, banner present", () => {
+  const cmd = buildHarnessTerminalCommand(builtin("claude-code"), "/home/u");
+  expect(cmd.startsWith("clear; ")).toBe(true);
+  expect(cmd).toContain("cd '/home/u'");
+  expect(cmd).not.toContain("export PATH=");
+  expect(cmd).not.toContain("export CLAUDE_CONFIG_DIR=");
+  expect(cmd).not.toContain("export HOME=");
+  expect(cmd).toContain("Agetor harness");
+  expect(cmd).toContain('Run "claude"');
+});
+
+test("claude-code alias exports CLAUDE_CONFIG_DIR but never HOME (keychain stays put)", () => {
+  const cmd = buildHarnessTerminalCommand(alias("claude-code", { home: "/cfg" }), "/cfg");
+  expect(cmd).toContain("export CLAUDE_CONFIG_DIR='/cfg'");
+  expect(cmd).not.toContain("export HOME=");
+});
+
+test("codex alias re-homes via HOME + CODEX_HOME", () => {
+  const cmd = buildHarnessTerminalCommand(alias("codex", { home: "/cfg" }), "/cfg");
+  expect(cmd).toContain("export HOME='/cfg'");
+  expect(cmd).toContain("export CODEX_HOME='/cfg/.codex'");
+});
+
+test("an absolute bin puts its dir first on PATH; a bare name does not", () => {
+  const withBin = buildHarnessTerminalCommand(alias("claude-code", { bin: "/opt/bin/claude" }), "/home/u");
+  expect(withBin).toContain("export PATH='/opt/bin':$PATH");
+  expect(withBin).toContain('Run "claude"');
+
+  const bareName = buildHarnessTerminalCommand(builtin("claude-code"), "/home/u");
+  expect(bareName).not.toContain("export PATH=");
+});
+
+test("env values with shell metacharacters are single-quote-escaped", () => {
+  const cmd = buildHarnessTerminalCommand(
+    alias("claude-code", { env: { TOKEN: "pa$$'w", SPACED: 'a b "c"' } }),
+    "/home/u",
+  );
+  // ' is closed-escaped-reopened; $ and " stay literal inside single quotes.
+  expect(cmd).toContain("export TOKEN='pa$$'\\''w'");
+  expect(cmd).toContain(`export SPACED='a b "c"'`);
+});
+
+test("non-identifier env keys are dropped, neutralizing injection from legacy rows", () => {
+  const cmd = buildHarnessTerminalCommand(
+    alias("claude-code", { env: { GOOD: "1", "EVIL; touch /tmp/pwned": "2" } }),
+    "/home/u",
+  );
+  expect(cmd).toContain("export GOOD='1'");
+  expect(cmd).not.toContain("touch /tmp/pwned");
+});
+
+// --- toTerminalAppleScript ---------------------------------------------------
+
+test("toTerminalAppleScript escapes quotes/backslashes and wraps in do script + activate", () => {
+  const script = toTerminalAppleScript('echo "hi"; cd /x\\y');
+  expect(script).toContain('do script "echo \\"hi\\"; cd /x\\\\y"');
+  expect(script).toContain('activate application "Terminal"');
 });
