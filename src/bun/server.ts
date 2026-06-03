@@ -682,10 +682,7 @@ export function startApiServer() {
           if (!harness) {
             return json({ error: "harness not found" }, { status: 404, headers: corsHeaders(req) });
           }
-          // cwd: the harness home if it's a real directory, else the user's
-          // home. A configured-but-missing home shouldn't fail the launch.
-          const cwd = harness.home && existsSync(harness.home) ? harness.home : homedir();
-          const script = toTerminalAppleScript(buildHarnessTerminalCommand(harness, cwd));
+          const script = toTerminalAppleScript(buildHarnessTerminalCommand(harness));
           const proc = Bun.spawn(["osascript", "-e", script], {
             stdout: "ignore",
             stderr: "pipe",

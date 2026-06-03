@@ -3,7 +3,7 @@ import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } f
 import { AlertTriangle, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task } from "../shared/types.ts";
+import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
@@ -81,6 +81,7 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState<ColumnId[]>([]);
   const [archivedView, setArchivedView] = useState<"active" | "all" | "archived">("active");
   const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
+  const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
@@ -318,11 +319,12 @@ export default function App() {
       }
       if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
       if (harnessFilter.length > 0 && !harnessFilter.includes(t.agent)) return false;
+      if (typeFilter.length > 0 && !typeFilter.includes(t.taskType)) return false;
       if (archivedView === "active" && t.archivedAt != null) return false;
       if (archivedView === "archived" && t.archivedAt == null) return false;
       return true;
     });
-  }, [tasks, textQuery, repoFilter, harnessFilter, archivedView]);
+  }, [tasks, textQuery, repoFilter, harnessFilter, typeFilter, archivedView]);
 
   const visibleColumns = useMemo(
     () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
@@ -560,6 +562,8 @@ export default function App() {
             onArchivedViewChange={setArchivedView}
             harnessFilter={harnessFilter}
             onHarnessFilterChange={setHarnessFilter}
+            typeFilter={typeFilter}
+            onTypeFilterChange={setTypeFilter}
             projects={projects}
             harnesses={harnesses}
             taskAgentIds={taskAgentIds}

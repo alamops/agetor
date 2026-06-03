@@ -2349,7 +2349,7 @@ function TaskDetails({
       <div className="mt-2 space-y-2">
         <div>
           <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
-          <p className="whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
+          <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
         </div>
 
         {!editable && (
