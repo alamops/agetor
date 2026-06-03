@@ -8,6 +8,8 @@ Agetor turns a kanban board into a control plane for AI coding agents. Each card
 
 It runs entirely on your machine. No cloud relay, no remote sandbox — agents execute with your shell privileges in your repos, the same way they would if you launched them by hand. Agetor just adds the orchestration, isolation, and UI on top.
 
+![Agetor app preview](docs/agetor-demo.png)
+
 ---
 
 ## Highlights
