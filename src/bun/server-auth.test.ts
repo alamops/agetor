@@ -60,6 +60,35 @@ test("/agent-commands requires a known agent kind", async () => {
   expect(res.status).toBe(400);
 });
 
+test("POST /harnesses/:id/open-terminal requires auth", async () => {
+  const res = await fetch(url("/harnesses/claude-code/open-terminal"), {
+    method: "POST",
+  });
+  expect(res.status).toBe(401);
+});
+
+test("POST /harnesses/:id/open-terminal 404s for an unknown harness", async () => {
+  const res = await fetch(url("/harnesses/nope-not-a-harness/open-terminal"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(404);
+});
+
+test("POST /harnesses rejects an invalid env var name", async () => {
+  const res = await fetch(url("/harnesses"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      id: "claude-badenv",
+      kind: "claude-code",
+      label: "Bad Env",
+      env: { "X; rm -rf ~": "1" },
+    }),
+  });
+  expect(res.status).toBe(400);
+});
+
 test("/approvals rejects unauthenticated POSTs", async () => {
   const res = await fetch(url("/approvals?taskId=any"), {
     method: "POST",
