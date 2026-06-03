@@ -984,7 +984,11 @@ const sessions = new Map<string, SessionState>(); // taskId → state
  * previous one's settle window has elapsed. Modal dismissals
  * (`dismissTmuxPrompt`) share the same chain so a click on a numbered
  * choice can't interleave its `"1"` + Enter keystrokes with an in-flight
- * paste-buffer + Enter from `queuePaste`.
+ * paste from `queuePaste`. (The exact tmux payload is mode-dependent —
+ * non-bracketed slash commands send `load-buffer + paste-buffer +
+ * delete-buffer + send-keys Enter` synchronously, while bracketed user
+ * pastes split the trailing Enter out with a small `bracketedEnterGapMs`
+ * sleep in between. See `queuePaste`.)
  *
  * The map's value is the tail promise of the in-flight chain; new ops
  * append via `queueTmuxOp`. Entries self-evict on completion when no
@@ -1542,6 +1546,125 @@ function sha1(s: string): string {
   return createHash("sha1").update(s).digest("hex").slice(0, 16);
 }
 
+/**
+ * One-time *startup consent* dialogs claude can draw before it ever reaches
+ * the REPL. These are special because they block JSONL creation entirely:
+ * the normal scraper only arms after the JSONL exists (`attachTailer`), so it
+ * never sees a dialog that's preventing the JSONL from existing in the first
+ * place. Left unhandled, the session sits at the dialog until the 30s boot
+ * timeout fires and the run is killed — exactly the "claude session JSONL
+ * never appeared … (empty — claude has not drawn any TUI output yet)" failure
+ * a claude version bump (which re-shows the bypass acceptance) reliably
+ * produces.
+ *
+ * Each entry here is tied to a choice the user has *already made*, so
+ * auto-confirming the affirmative option at boot matches intent rather than
+ * deciding anything on the user's behalf:
+ *   - bypass-permissions: only shown when claude was launched with
+ *     `--dangerously-skip-permissions`, which agetor only emits for the
+ *     `bypass` mode the user explicitly selected.
+ *   - trust-folder: shown the first time claude opens a directory; agetor
+ *     owns the worktree and the user pointed the task's workdir at it.
+ *
+ * We deliberately scope auto-confirm to these two recognised consent screens
+ * (matched by a marker string AND an affirmative choice label). Every other
+ * modal — real per-tool permission prompts, the model picker, `/login` — is
+ * left for the interactive scraper so the user decides.
+ */
+const STARTUP_CONSENT_DIALOGS: Array<{ name: string; marker: RegExp; affirmative: RegExp }> = [
+  // `claude --dangerously-skip-permissions` first-run warning:
+  //   WARNING: Claude Code running in Bypass Permissions mode
+  //   ❯ 1. No, exit
+  //     2. Yes, I accept
+  { name: "bypass-permissions", marker: /bypass permissions mode/i, affirmative: /\baccept\b/i },
+  // BEST-EFFORT / UNVERIFIED: the first-run trust prompt claude shows for a
+  // never-before-opened directory:
+  //   Do you trust the files in this folder?
+  //   ❯ 1. Yes, proceed
+  //     2. No, exit
+  // The exact wording/options here are assumed, not observed — `bypass` mode
+  // suppresses this prompt entirely, and auto-mode launches in agetor's
+  // worktrees have not been seen to trigger it. Kept as safe defence: the
+  // `affirmative` is deliberately the narrow `/\bproceed\b/i` (NOT `/trust/`,
+  // which a "No, don't trust" option would also match → wrong keypress). If
+  // claude's real affirmative isn't "…proceed", this entry simply no-ops and
+  // we fall back to the boot-timeout path — never a wrong action. Confirm the
+  // real TUI text before relying on it.
+  { name: "trust-folder", marker: /trust the files in this (folder|directory)/i, affirmative: /\bproceed\b/i },
+];
+
+export interface StartupDialogMatch {
+  /** Which consent dialog matched (for the status breadcrumb + dedup key). */
+  name: string;
+  choices: TmuxPromptChoice[];
+  /** 0-based index the `❯`/`›` cursor sits on right now. */
+  cursorIndex: number;
+  /** 0-based index of the affirmative ("accept" / "proceed") choice we want
+   *  to land on before pressing Enter. */
+  acceptIndex: number;
+  /** Stable hash of the matched dialog — lets the boot poller confirm a given
+   *  on-screen dialog exactly once while still acting on a *different*
+   *  subsequent dialog (e.g. trust-folder appearing after bypass). */
+  fingerprint: string;
+}
+
+/**
+ * Pure: identify a known startup *consent* dialog on the pane and the index
+ * of its affirmative choice. Returns null for anything that isn't one of
+ * `STARTUP_CONSENT_DIALOGS` with a parseable numbered choice list and a
+ * recognisable affirmative option — when in doubt we do nothing and let the
+ * boot timeout surface the raw pane to the user instead of guessing.
+ */
+export function matchStartupConsentDialog(pane: string): StartupDialogMatch | null {
+  const dialog = STARTUP_CONSENT_DIALOGS.find((d) => d.marker.test(pane));
+  if (!dialog) return null;
+  // Reuse the numbered-modal parser so the choice list / cursor handling
+  // stays identical to the runtime scraper. It requires a cursor marker,
+  // which every one of these dialogs draws.
+  const modal = matchNumberedModal(pane);
+  if (!modal || modal.cursorIndex === undefined) return null;
+  const acceptIndex = modal.choices.findIndex((c) => dialog.affirmative.test(c.label));
+  if (acceptIndex < 0) return null;
+  return {
+    name: dialog.name,
+    choices: modal.choices,
+    cursorIndex: modal.cursorIndex,
+    acceptIndex,
+    fingerprint: sha1(`startup:${dialog.name}:${modal.fingerprint}`),
+  };
+}
+
+/**
+ * Send the keystrokes that confirm a startup consent dialog: arrow from the
+ * cursor's current position to the affirmative option, then Enter. Talks to
+ * tmux directly (not via `queueTmuxOp`) because this runs during the boot
+ * window — before any turn slot or paste chain exists for the session. Each
+ * arrow is its own `send-keys` with a small gap, mirroring `dismissTmuxPrompt`
+ * so a bursted `Down Enter` can't coalesce in Ink's stdin reducer and confirm
+ * the wrong line.
+ *
+ * Returns true only when every keystroke (arrows + the final Enter) was
+ * delivered. The caller latches the dialog's fingerprint on a `true` so a
+ * transient `send-keys` failure leaves the fingerprint UN-latched and the next
+ * poll tick retries — otherwise a half-sent confirm would silently strand the
+ * dialog until the boot timeout.
+ */
+async function confirmStartupDialog(sessionName: string, m: StartupDialogMatch): Promise<boolean> {
+  const delta = m.acceptIndex - m.cursorIndex;
+  const arrow = delta >= 0 ? "Down" : "Up";
+  for (let i = 0; i < Math.abs(delta); i++) {
+    if (!tmux(["send-keys", "-t", sessionName, arrow]).ok) return false;
+    await Bun.sleep(30);
+  }
+  return tmux(["send-keys", "-t", sessionName, "Enter"]).ok;
+}
+
+/** How often the boot-time consent poller re-checks the pane. Fast enough
+ *  that a dialog blocking JSONL creation is cleared within a fraction of a
+ *  second; cheap because it's one `capture-pane` per tick and only runs
+ *  during the bounded boot window. */
+const STARTUP_DIALOG_POLL_MS = 350;
+
 /** TTL on the "just answered this fingerprint" suppression. Has to
  *  comfortably exceed the worst-case lag between sending Enter into
  *  tmux and claude repainting the pane without the modal. 3s is
@@ -1824,7 +1947,52 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // soon as it appears regardless.
   const BOOT_TIMEOUT_MS = 30_000;
   (async () => {
+    // Concurrently watch for a one-time startup consent dialog (the
+    // `--dangerously-skip-permissions` bypass warning, or the trust-folder
+    // prompt) blocking claude from ever writing its JSONL. Auto-confirm it —
+    // each maps to a choice the user already made (see STARTUP_CONSENT_DIALOGS).
+    // Without this the dialog sits unanswered until BOOT_TIMEOUT_MS and the run
+    // dies with an empty pane; this is the failure a claude version bump that
+    // re-shows the bypass acceptance reliably triggers. The poller self-stops
+    // the moment the JSONL appears, the session dies, or boot settles.
+    let bootSettled = false;
+    let lastConfirmedFingerprint: string | null = null;
+    void (async () => {
+      // Wrapped so a stray throw can never become an unhandled rejection on
+      // the fire-and-forget IIFE (mirrors `startScraper`'s try/catch posture);
+      // in practice none of the calls below throw.
+      try {
+        while (!bootSettled) {
+          await Bun.sleep(STARTUP_DIALOG_POLL_MS);
+          // Resume path: when the JSONL already exists at spawn (`--resume`),
+          // this short-circuits on the first tick so the poller is a no-op —
+          // a re-shown consent dialog on resume is out of scope (bypass
+          // acceptance is global + persistent once accepted).
+          if (bootSettled || existsSync(jsonlPath)) return;
+          if (!tmux(["has-session", "-t", sessionName]).ok) return;
+          const pane = tmux(["capture-pane", "-p", "-t", sessionName]).stdout;
+          const m = matchStartupConsentDialog(pane);
+          // Single-tick action is deliberate (unlike the runtime scraper's
+          // two-tick stability gate): this only runs during the bounded boot
+          // window and is gated on a marker string AND a parseable affirmative
+          // choice, so a half-drawn frame can't trigger a stray confirm.
+          // Confirm a given on-screen dialog at most once — the fingerprint is
+          // latched ONLY after `confirmStartupDialog` reports every keystroke
+          // landed, so a transient send-keys failure retries next tick instead
+          // of stranding the dialog. A genuinely different follow-up dialog
+          // (new fingerprint) is still acted on.
+          if (m && m.fingerprint !== lastConfirmedFingerprint) {
+            if (await confirmStartupDialog(sessionName, m)) {
+              lastConfirmedFingerprint = m.fingerprint;
+              opts.onChunk("status", `claude startup dialog auto-confirmed (${m.name})`);
+            }
+          }
+        }
+      } catch { /* never let the boot poller crash the spawn */ }
+    })();
+
     const found = await waitForJsonlAt(jsonlPath, BOOT_TIMEOUT_MS);
+    bootSettled = true;
     if (!found) {
       const stillAlive = tmux(["has-session", "-t", sessionName]).ok;
       // Capture whatever claude actually printed inside the pane so the user
@@ -2283,6 +2451,7 @@ export const __forTest = {
   firePendingEndTurn,
   matchNumberedModal,
   matchYesNoModal,
+  matchStartupConsentDialog,
   resumeJsonlOffset,
   /** Override the JSONL verification timeout used by `cycleToMode`. Tests
    *  shrink it to keep "timeout" cases fast. Returns the previous value
@@ -2307,19 +2476,28 @@ export const __forTest = {
     return prev;
   },
   getSlashCommandSettleMs(): number { return slashCommandSettleMs; },
-  /** Override the image-attach settle window — the delay between the
-   *  bracketed paste and the trailing Enter when the paste contains an
-   *  image file path. Tests shrink it to ~0 to avoid sleeping per
-   *  image-path assertion. Returns the previous value for restore. */
+  /** Override the bracketed-paste → Enter gap. Tests shrink it to ~0 to
+   *  avoid sleeping on every paste-queue assertion. Returns the previous
+   *  value so the test can restore it in `afterEach`. */
+  setBracketedEnterGapMs(ms: number): number {
+    const prev = bracketedEnterGapMs;
+    bracketedEnterGapMs = ms;
+    return prev;
+  },
+  getBracketedEnterGapMs(): number { return bracketedEnterGapMs; },
+  /** Override the image-attach settle window — the per-image delay used
+   *  when the paste contains image file paths. Tests shrink it to ~0 to
+   *  avoid sleeping per image-path assertion. Returns the previous value
+   *  for restore. */
   setImageAttachSettleMs(ms: number): number {
     const prev = imageAttachSettleMs;
     imageAttachSettleMs = ms;
     return prev;
   },
   getImageAttachSettleMs(): number { return imageAttachSettleMs; },
-  /** Image-path detection used by `pastePrompt` to decide whether to
-   *  take the slow (post-paste settle) path. Re-exported for unit tests
-   *  so the rule can be asserted without reaching into the regex literal. */
+  /** Image-path detection used by `queuePaste` to decide whether to
+   *  take the long (image-attach) gap. Re-exported for unit tests so the
+   *  rule can be asserted without reaching into the regex literal. */
   pasteContainsImagePath,
   /** Count the image paths the regex finds. Used internally to scale the
    *  settle window by image count; exposed so tests can pin the heuristic. */
@@ -2393,38 +2571,25 @@ const IMAGE_ATTACH_SETTLE_MAX_MS = 3_000;
  * newlines, dollar signs, quotes, …), paste it into the active window, then
  * press Enter to submit.
  *
- * When the paste contains image file paths, sleep before sending the
- * trailing Enter so claude's bracketed-paste handler can finish attaching
- * each image. Without the wait, the single Enter we send arrives mid-
- * flight in the attachment flow and gets consumed instead of submitting
- * the message — the symptom is the agetor UI showing the message as sent
- * while the JSONL has no corresponding user-message row, with the text
- * stuck in claude's input behind an `[Image #N]` placeholder.
+ * Stays synchronous — the caller (`queuePaste`) is responsible for any
+ * post-paste delays (the base bracketed gap or the longer image-attach
+ * gap) and for re-gating the trailing Enter on session identity. Keeping
+ * this function sync preserves the "no awaits between tmux calls"
+ * invariant the `queueTmuxOp` chain depends on; the gap + Enter split for
+ * the bracketed case happens in `queuePaste`.
  *
- * We send exactly one Enter — the same as the non-image path. Earlier
- * iterations of this fix sent two Enters (the first to dismiss a
- * suspected attach-confirm modal, the second to submit) but there is no
- * direct evidence such a modal exists in the bracketed-paste flow, and
- * the JSONL repro confirmed at least one image-bearing paste DID submit
- * with a single Enter — so the second Enter would risk a stray empty
- * submit / interrupt against an idle pane.
- *
- * The `stillCurrent` predicate is consulted before the trailing Enter so
- * a session dispose that lands during the image-settle sleep can't leak
- * the keystroke into a respawned pane reusing the same tmux session name.
- * The non-image fast path stays fully sync so the original `queueTmuxOp`
- * invariant (no awaits between tmux calls) is preserved for the common
- * case.
+ * `skipEnter` defers the trailing Enter to the caller so it can insert a
+ * gap before the `send-keys Enter`. See `queuePaste`'s bracketed branch
+ * for the rationale (and the image-attach scaling layered on top of it).
  *
  * Callers go through `queuePaste` so back-to-back pastes for the same
  * task can't interleave at the tmux layer. See `queuePaste` for why.
  */
-async function pastePrompt(
+function pastePromptSync(
   sessionName: string,
   text: string,
-  opts: { bracketed?: boolean } = {},
-  stillCurrent: () => boolean = () => true,
-): Promise<void> {
+  opts: { bracketed?: boolean; skipEnter?: boolean } = {},
+): void {
   // load-buffer reads from stdin; -b names a tmux buffer we can target.
   const buf = `agetor-${sessionName}`;
   const load = tmux(["load-buffer", "-b", buf, "-"], { stdinText: text });
@@ -2441,18 +2606,13 @@ async function pastePrompt(
   const pasteFlags = opts.bracketed ? ["-p"] : [];
   tmux(["paste-buffer", ...pasteFlags, "-b", buf, "-t", sessionName]);
   tmux(["delete-buffer", "-b", buf]);
-  if (opts.bracketed) {
-    const imageCount = countImagePaths(text);
-    if (imageCount > 0) {
-      // Slow path: claude is reading + attaching one or more images. Wait,
-      // then re-gate before the Enter so a dispose during the sleep can't
-      // leak the keystroke into a respawned pane.
-      const settle = Math.min(imageAttachSettleMs * imageCount, IMAGE_ATTACH_SETTLE_MAX_MS);
-      await Bun.sleep(settle);
-      if (!stillCurrent()) return;
-    }
-  }
-  tmux(["send-keys", "-t", sessionName, "Enter"]);
+  // `skipEnter` defers the trailing Enter to the caller so it can sleep
+  // between the bracketed paste and the Enter — see `queuePaste`. Without
+  // that gap, a follow-up turn pasted mid-stream gets rendered as `[Pasted
+  // text +N lines]` in claude's TUI but the immediately-following `\r` is
+  // absorbed as part of the same paste event, so the queued bubble sits
+  // unsubmitted until the user (or a later Enter) commits it.
+  if (!opts.skipEnter) tmux(["send-keys", "-t", sessionName, "Enter"]);
 }
 
 /**
@@ -2467,7 +2627,7 @@ async function pastePrompt(
  * applied before the *next* operation — never before the slash itself.
  *
  * Important caveat about what this delay actually buys: the timer starts
- * when `pastePrompt` returns (i.e. when tmux's `send-keys Enter`
+ * when `pastePromptSync` returns (i.e. when tmux's `send-keys Enter`
  * exits), NOT when claude has finished processing the slash command. On
  * an idle REPL these are close enough that 700ms covers consumption +
  * repaint. When claude is mid-turn, the slash command queues inside
@@ -2480,6 +2640,31 @@ async function pastePrompt(
  * Tests shrink the value to keep the queue suite fast.
  */
 let slashCommandSettleMs = 700;
+
+/**
+ * Gap between the bracketed-paste body (`paste-buffer -p`) and the trailing
+ * `send-keys Enter` for follow-up turns. Without a gap, claude's Ink TUI
+ * sees the `ESC[201~` end marker and the immediately-following `\r` as part
+ * of the same input read; the `\r` is absorbed as part of the paste event
+ * and the `[Pasted text +N lines]` bubble sits unsubmitted until something
+ * else commits it. 80ms comfortably exceeds the few-ms claude's reader
+ * takes to process the end marker on an idle session; the cost is one
+ * delay per follow-up paste, observable only as a brief queueing window.
+ *
+ * Only applied in bracketed mode — non-bracketed pastes (slash commands)
+ * stream as plain keystrokes and don't have the paste-event coalescing
+ * window. Tests shrink the value to keep the queue suite fast.
+ *
+ * Failure mode is asymmetric: too low silently regresses to the "paste
+ * shown, never submitted" bug with no log signal (the queued bubble
+ * just sits in the TUI input until something else commits it), while
+ * too high only adds perceived latency to follow-up turns. Prefer
+ * raising over lowering when in doubt. A real-world ceiling under load
+ * (e.g. claude paused on a tool call, reader latency higher) has not
+ * been measured — if you observe the regression returning, bump this
+ * first before assuming a structural fix is needed.
+ */
+let bracketedEnterGapMs = 80;
 
 /**
  * Append a tmux operation to the per-task chain. The `fn` thunk runs
@@ -2567,6 +2752,15 @@ function queueTmuxOp(
  * Pass `expectedState` to gate the paste on the session still being
  * the one this paste was scheduled against — see `queueTmuxOp` for the
  * race this closes.
+ *
+ * When `opts.bracketed` is true, the trailing `Enter` is split out of
+ * the synchronous paste body and sent after a small internal gap
+ * (`bracketedEnterGapMs`) so claude's Ink TUI commits the `ESC[200~ …
+ * ESC[201~` paste event before the `\r` arrives — without that gap the
+ * Enter is absorbed as part of the paste event and the queued bubble
+ * sits unsubmitted. The deferred Enter is re-gated through
+ * `stillCurrent()` so a `dropSession` landing during the gap can't
+ * leak the keystroke into a respawned pane.
  */
 function queuePaste(
   taskId: string,
@@ -2576,14 +2770,46 @@ function queuePaste(
   expectedState?: SessionState,
   opts: { bracketed?: boolean } = {},
 ): Promise<void> {
-  // Forward `stillCurrent` into pastePrompt — its image-attach slow path
-  // awaits between the bracketed paste and the trailing Enter, so it
-  // needs the same dispose-during-gap re-gate that the modal-dismissal
-  // path uses. The fast (non-image) path inside pastePrompt stays fully
-  // synchronous, so the original "no tmux calls after the await"
-  // invariant still holds for the common case.
+  // Non-bracketed path: load-buffer + paste-buffer + delete-buffer +
+  // send-keys Enter all happen synchronously inside pastePromptSync, so
+  // the only await is the optional settle — no tmux calls land after the
+  // sleep, and a dispose during the sleep can't leak keystrokes.
+  //
+  // Bracketed path: we split the trailing Enter out and insert a gap so
+  // claude's Ink TUI has time to consume `ESC[201~` and commit the paste
+  // before the `\r` arrives. Without the gap the Enter is absorbed as
+  // part of the paste event and the queued bubble sits unsubmitted
+  // (especially when the previous turn is still streaming or has a
+  // background tool in flight — see the "[Pasted text #N +M lines] never
+  // submits" repro).
+  //
+  // Image-bearing pastes need a LONGER gap than the base 80 ms: claude's
+  // bracketed-paste handler reads + base64-encodes each image file when
+  // it sees an image path in the paste, and the trailing Enter sent
+  // before that finishes is consumed by the attach flow instead of
+  // submitting the message — the "[Image #N] stuck in input" repro. So
+  // when image paths are detected we scale the gap by image count (up to
+  // `IMAGE_ATTACH_SETTLE_MAX_MS`); otherwise the base
+  // `bracketedEnterGapMs` applies. Exactly one Enter either way — a
+  // second Enter would risk a stray empty submit / pane interrupt on an
+  // idle prompt.
+  //
+  // The deferred Enter is re-gated through `stillCurrent()` so a
+  // `dropSession` landing in the gap can't leak the Enter into a
+  // respawned pane.
   return queueTmuxOp(taskId, async (stillCurrent) => {
-    await pastePrompt(sessionName, text, opts, stillCurrent);
+    if (opts.bracketed) {
+      pastePromptSync(sessionName, text, { ...opts, skipEnter: true });
+      const imageCount = countImagePaths(text);
+      const gap = imageCount > 0
+        ? Math.min(imageAttachSettleMs * imageCount, IMAGE_ATTACH_SETTLE_MAX_MS)
+        : bracketedEnterGapMs;
+      if (gap > 0) await Bun.sleep(gap);
+      if (!stillCurrent()) return;
+      tmux(["send-keys", "-t", sessionName, "Enter"]);
+    } else {
+      pastePromptSync(sessionName, text, opts);
+    }
     if (settleMs > 0) await Bun.sleep(settleMs);
   }, expectedState);
 }

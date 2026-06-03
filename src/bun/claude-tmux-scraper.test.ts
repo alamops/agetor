@@ -9,7 +9,7 @@ process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-scraper-")
 
 import { __forTest } from "./claude-tmux.ts";
 
-const { matchNumberedModal, matchYesNoModal } = __forTest;
+const { matchNumberedModal, matchYesNoModal, matchStartupConsentDialog } = __forTest;
 
 test("matchNumberedModal — claude plan-mode dialog (cursor on choice 1)", () => {
   const pane = `
@@ -114,6 +114,72 @@ test("matchYesNoModal — ignores numbered modal pane (different signature)", ()
   const pane = `❯ 1. Yes
   2. No`;
   expect(matchYesNoModal(pane)).toBeNull();
+});
+
+test("matchStartupConsentDialog — bypass-permissions warning, accept is option 2", () => {
+  // The exact shape claude draws on the first `--dangerously-skip-permissions`
+  // launch of a version that re-prompts. The cursor defaults to "No, exit"
+  // (option 1); we must navigate to the affirmative.
+  const pane = `
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  By proceeding, you accept all responsibility for actions taken while running
+  in Bypass Permissions mode.
+
+  https://code.claude.com/docs/en/security
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+`;
+  const m = matchStartupConsentDialog(pane);
+  expect(m).not.toBeNull();
+  expect(m!.name).toBe("bypass-permissions");
+  expect(m!.cursorIndex).toBe(0);
+  expect(m!.acceptIndex).toBe(1); // must move off the default "No, exit"
+});
+
+test("matchStartupConsentDialog — trust-folder dialog (HYPOTHESIZED shape, not yet observed), accept is the cursor default", () => {
+  // NOTE: this asserts the matcher's contract against an *assumed* trust-prompt
+  // shape — claude's real trust dialog wording/options have not been reproduced
+  // against the live TUI (bypass mode suppresses it; auto-mode worktree launches
+  // haven't triggered it). The entry is safe-by-omission (a wrong guess no-ops),
+  // so this test guards the parser, NOT that claude actually draws this.
+  const pane = `Do you trust the files in this folder?
+
+  /Users/me/.agetor/worktrees/abc
+
+❯ 1. Yes, proceed
+  2. No, exit`;
+  const m = matchStartupConsentDialog(pane);
+  expect(m).not.toBeNull();
+  expect(m!.name).toBe("trust-folder");
+  expect(m!.cursorIndex).toBe(0);
+  expect(m!.acceptIndex).toBe(0); // already on the affirmative → Enter alone
+});
+
+test("matchStartupConsentDialog — a normal per-tool permission modal is NOT auto-confirmed", () => {
+  // Runtime permission prompts carry no startup marker → must stay null so
+  // they route through the interactive scraper for the user to decide.
+  const pane = `Do you want to make this edit to foo.ts?
+  ❯ 1. Yes
+    2. Yes, allow all
+    3. No`;
+  expect(matchStartupConsentDialog(pane)).toBeNull();
+});
+
+test("matchStartupConsentDialog — bypass marker without a parseable choice list → null", () => {
+  // A half-drawn frame (marker present, choices not yet rendered) must not
+  // trigger a stray Enter.
+  const pane = `WARNING: Claude Code running in Bypass Permissions mode`;
+  expect(matchStartupConsentDialog(pane)).toBeNull();
+});
+
+test("matchStartupConsentDialog — distinct dialogs get distinct fingerprints", () => {
+  const bypass = matchStartupConsentDialog(`Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept`)!;
+  const trust = matchStartupConsentDialog(`trust the files in this folder\n❯ 1. Yes, proceed\n  2. No, exit`)!;
+  expect(bypass).not.toBeNull();
+  expect(trust).not.toBeNull();
+  expect(bypass.fingerprint).not.toBe(trust.fingerprint);
 });
 
 test("dispatchLine updates permissionMode BEFORE the dedup guard (reattach safety)", async () => {
