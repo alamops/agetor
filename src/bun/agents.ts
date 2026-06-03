@@ -145,6 +145,72 @@ export function harnessEnv(harness: Harness): Record<string, string> {
 }
 
 /**
+ * A POSIX-valid environment variable name: a letter or underscore followed
+ * by letters, digits, or underscores. Used to gate what the harness `env`
+ * map may contain, both at write time (the harness POST/PATCH routes) and at
+ * shell-emit time (`buildHarnessTerminalCommand` below). Anything outside
+ * this set can't be a real `export NAME=…` target and — left unquoted — would
+ * let a crafted key (`X; rm -rf ~`) break out of the generated command.
+ */
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export function isValidEnvKey(key: string): boolean {
+  return ENV_KEY_RE.test(key);
+}
+
+/**
+ * Build the interactive-shell command that loads a harness's env into a new
+ * Terminal window. Pure and deterministic — no spawning — so the escaping is
+ * unit-testable in isolation (see agents.test.ts). The caller wraps the
+ * result with `toTerminalAppleScript` and hands it to `osascript`.
+ *
+ * Every interpolated value is POSIX single-quoted (`sq`), which neutralizes
+ * `$`, backtick, spaces, and backslashes; the lone special case is `'`
+ * itself, closed-escaped-reopened. Env *keys* are filtered through
+ * `ENV_KEY_RE` rather than quoted — a non-identifier key can't be a valid
+ * `export` target anyway, and skipping it closes the injection vector even
+ * for legacy DB rows written before the route-level validation existed.
+ */
+export function buildHarnessTerminalCommand(harness: Harness, cwd: string): string {
+  const bin = resolveBin(harness);
+  const env = harnessEnv(harness);
+  const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+  const launch = path.basename(bin);
+
+  const cmds: string[] = ["clear"];
+  for (const [k, v] of Object.entries(env)) {
+    if (!ENV_KEY_RE.test(k)) continue;
+    cmds.push(`export ${k}=${sq(v)}`);
+  }
+  // Put the harness binary's directory first on PATH so a bare `claude` /
+  // `codex` in this shell resolves to exactly the binary agetor would spawn
+  // (matters for `bin` overrides / aliases). Skipped when `bin` is a bare
+  // name we couldn't resolve to an absolute path — there's no dir to add.
+  if (path.isAbsolute(bin)) cmds.push(`export PATH=${sq(path.dirname(bin))}:$PATH`);
+  cmds.push(`cd ${sq(cwd)}`);
+  cmds.push(
+    `printf '%s\\n' ${sq(`▸ Agetor harness "${harness.label}" (${harness.id}) — env loaded.`)} ` +
+      `${sq(`  Run "${launch}" to start it, or "${launch} /login" to authenticate this account.`)}`,
+  );
+  return cmds.join("; ");
+}
+
+/**
+ * Wrap a shell command in the AppleScript that opens it in a new Terminal.app
+ * window and brings Terminal to the front. `do script` feeds the string to a
+ * fresh interactive login shell and leaves the window at a prompt afterward,
+ * so exported vars persist for the user's session. Backslash and double-quote
+ * are escaped for the AppleScript double-quoted string literal.
+ */
+export function toTerminalAppleScript(shellCmd: string): string {
+  const asEscape = (s: string) => s.replace(/(["\\])/g, "\\$1");
+  return (
+    `tell application "Terminal" to do script "${asEscape(shellCmd)}"\n` +
+    `activate application "Terminal"`
+  );
+}
+
+/**
  * Build the launch argv for a harness. For claude-code this is the
  * interactive REPL — no `--print`. The driver (tmux) drops these args after
  * `tmux new-session ... -- <argv>`. For codex this is `codex exec ...`,

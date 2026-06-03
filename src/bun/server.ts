@@ -17,6 +17,11 @@ import {
 } from "./db.ts";
 import { archiveTask, createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import {
+  buildHarnessTerminalCommand,
+  isValidEnvKey,
+  toTerminalAppleScript,
+} from "./agents.ts";
 import { applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import {
   bundledTmuxAvailable,
@@ -524,7 +529,14 @@ export function startApiServer() {
           const env: Record<string, string> = {};
           if (body.env && typeof body.env === "object" && !Array.isArray(body.env)) {
             for (const [k, v] of Object.entries(body.env)) {
-              if (typeof v === "string") env[k] = v;
+              if (typeof v !== "string") continue;
+              if (!isValidEnvKey(k)) {
+                return json(
+                  { error: `invalid env var name "${k}" — names must match [A-Za-z_][A-Za-z0-9_]*` },
+                  { status: 400, headers: corsHeaders(req) },
+                );
+              }
+              env[k] = v;
             }
           }
           if (harnesses.get(body.id)) {
@@ -602,7 +614,14 @@ export function startApiServer() {
           if (body.env && typeof body.env === "object" && !Array.isArray(body.env)) {
             const env: Record<string, string> = {};
             for (const [k, v] of Object.entries(body.env)) {
-              if (typeof v === "string") env[k] = v;
+              if (typeof v !== "string") continue;
+              if (!isValidEnvKey(k)) {
+                return json(
+                  { error: `invalid env var name "${k}" — names must match [A-Za-z_][A-Za-z0-9_]*` },
+                  { status: 400, headers: corsHeaders(req) },
+                );
+              }
+              env[k] = v;
             }
             patch.env = env;
           }
@@ -645,6 +664,62 @@ export function startApiServer() {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           return json(harnesses.usage(req.params.id), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Open a configured shell for this harness in a new Terminal.app window.
+      // The harness's home-derived vars (CLAUDE_CONFIG_DIR for claude-code,
+      // HOME + CODEX_HOME for codex), its custom env, and its binary's
+      // directory on PATH are all exported, then the window is left at an
+      // interactive prompt. This is the supported way to authenticate or
+      // inspect a multi-account alias: `claude /login` run in this shell
+      // writes credentials against the alias's own config dir, exactly as a
+      // real run would. macOS-only (osascript + Terminal.app), same as
+      // `/tasks/:id/open-tmux`.
+      "/harnesses/:id/open-terminal": {
+        POST: authed(async (req) => {
+          const harness = harnesses.getByIdOrKind(req.params.id);
+          if (!harness) {
+            return json({ error: "harness not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // cwd: the harness home if it's a real directory, else the user's
+          // home. A configured-but-missing home shouldn't fail the launch.
+          const cwd = harness.home && existsSync(harness.home) ? harness.home : homedir();
+          const script = toTerminalAppleScript(buildHarnessTerminalCommand(harness, cwd));
+          const proc = Bun.spawn(["osascript", "-e", script], {
+            stdout: "ignore",
+            stderr: "pipe",
+          });
+          // Await the launch so the UI gets real feedback. `do script` returns
+          // as soon as Terminal accepts the command (it does NOT wait for the
+          // shell command to finish), so this resolves in well under a second
+          // on success and fails fast when Automation permission is denied.
+          // A 5s ceiling guards against a wedged osascript holding the
+          // response open.
+          const exit = await Promise.race([
+            proc.exited,
+            Bun.sleep(5000).then(() => "timeout" as const),
+          ]);
+          if (exit === "timeout") {
+            // Assume it's still coming up rather than reporting a false error.
+            return json({ ok: true }, { headers: corsHeaders(req) });
+          }
+          if (exit !== 0) {
+            const detail = (await new Response(proc.stderr).text()).trim();
+            console.warn(
+              `[agetor] osascript exited ${exit} while opening a terminal for harness "${harness.id}": ${detail}`,
+            );
+            return json(
+              {
+                error:
+                  `Couldn't open Terminal (osascript exited ${exit}).` +
+                  (detail ? ` ${detail}` : "") +
+                  " Check System Settings → Privacy & Security → Automation.",
+              },
+              { status: 502, headers: corsHeaders(req) },
+            );
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
 
