@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ClipboardList, Code2, GitBranch } from "lucide-react";
-import { api, type AgentModelMap, type AvailableCommand } from "@/lib/api";
+import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -33,6 +33,7 @@ import {
   type CapturedItem,
 } from "./ReferencesPicker";
 import { SlashAutocomplete } from "./SlashAutocomplete";
+import { ExtensionPicker } from "./ExtensionPicker";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 
 const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
@@ -135,22 +136,28 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   const [dragging, setDragging] = useState(false);
   const [dropHint, setDropHint] = useState<string | null>(null);
   const [agentCommands, setAgentCommands] = useState<AvailableCommand[]>([]);
+  const [agentExtensions, setAgentExtensions] = useState<AvailableExtension[]>([]);
   const promptRef = useRef<HTMLTextAreaElement>(null);
 
-  // Refresh the slash-command suggestions whenever the agent / project / branch
-  // changes — those three together determine what `/…` entries are reachable.
-  // Failures are swallowed: a missing list is no worse than no autocomplete.
+  // Refresh both the `/…` autocomplete (commands/skills) and the Extensions
+  // picker (MCP/skills/plugins) whenever the agent / project / branch changes —
+  // those three together determine what's reachable. One fetch covers both.
+  // Failures are swallowed: empty lists are no worse than no autocomplete.
   useEffect(() => {
-    if (!workdir.trim()) { setAgentCommands([]); return; }
+    if (!workdir.trim()) { setAgentCommands([]); setAgentExtensions([]); return; }
     let cancelled = false;
     // Pass the harness id (not just the kind) so aliased multi-account
     // harnesses read their own per-harness commands/skills — the server
     // resolves it via getByIdOrKind, so a built-in's id-equals-kind is still
     // honored unchanged.
     api
-      .listAgentCommands({ agent, workdir: workdir.trim(), branch: baseRef.trim() || undefined })
-      .then((cmds) => { if (!cancelled) setAgentCommands(cmds); })
-      .catch(() => { if (!cancelled) setAgentCommands([]); });
+      .listAgentCapabilities({ agent, workdir: workdir.trim(), branch: baseRef.trim() || undefined })
+      .then(({ commands, extensions }) => {
+        if (cancelled) return;
+        setAgentCommands(commands);
+        setAgentExtensions(extensions);
+      })
+      .catch(() => { if (!cancelled) { setAgentCommands([]); setAgentExtensions([]); } });
     return () => { cancelled = true; };
   }, [agent, workdir, baseRef]);
 
@@ -436,7 +443,18 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
         </div>
 
         <div className="space-y-1">
-          <label className="text-muted-foreground">Prompt</label>
+          <div className="flex items-center justify-between gap-2">
+            <label className="text-muted-foreground">Prompt</label>
+            <ExtensionPicker
+              extensions={agentExtensions}
+              value={prompt}
+              onChange={setPrompt}
+              textareaRef={promptRef}
+              placement="below"
+              align="right"
+              disabled={!workdir.trim()}
+            />
+          </div>
           <div className="relative">
             <Textarea
               ref={promptRef}

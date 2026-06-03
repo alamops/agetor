@@ -62,14 +62,26 @@ export async function hasUncommittedChanges(dir: string): Promise<boolean | null
   return res.stdout.trim().length > 0;
 }
 
+// A directory's git top-level is stable for the lifetime of the process, so
+// resolved roots are memoized — discovery (/agent-discovery) resolves the same
+// workdir on every refresh and would otherwise spawn a `git rev-parse` for
+// both the commands and the extensions pass. Only *successful* lookups are cached:
+// a null (not-a-repo) result is left uncached so a mid-session `git init` is
+// still picked up on the next call.
+const repoRootCache = new Map<string, string>();
+
 /**
  * Return the absolute path of the repo root for `dir`, or null if `dir`
  * isn't a git working tree. We base worktrees off the root, not subdirectories.
  */
 export async function repoRoot(dir: string): Promise<string | null> {
+  const cached = repoRootCache.get(dir);
+  if (cached !== undefined) return cached;
   if (!existsSync(dir)) return null;
   const res = await git(["rev-parse", "--show-toplevel"], dir);
-  return res.ok ? res.stdout : null;
+  if (!res.ok) return null;
+  repoRootCache.set(dir, res.stdout);
+  return res.stdout;
 }
 
 /**

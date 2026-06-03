@@ -2,7 +2,13 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import path from "node:path";
-import { listAvailableCommands } from "./commands.ts";
+import { listAvailableCommands, listAgentCapabilities } from "./commands.ts";
+
+/** Discover just the extension list via the production path (the picker uses
+ *  `listAgentCapabilities`; this keeps the extension assertions pointed at it). */
+async function listExtensions(opts: Parameters<typeof listAgentCapabilities>[0]) {
+  return (await listAgentCapabilities(opts)).extensions;
+}
 
 // We can't easily fake `os.homedir()`, so tests focus on project-level
 // discovery + precedence behavior. User-level entries pulled from the real
@@ -149,4 +155,194 @@ test("project entry overrides user entry with the same name", async () => {
   const all = await listAvailableCommands({ agent: "claude-code", workdir: project });
   const entry = all.find((c) => c.name === "/shared-name");
   expect(entry?.source).toBe("project");
+});
+
+// --- Extensions (MCP / skills / plugins) ----------------------------------
+
+test("extensions: discovers project .mcp.json servers as @mentions", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "ext-mcp-"));
+  writeFileSync(
+    path.join(project, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        jubarteai: { type: "http", url: "https://jubarte.ai/api/mcp", headers: { Authorization: "secret" } },
+      },
+    }),
+  );
+  const all = await listExtensions({ agent: "claude-code", workdir: project });
+  const mcp = all.find((e) => e.name === "jubarteai");
+  expect(mcp).toBeDefined();
+  expect(mcp!.kind).toBe("mcp");
+  expect(mcp!.insert).toBe("@jubarteai");
+  expect(mcp!.source).toBe("project");
+  // Description summarises transport/host but must never leak auth headers.
+  expect(mcp!.description).toContain("jubarte.ai");
+  expect(JSON.stringify(all)).not.toContain("secret");
+});
+
+test("extensions: surfaces skills with a /name insert token", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "ext-skill-"));
+  writeCmd(
+    path.join(project, ".claude", "skills", "my-skill"),
+    "SKILL.md",
+    "---\ndescription: A skill\n---\nbody",
+  );
+  const all = await listExtensions({ agent: "claude-code", workdir: project });
+  const skill = all.find((e) => e.name === "my-skill");
+  expect(skill).toBeDefined();
+  expect(skill!.kind).toBe("skill");
+  expect(skill!.insert).toBe("/my-skill");
+  expect(skill!.description).toBe("A skill");
+});
+
+test("extensions: discovers user-scoped plugins from harnessHome", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-plug-"));
+  const installPath = path.join(harness, "plugins", "cache", "demo");
+  mkdirSync(path.join(installPath, ".claude-plugin"), { recursive: true });
+  writeFileSync(
+    path.join(installPath, ".claude-plugin", "plugin.json"),
+    JSON.stringify({ name: "demo", description: "A demo plugin" }),
+  );
+  mkdirSync(path.join(harness, "plugins"), { recursive: true });
+  writeFileSync(
+    path.join(harness, "plugins", "installed_plugins.json"),
+    JSON.stringify({
+      version: 2,
+      plugins: {
+        "demo@some-marketplace": [{ scope: "user", installPath }],
+      },
+    }),
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-plug-proj-"));
+  const all = await listExtensions({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const plugin = all.find((e) => e.name === "demo");
+  expect(plugin).toBeDefined();
+  expect(plugin!.kind).toBe("plugin");
+  expect(plugin!.insert).toBe("@demo");
+  expect(plugin!.source).toBe("user");
+  expect(plugin!.description).toBe("A demo plugin");
+});
+
+test("extensions: project-scoped plugins only count for the matching repo", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-plug-scope-"));
+  const project = mkdtempSync(path.join(tmpRoot, "ext-plug-match-"));
+  const other = mkdtempSync(path.join(tmpRoot, "ext-plug-other-"));
+  mkdirSync(path.join(harness, "plugins"), { recursive: true });
+  writeFileSync(
+    path.join(harness, "plugins", "installed_plugins.json"),
+    JSON.stringify({
+      version: 2,
+      plugins: {
+        "mine@mp": [{ scope: "project", projectPath: project, installPath: "/nope" }],
+        "theirs@mp": [{ scope: "project", projectPath: other, installPath: "/nope" }],
+      },
+    }),
+  );
+  const all = await listExtensions({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  expect(all.some((e) => e.name === "mine" && e.kind === "plugin")).toBe(true);
+  expect(all.some((e) => e.name === "theirs")).toBe(false);
+});
+
+test("extensions: same plugin name across marketplaces keeps both, disambiguated", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-plug-dup-"));
+  mkdirSync(path.join(harness, "plugins"), { recursive: true });
+  writeFileSync(
+    path.join(harness, "plugins", "installed_plugins.json"),
+    JSON.stringify({
+      version: 2,
+      plugins: {
+        "dup@mp-one": [{ scope: "user", installPath: "/nope" }],
+        "dup@mp-two": [{ scope: "user", installPath: "/nope" }],
+      },
+    }),
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-plug-dup-proj-"));
+  const all = await listExtensions({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const plugins = all.filter((e) => e.kind === "plugin" && e.name.startsWith("dup"));
+  // Both survive (the final (kind, name) dedupe must not collapse them) and the
+  // marketplace disambiguates the display name.
+  expect(plugins).toHaveLength(2);
+  expect(plugins.some((e) => e.name === "dup (mp-one)")).toBe(true);
+  expect(plugins.some((e) => e.name === "dup (mp-two)")).toBe(true);
+});
+
+test("extensions: codex parses quoted, dotted MCP server names", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-codex-quoted-"));
+  mkdirSync(path.join(harness, ".codex"), { recursive: true });
+  writeFileSync(
+    path.join(harness, ".codex", "config.toml"),
+    `[mcp_servers."my.server"]\ncommand = "npx"\n`,
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-codex-quoted-proj-"));
+  const all = await listExtensions({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const mcp = all.find((e) => e.kind === "mcp" && e.name === "my.server");
+  expect(mcp).toBeDefined();
+  expect(mcp!.insert).toBe("@my.server");
+});
+
+test("extensions: codex reads [mcp_servers.*] from config.toml", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-codex-"));
+  mkdirSync(path.join(harness, ".codex"), { recursive: true });
+  writeFileSync(
+    path.join(harness, ".codex", "config.toml"),
+    `[mcp_servers.context7]\ncommand = "npx"\n\n[mcp_servers.linear]\nurl = "https://mcp.linear.app"\n`,
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-codex-proj-"));
+  const all = await listExtensions({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+  });
+  expect(all.some((e) => e.name === "context7" && e.kind === "mcp")).toBe(true);
+  expect(all.some((e) => e.name === "linear" && e.kind === "mcp")).toBe(true);
+});
+
+test("capabilities: returns both commands and extensions in one pass", async () => {
+  const project = mkdtempSync(path.join(tmpRoot, "cap-"));
+  // A slash command, a skill, and a project MCP server.
+  writeCmd(
+    path.join(project, ".claude", "commands"),
+    "deploy.md",
+    "---\ndescription: Deploy\n---\nbody",
+  );
+  writeCmd(
+    path.join(project, ".claude", "skills", "reviewer"),
+    "SKILL.md",
+    "---\ndescription: Reviews code\n---\nbody",
+  );
+  writeFileSync(
+    path.join(project, ".mcp.json"),
+    JSON.stringify({ mcpServers: { db: { command: "dbhub" } } }),
+  );
+
+  const { commands, extensions } = await listAgentCapabilities({
+    agent: "claude-code",
+    workdir: project,
+  });
+
+  // Commands list carries both the command and the skill (the `/` surface).
+  expect(commands.some((c) => c.name === "/deploy" && c.kind === "command")).toBe(true);
+  expect(commands.some((c) => c.name === "/reviewer" && c.kind === "skill")).toBe(true);
+
+  // Extensions list carries the skill (reused from the commands pass) and the
+  // MCP server, but NOT the plain command.
+  expect(extensions.some((e) => e.name === "reviewer" && e.kind === "skill" && e.insert === "/reviewer")).toBe(true);
+  expect(extensions.some((e) => e.name === "db" && e.kind === "mcp" && e.insert === "@db")).toBe(true);
+  expect(extensions.some((e) => e.name === "deploy")).toBe(false);
 });
