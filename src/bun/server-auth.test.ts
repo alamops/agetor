@@ -53,8 +53,8 @@ test("a request with the token in the query string succeeds (SSE fallback)", asy
   expect(res.status).toBe(200);
 });
 
-test("/agent-commands requires a known agent kind", async () => {
-  const res = await fetch(url("/agent-commands?agent=nope"), {
+test("/agent-discovery requires a known agent kind", async () => {
+  const res = await fetch(url("/agent-discovery?agent=nope"), {
     headers: { authorization: `Bearer ${token}` },
   });
   expect(res.status).toBe(400);
@@ -107,13 +107,14 @@ test("/questions rejects unauthenticated POSTs", async () => {
   expect(res.status).toBe(401);
 });
 
-test("/agent-commands returns an array for a known agent", async () => {
-  const res = await fetch(url("/agent-commands?agent=claude-code"), {
+test("/agent-discovery returns commands + extensions for a known agent", async () => {
+  const res = await fetch(url("/agent-discovery?agent=claude-code"), {
     headers: { authorization: `Bearer ${token}` },
   });
   expect(res.status).toBe(200);
   const body = await res.json();
-  expect(Array.isArray(body)).toBe(true);
+  expect(Array.isArray(body.commands)).toBe(true);
+  expect(Array.isArray(body.extensions)).toBe(true);
 });
 
 test("PATCH ignores server-managed fields and only writes the allow-listed ones", async () => {

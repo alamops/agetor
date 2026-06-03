@@ -35,6 +35,17 @@ export interface AvailableCommand {
   kind: "command" | "skill";
 }
 
+/** An MCP server / skill / plugin surfaced by the prompt-top picker.
+ *  `insert` is the token dropped into the textarea (`/name` for skills,
+ *  `@name` for MCP servers and plugins). */
+export interface AvailableExtension {
+  name: string;
+  insert: string;
+  description: string;
+  source: "user" | "project";
+  kind: "mcp" | "skill" | "plugin";
+}
+
 /** Per-agent model id list discovered from the CLI at boot. */
 export interface AgentModelMap {
   "claude-code": { id: string; label?: string }[];
@@ -272,15 +283,17 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ value }),
     }),
-  listAgentCommands: (opts: { agent: string; workdir: string; branch?: string }) => {
-    // `agent` is a harness id (built-ins use id-equals-kind, so passing
-    // "claude-code" / "codex" still works). The server resolves to the
-    // harness via getByIdOrKind and reads commands/skills from the harness's
-    // own home when set.
+  listAgentCapabilities: (opts: { agent: string; workdir: string; branch?: string }) => {
+    // Slash commands/skills + MCP/skill/plugin extensions in one fetch. `agent`
+    // is a harness id (built-ins use id-equals-kind, so "claude-code" / "codex"
+    // still works). The server resolves to the harness via getByIdOrKind and
+    // reads from the harness's own home when set.
     const q = new URLSearchParams({ agent: opts.agent });
     if (opts.workdir) q.set("workdir", opts.workdir);
     if (opts.branch) q.set("branch", opts.branch);
-    return j<AvailableCommand[]>(`/agent-commands?${q.toString()}`);
+    return j<{ commands: AvailableCommand[]; extensions: AvailableExtension[] }>(
+      `/agent-discovery?${q.toString()}`,
+    );
   },
   listTasks: () => j<Task[]>("/tasks"),
   createTask: (input: {
