@@ -7,7 +7,7 @@ import {
   GitCommit, GitCompare, Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
-import { api, type AgentModelMap, type AvailableCommand, type PendingInteraction } from "@/lib/api";
+import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/select";
@@ -39,6 +39,7 @@ import {
 } from "./ReferencesPicker";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 import { SlashAutocomplete } from "./SlashAutocomplete";
+import { ExtensionPicker } from "./ExtensionPicker";
 import { TerminalView } from "./TerminalView";
 
 /**
@@ -517,27 +518,28 @@ function RunPanelBody({
   // New Task form uses — depends on (agent, workdir, branch) so a slash
   // command available in this project shows up here too.
   const [sendCommands, setSendCommands] = useState<AvailableCommand[]>([]);
+  // MCP / skill / plugin entries for the Extensions picker above the send box.
+  const [sendExtensions, setSendExtensions] = useState<AvailableExtension[]>([]);
   const sendRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
-    if (!task.workdir.trim()) { setSendCommands([]); return; }
+    if (!task.workdir.trim()) { setSendCommands([]); setSendExtensions([]); return; }
     let cancelled = false;
     // Use the same (agent, workdir, branch) shape NewTaskForm uses so the
-    // two slash-command sources never disagree. We pick `task.branch` (the
-    // worktree's working branch, or null for isolation=none → falls back
-    // to repo HEAD on the backend) rather than `task.baseRef` (a pinned
-    // SHA used only for reproducibility) — commands are discovered
-    // against the live branch context, not the historical base.
+    // discovery sources never disagree. We pick `task.branch` (the worktree's
+    // working branch, or null for isolation=none → falls back to repo HEAD on
+    // the backend) rather than `task.baseRef` (a pinned SHA used only for
+    // reproducibility) — discovery runs against the live branch context, not
+    // the historical base. Pass the harness id (task.agent) so aliased
+    // multi-account harnesses read their own per-harness config.
     const branch = task.branch?.trim() || undefined;
-    // Pass the harness id (task.agent) so aliased multi-account harnesses
-    // read their own per-harness commands/skills.
     api
-      .listAgentCommands({
-        agent: task.agent,
-        workdir: task.workdir.trim(),
-        branch,
+      .listAgentCapabilities({ agent: task.agent, workdir: task.workdir.trim(), branch })
+      .then(({ commands, extensions }) => {
+        if (cancelled) return;
+        setSendCommands(commands);
+        setSendExtensions(extensions);
       })
-      .then((cmds) => { if (!cancelled) setSendCommands(cmds); })
-      .catch(() => { if (!cancelled) setSendCommands([]); });
+      .catch(() => { if (!cancelled) { setSendCommands([]); setSendExtensions([]); } });
     return () => { cancelled = true; };
   }, [task.agent, task.workdir, task.branch]);
 
@@ -894,6 +896,20 @@ function RunPanelBody({
               >
                 <GitCommit className="mr-1 size-3" /> Commit &amp; push
               </Button>
+            </div>
+          )}
+          {canSend && (
+            <div className="flex items-center">
+              <ExtensionPicker
+                extensions={sendExtensions}
+                value={input}
+                onChange={setInput}
+                textareaRef={sendRef}
+                placement="above"
+                // Already gated by the enclosing `canSend &&`, so only the
+                // in-flight send needs to disable the trigger here.
+                disabled={sending}
+              />
             </div>
           )}
           <div className="flex items-stretch gap-2">

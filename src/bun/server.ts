@@ -52,7 +52,7 @@ import {
   resizeTerminal,
   type TerminalSocketData,
 } from "./terminals.ts";
-import { listAvailableCommands } from "./commands.ts";
+import { listAgentCapabilities } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
@@ -754,16 +754,19 @@ export function startApiServer() {
         }),
       },
 
-      // Slash commands + skills available to the picked harness in the picked
-      // project. The new-task form queries this whenever harness/workdir/branch
-      // change so the prompt textarea can offer `/…` autocomplete.
+      // Slash commands/skills (for the `/…` autocomplete) and MCP/skill/plugin
+      // extensions (for the prompt-top picker) for the picked harness in the
+      // picked project. The new-task form and run panel query this whenever
+      // harness/workdir/branch change. Bundled into one response so discovery
+      // runs once per refresh instead of resolving the repo root and walking
+      // the skills tree twice.
       //
       // The `agent` query param is a harness id (or, for built-ins, the bare
       // AgentKind — they share the same value). Resolving via getByIdOrKind
       // lets us look up the harness's home, so an aliased multi-account
       // harness reads its own per-harness commands/skills instead of the
       // system home's.
-      "/agent-commands": {
+      "/agent-discovery": {
         GET: authed(async (req) => {
           const url = new URL(req.url);
           const agentParam = url.searchParams.get("agent");
@@ -777,7 +780,7 @@ export function startApiServer() {
             return json({ error: "agent required" }, { status: 400, headers: corsHeaders(req) });
           }
           return json(
-            await listAvailableCommands({
+            await listAgentCapabilities({
               agent: harness.kind,
               workdir,
               branch,
