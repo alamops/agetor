@@ -34,6 +34,7 @@ function makeTask() {
     agent: "claude-code",
     workdir: "/tmp",
     isolation: "none",
+    taskType: "task",
     branch: null,
     worktreePath: null,
     baseRef: null,

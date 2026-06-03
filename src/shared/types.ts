@@ -166,6 +166,60 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
 
 export type Isolation = "worktree" | "none";
 
+/**
+ * High-level classification of a task. Cosmetic only — drives the icon and
+ * left-border color on the kanban card and the picker in NewTaskForm. Has no
+ * effect on agent invocation, scheduling, or orchestration. New rows default
+ * to "task"; legacy rows are backfilled by migration 020.
+ */
+export type TaskType = "task" | "bug" | "spike";
+
+export interface TaskTypeMeta {
+  id: TaskType;
+  label: string;
+  hint: string;
+  /** Lucide icon name — resolved in the UI to the actual component. */
+  icon: "Inbox" | "Bug" | "FlaskConical";
+  /** Tailwind class fragments used to paint the icon (text-) and the card's
+   *  left border (border-l-). Kept as fragments rather than full class names
+   *  so the consumer composes them with `cn(...)`. */
+  iconClass: string;
+  borderClass: string;
+}
+
+export const TASK_TYPES: TaskTypeMeta[] = [
+  {
+    id: "task",
+    label: "Task",
+    hint: "Standard work item.",
+    icon: "Inbox",
+    iconClass: "text-sky-500",
+    borderClass: "border-l-sky-500",
+  },
+  {
+    id: "bug",
+    label: "Bug",
+    hint: "Defect to investigate or fix.",
+    icon: "Bug",
+    iconClass: "text-red-500",
+    borderClass: "border-l-red-500",
+  },
+  {
+    id: "spike",
+    label: "Spike",
+    hint: "Exploratory / research task.",
+    icon: "FlaskConical",
+    iconClass: "text-violet-500",
+    borderClass: "border-l-violet-500",
+  },
+];
+
+export const DEFAULT_TASK_TYPE: TaskType = "task";
+
+export function taskTypeMeta(t: TaskType | null | undefined): TaskTypeMeta {
+  return TASK_TYPES.find((x) => x.id === t) ?? TASK_TYPES[0]!;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -181,6 +235,12 @@ export interface Task {
   workdir: string;
   /** "worktree" runs the agent in a per-task git worktree off `workdir`. "none" runs directly in `workdir`. */
   isolation: Isolation;
+  /**
+   * Cosmetic classification — drives the icon + left-border color on the
+   * kanban card. No effect on orchestration. Persisted rows always carry a
+   * value (default "task"; migration 020 backfills legacy rows).
+   */
+  taskType: TaskType;
   /** Branch name created for this task. Set after the worktree is first materialized. */
   branch: string | null;
   /** Absolute path to the per-task worktree. Set after the worktree is first materialized. */

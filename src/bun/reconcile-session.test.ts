@@ -22,6 +22,7 @@ function baseTask(overrides: Partial<Task> = {}): Task {
     agent: "claude-code",
     workdir: "/tmp",
     isolation: "none",
+    taskType: "task",
     branch: null,
     worktreePath: null,
     baseRef: null,
@@ -152,6 +153,7 @@ test("reconcileTaskSession refreshes the hook matcher to narrow on ask → auto"
     workdir: cwd,
     worktreePath: null,
     isolation: "none",
+    taskType: "task",
     mode: "ask",
   });
   tasks.insert(before);
@@ -194,6 +196,7 @@ test("reconcileTaskSession refreshes the hook matcher to full on auto → ask", 
     workdir: cwd,
     worktreePath: null,
     isolation: "none",
+    taskType: "task",
     mode: "auto",
   });
   tasks.insert(before);
@@ -231,6 +234,7 @@ test("reconcileTaskSession does NOT refresh the matcher when cycleToMode fails (
     workdir: cwd,
     worktreePath: null,
     isolation: "none",
+    taskType: "task",
     mode: "ask",
   });
   tasks.insert(before);

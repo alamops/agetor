@@ -29,6 +29,7 @@ test("reconcileOrphans marks running rows as orphaned and returns tasks to ready
     agent: "claude-code",
     workdir: "/tmp",
     isolation: "none",
+    taskType: "task",
     branch: null,
     worktreePath: null,
     baseRef: null,
@@ -93,6 +94,7 @@ test("reattach pre-seed SQL: detects a prior api-error status row scoped to the 
     agent: "claude-code",
     workdir: "/tmp",
     isolation: "none",
+    taskType: "task",
     branch: null,
     worktreePath: null,
     baseRef: null,
@@ -174,6 +176,7 @@ test("startTask honors cancel — exit handler records status 'cancelled'", asyn
     agent: "codex",
     workdir: process.cwd(),
     isolation: "none",
+    taskType: "task",
   });
   if ("error" in created) throw new Error(created.error);
 

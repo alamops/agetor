@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, Harness, HarnessUsage, Project, Task, TaskReference, Run, RunEventStream } from "../shared/types.ts";
+import type { AgentKind, Harness, HarnessUsage, Project, Task, TaskReference, TaskType, Run, RunEventStream } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 // Interactions live in-memory in `interactions.ts`. The import creates a
@@ -58,6 +58,7 @@ if (applied.length) console.log(`[agetor] applied migrations: ${applied.join(", 
 type TaskRow = {
   id: string; title: string; prompt: string; column: string; agent: string;
   workdir: string; isolation: string;
+  task_type: string;
   branch: string | null; worktree_path: string | null; base_ref: string | null;
   mode: string | null; model: string | null; effort: string | null;
   refs: string;
@@ -98,6 +99,7 @@ const toTask = (r: TaskRow): Task => ({
   agent: r.agent as Task["agent"],
   workdir: r.workdir,
   isolation: r.isolation as Task["isolation"],
+  taskType: r.task_type as TaskType,
   branch: r.branch,
   worktreePath: r.worktree_path,
   baseRef: r.base_ref,
@@ -146,12 +148,13 @@ export const tasks = {
   insert(t: Task): Task {
     db.run(
       `INSERT INTO tasks
-         (id, title, prompt, "column", agent, workdir, isolation,
+         (id, title, prompt, "column", agent, workdir, isolation, task_type,
           branch, worktree_path, base_ref, mode, model, effort, refs,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
+        t.taskType,
         t.branch, t.worktreePath, t.baseRef, t.mode, t.model, t.effort,
         JSON.stringify(t.references ?? []),
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
@@ -168,12 +171,13 @@ export const tasks = {
     const next: Task = { ...current, ...patch, id, updatedAt: Date.now() };
     db.run(
       `UPDATE tasks SET
-         title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?,
+         title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
          branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
+        next.taskType,
         next.branch, next.worktreePath, next.baseRef, next.mode, next.model, next.effort,
         JSON.stringify(next.references ?? []),
         next.runId, next.updatedAt, next.archivedAt ?? null, id,
