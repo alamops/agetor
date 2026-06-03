@@ -43,6 +43,7 @@ async function makeTaskWithCwd(id: string): Promise<string> {
     agent: "claude-code",
     workdir: cwd,
     isolation: "none",
+    taskType: "task",
     branch: null,
     worktreePath: null,
     baseRef: null,

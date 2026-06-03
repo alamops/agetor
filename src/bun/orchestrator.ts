@@ -6,9 +6,12 @@ import {
   AGENT_OPTIONS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  DEFAULT_TASK_TYPE,
   MODEL_EFFORT_SUPPORT,
+  TASK_TYPES,
   type AgentKind,
   type Harness,
+  type TaskType,
 } from "../shared/types.ts";
 
 /**
@@ -1035,6 +1038,14 @@ export async function createTask(
   const effort = input.effort
     ?? (Array.isArray(effortSupport) && effortSupport.length === 0 ? null : DEFAULT_EFFORT[kind]);
 
+  // Validate taskType against the known set so a bogus value can't poison
+  // the row (the picker only ever sends one of the canonical ids, but
+  // direct API callers don't have that constraint).
+  const requestedType = input.taskType;
+  const taskType: TaskType =
+    requestedType && TASK_TYPES.some((t) => t.id === requestedType)
+      ? requestedType
+      : DEFAULT_TASK_TYPE;
   const task = tasks.insert({
     id,
     title: input.title,
@@ -1043,6 +1054,7 @@ export async function createTask(
     agent: agentId,
     workdir,
     isolation,
+    taskType,
     branch: plannedBranch,
     worktreePath: null,
     baseRef,
