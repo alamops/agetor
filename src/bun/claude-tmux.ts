@@ -2485,6 +2485,23 @@ export const __forTest = {
     return prev;
   },
   getBracketedEnterGapMs(): number { return bracketedEnterGapMs; },
+  /** Override the image-attach settle window — the per-image delay used
+   *  when the paste contains image file paths. Tests shrink it to ~0 to
+   *  avoid sleeping per image-path assertion. Returns the previous value
+   *  for restore. */
+  setImageAttachSettleMs(ms: number): number {
+    const prev = imageAttachSettleMs;
+    imageAttachSettleMs = ms;
+    return prev;
+  },
+  getImageAttachSettleMs(): number { return imageAttachSettleMs; },
+  /** Image-path detection used by `queuePaste` to decide whether to
+   *  take the long (image-attach) gap. Re-exported for unit tests so the
+   *  rule can be asserted without reaching into the regex literal. */
+  pasteContainsImagePath,
+  /** Count the image paths the regex finds. Used internally to scale the
+   *  settle window by image count; exposed so tests can pin the heuristic. */
+  countImagePaths,
   /** Direct access to the paste queue for assertions. Read-only — tests
    *  inspect ordering by observing tmux side effects, not by mutating
    *  the chain. */
@@ -2494,13 +2511,79 @@ export const __forTest = {
 };
 
 /**
+ * Match a file path whose basename ends in a common image extension. The
+ * pattern requires a word character immediately before the `.ext` so a
+ * bare `.png` token in prose ("save as .png next") or accidental ones
+ * like `..png` / `,.png` don't trigger the image-attach slow path. The
+ * extension list is kept in sync with `IMAGE` in
+ * `src/mainview/lib/file-icons.tsx` — when adding a new extension there,
+ * add it here too.
+ */
+const IMAGE_PATH_RE =
+  /[\w.\-/]*\w\.(png|jpe?g|gif|webp|svg|bmp|ico|avif|heic)\b/gi;
+
+/** True iff `text` carries at least one image-file path. Exported via
+ *  `__forTest` so the unit suite can assert the detection rule without
+ *  reaching into the regex literal. */
+export function pasteContainsImagePath(text: string): boolean {
+  // Reset state on the global regex before .test() — without it, .test()
+  // resumes from lastIndex and a repeat call on the same string returns
+  // alternating true/false.
+  IMAGE_PATH_RE.lastIndex = 0;
+  return IMAGE_PATH_RE.test(text);
+}
+
+/** Number of image-file paths in `text`. Used to scale the settle window
+ *  so multi-image pastes get proportional time for claude's bracketed-
+ *  paste handler to read, encode, and attach each one. */
+export function countImagePaths(text: string): number {
+  return text.match(IMAGE_PATH_RE)?.length ?? 0;
+}
+
+/**
+ * Per-image settle window. Claude's TUI reads the image synchronously on
+ * its input thread when it sees a path in a bracketed paste — it replaces
+ * the path with an `[Image #N]` placeholder, reads the file, and base64-
+ * encodes it. A `send-keys Enter` that arrives mid-flight is consumed by
+ * the attachment flow instead of submitting the message, leaving the
+ * text + placeholder sitting in the input forever. 600 ms comfortably
+ * exceeds the time observed for ~MB-sized screenshots; the cost is paid
+ * only when the heuristic fires, and is scaled by the number of image
+ * paths in the paste (Retina screenshots are routinely 3-5 MB and four
+ * of them in one message would exceed a single 600 ms budget).
+ *
+ * The scaled total is capped at `IMAGE_ATTACH_SETTLE_MAX_MS` so a paste
+ * that accidentally trips the detector many times (e.g. a doc dump that
+ * mentions many `.png` files) doesn't stall the queue for seconds.
+ *
+ * Tests shrink the per-image value to ~0 to keep the queue suite fast.
+ */
+let imageAttachSettleMs = 600;
+
+/** Absolute upper bound on the scaled settle window. Picked at 3 s —
+ *  beyond the slowest observed multi-image attach in practice while still
+ *  bounding the worst-case stall a paste can introduce. */
+const IMAGE_ATTACH_SETTLE_MAX_MS = 3_000;
+
+/**
  * Send `text` as a single user turn to the named tmux session. We pipe via
  * `load-buffer -` to avoid shell-quoting issues (the prompt may contain
  * newlines, dollar signs, quotes, …), paste it into the active window, then
  * press Enter to submit.
  *
- * Sync core — callers go through `queuePaste` so back-to-back pastes for the
- * same task can't interleave at the tmux layer. See `queuePaste` for why.
+ * Stays synchronous — the caller (`queuePaste`) is responsible for any
+ * post-paste delays (the base bracketed gap or the longer image-attach
+ * gap) and for re-gating the trailing Enter on session identity. Keeping
+ * this function sync preserves the "no awaits between tmux calls"
+ * invariant the `queueTmuxOp` chain depends on; the gap + Enter split for
+ * the bracketed case happens in `queuePaste`.
+ *
+ * `skipEnter` defers the trailing Enter to the caller so it can insert a
+ * gap before the `send-keys Enter`. See `queuePaste`'s bracketed branch
+ * for the rationale (and the image-attach scaling layered on top of it).
+ *
+ * Callers go through `queuePaste` so back-to-back pastes for the same
+ * task can't interleave at the tmux layer. See `queuePaste` for why.
  */
 function pastePromptSync(
   sessionName: string,
@@ -2692,19 +2775,36 @@ function queuePaste(
   // the only await is the optional settle — no tmux calls land after the
   // sleep, and a dispose during the sleep can't leak keystrokes.
   //
-  // Bracketed path: we split the trailing Enter out and insert a small
-  // gap so claude's Ink TUI has time to consume `ESC[201~` and commit
-  // the paste before the `\r` arrives. Without the gap the Enter is
-  // absorbed as part of the paste event and the queued bubble sits
-  // unsubmitted (especially when the previous turn is still streaming
-  // or has a background tool in flight — see the "[Pasted text #N +M
-  // lines] never submits" repro). The deferred Enter is re-gated through
-  // `stillCurrent()` so a `dropSession` landing in the gap can't leak the
-  // Enter into a respawned pane.
+  // Bracketed path: we split the trailing Enter out and insert a gap so
+  // claude's Ink TUI has time to consume `ESC[201~` and commit the paste
+  // before the `\r` arrives. Without the gap the Enter is absorbed as
+  // part of the paste event and the queued bubble sits unsubmitted
+  // (especially when the previous turn is still streaming or has a
+  // background tool in flight — see the "[Pasted text #N +M lines] never
+  // submits" repro).
+  //
+  // Image-bearing pastes need a LONGER gap than the base 80 ms: claude's
+  // bracketed-paste handler reads + base64-encodes each image file when
+  // it sees an image path in the paste, and the trailing Enter sent
+  // before that finishes is consumed by the attach flow instead of
+  // submitting the message — the "[Image #N] stuck in input" repro. So
+  // when image paths are detected we scale the gap by image count (up to
+  // `IMAGE_ATTACH_SETTLE_MAX_MS`); otherwise the base
+  // `bracketedEnterGapMs` applies. Exactly one Enter either way — a
+  // second Enter would risk a stray empty submit / pane interrupt on an
+  // idle prompt.
+  //
+  // The deferred Enter is re-gated through `stillCurrent()` so a
+  // `dropSession` landing in the gap can't leak the Enter into a
+  // respawned pane.
   return queueTmuxOp(taskId, async (stillCurrent) => {
     if (opts.bracketed) {
       pastePromptSync(sessionName, text, { ...opts, skipEnter: true });
-      if (bracketedEnterGapMs > 0) await Bun.sleep(bracketedEnterGapMs);
+      const imageCount = countImagePaths(text);
+      const gap = imageCount > 0
+        ? Math.min(imageAttachSettleMs * imageCount, IMAGE_ATTACH_SETTLE_MAX_MS)
+        : bracketedEnterGapMs;
+      if (gap > 0) await Bun.sleep(gap);
       if (!stillCurrent()) return;
       tmux(["send-keys", "-t", sessionName, "Enter"]);
     } else {
