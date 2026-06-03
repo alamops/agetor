@@ -269,7 +269,7 @@ test("partial trailing line is left for the next flush", async () => {
 
 /**
  * Snapshot + restore the `AGETOR_TMUX_BIN` env var around a test body.
- * The chain calls `pastePromptSync` → `tmux()` → `Bun.spawnSync(bin, …)`;
+ * The chain calls `pastePrompt` → `tmux()` → `Bun.spawnSync(bin, …)`;
  * pointing the bin at a no-op `true` lets the chain advance without
  * needing a real tmux. Restoring on exit keeps the env clean for later
  * tests in the same process (tmux probes elsewhere read this var).
@@ -587,6 +587,64 @@ test("queueTmuxOp: skips its body if the session was disposed between scheduling
   });
 });
 
+// ─── pasteContainsImagePath / countImagePaths detection rules ──────────
+// The image-aware long gap inside `queuePaste` only fires when these
+// helpers signal an image path in the paste. Get the rule wrong in
+// either direction and either every bracketed paste pays 600 ms+ of
+// latency for nothing, or the image-attach race re-opens.
+test("pasteContainsImagePath: matches absolute file paths with image extensions", () => {
+  // Real prompt shape — `appendReferences` writes `- /abs/path` bullets.
+  const prompt =
+    "fix the bug\n\nReferenced files/folders:\n- /Users/me/.agetor/screenshots/screenshot-2026-06-02_17-47-49-b51759d7.png";
+  expect(__forTest.pasteContainsImagePath(prompt)).toBe(true);
+});
+
+test("pasteContainsImagePath: matches each supported extension", () => {
+  for (const ext of ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif", "heic"]) {
+    expect(__forTest.pasteContainsImagePath(`see /tmp/foo.${ext}`)).toBe(true);
+  }
+});
+
+test("pasteContainsImagePath: case-insensitive on the extension", () => {
+  expect(__forTest.pasteContainsImagePath("attached: /tmp/Foo.PNG")).toBe(true);
+  expect(__forTest.pasteContainsImagePath("attached: /tmp/bar.JPEG")).toBe(true);
+});
+
+test("pasteContainsImagePath: a bare `.png` token (no word before the dot) does NOT match", () => {
+  // The regex requires a `\w` immediately before the extension dot so
+  // prose mentioning the extension doesn't trip the long gap. Likewise
+  // edge inputs like `..png` (consecutive dots) and `,png` (non-word
+  // prefix) are rejected.
+  expect(__forTest.pasteContainsImagePath(".png")).toBe(false);
+  expect(__forTest.pasteContainsImagePath("save as .png next")).toBe(false);
+  expect(__forTest.pasteContainsImagePath("see ..png file")).toBe(false);
+});
+
+test("pasteContainsImagePath: non-image extensions do not match", () => {
+  expect(__forTest.pasteContainsImagePath("see /tmp/foo.ts")).toBe(false);
+  expect(__forTest.pasteContainsImagePath("/Users/me/notes.md")).toBe(false);
+  expect(__forTest.pasteContainsImagePath("hello world")).toBe(false);
+});
+
+test("pasteContainsImagePath: is stateless across repeated calls (global regex regression)", () => {
+  // `IMAGE_PATH_RE` carries the /g flag so `.match()` can count occurrences
+  // for the scaled settle. Without an explicit `lastIndex = 0` reset, a
+  // repeat `.test()` on the same string alternates true/false — a footgun
+  // worth pinning so a future refactor doesn't quietly re-introduce it.
+  const s = "/tmp/foo.png";
+  expect(__forTest.pasteContainsImagePath(s)).toBe(true);
+  expect(__forTest.pasteContainsImagePath(s)).toBe(true);
+  expect(__forTest.pasteContainsImagePath(s)).toBe(true);
+});
+
+test("countImagePaths: counts each image reference for settle-window scaling", () => {
+  expect(__forTest.countImagePaths("no images here")).toBe(0);
+  expect(__forTest.countImagePaths("- /tmp/a.png")).toBe(1);
+  expect(__forTest.countImagePaths("- /tmp/a.png\n- /tmp/b.jpg\n- /tmp/c.webp")).toBe(3);
+  // Mixed image + non-image refs only counts images.
+  expect(__forTest.countImagePaths("- /tmp/a.png\n- /tmp/notes.md\n- /tmp/b.jpeg")).toBe(2);
+});
+
 // ─── bracketed-paste → Enter gap (regression for "[Pasted text +N lines]
 // renders but never submits" — the Enter that follows `paste-buffer -p`
 // gets absorbed as part of the bracketed paste event if it arrives in the
@@ -709,6 +767,155 @@ test("queuePaste(non-bracketed): keeps the original synchronous load-buffer → 
       const sendKeys = entries[3]!;
       expect(sendKeys.argv[sendKeys.argv.length - 1]).toBe("Enter");
     } finally {
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+// ─── image-attach gap (regression for "[Image #N] stuck in input,
+// message never sent" — the bracketed-paste handler reads + base64-
+// encodes images asynchronously, and the trailing Enter sent immediately
+// after the paste was consumed by the attach flow instead of submitting
+// the message). The image-aware long gap replaces the base
+// `bracketedEnterGapMs` inside `queuePaste` and scales by image count up
+// to `IMAGE_ATTACH_SETTLE_MAX_MS`. Enter count is unchanged — exactly
+// one per paste, image or not — so a second Enter can't cause a stray
+// empty submit or interrupt against an idle pane. ───
+
+test("queuePaste(image): single-image paste replaces the base gap with the longer image-attach window", async () => {
+  // The structural assertion (one Enter, gap floor) mirrors the bracketed
+  // test above; the timing floor uses `imageAttachSettleMs * 1` instead
+  // of `bracketedEnterGapMs`. We pin the base gap to 0 so any observed
+  // delay must come from the image branch.
+  const IMG = 100;
+  const TOLERANCE = 30;
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevImg = __forTest.setImageAttachSettleMs(IMG);
+    const prevGap = __forTest.setBracketedEnterGapMs(0);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const taskId = randomUUID();
+      await __forTest.queuePaste(
+        taskId,
+        "sess-img",
+        "fix this\n\nReferenced files/folders:\n- /tmp/screenshot.png",
+        0,
+        undefined,
+        { bracketed: true },
+      );
+      const entries = readTmuxLog(logPath);
+      const cmds = entries.map((e) => e.argv[0]);
+      expect(cmds).toEqual(["load-buffer", "paste-buffer", "delete-buffer", "send-keys"]);
+      const deleteBuffer = entries[2]!;
+      const sendKeys = entries[3]!;
+      expect(sendKeys.argv[sendKeys.argv.length - 1]).toBe("Enter");
+      const deltaMs = sendKeys.ms - deleteBuffer.ms;
+      expect(deltaMs).toBeGreaterThanOrEqual(IMG - TOLERANCE);
+    } finally {
+      __forTest.setImageAttachSettleMs(prevImg);
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+test("queuePaste(image): gap scales linearly with the number of image paths", async () => {
+  // 3 images × per-image settle, capped at IMAGE_ATTACH_SETTLE_MAX_MS.
+  // Lower bound `2.5 * IMG` is generous against scheduler slop while
+  // still proving the multiplication wasn't dropped.
+  const IMG = 100;
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevImg = __forTest.setImageAttachSettleMs(IMG);
+    const prevGap = __forTest.setBracketedEnterGapMs(0);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const taskId = randomUUID();
+      await __forTest.queuePaste(
+        taskId,
+        "sess-multi",
+        "compare these\n\nReferenced files/folders:\n- /tmp/a.png\n- /tmp/b.jpg\n- /tmp/c.webp",
+        0,
+        undefined,
+        { bracketed: true },
+      );
+      const entries = readTmuxLog(logPath);
+      const deleteBuffer = entries[2]!;
+      const sendKeys = entries[3]!;
+      const deltaMs = sendKeys.ms - deleteBuffer.ms;
+      expect(deltaMs).toBeGreaterThanOrEqual(IMG * 2.5);
+    } finally {
+      __forTest.setImageAttachSettleMs(prevImg);
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+test("queuePaste(image): non-image bracketed paste does NOT take the long gap (uses base bracketed gap instead)", async () => {
+  // Bloat the image settle to a value that would blow the test budget if
+  // the detector misfired. Base bracketed gap is a small non-zero value
+  // — small enough that the bracketed test above's GAP - TOLERANCE math
+  // doesn't apply — proving the path went through `bracketedEnterGapMs`
+  // and not through the scaled image settle.
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevImg = __forTest.setImageAttachSettleMs(5_000);
+    const prevGap = __forTest.setBracketedEnterGapMs(20);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const taskId = randomUUID();
+      const t0 = performance.now();
+      await __forTest.queuePaste(
+        taskId,
+        "sess-txt",
+        "no images here, just a follow-up\n\nReferenced files/folders:\n- /tmp/notes.md",
+        0,
+        undefined,
+        { bracketed: true },
+      );
+      const elapsed = performance.now() - t0;
+      // Well under the 5_000 ms slow-path bound. 500 ms is generous
+      // against CI scheduler noise while still being orders of magnitude
+      // below the bound.
+      expect(elapsed).toBeLessThan(500);
+      // Trailing send-keys Enter still fires exactly once.
+      const enterCalls = readTmuxLog(logPath)
+        .filter((e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "Enter");
+      expect(enterCalls.length).toBe(1);
+    } finally {
+      __forTest.setImageAttachSettleMs(prevImg);
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+test("queuePaste(image): sends exactly ONE Enter (no stray empty submit / pane interrupt)", async () => {
+  // Earlier iterations of the image fix sent two Enters on image paths;
+  // the second was a guess at dismissing a suspected attach-confirm
+  // modal that there's no evidence of in the bracketed-paste flow. The
+  // JSONL repro already showed a single-Enter image submit succeeding
+  // once claude was idle, so a second Enter would risk a stray empty
+  // submit or pane interrupt. Lock in the contract.
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevImg = __forTest.setImageAttachSettleMs(20);
+    const prevGap = __forTest.setBracketedEnterGapMs(0);
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    try {
+      const taskId = randomUUID();
+      await __forTest.queuePaste(
+        taskId,
+        "sess-once",
+        "fix this\n\nReferenced files/folders:\n- /tmp/screenshot.png",
+        0,
+        undefined,
+        { bracketed: true },
+      );
+      const enterCalls = readTmuxLog(logPath)
+        .filter((e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "Enter");
+      expect(enterCalls.length).toBe(1);
+    } finally {
+      __forTest.setImageAttachSettleMs(prevImg);
       __forTest.setBracketedEnterGapMs(prevGap);
       __forTest.setSlashCommandSettleMs(prevSettle);
     }
