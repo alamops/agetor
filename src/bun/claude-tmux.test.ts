@@ -18,18 +18,12 @@ import {
   cycleOrderFor,
   cycleToMode,
   encodeProjectPath,
-  isAgetorInterceptReply,
   jsonlPathFor,
   mapJsonlEventToChunks,
   rebuildEventsFromJsonl,
   sessionNameFor,
   toClaudeModeString,
 } from "./claude-tmux.ts";
-import {
-  ASK_QUESTIONS_REPLY_PREFIX,
-  PLAN_APPROVED_REPLY_PREFIX,
-  PLAN_REJECTED_REPLY_PREFIX,
-} from "./interactions.ts";
 
 test("jsonlPathFor with home=null falls back to the system homedir", () => {
   const p = jsonlPathFor("/a/b", "session-uuid", null);
@@ -394,61 +388,6 @@ test("mapJsonlEventToChunks: user.content[].tool_result → `tool_result` stream
   expect(parsed).toMatchObject({ toolUseId: "toolu_1", content: "ok", isError: false });
 });
 
-test("mapJsonlEventToChunks: AskUserQuestion intercept reply overrides is_error → false", () => {
-  const { out, onChunk } = recorder();
-  const line = JSON.stringify({
-    type: "user",
-    message: { content: [{
-      type: "tool_result",
-      tool_use_id: "toolu_2",
-      content: `${ASK_QUESTIONS_REPLY_PREFIX} "Q1"="A1". You can now continue with the user's answers in mind.`,
-      is_error: true,
-    }] },
-  });
-  mapJsonlEventToChunks(line, onChunk);
-  const parsed = JSON.parse(out[0]!.data);
-  expect(parsed.isError).toBe(false);
-});
-
-test("mapJsonlEventToChunks: ExitPlanMode approval reply overrides is_error → false", () => {
-  const { out, onChunk } = recorder();
-  const line = JSON.stringify({
-    type: "user",
-    message: { content: [{
-      type: "tool_result",
-      tool_use_id: "toolu_3",
-      content: `${PLAN_APPROVED_REPLY_PREFIX} and wants you to implement it now.`,
-      is_error: true,
-    }] },
-  });
-  mapJsonlEventToChunks(line, onChunk);
-  const parsed = JSON.parse(out[0]!.data);
-  expect(parsed.isError).toBe(false);
-});
-
-test("mapJsonlEventToChunks: intercept reply in array-of-text-blocks shape also overrides is_error", () => {
-  // Defensive: claude has historically emitted tool_result.content as both a
-  // bare string and an array of `{type:"text", text:"…"}` blocks. The override
-  // must work for the array form too, or a future claude release could
-  // silently revert the rendering.
-  const { out, onChunk } = recorder();
-  const line = JSON.stringify({
-    type: "user",
-    message: { content: [{
-      type: "tool_result",
-      tool_use_id: "toolu_5",
-      content: [{
-        type: "text",
-        text: `${ASK_QUESTIONS_REPLY_PREFIX} "Q1"="A1". You can now continue with the user's answers in mind.`,
-      }],
-      is_error: true,
-    }] },
-  });
-  mapJsonlEventToChunks(line, onChunk);
-  const parsed = JSON.parse(out[0]!.data);
-  expect(parsed.isError).toBe(false);
-});
-
 test("mapJsonlEventToChunks: real tool error (non-intercept content) preserves is_error → true", () => {
   const { out, onChunk } = recorder();
   const line = JSON.stringify({
@@ -463,19 +402,6 @@ test("mapJsonlEventToChunks: real tool error (non-intercept content) preserves i
   mapJsonlEventToChunks(line, onChunk);
   const parsed = JSON.parse(out[0]!.data);
   expect(parsed.isError).toBe(true);
-});
-
-test("isAgetorInterceptReply: handles string content, array-of-text-blocks, and rejects non-matches", () => {
-  expect(isAgetorInterceptReply(`${ASK_QUESTIONS_REPLY_PREFIX} ...`)).toBe(true);
-  expect(isAgetorInterceptReply(`${PLAN_APPROVED_REPLY_PREFIX} ...`)).toBe(true);
-  expect(isAgetorInterceptReply(`${PLAN_REJECTED_REPLY_PREFIX} ...`)).toBe(true);
-  expect(isAgetorInterceptReply([{ type: "text", text: `${ASK_QUESTIONS_REPLY_PREFIX} x` }])).toBe(true);
-  // Non-text blocks contribute nothing and don't trip the match.
-  expect(isAgetorInterceptReply([{ type: "image", source: {} }])).toBe(false);
-  expect(isAgetorInterceptReply("Error: command failed")).toBe(false);
-  expect(isAgetorInterceptReply("")).toBe(false);
-  expect(isAgetorInterceptReply(null)).toBe(false);
-  expect(isAgetorInterceptReply(undefined)).toBe(false);
 });
 
 test("mapJsonlEventToChunks: user with string content emits a `user` stream event", () => {
@@ -841,6 +767,40 @@ test("dispatchLine: end_turn staging — tool_use line stages but tool_result ca
   expect(state.pendingEndTurn).toBeNull();
   expect(state.turnQueue.length).toBe(1); // still alive
   expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(false);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: a user-INTERRUPT tool_result FIRES the staged turn-end (run resolves — the ExitPlanMode reject fix)", async () => {
+  // Esc'ing a modal (or Ctrl+C) makes claude write a cancel tool_result. Unlike
+  // a normal tool_result (which continues the turn), this ENDS it. The staged
+  // end_turn must FIRE — otherwise the run hangs "Agent is working" forever
+  // (the bug behind rejecting an ExitPlanMode plan).
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-staging-interrupt-fires";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+
+  const recorded: { stream: string; data: string }[] = [];
+  void __forTest.pushTurnSlot(state, (stream, data) => recorded.push({ stream, data }));
+
+  // ExitPlanMode tool_use with end_turn → staged.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "assistant", uuid: "ep-1",
+    message: { id: "msg-plan", role: "assistant",
+      content: [{ type: "tool_use", id: "plan1", name: "ExitPlanMode", input: { plan: "x" } }],
+      stop_reason: "end_turn" },
+  }));
+  expect(state.pendingEndTurn?.messageId).toBe("msg-plan");
+  expect(state.turnQueue.length).toBe(1);
+
+  // Interrupt tool_result (Esc) → must FIRE the end_turn, not cancel it.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user", uuid: "int-1",
+    message: { content: [{ type: "tool_result", tool_use_id: "plan1",
+      content: "The user doesn't want to proceed with this tool use. The tool use was rejected." }] },
+  }));
+  expect(state.pendingEndTurn).toBeNull();   // fired, not lingering
+  expect(state.turnQueue.length).toBe(0);    // slot popped → the run resolves
+  expect(recorded.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
   __forTest.uninstallSession(taskId);
 });
 
@@ -1422,4 +1382,40 @@ test("cycleToMode: overlapping calls don't clobber each other's listeners", asyn
   } finally {
     __forTest.setModeVerifyTimeoutMs(prevTimeout);
   }
+});
+
+test("resolveAskCard resolves the card AND clears the session askCardId (so a failed drive can re-collect)", async () => {
+  const { __forTest, resolveAskCard } = await import("./claude-tmux.ts");
+  const { __testing, registerScrapedAskQuestions, activeAskQuestionsForTask } =
+    await import("./interactions.ts");
+  __testing.reset();
+  const taskId = "task-resolve-ask-card";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const card = registerScrapedAskQuestions({
+    taskId, runId: "r1",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp",
+  });
+  state.askCardId = card.id;
+  expect(activeAskQuestionsForTask(taskId)).toHaveLength(1);
+
+  resolveAskCard(card.id, taskId);
+  expect(activeAskQuestionsForTask(taskId)).toHaveLength(0); // interaction dropped
+  expect(state.askCardId).toBeNull();                        // tracker cleared → scraper can re-collect
+  __forTest.uninstallSession(taskId);
+});
+
+test("resolveAskCard still drops the card with no live session (the route's no-tmux path)", async () => {
+  const { resolveAskCard } = await import("./claude-tmux.ts");
+  const { __testing, registerScrapedAskQuestions, activeAskQuestionsForTask } =
+    await import("./interactions.ts");
+  __testing.reset();
+  const card = registerScrapedAskQuestions({
+    taskId: "task-resolve-ask-nosession", runId: "r1",
+    questions: [{ question: "Q", options: [{ label: "A" }] }],
+    fingerprint: "fp",
+  });
+  expect(activeAskQuestionsForTask("task-resolve-ask-nosession")).toHaveLength(1);
+  resolveAskCard(card.id, "task-resolve-ask-nosession"); // no installSession → no state
+  expect(activeAskQuestionsForTask("task-resolve-ask-nosession")).toHaveLength(0);
 });

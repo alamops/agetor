@@ -33,13 +33,15 @@ import {
 } from "./tmux-resolution.ts";
 import {
   dismissTmuxPrompt,
-  getCurrentPermissionMode,
   jsonlPathFor,
   rebuildEventsFromJsonl,
   markTmuxPromptAnswered,
+  resolveAskCard,
+  sendModalKeys,
   sessionExists,
   sessionNameFor,
 } from "./claude-tmux.ts";
+import { planAskAnswers } from "./claude-questions.ts";
 import { getTaskDiff, hasUncommittedChanges, listBranches } from "./worktree.ts";
 import {
   attachSocket,
@@ -56,31 +58,16 @@ import { listAgentCapabilities } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
-  SAFE_TOOLS,
-  answerApproval,
-  answerAskQuestions,
-  answerPlanApproval,
   answerQuestion,
   answerTmuxPrompt,
   findTmuxPromptById,
-  formatAskQuestionsReason,
-  formatPlanApprovalReason,
+  getAskQuestionsById,
   listPendingForTask,
-  lookupAllowRule,
-  makeHookResponse,
-  planApprovalTargetMode,
-  registerApproval,
-  registerAskQuestions,
-  registerPlanApproval,
   registerQuestion,
-  type AskQuestion,
   type AskQuestionsAnswer,
-  type ApprovalAnswer,
-  type PlanApprovalAnswer,
   type QuestionAnswer,
 } from "./interactions.ts";
 import { MODEL_EFFORT_SUPPORT, TASK_TYPES } from "../shared/types.ts";
-import { isReadOnlyBashCommand } from "../shared/claude-permissions.ts";
 import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 
@@ -184,43 +171,6 @@ function filterPatch(raw: unknown): Partial<Task> {
     if (ALLOWED_PATCH_FIELDS.has(k as keyof Task)) (patch as Record<string, unknown>)[k] = v;
   }
   return patch;
-}
-
-/** Defensively parse claude's AskUserQuestion tool input. Skips malformed
- *  questions/options rather than failing the whole interception — keeps
- *  the UI usable even if a future claude release tweaks the shape. */
-function parseAskQuestionsInput(input: unknown): AskQuestion[] {
-  if (!input || typeof input !== "object") return [];
-  const raw = (input as { questions?: unknown }).questions;
-  if (!Array.isArray(raw)) return [];
-  const out: AskQuestion[] = [];
-  for (const q of raw) {
-    if (!q || typeof q !== "object") continue;
-    const qq = q as Record<string, unknown>;
-    if (typeof qq.question !== "string" || !qq.question.trim()) continue;
-    const optionsRaw = Array.isArray(qq.options) ? qq.options : [];
-    const options = optionsRaw
-      .map((o) => (o && typeof o === "object" ? (o as Record<string, unknown>) : null))
-      .filter((o): o is Record<string, unknown> => o !== null && typeof o.label === "string")
-      .map((o) => ({
-        label: o.label as string,
-        description: typeof o.description === "string" ? o.description : undefined,
-      }));
-    out.push({
-      question: qq.question,
-      header: typeof qq.header === "string" ? qq.header : undefined,
-      multiSelect: Boolean(qq.multiSelect),
-      options,
-    });
-  }
-  return out;
-}
-
-function parseExitPlanInput(input: unknown): string {
-  if (input && typeof input === "object" && typeof (input as { plan?: unknown }).plan === "string") {
-    return (input as { plan: string }).plan;
-  }
-  return "(claude did not provide a plan body)";
 }
 
 export function startApiServer() {
@@ -1247,203 +1197,6 @@ export function startApiServer() {
         }),
       },
 
-      // ─── Interactions: tool-call approvals (from the PreToolUse hook) ───
-      "/approvals": {
-        POST: authed(async (req) => {
-          const url = new URL(req.url);
-          const taskId = url.searchParams.get("taskId");
-          if (!taskId) {
-            return json({ error: "taskId required" }, { status: 400, headers: corsHeaders(req) });
-          }
-          // The hook script POSTs claude's verbatim PreToolUse payload —
-          // we read tool_name + tool_input out of it.
-          const payload = (await req.json().catch(() => ({}))) as {
-            tool_name?: string;
-            tool_input?: unknown;
-          };
-          const toolName = payload.tool_name ?? "unknown";
-          // Resolve the current run id for this task. If there isn't one
-          // (race: agetor restarted between spawn and first tool call), fall
-          // back to "ask" so claude pops its TUI modal.
-          const task = tasks.get(taskId);
-          const runId = task?.runId;
-          if (!runId) {
-            return json(makeHookResponse({ decision: "deny", reason: "no active run" }), {
-              headers: corsHeaders(req),
-            });
-          }
-          // Defense-in-depth: claude's built-in interactive tools must
-          // always go through the UI intercept, never the safe-tool nor
-          // saved-rule auto-allow paths — auto-allowing them lets claude
-          // pop its invisible TUI modal and the run hangs exactly like
-          // pre-intercept. A stale rule (manual SQL fix, future refactor,
-          // accidental "Allow always" path that used to route through the
-          // generic ApprovalCard) shouldn't be able to disable the safety.
-          const ALWAYS_INTERCEPT = new Set(["AskUserQuestion", "ExitPlanMode"]);
-          // Plan mode is the user explicitly opting into "stop and ask
-          // before any write". Tools without a saved allow-rule still get
-          // intercepted; saved rules (created via "Allow always") are
-          // honored everywhere — "always" means always, including in
-          // plan mode. Read-only tools keep their fast-path either way.
-          const PLAN_MODE_INTERCEPT = new Set([
-            "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash",
-          ]);
-          // File-edit tools that auto-allow under acceptEdits — mirrors
-          // claude's own acceptEdits scope (edits flow, Bash still asks).
-          const ACCEPT_EDITS_TOOLS = new Set([
-            "Edit", "Write", "MultiEdit", "NotebookEdit",
-          ]);
-          // A `Bash` call whose command is confidently read-only (grep/find/
-          // ls/cat/…) is treated like the dedicated read-only tools: it can't
-          // mutate the workspace, so it auto-allows even in ask/acceptEdits
-          // and is exempt from the plan-mode force-intercept below. Mutating
-          // Bash (rm, git push, an Edit-equivalent shell write…) classifies
-          // false and still draws a card.
-          const ti = payload.tool_input as { command?: unknown } | null | undefined;
-          const bashCommand = ti && typeof ti.command === "string" ? ti.command : "";
-          const readOnlyBash = toolName === "Bash" && bashCommand !== "" &&
-            isReadOnlyBashCommand(bashCommand);
-          const currentMode = getCurrentPermissionMode(taskId);
-          const planModeForce = currentMode === "plan" &&
-            PLAN_MODE_INTERCEPT.has(toolName) && !readOnlyBash;
-          // Auto / bypass fast-path: claude's own classifier has already
-          // decided this tool is safe to run (auto = "let claude decide",
-          // bypassPermissions = "don't ask me anything"). Second-guessing
-          // it here only annoys the user — they explicitly opted into the
-          // hands-off posture. ALWAYS_INTERCEPT still applies (the modal-
-          // deadlock prevention isn't negotiable). This branch matters
-          // primarily for the mid-session mode-change path: a task spawned
-          // in `ask` mode installed the FULL hook matcher, and a later
-          // PATCH to `auto` doesn't re-narrow the matcher — so every tool
-          // call still lands here. Without this fast-path the user gets
-          // approval cards for routine Bash even after switching to auto.
-          if (!ALWAYS_INTERCEPT.has(toolName) &&
-              (currentMode === "auto" || currentMode === "bypassPermissions")) {
-            return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
-          }
-          // acceptEdits fast-path: edit tools auto-allow (matches claude's
-          // own acceptEdits semantics — file edits flow without prompts,
-          // everything else still asks). Without this, a task in acceptEdits
-          // mode (either set via PATCH or via "Approve & implement" on a
-          // plan-mode card) still draws an approval card for every Edit,
-          // contradicting the badge. Bash and other non-edit tools fall
-          // through to the standard interactive flow.
-          if (!ALWAYS_INTERCEPT.has(toolName) &&
-              currentMode === "acceptEdits" &&
-              ACCEPT_EDITS_TOOLS.has(toolName)) {
-            return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
-          }
-          // Fast paths: safe tools and previously-saved rules auto-allow,
-          // except for the always-intercept set above. Order matters —
-          // the cheap, plan-gated safe/readOnlyBash check runs first so
-          // the common case (every grep/find/ls) skips the disk read in
-          // lookupAllowRule. The saved-rule path runs second and bypasses
-          // planModeForce: "Allow always" is the user's explicit trust
-          // signal and holds across mode changes. To revoke a rule,
-          // delete it from the Rules manager.
-          if (!ALWAYS_INTERCEPT.has(toolName) && !planModeForce &&
-              (SAFE_TOOLS.has(toolName) || readOnlyBash)) {
-            return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
-          }
-          if (!ALWAYS_INTERCEPT.has(toolName) &&
-              lookupAllowRule({ taskId, toolName, toolInput: payload.tool_input }) === "allow") {
-            return json(makeHookResponse({ decision: "allow" }), { headers: corsHeaders(req) });
-          }
-          // ─── Claude built-in interactive tools ─────────────────────────
-          // AskUserQuestion / ExitPlanMode are tools whose body is "block
-          // until the human answers in the TUI". Agetor can't see that
-          // modal (claude runs detached in tmux), so we intercept here,
-          // route to a structured InteractionCard, and return the user's
-          // answer back to claude as the hook's `permissionDecisionReason`
-          // (decision: deny). Claude reads the reason as if it were the
-          // modal's output and continues.
-          if (toolName === "AskUserQuestion") {
-            const questions = parseAskQuestionsInput(payload.tool_input);
-            if (questions.length === 0) {
-              // Malformed input — let claude's own TUI handle it (fail open).
-              return json(makeHookResponse({ decision: "ask" }), { headers: corsHeaders(req) });
-            }
-            const { req: registered, answer } = registerAskQuestions({ taskId, runId, questions });
-            const ans = await answer;
-            return json(
-              makeHookResponse({ decision: "deny", reason: formatAskQuestionsReason(registered, ans) }),
-              { headers: corsHeaders(req) },
-            );
-          }
-          if (toolName === "ExitPlanMode") {
-            const plan = parseExitPlanInput(payload.tool_input);
-            const { answer } = registerPlanApproval({ taskId, runId, plan });
-            const ans = await answer;
-            // Approve choices also flip the live claude session's permission
-            // mode (and persist `task.mode`) so the PreToolUse hook's
-            // auto/bypass fast-path kicks in for subsequent tools and the
-            // kanban badge reflects reality. Without this, claude stays in
-            // `plan` mode and every Bash/Edit still draws a card even after
-            // "Approve & auto". Reuses the same reconciliation helper that
-            // PATCH /tasks/:id uses for mode edits.
-            const targetMode = planApprovalTargetMode(ans);
-            if (targetMode) {
-              const before = tasks.get(taskId);
-              if (before && before.mode !== targetMode) {
-                const updated = tasks.update(taskId, { mode: targetMode });
-                if (updated) {
-                  // Block the hook response on cycle-and-verify (unlike PATCH
-                  // /tasks/:id, which is fire-and-forget). The deny+reason we
-                  // return here unblocks claude to issue its next tool call
-                  // immediately, but `getCurrentPermissionMode` only flips
-                  // once the JSONL `permission-mode` event arrives — so a
-                  // fire-and-forget here lets claude's next Bash hit the
-                  // PreToolUse hook with `currentMode` still "plan" and draw
-                  // an approval card the user just opted out of. Cycle
-                  // verification takes ~100–400ms in the happy path, up to
-                  // 4.5s on retry — an acceptable wait on a button-click
-                  // boundary the user is already engaged with.
-                  await reconcileTaskSession(taskId, before, updated).catch((err: unknown) => {
-                    console.error("reconcileTaskSession (plan approval) failed:", err);
-                  });
-                }
-              }
-            }
-            return json(
-              makeHookResponse({ decision: "deny", reason: formatPlanApprovalReason(ans) }),
-              { headers: corsHeaders(req) },
-            );
-          }
-          // Otherwise register and hold until the UI answers.
-          const { answer } = registerApproval({
-            taskId,
-            runId,
-            toolName,
-            toolInput: payload.tool_input,
-          });
-          const decision = await answer;
-          return json(makeHookResponse(decision), { headers: corsHeaders(req) });
-        }),
-      },
-
-      "/approvals/:id/answer": {
-        POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as Partial<ApprovalAnswer>;
-          // The UI only ever issues allow / deny — `ask` is reserved for
-          // the server's internal fail-open path on malformed requests.
-          if (body.decision !== "allow" && body.decision !== "deny") {
-            return json(
-              { error: "decision must be 'allow' or 'deny'" },
-              { status: 400, headers: corsHeaders(req) },
-            );
-          }
-          const ok = answerApproval(req.params.id, {
-            decision: body.decision,
-            reason: body.reason,
-            remember: Boolean(body.remember),
-            // Optional pattern-keyed entry from the UI's granularity chooser.
-            // Server-side derive picks the most-specific scope if absent.
-            entry: typeof body.entry === "string" ? body.entry : undefined,
-          });
-          return json({ ok }, { headers: corsHeaders(req) });
-        }),
-      },
-
       // ─── Interactions: clarifying questions (from the ask_user MCP tool) ──
       "/questions": {
         POST: authed(async (req) => {
@@ -1498,7 +1251,12 @@ export function startApiServer() {
         }),
       },
 
-      // ─── Interactions: claude built-in AskUserQuestion (intercepted) ──
+      // ─── Interactions: claude built-in AskUserQuestion (scraper-sourced) ──
+      // The native modal is live on the tmux pane; there's no promise. Plan
+      // the keystrokes from the user's picks and drive them into the modal
+      // (planAskAnswers + sendModalKeys), or, for a custom/free-text answer,
+      // Esc the modal and post the answer as a normal follow-up turn. Then
+      // drop the card.
       "/ask-questions/:id/answer": {
         POST: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer>;
@@ -1511,24 +1269,39 @@ export function startApiServer() {
           if (sanitised.length === 0) {
             return json({ error: "answers required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const ok = answerAskQuestions(req.params.id, { answers: sanitised });
-          return json({ ok }, { headers: corsHeaders(req) });
-        }),
-      },
-
-      // ─── Interactions: claude built-in ExitPlanMode (intercepted) ─────
-      "/plan-approvals/:id/answer": {
-        POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as Partial<PlanApprovalAnswer>;
-          if (body.choice !== "approve_implement" && body.choice !== "approve_ask" && body.choice !== "reject") {
-            return json(
-              { error: "choice must be 'approve_implement', 'approve_ask', or 'reject'" },
-              { status: 400, headers: corsHeaders(req) },
-            );
+          const pending = getAskQuestionsById(req.params.id);
+          if (pending && pending.source === "scraper") {
+            const specs = pending.questions.map((q) => ({
+              question: q.question,
+              multiSelect: !!q.multiSelect,
+              options: q.options.map((o) => o.label),
+            }));
+            const plan = planAskAnswers(specs, sanitised);
+            let ok = false;
+            if (plan.mode === "drive") {
+              ok = await sendModalKeys(pending.taskId, plan.keys);
+            } else {
+              // Custom/free-text (or anything we can't drive): dismiss the
+              // native modal, then deliver the answer as a follow-up turn —
+              // mirrors claude's own "Type something." → REPL behaviour.
+              await sendModalKeys(pending.taskId, ["Escape"]);
+              // Give claude a beat to tear the modal down and return to the
+              // REPL prompt before the paste lands, so it isn't eaten by the
+              // dismissing modal.
+              await Bun.sleep(150);
+              ok = sendInput(pending.runId, plan.text).delivered;
+            }
+            // Drop the card. `resolveAskCard` also clears the session's
+            // `askCardId` tracker, so if a drive FAILED and the modal is still
+            // on the pane the scraper re-collects a fresh card on its next tick
+            // (without clearing it, the `!askCardId` gate would block
+            // re-registration and strand the modal with no card).
+            resolveAskCard(req.params.id, pending.taskId);
+            return json({ ok }, { headers: corsHeaders(req) });
           }
-          const revision = typeof body.revision === "string" ? body.revision : undefined;
-          const ok = answerPlanApproval(req.params.id, { choice: body.choice, revision });
-          return json({ ok }, { headers: corsHeaders(req) });
+          // No scraper-sourced card matched this id (and there are no
+          // hook-sourced ask cards any more) — nothing to drive.
+          return json({ ok: false }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -1540,17 +1313,34 @@ export function startApiServer() {
       // it as the user's keypress and dismisses the modal.
       "/tmux-prompts/:id/answer": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { key?: unknown };
-          const key = typeof body.key === "string" ? body.key : "";
-          if (!key) {
-            return json({ error: "key required" }, { status: 400, headers: corsHeaders(req) });
-          }
+          const body = (await req.json().catch(() => ({}))) as { key?: unknown; reject?: unknown };
           const pending = findTmuxPromptById(req.params.id);
           if (!pending) {
             // Either the prompt was auto-cancelled (scraper saw the pane
             // change) or the id is unknown. Either way return ok:false so
             // the UI can drop the card on its next poll.
             return json({ ok: false }, { headers: corsHeaders(req) });
+          }
+          // Reject: the user wants none of the options. Esc the modal and drop
+          // the card. Once no card is pending the message box re-enables, so
+          // the user sends their redirect as a normal, separate turn — no
+          // in-flight Esc-then-send interrupt (which is what corrupts the run
+          // accounting). The modal having been Esc'd, the message reaches claude.
+          if (body.reject === true) {
+            if (!sessionExists(pending.taskId)) {
+              return json(
+                { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
+                { status: 410, headers: corsHeaders(req) },
+              );
+            }
+            await sendModalKeys(pending.taskId, ["Escape"]);
+            markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
+            const ok = answerTmuxPrompt(req.params.id, { key: "__external__" });
+            return json({ ok }, { headers: corsHeaders(req) });
+          }
+          const key = typeof body.key === "string" ? body.key : "";
+          if (!key) {
+            return json({ error: "key required" }, { status: 400, headers: corsHeaders(req) });
           }
           // Reject anything not in the recorded choice set — the request
           // ships the exact keys we want the user to be able to send, and

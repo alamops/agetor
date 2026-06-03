@@ -52,17 +52,6 @@ export interface AgentModelMap {
   "codex": { id: string; label?: string }[];
 }
 
-/** Pending tool-call approval (from claude's PreToolUse hook). */
-export interface PendingApproval {
-  kind: "approval";
-  id: string;
-  taskId: string;
-  runId: string;
-  toolName: string;
-  toolInput: unknown;
-  createdAt: number;
-}
-
 /** Pending clarifying question (from the ask_user MCP tool). */
 export interface PendingQuestion {
   kind: "question";
@@ -76,7 +65,7 @@ export interface PendingQuestion {
 }
 
 /** Pending multi-question card from claude's built-in AskUserQuestion tool
- *  (intercepted via PreToolUse hook). */
+ *  (scraper-sourced). */
 export interface PendingAskQuestions {
   kind: "ask_questions";
   id: string;
@@ -88,17 +77,6 @@ export interface PendingAskQuestions {
     multiSelect?: boolean;
     options: Array<{ label: string; description?: string }>;
   }>;
-  createdAt: number;
-}
-
-/** Pending plan-approval card from claude's built-in ExitPlanMode tool
- *  (intercepted via PreToolUse hook). */
-export interface PendingPlanApproval {
-  kind: "plan_approval";
-  id: string;
-  taskId: string;
-  runId: string;
-  plan: string;
   createdAt: number;
 }
 
@@ -118,10 +96,8 @@ export interface PendingTmuxPrompt {
 }
 
 export type PendingInteraction =
-  | PendingApproval
   | PendingQuestion
   | PendingAskQuestions
-  | PendingPlanApproval
   | PendingTmuxPrompt;
 
 // Read api port + token, preferring globals injected by the Bun side via
@@ -398,47 +374,23 @@ export const api = {
     return body as { path: string; basename: string };
   },
 
-  /** Interactions: tool-call approvals and clarifying questions. */
-  answerApproval: (
-    id: string,
-    body: {
-      decision: "allow" | "deny";
-      reason?: string;
-      remember?: boolean;
-      /** Optional permissions.allow entry from the UI's granularity chooser.
-       *  Server falls back to the tool's most-specific scope if absent. */
-      entry?: string;
-    },
-  ) =>
-    j<{ ok: boolean }>(`/approvals/${id}/answer`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
+  /** Interactions: clarifying questions (from the ask_user MCP tool). */
   answerQuestion: (id: string, body: { selected: string[]; custom?: string }) =>
     j<{ ok: boolean }>(`/questions/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  /** Answer claude's AskUserQuestion (intercepted via PreToolUse hook). One
-   *  entry per question in the original tool input, in the same order. */
+  /** Answer claude's AskUserQuestion (scraper-sourced). One entry per
+   *  question in the original tool input, in the same order. */
   answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; custom?: string }> }) =>
     j<{ ok: boolean }>(`/ask-questions/${id}/answer`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-  /** Answer claude's ExitPlanMode (intercepted via PreToolUse hook). */
-  answerPlanApproval: (
-    id: string,
-    body: { choice: "approve_auto" | "approve_implement" | "approve_ask" | "reject"; revision?: string },
-  ) =>
-    j<{ ok: boolean }>(`/plan-approvals/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
   /** Answer a tmux-pane-scraped REPL prompt. `key` must be one of the
    *  keys advertised on the request — the server validates against the
    *  recorded set before injecting keystrokes via `tmux send-keys`. */
-  answerTmuxPrompt: (id: string, body: { key: string }) =>
+  answerTmuxPrompt: (id: string, body: { key: string } | { reject: true }) =>
     j<{ ok: boolean }>(`/tmux-prompts/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),

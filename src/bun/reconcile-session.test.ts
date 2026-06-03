@@ -171,10 +171,9 @@ test("reconcileTaskSession refreshes the hook matcher to narrow on ask → auto"
   const after: Task = { ...before, mode: "auto" };
   reconcileTaskSession("task-matcher-narrow", before, after);
 
-  // Auto mode → narrow matcher (only AskUserQuestion + ExitPlanMode hit
-  // the hook). Without the reinstall the file would still hold the
-  // baseline `{}` we wrote above (no matcher at all) or the FULL `.*`.
-  expect(readMatcher(cwd)).toBe("^(AskUserQuestion|ExitPlanMode)$");
+  // Agetor no longer installs a PreToolUse hook, so reconcile (which re-runs
+  // the installer on a mode change) must leave NO agetor matcher behind.
+  expect(readMatcher(cwd)).toBeUndefined();
   __forTest.uninstallSession("task-matcher-narrow");
 });
 
@@ -209,7 +208,8 @@ test("reconcileTaskSession refreshes the hook matcher to full on auto → ask", 
   const after: Task = { ...before, mode: "ask" };
   reconcileTaskSession("task-matcher-full", before, after);
 
-  expect(readMatcher(cwd)).toBe(".*");
+  // No agetor PreToolUse hook is installed any more (see the narrow case).
+  expect(readMatcher(cwd)).toBeUndefined();
   __forTest.uninstallSession("task-matcher-full");
 });
 

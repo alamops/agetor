@@ -13,7 +13,6 @@ import { isValidPermissionEntry } from "../shared/claude-permissions.ts";
 // not survive the bundle, leaving claude's MCP launcher pointing at a path
 // that doesn't exist — and claude blocks on the initialize handshake long
 // enough that our JSONL discovery times out before the first event lands.
-import hookSource from "./hooks/agetor-approval-hook.sh" with { type: "text" };
 import systemPromptText from "./hooks/agetor-system-prompt.md" with { type: "text" };
 // TypeScript resolves the relative `.ts` path as a real module and ignores
 // the text attribute, so it complains about the missing default export.
@@ -23,11 +22,11 @@ import systemPromptText from "./hooks/agetor-system-prompt.md" with { type: "tex
 import mcpServerSource from "./mcp/agetor-mcp.ts" with { type: "text" };
 
 /**
- * Installs the PreToolUse hook script, the MCP-server launcher, and the
- * per-task `.claude/settings.local.json` that wires them into claude's
- * interactive session.
+ * Installs the MCP-server launcher and the per-task
+ * `.claude/settings.local.json` that wires it into claude's interactive
+ * session. (agetor no longer installs a PreToolUse hook — see
+ * applyAgetorSettings; it only strips stale ones a previous build wrote.)
  *
- *   $AGETOR_DATA_DIR/bin/agetor-approval-hook.sh   # the bash hook
  *   $AGETOR_DATA_DIR/bin/agetor-mcp.sh             # launcher → bun runs the ts
  *   $AGETOR_DATA_DIR/bin/agetor-system-prompt.md   # --append-system-prompt body
  *
@@ -78,19 +77,15 @@ export function prewarmSharedFiles(): void {
   materialiseSharedFiles();
 }
 
-/** Write the static, task-agnostic files (hook script + system-prompt
- *  addendum + MCP launcher). Idempotent — runs at most once per agetor
+/** Write the static, task-agnostic files (system-prompt addendum + MCP
+ *  launcher). Idempotent — runs at most once per agetor
  *  process. The MCP launcher is *.sh that exec's `bun` at the path resolved
  *  at install time. */
-function materialiseSharedFiles(): { hookScript: string; mcpLauncher: string; systemPromptFile: string } {
-  const hookScript = binPath("agetor-approval-hook.sh");
+function materialiseSharedFiles(): { mcpLauncher: string; systemPromptFile: string } {
   const mcpLauncher = binPath("agetor-mcp.sh");
   const systemPromptFile = binPath("agetor-system-prompt.md");
 
   if (!materialised) {
-    writeFileSync(hookScript, hookSource);
-    chmodSync(hookScript, 0o755);
-
     // Resolve `bun` to an absolute path AT INSTALL TIME so the launcher we
     // write doesn't depend on claude's PATH (Electrobun-launched processes
     // sometimes get a sanitised PATH that's missing Homebrew, etc.).
@@ -154,7 +149,7 @@ function materialiseSharedFiles(): { hookScript: string; mcpLauncher: string; sy
     materialised = true;
   }
 
-  return { hookScript, mcpLauncher, systemPromptFile };
+  return { mcpLauncher, systemPromptFile };
 }
 
 /**
@@ -164,7 +159,6 @@ function materialiseSharedFiles(): { hookScript: string; mcpLauncher: string; sy
  * worktree we own (caller is responsible for the gate).
  */
 export interface InstalledPaths {
-  hookScript: string;
   mcpLauncher: string;
   systemPromptFile: string;
 }
@@ -395,19 +389,26 @@ function applyAgetorSettings(
     }
   }
 
-  // Hooks: strip stale agetor entries, then append our fresh one with the
-  // matcher this scope requires (narrow for auto/bypass, full otherwise).
+  // Hooks: agetor no longer installs a PreToolUse hook at all. The two modal-
+  // deadlock tools (AskUserQuestion / ExitPlanMode) run natively now, and
+  // tool-call approvals fall to claude's own permission modals — both surfaced
+  // through the tmux pane scraper. We still STRIP any stale agetor hook entry
+  // a previous build wrote, so upgrading installs clean up the old
+  // interception on the next spawn (and never POST to the removed /approvals
+  // endpoint). If that leaves PreToolUse empty, drop the key so we don't leave
+  // an empty array behind in the user's settings file.
   const hooks = (settings.hooks && typeof settings.hooks === "object" && !Array.isArray(settings.hooks))
     ? settings.hooks as Record<string, unknown>
     : {};
   const preToolUseRaw = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse as unknown[] : [];
   const preToolUse = preToolUseRaw.filter((e) => !isAgetorHookEntry(e));
-  preToolUse.push({
-    matcher: matcherForScope(scope),
-    hooks: [{ type: "command", command: paths.hookScript }],
-  });
-  hooks.PreToolUse = preToolUse;
-  settings.hooks = hooks;
+  if (preToolUse.length > 0) {
+    hooks.PreToolUse = preToolUse;
+  } else {
+    delete hooks.PreToolUse;
+  }
+  if (Object.keys(hooks).length > 0) settings.hooks = hooks;
+  else delete settings.hooks;
 
   // MCP server: overwrite our own previous registration; never clobber a
   // user-named `agetor` MCP server (one whose `command` doesn't end with
