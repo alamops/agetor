@@ -1,7 +1,14 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   darkMode: "class",
-  content: ["./src/mainview/**/*.{html,js,ts,jsx,tsx}"],
+  // `src/shared/**/*.ts` is included so Tailwind's JIT picks up class-name
+  // literals defined in shared metadata (e.g. TASK_TYPES' `iconClass` /
+  // `borderClass`). Without it the JIT scan misses them and the colors
+  // get purged from the bundle.
+  content: [
+    "./src/mainview/**/*.{html,js,ts,jsx,tsx}",
+    "./src/shared/**/*.ts",
+  ],
   theme: {
     extend: {
       colors: {

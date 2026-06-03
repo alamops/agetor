@@ -1,12 +1,19 @@
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bug, CheckCircle2, FlaskConical, FolderOpen, GitBranch, GitCompare, Inbox, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
-import type { Task } from "../../../shared/types.ts";
+import { taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
+
+// Resolve TaskTypeMeta.icon strings to actual lucide components.
+const TASK_TYPE_ICONS = {
+  Inbox,
+  Bug,
+  FlaskConical,
+} as const;
 
 interface Props {
   task: Task;
@@ -59,12 +66,16 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, o
     : pendingCount === 1 ? "Answer"
     : "Review";
 
+  const type = taskTypeMeta(task.taskType);
+  const TypeIcon = TASK_TYPE_ICONS[type.icon];
+
   return (
     <Card
       ref={setNodeRef}
       style={style}
       className={cn(
-        "cursor-grab select-none border-border/60 hover:border-border transition-colors",
+        "cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
+        type.borderClass,
         isDragging && "opacity-50",
         awaiting && "ring-2 ring-amber-500/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
         archived && "cursor-default opacity-60",
@@ -75,7 +86,13 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, o
     >
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
-          <CardTitle className="text-sm min-w-0 flex-1 break-words">{task.title}</CardTitle>
+          <div className="flex min-w-0 flex-1 items-start gap-1.5">
+            <TypeIcon
+              className={cn("mt-0.5 size-3.5 shrink-0", type.iconClass)}
+              aria-label={type.label}
+            />
+            <CardTitle className="text-sm min-w-0 flex-1 break-words">{task.title}</CardTitle>
+          </div>
           <div className="flex shrink-0 flex-col items-end gap-1">
             <Badge variant="secondary" className="gap-1">
               <AgentIcon kind={task.agent} className="size-3" />

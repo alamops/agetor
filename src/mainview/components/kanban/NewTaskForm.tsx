@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ClipboardList, Code2, GitBranch } from "lucide-react";
+import { Bug, ClipboardList, Code2, FlaskConical, GitBranch, Inbox } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,6 +11,8 @@ import {
   CODE_PLAN_MODE,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  DEFAULT_TASK_TYPE,
+  TASK_TYPES,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -18,6 +20,7 @@ import {
   type Harness,
   type Isolation,
   type TaskReference,
+  type TaskType,
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
 import { BranchPicker } from "./BranchPicker";
@@ -33,6 +36,14 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
 
 const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
 
+// Map the `TaskTypeMeta.icon` string ids to actual lucide components.
+// Defined module-scope so the lookup doesn't re-allocate per render.
+const TASK_TYPE_ICONS = {
+  Inbox,
+  Bug,
+  FlaskConical,
+} as const;
+
 interface Props {
   onSubmit: (
     input: {
@@ -47,6 +58,7 @@ interface Props {
       model: string | null;
       effort: string | null;
       references: TaskReference[];
+      taskType: TaskType;
     },
     options: { start: boolean },
   ) => void;
@@ -62,6 +74,7 @@ interface Props {
 export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props) {
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [taskType, setTaskType] = useState<TaskType>(DEFAULT_TASK_TYPE);
   // Soft-deleted harnesses are excluded from the picker and the default-
   // fallback logic. The full `harnesses` list is still used for
   // `selectedHarness` lookup so the resolved kind stays correct even for a
@@ -293,6 +306,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
         model,
         effort,
         references,
+        taskType,
       },
       { start },
     );
@@ -396,6 +410,29 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
       </div>
 
       <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3 text-xs">
+        <div className="space-y-1">
+          <label className="text-muted-foreground">Type</label>
+          <div className="grid grid-cols-3 gap-1">
+            {TASK_TYPES.map((t) => {
+              const Icon = TASK_TYPE_ICONS[t.icon];
+              const selected = taskType === t.id;
+              return (
+                <Button
+                  key={t.id}
+                  size="sm"
+                  variant={selected ? "default" : "outline"}
+                  onClick={() => setTaskType(t.id)}
+                  title={t.hint}
+                  className="justify-start"
+                >
+                  <Icon className={cn("mr-1 size-3.5", !selected && t.iconClass)} />
+                  <span className="truncate">{t.label}</span>
+                </Button>
+              );
+            })}
+          </div>
+        </div>
+
         <div className="space-y-1">
           <label className="text-muted-foreground">Title</label>
           <Input

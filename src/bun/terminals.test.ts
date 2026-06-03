@@ -33,6 +33,7 @@ function makeTask(workdir: string, extra: Partial<Task> = {}): Task {
     agent: "codex",
     workdir,
     isolation: "none", // no git repo needed; cwd resolves to workdir
+    taskType: "task",
     branch: null,
     worktreePath: null,
     baseRef: null,

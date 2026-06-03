@@ -47,6 +47,7 @@ function makeTaskRow(taskId: string, agent: Task["agent"] = "claude-code"): Task
     agent,
     workdir: "/tmp",
     isolation: "none",
+    taskType: "task",
     branch: null,
     worktreePath: null,
     baseRef: null,

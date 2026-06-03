@@ -74,7 +74,7 @@ import {
   type PlanApprovalAnswer,
   type QuestionAnswer,
 } from "./interactions.ts";
-import { MODEL_EFFORT_SUPPORT } from "../shared/types.ts";
+import { MODEL_EFFORT_SUPPORT, TASK_TYPES } from "../shared/types.ts";
 import { isReadOnlyBashCommand } from "../shared/claude-permissions.ts";
 import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
@@ -169,7 +169,7 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
 
 /** Fields callers may patch on a task. Everything else is server-managed. */
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
-  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort",
+  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "taskType",
 ]);
 
 function filterPatch(raw: unknown): Partial<Task> {
@@ -813,6 +813,15 @@ export function startApiServer() {
                 { status: 400, headers: corsHeaders(req) },
               );
             }
+          }
+          if (
+            "taskType" in patch
+            && !TASK_TYPES.some((t) => t.id === patch.taskType)
+          ) {
+            return json(
+              { error: `unknown taskType: ${patch.taskType}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
           }
           if ("effort" in patch && patch.effort === null) {
             const resolvedAgent = typeof patch.agent === "string" ? patch.agent : before.agent;

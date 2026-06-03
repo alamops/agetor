@@ -14,6 +14,7 @@ import type {
   Task,
   TaskDiff,
   TaskReference,
+  TaskType,
   TerminalTab,
   UpdateStatus,
 } from "../../shared/types.ts";
@@ -292,6 +293,7 @@ export const api = {
     /** Initial column. Defaults to "backlog" if omitted. */
     column?: ColumnId;
     references?: TaskReference[];
+    taskType?: TaskType;
   }) => j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }),
   updateTask: (id: string, patch: Partial<Task>) =>
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),

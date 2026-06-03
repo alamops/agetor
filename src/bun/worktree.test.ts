@@ -34,6 +34,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     column: "ready",
     agent: "claude-code",
     isolation: "worktree",
+    taskType: "task",
     branch: null,
     worktreePath: null,
     baseRef: null,
