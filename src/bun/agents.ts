@@ -149,7 +149,7 @@ export function harnessEnv(harness: Harness): Record<string, string> {
  * by letters, digits, or underscores. Used to gate what the harness `env`
  * map may contain, both at write time (the harness POST/PATCH routes) and at
  * shell-emit time (`buildHarnessTerminalCommand` below). Anything outside
- * this set can't be a real `export NAME=…` target and — left unquoted — would
+ * this set can't be a real `NAME=…` assignment and — left unquoted — would
  * let a crafted key (`X; rm -rf ~`) break out of the generated command.
  */
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -159,48 +159,55 @@ export function isValidEnvKey(key: string): boolean {
 }
 
 /**
- * Build the interactive-shell command that loads a harness's env into a new
- * Terminal window. Pure and deterministic — no spawning — so the escaping is
- * unit-testable in isolation (see agents.test.ts). The caller wraps the
- * result with `toTerminalAppleScript` and hands it to `osascript`.
+ * Build the command that launches a harness's agent in a new Terminal window.
+ * The agent is started directly with its config applied as an inline env-var
+ * prefix, so the user lands straight in the REPL (e.g. to run `/login`)
+ * instead of a bare shell:
+ *
+ *   - default Claude Code      → `claude`
+ *   - a config-dir alias       → `CLAUDE_CONFIG_DIR=… claude`
+ *   - a codex alias            → `HOME=… CODEX_HOME=… codex`
+ *
+ * Pure and deterministic — no spawning — so the escaping is unit-testable in
+ * isolation (see agents.test.ts). The caller wraps the result with
+ * `toTerminalAppleScript` and hands it to `osascript`.
  *
  * Every interpolated value is POSIX single-quoted (`sq`), which neutralizes
  * `$`, backtick, spaces, and backslashes; the lone special case is `'`
  * itself, closed-escaped-reopened. Env *keys* are filtered through
- * `ENV_KEY_RE` rather than quoted — a non-identifier key can't be a valid
- * `export` target anyway, and skipping it closes the injection vector even
- * for legacy DB rows written before the route-level validation existed.
+ * `isValidEnvKey` rather than quoted — a non-identifier key can't be a valid
+ * assignment anyway, and skipping it closes the injection vector even for
+ * legacy DB rows written before the route-level validation existed.
  */
-export function buildHarnessTerminalCommand(harness: Harness, cwd: string): string {
+export function buildHarnessTerminalCommand(harness: Harness): string {
   const bin = resolveBin(harness);
+  const launch = path.basename(bin);
   const env = harnessEnv(harness);
   const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-  const launch = path.basename(bin);
 
-  const cmds: string[] = ["clear"];
-  for (const [k, v] of Object.entries(env)) {
-    if (!ENV_KEY_RE.test(k)) continue;
-    cmds.push(`export ${k}=${sq(v)}`);
+  // Inline `VAR=val … cmd` prefix: the agent launches with its config applied,
+  // but the user's shell isn't permanently re-homed.
+  const prefix: string[] = [];
+  // Only an explicit `bin` override needs a PATH tweak so the bare agent name
+  // resolves to it. The default and config-dir-only aliases already find the
+  // agent on the inherited PATH, which keeps the command as clean as `claude`
+  // / `CLAUDE_CONFIG_DIR=… claude` rather than dragging in an absolute path.
+  if (harness.bin && path.isAbsolute(harness.bin)) {
+    prefix.push(`PATH=${sq(path.dirname(harness.bin))}:$PATH`);
   }
-  // Put the harness binary's directory first on PATH so a bare `claude` /
-  // `codex` in this shell resolves to exactly the binary agetor would spawn
-  // (matters for `bin` overrides / aliases). Skipped when `bin` is a bare
-  // name we couldn't resolve to an absolute path — there's no dir to add.
-  if (path.isAbsolute(bin)) cmds.push(`export PATH=${sq(path.dirname(bin))}:$PATH`);
-  cmds.push(`cd ${sq(cwd)}`);
-  cmds.push(
-    `printf '%s\\n' ${sq(`▸ Agetor harness "${harness.label}" (${harness.id}) — env loaded.`)} ` +
-      `${sq(`  Run "${launch}" to start it, or "${launch} /login" to authenticate this account.`)}`,
-  );
-  return cmds.join("; ");
+  for (const [k, v] of Object.entries(env)) {
+    if (!isValidEnvKey(k)) continue;
+    prefix.push(`${k}=${sq(v)}`);
+  }
+  return [...prefix, launch].join(" ");
 }
 
 /**
  * Wrap a shell command in the AppleScript that opens it in a new Terminal.app
- * window and brings Terminal to the front. `do script` feeds the string to a
- * fresh interactive login shell and leaves the window at a prompt afterward,
- * so exported vars persist for the user's session. Backslash and double-quote
- * are escaped for the AppleScript double-quoted string literal.
+ * window and brings Terminal to the front. `do script` runs the command in a
+ * fresh interactive shell (so the agent's REPL is fully interactive) and
+ * leaves the window open when it exits. Backslash and double-quote are
+ * escaped for the AppleScript double-quoted string literal.
  */
 export function toTerminalAppleScript(shellCmd: string): string {
   const asEscape = (s: string) => s.replace(/(["\\])/g, "\\$1");
