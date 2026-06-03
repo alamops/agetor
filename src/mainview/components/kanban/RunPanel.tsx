@@ -886,20 +886,10 @@ function RunPanelBody({
               startingFolder={task.worktreePath ?? task.workdir}
             />
           )}
-          {canSend && latestRun?.status === "succeeded" && hasChanges && !sending && (
-            <div>
-              <Button
-                size="sm"
-                variant="secondary"
-                onClick={() => void sendCommitPush()}
-                title="Ask the agent to commit the working-tree changes and push the current branch to origin."
-              >
-                <GitCommit className="mr-1 size-3" /> Commit &amp; push
-              </Button>
-            </div>
-          )}
           {canSend && (
-            <div className="flex items-center">
+            // Picker on the left; "Commit & push" (when offered) pushed to the
+            // right so it isn't stacked directly on top of the picker.
+            <div className="flex items-center justify-between gap-2">
               <ExtensionPicker
                 extensions={sendExtensions}
                 value={input}
@@ -910,6 +900,16 @@ function RunPanelBody({
                 // in-flight send needs to disable the trigger here.
                 disabled={sending}
               />
+              {latestRun?.status === "succeeded" && hasChanges && !sending && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => void sendCommitPush()}
+                  title="Ask the agent to commit the working-tree changes and push the current branch to origin."
+                >
+                  <GitCommit className="mr-1 size-3" /> Commit &amp; push
+                </Button>
+              )}
             </div>
           )}
           <div className="flex items-stretch gap-2">
