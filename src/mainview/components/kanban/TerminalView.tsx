@@ -50,6 +50,13 @@ function TerminalPane({
       cursorBlink: true,
       theme: XTERM_THEME,
       scrollback: 5000,
+      // Treat the macOS Option key as Meta so Alt-prefixed bindings work
+      // (Opt+B/Opt+F word nav, Opt+D kill-word, Opt+. last-arg, etc.). Without
+      // this, the webview emits the OS-composed glyph (Opt+B → "∫") instead of
+      // the ESC-prefixed sequence readline/zsh expect, so those commands no-op.
+      // This is the same behavior as iTerm2/Terminal.app "Use Option as Meta".
+      // On Windows/Linux xterm already maps Alt→Meta, so this is a no-op there.
+      macOptionIsMeta: true,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
