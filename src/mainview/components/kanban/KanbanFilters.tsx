@@ -1,10 +1,12 @@
-import { Cpu, Folder, Search, Tag } from "lucide-react";
+import { Cpu, Folder, Search, Shapes, Tag } from "lucide-react";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { MultiSearchSelect } from "@/components/ui/multi-search-select";
 import { Select } from "@/components/ui/select";
-import { COLUMNS, type ColumnId, type Harness, type Project } from "../../../shared/types.ts";
+import { cn } from "@/lib/utils";
+import { taskTypeIcon } from "@/lib/task-type-icon";
+import { COLUMNS, TASK_TYPES, type ColumnId, type Harness, type Project, type TaskType } from "../../../shared/types.ts";
 
 export type ArchivedView = "active" | "all" | "archived";
 
@@ -19,6 +21,8 @@ interface Props {
   onArchivedViewChange: (v: ArchivedView) => void;
   harnessFilter: string[];
   onHarnessFilterChange: (v: string[]) => void;
+  typeFilter: TaskType[];
+  onTypeFilterChange: (v: TaskType[]) => void;
   projects: Project[];
   harnesses: Harness[];
   /** Distinct harness ids referenced by any current task. Used to surface
@@ -45,6 +49,8 @@ export function KanbanFilters({
   onArchivedViewChange,
   harnessFilter,
   onHarnessFilterChange,
+  typeFilter,
+  onTypeFilterChange,
   projects,
   harnesses,
   taskAgentIds,
@@ -74,12 +80,21 @@ export function KanbanFilters({
     .filter((id) => !known.has(id))
     .map((id) => ({ value: id, label: id, hint: "removed" }));
   const harnessItems = [...enabledItems, ...disabledItems, ...orphanItems];
+  const typeItems = TASK_TYPES.map((t) => {
+    const Icon = taskTypeIcon(t.icon);
+    return {
+      value: t.id,
+      label: t.label,
+      icon: <Icon className={cn("size-3.5", t.iconClass)} />,
+    };
+  });
   const anyActive =
     textQuery !== ""
     || repoFilter.length > 0
     || statusFilter.length > 0
     || archivedView !== "active"
-    || harnessFilter.length > 0;
+    || harnessFilter.length > 0
+    || typeFilter.length > 0;
 
   return (
     <div className="flex shrink-0 items-center gap-2 border-b border-border/60 px-4 py-2">
@@ -119,6 +134,15 @@ export function KanbanFilters({
         leadingIcon={<Tag className="size-3.5" />}
         className="w-48"
       />
+      <MultiSearchSelect
+        values={typeFilter}
+        onChange={onTypeFilterChange}
+        items={typeItems}
+        emptyLabel="All types"
+        placeholder="Search types…"
+        leadingIcon={<Shapes className="size-3.5" />}
+        className="w-44"
+      />
       <Select
         value={archivedView}
         onChange={(e) => onArchivedViewChange(e.target.value as ArchivedView)}
@@ -139,6 +163,7 @@ export function KanbanFilters({
             onStatusFilterChange([]);
             onArchivedViewChange("active");
             onHarnessFilterChange([]);
+            onTypeFilterChange([]);
           }}
         >
           Clear

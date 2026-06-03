@@ -1,19 +1,13 @@
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bug, CheckCircle2, FlaskConical, FolderOpen, GitBranch, GitCompare, Inbox, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
+import { taskTypeIcon } from "@/lib/task-type-icon";
 import { taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
-
-// Resolve TaskTypeMeta.icon strings to actual lucide components.
-const TASK_TYPE_ICONS = {
-  Inbox,
-  Bug,
-  FlaskConical,
-} as const;
 
 interface Props {
   task: Task;
@@ -67,7 +61,7 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, o
     : "Review";
 
   const type = taskTypeMeta(task.taskType);
-  const TypeIcon = TASK_TYPE_ICONS[type.icon];
+  const TypeIcon = taskTypeIcon(type.icon);
 
   return (
     <Card
