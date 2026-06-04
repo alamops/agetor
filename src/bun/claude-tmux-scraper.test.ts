@@ -138,23 +138,32 @@ test("matchStartupConsentDialog — bypass-permissions warning, accept is option
   expect(m!.acceptIndex).toBe(1); // must move off the default "No, exit"
 });
 
-test("matchStartupConsentDialog — trust-folder dialog (HYPOTHESIZED shape, not yet observed), accept is the cursor default", () => {
-  // NOTE: this asserts the matcher's contract against an *assumed* trust-prompt
-  // shape — claude's real trust dialog wording/options have not been reproduced
-  // against the live TUI (bypass mode suppresses it; auto-mode worktree launches
-  // haven't triggered it). The entry is safe-by-omission (a wrong guess no-ops),
-  // so this test guards the parser, NOT that claude actually draws this.
-  const pane = `Do you trust the files in this folder?
+test("matchStartupConsentDialog — workspace-trust dialog (real observed text), accept is the cursor default", () => {
+  // The real first-run workspace-trust prompt (claude 2.1.x). NOT suppressed by
+  // --dangerously-skip-permissions, so agetor's fresh worktrees hit it; left
+  // unanswered it blocks JSONL creation until the 30s boot timeout kills the run.
+  const pane = `────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
 
-  /Users/me/.agetor/worktrees/abc
+ /Users/me/.agetor/worktrees/00000000-0000-0000-0000-000000000000
 
-❯ 1. Yes, proceed
-  2. No, exit`;
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm · Esc to cancel`;
   const m = matchStartupConsentDialog(pane);
   expect(m).not.toBeNull();
   expect(m!.name).toBe("trust-folder");
   expect(m!.cursorIndex).toBe(0);
-  expect(m!.acceptIndex).toBe(0); // already on the affirmative → Enter alone
+  expect(m!.acceptIndex).toBe(0); // already on "Yes, I trust this folder" → Enter alone
 });
 
 test("matchStartupConsentDialog — a normal per-tool permission modal is NOT auto-confirmed", () => {
@@ -176,7 +185,7 @@ test("matchStartupConsentDialog — bypass marker without a parseable choice lis
 
 test("matchStartupConsentDialog — distinct dialogs get distinct fingerprints", () => {
   const bypass = matchStartupConsentDialog(`Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept`)!;
-  const trust = matchStartupConsentDialog(`trust the files in this folder\n❯ 1. Yes, proceed\n  2. No, exit`)!;
+  const trust = matchStartupConsentDialog(`Quick safety check\n❯ 1. Yes, I trust this folder\n  2. No, exit`)!;
   expect(bypass).not.toBeNull();
   expect(trust).not.toBeNull();
   expect(bypass.fingerprint).not.toBe(trust.fingerprint);

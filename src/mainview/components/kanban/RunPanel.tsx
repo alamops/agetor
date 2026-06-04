@@ -2769,6 +2769,28 @@ function AskQuestionsCard({
  * background) so the user recognises that they're looking at what's
  * actually on the tmux screen, not an agetor-synthesised question.
  */
+/** claude's TUI keyboard-shortcut footers — meaningless when answering through
+ *  agetor's buttons, and they bury the actual prompt. Stripped from the scraped
+ *  pane before display. Display-only; the parsed choices are unaffected. */
+const PROMPT_NOISE_RE = [
+  /^esc to cancel\b/i,
+  /^enter to (confirm|select|continue)\b/i,
+  /^↑\/↓/,
+  /^tab to amend\b/i,
+  /\bctrl\+e to explain\b/i,
+  /\(ctrl\+b ctrl\+b/i,
+  /to run in background\)/i,
+];
+function cleanPromptPane(text: string): string {
+  const out: string[] = [];
+  for (const line of text.split("\n")) {
+    if (PROMPT_NOISE_RE.some((re) => re.test(line.trim()))) continue;
+    if (out.length > 0 && out[out.length - 1] === line) continue; // repaint dup row
+    out.push(line);
+  }
+  return out.join("\n").replace(/^\n+|\n+$/g, "");
+}
+
 function TmuxPromptCard({
   req,
   onResolved,
@@ -2868,8 +2890,8 @@ function TmuxPromptCard({
           <Terminal className="size-3.5" aria-hidden /> Claude is paused on a prompt
         </span>
       </div>
-      <pre className="max-h-96 overflow-auto whitespace-pre rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-snug">
-        {req.paneText}
+      <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-snug">
+        {cleanPromptPane(req.paneText)}
       </pre>
       <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
         {req.choices.map((c) => {

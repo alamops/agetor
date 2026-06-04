@@ -1749,20 +1749,25 @@ const STARTUP_CONSENT_DIALOGS: Array<{ name: string; marker: RegExp; affirmative
   //   ❯ 1. No, exit
   //     2. Yes, I accept
   { name: "bypass-permissions", marker: /bypass permissions mode/i, affirmative: /\baccept\b/i },
-  // BEST-EFFORT / UNVERIFIED: the first-run trust prompt claude shows for a
-  // never-before-opened directory:
-  //   Do you trust the files in this folder?
-  //   ❯ 1. Yes, proceed
+  // Workspace-trust prompt: claude shows this the first time it opens a
+  // directory not already trusted in ~/.claude.json. It is NOT suppressed by
+  // `--dangerously-skip-permissions` (workspace trust is a separate layer from
+  // permissions), so agetor's fresh per-task worktrees reliably trigger it —
+  // and it blocks claude from ever writing its JSONL until answered (otherwise
+  // the run dies at the 30s boot timeout with the dialog on the pane). Observed
+  // text (claude 2.1.x):
+  //   Quick safety check: Is this a project you created or one you trust? …
+  //   ❯ 1. Yes, I trust this folder
   //     2. No, exit
-  // The exact wording/options here are assumed, not observed — `bypass` mode
-  // suppresses this prompt entirely, and auto-mode launches in agetor's
-  // worktrees have not been seen to trigger it. Kept as safe defence: the
-  // `affirmative` is deliberately the narrow `/\bproceed\b/i` (NOT `/trust/`,
-  // which a "No, don't trust" option would also match → wrong keypress). If
-  // claude's real affirmative isn't "…proceed", this entry simply no-ops and
-  // we fall back to the boot-timeout path — never a wrong action. Confirm the
-  // real TUI text before relying on it.
-  { name: "trust-folder", marker: /trust the files in this (folder|directory)/i, affirmative: /\bproceed\b/i },
+  // `affirmative` is anchored on "Yes …trust this folder", so it can only ever
+  // land on the trust option — never a "No, …trust" variant (the original
+  // safety concern). The marker also keeps the older "trust the files in this
+  // folder" wording as a fallback in case an earlier build phrased it that way.
+  {
+    name: "trust-folder",
+    marker: /Quick safety check|trust this folder|trust the files in this (folder|directory)/i,
+    affirmative: /Yes\b.*\btrust this folder\b/i,
+  },
 ];
 
 export interface StartupDialogMatch {
