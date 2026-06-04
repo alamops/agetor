@@ -11,7 +11,6 @@ import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { API_TOKEN, getApiPort } from "./api-config.ts";
 import { tasks } from "./db.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
@@ -2052,23 +2051,20 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // session (so the spawned claude inherits them); `--` separates the tmux
   // flags from the command to run.
   //
-  // We unconditionally inject our localhost API coordinates. These are
-  // vestigial now that agetor installs no hook script or MCP server (nothing
-  // in the spawned claude reads them back), but they're harmless and cheap to
-  // keep for any future child that wants to call back into the API.
-  //
   // PATH is injected explicitly because the tmux *server* captures env at
   // its first launch and reuses it for every subsequent session — passing
   // it per-session via `-e` guarantees the spawned claude sees the
   // currently-rehydrated PATH even if the server's captured copy is stale
   // (e.g. agetor restarted with a different login-shell PATH but the
   // long-running bundled tmux server is still around).
+  //
+  // We no longer inject AGETOR_API_PORT/TOKEN/TASK_ID: with the PreToolUse hook
+  // and the ask_user MCP both gone, nothing in the spawned claude reads them,
+  // and AGETOR_API_TOKEN gates every orchestration route — no reason to expose
+  // it to the agent's environment.
   const fullEnv: Record<string, string> = {
     ...opts.env,
     PATH: process.env.PATH ?? "",
-    AGETOR_API_PORT: String(getApiPort()),
-    AGETOR_API_TOKEN: API_TOKEN,
-    AGETOR_TASK_ID: opts.taskId,
   };
   const tmuxArgs: string[] = ["new-session", "-d", "-s", sessionName, "-c", opts.cwd];
   for (const [k, v] of Object.entries(fullEnv)) tmuxArgs.push("-e", `${k}=${v}`);
