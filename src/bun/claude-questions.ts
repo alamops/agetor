@@ -232,23 +232,39 @@ export function parseModalPane(tail: string): ParsedQuestionPane | null {
   const isNoise = (l: string | undefined): boolean =>
     l === undefined || l.trim() === "" || /^[─-]{3,}$/.test(l.trim())
     || /^Next$/.test(l.trim()) || /Esc to cancel/.test(l) || OPTION_RE.test(l);
-  const options = kept.map((r) => ({
-    label: r.label,
-    description: isNoise(lines[r.idx + 1]) ? undefined : lines[r.idx + 1]!.trim(),
-    checked: r.checkbox === "✔" || r.checkbox?.toLowerCase() === "x",
-  }));
+  const options = kept.map((r) => {
+    // A description may hard-wrap across several rows; gather every row between
+    // this option and the next noise boundary (next option / separator / blank
+    // / footer), not just the first.
+    const descLines: string[] = [];
+    for (let i = r.idx + 1; !isNoise(lines[i]); i++) descLines.push(lines[i]!.trim());
+    return {
+      label: r.label,
+      description: descLines.length > 0 ? descLines.join(" ") : undefined,
+      checked: r.checkbox === "✔" || r.checkbox?.toLowerCase() === "x",
+    };
+  });
 
-  // Question text: nearest non-empty line above the first option that isn't the
-  // tab bar, a `☐ <header>` line, an arrow row, or a separator.
+  // Question text: claude hard-wraps a long question across several pane rows,
+  // so gather the whole contiguous block just above the first option — skipping
+  // the blank / tab bar / `☐ <header>` / separator that frame it — and join.
+  // Taking only the nearest row (the old behaviour) dropped everything but the
+  // wrapped tail (e.g. "OpenAI). How are they used?").
   const firstOptIdx = kept[0]!.idx;
-  let questionText = "";
+  const qLines: string[] = [];
   for (let i = firstOptIdx - 1; i >= 0; i--) {
     const l = lines[i]!.trim();
-    if (l === "") continue;
-    if (/^[☐☒←→]/.test(l) || /✔\s*Submit/.test(l) || /^[─-]{3,}$/.test(l)) continue;
-    questionText = l;
-    break;
+    if (/^[☐☒←→]/.test(l) || /✔\s*Submit/.test(l) || /^[─-]{3,}$/.test(l)) {
+      if (qLines.length > 0) break; // a frame row above the gathered block → done
+      continue;                      // frame row below the question → keep scanning up
+    }
+    if (l === "") {
+      if (qLines.length > 0) break; // blank above the question → top boundary
+      continue;                      // blank between question and options → skip
+    }
+    qLines.unshift(l);               // a (possibly wrapped) question row
   }
+  const questionText = qLines.join(" ");
 
   return { tabbed: tabHeaders.length > 0, tabHeaders, questionText, multiSelect, options, cursorIndex };
 }

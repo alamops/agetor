@@ -99,6 +99,24 @@ describe("parseModalPane — reads the visible question off the pane", () => {
     expect(p.multiSelect).toBe(false);
   });
 
+  test("wrapped question + wrapped description: gathers every hard-wrapped row, not just the tail", () => {
+    const p = parseModalPane(fx("single_wrapped_question"))!;
+    // The full question spans two pane rows; the old parser kept only the tail
+    // ("OpenAI). How are they used?").
+    expect(p.questionText).toBe(
+      "There are 5+ AI providers wired up (Vision, Translate, Gemini, Mistral, Groq, OpenAI). How are they used?",
+    );
+    expect(p.options.map((o) => o.label)).toEqual([
+      "Primary + fallbacks", "Task-specialized", "Experimental",
+    ]);
+    expect(p.options[0]!.description).toBe("One main model with others as failover/cost backups.");
+    // option 2's description hard-wraps across two rows → joined into one.
+    expect(p.options[1]!.description).toBe(
+      "Each provider handles a specific job (OCR vs translate vs explain vs chat).",
+    );
+    expect(p.multiSelect).toBe(false);
+  });
+
   test("tabbed multiSelect (Toppings): tab headers, checkbox options, multiSelect=true", () => {
     const p = parseModalPane(fx("multi_initial_toppings"))!;
     expect(p.tabbed).toBe(true);
