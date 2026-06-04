@@ -11,20 +11,20 @@ import { open } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { API_TOKEN, getApiPort } from "./api-config.ts";
 import { tasks } from "./db.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
-  ASK_QUESTIONS_REPLY_PREFIX,
-  PLAN_APPROVED_REPLY_PREFIX,
-  PLAN_REJECTED_REPLY_PREFIX,
   activeTmuxPromptsForTask,
   answerTmuxPrompt,
   findTmuxPromptByFingerprint,
+  registerScrapedAskQuestions,
   registerTmuxPrompt,
+  resolveScrapedAskQuestions,
+  type AskQuestion,
   type TmuxPromptChoice,
 } from "./interactions.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
+import { detectAskModal, parseModalPane, type NavKey } from "./claude-questions.ts";
 
 /**
  * Driver that hosts Claude Code's interactive REPL inside a per-task tmux
@@ -99,18 +99,10 @@ export interface ClaudeLaunchOptions {
   configDir: string | null;
   /**
    * Agetor permission mode for this task (see AGENT_OPTIONS in
-   * shared/types.ts). Forwarded to `ensureInstalledForCwd` to pick the
-   * install scope:
-   *   - `auto` and `bypass` → narrow PreToolUse matcher that only catches
-   *     AskUserQuestion + ExitPlanMode. For `auto` this is critical: with
-   *     a narrow matcher, claude's own permission engine (including its
-   *     AI auto-mode classifier) handles every other tool call, since
-   *     PreToolUse hooks are terminal when they match. A `.*` matcher
-   *     here would short-circuit the classifier and re-introduce the
-   *     "every tool needs a card" problem.
-   *   - Other modes (`ask`, `plan`, `acceptEdits`) get the full `.*`
-   *     matcher so agetor's UI cards render for every tool call.
-   * See `installScopeForMode` in hook-installer.ts.
+   * shared/types.ts). Drives `--permission-mode` / `--dangerously-skip-
+   * permissions` on the claude launch argv. (agetor no longer installs any
+   * PreToolUse hook or MCP server, so this no longer influences settings
+   * installation — see `ensureInstalledForCwd` in hook-installer.ts.)
    */
   mode: string | null;
 }
@@ -194,30 +186,6 @@ export function encodeProjectPath(cwd: string): string {
 /** Tmux-safe session name derived from a task id. */
 export function sessionNameFor(taskId: string): string {
   return `agetor-${taskId.slice(0, 12)}`;
-}
-
-/**
- * Detect tool_result content that's actually one of agetor's own intercept
- * replies (AskUserQuestion / ExitPlanMode). Claude writes those results with
- * `is_error: true` in JSONL because the PreToolUse hook returned `decision:
- * "deny"` — but from the user's POV those are successful answers, not errors.
- *
- * Sentinel prefixes are imported from `interactions.ts` so the formatter and
- * the detector cannot drift out of sync.
- */
-export function isAgetorInterceptReply(content: unknown): boolean {
-  const text = typeof content === "string"
-    ? content
-    : Array.isArray(content)
-      ? content
-          .map((b) => (b && typeof b === "object" && (b as { type?: string }).type === "text"
-            ? (b as { text?: string }).text ?? ""
-            : ""))
-          .join("")
-      : "";
-  return text.startsWith(ASK_QUESTIONS_REPLY_PREFIX)
-    || text.startsWith(PLAN_APPROVED_REPLY_PREFIX)
-    || text.startsWith(PLAN_REJECTED_REPLY_PREFIX);
 }
 
 interface ContentBlock {
@@ -384,6 +352,41 @@ function isEndTurnContinuation(
   return false;
 }
 
+/** A user message whose tool_result is claude's interrupt/cancel marker (Esc on
+ *  a modal, Ctrl+C). `dispatchLine` force-resolves the run on these — see the
+ *  force-end at the bottom of `dispatchLine`. */
+function isInterruptUserEvent(evt: ParsedJsonlEvent): boolean {
+  return evt.type === "user"
+    && Array.isArray(evt.message?.content)
+    && isUserInterruptResult(evt.message!.content as ContentBlock[]);
+}
+
+/** claude's canonical user-interrupt / tool-rejection text, written as the
+ *  tool_result when the user cancels an in-flight tool (Esc on a modal, Ctrl+C).
+ *  Matched loosely so minor wording changes across versions still register. */
+const USER_INTERRUPT_RE =
+  /doesn't want to proceed with this tool use|Request interrupted by user|tool use was rejected/i;
+
+/** Plain text of a tool_result block's `content` — a string, or an array of
+ *  text blocks (claude uses both shapes). */
+function toolResultText(content: unknown): string {
+  return typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+          .map((x) => (x && typeof x === "object" && (x as { type?: string }).type === "text"
+            ? (x as { text?: string }).text ?? ""
+            : ""))
+          .join("")
+      : "";
+}
+
+/** True when any tool_result block in this user message is the user-interrupt
+ *  marker rather than a real tool result — see `isEndTurnContinuation`. */
+function isUserInterruptResult(content: ContentBlock[]): boolean {
+  return content.some((b) => b?.type === "tool_result" && USER_INTERRUPT_RE.test(toolResultText(b.content)));
+}
+
 /** Human-friendly millisecond formatter for `turn_duration` breadcrumbs.
  *  Mirrors how the rest of the run panel writes durations (seconds for
  *  short turns; minutes+seconds beyond a minute). Kept inline rather than
@@ -499,13 +502,17 @@ function mapParsedEventToChunks(
       } else if (Array.isArray(content)) {
         for (const block of content) {
           if (block?.type === "tool_result") {
-            // Override is_error for agetor's own intercept replies — claude
-            // marks them `is_error: true` because the hook said `deny`, but
-            // they carry the user's successful answer.
-            const isError = (block.is_error ?? false) && !isAgetorInterceptReply(block.content);
+            // A user-interrupt tool_result (you rejected a plan / Esc'd a
+            // question / Ctrl+C) is claude's internal "STOP, the user rejected
+            // this" text, which it marks `is_error: true`. From the user's POV
+            // that's not an error — they chose it — and the verbose text is
+            // noise. Show a short, neutral note instead of a red ERROR RESULT.
+            const isInterrupt = USER_INTERRUPT_RE.test(toolResultText(block.content));
+            const isError = (block.is_error ?? false)
+              && !isInterrupt;
             onChunk("tool_result", JSON.stringify({
               toolUseId: block.tool_use_id ?? "",
-              content: block.content,
+              content: isInterrupt ? "Declined — Claude is waiting for your direction." : block.content,
               isError,
             }), uuid);
           } else if (block?.type === "text" && block.text) {
@@ -822,6 +829,43 @@ export async function dismissTmuxPrompt(
   return ok;
 }
 
+/**
+ * Drive a planned keystroke sequence into the task's tmux session — used to
+ * answer claude's native AskUserQuestion / ExitPlanMode modals once the
+ * PreToolUse hook no longer intercepts them. The key list comes from
+ * `planAskAnswers` (claude-questions.ts), which encodes the observed
+ * navigate/toggle/advance/submit choreography of claude's Ink modal.
+ *
+ * Each key is its own `send-keys` with a small gap so Ink's stdin reducer
+ * doesn't coalesce two events into one cursor move (the same race
+ * `dismissTmuxPrompt` works around). The whole sequence is serialized behind
+ * any in-flight paste via `queueTmuxOp`, so a racing user message can't slip
+ * its `paste-buffer + Enter` between two of our keys and confirm garbage. The
+ * per-key `stillCurrent()` re-gate aborts cleanly if the session is disposed
+ * (Stop / delete / respawn) mid-sequence rather than leaking a trailing Enter
+ * into a fresh pane.
+ *
+ * `NavKey`s map 1:1 onto tmux key names (`Down`/`Up`/`Left`/`Right`/`Enter`/
+ * `Escape`/`Tab`). Returns true only when every send-keys exited 0.
+ */
+export async function sendModalKeys(taskId: string, keys: NavKey[]): Promise<boolean> {
+  const state = sessions.get(taskId);
+  if (!state) return false;
+  if (keys.length === 0) return true;
+  let ok = false;
+  await queueTmuxOp(taskId, async (stillCurrent) => {
+    for (const key of keys) {
+      if (!tmux(["send-keys", "-t", state.sessionName, key]).ok) return;
+      // Inter-key gap mirrors dismissTmuxPrompt: a bursted pair can read as a
+      // single Ink event, and the gap lets the dispose re-gate fire.
+      await Bun.sleep(35);
+      if (!stillCurrent()) return;
+    }
+    ok = true;
+  }, state);
+  return ok;
+}
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * Per-task session state.
  * ────────────────────────────────────────────────────────────────────────── */
@@ -930,6 +974,17 @@ interface SessionState {
    *  pending map, and we'd register a ghost duplicate before
    *  tmux/claude actually repainted. */
   recentlyAnsweredFingerprints: Map<string, number>;
+  /**
+   * The structured AskUserQuestion card registered for this session's live
+   * native modal, or null when none is up. Detection AND content come from the
+   * tmux pane: claude doesn't write the AskUserQuestion tool_use to the JSONL
+   * until the modal is *answered*, so the JSONL is useless while it's open. The
+   * card is resolved when the modal leaves the pane.
+   */
+  askCardId: string | null;
+  /** True while the tab-walk collector is mid-flight reading a multi-question
+   *  modal's tabs, so the scraper doesn't kick off a second collection. */
+  askCollecting: boolean;
   /**
    * A turn-end (`stop_reason: "end_turn"`) that has been observed but not yet
    * confirmed as real. Claude stamps `end_turn` on *every* split line of a
@@ -1043,6 +1098,8 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     scrapeLastFingerprint: null,
     lastJsonlAppendAt: 0,
     recentlyAnsweredFingerprints: new Map(),
+    askCardId: null,
+    askCollecting: false,
     pendingEndTurn: null,
   };
 }
@@ -1199,6 +1256,102 @@ function firePendingEndTurn(state: SessionState): void {
  * — only when the NEXT line is not a same-message continuation or a
  * tool_result. This prevents both the "run flips to succeeded mid-turn" bug
  * and the spurious "TURN COMPLETE" divider spam it caused. */
+/** Capture the trailing pane lines for this session (best-effort; "" on miss). */
+function captureTail(state: SessionState): string {
+  const cap = tmux(["capture-pane", "-p", "-t", state.sessionName]);
+  if (!cap.ok) return "";
+  const cl = cap.stdout.split("\n");
+  return cl.slice(Math.max(0, cl.length - SCRAPE_TAIL_LINES)).join("\n");
+}
+
+/**
+ * Read the live native AskUserQuestion modal off the tmux pane and register a
+ * structured card for it.
+ *
+ * Why the pane and not the JSONL: claude does NOT write the AskUserQuestion
+ * tool_use to the session JSONL until the modal is *answered*, so while it's
+ * open the rendered pane is the only source of the question text + options. For
+ * a single-question modal everything is on screen; for a multi-question
+ * (tabbed) modal only the active tab's options are visible, so we briefly walk
+ * the tabs (`→` per tab, capture+parse each, then `←` back to the first) and
+ * register one card with every question.
+ *
+ * Fire-and-forget from the scraper, guarded by `askCollecting` (so a 1s tick
+ * can't start a second walk) and `askCardId` (so we never double-register). The
+ * card is resolved by the scraper when the modal leaves the pane.
+ */
+async function collectAndRegisterAskCard(state: SessionState, firstTail: string): Promise<void> {
+  if (state.askCollecting || state.askCardId) return;
+  const runId = tasks.get(state.taskId)?.runId;
+  if (!runId) return;
+  const first = parseModalPane(firstTail);
+  if (!first) return;
+
+  state.askCollecting = true;
+  try {
+    const collected = [first];
+    const n = first.tabbed ? Math.max(1, first.tabHeaders.length) : 1;
+    if (n > 1) {
+      // Walk the tabs to read every question, then return to the first tab so
+      // the answer-driving sequence (planAskAnswers) starts from a known state.
+      await queueTmuxOp(state.taskId, async (stillCurrent) => {
+        for (let i = 1; i < n; i++) {
+          if (!tmux(["send-keys", "-t", state.sessionName, "Right"]).ok) return;
+          await Bun.sleep(180);
+          if (!stillCurrent()) return;
+          const p = parseModalPane(captureTail(state));
+          if (p) collected.push(p);
+        }
+        for (let i = 1; i < n; i++) {
+          if (!tmux(["send-keys", "-t", state.sessionName, "Left"]).ok) return;
+          await Bun.sleep(90);
+          if (!stillCurrent()) return;
+        }
+      }, state);
+    }
+
+    // Don't register a PARTIAL read: if any walked tab failed to parse (a
+    // capture-pane landed mid-repaint and parseModalPane returned null), the
+    // question count would be wrong and `planAskAnswers` would mis-drive the
+    // answer (submit early / wrong header alignment). Bail — `askCollecting`
+    // clears in `finally` and the next scrape tick retries cleanly.
+    if (collected.length !== n) return;
+    // The modal may have been answered out from under us mid-walk.
+    if (state.askCardId || detectAskModal(captureTail(state)) === null) return;
+
+    const questions: AskQuestion[] = collected.map((p, i) => ({
+      question: p.questionText,
+      header: first.tabHeaders[i],
+      multiSelect: p.multiSelect,
+      options: p.options.map((o) => ({ label: o.label, description: o.description })),
+    }));
+    const card = registerScrapedAskQuestions({
+      taskId: state.taskId,
+      runId,
+      questions,
+      fingerprint: `ask-${runId}`,
+    });
+    state.askCardId = card.id;
+  } finally {
+    state.askCollecting = false;
+  }
+}
+
+/**
+ * Resolve the structured AskUserQuestion card for a task and clear the session
+ * tracker. Called by the `/ask-questions` answer route after it drives (or
+ * message-delivers) the answer. Resolving the interaction is unconditional (so
+ * the UI always drops the card); clearing `state.askCardId` is what lets the
+ * scraper re-collect if the modal is somehow still on the pane (e.g. a failed
+ * drive) — without it the `!state.askCardId` gate would block re-registration
+ * and strand the modal with no card.
+ */
+export function resolveAskCard(cardId: string, taskId: string): void {
+  resolveScrapedAskQuestions(cardId);
+  const state = sessions.get(taskId);
+  if (state && state.askCardId === cardId) state.askCardId = null;
+}
+
 function dispatchLine(state: SessionState, line: string): void {
   let evt: ParsedJsonlEvent;
   try {
@@ -1271,6 +1424,25 @@ function dispatchLine(state: SessionState, line: string): void {
       emitBanner: true,
       stagedAt: Date.now(),
     };
+  }
+
+  // Interrupt force-end: a user-interrupt tool_result (Esc on a modal / Ctrl+C)
+  // definitively ends the turn — claude stops and waits. Resolve the run NOW
+  // regardless of staging. This is what unsticks "Agent is working" when a plan
+  // is rejected: the ExitPlanMode tool_use may carry stop_reason "tool_use" (so
+  // nothing was staged to fire), and even when it carried "end_turn" the
+  // interrupt would otherwise cancel that staged end_turn as a "continuation".
+  //
+  // ASSUMPTION (verified live, claude 2.1.162): claude always stops after this
+  // marker — its text is literally "STOP what you are doing and wait for the
+  // user to tell you how to proceed". If a future claude version instead kept
+  // talking, that continuation would land on the just-popped slot's `lastChunk`
+  // with the run already resolved (premature "succeeded"). Re-validate this if
+  // the rejection wording changes.
+  if (isInterruptUserEvent(evt) && (state.turnQueue.length > 0 || state.onEndOfTurn)) {
+    state.pendingEndTurn = null;
+    onChunk("status", "turn complete", uuid);
+    popEndOfTurn(state);
   }
 }
 
@@ -1695,7 +1867,11 @@ function scrapeOnce(state: SessionState): void {
   if (state.turnQueue.length === 0
       && state.lastJsonlAppendAt !== 0
       && now - state.lastJsonlAppendAt > SCRAPE_IDLE_AFTER_MS
-      && activeTmuxPromptsForTask(state.taskId).length === 0) {
+      && activeTmuxPromptsForTask(state.taskId).length === 0
+      // Keep polling while an AskUserQuestion card is live, so the
+      // resolve-on-modal-gone backstop fires if the user answers it via a real
+      // `tmux attach` (external dismissal) rather than the card.
+      && state.askCardId === null) {
     return;
   }
 
@@ -1715,7 +1891,25 @@ function scrapeOnce(state: SessionState): void {
   const claudeIsWriting = state.lastJsonlAppendAt !== 0
     && now - state.lastJsonlAppendAt < JSONL_RECENT_WRITE_MS;
 
-  const match = claudeIsWriting
+  // Native AskUserQuestion modal handling. Its options render as a numbered
+  // checkbox list (`❯ 1. [✔] Cheese …`) that matchNumberedModal would otherwise
+  // grab, producing a competing single-keystroke tmux_prompt card. So whenever
+  // the modal is on the pane we (a) suppress the numbered matcher and (b) drive
+  // the structured-card flow off the pane (collectAndRegisterAskCard). When the
+  // modal leaves the pane (answered/cancelled) we drop the card. ExitPlanMode's
+  // approval modal carries no AskUserQuestion signature, so it still flows
+  // through the numbered matcher as intended.
+  const askOnPane = detectAskModal(tail) !== null;
+  if (askOnPane) {
+    if (!claudeIsWriting && !state.askCardId && !state.askCollecting) {
+      void collectAndRegisterAskCard(state, tail);
+    }
+  } else if (state.askCardId) {
+    resolveScrapedAskQuestions(state.askCardId);
+    state.askCardId = null;
+  }
+
+  const match = (claudeIsWriting || askOnPane)
     ? null
     : (matchNumberedModal(tail) ?? matchYesNoModal(tail));
 
@@ -1843,29 +2037,19 @@ function attachTailer(state: SessionState): void {
 export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   const sessionName = sessionNameFor(opts.taskId);
 
-  // Install the PreToolUse hook + ask_user MCP server before tmux starts
-  // so claude picks them up from `.claude/settings.local.json` on launch.
-  // Owned worktrees get an overwrite install; user-repo cwds (isolation=
-  // none) get a merge install that preserves any existing user hooks /
-  // mcpServers.
-  //
-  // Scope depends on `opts.mode`:
-  //  - `auto` and `bypass` → narrow matcher (only AskUserQuestion +
-  //    ExitPlanMode). In `auto` this is what lets claude's own auto-mode
-  //    classifier handle every other tool call — PreToolUse hooks are
-  //    terminal when they match, so a `.*` matcher would short-circuit
-  //    the classifier and force every tool through agetor's UI.
-  //  - `ask` / `plan` / `acceptEdits` / default → full `.*` matcher;
-  //    per-tool cards render in the run panel.
+  // Clean up any stale agetor settings before tmux starts so claude reads a
+  // tidy `.claude/settings.local.json` on launch. agetor is non-invasive: it
+  // installs no PreToolUse hook and no MCP server. This call only STRIPS a
+  // stale agetor PreToolUse entry / `mcpServers.agetor` key a previous build
+  // wrote (so claude doesn't error launching a deleted MCP launcher) and
+  // self-heals permission rules in owned worktrees. Owned worktrees get a
+  // self-heal-safe pass; user-repo cwds (isolation=none) get a merge pass
+  // that preserves all existing user config.
   ensureInstalledForCwd(opts.cwd, opts.mode);
 
   // Build the tmux command. `-e KEY=VAL` injects env vars into the new
   // session (so the spawned claude inherits them); `--` separates the tmux
   // flags from the command to run.
-  //
-  // We unconditionally inject our localhost API coordinates so the hook
-  // script + MCP server can reach back. These are no-ops on isolation=none
-  // tasks (no settings.local.json registers them), but they don't hurt.
   //
   // PATH is injected explicitly because the tmux *server* captures env at
   // its first launch and reuses it for every subsequent session — passing
@@ -1873,12 +2057,14 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // currently-rehydrated PATH even if the server's captured copy is stale
   // (e.g. agetor restarted with a different login-shell PATH but the
   // long-running bundled tmux server is still around).
+  //
+  // We no longer inject AGETOR_API_PORT/TOKEN/TASK_ID: with the PreToolUse hook
+  // and the ask_user MCP both gone, nothing in the spawned claude reads them,
+  // and AGETOR_API_TOKEN gates every orchestration route — no reason to expose
+  // it to the agent's environment.
   const fullEnv: Record<string, string> = {
     ...opts.env,
     PATH: process.env.PATH ?? "",
-    AGETOR_API_PORT: String(getApiPort()),
-    AGETOR_API_TOKEN: API_TOKEN,
-    AGETOR_TASK_ID: opts.taskId,
   };
   const tmuxArgs: string[] = ["new-session", "-d", "-s", sessionName, "-c", opts.cwd];
   for (const [k, v] of Object.entries(fullEnv)) tmuxArgs.push("-e", `${k}=${v}`);

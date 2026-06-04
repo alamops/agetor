@@ -292,8 +292,8 @@ export interface Task {
   hasOpenableRun: boolean;
   /**
    * Number of pending interactions waiting on the user for this task —
-   * `ask_user` MCP calls, `AskUserQuestion` / `ExitPlanMode` Claude built-ins,
-   * tool-call approval requests, and unstructured in-REPL tmux prompts
+   * `AskUserQuestion` / `ExitPlanMode` Claude built-ins, tool-call approval
+   * requests, and unstructured in-REPL tmux prompts
    * (the "CLAUDE IS PAUSED ON A PROMPT" card). Computed in `tasks.list()` /
    * `tasks.get()` via `countPendingForTask` (interactions live in memory;
    * not persisted). Drives the kanban card's "Answer →" call-to-action.
@@ -398,12 +398,10 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
  *
  * For claude-code, `Code` resolves to `auto` — claude's real
  * `--permission-mode auto` where the server-side AI classifier decides
- * per call. Agetor installs a narrow PreToolUse hook (AskUserQuestion +
- * ExitPlanMode only) so the classifier handles everything else without
- * being short-circuited by our hook. `bypass` is the explicit
- * "no classifier, no MCP, no clarifying-question channel" mode for
- * users who want pure `--dangerously-skip-permissions`. See
- * `installScopeForMode` in src/bun/hook-installer.ts.
+ * per call. Agetor is non-invasive: it installs no PreToolUse hook and no
+ * MCP server, so AskUserQuestion / ExitPlanMode / tool-permission prompts
+ * all run natively in the tmux pane and are surfaced through the scraper.
+ * `bypass` is the explicit pure `--dangerously-skip-permissions` mode.
  */
 export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> = {
   "claude-code": { code: "auto", plan: "plan" },

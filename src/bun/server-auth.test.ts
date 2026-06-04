@@ -89,20 +89,11 @@ test("POST /harnesses rejects an invalid env var name", async () => {
   expect(res.status).toBe(400);
 });
 
-test("/approvals rejects unauthenticated POSTs", async () => {
-  const res = await fetch(url("/approvals?taskId=any"), {
+test("/ask-questions/:id/answer rejects unauthenticated POSTs", async () => {
+  const res = await fetch(url("/ask-questions/any/answer"), {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ tool_name: "Bash" }),
-  });
-  expect(res.status).toBe(401);
-});
-
-test("/questions rejects unauthenticated POSTs", async () => {
-  const res = await fetch(url("/questions?taskId=any"), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ question: "?" }),
+    body: JSON.stringify({ answers: [{ selected: ["A"] }] }),
   });
   expect(res.status).toBe(401);
 });
