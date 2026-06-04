@@ -5,7 +5,6 @@ import { startApiServer, API_PORT, API_TOKEN } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks } from "./db.ts";
 import { reconcileOrphans } from "./orchestrator.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
-import { prewarmSharedFiles } from "./hook-installer.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
 import { startUpdaterLoop } from "./updater.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
@@ -105,18 +104,9 @@ async function getMainViewUrl(): Promise<string> {
 // actually install dev CLIs (/opt/homebrew/bin, ~/.nvm/…, ~/.npm-global/bin,
 // asdf shims, …). Source the user's login-shell PATH once at boot so
 // `Bun.which("claude")` / "codex" / "tmux" can find what's there. Has to run
-// before prewarmSharedFiles (which resolves `bun`) and before the API server
-// starts handling /agents probes. Idempotent and safe in dev runs — the
-// merge dedupes.
+// before the API server starts handling /agents probes. Idempotent and safe
+// in dev runs — the merge dedupes.
 rehydratePath();
-
-// Eagerly refresh the materialised hook + MCP launcher scripts on disk
-// (~/.agetor/bin/*) so a `claude` invocation made directly in a previously-
-// hook-installed repo — between this restart and the first task spawn —
-// runs the current version of the bypass logic, not whatever the prior
-// agetor process wrote. Idempotent per process (the `materialised` flag in
-// hook-installer.ts gates the writes).
-prewarmSharedFiles();
 
 // Mark any runs that were "running" when we last shut down as orphaned, so the
 // kanban doesn't show stuck cards.

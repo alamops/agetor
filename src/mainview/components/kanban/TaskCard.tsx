@@ -36,8 +36,8 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, o
     : undefined;
 
   // Button precedence: Answer > Stop > Open > Run.
-  //  - Answer when at least one interaction (ask_user / AskUserQuestion /
-  //    ExitPlanMode / tool-approval) is pending OR codex flipped the task to
+  //  - Answer when at least one interaction (AskUserQuestion / ExitPlanMode /
+  //    tool-approval) is pending OR codex flipped the task to
   //    `blocked` via the approval-prompt heuristic. Opens the run panel; Stop
   //    moves to a trailing icon slot so the user can still cancel.
   //  - Stop while the agent process is live (running OR blocked-awaiting-user).

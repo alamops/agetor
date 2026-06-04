@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, Bot, Check, ClipboardList, Copy, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
+  GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
@@ -29,7 +29,6 @@ import {
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
-import { proposeAllowRules, type AllowRuleProposal } from "../../../shared/claude-permissions.ts";
 import { AgentIcon } from "./AgentIcon";
 import {
   ReferencesPicker,
@@ -500,6 +499,13 @@ function RunPanelBody({
   // is created immediately so the user sees their queued message in the
   // history.
   const canSend = !!resumableRunId;
+  // While a native modal (question / plan / permission prompt) is pending,
+  // claude is blocked on it in the tmux REPL — a typed message would paste
+  // into the modal instead of reaching claude (and the run would hang
+  // "working"). So gate the send box: answer via the card above, or press Stop
+  // to cancel cleanly first. AskUserQuestion's own card carries a per-question
+  // "Custom answer" field, so custom input isn't lost.
+  const modalPending = interactions.length > 0;
 
   const [input, setInput] = useState("");
   const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
@@ -933,7 +939,9 @@ function RunPanelBody({
                   }
                 }}
                 placeholder={
-                  canSend
+                  modalPending
+                    ? "Answer the prompt above — or press Stop to cancel, then send a new message."
+                    : canSend
                     ? task.column === "running"
                       ? "Agent is working — your message will queue as the next turn. Type / for commands."
                       : task.column === "blocked"
@@ -942,7 +950,7 @@ function RunPanelBody({
                     : "Press Run task first to start a conversation."
                 }
                 rows={2}
-                disabled={!canSend || sending}
+                disabled={!canSend || sending || modalPending}
                 className="h-16 min-h-0 w-full resize-none text-xs"
               />
               <SlashAutocomplete
@@ -959,7 +967,7 @@ function RunPanelBody({
             <Button
               size="icon"
               onClick={() => void send()}
-              disabled={!canSend || sending || (!input.trim() && sendRefs.length === 0)}
+              disabled={!canSend || sending || modalPending || (!input.trim() && sendRefs.length === 0)}
               title={
                 // Distinguish "live session exists" from "needs resume" — not
                 // "turn in flight". `liveRunId` (task.runId) stays set while the
@@ -1289,14 +1297,8 @@ function RunEventList({
   const renderInteraction = (it: PendingInteraction) => {
     const onResolved = onInteractionResolved ?? (() => {});
     switch (it.kind) {
-      case "approval":
-        return <ApprovalCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
-      case "question":
-        return <QuestionCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
       case "ask_questions":
         return <AskQuestionsCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
-      case "plan_approval":
-        return <PlanApprovalCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
       case "tmux_prompt":
         return <TmuxPromptCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
     }
@@ -1782,8 +1784,8 @@ function ToolUseBlock({ call, result }: { call: ParsedToolUse; result?: ParsedTo
       {isInteractive && !result && (
         <div className="border-t border-primary/40 bg-primary/10 px-2 py-1.5 text-[11px] text-foreground">
           {call.name === "AskUserQuestion"
-            ? "Claude is asking you a question. If an answer card appeared at the top of the panel, use it. Otherwise (worktree isolation off → no interactive card), reply in the message field below."
-            : "Claude finished a plan and is waiting. If an approval card appeared at the top of the panel, click one of its buttons. Otherwise (worktree isolation off → no interactive card), reply in the message field below to direct claude."}
+            ? "Claude is asking — answer it in the card above (it has a custom-answer field for anything not listed)."
+            : "Claude is waiting for plan approval — use the card above. To reject or request changes, press Stop, then send a message."}
         </div>
       )}
     </div>
@@ -2593,288 +2595,15 @@ function summarizeToolInput(toolName: string, input: unknown): string {
   return s.length > 120 ? s.slice(0, 120) + "…" : s;
 }
 
-function ApprovalCard({
-  req,
-  onResolved,
-}: {
-  req: Extract<PendingInteraction, { kind: "approval" }>;
-  onResolved: (id: string) => void;
-}) {
-  const [busy, setBusy] = useState(false);
-  const [customOpen, setCustomOpen] = useState(false);
-  const [customReason, setCustomReason] = useState("");
-  const [expanded, setExpanded] = useState(false);
-  // Granularity chooser state. Closed by default — a bare "Allow always"
-  // click commits the most-specific scope (proposals[0]) without ever
-  // opening the chooser. Power users open it to broaden.
-  const [chooserOpen, setChooserOpen] = useState(false);
-  // The chooser's radio options. Memoised on (toolName, toolInput).
-  const proposals = useMemo<AllowRuleProposal[]>(
-    () => proposeAllowRules(req.toolName, req.toolInput),
-    [req.toolName, req.toolInput],
-  );
-  // Picked option for the chooser. Defaults to proposals[0] (most specific).
-  // Encoded as "<scope>:<variant>" so the bash_prefix 1-token vs 2-token
-  // variants don't collide on the same scope id.
-  const optionKey = (p: AllowRuleProposal) => `${p.scope}:${p.variant}`;
-  const [pickedKey, setPickedKey] = useState<string>(
-    proposals[0] ? optionKey(proposals[0]) : "tool:",
-  );
-  const pickedProposal = proposals.find((p) => optionKey(p) === pickedKey) ?? proposals[0];
-
-  const send = async (body: { decision: "allow" | "deny"; reason?: string; remember?: boolean; entry?: string }) => {
-    if (busy) return;
-    setBusy(true);
-    // Optimistic remove — the server's broadcast on resolve confirms.
-    onResolved(req.id);
-    try {
-      await api.answerApproval(req.id, body);
-    } catch {
-      // Failure path: re-fetching pending will resurrect the card if needed.
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const summary = summarizeToolInput(req.toolName, req.toolInput);
-  const ToolIcon = toolIcon(req.toolName);
-
-  return (
-    <div className="rounded-md border border-border/60 bg-card p-2 text-xs">
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-          <ToolIcon className="size-3.5" aria-hidden /> Approval needed
-        </span>
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="text-[10px] text-muted-foreground underline-offset-2 hover:underline"
-        >
-          {expanded ? "Hide raw input" : "Show raw input"}
-        </button>
-      </div>
-      <div className="mb-2">
-        <span className="font-mono">{req.toolName}</span>
-        <span className="ml-2 text-muted-foreground">{summary}</span>
-      </div>
-      {expanded && (
-        <pre className="mb-2 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-snug">
-          {JSON.stringify(req.toolInput, null, 2)}
-        </pre>
-      )}
-      <div className="flex flex-wrap items-center gap-1">
-        <Button size="sm" disabled={busy} onClick={() => void send({ decision: "allow" })}>
-          Allow once
-        </Button>
-        {/* Split button: clicking the label commits with default (most-specific)
-            scope; the chevron opens the chooser for power users. */}
-        <div className="inline-flex">
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={busy}
-            className="rounded-r-none"
-            onClick={() => void send({ decision: "allow", remember: true })}
-          >
-            Allow always
-          </Button>
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={busy || proposals.length <= 1}
-            aria-label="Choose granularity"
-            className="rounded-l-none border-l border-border/40 px-1.5"
-            onClick={() => setChooserOpen((v) => !v)}
-          >
-            {chooserOpen ? "▲" : "▾"}
-          </Button>
-        </div>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={busy}
-          onClick={() => void send({ decision: "deny" })}
-        >
-          Deny
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          disabled={busy}
-          onClick={() => setCustomOpen((v) => !v)}
-        >
-          {customOpen ? "Cancel" : "Custom…"}
-        </Button>
-      </div>
-      {chooserOpen && proposals.length > 1 && (
-        <div className="mt-2 space-y-1 rounded-md border border-border/40 bg-muted/20 p-2">
-          <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Allow always — scope</div>
-          {proposals.map((p) => {
-            const key = optionKey(p);
-            const picked = key === pickedKey;
-            return (
-              <label
-                key={key}
-                className={cn(
-                  "flex cursor-pointer items-start gap-2 rounded border border-transparent px-1.5 py-1 hover:bg-accent/30",
-                  picked && "border-primary/40 bg-primary/10",
-                )}
-              >
-                <input
-                  type="radio"
-                  name={`approval-scope-${req.id}`}
-                  className="mt-0.5"
-                  checked={picked}
-                  onChange={() => setPickedKey(key)}
-                />
-                <span className="flex-1 min-w-0">
-                  {/* Truncate to a single line: commands can contain newlines
-                      and quotes that would otherwise break the option row. */}
-                  <span className="block truncate">{p.label.replace(/\s+/g, " ")}</span>
-                  <span className="block truncate font-mono text-[10px] text-muted-foreground">{p.entry.replace(/\s+/g, " ")}</span>
-                </span>
-              </label>
-            );
-          })}
-          <div className="flex justify-end pt-1">
-            <Button
-              size="sm"
-              disabled={busy || !pickedProposal}
-              onClick={() => void send({
-                decision: "allow",
-                remember: true,
-                // Send the entry explicitly so the server doesn't fall back
-                // to its default-derive (which would pick the most-specific
-                // scope and ignore the user's broader choice).
-                entry: pickedProposal?.entry,
-              })}
-            >
-              Save & allow
-            </Button>
-          </div>
-        </div>
-      )}
-      {customOpen && (
-        <div className="mt-2 space-y-1">
-          <Textarea
-            value={customReason}
-            onChange={(e) => setCustomReason(e.target.value)}
-            placeholder="No, do this instead…"
-            rows={2}
-            className="resize-none text-xs"
-          />
-          <div className="flex justify-end">
-            <Button
-              size="sm"
-              disabled={busy || !customReason.trim()}
-              onClick={() => void send({ decision: "deny", reason: customReason.trim() })}
-            >
-              Send
-            </Button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function QuestionCard({
-  req,
-  onResolved,
-}: {
-  req: Extract<PendingInteraction, { kind: "question" }>;
-  onResolved: (id: string) => void;
-}) {
-  const [busy, setBusy] = useState(false);
-  const [selected, setSelected] = useState<string[]>([]);
-  const [custom, setCustom] = useState("");
-
-  const choices = req.choices ?? [];
-  const multi = !!req.multi;
-
-  const toggle = (choice: string) => {
-    if (multi) {
-      setSelected((cur) =>
-        cur.includes(choice) ? cur.filter((c) => c !== choice) : [...cur, choice],
-      );
-    } else {
-      setSelected([choice]);
-    }
-  };
-
-  const send = async () => {
-    if (busy) return;
-    if (selected.length === 0 && !custom.trim()) return;
-    setBusy(true);
-    onResolved(req.id);
-    try {
-      await api.answerQuestion(req.id, {
-        selected,
-        custom: custom.trim() || undefined,
-      });
-    } catch {
-      // see ApprovalCard
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div className="rounded-md border border-border/60 bg-card p-2 text-xs">
-      <div className="mb-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-        <MessageSquareQuote className="size-3.5" aria-hidden /> Claude is asking
-      </div>
-      <p className="mb-2 whitespace-pre-wrap">{req.question}</p>
-      {choices.length > 0 && (
-        <div className="mb-2 space-y-1">
-          {choices.map((c) => (
-            <label key={c} className="flex cursor-pointer items-center gap-2">
-              <input
-                type={multi ? "checkbox" : "radio"}
-                name={`question-${req.id}`}
-                checked={selected.includes(c)}
-                onChange={() => toggle(c)}
-              />
-              <span>{c}</span>
-            </label>
-          ))}
-        </div>
-      )}
-      <Textarea
-        value={custom}
-        onChange={(e) => setCustom(e.target.value)}
-        placeholder={
-          choices.length > 0
-            ? "Custom answer (optional)…"
-            : "Type your answer…"
-        }
-        rows={2}
-        className="resize-none text-xs"
-      />
-      <div className="mt-2 flex justify-end">
-        <Button
-          size="sm"
-          disabled={busy || (selected.length === 0 && !custom.trim())}
-          onClick={() => void send()}
-        >
-          Send
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 /**
- * Card for claude's built-in AskUserQuestion (intercepted via PreToolUse
- * hook). One claude tool call can carry multiple sub-questions; we render
+ * Card for claude's built-in AskUserQuestion (scraper-sourced from the tmux
+ * pane). One claude tool call can carry multiple sub-questions; we render
  * each with its own radio/checkbox group + free-text "Custom answer"
  * field. A single Send button at the bottom commits all of them.
  *
- * Differs from QuestionCard (which handles our own MCP `ask_user` tool)
- * in two ways: the wire format includes rich `options` with descriptions,
- * and the answer round-trip goes through `/ask-questions/:id/answer` —
- * the server formats the picks into claude's canonical "User has
- * answered…" string and returns it as the hook's `permissionDecisionReason`.
+ * The wire format includes rich `options` with descriptions, and the answer
+ * round-trip goes through `/ask-questions/:id/answer` — the server plans the
+ * keystrokes from the user's picks and drives them into the native modal.
  */
 function AskQuestionsCard({
   req,
@@ -2888,6 +2617,9 @@ function AskQuestionsCard({
     () => req.questions.map(() => ({ selected: [], custom: "" })),
   );
   const [submitting, setSubmitting] = useState(false);
+  // Two-phase flow mirroring claude's native modal: answer every question,
+  // then a review screen ("✔ Submit" tab) before the final submit.
+  const [phase, setPhase] = useState<"answer" | "review">("answer");
 
   const togglePick = (qi: number, label: string, multi: boolean) => {
     setAnswers((cur) =>
@@ -2929,189 +2661,99 @@ function AskQuestionsCard({
     }
   };
 
+  /** One-line summary of the user's answer to question `qi` (picked labels +
+   *  any custom text), for the review screen. Mirrors the native "→ a, b". */
+  const answerSummary = (qi: number): string => {
+    const a = answers[qi] ?? { selected: [], custom: "" };
+    const pieces = [...a.selected];
+    if (a.custom.trim()) pieces.push(a.custom.trim());
+    return pieces.length ? pieces.join(", ") : "(no answer)";
+  };
+
   return (
     <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
       <div className="mb-2 flex items-center justify-between">
         <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
-          <HelpCircle className="size-3.5" aria-hidden /> Claude is asking
+          <HelpCircle className="size-3.5" aria-hidden />
+          {phase === "review" ? "Review your answers" : "Claude is asking"}
         </span>
         <span className="font-mono text-[10px] text-muted-foreground">
-          {req.questions.length === 1 ? "1 question" : `${req.questions.length} questions`}
+          {phase === "review"
+            ? "before submitting"
+            : req.questions.length === 1 ? "1 question" : `${req.questions.length} questions`}
         </span>
       </div>
-      <div className="space-y-3">
-        {req.questions.map((q, qi) => (
-          <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
-            <div className="mb-1.5 text-[13px] font-medium">{q.question}</div>
-            <div className="space-y-1">
-              {q.options.map((opt) => {
-                const picked = answers[qi]?.selected.includes(opt.label) ?? false;
-                return (
-                  <label
-                    key={opt.label}
-                    className={cn(
-                      "flex cursor-pointer items-start gap-2 rounded border border-transparent px-1.5 py-1 hover:bg-accent/30",
-                      picked && "border-primary/40 bg-primary/10",
-                    )}
-                  >
-                    <input
-                      type={q.multiSelect ? "checkbox" : "radio"}
-                      name={`q-${req.id}-${qi}`}
-                      checked={picked}
-                      onChange={() => togglePick(qi, opt.label, Boolean(q.multiSelect))}
-                      className="mt-0.5"
-                    />
-                    <span className="text-[12px]">
-                      <span className="font-medium">{opt.label}</span>
-                      {opt.description && (
-                        <span className="block text-[11px] text-muted-foreground">{opt.description}</span>
-                      )}
-                    </span>
-                  </label>
-                );
-              })}
-            </div>
-            <Textarea
-              value={answers[qi]?.custom ?? ""}
-              onChange={(e) => setCustom(qi, e.target.value)}
-              placeholder="Custom answer (optional)"
-              rows={2}
-              className="mt-2 text-[12px]"
-            />
+
+      {phase === "review" ? (
+        <>
+          <div className="space-y-2">
+            {req.questions.map((q, qi) => (
+              <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
+                <div className="text-[12px] font-medium">{q.question}</div>
+                <div className="mt-0.5 text-[12px] text-primary">→ {answerSummary(qi)}</div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-      <div className="mt-3 flex items-center justify-end">
-        <Button onClick={() => void submit()} disabled={!canSubmit || submitting} size="sm">
-          {submitting ? "Sending…" : "Send to claude"}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-/**
- * Card for claude's built-in ExitPlanMode (intercepted via PreToolUse
- * hook). Renders the plan body verbatim plus four action buttons:
- *
- *   • Approve & auto           — switches task to auto, no further prompts
- *   • Approve & implement      — switches task to acceptEdits (auto-accept
- *                                edits, ask for Bash etc.)
- *   • Approve, ask before each — switches task to default (ask each change)
- *   • Reject / revise          — claude rewrites the plan with feedback
- *
- * The chosen action becomes a natural-language string the server emits as
- * the hook's `permissionDecisionReason`, and the server also calls
- * cycleToMode + tasks.update so the live session and the kanban badge
- * follow.
- */
-function PlanApprovalCard({
-  req,
-  onResolved,
-}: {
-  req: Extract<PendingInteraction, { kind: "plan_approval" }>;
-  onResolved: (id: string) => void;
-}) {
-  const [revising, setRevising] = useState(false);
-  const [revision, setRevision] = useState("");
-  // `submittingChoice` tracks which button was clicked so we can render
-  // "Sending…" on that specific button. `submitting` is the boolean any
-  // disabled={} predicate should read.
-  type Choice = "approve_auto" | "approve_implement" | "approve_ask" | "reject";
-  const [submittingChoice, setSubmittingChoice] = useState<Choice | null>(null);
-  const submitting = submittingChoice !== null;
-
-  const decide = async (choice: Choice) => {
-    if (submitting) return;
-    setSubmittingChoice(choice);
-    try {
-      await api.answerPlanApproval(req.id, {
-        choice,
-        revision: choice === "reject" ? (revision.trim() || undefined) : undefined,
-      });
-      onResolved(req.id);
-    } finally {
-      setSubmittingChoice(null);
-    }
-  };
-  const labelFor = (choice: Choice, fallback: string) =>
-    submittingChoice === choice ? "Sending…" : fallback;
-
-  return (
-    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
-      <div className="mb-2 flex items-center justify-between">
-        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
-          <ClipboardList className="size-3.5" aria-hidden /> Plan ready for approval
-        </span>
-      </div>
-      <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-md border border-border/40 bg-muted/20 p-2 text-[11px]">
-        {req.plan}
-      </pre>
-      {revising && (
-        <Textarea
-          value={revision}
-          onChange={(e) => setRevision(e.target.value)}
-          placeholder="What should claude change about the plan? (optional — empty asks claude to revise on its own.)"
-          rows={3}
-          className="mt-2 text-[12px]"
-        />
+          <div className="mt-3 flex items-center justify-between">
+            <Button variant="ghost" size="sm" onClick={() => setPhase("answer")} disabled={submitting}>
+              ← Back
+            </Button>
+            <Button onClick={() => void submit()} disabled={!canSubmit || submitting} size="sm">
+              {submitting ? "Submitting…" : "Submit answers"}
+            </Button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="space-y-3">
+            {req.questions.map((q, qi) => (
+              <div key={qi} className="rounded-md border border-border/40 bg-muted/20 p-2">
+                <div className="mb-1.5 text-[13px] font-medium">{q.question}</div>
+                <div className="space-y-1">
+                  {q.options.map((opt) => {
+                    const picked = answers[qi]?.selected.includes(opt.label) ?? false;
+                    return (
+                      <label
+                        key={opt.label}
+                        className={cn(
+                          "flex cursor-pointer items-start gap-2 rounded border border-transparent px-1.5 py-1 hover:bg-accent/30",
+                          picked && "border-primary/40 bg-primary/10",
+                        )}
+                      >
+                        <input
+                          type={q.multiSelect ? "checkbox" : "radio"}
+                          name={`q-${req.id}-${qi}`}
+                          checked={picked}
+                          onChange={() => togglePick(qi, opt.label, Boolean(q.multiSelect))}
+                          className="mt-0.5"
+                        />
+                        <span className="text-[12px]">
+                          <span className="font-medium">{opt.label}</span>
+                          {opt.description && (
+                            <span className="block text-[11px] text-muted-foreground">{opt.description}</span>
+                          )}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <Textarea
+                  value={answers[qi]?.custom ?? ""}
+                  onChange={(e) => setCustom(qi, e.target.value)}
+                  placeholder="Custom answer (optional)"
+                  rows={2}
+                  className="mt-2 text-[12px]"
+                />
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex items-center justify-end">
+            <Button onClick={() => setPhase("review")} disabled={!canSubmit || submitting} size="sm">
+              Review answers →
+            </Button>
+          </div>
+        </>
       )}
-      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
-        {revising ? (
-          <>
-            <Button
-              onClick={() => { setRevising(false); setRevision(""); }}
-              variant="outline"
-              size="sm"
-              disabled={submitting}
-            >
-              Back
-            </Button>
-            <Button
-              onClick={() => void decide("reject")}
-              variant="destructive"
-              size="sm"
-              disabled={submitting}
-            >
-              {labelFor("reject", "Send revision request")}
-            </Button>
-          </>
-        ) : (
-          <>
-            <Button
-              onClick={() => setRevising(true)}
-              variant="outline"
-              size="sm"
-              disabled={submitting}
-            >
-              Reject / revise
-            </Button>
-            <Button
-              onClick={() => void decide("approve_ask")}
-              variant="secondary"
-              size="sm"
-              disabled={submitting}
-            >
-              {labelFor("approve_ask", "Approve, ask each edit")}
-            </Button>
-            <Button
-              onClick={() => void decide("approve_auto")}
-              variant="secondary"
-              size="sm"
-              disabled={submitting}
-            >
-              {labelFor("approve_auto", "Approve & auto")}
-            </Button>
-            <Button
-              onClick={() => void decide("approve_implement")}
-              size="sm"
-              disabled={submitting}
-            >
-              {labelFor("approve_implement", "Approve & implement")}
-            </Button>
-          </>
-        )}
-      </div>
     </div>
   );
 }
@@ -3150,7 +2792,7 @@ function TmuxPromptCard({
       // server-side (scraper auto-cancel, double-click) — the card should
       // just go away, not show an error. Genuine delivery failures come
       // back as 410/500 and throw, landing in the catch below.
-      await api.answerTmuxPrompt(req.id, { key });
+      await api.answerTmuxPrompt(req.id, key === "__reject__" ? { reject: true } : { key });
       onResolved(req.id);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to send choice.");
@@ -3158,6 +2800,67 @@ function TmuxPromptCard({
       setSubmitting(null);
     }
   };
+  // ExitPlanMode's native approval modal is a numbered prompt the scraper
+  // catches like any other, but it deserves a first-class card (not the raw
+  // pane dump) — same polish as the AskUserQuestion card. Detect it by its
+  // signature and render labelled buttons; the plan markdown itself is already
+  // shown just above in the ExitPlanMode tool-use card.
+  const isPlan = /written up a plan|Would you like to proceed/i.test(req.paneText);
+  if (isPlan) {
+    const planLabel = (label: string): string => {
+      const l = label.toLowerCase();
+      if (/auto/.test(l)) return "Approve — auto-accept edits";
+      if (/manual/.test(l)) return "Approve — review each edit";
+      if (/tell claude/.test(l)) return "Tell Claude what to change";
+      if (/^no\b|refine|keep planning/.test(l)) return "Keep planning (don't proceed)";
+      return label;
+    };
+    return (
+      <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
+        <div className="mb-2 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
+          <ClipboardList className="size-3.5" aria-hidden /> Claude’s plan is ready
+        </div>
+        <p className="mb-3 text-[12px] text-muted-foreground">
+          Claude finished a plan (shown above) and is ready to execute. How should it proceed?
+        </p>
+        <div className="flex flex-col gap-1.5">
+          {req.choices
+            // Only the two "Yes, …" approvals are genuine one-click actions.
+            // Claude's own "No, refine with Ultraplan…" jumps to the web and
+            // "Tell Claude what to change" opens an inline TUI field a button
+            // can't fill — so we offer our own Reject (below) instead, which
+            // Esc's the modal and lets the user redirect via the message box.
+            .filter((c) => /^yes\b/i.test(c.label.trim()))
+            .map((c) => (
+              <Button
+                key={c.key}
+                onClick={() => void send(c.key)}
+                size="sm"
+                variant="secondary"
+                disabled={submitting !== null}
+                className="justify-start"
+              >
+                {submitting === c.key ? "Sending…" : planLabel(c.label)}
+              </Button>
+            ))}
+          <Button
+            onClick={() => void send("__reject__")}
+            size="sm"
+            variant="outline"
+            disabled={submitting !== null}
+            className="justify-start"
+          >
+            {submitting === "__reject__" ? "Dismissing…" : "Reject — don’t approve"}
+          </Button>
+        </div>
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Rejecting dismisses the plan; then describe your changes in the message box below.
+        </p>
+        {error && <p className="mt-2 text-[11px] text-destructive">{error}</p>}
+      </div>
+    );
+  }
+
   return (
     <div className="rounded-md border border-amber-500/60 bg-card p-3 ring-1 ring-amber-500/40">
       <div className="mb-2 flex items-center justify-between">
