@@ -1,0 +1,21 @@
+ ⚠ 1 setup issue: MCP · /doctor
+
+❯ Call AskUserQuestion with one question about AI provider usage and three options.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Providers
+
+There are 5+ AI providers wired up (Vision, Translate, Gemini, Mistral, Groq,
+OpenAI). How are they used?
+
+❯ 1. Primary + fallbacks
+  One main model with others as failover/cost backups.
+  2. Task-specialized
+  Each provider handles a specific job
+  (OCR vs translate vs explain vs chat).
+  3. Experimental
+  Several are leftovers/experiments, not all in active use.
+  4. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
