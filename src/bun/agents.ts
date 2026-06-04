@@ -271,10 +271,8 @@ export function buildCommand(
     //
     //   - `bypass` → emit `--dangerously-skip-permissions` instead of the
     //     `--permission-mode bypassPermissions` form. Both are valid, but
-    //     the legacy flag is what users see in claude's own docs and what
-    //     the hook scope check (`installScopeForMode`) keys off — keep
-    //     parity with that and the narrow PreToolUse matcher behavior
-    //     described below.
+    //     the legacy flag is what users see in claude's own docs — keep
+    //     parity with that.
     //
     //   - `ask` → emit nothing; claude lands in its built-in `default`
     //     mode, which is exactly the "ask before each action" posture we
@@ -282,16 +280,12 @@ export function buildCommand(
     //     explicitly works too, but omitting it matches the prior
     //     behavior so the launch transcript is unchanged.
     //
-    // Hook scope context: `auto` and `bypass` install the narrow
-    // PreToolUse matcher (`^(AskUserQuestion|ExitPlanMode)$`) so claude's
-    // own permission engine + classifier handles every other tool call;
-    // a `.*` matcher would short-circuit the classifier and force every
-    // tool through agetor's UI. Other modes (`ask`, `plan`,
-    // `acceptEdits`) install the full `.*` matcher so per-tool approval
-    // cards render in agetor's UI — claude's own TUI prompts are
-    // invisible in detached tmux, so agetor's UI is the user's only
-    // window into per-call decisions. See `installScopeForMode` in
-    // hook-installer.ts.
+    // agetor installs no PreToolUse hook and no MCP server, so the mode
+    // only drives these launch flags — claude's own permission engine and
+    // its TUI prompts (surfaced through the tmux pane scraper) handle every
+    // tool call. claude's TUI prompts are invisible in detached tmux, so
+    // agetor's scraper-driven UI cards are the user's window into per-call
+    // decisions.
     const mode = opts.mode ?? "auto";
     if (mode === "bypass") {
       args.push("--dangerously-skip-permissions");

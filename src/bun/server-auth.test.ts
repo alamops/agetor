@@ -98,15 +98,6 @@ test("/ask-questions/:id/answer rejects unauthenticated POSTs", async () => {
   expect(res.status).toBe(401);
 });
 
-test("/questions rejects unauthenticated POSTs", async () => {
-  const res = await fetch(url("/questions?taskId=any"), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ question: "?" }),
-  });
-  expect(res.status).toBe(401);
-});
-
 test("/agent-discovery returns commands + extensions for a known agent", async () => {
   const res = await fetch(url("/agent-discovery?agent=claude-code"), {
     headers: { authorization: `Bearer ${token}` },

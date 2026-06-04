@@ -2,11 +2,10 @@ import { randomUUID } from "node:crypto";
 
 /**
  * In-process registry for user interactions claude needs to drive through
- * agetor's UI: clarifying questions (ask_user MCP tool), scraper-sourced
- * AskUserQuestion / ExitPlanMode modals, and unstructured tmux-pane prompts.
- * Each follows the same shape — a localhost POST or a scraper-driven send-keys
- * sequence that we hold open via a Promise (or a no-op resolve) until the user
- * answers.
+ * agetor's UI: scraper-sourced AskUserQuestion / ExitPlanMode modals, and
+ * unstructured tmux-pane prompts. Each follows the same shape — a localhost
+ * POST or a scraper-driven send-keys sequence that we hold open via a Promise
+ * (or a no-op resolve) until the user answers.
  *
  * Everything here is in-memory. Pending interactions don't survive an agetor
  * restart, by design: on boot we kill / reattach `agetor-*` tmux sessions, so
@@ -15,30 +14,8 @@ import { randomUUID } from "node:crypto";
  */
 
 export type InteractionKind =
-  | "question"
   | "ask_questions"   // claude built-in AskUserQuestion (scraper-sourced)
   | "tmux_prompt";    // unstructured in-REPL prompt detected by scraping the tmux pane
-
-export interface QuestionRequest {
-  kind: "question";
-  id: string;
-  taskId: string;
-  runId: string;
-  question: string;
-  /** Preset options. When present + multi=false the UI renders radios; when
-   *  multi=true, checkboxes. Always paired with a free-text custom answer. */
-  choices?: string[];
-  multi?: boolean;
-  createdAt: number;
-}
-
-export interface QuestionAnswer {
-  /** Selected choice strings. Empty when the user only typed a custom answer. */
-  selected: string[];
-  /** Optional free-text addition. May be the only field set if the user
-   *  declined the presets. */
-  custom?: string;
-}
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Claude built-in AskUserQuestion (scraper-sourced).
@@ -149,14 +126,9 @@ export interface TmuxPromptAnswer {
 }
 
 export type AnyRequest =
-  | QuestionRequest
   | AskQuestionsRequest
   | TmuxPromptRequest;
 
-interface QuestionEntry {
-  req: QuestionRequest;
-  resolve: (answer: QuestionAnswer) => void;
-}
 interface AskQuestionsEntry {
   req: AskQuestionsRequest;
   resolve: (answer: AskQuestionsAnswer) => void;
@@ -166,7 +138,6 @@ interface TmuxPromptEntry {
   resolve: (answer: TmuxPromptAnswer) => void;
 }
 
-const questions = new Map<string, QuestionEntry>();
 const askQuestions = new Map<string, AskQuestionsEntry>();
 const tmuxPrompts = new Map<string, TmuxPromptEntry>();
 
@@ -213,49 +184,6 @@ export function setResolvedBroadcaster(fn: ResolveBroadcastFn): void {
  *  hears about it. */
 function fanoutResolved(req: AnyRequest): void {
   broadcastResolved({ id: req.id, taskId: req.taskId, runId: req.runId, kind: req.kind });
-}
-
-/* ────────────────────────────────────────────────────────────────────────── *
- * Questions
- * ────────────────────────────────────────────────────────────────────────── */
-
-export interface RegisterQuestionArgs {
-  taskId: string;
-  runId: string;
-  question: string;
-  choices?: string[];
-  multi?: boolean;
-}
-
-export function registerQuestion(args: RegisterQuestionArgs): {
-  id: string;
-  answer: Promise<QuestionAnswer>;
-} {
-  const id = randomUUID();
-  const req: QuestionRequest = {
-    kind: "question",
-    id,
-    taskId: args.taskId,
-    runId: args.runId,
-    question: args.question,
-    choices: args.choices,
-    multi: args.multi,
-    createdAt: Date.now(),
-  };
-  const answer = new Promise<QuestionAnswer>((resolve) => {
-    questions.set(id, { req, resolve });
-  });
-  broadcast(req);
-  return { id, answer };
-}
-
-export function answerQuestion(id: string, answer: QuestionAnswer): boolean {
-  const entry = questions.get(id);
-  if (!entry) return false;
-  questions.delete(id);
-  entry.resolve(answer);
-  fanoutResolved(entry.req);
-  return true;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -424,12 +352,6 @@ export function activeTmuxPromptsForTask(taskId: string): TmuxPromptRequest[] {
  * until their HTTP timeout instead of returning cleanly.
  */
 export function cancelPendingForTask(taskId: string, reason: string): void {
-  for (const [id, entry] of questions) {
-    if (entry.req.taskId !== taskId) continue;
-    questions.delete(id);
-    entry.resolve({ selected: [], custom: reason });
-    fanoutResolved(entry.req);
-  }
   for (const [id, entry] of askQuestions) {
     if (entry.req.taskId !== taskId) continue;
     askQuestions.delete(id);
@@ -451,7 +373,6 @@ export function cancelPendingForTask(taskId: string, reason: string): void {
 
 export function listPendingForTask(taskId: string): AnyRequest[] {
   const out: AnyRequest[] = [];
-  for (const e of questions.values()) if (e.req.taskId === taskId) out.push(e.req);
   for (const e of askQuestions.values()) if (e.req.taskId === taskId) out.push(e.req);
   for (const e of tmuxPrompts.values()) if (e.req.taskId === taskId) out.push(e.req);
   return out.sort((a, b) => a.createdAt - b.createdAt);
@@ -462,7 +383,6 @@ export function listPendingForTask(taskId: string): AnyRequest[] {
  *  full payloads. Linear scan over the small in-memory Maps. */
 export function countPendingForTask(taskId: string): number {
   let n = 0;
-  for (const e of questions.values()) if (e.req.taskId === taskId) n++;
   for (const e of askQuestions.values()) if (e.req.taskId === taskId) n++;
   for (const e of tmuxPrompts.values()) if (e.req.taskId === taskId) n++;
   return n;
@@ -470,11 +390,9 @@ export function countPendingForTask(taskId: string): number {
 
 /** Test-only handle for asserting the registry state. */
 export const __testing = {
-  questionsSize: () => questions.size,
   askQuestionsSize: () => askQuestions.size,
   tmuxPromptsSize: () => tmuxPrompts.size,
   reset() {
-    questions.clear();
     askQuestions.clear();
     tmuxPrompts.clear();
     broadcast = () => { /* reset */ };

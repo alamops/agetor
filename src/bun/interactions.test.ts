@@ -46,59 +46,60 @@ async function makeTaskWithCwd(id: string): Promise<string> {
   return cwd;
 }
 
-test("registerQuestion resolves with selected + custom from answerQuestion", async () => {
-  const { registerQuestion, answerQuestion } = await import("./interactions.ts");
-  const { id, answer } = registerQuestion({
-    taskId: "t1",
-    runId: "r1",
-    question: "Which page?",
-    choices: ["A", "B", "C"],
+/** Convenience wrapper so the generic-machinery tests below read cleanly —
+ *  registers a tmux_prompt with a single Yes choice. */
+async function makePrompt(taskId: string, runId: string, fingerprint: string) {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  return registerTmuxPrompt({
+    taskId, runId,
+    paneText: "?", choices: [{ key: "1", label: "Yes" }], fingerprint,
   });
-  answerQuestion(id, { selected: ["B"], custom: "actually maybe X" });
-  await expect(answer).resolves.toEqual({ selected: ["B"], custom: "actually maybe X" });
-});
+}
 
-test("cancelPendingForTask resolves every pending question with cancel reason", async () => {
-  const { registerQuestion, cancelPendingForTask, __testing } = await import("./interactions.ts");
-  const q = registerQuestion({ taskId: "tCancel", runId: "r1", question: "huh?" });
-  expect(__testing.questionsSize()).toBe(1);
+test("cancelPendingForTask resolves every pending interaction with the sentinel", async () => {
+  const { cancelPendingForTask, __testing } = await import("./interactions.ts");
+  const p = await makePrompt("tCancel", "r1", "fp-cancel");
+  expect(__testing.tmuxPromptsSize()).toBe(1);
 
   cancelPendingForTask("tCancel", "bye");
-  await expect(q.answer).resolves.toEqual({ selected: [], custom: "bye" });
-  expect(__testing.questionsSize()).toBe(0);
+  await expect(p.answer).resolves.toEqual({ key: "__cancelled__" });
+  expect(__testing.tmuxPromptsSize()).toBe(0);
 });
 
 test("cancelPendingForTask leaves other tasks' interactions untouched", async () => {
-  const { registerQuestion, cancelPendingForTask, answerQuestion } = await import("./interactions.ts");
-  const keep = registerQuestion({ taskId: "tA", runId: "r1", question: "keep?" });
-  const drop = registerQuestion({ taskId: "tB", runId: "r1", question: "drop?" });
+  const { cancelPendingForTask, answerTmuxPrompt } = await import("./interactions.ts");
+  const keep = await makePrompt("tA", "r1", "fp-keep");
+  const drop = await makePrompt("tB", "r1", "fp-drop");
   cancelPendingForTask("tB", "stop");
-  await expect(drop.answer).resolves.toEqual({ selected: [], custom: "stop" });
+  await expect(drop.answer).resolves.toEqual({ key: "__cancelled__" });
   // 'keep' still pending → answerable:
-  expect(answerQuestion(keep.id, { selected: ["ok"] })).toBe(true);
-  await expect(keep.answer).resolves.toEqual({ selected: ["ok"], custom: undefined });
+  expect(answerTmuxPrompt(keep.id, { key: "1" })).toBe(true);
+  await expect(keep.answer).resolves.toEqual({ key: "1" });
 });
 
-test("listPendingForTask returns questions in createdAt order", async () => {
-  const { registerQuestion, listPendingForTask } = await import("./interactions.ts");
-  const q1 = registerQuestion({ taskId: "tList", runId: "r1", question: "first?" });
+test("listPendingForTask returns interactions in createdAt order", async () => {
+  const { listPendingForTask } = await import("./interactions.ts");
+  const q1 = await makePrompt("tList", "r1", "fp-1");
   await new Promise((r) => setTimeout(r, 5));
-  const q2 = registerQuestion({ taskId: "tList", runId: "r1", question: "second?" });
+  const q2 = await makePrompt("tList", "r1", "fp-2");
   const pending = listPendingForTask("tList");
   expect(pending.map((p) => p.id)).toEqual([q1.id, q2.id]);
 });
 
 test("setBroadcaster receives newly registered interactions", async () => {
-  const { setBroadcaster, registerQuestion } = await import("./interactions.ts");
+  const { setBroadcaster, registerScrapedAskQuestions } = await import("./interactions.ts");
   const seen: string[] = [];
   setBroadcaster((req) => {
-    if (req.kind === "question") seen.push(`question:${req.question}`);
-    else if (req.kind === "ask_questions") seen.push(`ask_questions:${req.questions.length}`);
+    if (req.kind === "ask_questions") seen.push(`ask_questions:${req.questions.length}`);
     else if (req.kind === "tmux_prompt") seen.push(`tmux_prompt`);
   });
-  registerQuestion({ taskId: "tBroad", runId: "r1", question: "Which?" });
+  registerScrapedAskQuestions({
+    taskId: "tBroad", runId: "r1",
+    questions: [{ question: "Which?", options: [{ label: "A" }] }],
+    fingerprint: "fp-broad",
+  });
   expect(seen.length).toBe(1);
-  expect(seen[0]).toBe("question:Which?");
+  expect(seen[0]).toBe("ask_questions:1");
 });
 
 /* ── AskUserQuestion scraper-sourced ────────────────────────────────── */
@@ -208,34 +209,33 @@ test("tasks.get / tasks.list expose pendingInteractionCount reflecting open inte
   await makeTaskWithCwd("tCount");
   const { tasks } = await import("./db.ts");
   const {
-    registerQuestion, registerScrapedAskQuestions, registerTmuxPrompt, answerQuestion,
+    registerScrapedAskQuestions, registerTmuxPrompt, answerTmuxPrompt,
   } = await import("./interactions.ts");
 
   // No interactions yet → 0.
   expect(tasks.get("tCount")!.pendingInteractionCount).toBe(0);
 
   // One of each remaining kind from the in-memory maps; counter reflects all.
-  const q = registerQuestion({ taskId: "tCount", runId: "r1", question: "?" });
   registerScrapedAskQuestions({
     taskId: "tCount", runId: "r1",
     questions: [{ question: "?", options: [{ label: "A" }] }],
     fingerprint: "fp-tCount",
   });
-  registerTmuxPrompt({
+  const t = registerTmuxPrompt({
     taskId: "tCount", runId: "r1",
     paneText: "Do you want to proceed?",
     choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
     fingerprint: "fp-count",
   });
-  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(3);
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(2);
   // And the same count surfaces via tasks.list (the kanban's polling path).
   const fromList = tasks.list().find((t) => t.id === "tCount");
-  expect(fromList?.pendingInteractionCount).toBe(3);
+  expect(fromList?.pendingInteractionCount).toBe(2);
 
   // Answering removes the entry from its map and decrements the count.
-  answerQuestion(q.id, { selected: ["ok"] });
-  await q.answer;
-  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(2);
+  answerTmuxPrompt(t.id, { key: "1" });
+  await t.answer;
+  expect(tasks.get("tCount")!.pendingInteractionCount).toBe(1);
 
   // Counter is scoped to the task: a sibling task with no interactions reads 0.
   await makeTaskWithCwd("tCountSibling");
@@ -273,14 +273,18 @@ test("findTmuxPromptByFingerprint hits only the same task + fingerprint", async 
 });
 
 test("listPendingForTask returns tmux_prompt entries alongside other kinds", async () => {
-  const { registerQuestion, registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
-  registerQuestion({ taskId: "tM", runId: "rM", question: "?" });
+  const { registerScrapedAskQuestions, registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
+  registerScrapedAskQuestions({
+    taskId: "tM", runId: "rM",
+    questions: [{ question: "?", options: [{ label: "A" }] }],
+    fingerprint: "fp-ask",
+  });
   registerTmuxPrompt({
     taskId: "tM", runId: "rM",
     paneText: "?", choices: [{ key: "1", label: "Y" }], fingerprint: "fp",
   });
   const kinds = listPendingForTask("tM").map((r) => r.kind).sort();
-  expect(kinds).toEqual(["question", "tmux_prompt"]);
+  expect(kinds).toEqual(["ask_questions", "tmux_prompt"]);
 });
 
 test("cancelPendingForTask resolves tmux_prompt entries with the sentinel", async () => {
@@ -306,16 +310,19 @@ test("registerTmuxPrompt rejects reserved sentinel keys", async () => {
 test("answer* paths emit on the resolved broadcaster", async () => {
   const {
     setResolvedBroadcaster,
-    registerQuestion, answerQuestion,
+    registerScrapedAskQuestions, resolveScrapedAskQuestions,
     registerTmuxPrompt, answerTmuxPrompt,
     cancelPendingForTask,
   } = await import("./interactions.ts");
   const seen: Array<{ id: string; kind: string }> = [];
   setResolvedBroadcaster((r) => { seen.push({ id: r.id, kind: r.kind }); });
 
-  const q = registerQuestion({ taskId: "tR", runId: "rR", question: "?" });
-  answerQuestion(q.id, { selected: ["ok"] });
-  await q.answer;
+  const q = registerScrapedAskQuestions({
+    taskId: "tR", runId: "rR",
+    questions: [{ question: "?", options: [{ label: "A" }] }],
+    fingerprint: "fp-rq",
+  });
+  resolveScrapedAskQuestions(q.id);
 
   const t = registerTmuxPrompt({
     taskId: "tR", runId: "rR",
@@ -333,6 +340,6 @@ test("answer* paths emit on the resolved broadcaster", async () => {
   await t2.answer;
 
   // Expect three resolution emissions in order.
-  expect(seen.map((s) => s.kind)).toEqual(["question", "tmux_prompt", "tmux_prompt"]);
+  expect(seen.map((s) => s.kind)).toEqual(["ask_questions", "tmux_prompt", "tmux_prompt"]);
   expect(seen.map((s) => s.id)).toEqual([q.id, t.id, t2.id]);
 });

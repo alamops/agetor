@@ -52,18 +52,6 @@ export interface AgentModelMap {
   "codex": { id: string; label?: string }[];
 }
 
-/** Pending clarifying question (from the ask_user MCP tool). */
-export interface PendingQuestion {
-  kind: "question";
-  id: string;
-  taskId: string;
-  runId: string;
-  question: string;
-  choices?: string[];
-  multi?: boolean;
-  createdAt: number;
-}
-
 /** Pending multi-question card from claude's built-in AskUserQuestion tool
  *  (scraper-sourced). */
 export interface PendingAskQuestions {
@@ -96,7 +84,6 @@ export interface PendingTmuxPrompt {
 }
 
 export type PendingInteraction =
-  | PendingQuestion
   | PendingAskQuestions
   | PendingTmuxPrompt;
 
@@ -374,12 +361,6 @@ export const api = {
     return body as { path: string; basename: string };
   },
 
-  /** Interactions: clarifying questions (from the ask_user MCP tool). */
-  answerQuestion: (id: string, body: { selected: string[]; custom?: string }) =>
-    j<{ ok: boolean }>(`/questions/${id}/answer`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
   /** Answer claude's AskUserQuestion (scraper-sourced). One entry per
    *  question in the original tool input, in the same order. */
   answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; custom?: string }> }) =>

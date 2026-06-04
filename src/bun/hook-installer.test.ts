@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 // Top-level: db.ts captures AGETOR_DATA_DIR at first import. hook-installer
-// imports db.ts indirectly via dataDir for the bin/ directory path.
+// imports db.ts indirectly via dataDir for the worktree-namespace check.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-hook-installer-"));
 
 function makeCwd(): string {
@@ -17,23 +17,21 @@ function readSettings(cwd: string): Record<string, unknown> {
 }
 
 beforeEach(() => {
-  // Each test gets a fresh dataDir-derived bin/ — materialiseSharedFiles is
-  // memoised per-process so we only verify *behaviour around* the shared
-  // files, not that they're re-written each time.
+  // No per-test setup needed — agetor materialises no shared files any more.
 });
 
-test("ensureInstalledMerged: writes hook + MCP entry into an empty repo", async () => {
+test("ensureInstalledMerged: writes a clean settings file into an empty repo (no hook, no MCP)", async () => {
   const { ensureInstalledMerged } = await import("./hook-installer.ts");
   const cwd = makeCwd();
   const paths = ensureInstalledMerged(cwd);
   expect(paths).not.toBeNull();
 
   const settings = readSettings(cwd) as { hooks?: { PreToolUse?: unknown[] }; mcpServers?: Record<string, unknown> };
-  // Agetor no longer installs a PreToolUse hook at all (the modal tools run
-  // natively; tool approvals fall to claude's own permission modals).
+  // Agetor is non-invasive: it installs no PreToolUse hook and no MCP server.
   expect(settings.hooks?.PreToolUse).toBeUndefined();
-  // mcpServers.agetor is still wired (the ask_user MCP channel).
-  expect(settings.mcpServers?.agetor).toBeDefined();
+  expect(settings.mcpServers).toBeUndefined();
+  // And it never writes a CLAUDE.md.
+  expect(existsSync(path.join(cwd, ".claude", "CLAUDE.md"))).toBe(false);
 });
 
 test("ensureInstalledMerged: preserves a pre-existing user PreToolUse entry", async () => {
@@ -66,18 +64,19 @@ test("ensureInstalledMerged: preserves a pre-existing user PreToolUse entry", as
   expect(settings.permissions.allow).toEqual(["Bash(git push *)"]);
 });
 
-test("ensureInstalledMerged: re-merge stays clean — never installs a PreToolUse hook", async () => {
+test("ensureInstalledMerged: re-merge stays clean — never installs a PreToolUse hook or MCP", async () => {
   const { ensureInstalledMerged } = await import("./hook-installer.ts");
   const cwd = makeCwd();
   ensureInstalledMerged(cwd);
   ensureInstalledMerged(cwd);
   ensureInstalledMerged(cwd);
 
-  const settings = readSettings(cwd) as { hooks?: { PreToolUse?: unknown[] } };
+  const settings = readSettings(cwd) as { hooks?: { PreToolUse?: unknown[] }; mcpServers?: Record<string, unknown> };
   expect(settings.hooks?.PreToolUse).toBeUndefined();
+  expect(settings.mcpServers).toBeUndefined();
 });
 
-test("ensureInstalledMerged: strips stale agetor entries from a previous data-dir", async () => {
+test("ensureInstalledMerged: strips a stale agetor PreToolUse hook from a previous data-dir", async () => {
   const { ensureInstalledMerged } = await import("./hook-installer.ts");
   const cwd = makeCwd();
   const dir = path.join(cwd, ".claude");
@@ -107,22 +106,43 @@ test("ensureInstalledMerged: strips stale agetor entries from a previous data-di
   expect(commands.some((c) => c.endsWith("agetor-approval-hook.sh"))).toBe(false);
 });
 
-test("ensureInstalledMerged: leaves a user-claimed `agetor` MCP server name alone", async () => {
+test("ensureInstalledMerged: strips a stale `mcpServers.agetor` registration (no new one added)", async () => {
   const { ensureInstalledMerged } = await import("./hook-installer.ts");
   const cwd = makeCwd();
   const dir = path.join(cwd, ".claude");
   require("node:fs").mkdirSync(dir, { recursive: true });
+  // Settings a previous agetor build wrote: the `agetor` MCP launcher plus an
+  // unrelated user-installed MCP server that must survive untouched.
   writeFileSync(path.join(dir, "settings.local.json"), JSON.stringify({
     mcpServers: {
-      // User picked the same name for an unrelated server.
-      agetor: { command: "/u/their-agetor.sh" },
+      agetor: { command: "/old/.agetor/bin/agetor-mcp.sh" },
+      context7: { command: "/u/context7.sh" },
     },
   }));
 
   ensureInstalledMerged(cwd);
 
-  const settings = readSettings(cwd) as { mcpServers: { agetor: { command: string } } };
-  expect(settings.mcpServers.agetor.command).toBe("/u/their-agetor.sh");
+  const settings = readSettings(cwd) as { mcpServers: Record<string, { command: string }> };
+  // The stale agetor registration is gone, and none is re-added.
+  expect(settings.mcpServers.agetor).toBeUndefined();
+  // Every other MCP server is left exactly as it was.
+  expect(settings.mcpServers.context7?.command).toBe("/u/context7.sh");
+});
+
+test("ensureInstalledMerged: drops the whole mcpServers object once the only key (agetor) is stripped", async () => {
+  const { ensureInstalledMerged } = await import("./hook-installer.ts");
+  const cwd = makeCwd();
+  const dir = path.join(cwd, ".claude");
+  require("node:fs").mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, "settings.local.json"), JSON.stringify({
+    mcpServers: { agetor: { command: "/old/.agetor/bin/agetor-mcp.sh" } },
+  }));
+
+  ensureInstalledMerged(cwd);
+
+  const settings = readSettings(cwd) as { mcpServers?: Record<string, unknown> };
+  // Mirrors the empty-PreToolUse handling: drop the key, don't leave `{}`.
+  expect(settings.mcpServers).toBeUndefined();
 });
 
 test("ensureInstalledMerged: refuses to overwrite malformed JSON and returns null", async () => {
@@ -163,7 +183,7 @@ test("ensureInstalledMerged: empty file content treated as fresh install", async
   expect(result).not.toBeNull();
   const settings = readSettings(cwd) as { hooks?: { PreToolUse?: unknown[] }; mcpServers?: Record<string, unknown> };
   expect(settings.hooks?.PreToolUse).toBeUndefined();
-  expect(settings.mcpServers?.agetor).toBeDefined();
+  expect(settings.mcpServers).toBeUndefined();
 });
 
 test("ensureInstalledMerged: returns null when the cwd doesn't exist", async () => {
@@ -173,54 +193,10 @@ test("ensureInstalledMerged: returns null when the cwd doesn't exist", async () 
   expect(ensureInstalledMerged(missing)).toBeNull();
 });
 
-test("installScopeForMode: bypass → narrow-no-mcp, auto → narrow, everything else → full", async () => {
-  const { installScopeForMode } = await import("./hook-installer.ts");
-  expect(installScopeForMode("bypass")).toBe("narrow-no-mcp");
-  expect(installScopeForMode("auto")).toBe("narrow");
-  // Interactive modes still want UI-routed approval + clarifying-question cards.
-  expect(installScopeForMode("ask")).toBe("full");
-  expect(installScopeForMode("plan")).toBe("full");
-  expect(installScopeForMode("acceptEdits")).toBe("full");
-  // Unknown future modes default to full — safer to over-route than to leak
-  // hands-off behavior into a mode the user didn't opt into.
-  expect(installScopeForMode("future-mode")).toBe("full");
-  expect(installScopeForMode(null)).toBe("full");
-  expect(installScopeForMode(undefined)).toBe("full");
-});
-
-test("ensureInstalled (narrow): matcher only catches AskUserQuestion + ExitPlanMode, MCP + CLAUDE.md wired", async () => {
+test("ensureInstalled (owned worktree): writes a clean settings file — no hook, no MCP, no CLAUDE.md", async () => {
   const { ensureInstalled } = await import("./hook-installer.ts");
   const cwd = makeCwd();
-  ensureInstalled(cwd, "narrow");
-  const settings = readSettings(cwd) as {
-    hooks?: { PreToolUse?: Array<{ matcher: string }> };
-    mcpServers?: Record<string, unknown>;
-  };
-  expect(settings.hooks?.PreToolUse).toBeUndefined();
-  // narrow keeps the agetor MCP so claude can still call ask_user for clarifications.
-  expect(settings.mcpServers?.agetor).toBeDefined();
-  // CLAUDE.md is written whenever the MCP is — narrow has MCP, so addendum present.
-  expect(existsSync(path.join(cwd, ".claude", "CLAUDE.md"))).toBe(true);
-});
-
-test("ensureInstalled (full): CLAUDE.md addendum includes the tool-not-found fallback instruction", async () => {
-  // Belt-and-suspenders for the edge case: claude run directly inside an
-  // agetor-owned worktree reads CLAUDE.md but the bypassed MCP launcher
-  // never registers ask_user. The addendum must instruct the agent to
-  // fall back to plain text on tool-not-found rather than retry.
-  const { ensureInstalled } = await import("./hook-installer.ts");
-  const { readFileSync } = await import("node:fs");
-  const cwd = makeCwd();
-  ensureInstalled(cwd, "full");
-  const addendum = readFileSync(path.join(cwd, ".claude", "CLAUDE.md"), "utf8");
-  expect(addendum).toContain("tool not found");
-  expect(addendum).toContain("plain text");
-});
-
-test("ensureInstalled (narrow-no-mcp): narrow matcher, no MCP server, no CLAUDE.md", async () => {
-  const { ensureInstalled } = await import("./hook-installer.ts");
-  const cwd = makeCwd();
-  ensureInstalled(cwd, "narrow-no-mcp");
+  ensureInstalled(cwd);
   const settings = readSettings(cwd) as {
     hooks?: { PreToolUse?: Array<{ matcher: string }> };
     mcpServers?: Record<string, unknown>;
@@ -230,43 +206,7 @@ test("ensureInstalled (narrow-no-mcp): narrow matcher, no MCP server, no CLAUDE.
   expect(existsSync(path.join(cwd, ".claude", "CLAUDE.md"))).toBe(false);
 });
 
-test("ensureInstalled (full): matcher is `.*`, MCP wired, CLAUDE.md addendum written", async () => {
-  const { ensureInstalled } = await import("./hook-installer.ts");
-  const cwd = makeCwd();
-  ensureInstalled(cwd, "full");
-  const settings = readSettings(cwd) as {
-    hooks?: { PreToolUse?: Array<{ matcher: string }> };
-    mcpServers?: Record<string, unknown>;
-  };
-  expect(settings.hooks?.PreToolUse).toBeUndefined();
-  expect(settings.mcpServers?.agetor).toBeDefined();
-  // CLAUDE.md addendum teaches claude when to prefer the ask_user MCP
-  // tool over plain-text clarification — the central training signal for
-  // one of agetor's main value-adds. Always written in owned worktrees;
-  // never written to user repos (ensureInstalledMerged path).
-  expect(existsSync(path.join(cwd, ".claude", "CLAUDE.md"))).toBe(true);
-});
-
-test("ensureInstalledMerged (narrow-no-mcp): strips a previously-installed agetor MCP entry", async () => {
-  const { ensureInstalledMerged } = await import("./hook-installer.ts");
-  const cwd = makeCwd();
-  // Seed a prior full install — full scope writes an mcpServers.agetor entry.
-  ensureInstalledMerged(cwd, "full");
-  expect((readSettings(cwd) as { mcpServers?: { agetor?: unknown } }).mcpServers?.agetor).toBeDefined();
-  // Re-install with narrow-no-mcp (matches `bypass`): our prior agetor MCP
-  // entry must be removed so a hands-off run doesn't leave a dangling
-  // clarifying-question channel claude could still call into.
-  ensureInstalledMerged(cwd, "narrow-no-mcp");
-  const after = readSettings(cwd) as {
-    hooks?: { PreToolUse?: Array<{ matcher: string }> };
-    mcpServers?: Record<string, unknown>;
-  };
-  expect(after.hooks?.PreToolUse).toBeUndefined();
-  // Whole mcpServers key is dropped once its only key (`agetor`) is removed.
-  expect(after.mcpServers).toBeUndefined();
-});
-
-test("ensureInstalledForCwd: overwrites inside an agetor-owned worktree", async () => {
+test("ensureInstalledForCwd: cleans up inside an agetor-owned worktree", async () => {
   const { ensureInstalledForCwd } = await import("./hook-installer.ts");
   // Simulate an agetor-owned worktree path. `dataDir` is the AGETOR_DATA_DIR
   // we set at the top of this file, so anything under it counts as owned.
@@ -280,11 +220,10 @@ test("ensureInstalledForCwd: overwrites inside an agetor-owned worktree", async 
     mcpServers?: Record<string, unknown>;
   };
   expect(settings.hooks?.PreToolUse).toBeUndefined();
-  // The MCP is still wired for owned worktrees (full scope for `ask`).
-  expect(settings.mcpServers?.agetor).toBeDefined();
+  expect(settings.mcpServers).toBeUndefined();
 });
 
-test("ensureInstalled preserves `permissions.allow` across re-spawns (regression)", async () => {
+test("ensureInstalled preserves `permissions.allow` and other keys across re-spawns (regression)", async () => {
   // Repro of the bug where ensureInstalled built a fresh settings object
   // on every call, clobbering pre-existing `permissions.allow` entries
   // between the first task spawn and a re-run. Today those entries come
@@ -298,7 +237,7 @@ test("ensureInstalled preserves `permissions.allow` across re-spawns (regression
   require("node:fs").mkdirSync(owned, { recursive: true });
 
   // 1. First install (fresh worktree, no settings file).
-  ensureInstalled(owned, "full");
+  ensureInstalled(owned);
 
   // 2. Simulate a permissions.allow entry landing in the same settings
   //    file (from any of the sources noted above).
@@ -310,14 +249,14 @@ test("ensureInstalled preserves `permissions.allow` across re-spawns (regression
   require("node:fs").writeFileSync(settingsFile, JSON.stringify(after1, null, 2));
 
   // 3. Re-spawn: ensureInstalled runs again on the same cwd.
-  ensureInstalled(owned, "full");
+  ensureInstalled(owned);
 
   const final = JSON.parse(require("node:fs").readFileSync(settingsFile, "utf8"));
   expect(final.permissions?.allow).toEqual(["Bash(git status)"]);
   expect(final.experimentalUserKey).toEqual({ keep: true });
-  // No agetor PreToolUse hook is installed; the MCP is still wired.
+  // No agetor PreToolUse hook and no MCP are installed.
   expect(final.hooks?.PreToolUse).toBeUndefined();
-  expect(final.mcpServers?.agetor).toBeDefined();
+  expect(final.mcpServers).toBeUndefined();
 });
 
 test("ensureInstalled: strips permission entries claude's parser would reject (owned worktree self-heal)", async () => {
@@ -339,15 +278,15 @@ test("ensureInstalled: strips permission entries claude's parser would reject (o
     },
   }));
 
-  ensureInstalled(owned, "full");
+  ensureInstalled(owned);
 
   const settings = readSettings(owned) as { permissions: { allow: string[] } };
   expect(settings.permissions.allow).toEqual(["Bash(git status)", "Edit(/repo/src/**)"]);
 });
 
 test("ensureInstalledMerged: does NOT strip a user repo's own permission entries", async () => {
-  // The user's source repo (isolation=none) — we add our hook but must
-  // never silently delete the user's version-controlled rules, even ones
+  // The user's source repo (isolation=none) — we strip our stale entries but
+  // must never silently delete the user's version-controlled rules, even ones
   // claude would itself reject. claude's own startup dialog surfaces those.
   const { ensureInstalledMerged } = await import("./hook-installer.ts");
   const cwd = makeCwd();

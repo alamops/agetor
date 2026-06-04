@@ -100,18 +100,10 @@ export interface ClaudeLaunchOptions {
   configDir: string | null;
   /**
    * Agetor permission mode for this task (see AGENT_OPTIONS in
-   * shared/types.ts). Forwarded to `ensureInstalledForCwd` to pick the
-   * install scope:
-   *   - `auto` and `bypass` → narrow PreToolUse matcher that only catches
-   *     AskUserQuestion + ExitPlanMode. For `auto` this is critical: with
-   *     a narrow matcher, claude's own permission engine (including its
-   *     AI auto-mode classifier) handles every other tool call, since
-   *     PreToolUse hooks are terminal when they match. A `.*` matcher
-   *     here would short-circuit the classifier and re-introduce the
-   *     "every tool needs a card" problem.
-   *   - Other modes (`ask`, `plan`, `acceptEdits`) get the full `.*`
-   *     matcher so agetor's UI cards render for every tool call.
-   * See `installScopeForMode` in hook-installer.ts.
+   * shared/types.ts). Drives `--permission-mode` / `--dangerously-skip-
+   * permissions` on the claude launch argv. (agetor no longer installs any
+   * PreToolUse hook or MCP server, so this no longer influences settings
+   * installation — see `ensureInstalledForCwd` in hook-installer.ts.)
    */
   mode: string | null;
 }
@@ -2046,29 +2038,24 @@ function attachTailer(state: SessionState): void {
 export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   const sessionName = sessionNameFor(opts.taskId);
 
-  // Install the PreToolUse hook + ask_user MCP server before tmux starts
-  // so claude picks them up from `.claude/settings.local.json` on launch.
-  // Owned worktrees get an overwrite install; user-repo cwds (isolation=
-  // none) get a merge install that preserves any existing user hooks /
-  // mcpServers.
-  //
-  // Scope depends on `opts.mode`:
-  //  - `auto` and `bypass` → narrow matcher (only AskUserQuestion +
-  //    ExitPlanMode). In `auto` this is what lets claude's own auto-mode
-  //    classifier handle every other tool call — PreToolUse hooks are
-  //    terminal when they match, so a `.*` matcher would short-circuit
-  //    the classifier and force every tool through agetor's UI.
-  //  - `ask` / `plan` / `acceptEdits` / default → full `.*` matcher;
-  //    per-tool cards render in the run panel.
+  // Clean up any stale agetor settings before tmux starts so claude reads a
+  // tidy `.claude/settings.local.json` on launch. agetor is non-invasive: it
+  // installs no PreToolUse hook and no MCP server. This call only STRIPS a
+  // stale agetor PreToolUse entry / `mcpServers.agetor` key a previous build
+  // wrote (so claude doesn't error launching a deleted MCP launcher) and
+  // self-heals permission rules in owned worktrees. Owned worktrees get a
+  // self-heal-safe pass; user-repo cwds (isolation=none) get a merge pass
+  // that preserves all existing user config.
   ensureInstalledForCwd(opts.cwd, opts.mode);
 
   // Build the tmux command. `-e KEY=VAL` injects env vars into the new
   // session (so the spawned claude inherits them); `--` separates the tmux
   // flags from the command to run.
   //
-  // We unconditionally inject our localhost API coordinates so the hook
-  // script + MCP server can reach back. These are no-ops on isolation=none
-  // tasks (no settings.local.json registers them), but they don't hurt.
+  // We unconditionally inject our localhost API coordinates. These are
+  // vestigial now that agetor installs no hook script or MCP server (nothing
+  // in the spawned claude reads them back), but they're harmless and cheap to
+  // keep for any future child that wants to call back into the API.
   //
   // PATH is injected explicitly because the tmux *server* captures env at
   // its first launch and reuses it for every subsequent session — passing

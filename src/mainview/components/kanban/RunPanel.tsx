@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, Bot, Check, ClipboardList, Copy, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, Globe, HelpCircle, ListTodo, MessageSquareQuote, Plug, Search, Send, Slash,
+  GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
@@ -1297,8 +1297,6 @@ function RunEventList({
   const renderInteraction = (it: PendingInteraction) => {
     const onResolved = onInteractionResolved ?? (() => {});
     switch (it.kind) {
-      case "question":
-        return <QuestionCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
       case "ask_questions":
         return <AskQuestionsCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
       case "tmux_prompt":
@@ -2597,104 +2595,15 @@ function summarizeToolInput(toolName: string, input: unknown): string {
   return s.length > 120 ? s.slice(0, 120) + "…" : s;
 }
 
-function QuestionCard({
-  req,
-  onResolved,
-}: {
-  req: Extract<PendingInteraction, { kind: "question" }>;
-  onResolved: (id: string) => void;
-}) {
-  const [busy, setBusy] = useState(false);
-  const [selected, setSelected] = useState<string[]>([]);
-  const [custom, setCustom] = useState("");
-
-  const choices = req.choices ?? [];
-  const multi = !!req.multi;
-
-  const toggle = (choice: string) => {
-    if (multi) {
-      setSelected((cur) =>
-        cur.includes(choice) ? cur.filter((c) => c !== choice) : [...cur, choice],
-      );
-    } else {
-      setSelected([choice]);
-    }
-  };
-
-  const send = async () => {
-    if (busy) return;
-    if (selected.length === 0 && !custom.trim()) return;
-    setBusy(true);
-    onResolved(req.id);
-    try {
-      await api.answerQuestion(req.id, {
-        selected,
-        custom: custom.trim() || undefined,
-      });
-    } catch {
-      // Optimistic remove already fired; the server broadcast is the
-      // source of truth, so a transient failure just leaves the card gone.
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div className="rounded-md border border-border/60 bg-card p-2 text-xs">
-      <div className="mb-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-        <MessageSquareQuote className="size-3.5" aria-hidden /> Claude is asking
-      </div>
-      <p className="mb-2 whitespace-pre-wrap">{req.question}</p>
-      {choices.length > 0 && (
-        <div className="mb-2 space-y-1">
-          {choices.map((c) => (
-            <label key={c} className="flex cursor-pointer items-center gap-2">
-              <input
-                type={multi ? "checkbox" : "radio"}
-                name={`question-${req.id}`}
-                checked={selected.includes(c)}
-                onChange={() => toggle(c)}
-              />
-              <span>{c}</span>
-            </label>
-          ))}
-        </div>
-      )}
-      <Textarea
-        value={custom}
-        onChange={(e) => setCustom(e.target.value)}
-        placeholder={
-          choices.length > 0
-            ? "Custom answer (optional)…"
-            : "Type your answer…"
-        }
-        rows={2}
-        className="resize-none text-xs"
-      />
-      <div className="mt-2 flex justify-end">
-        <Button
-          size="sm"
-          disabled={busy || (selected.length === 0 && !custom.trim())}
-          onClick={() => void send()}
-        >
-          Send
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 /**
- * Card for claude's built-in AskUserQuestion (intercepted via PreToolUse
- * hook). One claude tool call can carry multiple sub-questions; we render
+ * Card for claude's built-in AskUserQuestion (scraper-sourced from the tmux
+ * pane). One claude tool call can carry multiple sub-questions; we render
  * each with its own radio/checkbox group + free-text "Custom answer"
  * field. A single Send button at the bottom commits all of them.
  *
- * Differs from QuestionCard (which handles our own MCP `ask_user` tool)
- * in two ways: the wire format includes rich `options` with descriptions,
- * and the answer round-trip goes through `/ask-questions/:id/answer` —
- * the server formats the picks into claude's canonical "User has
- * answered…" string and returns it as the hook's `permissionDecisionReason`.
+ * The wire format includes rich `options` with descriptions, and the answer
+ * round-trip goes through `/ask-questions/:id/answer` — the server plans the
+ * keystrokes from the user's picks and drives them into the native modal.
  */
 function AskQuestionsCard({
   req,

@@ -58,14 +58,11 @@ import { listAgentCapabilities } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
-  answerQuestion,
   answerTmuxPrompt,
   findTmuxPromptById,
   getAskQuestionsById,
   listPendingForTask,
-  registerQuestion,
   type AskQuestionsAnswer,
-  type QuestionAnswer,
 } from "./interactions.ts";
 import { MODEL_EFFORT_SUPPORT, TASK_TYPES } from "../shared/types.ts";
 import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
@@ -1194,60 +1191,6 @@ export function startApiServer() {
           const abs = path.join(dir, basename);
           await Bun.write(abs, buf);
           return json({ path: abs, basename }, { headers: corsHeaders(req) });
-        }),
-      },
-
-      // ─── Interactions: clarifying questions (from the ask_user MCP tool) ──
-      "/questions": {
-        POST: authed(async (req) => {
-          const url = new URL(req.url);
-          const taskId = url.searchParams.get("taskId");
-          if (!taskId) {
-            return json({ error: "taskId required" }, { status: 400, headers: corsHeaders(req) });
-          }
-          const body = (await req.json().catch(() => ({}))) as {
-            question?: string;
-            choices?: string[];
-            multi?: boolean;
-          };
-          if (typeof body.question !== "string" || body.question.trim() === "") {
-            return json(
-              { error: "question required" },
-              { status: 400, headers: corsHeaders(req) },
-            );
-          }
-          const task = tasks.get(taskId);
-          const runId = task?.runId;
-          if (!runId) {
-            return json(
-              { selected: [], custom: "(no active run to ask)" } satisfies QuestionAnswer,
-              { headers: corsHeaders(req) },
-            );
-          }
-          const { answer } = registerQuestion({
-            taskId,
-            runId,
-            question: body.question,
-            choices: body.choices,
-            multi: body.multi,
-          });
-          return json(await answer, { headers: corsHeaders(req) });
-        }),
-      },
-
-      "/questions/:id/answer": {
-        POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as Partial<QuestionAnswer>;
-          const selected = Array.isArray(body.selected) ? body.selected : [];
-          const custom = typeof body.custom === "string" ? body.custom : undefined;
-          if (selected.length === 0 && (!custom || !custom.trim())) {
-            return json(
-              { error: "selected or custom required" },
-              { status: 400, headers: corsHeaders(req) },
-            );
-          }
-          const ok = answerQuestion(req.params.id, { selected, custom });
-          return json({ ok }, { headers: corsHeaders(req) });
         }),
       },
 
