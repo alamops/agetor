@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
@@ -294,8 +294,13 @@ function RunPanelBody({
     return () => { cancelled = true; };
   }, [task.id]);
 
-  const dismissInteraction = (id: string) =>
-    setInteractions((cur) => cur.filter((x) => x.id !== id));
+  // Stable identity so RunEventList's memoized section tree isn't invalidated
+  // on every parent re-render (e.g. the 2s runs poll). `setInteractions` is a
+  // stable setter, so the empty dep list is correct.
+  const dismissInteraction = useCallback(
+    (id: string) => setInteractions((cur) => cur.filter((x) => x.id !== id)),
+    [],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -338,6 +343,21 @@ function RunPanelBody({
       e.stream === "user"
         ? `user|${e.runId}|${normalizeForKey(e.data ?? "").slice(0, 200)}`
         : `${e.ts}|${e.runId}|${e.stream}|${(e.data ?? "").slice(0, 200)}`;
+    // Coalesce the open-time replay burst into one state update per animation
+    // frame. On connect the server streams the whole history as one SSE frame
+    // per event; each `onmessage` is its own event-loop task, so React can't
+    // auto-batch them. Appending one-at-a-time meant N renders of the full
+    // list = O(N²) on open. Buffering + a single rAF flush makes it O(N).
+    // Dedup (below) stays synchronous so it's unaffected by the batching.
+    let pending: RunEvent[] = [];
+    let raf = 0;
+    const flush = () => {
+      raf = 0;
+      if (pending.length === 0) return;
+      const batch = pending;
+      pending = [];
+      setEvents((cur) => [...cur, ...batch]);
+    };
     const unsub = api.subscribeTask(task.id, (e) => {
       const key = keyFor(e);
       if (seen.has(key)) return;
@@ -369,9 +389,13 @@ function RunPanelBody({
         } catch { /* ignore malformed */ }
         return;
       }
-      setEvents((cur) => [...cur, e]);
+      pending.push(e);
+      if (raf === 0) raf = requestAnimationFrame(flush);
     });
-    return unsub;
+    return () => {
+      if (raf !== 0) cancelAnimationFrame(raf);
+      unsub();
+    };
   }, [task.id]);
 
   // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
@@ -1258,47 +1282,6 @@ function RunEventList({
     return map;
   }, [normalised]);
 
-  const renderEvent = (e: RunEvent, key: string) => {
-    switch (e.stream) {
-      case "user":
-        return [<UserMessageBlock key={key} text={e.data} />];
-      case "assistant":
-        return [<AssistantBlock key={key} text={e.data} />];
-      case "thinking":
-        return [<ThinkingBlock key={key} text={e.data} />];
-      case "tool_use": {
-        const parsed = safeParse<ParsedToolUse>(e.data);
-        if (!parsed) return [<RawText key={key} text={e.data} muted />];
-        const result = resultByToolId.get(parsed.id);
-        return [<ToolUseBlock key={key} call={parsed} result={result} />];
-      }
-      case "tool_result": {
-        const parsed = safeParse<ParsedToolResult>(e.data);
-        if (parsed && parsed.toolUseId && resultByToolId.get(parsed.toolUseId)) return [];
-        return [<ToolResultBlock key={key} result={parsed} />];
-      }
-      case "status":
-        return [<StatusDivider key={key} text={e.data} />];
-      case "stderr":
-        return [<ErrorBlock key={key} text={e.data} />];
-      case "stdout":
-      case "interaction":
-      default:
-        if (e.stream === "interaction") return [];
-        return [<RawText key={key} text={e.data} />];
-    }
-  };
-
-  const renderInteraction = (it: PendingInteraction) => {
-    const onResolved = onInteractionResolved ?? (() => {});
-    switch (it.kind) {
-      case "ask_questions":
-        return <AskQuestionsCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
-      case "tmux_prompt":
-        return <TmuxPromptCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
-    }
-  };
-
   // Interleave events and interaction cards by timestamp. Interactions
   // already carry a `createdAt`; pair each with the first event-index
   // whose ts is >= createdAt so it lands next to the agent activity that
@@ -1327,27 +1310,83 @@ function RunEventList({
   // for the duration of its own section — when the next user message
   // appears in view, the previous one releases naturally rather than
   // stacking on top of it.
-  const sections: { header: React.ReactNode; body: React.ReactNode[] }[] = [];
-  let current: { header: React.ReactNode; body: React.ReactNode[] } = { header: null, body: [] };
-  for (let i = 0; i < normalised.length; i++) {
-    const e = normalised[i]!;
-    const key = `${e.ts}-${i}`;
-    const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
-    if (e.stream === "user") {
-      if (current.header !== null || current.body.length > 0) sections.push(current);
-      current = { header: renderEvent(e, key)[0] ?? null, body: [...before] };
-    } else {
-      current.body.push(...before, ...renderEvent(e, key));
+  //
+  // Memoized over the parsed inputs: this rebuilds the rendered element tree
+  // only when the events / interactions / tool-result map actually change.
+  // A bare `setRuns` poll re-render (every 2s) hits the cache, so React gets
+  // the identical element references and bails out of the whole subtree —
+  // without this, the O(n) loop + every block's markdown re-parsed on each
+  // poll is what made long conversations lag. `renderEvent`/`renderInteraction`
+  // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`)
+  // are tracked explicitly.
+  const sections = useMemo(() => {
+    const renderEvent = (e: RunEvent, key: string): React.ReactNode[] => {
+      switch (e.stream) {
+        case "user":
+          return [<UserMessageBlock key={key} text={e.data} />];
+        case "assistant":
+          return [<AssistantBlock key={key} text={e.data} />];
+        case "thinking":
+          return [<ThinkingBlock key={key} text={e.data} />];
+        case "tool_use": {
+          const parsed = safeParse<ParsedToolUse>(e.data);
+          if (!parsed) return [<RawText key={key} text={e.data} muted />];
+          const result = resultByToolId.get(parsed.id);
+          return [<ToolUseBlock key={key} call={parsed} result={result} />];
+        }
+        case "tool_result": {
+          const parsed = safeParse<ParsedToolResult>(e.data);
+          if (parsed && parsed.toolUseId && resultByToolId.get(parsed.toolUseId)) return [];
+          return [<ToolResultBlock key={key} result={parsed} />];
+        }
+        case "status":
+          return [<StatusDivider key={key} text={e.data} />];
+        case "stderr":
+          return [<ErrorBlock key={key} text={e.data} />];
+        case "stdout":
+        case "interaction":
+        default:
+          if (e.stream === "interaction") return [];
+          return [<RawText key={key} text={e.data} />];
+      }
+    };
+    const renderInteraction = (it: PendingInteraction) => {
+      const onResolved = onInteractionResolved ?? (() => {});
+      switch (it.kind) {
+        case "ask_questions":
+          return <AskQuestionsCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
+        case "tmux_prompt":
+          return <TmuxPromptCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
+      }
+    };
+
+    const out: { key: string; header: React.ReactNode; body: React.ReactNode[] }[] = [];
+    // Stable per-section key = the key of the section's first event (`ts-index`,
+    // unique and append-stable), so appending events keeps earlier sections'
+    // identity instead of reindexing them as the old `sec-${idx}` key did.
+    let current: { key: string; header: React.ReactNode; body: React.ReactNode[] } = { key: "", header: null, body: [] };
+    for (let i = 0; i < normalised.length; i++) {
+      const e = normalised[i]!;
+      const key = `${e.ts}-${i}`;
+      const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
+      if (e.stream === "user") {
+        if (current.header !== null || current.body.length > 0) out.push(current);
+        current = { key, header: renderEvent(e, key)[0] ?? null, body: [...before] };
+      } else {
+        if (current.key === "") current.key = key;
+        current.body.push(...before, ...renderEvent(e, key));
+      }
     }
-  }
-  const tail = (interactionByIndex.get(normalised.length) ?? []).map(renderInteraction);
-  current.body.push(...tail);
-  if (current.header !== null || current.body.length > 0) sections.push(current);
+    const tail = (interactionByIndex.get(normalised.length) ?? []).map(renderInteraction);
+    current.body.push(...tail);
+    if (current.header !== null || current.body.length > 0) out.push(current);
+    return out;
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved]);
 
   return (
     <div className="flex flex-col gap-4">
       {sections.map((s, idx) => (
-        <section key={`sec-${idx}`} className="flex flex-col gap-4">
+        <section key={s.key || `sec-${idx}`} className="flex flex-col gap-4">
           {s.header}
           {s.body}
         </section>
@@ -1484,7 +1523,52 @@ function findScrollParent(el: HTMLElement | null): HTMLElement | null {
   return null;
 }
 
-function UserMessageBlock({ text }: { text: string }) {
+// Hoisted ReactMarkdown `components` maps. Defined once at module scope so the
+// prop identity is stable across renders. The previous shape built a fresh
+// `components={{…}}` object inside every render of every markdown block, which
+// forced ReactMarkdown to re-parse/re-render — the dominant cost once a run log
+// is long. The two maps differ only in the code-block background.
+type MdComponents = NonNullable<React.ComponentProps<typeof ReactMarkdown>["components"]>;
+
+// External links open in the system browser via the OS handler.
+const mdRenderLink: NonNullable<MdComponents["a"]> = ({ href, children, ...rest }) => (
+  <ExternalLink {...rest} href={href}>
+    {children}
+  </ExternalLink>
+);
+
+const mdRenderCode: NonNullable<MdComponents["code"]> = ({ className, children, ...props }) => {
+  const isBlock = /language-/.test(className ?? "");
+  if (isBlock) {
+    return (
+      <code className={cn(className, "font-mono text-[11px]")} {...props}>
+        {children}
+      </code>
+    );
+  }
+  return (
+    <code
+      className="rounded bg-muted/60 px-1 py-0.5 font-mono text-[11px] text-foreground"
+      {...props}
+    >
+      {children}
+    </code>
+  );
+};
+
+const USER_MD_COMPONENTS: MdComponents = {
+  a: mdRenderLink,
+  code: mdRenderCode,
+  pre: ({ children }) => <CodeBlock bgClassName="bg-background/60">{children}</CodeBlock>,
+};
+
+const ASSISTANT_MD_COMPONENTS: MdComponents = {
+  a: mdRenderLink,
+  code: mdRenderCode,
+  pre: ({ children }) => <CodeBlock bgClassName="bg-muted/40">{children}</CodeBlock>,
+};
+
+const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false);
   const [needsToggle, setNeedsToggle] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -1539,37 +1623,7 @@ function UserMessageBlock({ text }: { text: string }) {
               ? "max-h-[40vh] overflow-y-auto"
               : "max-h-[4.5rem] overflow-hidden",
           )}>
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            components={{
-              a: ({ href, children, ...rest }) => (
-                <ExternalLink {...rest} href={href}>
-                  {children}
-                </ExternalLink>
-              ),
-              code: ({ className, children, ...props }) => {
-                const isBlock = /language-/.test(className ?? "");
-                if (isBlock) {
-                  return (
-                    <code className={cn(className, "font-mono text-[11px]")} {...props}>
-                      {children}
-                    </code>
-                  );
-                }
-                return (
-                  <code
-                    className="rounded bg-muted/60 px-1 py-0.5 font-mono text-[11px] text-foreground"
-                    {...props}
-                  >
-                    {children}
-                  </code>
-                );
-              },
-              pre: ({ children }) => (
-                <CodeBlock bgClassName="bg-background/60">{children}</CodeBlock>
-              ),
-            }}
-          >
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
             {text}
           </ReactMarkdown>
         </div>
@@ -1585,48 +1639,17 @@ function UserMessageBlock({ text }: { text: string }) {
       </div>
     </div>
   );
-}
+});
 
-function AssistantBlock({ text }: { text: string }) {
+const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) {
   return (
     <div className="agetor-md text-foreground">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          // External links open in the system browser via the OS handler.
-          a: ({ href, children, ...rest }) => (
-            <ExternalLink {...rest} href={href}>
-              {children}
-            </ExternalLink>
-          ),
-          code: ({ className, children, ...props }) => {
-            const isBlock = /language-/.test(className ?? "");
-            if (isBlock) {
-              return (
-                <code className={cn(className, "font-mono text-[11px]")} {...props}>
-                  {children}
-                </code>
-              );
-            }
-            return (
-              <code
-                className="rounded bg-muted/60 px-1 py-0.5 font-mono text-[11px] text-foreground"
-                {...props}
-              >
-                {children}
-              </code>
-            );
-          },
-          pre: ({ children }) => (
-            <CodeBlock bgClassName="bg-muted/40">{children}</CodeBlock>
-          ),
-        }}
-      >
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MD_COMPONENTS}>
         {text}
       </ReactMarkdown>
     </div>
   );
-}
+});
 
 function nodeToText(node: unknown): string {
   if (node === null || node === undefined) return "";
@@ -1680,7 +1703,7 @@ function CodeBlock({
   );
 }
 
-function RawText({ text, muted }: { text: string; muted?: boolean }) {
+const RawText = memo(function RawText({ text, muted }: { text: string; muted?: boolean }) {
   return (
     <div
       className={cn(
@@ -1691,17 +1714,17 @@ function RawText({ text, muted }: { text: string; muted?: boolean }) {
       {text}
     </div>
   );
-}
+});
 
-function ErrorBlock({ text }: { text: string }) {
+const ErrorBlock = memo(function ErrorBlock({ text }: { text: string }) {
   return (
     <div className="whitespace-pre-wrap rounded-md border border-destructive/40 bg-destructive/5 p-2 font-mono text-[11px] text-destructive">
       {text}
     </div>
   );
-}
+});
 
-function StatusDivider({ text }: { text: string }) {
+const StatusDivider = memo(function StatusDivider({ text }: { text: string }) {
   return (
     <div className="flex items-center gap-2 py-1 text-[10px] uppercase tracking-wide text-muted-foreground">
       <span className="h-px flex-1 bg-border" />
@@ -1709,9 +1732,9 @@ function StatusDivider({ text }: { text: string }) {
       <span className="h-px flex-1 bg-border" />
     </div>
   );
-}
+});
 
-function ThinkingBlock({ text }: { text: string }) {
+const ThinkingBlock = memo(function ThinkingBlock({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
   const preview = text.length > 120 ? text.slice(0, 120) + "…" : text;
   return (
@@ -1729,14 +1752,14 @@ function ThinkingBlock({ text }: { text: string }) {
       </div>
     </div>
   );
-}
+});
 
 /** Tool-call card with input rendered per-tool, plus the matched result
  *  collapsed underneath (expand to read full output). Special-cases:
  *  AskUserQuestion + ExitPlanMode get prominent styling because the user
  *  *needs to act on them* — claude is blocked waiting for an answer that
  *  agetor's UI doesn't otherwise prompt for. */
-function ToolUseBlock({ call, result }: { call: ParsedToolUse; result?: ParsedToolResult }) {
+const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: ParsedToolUse; result?: ParsedToolResult }) {
   const summary = formatToolInputSummary(call.name, call.input);
   const isInteractive = call.name === "AskUserQuestion" || call.name === "ExitPlanMode";
   // MCP convention: `mcp__<server>__<tool>`. The server name is always the
@@ -1778,9 +1801,9 @@ function ToolUseBlock({ call, result }: { call: ParsedToolUse; result?: ParsedTo
       )}
     </div>
   );
-}
+});
 
-function ToolResultBlock({ result }: { result: ParsedToolResult | null }) {
+const ToolResultBlock = memo(function ToolResultBlock({ result }: { result: ParsedToolResult | null }) {
   if (!result) return null;
   return (
     <div className="rounded-md border border-border/40 bg-muted/20">
@@ -1790,7 +1813,7 @@ function ToolResultBlock({ result }: { result: ParsedToolResult | null }) {
       <ToolResultBody result={result} />
     </div>
   );
-}
+});
 
 /**
  * Anchor that hands off http(s)/mailto navigation to the OS default browser
