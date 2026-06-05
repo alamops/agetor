@@ -6,6 +6,7 @@ import { Plus, X, TerminalSquare } from "lucide-react";
 import { toast } from "sonner";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { macEditSequence } from "./terminal-keys.ts";
 import type { TerminalTab } from "../../../shared/types.ts";
 
 /** xterm theme tuned to the app's dark zinc palette. */
@@ -116,6 +117,18 @@ function TerminalPane({
 
     const dataSub = term.onData((d) => {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(enc.encode(d));
+    });
+
+    // macOS word/line editing shortcuts (⌥/⌘ + arrows/backspace/delete),
+    // matching VS Code's terminal. See macEditSequence for the mapping + why
+    // xterm's defaults don't work here.
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== "keydown") return true;
+      const seq = macEditSequence(e);
+      if (!seq) return true;
+      e.preventDefault(); // keep the webview from also acting on the combo
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(enc.encode(seq));
+      return false; // handled — don't let xterm emit its own variant
     });
 
     const ro = new ResizeObserver(() => {
