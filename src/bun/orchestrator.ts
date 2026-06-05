@@ -39,6 +39,7 @@ import {
   listAgetorSessions,
   killSessionByName,
   reattachSession,
+  pasteFollowUp,
   sendSlashCommand,
   sendTurn,
   sessionExists,
@@ -781,12 +782,14 @@ export type SendInputResult =
  * Forward a line of user-supplied input to the agent. Behavior depends on
  * agent kind:
  *
- *   • claude-code: each user message is its own turn → its own run row. We
- *     paste the prompt into the live tmux session and queue a new run
- *     slot. If a turn is already in flight, claude's TUI accepts the
- *     keystrokes and replays the prompt as a *new* user turn once the
- *     current one ends — our session state mirrors that with a FIFO of
- *     resolveTurn slots so each queued run resolves on its own end_turn.
+ *   • claude-code: when the session is idle, each user message is its own
+ *     turn → its own run row (paste into the live tmux session + a new turn
+ *     slot via `sendTurn`). When a turn is already in flight, the message is
+ *     *folded* into the active run instead (`pasteFollowUp` — paste into the
+ *     session, record a user event on the current run, no new row/slot). This
+ *     keeps at most one in-flight run per task so claude coalescing queued
+ *     messages can't strand surplus run rows in `running`. See
+ *     `sendTurnInExistingSession`.
  *
  *   • codex: writes to the active run's stdin (single-run model unchanged).
  */
@@ -841,12 +844,36 @@ function sendClaudeTurn(taskId: string, line: string): string | null {
 }
 
 function sendTurnInExistingSession(task: Task, taskId: string, line: string): string {
-  // One run row per user turn — the runs list mirrors the conversation
-  // history at turn granularity. The race that used to make a fast claude
-  // reply land the new row as "succeeded" before the UI ever observed the
-  // "running" transition no longer matters: the unified task-level event
-  // stream surfaces the new user/assistant messages live regardless of
-  // which run row they belong to.
+  // Fold-while-busy: if a turn is already in flight, paste the message into
+  // the live session and record it on the ACTIVE run — no new run row, no new
+  // turn slot. Claude's TUI queues the keystrokes and replays them as part of
+  // the current response. This keeps at most one in-flight run per task, which
+  // is what prevents the stranding bug: claude can coalesce several queued
+  // messages into fewer `end_turn` events than messages, and one slot per
+  // message would leave the surplus slots (and their run rows) stuck `running`
+  // forever. `active.has(task.runId)` is true iff the latest run hasn't
+  // resolved yet (registerActiveRun adds; attachDoneHandler deletes on done) —
+  // a more reliable "in flight" signal than the polled `task.column`.
+  if (task.runId && active.has(task.runId) && pasteFollowUp(taskId, line)) {
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    // Record the user bubble optimistically — `pasteFollowUp` only confirms a
+    // live session exists, not that claude consumed the keystrokes. If the
+    // user hits Stop before claude drains its input buffer, Ctrl+C clears the
+    // queued message (see `cancelRun`) and this bubble has no reply. That's the
+    // same optimism `sendTurn` already runs with; the bubble correctly reflects
+    // that the user did send the message.
+    runs.appendEvent(runId, "user", data);
+    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    return runId;
+  }
+
+  // Idle (or the paste raced a vanishing session): one run row per user turn —
+  // the runs list mirrors the conversation history at turn granularity. The
+  // race that used to make a fast claude reply land the new row as "succeeded"
+  // before the UI ever observed the "running" transition no longer matters:
+  // the unified task-level event stream surfaces the new user/assistant
+  // messages live regardless of which run row they belong to.
   const newRunId = randomUUID();
   const now = Date.now();
   const inheritedSessionId = findLastClaudeSessionId(taskId);

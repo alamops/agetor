@@ -1014,6 +1014,14 @@ interface SessionState {
      *  JSONL data arrives (e.g., the end_turn line is truly the last write). */
     stagedAt: number;
   } | null;
+  /** True while we're folding follow-up messages into the active run (set by
+   *  `pasteFollowUp`). While set, an intermediate `end_turn` boundary does NOT
+   *  pop the turn slot — claude is just moving on to a folded message, so the
+   *  run stays "running" (the task doesn't bounce to `review` between folded
+   *  turns). Only the idle-fire in `flush` resolves the run, once claude has
+   *  been quiet for `END_TURN_IDLE_FIRE_MS`. Cleared in `popEndOfTurn` when the
+   *  slot finally pops (the whole busy period is over). */
+  holdUntilIdle: boolean;
 }
 
 interface TurnSlot {
@@ -1107,6 +1115,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     askCollecting: false,
     askFirstSeenAt: null,
     pendingEndTurn: null,
+    holdUntilIdle: false,
   };
 }
 
@@ -1211,6 +1220,9 @@ const END_TURN_IDLE_FIRE_MS = 800;
  *  one-shot `onEndOfTurn` listener (reattach path, where there's no slot
  *  but the orchestrator still needs to know the run completed). */
 function popEndOfTurn(state: SessionState): void {
+  // The busy period (the active turn plus any folded follow-ups) is ending —
+  // clear the hold so the next genuinely-sequential turn resolves normally.
+  state.holdUntilIdle = false;
   const slot = state.turnQueue[0];
   if (slot) {
     state.turnQueue.shift();
@@ -1508,6 +1520,16 @@ function dispatchLine(state: SessionState, line: string): void {
       // Same message still going, or tool_result for a tool_use in that
       // message → the staged end_turn was spurious. Discard it.
       state.pendingEndTurn = null;
+    } else if (state.holdUntilIdle) {
+      // We're folding follow-ups into the active run: a new turn starting here
+      // is claude beginning to answer a folded message, not the end of the
+      // busy period. Keep the staged end_turn (and the slot) alive so the run
+      // stays "running" — the task must not bounce to `review` between folded
+      // turns. Resolution is deferred to the idle-fire in `flush`, which pops
+      // the slot only once claude has been quiet for END_TURN_IDLE_FIRE_MS.
+      // (Keeping the pending staged rather than discarding it means a trailing
+      // metadata event after the *final* end_turn can't strand the run — the
+      // idle-fire still has a pending to resolve.)
     } else {
       // Something unrelated started → the previous turn truly ended. Fire.
       firePendingEndTurn(state);
@@ -2475,6 +2497,41 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
   // FIFO order.
   void queuePaste(taskId, state.sessionName, prompt, 0, state, { bracketed: true });
   return makeAgent(taskId, done);
+}
+
+/**
+ * Paste a follow-up user message into a live session's tmux input buffer
+ * WITHOUT pushing a turnQueue slot. Used when the user sends a message while
+ * a turn is already in flight: claude's TUI queues the keystrokes and replays
+ * them as part of the current (often coalesced) response, so we fold the
+ * message into the active run instead of opening a new turn slot.
+ *
+ * Why no new slot (unlike `sendTurn`): claude can coalesce several queued
+ * messages into fewer `end_turn` events than messages. One slot per message
+ * would then strand the surplus slots in `turnQueue` forever (their runs stuck
+ * `running`). With no extra slot there is nothing to strand — the single
+ * active slot carries the whole busy period.
+ *
+ * Sets `state.holdUntilIdle` so the run doesn't resolve on the *intermediate*
+ * end_turn between the current response and the folded message — otherwise the
+ * task would bounce to `review` while claude is still working on the follow-up.
+ * The slot resolves only when claude goes quiet (the idle-fire in `flush`),
+ * i.e. "the end is the end."
+ *
+ * Why no `flushSync` (unlike `sendTurn`): `sendTurn` drains leftover JSONL
+ * before pushing its new slot so a stale end_turn can't pop the fresh slot.
+ * Here there is no new slot to protect, and running `flushSync` would instead
+ * fire a staged `pendingEndTurn` and pop the live slot mid-turn — resolving
+ * the active run early. So we set the hold, paste, and nothing else.
+ *
+ * Returns false when no live session exists (caller falls back to spawning).
+ */
+export function pasteFollowUp(taskId: string, prompt: string): boolean {
+  const state = sessions.get(taskId);
+  if (!state) return false;
+  state.holdUntilIdle = true;
+  void queuePaste(taskId, state.sessionName, prompt, 0, state, { bracketed: true });
+  return true;
 }
 
 /**

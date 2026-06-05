@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-queue-"));
 
-const { __forTest, dismissTmuxPrompt } = await import("./claude-tmux.ts");
+const { __forTest, dismissTmuxPrompt, pasteFollowUp } = await import("./claude-tmux.ts");
 
 // Each test gets its own taskId + JSONL file so they can't trample each
 // other. The dispatch logic is purely synchronous on flushSync (we don't
@@ -53,6 +53,23 @@ function midTurnLine(text: string): string {
   }) + "\n";
 }
 
+// id-carrying variants: the turn-end staging keys continuations on
+// `message.id`, so distinct ids make one assistant message clearly a *new*
+// turn rather than a same-message split.
+function endTurnLineId(text: string, id: string): string {
+  return JSON.stringify({
+    type: "assistant",
+    message: { id, content: [{ type: "text", text }], stop_reason: "end_turn" },
+  }) + "\n";
+}
+
+function assistantLineId(text: string, id: string): string {
+  return JSON.stringify({
+    type: "assistant",
+    message: { id, content: [{ type: "text", text }], stop_reason: "tool_use" },
+  }) + "\n";
+}
+
 test("single-turn dispatch: end_turn pops the slot and resolves its promise", async () => {
   const { taskId, jsonlPath } = freshSession();
   const state = __forTest.installSession(taskId, jsonlPath);
@@ -76,6 +93,11 @@ test("single-turn dispatch: end_turn pops the slot and resolves its promise", as
 });
 
 test("pipelined sends: queued slots resolve in FIFO order on successive end_turns", async () => {
+  // Low-level turnQueue mechanism. NOTE: the orchestrator no longer pushes a
+  // slot per rapid follow-up — a message sent while a turn is in flight folds
+  // into the active run via `pasteFollowUp` (no new slot). This FIFO behavior
+  // still backs genuinely-sequential turns (idle between sends, each via
+  // `sendTurn`) and the reattach path, so it stays pinned here.
   const { taskId, jsonlPath } = freshSession();
   const state = __forTest.installSession(taskId, jsonlPath);
   try {
@@ -112,6 +134,116 @@ test("pipelined sends: queued slots resolve in FIFO order on successive end_turn
   } finally {
     __forTest.uninstallSession(taskId);
   }
+});
+
+test("pasteFollowUp: folds into the active turn without pushing a new slot", async () => {
+  // The fold-while-busy path: a follow-up sent mid-turn pastes into the live
+  // session but does NOT open a second turn slot. This is what prevents the
+  // stranding bug — claude can coalesce queued messages into fewer end_turn
+  // events than messages, so one-slot-per-message would leave the surplus
+  // slots (and their run rows) stuck "running" forever.
+  await withFakeTmuxBin(async () => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const prevGap = __forTest.setBracketedEnterGapMs(0);
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    try {
+      const a = recorder();
+      const doneA = __forTest.pushTurnSlot(state, a.onChunk);
+
+      // Fold a message in while the turn is live.
+      expect(pasteFollowUp(taskId, "second message while busy")).toBe(true);
+      // No second slot — the queue stays at one in-flight turn (synchronous;
+      // pasteFollowUp never touches turnQueue).
+      expect(state.turnQueue.length).toBe(1);
+      // Let the background paste chain drain so it can't outlive the test.
+      await new Promise((r) => setTimeout(r, 20));
+
+      // The paste did not prematurely resolve the active turn.
+      let resolved = false;
+      void doneA.then(() => { resolved = true; });
+      await new Promise((r) => setTimeout(r, 10));
+      expect(resolved).toBe(false);
+
+      // flushSync (the sendTurn path) force-resolves any staged end_turn, so
+      // here the single turn resolves immediately. The *live tailer* instead
+      // holds the run open until idle — see the next test.
+      appendFileSync(jsonlPath, endTurnLine("done"));
+      __forTest.flushSync(state);
+      await expect(doneA).resolves.toBe(0);
+      expect(state.turnQueue.length).toBe(0);
+
+      // A surplus end_turn (claude coalesced the folded reply into one
+      // response, emitting an extra marker) must be a clean no-op — nothing
+      // to strand.
+      appendFileSync(jsonlPath, endTurnLine("extra"));
+      expect(() => __forTest.flushSync(state)).not.toThrow();
+      expect(state.turnQueue.length).toBe(0);
+    } finally {
+      __forTest.uninstallSession(taskId);
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+test("pasteFollowUp: returns false when no live session exists", () => {
+  expect(pasteFollowUp(randomUUID(), "msg")).toBe(false);
+});
+
+test("pasteFollowUp: holds the run open across folded turns until the session goes idle", async () => {
+  // The fix for the review's medium finding: a single mid-turn follow-up must
+  // NOT bounce the run to "succeeded" (task → review) on the intermediate
+  // end_turn while claude is still answering the folded message. The run stays
+  // open (slot held) until the live tailer (`flush`) sees the session go idle.
+  await withFakeTmuxBin(async () => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const prevGap = __forTest.setBracketedEnterGapMs(0);
+    const { taskId, jsonlPath } = freshSession();
+    const state = __forTest.installSession(taskId, jsonlPath);
+    try {
+      const a = recorder();
+      const doneA = __forTest.pushTurnSlot(state, a.onChunk);
+
+      expect(pasteFollowUp(taskId, "do another thing")).toBe(true);
+      expect(state.holdUntilIdle).toBe(true);
+      await new Promise((r) => setTimeout(r, 20)); // drain the paste chain
+
+      // R1's response ends, then claude immediately starts answering the
+      // folded message (a NEW assistant message id). Driven through the async
+      // `flush` (the live path) — NOT flushSync, which would force-resolve.
+      appendFileSync(jsonlPath, endTurnLineId("R1 reply done", "msg-r1"));
+      appendFileSync(jsonlPath, assistantLineId("on it — the folded ask", "msg-m2"));
+      await __forTest.flush(state);
+      // Held: the intermediate end_turn did not pop the slot.
+      expect(state.turnQueue.length).toBe(1);
+      let resolved = false;
+      void doneA.then(() => { resolved = true; });
+      await new Promise((r) => setTimeout(r, 10));
+      expect(resolved).toBe(false);
+
+      // The folded message's own end_turn arrives — still held (a trailing
+      // line keeps re-staging, never popping, while holdUntilIdle is set).
+      appendFileSync(jsonlPath, endTurnLineId("folded reply done", "msg-m2"));
+      await __forTest.flush(state);
+      expect(state.turnQueue.length).toBe(1);
+      expect(resolved).toBe(false);
+
+      // Session goes idle: force the staged end_turn past the idle threshold,
+      // then a no-new-data flush fires it → the run resolves exactly once and
+      // the hold clears.
+      expect(state.pendingEndTurn).not.toBeNull();
+      if (state.pendingEndTurn) state.pendingEndTurn.stagedAt = 0;
+      await __forTest.flush(state);
+      await expect(doneA).resolves.toBe(0);
+      expect(state.turnQueue.length).toBe(0);
+      expect(state.holdUntilIdle).toBe(false);
+    } finally {
+      __forTest.uninstallSession(taskId);
+      __forTest.setBracketedEnterGapMs(prevGap);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
 });
 
 test("multiple events including end_turn in one flush dispatch correctly", async () => {
