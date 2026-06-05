@@ -33,7 +33,10 @@ export interface AskQuestion {
   question: string;
   header?: string;
   multiSelect?: boolean;
-  options: Array<{ label: string; description?: string }>;
+  /** `preview` is the multi-line code/text block claude attaches to an option
+   *  (rendered as a side box in the TUI; only available when the card is sourced
+   *  from the JSONL tool_use, since the pane collapses long ones). */
+  options: Array<{ label: string; description?: string; preview?: string }>;
 }
 
 export interface AskQuestionsRequest {
