@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import path from "node:path";
 import { listAvailableCommands, listAgentCapabilities } from "./commands.ts";
@@ -345,4 +345,233 @@ test("capabilities: returns both commands and extensions in one pass", async () 
   expect(extensions.some((e) => e.name === "reviewer" && e.kind === "skill" && e.insert === "/reviewer")).toBe(true);
   expect(extensions.some((e) => e.name === "db" && e.kind === "mcp" && e.insert === "@db")).toBe(true);
   expect(extensions.some((e) => e.name === "deploy")).toBe(false);
+});
+
+// --- Plugin-contributed content (commands / skills / MCP) ------------------
+
+/**
+ * Scaffold a claude-code plugin under a fake harnessHome: writes an install
+ * record into `installed_plugins.json`, the unpacked plugin tree (commands/,
+ * skills/, .mcp.json, plugin.json), and — when `enabled` is given — an
+ * `enabledPlugins` entry in the harness settings.json. Returns the installPath.
+ */
+function installPlugin(
+  harness: string,
+  key: string,
+  opts: {
+    commands?: Record<string, string>;
+    skills?: Record<string, string>;
+    mcpServers?: Record<string, unknown>;
+    manifest?: Record<string, unknown>;
+    enabled?: boolean;
+  } = {},
+): string {
+  const installPath = path.join(harness, "plugins", "cache", key.replace(/[@/]/g, "_"));
+  for (const [name, body] of Object.entries(opts.commands ?? {})) {
+    writeCmd(path.join(installPath, "commands"), name, body);
+  }
+  for (const [name, body] of Object.entries(opts.skills ?? {})) {
+    writeCmd(path.join(installPath, "skills", name), "SKILL.md", body);
+  }
+  if (opts.mcpServers) {
+    mkdirSync(installPath, { recursive: true });
+    writeFileSync(path.join(installPath, ".mcp.json"), JSON.stringify({ mcpServers: opts.mcpServers }));
+  }
+  if (opts.manifest) {
+    mkdirSync(path.join(installPath, ".claude-plugin"), { recursive: true });
+    writeFileSync(path.join(installPath, ".claude-plugin", "plugin.json"), JSON.stringify(opts.manifest));
+  }
+  mkdirSync(path.join(harness, "plugins"), { recursive: true });
+  // Merge into any existing install file so a test can stage several plugins.
+  let installed: any = { version: 2, plugins: {} };
+  try { installed = JSON.parse(readFileSync(path.join(harness, "plugins", "installed_plugins.json"), "utf8")); } catch { /* first plugin */ }
+  installed.plugins[key] = [{ scope: "user", installPath }];
+  writeFileSync(path.join(harness, "plugins", "installed_plugins.json"), JSON.stringify(installed));
+  if (opts.enabled !== undefined) {
+    let settings: any = {};
+    try { settings = JSON.parse(readFileSync(path.join(harness, "settings.json"), "utf8")); } catch { /* none yet */ }
+    settings.enabledPlugins = { ...(settings.enabledPlugins ?? {}), [key]: opts.enabled };
+    writeFileSync(path.join(harness, "settings.json"), JSON.stringify(settings));
+  }
+  return installPath;
+}
+
+test("plugin commands + skills are namespaced `/<plugin>:<name>` on the `/` surface", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-cmd-"));
+  installPlugin(harness, "vercel@mp", {
+    commands: { "deploy.md": "---\ndescription: Deploy to Vercel\n---\nbody" },
+    skills: { "ai-sdk": "---\ndescription: AI SDK guidance\n---\nbody" },
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-cmd-proj-"));
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: project, harnessHome: harness });
+
+  const cmd = all.find((c) => c.name === "/vercel:deploy");
+  expect(cmd).toBeDefined();
+  expect(cmd!.kind).toBe("command");
+  expect(cmd!.source).toBe("plugin");
+  expect(cmd!.description).toBe("Deploy to Vercel");
+
+  const skill = all.find((c) => c.name === "/vercel:ai-sdk");
+  expect(skill).toBeDefined();
+  expect(skill!.kind).toBe("skill");
+  expect(skill!.source).toBe("plugin");
+});
+
+test("plugin .mcp.json servers surface as extensions (server==plugin collapses to bare name)", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-mcp-"));
+  installPlugin(harness, "vercel@mp", {
+    mcpServers: {
+      vercel: { type: "http", url: "https://mcp.vercel.com" },
+      logs: { command: "vercel-logs" },
+    },
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-mcp-proj-"));
+  const exts = await listExtensions({ agent: "claude-code", workdir: project, harnessHome: harness });
+
+  // Single-server-named-after-the-plugin collapses to just `vercel`.
+  const main = exts.find((e) => e.name === "vercel" && e.kind === "mcp");
+  expect(main).toBeDefined();
+  expect(main!.insert).toBe("@vercel");
+  expect(main!.source).toBe("plugin");
+  // A differently-named server keeps the `<plugin>:<server>` namespace.
+  const logs = exts.find((e) => e.name === "vercel:logs" && e.kind === "mcp");
+  expect(logs).toBeDefined();
+  expect(logs!.insert).toBe("@vercel:logs");
+});
+
+test("plugin skill appears in the extensions Skills group with a /<plugin>:<name> insert", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-skillext-"));
+  installPlugin(harness, "sentry@mp", {
+    skills: { seer: "---\ndescription: Ask Sentry questions\n---\nbody" },
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-skillext-proj-"));
+  const exts = await listExtensions({ agent: "claude-code", workdir: project, harnessHome: harness });
+  const skill = exts.find((e) => e.name === "sentry:seer" && e.kind === "skill");
+  expect(skill).toBeDefined();
+  expect(skill!.insert).toBe("/sentry:seer");
+  expect(skill!.source).toBe("plugin");
+});
+
+test("a plugin disabled via enabledPlugins contributes nothing", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-disabled-"));
+  installPlugin(harness, "off@mp", {
+    commands: { "go.md": "do it" },
+    skills: { helper: "---\ndescription: helps\n---\nbody" },
+    mcpServers: { off: { command: "x" } },
+    manifest: { name: "off", description: "A disabled plugin" },
+    enabled: false,
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-disabled-proj-"));
+  const { commands, extensions } = await listAgentCapabilities({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  expect(commands.some((c) => c.name.startsWith("/off"))).toBe(false);
+  expect(extensions.some((e) => e.name === "off" || e.name.startsWith("off:"))).toBe(false);
+});
+
+test("two plugins sharing a bare name collapse to one /name:cmd but both self-rows show", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-dupcmd-"));
+  installPlugin(harness, "dup@mp-one", {
+    commands: { "deploy.md": "---\ndescription: From mp-one\n---\nbody" },
+    manifest: { name: "dup", description: "dup from mp-one" },
+  });
+  installPlugin(harness, "dup@mp-two", {
+    commands: { "deploy.md": "---\ndescription: From mp-two\n---\nbody" },
+    manifest: { name: "dup", description: "dup from mp-two" },
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-dupcmd-proj-"));
+  const { commands, extensions } = await listAgentCapabilities({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  // claude has no per-marketplace invocation token, so the `/dup:deploy`
+  // namespace collapses to a single deterministic entry (first install wins).
+  const deploy = commands.filter((c) => c.name === "/dup:deploy");
+  expect(deploy).toHaveLength(1);
+  expect(deploy[0]!.source).toBe("plugin");
+  // …but the picker still surfaces both plugins, marketplace-disambiguated, so
+  // the conflict is visible.
+  const dupRows = extensions.filter((e) => e.kind === "plugin" && e.name.startsWith("dup"));
+  expect(dupRows).toHaveLength(2);
+  expect(dupRows.some((e) => e.name === "dup (mp-one)")).toBe(true);
+  expect(dupRows.some((e) => e.name === "dup (mp-two)")).toBe(true);
+});
+
+// --- Built-in (binary-baked) commands + skills -----------------------------
+
+// An empty harnessHome isolates these from the test runner's real ~/.claude
+// (which may carry user skills like `code-review` that legitimately shadow a
+// same-named built-in — see the shadow test below).
+test("claude-code surfaces curated built-in commands + skills; codex gets none", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "builtin-home-"));
+  const project = mkdtempSync(path.join(tmpRoot, "builtin-"));
+  const claude = await listAvailableCommands({ agent: "claude-code", workdir: project, harnessHome: harness });
+
+  const init = claude.find((c) => c.name === "/init");
+  expect(init).toBeDefined();
+  expect(init!.source).toBe("builtin");
+  expect(init!.kind).toBe("command");
+
+  const codeReview = claude.find((c) => c.name === "/code-review");
+  expect(codeReview).toBeDefined();
+  expect(codeReview!.source).toBe("builtin");
+  expect(codeReview!.kind).toBe("skill");
+
+  // Built-ins are claude-code-specific; codex must not inherit them.
+  const codex = await listAvailableCommands({ agent: "codex", workdir: project, harnessHome: harness });
+  expect(codex.some((c) => c.source === "builtin")).toBe(false);
+});
+
+test("built-ins are available even with no workdir", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "builtin-nowd-"));
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: null, harnessHome: harness });
+  expect(all.some((c) => c.name === "/security-review" && c.source === "builtin")).toBe(true);
+});
+
+test("a user/project command shadows a same-named built-in", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "builtin-shadow-home-"));
+  const project = mkdtempSync(path.join(tmpRoot, "builtin-shadow-"));
+  writeCmd(
+    path.join(project, ".claude", "commands"),
+    "review.md",
+    "---\ndescription: My custom review\n---\nbody",
+  );
+  const all = await listAvailableCommands({ agent: "claude-code", workdir: project, harnessHome: harness });
+  const review = all.filter((c) => c.name === "/review");
+  // Exactly one `/review`, and it's the project one (not the built-in).
+  expect(review).toHaveLength(1);
+  expect(review[0]!.source).toBe("project");
+  expect(review[0]!.description).toBe("My custom review");
+});
+
+test("built-in skills surface in the extensions Skills group", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "builtin-ext-home-"));
+  const project = mkdtempSync(path.join(tmpRoot, "builtin-ext-"));
+  const exts = await listExtensions({ agent: "claude-code", workdir: project, harnessHome: harness });
+  const verify = exts.find((e) => e.name === "verify" && e.kind === "skill");
+  expect(verify).toBeDefined();
+  expect(verify!.insert).toBe("/verify");
+  expect(verify!.source).toBe("builtin");
+});
+
+test("an explicitly enabled plugin contributes its self-row + content", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "plug-enabled-"));
+  installPlugin(harness, "on@mp", {
+    commands: { "go.md": "do it" },
+    manifest: { name: "on", description: "An enabled plugin" },
+    enabled: true,
+  });
+  const project = mkdtempSync(path.join(tmpRoot, "plug-enabled-proj-"));
+  const { commands, extensions } = await listAgentCapabilities({
+    agent: "claude-code",
+    workdir: project,
+    harnessHome: harness,
+  });
+  expect(commands.some((c) => c.name === "/on:go")).toBe(true);
+  const selfRow = extensions.find((e) => e.name === "on" && e.kind === "plugin");
+  expect(selfRow).toBeDefined();
+  expect(selfRow!.description).toBe("An enabled plugin");
 });
