@@ -1,7 +1,8 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 // Top-level: db.ts captures AGETOR_DATA_DIR at first import — `beforeAll`
 // would race with any sibling test file that already imported db.ts.
@@ -74,6 +75,72 @@ test("createTask + startTask runs to completion and emits stdout", async () => {
   // Fake driver echoes the prompt back via stdout, then emits a status.
   expect(out.join("")).toContain("hello world");
   expect(statuses.some((s) => s.startsWith("exit:"))).toBe(true);
+});
+
+test("sendInput folds a follow-up into the in-flight run instead of stranding a new one", async () => {
+  // Regression for the "queue status never recovers" bug: a message sent
+  // while a claude turn is in flight must fold into the active run (same
+  // runId, no new row), not spawn a second run row + turn slot that could
+  // strand in "running" when claude coalesces queued messages.
+  const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+  const { db, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "fold-while-busy",
+    prompt: "first message",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const task = created.task;
+
+  const res = await startTask(task.id);
+  expect("runId" in res).toBe(true);
+  if (!("runId" in res)) return;
+  const r1 = res.runId;
+
+  // The fake claude driver doesn't create a tmux session, so stand one up so
+  // `sendClaudeTurn` takes the existing-session (fold-capable) path. The fake
+  // run R1 stays in flight (`active`) for ~20ms — long enough to send into it.
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-fold-"));
+  const jsonlPath = path.join(dir, `${randomUUID()}.jsonl`);
+  writeFileSync(jsonlPath, "");
+  claudeTmux.__forTest.installSession(task.id, jsonlPath);
+  try {
+    // TIMING INVARIANT: `sendInput` must run synchronously here, before the
+    // fake driver's ~20ms `done` timer resolves R1 (after which `active` no
+    // longer has it and the call would take the idle path → a NEW run row).
+    // There must be no `await` between `await startTask(...)` above and this
+    // call. If a future edit introduces one and the window is missed, the
+    // `rows.length === 1` assertion below fails loudly rather than silently
+    // passing for the wrong reason.
+    // R1 is still in flight → this must fold into it.
+    const sent = sendInput(r1, "second message while busy");
+    expect(sent.delivered).toBe(true);
+    if (sent.delivered) expect(sent.runId).toBe(r1);
+
+    // No second run row was created — the task still has exactly one run.
+    const rows = runs.listForTask(task.id);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.id).toBe(r1);
+
+    // The folded user message was recorded on the active run so it shows in
+    // the conversation stream.
+    const events = runs.eventsForTask(task.id);
+    expect(events.some((e) => e.stream === "user" && e.data.includes("second message while busy"))).toBe(true);
+
+    // Let R1's fake turn resolve, then confirm the task recovered out of
+    // "running" (no stranding) and still has just the one run row.
+    await new Promise((r) => setTimeout(r, 120));
+    const { tasks } = await import("./db.ts");
+    expect(tasks.get(task.id)?.column).not.toBe("running");
+    expect(runs.listForTask(task.id).length).toBe(1);
+  } finally {
+    claudeTmux.__forTest.uninstallSession(task.id);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [task.id]);
+  }
 });
 
 test("archiveTask refuses tasks that aren't in the Done column", async () => {
