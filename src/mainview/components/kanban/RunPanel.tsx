@@ -2732,6 +2732,9 @@ function AskQuestionsCard({
                           {opt.description && (
                             <span className="block text-[11px] text-muted-foreground">{opt.description}</span>
                           )}
+                          {opt.preview && (
+                            <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-1.5 font-mono text-[10px] leading-snug text-muted-foreground">{opt.preview}</pre>
+                          )}
                         </span>
                       </label>
                     );

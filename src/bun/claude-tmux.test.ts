@@ -1419,3 +1419,72 @@ test("resolveAskCard still drops the card with no live session (the route's no-t
   resolveAskCard(card.id, "task-resolve-ask-nosession"); // no installSession → no state
   expect(activeAskQuestionsForTask("task-resolve-ask-nosession")).toHaveLength(0);
 });
+
+test("readPendingAskQuestionsFromJsonl: returns the unanswered AskUserQuestion tool_use, with previews", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+  const jsonl = path.join(mkdtempSync(path.join(tmpdir(), "agetor-askjsonl-")), "s.jsonl");
+  const toolUse = {
+    type: "assistant",
+    message: { content: [{
+      type: "tool_use", id: "tu1", name: "AskUserQuestion",
+      input: { questions: [{
+        question: "How far should this go?", header: "Scope", multiSelect: false,
+        options: [
+          { label: "Plugins + curated built-ins", description: "Enumerate plugins AND a curated built-in list.", preview: "/ autocomplete shows:\n  /deploy ... [plugin]\n  /init ... [builtin]" },
+          { label: "Plugins only", description: "Enumerate enabled-plugin items only.", preview: "/ autocomplete shows:\n  /deploy ... [plugin]" },
+        ],
+      }] },
+    }] },
+  };
+  // A prior unrelated line + the pending tool_use, no matching tool_result.
+  writeFileSync(jsonl,
+    JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "go" }] } }) + "\n"
+    + JSON.stringify(toolUse) + "\n");
+
+  const qs = __forTest.readPendingAskQuestionsFromJsonl(jsonl);
+  expect(qs).not.toBeNull();
+  expect(qs!.length).toBe(1);
+  expect(qs![0]!.question).toBe("How far should this go?");
+  expect(qs![0]!.header).toBe("Scope");
+  expect(qs![0]!.options.map((o) => o.label)).toEqual(["Plugins + curated built-ins", "Plugins only"]);
+  expect(qs![0]!.options[0]!.description).toBe("Enumerate plugins AND a curated built-in list.");
+  expect(qs![0]!.options[0]!.preview).toContain("[builtin]"); // the multi-line preview survives
+});
+
+test("readPendingAskQuestionsFromJsonl: null once the tool_use has a matching tool_result (answered)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+  const jsonl = path.join(mkdtempSync(path.join(tmpdir(), "agetor-askjsonl2-")), "s.jsonl");
+  writeFileSync(jsonl,
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu1", name: "AskUserQuestion", input: { questions: [{ question: "Q?", options: [{ label: "A" }] }] } }] } }) + "\n"
+    + JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", content: "answered" }] } }) + "\n");
+  expect(__forTest.readPendingAskQuestionsFromJsonl(jsonl)).toBeNull();
+});
+
+test("readPendingAskQuestionsFromJsonl: null when there's no AskUserQuestion / the file is missing", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  expect(__forTest.readPendingAskQuestionsFromJsonl("/no/such/agetor/file.jsonl")).toBeNull();
+});
+
+test("shouldWaitForAskJsonl: stalls only for a lossy pane with no JSONL, inside the grace window", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const wait = __forTest.shouldWaitForAskJsonl;
+  const lossy = "❯ 1. Plugins + curated\n  ✂ 5 lines hidden\n  2. Plugins only";
+  const simple = "❯ 1. Plugins + curated\n  2. Plugins only";
+  const now = 1_000_000;
+  // Lossy pane, no JSONL yet, modal just appeared → wait for the JSONL.
+  expect(wait(false, lossy, now, now)).toBe(true);
+  // Grace expired (>2s since first seen) → register from the pane instead.
+  expect(wait(false, lossy, now - 2_001, now)).toBe(false);
+  // Simple pane → never wait; the pane already renders it cleanly.
+  expect(wait(false, simple, now, now)).toBe(false);
+  // JSONL already available → use it, don't wait.
+  expect(wait(true, lossy, now, now)).toBe(false);
+  // No firstSeenAt recorded → don't wait.
+  expect(wait(false, lossy, null, now)).toBe(false);
+});

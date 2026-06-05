@@ -231,7 +231,12 @@ export function parseModalPane(tail: string): ParsedQuestionPane | null {
   // a separator, "Next", blank, or the footer.
   const isNoise = (l: string | undefined): boolean =>
     l === undefined || l.trim() === "" || /^[─-]{3,}$/.test(l.trim())
-    || /^Next$/.test(l.trim()) || /Esc to cancel/.test(l) || OPTION_RE.test(l);
+    || /^Next$/.test(l.trim()) || /Esc to cancel/.test(l) || OPTION_RE.test(l)
+    // TUI chrome that the pane sometimes interleaves with options: an option's
+    // multi-line `preview`/description collapsed to "✂ N lines hidden" / "── N
+    // lines hidden ──", and the "press n to add notes" hint. Never part of a
+    // description — keep them out so the card isn't garbled in the pane fallback.
+    || /✂|\blines hidden\b/.test(l) || /^Notes:|press n to add notes/i.test(l.trim());
   const options = kept.map((r) => {
     // A description may hard-wrap across several rows; gather every row between
     // this option and the next noise boundary (next option / separator / blank
