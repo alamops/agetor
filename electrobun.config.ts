@@ -4,7 +4,7 @@ export default {
   app: {
     name: "Agetor",
     identifier: "sh.alamops.agetor",
-    version: "0.0.14",
+    version: "0.0.15",
   },
   release: {
     // GitHub Releases' "latest" download URL — always redirects to the most
