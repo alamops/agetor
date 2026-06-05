@@ -28,10 +28,15 @@ export interface UpdateSnapshot {
 
 export interface BranchInfo { name: string; committedAt: number; current: boolean }
 
+/** Where a command/extension comes from. `plugin` entries are contributed by an
+ *  enabled Claude Code plugin and are namespaced `<plugin>:<name>`; `builtin`
+ *  entries are baked into the harness binary (e.g. /init, /review). */
+export type EntrySource = "user" | "project" | "plugin" | "builtin";
+
 export interface AvailableCommand {
   name: string;
   description: string;
-  source: "user" | "project";
+  source: EntrySource;
   kind: "command" | "skill";
 }
 
@@ -42,7 +47,7 @@ export interface AvailableExtension {
   name: string;
   insert: string;
   description: string;
-  source: "user" | "project";
+  source: EntrySource;
   kind: "mcp" | "skill" | "plugin";
 }
 
