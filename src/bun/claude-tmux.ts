@@ -985,6 +985,11 @@ interface SessionState {
   /** True while the tab-walk collector is mid-flight reading a multi-question
    *  modal's tabs, so the scraper doesn't kick off a second collection. */
   askCollecting: boolean;
+  /** Wall-clock ms when the AskUserQuestion modal was first seen on the pane.
+   *  Gives claude a grace window to flush the tool_use (which carries the full
+   *  question incl. previews + long descriptions) before we degrade to the
+   *  lossy pane scrape. Null when no modal is open. */
+  askFirstSeenAt: number | null;
   /**
    * A turn-end (`stop_reason: "end_turn"`) that has been observed but not yet
    * confirmed as real. Claude stamps `end_turn` on *every* split line of a
@@ -1100,6 +1105,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     recentlyAnsweredFingerprints: new Map(),
     askCardId: null,
     askCollecting: false,
+    askFirstSeenAt: null,
     pendingEndTurn: null,
   };
 }
@@ -1280,51 +1286,163 @@ function captureTail(state: SessionState): string {
  * can't start a second walk) and `askCardId` (so we never double-register). The
  * card is resolved by the scraper when the modal leaves the pane.
  */
+/** Map an AskUserQuestion tool_use `input` (the `{questions:[…]}` object claude
+ *  writes to the JSONL) to our AskQuestion[], including each option's multi-line
+ *  `preview`. Returns null when the shape isn't what we expect. */
+function mapJsonlAskInput(input: unknown): AskQuestion[] | null {
+  const qs = (input as { questions?: unknown } | null)?.questions;
+  if (!Array.isArray(qs) || qs.length === 0) return null;
+  const out: AskQuestion[] = [];
+  for (const q of qs as Array<Record<string, unknown>>) {
+    if (!q || typeof q.question !== "string" || !Array.isArray(q.options)) return null;
+    out.push({
+      question: q.question,
+      header: typeof q.header === "string" ? q.header : undefined,
+      multiSelect: q.multiSelect === true,
+      options: (q.options as Array<Record<string, unknown>>).map((o) => ({
+        label: String(o?.label ?? ""),
+        description: typeof o?.description === "string" ? o.description : undefined,
+        preview: typeof o?.preview === "string" ? o.preview : undefined,
+      })),
+    });
+  }
+  return out;
+}
+
+/** Read the structured questions for the CURRENTLY-OPEN AskUserQuestion straight
+ *  from the session JSONL: the last `AskUserQuestion` tool_use whose
+ *  tool_use_id has no matching tool_result yet (still awaiting the user). When
+ *  present this beats scraping the pane — it carries full descriptions and the
+ *  multi-line `preview` blocks the TUI collapses to "✂ N lines hidden". Returns
+ *  null when the tool_use isn't on disk yet (claude can flush it lazily), so the
+ *  caller falls back to the pane parser. */
+/** Read the trailing `maxBytes` of a file as UTF-8 text, dropping the (partial)
+ *  first line when we didn't start at byte 0. Returns null on any error. Lets us
+ *  scan just the recent JSONL instead of loading a multi-MB session file into
+ *  memory on every grace tick (a sync read that would otherwise block the loop). */
+function readFileTail(filePath: string, maxBytes: number): string | null {
+  let fd: number | null = null;
+  try {
+    const size = fsStatSync(filePath).size;
+    const start = Math.max(0, size - maxBytes);
+    const len = size - start;
+    if (len <= 0) return "";
+    fd = fsOpenSync(filePath, "r");
+    const buf = Buffer.alloc(len);
+    fsReadSync(fd, buf, 0, len, start);
+    const text = buf.toString("utf8");
+    if (start === 0) return text;
+    const nl = text.indexOf("\n");
+    return nl >= 0 ? text.slice(nl + 1) : "";
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) { try { fsCloseSync(fd); } catch { /* already gone */ } }
+  }
+}
+
+function readPendingAskQuestionsFromJsonl(jsonlPath: string): AskQuestion[] | null {
+  // The pending tool_use (and its result, if answered) are always the most
+  // recent lines, so the tail is enough — no need to read the whole session.
+  const text = readFileTail(jsonlPath, 256 * 1024);
+  if (text === null) return null;
+  const answered = new Set<string>();
+  let last: { id: string; questions: AskQuestion[] } | null = null;
+  for (const line of text.split("\n")) {
+    if (!line.includes("AskUserQuestion") && !line.includes("tool_result")) continue;
+    let j: { message?: { content?: unknown } };
+    try { j = JSON.parse(line); } catch { continue; }
+    const blocks = Array.isArray(j?.message?.content)
+      ? (j.message!.content as Array<Record<string, unknown>>) : [];
+    for (const b of blocks) {
+      if (b?.type === "tool_result" && typeof b.tool_use_id === "string") answered.add(b.tool_use_id);
+      if (b?.type === "tool_use" && b.name === "AskUserQuestion" && typeof b.id === "string") {
+        const qs = mapJsonlAskInput(b.input);
+        if (qs) last = { id: b.id, questions: qs };
+      }
+    }
+  }
+  return last && !answered.has(last.id) ? last.questions : null;
+}
+
+/** Pane fallback for when the JSONL tool_use isn't on disk yet: scrape the
+ *  visible modal, walking tabs for a multi-question modal. Loses `preview`
+ *  blocks (collapsed in the TUI) and any long descriptions the TUI truncates. */
+async function collectAskQuestionsFromPane(state: SessionState, firstTail: string): Promise<AskQuestion[] | null> {
+  const first = parseModalPane(firstTail);
+  if (!first) return null;
+  const collected = [first];
+  const n = first.tabbed ? Math.max(1, first.tabHeaders.length) : 1;
+  if (n > 1) {
+    // Walk the tabs to read every question, then return to the first tab so the
+    // answer-driving sequence (planAskAnswers) starts from a known state.
+    await queueTmuxOp(state.taskId, async (stillCurrent) => {
+      for (let i = 1; i < n; i++) {
+        if (!tmux(["send-keys", "-t", state.sessionName, "Right"]).ok) return;
+        await Bun.sleep(180);
+        if (!stillCurrent()) return;
+        const p = parseModalPane(captureTail(state));
+        if (p) collected.push(p);
+      }
+      for (let i = 1; i < n; i++) {
+        if (!tmux(["send-keys", "-t", state.sessionName, "Left"]).ok) return;
+        await Bun.sleep(90);
+        if (!stillCurrent()) return;
+      }
+    }, state);
+  }
+  // Don't register a PARTIAL read: a tab that failed to parse (capture landed
+  // mid-repaint) would give the wrong question count and mis-drive the answer.
+  if (collected.length !== n) return null;
+  return collected.map((p, i) => ({
+    question: p.questionText,
+    header: first.tabHeaders[i],
+    multiSelect: p.multiSelect,
+    options: p.options.map((o) => ({ label: o.label, description: o.description })),
+  }));
+}
+
+/** Grace window during which we keep waiting for claude to flush its
+ *  AskUserQuestion tool_use to the JSONL (full data incl. previews) before
+ *  degrading to the lossy pane scrape. Only applied to a *lossy* pane (see
+ *  `shouldWaitForAskJsonl`), so simple questions never incur it. */
+const ASK_JSONL_GRACE_MS = 2000;
+
+/** True when the visible pane can't represent the question — it shows claude's
+ *  "✂ N lines hidden" collapse markers, meaning an option's preview / long
+ *  description is off-screen. */
+function paneCollapsesContent(paneTail: string): boolean {
+  return /✂|\blines hidden\b/.test(paneTail);
+}
+
+/** Decide whether to keep waiting for the JSONL tool_use rather than register
+ *  from the pane: only when there's no JSONL yet, the pane is lossy, and we're
+ *  still inside the grace window. A simple (non-collapsed) pane registers
+ *  immediately, so we never stall a question the pane can already render. Pure,
+ *  so the timing logic is unit-testable without tmux. */
+function shouldWaitForAskJsonl(hasJsonl: boolean, paneTail: string, firstSeenAt: number | null, now: number): boolean {
+  if (hasJsonl || firstSeenAt === null) return false;
+  return paneCollapsesContent(paneTail) && now - firstSeenAt < ASK_JSONL_GRACE_MS;
+}
+
 async function collectAndRegisterAskCard(state: SessionState, firstTail: string): Promise<void> {
   if (state.askCollecting || state.askCardId) return;
   const runId = tasks.get(state.taskId)?.runId;
   if (!runId) return;
-  const first = parseModalPane(firstTail);
-  if (!first) return;
-
   state.askCollecting = true;
   try {
-    const collected = [first];
-    const n = first.tabbed ? Math.max(1, first.tabHeaders.length) : 1;
-    if (n > 1) {
-      // Walk the tabs to read every question, then return to the first tab so
-      // the answer-driving sequence (planAskAnswers) starts from a known state.
-      await queueTmuxOp(state.taskId, async (stillCurrent) => {
-        for (let i = 1; i < n; i++) {
-          if (!tmux(["send-keys", "-t", state.sessionName, "Right"]).ok) return;
-          await Bun.sleep(180);
-          if (!stillCurrent()) return;
-          const p = parseModalPane(captureTail(state));
-          if (p) collected.push(p);
-        }
-        for (let i = 1; i < n; i++) {
-          if (!tmux(["send-keys", "-t", state.sessionName, "Left"]).ok) return;
-          await Bun.sleep(90);
-          if (!stillCurrent()) return;
-        }
-      }, state);
-    }
-
-    // Don't register a PARTIAL read: if any walked tab failed to parse (a
-    // capture-pane landed mid-repaint and parseModalPane returned null), the
-    // question count would be wrong and `planAskAnswers` would mis-drive the
-    // answer (submit early / wrong header alignment). Bail — `askCollecting`
-    // clears in `finally` and the next scrape tick retries cleanly.
-    if (collected.length !== n) return;
-    // The modal may have been answered out from under us mid-walk.
+    // Prefer the JSONL tool_use — it carries the full question incl. multi-line
+    // previews and the long descriptions the pane collapses to "✂ N lines
+    // hidden". When the pane is lossy and the tool_use isn't on disk yet, stall
+    // within a short grace window (return → next scrape tick retries) rather
+    // than registering a degraded scrape. A simple pane, or the grace expiring,
+    // registers immediately so a never-flushed tool_use can't strand the card.
+    const fromJsonl = readPendingAskQuestionsFromJsonl(state.jsonlPath);
+    if (shouldWaitForAskJsonl(fromJsonl !== null, firstTail, state.askFirstSeenAt, Date.now())) return;
+    const questions = fromJsonl ?? await collectAskQuestionsFromPane(state, firstTail);
+    if (!questions) return;
+    // The modal may have been answered out from under us mid-collect.
     if (state.askCardId || detectAskModal(captureTail(state)) === null) return;
-
-    const questions: AskQuestion[] = collected.map((p, i) => ({
-      question: p.questionText,
-      header: first.tabHeaders[i],
-      multiSelect: p.multiSelect,
-      options: p.options.map((o) => ({ label: o.label, description: o.description })),
-    }));
     const card = registerScrapedAskQuestions({
       taskId: state.taskId,
       runId,
@@ -1332,6 +1450,11 @@ async function collectAndRegisterAskCard(state: SessionState, firstTail: string)
       fingerprint: `ask-${runId}`,
     });
     state.askCardId = card.id;
+    if (process.env.AGETOR_DEBUG) {
+      (state.turnQueue[0]?.onChunk ?? state.lastChunk)?.(
+        "status", `question card ready (${fromJsonl ? "jsonl" : "pane"})`,
+      );
+    }
   } finally {
     state.askCollecting = false;
   }
@@ -1906,12 +2029,16 @@ function scrapeOnce(state: SessionState): void {
   // through the numbered matcher as intended.
   const askOnPane = detectAskModal(tail) !== null;
   if (askOnPane) {
+    if (state.askFirstSeenAt === null) state.askFirstSeenAt = now;
     if (!claudeIsWriting && !state.askCardId && !state.askCollecting) {
       void collectAndRegisterAskCard(state, tail);
     }
-  } else if (state.askCardId) {
-    resolveScrapedAskQuestions(state.askCardId);
-    state.askCardId = null;
+  } else {
+    if (state.askCardId) {
+      resolveScrapedAskQuestions(state.askCardId);
+      state.askCardId = null;
+    }
+    state.askFirstSeenAt = null;
   }
 
   const match = (claudeIsWriting || askOnPane)
@@ -2643,6 +2770,8 @@ export const __forTest = {
   matchNumberedModal,
   matchYesNoModal,
   matchStartupConsentDialog,
+  readPendingAskQuestionsFromJsonl,
+  shouldWaitForAskJsonl,
   resumeJsonlOffset,
   /** Override the JSONL verification timeout used by `cycleToMode`. Tests
    *  shrink it to keep "timeout" cases fast. Returns the previous value

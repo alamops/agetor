@@ -117,6 +117,29 @@ describe("parseModalPane — reads the visible question off the pane", () => {
     expect(p.multiSelect).toBe(false);
   });
 
+  test("pane fallback: TUI collapse markers ('✂ N lines hidden') + 'Notes:' rows never leak into descriptions", () => {
+    const pane = [
+      " ☐ Scope",
+      "",
+      "How far should this go?",
+      "",
+      "❯ 1. Plugins + curated built-ins",
+      "  Enumerate plugins and a curated list.",
+      "  ✂ 5 lines hidden",
+      "  2. Plugins only",
+      "  Enumerate enabled-plugin items only.",
+      "Notes: press n to add notes",
+      "──────────────────────────────────────",
+      "  3. Chat about this",
+      "",
+      "Enter to select · ↑/↓ to navigate · Esc to cancel",
+    ].join("\n");
+    const p = parseModalPane(pane)!;
+    expect(p.options.map((o) => o.label)).toEqual(["Plugins + curated built-ins", "Plugins only"]);
+    expect(p.options[0]!.description).toBe("Enumerate plugins and a curated list.");
+    expect(p.options[1]!.description).toBe("Enumerate enabled-plugin items only.");
+  });
+
   test("tabbed multiSelect (Toppings): tab headers, checkbox options, multiSelect=true", () => {
     const p = parseModalPane(fx("multi_initial_toppings"))!;
     expect(p.tabbed).toBe(true);
