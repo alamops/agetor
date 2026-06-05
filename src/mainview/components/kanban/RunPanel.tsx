@@ -449,20 +449,15 @@ function RunPanelBody({
     return [...others, ...rebuilt.events];
   }, [events, rebuilt, rebuiltRunIds]);
 
-  /** Indicator mode for the bottom-pinned heartbeat. When the user
-   *  pipelines turns (two `running` rows live at once), only the
-   *  earliest is being actively processed by claude — the rest are
-   *  queued behind it in tmux's input buffer. Surface that distinction
-   *  so the indicator label ("Agent is working…" vs "Queued — waiting
-   *  for previous turn…") stays accurate. */
+  /** Indicator mode for the bottom-pinned heartbeat. A follow-up sent while
+   *  the agent is working is folded into the active run (the backend pastes it
+   *  into the live session — no new run row), so there's only ever one
+   *  in-flight run per task: the heartbeat is simply on ("Agent is working…")
+   *  or off. Hidden while an interaction card is up. */
   const indicatorMode: RunIndicatorMode = useMemo(() => {
     if (interactions.length > 0) return "off";
-    const inflight = runs.filter((r) => r.status === "running");
-    if (inflight.length === 0) return "off";
-    if (inflight.length === 1) return "active";
-    const earliest = inflight.reduce((a, b) => (a.startedAt <= b.startedAt ? a : b));
-    return earliest.id === latestRun?.id ? "active" : "queued";
-  }, [interactions.length, runs, latestRun?.id]);
+    return runs.some((r) => r.status === "running") ? "active" : "off";
+  }, [interactions.length, runs]);
 
   // Two separate affordances:
   //   • `canControl` — Stop button is only meaningful when there's an in-flight
@@ -493,11 +488,11 @@ function RunPanelBody({
   const resumableRunId = liveRunId
     ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
   // Send is enabled whenever the task has ever been run. While a turn is
-  // in flight, the backend pastes the new prompt into the live tmux
-  // session — claude queues it in its TUI input buffer and processes it
-  // as a *follow-up* turn once the current one finishes. A new run row
-  // is created immediately so the user sees their queued message in the
-  // history.
+  // in flight, the backend pastes the new prompt into the live tmux session —
+  // claude queues it in its TUI input buffer and replays it as part of the
+  // current response. The message folds into the active run (recorded in the
+  // conversation stream, no new run row), so the task stays a single in-flight
+  // run rather than stacking queued rows that could strand "running".
   const canSend = !!resumableRunId;
   // While a native modal (question / plan / permission prompt) is pending,
   // claude is blocked on it in the tmux REPL — a typed message would paste
@@ -943,7 +938,7 @@ function RunPanelBody({
                     ? "Answer the prompt above — or press Stop to cancel, then send a new message."
                     : canSend
                     ? task.column === "running"
-                      ? "Agent is working — your message will queue as the next turn. Type / for commands."
+                      ? "Agent is working — your message will be added to the current turn. Type / for commands."
                       : task.column === "blocked"
                         ? "Answer the question, or send any follow-up. Type / for commands."
                         : "Send a message — resumes the conversation in a fresh session. Type / for commands."
@@ -1226,7 +1221,7 @@ function TerminalsSection({ task }: { task: Task }) {
  * dedup + replay invariants are easier when each event stays atomic.
  * ────────────────────────────────────────────────────────────────────────── */
 
-type RunIndicatorMode = "off" | "active" | "queued";
+type RunIndicatorMode = "off" | "active";
 
 function RunEventList({
   events,
@@ -1358,7 +1353,7 @@ function RunEventList({
         </section>
       ))}
       {indicatorMode !== "off" && runStatus === "running" && (
-        <RunningIndicator mode={indicatorMode} />
+        <RunningIndicator />
       )}
     </div>
   );
@@ -1367,25 +1362,18 @@ function RunEventList({
 /**
  * Pinned-at-bottom heartbeat shown while the agent is mid-turn. Hidden
  * when an interaction card is up — the card is the right affordance for
- * "waiting on you" and the spinner would compete with it. The "queued"
- * variant fires for runs that exist as a row but haven't reached the
- * front of the turn queue yet (claude is still mid-response on an
- * earlier turn).
+ * "waiting on you" and the spinner would compete with it. Follow-ups sent
+ * while the agent is working fold into the active run, so there's no separate
+ * "queued" state to surface — it's simply working or not.
  */
-function RunningIndicator({ mode }: { mode: "active" | "queued" }) {
-  const queued = mode === "queued";
+function RunningIndicator() {
   return (
     <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
       <span className="relative inline-flex size-2">
-        {!queued && (
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 opacity-75" />
-        )}
-        <span className={cn(
-          "relative inline-flex size-2 rounded-full",
-          queued ? "bg-amber-500" : "bg-emerald-500",
-        )} />
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 opacity-75" />
+        <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
       </span>
-      <span>{queued ? "Queued — waiting for previous turn…" : "Agent is working…"}</span>
+      <span>Agent is working…</span>
     </div>
   );
 }
