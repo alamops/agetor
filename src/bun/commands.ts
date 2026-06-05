@@ -5,6 +5,16 @@ import type { AgentKind } from "../shared/types.ts";
 import { repoRoot } from "./worktree.ts";
 
 /**
+ * Where an entry comes from, for UI badging and dedupe precedence:
+ *  - `user`    — the user's global config (`~/.claude`, harnessHome, …)
+ *  - `project` — the workdir's repo (`.claude/…`); wins over `user` on a name clash
+ *  - `plugin`  — contributed by an enabled plugin (namespaced `<plugin>:<name>`)
+ *  - `builtin` — baked into the harness binary; only ever fills a gap (a same-named
+ *    user/project/plugin entry always shadows it, matching the CLI)
+ */
+export type EntrySource = "user" | "project" | "plugin" | "builtin";
+
+/**
  * A single slash-invokable entry surfaced to the new-task prompt autocomplete.
  *
  * `name` includes the leading `/` so the UI can drop it into the textarea
@@ -14,7 +24,7 @@ import { repoRoot } from "./worktree.ts";
 export interface AvailableCommand {
   name: string;
   description: string;
-  source: "user" | "project";
+  source: EntrySource;
   kind: "command" | "skill";
 }
 
@@ -34,7 +44,7 @@ export interface AvailableExtension {
   name: string;
   insert: string;
   description: string;
-  source: "user" | "project";
+  source: EntrySource;
   kind: "mcp" | "skill" | "plugin";
 }
 
@@ -70,7 +80,7 @@ function safeListDir(p: string): string[] {
  * Walk a commands directory, treating nested folders as `parent:child` namespaces
  * (the convention both Claude Code and `bunx claudeup`-style tooling adopt).
  */
-function discoverCommands(dir: string, source: "user" | "project"): AvailableCommand[] {
+function discoverCommands(dir: string, source: EntrySource): AvailableCommand[] {
   if (!existsSync(dir)) return [];
   const out: AvailableCommand[] = [];
   const walk = (cur: string, prefix: string) => {
@@ -99,7 +109,7 @@ function discoverCommands(dir: string, source: "user" | "project"): AvailableCom
  * A "skill" is a folder under `skills/` containing a SKILL.md file. The folder
  * name is the slash-invokable name.
  */
-function discoverSkills(dir: string, source: "user" | "project"): AvailableCommand[] {
+function discoverSkills(dir: string, source: EntrySource): AvailableCommand[] {
   if (!existsSync(dir)) return [];
   const out: AvailableCommand[] = [];
   for (const name of safeListDir(dir)) {
@@ -113,6 +123,31 @@ function discoverSkills(dir: string, source: "user" | "project"): AvailableComma
     });
   }
   return out;
+}
+
+/**
+ * Curated snapshot of claude-code's binary-baked built-in commands + skills.
+ * These have NO on-disk discovery surface (no manifest, no `--list` flag), so
+ * enumerating them means hand-maintaining the set worth dropping into a task
+ * prompt. Kept deliberately tight: actionable coding-workflow entries only — not
+ * interactive/TUI meta (`/clear`, `/compact`, `/config`, `/model`, `/help`, …),
+ * which make no sense as a task. Update this when claude-code adds/renames a
+ * built-in. claude-code only; codex's built-ins aren't modelled here.
+ */
+const CLAUDE_BUILTINS: ReadonlyArray<{ name: string; description: string; kind: "command" | "skill" }> = [
+  { name: "/init", description: "Initialize a new CLAUDE.md file with codebase documentation", kind: "command" },
+  { name: "/review", description: "Review a pull request", kind: "command" },
+  { name: "/security-review", description: "Complete a security review of the pending changes on the current branch", kind: "command" },
+  { name: "/code-review", description: "Review the current diff for correctness bugs and reuse/simplification/efficiency cleanups", kind: "skill" },
+  { name: "/simplify", description: "Review the changed code for reuse, simplification, and efficiency, then apply the fixes", kind: "skill" },
+  { name: "/verify", description: "Verify a change works by running the app and observing real behavior", kind: "skill" },
+  { name: "/run", description: "Launch and drive this project's app to confirm a change works", kind: "skill" },
+];
+
+/** The harness's built-in commands/skills as AvailableCommand rows. */
+function builtinCommands(agent: AgentKind): AvailableCommand[] {
+  if (agent !== "claude-code") return [];
+  return CLAUDE_BUILTINS.map((b) => ({ name: b.name, description: b.description, source: "builtin", kind: b.kind }));
 }
 
 /**
@@ -135,23 +170,37 @@ function discoverSkills(dir: string, source: "user" | "project"): AvailableComma
  * avoids spawning git per keystroke. The branch field is wired through so a
  * future enhancement can git-ls-tree without breaking the API shape.
  */
-export async function listAvailableCommands(opts: {
-  agent: AgentKind;
-  workdir: string | null;
-  branch?: string | null;
-  harnessHome?: string | null;
-}): Promise<AvailableCommand[]> {
+export async function listAvailableCommands(
+  opts: {
+    agent: AgentKind;
+    workdir: string | null;
+    branch?: string | null;
+    harnessHome?: string | null;
+  },
+  // Pre-resolved active plugins, threaded in by `listAgentCapabilities` so the
+  // (settings + installed_plugins) resolution runs once per capabilities request
+  // instead of once here and again in `discoverMcpAndPluginExtensions`. Omitted
+  // by direct callers (e.g. tests), who get a self-contained resolve.
+  activePlugins?: ActivePlugin[],
+): Promise<AvailableCommand[]> {
   const all: AvailableCommand[] = [];
 
   if (opts.agent === "claude-code") {
     const userCmdRoot = opts.harnessHome ?? path.join(homedir(), ".claude");
     all.push(...discoverCommands(path.join(userCmdRoot, "commands"), "user"));
     all.push(...discoverSkills(path.join(userCmdRoot, "skills"), "user"));
-    if (opts.workdir) {
-      const root = (await repoRoot(opts.workdir)) ?? opts.workdir;
+    // Plugins apply regardless of workdir (user-scoped ones are global), so
+    // resolve the repo root up front — it's also reused for project entries.
+    const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
+    if (root) {
       all.push(...discoverCommands(path.join(root, ".claude", "commands"), "project"));
       all.push(...discoverSkills(path.join(root, ".claude", "skills"), "project"));
     }
+    // Enabled plugins contribute namespaced `/<plugin>:<name>` commands + skills.
+    all.push(...pluginCommands(activePlugins ?? resolveActivePlugins(opts, root)));
+    // Binary built-ins go LAST so any same-named user/project/plugin entry above
+    // wins the dedupe and built-ins only ever fill a gap (matches the CLI).
+    all.push(...builtinCommands(opts.agent));
   } else if (opts.agent === "codex") {
     const userCmdRoot = opts.harnessHome
       ? path.join(opts.harnessHome, ".codex")
@@ -260,21 +309,70 @@ function codexTomlMcpServers(tomlPath: string, source: "user" | "project"): Avai
 }
 
 /**
- * Installed claude-code plugins, scoped to what applies here: user-scoped
- * plugins always count; project-scoped ones only when their `projectPath`
- * matches the repo we're discovering against. Descriptions come from each
- * plugin's `.claude-plugin/plugin.json` when readable.
+ * A claude-code plugin that is installed, applicable to this context, and not
+ * disabled — i.e. one the spawned `claude` would actually load. The resolution
+ * (scope + enablement) is shared by everything the plugin contributes: its
+ * `@plugin` picker row, its namespaced `/<plugin>:<name>` commands + skills, and
+ * its bundled MCP servers.
  */
-function pluginExtensions(
-  pluginsDir: string,
-  repoRoots: string[],
-): AvailableExtension[] {
-  const installed = safeReadJson(path.join(pluginsDir, "installed_plugins.json"));
+interface ActivePlugin {
+  /** Bare plugin name (the `name` half of the `name@marketplace` key). */
+  name: string;
+  /** Marketplace half of the key; "" when the key carried no `@marketplace`. */
+  marketplace: string;
+  /** Absolute path to the chosen install record's unpacked plugin dir. */
+  installPath: string;
+  /** Install scope of the chosen record, for UI badging. */
+  source: "user" | "project";
+}
+
+/**
+ * Merge the `enabledPlugins` maps claude-code consults, lowest-precedence
+ * first: user settings, then project `settings.json`, then project
+ * `settings.local.json` (later writes win). Keys are `name@marketplace`; values
+ * are booleans. A plugin absent from every map is treated as enabled (claude
+ * adds an explicit `true` on install, so "absent" means "no opinion recorded"),
+ * but an explicit `false` at any scope hides it.
+ */
+function readEnabledPlugins(harnessHome: string | null, root: string | null): Map<string, boolean> {
+  const merged = new Map<string, boolean>();
+  const apply = (p: string) => {
+    const ep = safeReadJsonCached(p)?.enabledPlugins;
+    if (ep && typeof ep === "object") {
+      for (const [k, v] of Object.entries(ep)) {
+        if (typeof v === "boolean") merged.set(k, v);
+      }
+    }
+  };
+  // harnessHome IS the CLAUDE_CONFIG_DIR, so settings.json sits directly under
+  // it (mirroring how commands/skills live there sans `.claude/` segment).
+  apply(harnessHome ? path.join(harnessHome, "settings.json") : path.join(homedir(), ".claude", "settings.json"));
+  if (root) {
+    apply(path.join(root, ".claude", "settings.json"));
+    apply(path.join(root, ".claude", "settings.local.json"));
+  }
+  return merged;
+}
+
+/**
+ * The plugins a spawned `claude` would load for this (workdir, harness): an
+ * applicable install record (user-scoped always; project-scoped only when its
+ * `projectPath` matches the repo) AND not explicitly disabled via
+ * `enabledPlugins`. claude-code only — codex has no plugin system.
+ */
+function resolveActivePlugins(opts: DiscoveryOpts, root: string | null): ActivePlugin[] {
+  if (opts.agent !== "claude-code") return [];
+  const configDir = opts.harnessHome ?? path.join(homedir(), ".claude");
+  const installed = safeReadJsonCached(path.join(configDir, "plugins", "installed_plugins.json"));
   const plugins = installed?.plugins;
   if (!plugins || typeof plugins !== "object") return [];
-  const roots = new Set(repoRoots.filter(Boolean));
-  const rows: (AvailableExtension & { marketplace: string })[] = [];
+  const enabled = readEnabledPlugins(opts.harnessHome ?? null, root);
+  const roots = new Set([root, opts.workdir].filter(Boolean) as string[]);
+  const out: ActivePlugin[] = [];
   for (const [key, recordsRaw] of Object.entries(plugins as Record<string, unknown>)) {
+    // Explicit disable at any settings scope ⇒ claude won't load it. Absent ⇒
+    // load (default-enabled-on-install), so only `=== false` excludes.
+    if (enabled.get(key) === false) continue;
     const records = Array.isArray(recordsRaw) ? recordsRaw : [];
     // Pick the most relevant install record: prefer a project match, else any
     // user-scoped one. A plugin can be installed at both scopes.
@@ -286,32 +384,93 @@ function pluginExtensions(
       }
       if (rec && rec.scope === "user" && !chosen) { chosen = rec; source = "user"; }
     }
-    if (!chosen) continue;
-    // Plugin keys are `name@marketplace`; show the bare name, marketplace as a hint.
+    if (!chosen || typeof chosen.installPath !== "string") continue;
+    // Plugin keys are `name@marketplace`; split into the bare name + marketplace.
     const at = key.indexOf("@");
-    const name = at > 0 ? key.slice(0, at) : key;
-    const marketplace = at > 0 ? key.slice(at + 1) : "";
-    let description = marketplace ? `plugin · ${marketplace}` : "plugin";
-    if (typeof chosen.installPath === "string") {
-      const manifest = safeReadJson(path.join(chosen.installPath, ".claude-plugin", "plugin.json"));
-      if (manifest && typeof manifest.description === "string" && manifest.description.trim()) {
-        description = manifest.description.trim().slice(0, 200);
-      }
-    }
-    rows.push({ name, insert: "@" + name, description, source, kind: "plugin", marketplace });
+    out.push({
+      name: at > 0 ? key.slice(0, at) : key,
+      marketplace: at > 0 ? key.slice(at + 1) : "",
+      installPath: chosen.installPath,
+      source,
+    });
   }
-  // Two marketplaces can ship a plugin with the same bare name. Those are
-  // distinct plugins, not a user/project shadow of each other, so they must not
-  // collapse into one in the final (kind, name) dedupe. Suffix the display name
-  // with the marketplace for any name that appears more than once so both
-  // survive and the user can tell them apart.
+  return out;
+}
+
+/**
+ * One `@plugin` picker row per active plugin. Descriptions come from each
+ * plugin's `.claude-plugin/plugin.json` when readable. Two marketplaces can
+ * ship a plugin with the same bare name — those are distinct plugins, not a
+ * user/project shadow of each other, so they must not collapse in the final
+ * (kind, name) dedupe; suffix the display name with the marketplace for any
+ * name that appears more than once so both survive and stay distinguishable.
+ */
+function pluginSelfExtensions(active: ActivePlugin[]): AvailableExtension[] {
+  const rows = active.map((p) => {
+    let description = p.marketplace ? `plugin · ${p.marketplace}` : "plugin";
+    const manifest = safeReadJson(path.join(p.installPath, ".claude-plugin", "plugin.json"));
+    if (manifest && typeof manifest.description === "string" && manifest.description.trim()) {
+      description = manifest.description.trim().slice(0, 200);
+    }
+    return { name: p.name, insert: "@" + p.name, description, source: p.source, kind: "plugin" as const, marketplace: p.marketplace };
+  });
   const nameCounts = new Map<string, number>();
   for (const r of rows) nameCounts.set(r.name, (nameCounts.get(r.name) ?? 0) + 1);
   return rows.map(({ marketplace, ...r }) =>
-    nameCounts.get(r.name)! > 1 && marketplace
-      ? { ...r, name: `${r.name} (${marketplace})` }
-      : r,
+    nameCounts.get(r.name)! > 1 && marketplace ? { ...r, name: `${r.name} (${marketplace})` } : r,
   );
+}
+
+/**
+ * Commands + skills an active plugin contributes to the `/` surface. claude
+ * namespaces them `<plugin>:<name>` (e.g. `/vercel:deploy`, `/sentry:seer`), so
+ * we walk the plugin's own `commands/` + `skills/` trees and re-prefix each
+ * discovered `/name` as `/<plugin>:<name>`. `source: "plugin"` keeps them from
+ * shadowing — or being shadowed by — user/project entries.
+ *
+ * Two plugins that share a bare name across marketplaces (e.g. `foo@mp-a` +
+ * `foo@mp-b`) both emit `/foo:deploy`; the outer name-dedupe in
+ * `listAvailableCommands` keeps the first deterministically. That collapse is
+ * CORRECT, not a bug: claude has no invocation-level marketplace disambiguation
+ * (there is no `/foo@mp-a:deploy` token), so both versions genuinely compete for
+ * the one `/foo:deploy` namespace at runtime too. The `@plugin` picker rows
+ * still list both (suffixed with their marketplace) so the user can see the
+ * conflict; the slash surface just mirrors claude's actual single-namespace
+ * resolution. Do NOT "fix" this by minting a marketplace-qualified token — that
+ * token would not be invokable.
+ */
+function pluginCommands(active: ActivePlugin[]): AvailableCommand[] {
+  const out: AvailableCommand[] = [];
+  for (const p of active) {
+    const contributed = [
+      ...discoverCommands(path.join(p.installPath, "commands"), "plugin"),
+      ...discoverSkills(path.join(p.installPath, "skills"), "plugin"),
+    ];
+    for (const c of contributed) {
+      out.push({ ...c, name: `/${p.name}:${c.name.slice(1)}` });
+    }
+  }
+  return out;
+}
+
+/**
+ * MCP servers an active plugin ships via its bundled `.mcp.json`. These start
+ * automatically when the plugin is enabled, so they belong in the picker.
+ * Namespaced `<plugin>:<server>` to avoid colliding across plugins; collapsed
+ * to just `<plugin>` when the server name already equals the plugin name (the
+ * common single-server case, e.g. the `vercel` plugin's `vercel` server).
+ */
+function pluginMcpExtensions(active: ActivePlugin[]): AvailableExtension[] {
+  const out: AvailableExtension[] = [];
+  for (const p of active) {
+    const servers = safeReadJson(path.join(p.installPath, ".mcp.json"))?.mcpServers;
+    if (!servers || typeof servers !== "object") continue;
+    for (const [server, cfg] of Object.entries(servers as Record<string, unknown>)) {
+      const name = server === p.name ? p.name : `${p.name}:${server}`;
+      out.push({ name, insert: "@" + name, description: describeMcpServer(cfg), source: "plugin", kind: "mcp" });
+    }
+  }
+  return out;
 }
 
 interface DiscoveryOpts {
@@ -327,12 +486,11 @@ interface DiscoveryOpts {
  * `listAgentCapabilities` can reuse the skills `listAvailableCommands` already
  * walked instead of walking the `skills/` tree a second time.
  */
-function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null): AvailableExtension[] {
+function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null, active: ActivePlugin[]): AvailableExtension[] {
   const all: AvailableExtension[] = [];
   if (opts.agent === "claude-code") {
     // harnessHome (CLAUDE_CONFIG_DIR) replaces ~/.claude; the big config blob
     // lives alongside it as `.claude.json` (in HOME by default).
-    const configDir = opts.harnessHome ?? path.join(homedir(), ".claude");
     const claudeJsonPath = opts.harnessHome
       ? path.join(opts.harnessHome, ".claude.json")
       : path.join(homedir(), ".claude.json");
@@ -349,8 +507,11 @@ function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null
       all.push(...mcpServersToExtensions(safeReadJson(path.join(root, ".mcp.json"))?.mcpServers, "project"));
     }
 
-    // Plugins (claude-code only).
-    all.push(...pluginExtensions(path.join(configDir, "plugins"), [root, opts.workdir].filter(Boolean) as string[]));
+    // Plugins (claude-code only): the `@plugin` rows plus the MCP servers each
+    // enabled plugin ships via its bundled `.mcp.json`. `active` is resolved once
+    // by the caller and shared with the command pass.
+    all.push(...pluginSelfExtensions(active));
+    all.push(...pluginMcpExtensions(active));
   } else if (opts.agent === "codex") {
     const codexHome = opts.harnessHome ? path.join(opts.harnessHome, ".codex") : path.join(homedir(), ".codex");
     all.push(...codexTomlMcpServers(path.join(codexHome, "config.toml"), "user"));
@@ -396,9 +557,12 @@ export async function listAgentCapabilities(opts: DiscoveryOpts): Promise<{
   commands: AvailableCommand[];
   extensions: AvailableExtension[];
 }> {
-  const commands = await listAvailableCommands(opts);
-  // repoRoot is memoized, so this is a cache hit after listAvailableCommands.
+  // Resolve repo root + active plugins once, then thread both into the command
+  // and extension passes so neither re-reads settings/installed_plugins. repoRoot
+  // is memoized, so `listAvailableCommands` re-deriving root internally is a hit.
   const root = opts.workdir ? (await repoRoot(opts.workdir)) ?? opts.workdir : null;
+  const active = resolveActivePlugins(opts, root);
+  const commands = await listAvailableCommands(opts, active);
   const skillExts: AvailableExtension[] = commands
     .filter((c) => c.kind === "skill")
     .map((c) => ({
@@ -410,7 +574,7 @@ export async function listAgentCapabilities(opts: DiscoveryOpts): Promise<{
     }));
   const extensions = dedupeAndSortExtensions([
     ...skillExts,
-    ...discoverMcpAndPluginExtensions(opts, root),
+    ...discoverMcpAndPluginExtensions(opts, root, active),
   ]);
   return { commands, extensions };
 }
