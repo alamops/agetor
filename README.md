@@ -17,7 +17,7 @@ It runs entirely on your machine. No cloud relay, no remote sandbox — agents e
 - **Multi-agent, multi-account.** Built-in support for `claude-code` and `codex`. Define additional *harnesses* to run a second Claude or Codex account in parallel — each one gets a dedicated `$HOME` so logins, history, and config never collide.
 - **Per-task git worktrees.** Every task runs on its own branch (`agetor/<short-id>-<slug>`) in a dedicated worktree under `~/.agetor/worktrees/`. Two agents can hammer the same repo simultaneously without stepping on each other. Base ref is pinned at create time, so re-runs always start from the same commit.
 - **Interactive Claude sessions.** Claude Code is hosted in a per-task `tmux` session that stays alive across multiple turns. Follow up on a task without losing the conversation. Output is streamed by tailing Claude's own JSONL transcript, so assistant text, thinking blocks, tool calls, and tool results all render with their own UI components.
-- **Approvals and questions, lifted out of the TUI.** A `PreToolUse` hook and a tiny MCP server intercept Claude's tool-permission prompts and `AskUserQuestion` / `ExitPlanMode` calls. They surface in the run panel as structured cards — radios, checkboxes, free-text — with an optional "always allow for this task" rule. Codex prompts are detected heuristically from stdout and surfaced the same way.
+- **Approvals and questions, lifted out of the TUI.** Agetor watches Claude's tmux pane and JSONL transcript to detect `AskUserQuestion` / `ExitPlanMode` modals and tool-permission prompts, and surfaces them in the run panel as structured cards — radios, checkboxes, free-text. It's fully non-invasive: it registers no MCP server and installs no hook (it only strips stale entries left by older builds). Codex prompts are detected heuristically from stdout and surfaced the same way.
 - **Live event stream.** SSE per task and a global event channel. Status toasts and native notifications fire when a run finishes, succeeds, fails, or blocks waiting on input.
 - **Reproducible re-runs.** Run history persists per task. Cancelling a run keeps the tmux session alive so you can iterate; deleting a task tears down its worktree, branch, and session.
 - **Local SQLite.** All state — tasks, runs, events, projects, harnesses, preferences, approval rules — lives in `~/.agetor/agetor.sqlite` with a versioned migration runner. Nothing leaves your machine.
@@ -109,6 +109,50 @@ Drag cards between columns to override flow manually. Open a card to see the liv
 
 ---
 
+## Command-line interface (`agetor`)
+
+Agetor also ships as a standalone terminal CLI — drive the same board from your shell, with or without the desktop app open.
+
+### Install
+
+```bash
+curl -fsSL https://github.com/alamops/agetor/releases/latest/download/install.sh | sh
+```
+
+The installer is arm64-macOS only (matching the app), verifies a SHA-256 checksum, and drops a single `agetor` binary in `/usr/local/bin` (falling back to `~/.local/bin`). To build it from source instead:
+
+```bash
+bun run build:cli          # → artifacts/agetor-arm64 (+ .sha256, install.sh)
+# …or run straight from source, no build:
+bun src/cli/index.ts --help
+```
+
+### How it connects
+
+The CLI is a thin client over the same localhost API the webview uses. It discovers the running core through a `0600` credentials file (`~/.agetor/agetor-core.json`, written on launch with the per-launch port + token). If the desktop app is open, the CLI talks to it; if not, it **auto-starts a headless background daemon** that shares the same `~/.agetor` state — so a task you add from the CLI shows up in the app and vice-versa. When you later open the app, the daemon hands the port off to it.
+
+It honors the same `AGETOR_DATA_DIR` / `AGETOR_API_PORT` as the app, so e.g. `AGETOR_DATA_DIR=~/.agetor-dev agetor ls` targets the dev tree.
+
+### Commands
+
+```bash
+agetor                      # full-screen live dashboard (board + streaming detail)
+agetor add                  # create a task (guided wizard, or --title/--prompt[/--start])
+agetor ls                   # list all tasks        (ps = running/blocked only)
+agetor show <id>            # details, runs, pending interactions
+agetor start <id>           # start a task
+agetor send <id> <msg…>     # message a running task
+agetor answer <id>          # answer a task that needs input (interactive picker)
+agetor logs <id>            # stream a task's live conversation (--no-follow for a snapshot)
+agetor cancel <id>          # stop the active run
+agetor rm <id> --yes        # delete a task (worktree + branch)
+agetor daemon status|start|stop
+```
+
+Every command accepts `--json` for scripting, `--data-dir <dir>` / `--port <n>` to target a specific core, and `--no-daemon` to fail instead of auto-spawning one. Short id prefixes (the 8 chars shown in `agetor ls`) work anywhere an `<id>` is expected. The desktop `.dmg`/`.app` is unchanged — the CLI is an additional surface, not a replacement.
+
+---
+
 ## Configuration
 
 All persistent state lives in `~/.agetor/` (override with `AGETOR_DATA_DIR`):
@@ -116,8 +160,9 @@ All persistent state lives in `~/.agetor/` (override with `AGETOR_DATA_DIR`):
 ```
 ~/.agetor/
 ├── agetor.sqlite               # tasks, runs, events, projects, harnesses, preferences
+├── agetor-core.json            # 0600 creds file: the running core's port + token (CLI auth)
+├── daemon.log                  # headless CLI daemon log (when the app isn't running)
 ├── worktrees/<task-id>/        # per-task git worktrees
-├── bin/                        # installed approval hook + MCP launcher
 └── harnesses/<id>/             # optional per-harness HOME (multi-account)
 ```
 
@@ -133,6 +178,7 @@ All persistent state lives in `~/.agetor/` (override with `AGETOR_DATA_DIR`):
 | `AGETOR_CODEX_ARGS` | Extra args appended to every Codex spawn. | *(none)* |
 | `AGETOR_TMUX_BIN` | Override the `tmux` binary path. | `tmux` on `PATH` |
 | `AGETOR_CLAUDE_DRIVER` | Set to `fake` to skip tmux + the real CLI (test-only). | unset |
+| `AGETOR_DAEMON_IDLE_MS` | CLI daemon: idle-shutdown after this long with no run and no attached client. `0` disables. | `300000` (5 min) |
 
 Per-harness `bin`, `home`, and `env` overrides are configured through the Settings dialog and stored in SQLite — they take precedence over the corresponding env vars.
 

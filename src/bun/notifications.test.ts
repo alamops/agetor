@@ -2,6 +2,7 @@ import { test, expect, beforeAll, afterAll, mock } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { makeTestNative } from "./test-native.ts";
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-notifications-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
@@ -35,7 +36,9 @@ let token: string;
 beforeAll(async () => {
   await import("./db.ts");
   const { startApiServer, API_TOKEN } = await import("./server.ts");
-  server = startApiServer() as unknown as { stop: () => void; port: number };
+  server = startApiServer({
+    native: makeTestNative({ showNotification: (o) => { recorded.push(o); } }),
+  }) as unknown as { stop: () => void; port: number };
   token = API_TOKEN;
 });
 

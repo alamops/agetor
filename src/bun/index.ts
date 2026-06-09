@@ -1,14 +1,16 @@
 import { writeFileSync } from "node:fs";
-import Electrobun, { ApplicationMenu, BrowserWindow, Updater } from "electrobun/bun";
+import Electrobun, { ApplicationMenu, BrowserWindow, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
-import { startApiServer, API_PORT, API_TOKEN } from "./server.ts";
-import { db, harnesses, pidFilePath, tasks } from "./db.ts";
+import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
+import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans } from "./orchestrator.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
-import { startUpdaterLoop } from "./updater.ts";
+import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
+import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
+import pkg from "../../package.json" with { type: "json" };
 
 /** Drop a pid file in the data dir so out-of-process tools (notably
  *  `bun run wipe:dev`) can tell whether an agetor instance is using this
@@ -137,19 +139,76 @@ installNativeMenu();
 // background — we don't await it so a slow CLI never delays the API/window.
 void refreshDiscoveredModels();
 
+// Native-host capabilities the API server needs but that only exist inside
+// Electrobun (file dialogs, OS notifications, open-in-Finder/browser, the
+// self-updater, quit). The headless CLI daemon injects none of these — its
+// routes 501 — but the packaged app wires them up here.
+const native: ApiNative = {
+  openFileDialog: (opts) => Utils.openFileDialog(opts),
+  openPath: (p) => Utils.openPath(p),
+  openExternal: (url) => Utils.openExternal(url),
+  showNotification: (n) => Utils.showNotification(n),
+  quit: () => Utils.quit(),
+  updates: {
+    snapshot: () => getUpdateSnapshot(),
+    check: () => checkForUpdate(),
+    apply: () => applyUpdate(),
+  },
+};
+
+let apiServer: ReturnType<typeof startApiServer>;
 try {
-  startApiServer();
+  apiServer = startApiServer({ native });
 } catch (e) {
-  // The webview is created after this — if the API never came up, we'd
-  // leave an orphan window talking to whatever else happens to be on the
-  // port (e.g. a stale agetor, or OTLP gRPC which also defaults to 4317).
-  // Fail loudly instead so the user sees the real problem in the launcher
-  // logs rather than a wall of CORS errors in the renderer console.
-  const msg = (e as Error)?.message ?? String(e);
-  console.error(`[agetor] failed to bind API on 127.0.0.1:${API_PORT}: ${msg}`);
-  console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
-  process.exit(1);
+  // Port busy. If our own cli-daemon owns it (the CLI started a background core
+  // while the app was closed), ask it to hand off, wait for the port to free,
+  // then bind and become the owner. Anything else — a foreign process (stale
+  // agetor, or OTLP gRPC which also defaults to 4317) or a wedged daemon that
+  // won't release — falls through to the loud message + exit so the user sees
+  // the real problem rather than a wall of CORS errors in the renderer.
+  const creds = readCoreCreds(dataDir);
+  let recovered: ReturnType<typeof startApiServer> | null = null;
+  if (creds && creds.kind === "cli-daemon" && (await probeLiveCore(creds))) {
+    console.log("[agetor] a CLI daemon owns the API port — requesting handoff…");
+    try {
+      await fetch(`http://127.0.0.1:${creds.port}/daemon/shutdown`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${creds.token}` },
+      });
+    } catch {
+      /* the daemon drops the connection as it exits — expected */
+    }
+    if (await waitForPortFree(creds.port, 10_000)) {
+      try {
+        recovered = startApiServer({ native });
+      } catch {
+        /* fall through to the loud message below */
+      }
+    }
+  }
+  if (!recovered) {
+    const msg = (e as Error)?.message ?? String(e);
+    console.error(`[agetor] failed to bind API on 127.0.0.1:${API_PORT}: ${msg}`);
+    console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
+    process.exit(1);
+  }
+  apiServer = recovered;
 }
+
+// Publish the per-launch API port + token so the CLI (and a second app launch)
+// can discover and authenticate to this core. `kind: "app"` tells a future
+// daemon spawn that the richer surface owns the port.
+writeCoreCreds(
+  {
+    port: apiServer.port!,
+    token: API_TOKEN,
+    pid: process.pid,
+    kind: "app",
+    version: pkg.version,
+    startedAt: Date.now(),
+  },
+  dataDir,
+);
 
 // Warn the user before quitting when runs are still active. Electrobun's
 // `before-quit` event fires synchronously from Utils.quit() and reads
@@ -166,6 +225,7 @@ try {
 // is in flight.
 Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
   if (consumeForceQuit()) {
+    removeCoreCreds(dataDir);
     event.response = { allow: true };
     return;
   }
@@ -185,6 +245,7 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
     // of a missed warning is small; the cost of trapping the user is high.
   }
   if (runningCount === 0) {
+    removeCoreCreds(dataDir);
     event.response = { allow: true };
     return;
   }

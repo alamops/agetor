@@ -2,6 +2,7 @@ import { test, expect, beforeAll, afterAll, mock } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { makeTestNative } from "./test-native.ts";
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-open-external-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
@@ -34,7 +35,9 @@ let token: string;
 beforeAll(async () => {
   await import("./db.ts");
   const { startApiServer, API_TOKEN } = await import("./server.ts");
-  server = startApiServer() as unknown as { stop: () => void };
+  server = startApiServer({
+    native: makeTestNative({ openExternal: (u) => { opened.push(u); return true; } }),
+  }) as unknown as { stop: () => void };
   token = API_TOKEN;
 });
 

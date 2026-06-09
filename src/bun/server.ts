@@ -1,10 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { Utils } from "electrobun/bun";
 import type { WebSocketHandler } from "bun";
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, getApiPort } from "./api-config.ts";
+import { removeCoreCreds } from "./core-creds.ts";
 import {
   tasks,
   runs,
@@ -22,7 +22,7 @@ import {
   isValidEnvKey,
   toTerminalAppleScript,
 } from "./agents.ts";
-import { applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
+import type { UpdaterSnapshot } from "./updater.ts";
 import {
   bundledTmuxAvailable,
   bundledTmuxPath,
@@ -81,6 +81,16 @@ export const API_PORT = getApiPort();
 // the runtime port is known. Kept as a mutable Set so handlers can close
 // over the binding at module load and still see the correct values.
 const ALLOWED_ORIGINS = new Set<string>();
+
+// Count of attached SSE clients across /events, /runs/:id/events,
+// /tasks/:id/events and /app/events. The headless CLI daemon reads this to
+// decide when it's safe to idle-shutdown: a connected CLI keeps the core alive
+// even with no running task. Best-effort — incremented when a stream opens,
+// decremented on the request abort.
+let attachedClients = 0;
+export function attachedClientCount(): number {
+  return attachedClients;
+}
 
 const json = (data: unknown, init?: ResponseInit) =>
   new Response(JSON.stringify(data), {
@@ -170,7 +180,47 @@ function filterPatch(raw: unknown): Partial<Task> {
   return patch;
 }
 
-export function startApiServer() {
+/**
+ * Native-host capabilities the API needs but that only exist inside the
+ * Electrobun app: file/folder dialogs, OS notifications, open-in-Finder /
+ * open-in-browser, the self-updater, and app quit. The Electrobun entry
+ * (`index.ts`) injects a real implementation built from `electrobun/bun` +
+ * `updater.ts`; the headless CLI daemon injects nothing, so the handful of
+ * routes that need these return 501. Keeping them behind this interface is
+ * what lets `server.ts` load without importing `electrobun/bun`.
+ */
+export interface ApiNative {
+  openFileDialog(opts: {
+    startingFolder: string;
+    canChooseFiles: boolean;
+    canChooseDirectory: boolean;
+    allowsMultipleSelection: boolean;
+  }): Promise<string[]>;
+  openPath(p: string): boolean;
+  openExternal(url: string): boolean;
+  showNotification(n: {
+    title: string;
+    body?: string;
+    subtitle?: string;
+    silent?: boolean;
+  }): void;
+  quit(): void;
+  updates: {
+    snapshot(): UpdaterSnapshot;
+    check(): Promise<void>;
+    apply(): Promise<void>;
+  };
+}
+
+/** 501 for native-only routes when running headless (no Electrobun host). */
+const notAvailableHeadless = (req: Request) =>
+  json(
+    { error: "not available in headless mode" },
+    { status: 501, headers: corsHeaders(req) },
+  );
+
+export function startApiServer(deps: { native?: ApiNative } = {}) {
+  const native = deps.native;
   // Read the port fresh — supports tests that import server.ts after setting
   // AGETOR_API_PORT and rely on the bind to honour their override even when
   // a sibling test file imported the module first.
@@ -254,7 +304,8 @@ export function startApiServer() {
               startingFolder = (body as { startingFolder: string }).startingFolder;
             }
           } catch { /* no body is fine */ }
-          const paths = await Utils.openFileDialog({
+          if (!native) return notAvailableHeadless(req);
+          const paths = await native.openFileDialog({
             startingFolder,
             canChooseFiles: false,
             canChooseDirectory: true,
@@ -345,23 +396,27 @@ export function startApiServer() {
       // the banner's "Restart now" button.
       "/updates/status": {
         GET: authed((req) =>
-          json(getUpdateSnapshot(), { headers: corsHeaders(req) })),
+          native
+            ? json(native.updates.snapshot(), { headers: corsHeaders(req) })
+            : notAvailableHeadless(req)),
       },
       "/updates/check": {
         POST: authed(async (req) => {
-          await checkForUpdate();
-          return json(getUpdateSnapshot(), { headers: corsHeaders(req) });
+          if (!native) return notAvailableHeadless(req);
+          await native.updates.check();
+          return json(native.updates.snapshot(), { headers: corsHeaders(req) });
         }),
       },
       "/updates/apply": {
         POST: authed((req) => {
+          if (!native) return notAvailableHeadless(req);
           // Status check runs synchronously here — not inside applyUpdate —
           // so the 409 reaches the client. An earlier shape wrapped a void
           // applyUpdate() call in try/catch, but async functions never throw
           // synchronously, so that catch was dead code and stale-button
           // clicks silently 200'd while the actual rejection became an
           // unhandled promise inside the bun process.
-          const snap = getUpdateSnapshot();
+          const snap = native.updates.snapshot();
           if (snap.status !== "ready") {
             return json(
               { error: `no update is ready to apply (status: ${snap.status})` },
@@ -371,7 +426,7 @@ export function startApiServer() {
           // applyUpdate quits + relaunches; the HTTP response races against
           // process exit. Void on purpose — the webview drops its connection
           // when the process goes away.
-          void applyUpdate();
+          void native.updates.apply();
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
@@ -1070,7 +1125,8 @@ export function startApiServer() {
               { status: 404, headers: corsHeaders(req) },
             );
           }
-          const ok = Utils.openPath(abs);
+          if (!native) return notAvailableHeadless(req);
+          const ok = native.openPath(abs);
           return json({ opened: ok, path: abs }, { headers: corsHeaders(req) });
         }),
       },
@@ -1093,7 +1149,8 @@ export function startApiServer() {
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const ok = Utils.openExternal(raw);
+          if (!native) return notAvailableHeadless(req);
+          const ok = native.openExternal(raw);
           return json({ opened: ok, url: raw }, { headers: corsHeaders(req) });
         }),
       },
@@ -1116,7 +1173,8 @@ export function startApiServer() {
             typeof body.startingFolder === "string" && body.startingFolder.trim()
               ? body.startingFolder
               : homedir();
-          const paths = await Utils.openFileDialog({
+          if (!native) return notAvailableHeadless(req);
+          const paths = await native.openFileDialog({
             startingFolder,
             canChooseFiles: mode === "files",
             canChooseDirectory: mode === "folder",
@@ -1420,9 +1478,19 @@ export function startApiServer() {
         const runId = req.params.id;
         const stream = new ReadableStream({
           start(controller) {
+            attachedClients++;
             const enc = new TextEncoder();
             const send = (e: RunEvent | { type: "ping" }) => {
-              controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              try {
+                controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              } catch {
+                // Client went away mid-send (replay or a live event landing on a
+                // closed controller). Swallow so `start` never throws before the
+                // abort handler is registered — that handler owns the cleanup
+                // (unsubscribe + attachedClients--), and letting `start` throw
+                // would leak both the subscription and the attached-client count
+                // (which would then permanently block the daemon's idle-shutdown).
+              }
             };
             // Subscribe BEFORE reading the stored history snapshot so any
             // live event fired between the snapshot read and the subscribe
@@ -1452,6 +1520,7 @@ export function startApiServer() {
               clearInterval(ping);
               unsubscribe();
               controller.close();
+              attachedClients--;
             });
           },
         });
@@ -1471,9 +1540,19 @@ export function startApiServer() {
       "/events": authed((req) => {
         const stream = new ReadableStream({
           start(controller) {
+            attachedClients++;
             const enc = new TextEncoder();
             const send = (e: GlobalEvent | { type: "ping" }) => {
-              controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              try {
+                controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              } catch {
+                // Client went away mid-send (replay or a live event landing on a
+                // closed controller). Swallow so `start` never throws before the
+                // abort handler is registered — that handler owns the cleanup
+                // (unsubscribe + attachedClients--), and letting `start` throw
+                // would leak both the subscription and the attached-client count
+                // (which would then permanently block the daemon's idle-shutdown).
+              }
             };
             const unsubscribe = subscribeGlobal((e) => send(e));
             const ping = setInterval(() => send({ type: "ping" }), 15_000);
@@ -1481,6 +1560,7 @@ export function startApiServer() {
               clearInterval(ping);
               unsubscribe();
               controller.close();
+              attachedClients--;
             });
           },
         });
@@ -1500,6 +1580,7 @@ export function startApiServer() {
       // the OS notification queue.
       "/notifications": {
         POST: authed(async (req) => {
+          if (!native) return notAvailableHeadless(req);
           const body = (await req.json().catch(() => ({}))) as {
             title?: unknown;
             body?: unknown;
@@ -1516,7 +1597,7 @@ export function startApiServer() {
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          Utils.showNotification({
+          native.showNotification({
             title,
             body: trunc(body.body),
             subtitle: trunc(body.subtitle),
@@ -1533,9 +1614,19 @@ export function startApiServer() {
       "/app/events": authed((req) => {
         const stream = new ReadableStream({
           start(controller) {
+            attachedClients++;
             const enc = new TextEncoder();
             const send = (e: AppEvent | { type: "ping" }) => {
-              controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              try {
+                controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              } catch {
+                // Client went away mid-send (replay or a live event landing on a
+                // closed controller). Swallow so `start` never throws before the
+                // abort handler is registered — that handler owns the cleanup
+                // (unsubscribe + attachedClients--), and letting `start` throw
+                // would leak both the subscription and the attached-client count
+                // (which would then permanently block the daemon's idle-shutdown).
+              }
             };
             const unsubscribe = subscribeAppEvents((e) => send(e));
             const ping = setInterval(() => send({ type: "ping" }), 15_000);
@@ -1543,6 +1634,7 @@ export function startApiServer() {
               clearInterval(ping);
               unsubscribe();
               controller.close();
+              attachedClients--;
             });
           },
         });
@@ -1562,6 +1654,7 @@ export function startApiServer() {
       // page that knows the port can't forcibly close the app.
       "/app/force-quit": {
         POST: authed((req) => {
+          if (!native) return notAvailableHeadless(req);
           // Only the first call queues Utils.quit() — subsequent POSTs
           // (rapid double-click on "Quit anyway", a buggy/looping caller,
           // etc.) short-circuit. Electrobun's own `isQuitting` guard is a
@@ -1576,7 +1669,24 @@ export function startApiServer() {
           // reaches the webview before the renderer is torn down. (Even if
           // it doesn't, the client doesn't care — its EventSource just drops.)
           setTimeout(() => {
-            try { Utils.quit(); } catch { /* electrobun internals may throw on second quit; safe to swallow */ }
+            try { native.quit(); } catch { /* electrobun internals may throw on second quit; safe to swallow */ }
+          }, 0);
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Shut the core down gracefully. Used for the app⇄daemon port handoff
+      // (the app POSTs this to a running cli-daemon before binding) and by
+      // `agetor daemon stop`. Removes the creds file, then quits via the
+      // native host if present (app mode) or exits the process (headless).
+      // Token-gated like every other mutating route; the setTimeout(…, 0) lets
+      // the 200 flush before the process goes away (same pattern as force-quit).
+      "/daemon/shutdown": {
+        POST: authed((req) => {
+          setTimeout(() => {
+            removeCoreCreds(dataDir);
+            if (native) native.quit();
+            else process.exit(0);
           }, 0);
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
@@ -1611,9 +1721,19 @@ export function startApiServer() {
         const taskId = req.params.id;
         const stream = new ReadableStream({
           start(controller) {
+            attachedClients++;
             const enc = new TextEncoder();
             const send = (e: RunEvent | { type: "ping" }) => {
-              controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              try {
+                controller.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`));
+              } catch {
+                // Client went away mid-send (replay or a live event landing on a
+                // closed controller). Swallow so `start` never throws before the
+                // abort handler is registered — that handler owns the cleanup
+                // (unsubscribe + attachedClients--), and letting `start` throw
+                // would leak both the subscription and the attached-client count
+                // (which would then permanently block the daemon's idle-shutdown).
+              }
             };
             // Unified task-level stream: one scrollback per task, merging
             // events across every run. Subscribe before replay (same race
@@ -1641,6 +1761,7 @@ export function startApiServer() {
               clearInterval(ping);
               unsubscribe();
               controller.close();
+              attachedClients--;
             });
           },
         });
