@@ -33,14 +33,20 @@ test("claude haiku-4.5 exposes no effort options (CLI doesn't accept the flag)",
   expect(ids).toEqual([]);
 });
 
-test("claude null model falls back to DEFAULT_MODEL support set (opus-4.7)", () => {
+test("claude null model falls back to DEFAULT_MODEL support set (opus-4.8)", () => {
   // No model specified → use the agent's default model's support set. Since
-  // claude-code's DEFAULT_MODEL is opus-4.7, xhigh + max are both available.
-  expect(DEFAULT_MODEL["claude-code"]).toBe("opus-4.7");
+  // claude-code's DEFAULT_MODEL is opus-4.8, xhigh + max are both available.
+  expect(DEFAULT_MODEL["claude-code"]).toBe("opus-4.8");
   const ids = supportedEfforts("claude-code", null).map((o) => o.id);
   expect(ids).toContain("xhigh");
   expect(ids).toContain("max");
   expect(ids).toContain("high");
+});
+
+test("claude fable-5 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "fable-5").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
 });
 
 test("codex gpt-5.5 supports xhigh but not max", () => {
