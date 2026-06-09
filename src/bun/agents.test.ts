@@ -150,6 +150,16 @@ test("claude-code 'opus-4.8' maps to --model claude-opus-4-8", () => {
   ]);
 });
 
+test("claude-code 'fable-5' maps to --model claude-fable-5", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "fable-5", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-fable-5",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
 test("claude-code prefixes the prompt with `--` so a leading-dash prompt isn't parsed as a flag", () => {
   // Regression: a prompt like a markdown checklist item starts with `-`.
   // Without the `--` terminator claude's CLI errors `unknown option` and

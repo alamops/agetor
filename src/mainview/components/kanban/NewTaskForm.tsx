@@ -642,6 +642,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
           </div>
         </div>
 
+        {/* Fable 5 sits above Opus in the picker but bills at 2x the usage —
+            surface that under the model row so the cost is obvious before Create. */}
+        {kind === "claude-code" && model === "fable-5" && (
+          <div className="text-[11px] text-muted-foreground">
+            Fable 5 uses 2x the usage of Opus.
+          </div>
+        )}
+
         {/* Surfacing a missing-agent error inline so the user sees install
             guidance before they hit Create and get a delayed failure. */}
         {selectedStatus && !selectedStatus.available && (
