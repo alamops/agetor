@@ -11,22 +11,30 @@ import { cmdStart, cmdSend, cmdCancel, cmdRm } from "./commands/lifecycle.ts";
 import { cmdAdd } from "./commands/add.ts";
 import { cmdAnswer } from "./commands/answer.ts";
 import { cmdLogs } from "./commands/logs.ts";
+import { cmdEdit, cmdMove, cmdArchive, cmdUnarchive } from "./commands/manage.ts";
+import { cmdDiff } from "./commands/diff.ts";
+import { cmdAttach } from "./commands/attach.ts";
 
 const HELP = `agetor — drive Agetor from the terminal
 
 Usage: agetor [command] [options]
 
 Commands:
-  (no command)        open the dashboard (coming soon)
+  (no command)        open the live dashboard
   add                 create a task (guided wizard, or --title/--prompt)
-  ls                  list all tasks
+  ls [filters]        list tasks (--column/--agent/--type/--repo/--search/--archived/--all)
   ps                  list running / blocked tasks
   show <id>           task details, runs, pending interactions
-  start <id>          start a task
-  send <id> <msg…>    send a message to a running task
+  edit <id> [flags]   change title/prompt/agent/workdir/model/mode/effort/type/column
+  move <id> <column>  move a task between columns (mark done = move <id> done)
+  start <id>          run a not-yet-run task
+  send <id> <msg…>    message a running task (resumes a finished one)
   answer <id>         answer a task that needs input (interactive)
   logs <id>           stream a task's live conversation (--no-follow)
+  diff <id>           show the task's git diff
+  attach <id>         attach your terminal to the live tmux session (claude-code)
   cancel <id>         stop the active run
+  archive <id>        archive a done task   (unarchive <id> to restore)
   rm <id> [--yes]     delete a task (worktree + branch)
   info                show the connected core's version
   daemon <sub>        start | stop | status of the background core
@@ -127,6 +135,19 @@ async function main(): Promise<void> {
     case "rm":
     case "delete":
       return cmdRm(args, flags);
+    case "edit":
+      return cmdEdit(args, flags);
+    case "move":
+    case "mv":
+      return cmdMove(args, flags);
+    case "archive":
+      return cmdArchive(args, flags);
+    case "unarchive":
+      return cmdUnarchive(args, flags);
+    case "diff":
+      return cmdDiff(args, flags);
+    case "attach":
+      return cmdAttach(args, flags);
     case "info": {
       const client = await getClient(flags);
       const meta = await client.info();

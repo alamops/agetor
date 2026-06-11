@@ -11,19 +11,66 @@ const COLUMN_GLYPH: Record<string, string> = {
   done: "✓",
 };
 
+interface LsFilters {
+  columns: string[];
+  agent?: string;
+  type?: string;
+  repo?: string;
+  search?: string;
+  archived: boolean;
+  all: boolean;
+}
+
+function parseLsFilters(args: string[]): LsFilters {
+  const f: LsFilters = { columns: [], archived: false, all: false };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const next = () => args[++i];
+    switch (a) {
+      case "--column": case "-c": { const v = next(); if (v) f.columns.push(...v.split(",")); break; }
+      case "--agent": f.agent = next(); break;
+      case "--type": f.type = next(); break;
+      case "--repo": case "--workdir": f.repo = next(); break;
+      case "--search": case "-q": f.search = next(); break;
+      case "--archived": f.archived = true; break;
+      case "--all": f.all = true; break;
+      default: break;
+    }
+  }
+  return f;
+}
+
 export async function cmdLs(
-  _args: string[],
+  args: string[],
   flags: Flags,
   opts: { onlyRunning?: boolean } = {},
 ): Promise<void> {
+  const f = parseLsFilters(args);
   const client = await getClient(flags);
   let tasks = await client.listTasks();
+  // Archive view: active-only by default (matches the app); --archived shows
+  // only archived, --all shows both.
+  if (f.archived) tasks = tasks.filter((t) => t.archivedAt != null);
+  else if (!f.all) tasks = tasks.filter((t) => t.archivedAt == null);
   if (opts.onlyRunning) {
     tasks = tasks.filter((t) => t.column === "running" || t.column === "blocked");
   }
+  if (f.columns.length) tasks = tasks.filter((t) => f.columns.includes(t.column));
+  if (f.agent) tasks = tasks.filter((t) => t.agent === f.agent);
+  if (f.type) tasks = tasks.filter((t) => t.taskType === f.type);
+  if (f.repo) {
+    const r = f.repo.toLowerCase();
+    tasks = tasks.filter((t) => t.workdir.toLowerCase().includes(r));
+  }
+  if (f.search) {
+    const q = f.search.toLowerCase();
+    tasks = tasks.filter((t) =>
+      `${t.title} ${t.prompt} ${t.workdir} ${t.branch ?? ""}`.toLowerCase().includes(q),
+    );
+  }
   if (flags.json) return printJson(tasks);
   if (tasks.length === 0) {
-    out(c.dim(opts.onlyRunning ? "no running tasks" : "no tasks"));
+    out(c.dim("no matching tasks"));
     return;
   }
   const rows = tasks.map((t) => [

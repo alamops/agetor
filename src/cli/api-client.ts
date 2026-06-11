@@ -9,6 +9,7 @@ import type {
   Project,
   Harness,
   TaskReference,
+  TaskDiff,
 } from "../shared/types.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
 
@@ -125,10 +126,13 @@ export class AgetorClient {
   archiveTask(id: string): Promise<Task> {
     return this.req("POST", `/tasks/${id}/archive`);
   }
+  unarchiveTask(id: string): Promise<Task> {
+    return this.req("POST", `/tasks/${id}/unarchive`);
+  }
   getRuns(id: string): Promise<Run[]> {
     return this.req("GET", `/tasks/${id}/runs`);
   }
-  getDiff(id: string): Promise<{ diff?: string; error?: string }> {
+  getDiff(id: string): Promise<TaskDiff> {
     return this.req("GET", `/tasks/${id}/diff`);
   }
   getGitStatus(id: string): Promise<{ dirty: boolean }> {
