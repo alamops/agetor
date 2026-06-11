@@ -39,13 +39,19 @@ export function Dashboard({
   const events = useCoalescedStream(selected?.id ?? null, dataDir);
   const [status, setStatus] = useState("");
   const [mode, setMode] = useState<Mode>("nav");
+  // The compose/answer target is PINNED by id when the mode opens — the 1.5s
+  // poll re-sorts the board, so following `sorted[sel]` could redirect a send
+  // or answer to whatever task slid into that slot. Resolve by id each render
+  // so runId / pendingInteractionCount stay fresh but the task can't change.
+  const [targetId, setTargetId] = useState<string | null>(null);
+  const target = targetId ? sorted.find((t) => t.id === targetId) ?? null : null;
   const toast = useGlobalEvents(dataDir);
 
-  // Never let a mode get stranded (and the keyboard dead) if the selected task
+  // Never let a mode get stranded (and the keyboard dead) if the target task
   // disappears from the board while composing / answering.
   useEffect(() => {
-    if (mode !== "nav" && !selected) setMode("nav");
-  }, [mode, selected]);
+    if (mode !== "nav" && !target) setMode("nav");
+  }, [mode, target]);
 
   const anyRunning = useMemo(() => sorted.some((t) => t.column === "running"), [sorted]);
   const frame = useSpinner(anyRunning);
@@ -77,9 +83,15 @@ export function Dashboard({
     if (input === "q" || (key.ctrl && input === "c")) return exit();
     if (key.upArrow || input === "k") setSel((s) => Math.max(0, s - 1));
     if (key.downArrow || input === "j") setSel((s) => Math.min(sorted.length - 1, s + 1));
-    if (input === "m" && selected) return setMode("compose");
+    if (input === "m" && selected) {
+      setTargetId(selected.id);
+      return setMode("compose");
+    }
     if (input === "g" && selected) {
-      if (selected.pendingInteractionCount > 0) return setMode("answer");
+      if (selected.pendingInteractionCount > 0) {
+        setTargetId(selected.id);
+        return setMode("answer");
+      }
       setStatus("nothing to answer");
       return;
     }
@@ -160,19 +172,20 @@ export function Dashboard({
           )}
         </Box>
       </Box>
-      {mode === "compose" && selected ? (
+      {mode === "compose" && target ? (
         <Composer
           active
-          label={`→ ${selected.id.slice(0, 8)}`}
-          onSubmit={(t) => sendMessage(selected, t)}
+          width={cols}
+          label={`→ ${target.id.slice(0, 8)}`}
+          onSubmit={(t) => sendMessage(target, t)}
           onCancel={() => setMode("nav")}
         />
       ) : null}
-      {mode === "answer" && selected ? (
-        <Box borderStyle="round" borderColor="yellow" paddingX={1}>
+      {mode === "answer" && target ? (
+        <Box borderStyle="round" borderColor="yellow" paddingX={1} overflow="hidden">
           <AnswerOverlay
             client={client}
-            taskId={selected.id}
+            taskId={target.id}
             onDone={(msg) => {
               setStatus(msg);
               setMode("nav");

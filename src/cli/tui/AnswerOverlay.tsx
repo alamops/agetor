@@ -71,9 +71,14 @@ export function AnswerOverlay({
           });
         }
         if (key.return) {
-          const selected = q.multiSelect
-            ? [...toggled].map((i) => q.options[i]!.label)
-            : [q.options[cursor]!.label];
+          let selected: string[];
+          if (q.multiSelect) {
+            selected = [...toggled].map((i) => q.options[i]!.label);
+          } else {
+            const pick = q.options[cursor];
+            if (!pick) return; // empty/malformed question — nothing to submit
+            selected = [pick.label];
+          }
           const next = [...answers, { selected }];
           if (qIndex + 1 < req.questions.length) {
             setAnswers(next);

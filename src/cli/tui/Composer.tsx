@@ -10,11 +10,13 @@ import { Box, Text, useInput } from "ink";
 export function Composer({
   active,
   label,
+  width,
   onSubmit,
   onCancel,
 }: {
   active: boolean;
   label: string;
+  width?: number;
   onSubmit: (text: string) => void;
   onCancel: () => void;
 }) {
@@ -46,10 +48,14 @@ export function Composer({
   );
 
   return (
-    <Box paddingX={1}>
-      <Text color="cyan">{label} </Text>
-      <Text>{text}</Text>
-      <Text color="cyan">▏</Text>
+    // truncate-start keeps the caret (and the text you just typed) on screen
+    // when the message outgrows the terminal width.
+    <Box paddingX={1} width={width}>
+      <Text wrap="truncate-start">
+        <Text color="cyan">{label} </Text>
+        {text}
+        <Text color="cyan">▏</Text>
+      </Text>
     </Box>
   );
 }
