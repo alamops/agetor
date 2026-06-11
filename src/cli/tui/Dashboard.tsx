@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
+import { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
 import { useTasks } from "./useTasks.ts";
 import { useCoalescedStream, eventKey } from "./useCoalescedStream.ts";
 import { useSpinner } from "./useSpinner.ts";
@@ -56,7 +57,7 @@ export function Dashboard({
   const anyRunning = useMemo(() => sorted.some((t) => t.column === "running"), [sorted]);
   const frame = useSpinner(anyRunning);
 
-  const sendMessage = (task: Task, text: string) => {
+  const sendMessage = (task: Task, text: string, okLabel = "→ sent") => {
     if (task.pendingInteractionCount > 0) {
       setStatus("answer the pending question first (g)");
       return;
@@ -72,7 +73,7 @@ export function Dashboard({
           return;
         }
         const res = await client.sendInput(runId, text);
-        setStatus(res.delivered === false ? `! ${res.reason ?? "not delivered"}` : "→ sent");
+        setStatus(res.delivered === false ? `! ${res.reason ?? "not delivered"}` : okLabel);
       } catch (e) {
         setStatus(`! ${(e as Error).message}`);
       }
@@ -93,6 +94,10 @@ export function Dashboard({
         return setMode("answer");
       }
       setStatus("nothing to answer");
+      return;
+    }
+    if (input === "c" && selected) {
+      sendMessage(selected, COMMIT_PUSH_PROMPT, "→ commit & push requested");
       return;
     }
     if (input === "s" && selected) {
@@ -331,7 +336,7 @@ function Footer({
       ? "type a message · enter send · esc cancel"
       : mode === "answer"
         ? "↑/↓ move · space toggle · enter submit · esc cancel"
-        : "↑/↓ select · s run · x stop · m message · g answer · q quit";
+        : "↑/↓ select · s run · x stop · m msg · c commit · g answer · q quit";
   return (
     <Box justifyContent="space-between" paddingX={1}>
       <Text dimColor>{hint}</Text>

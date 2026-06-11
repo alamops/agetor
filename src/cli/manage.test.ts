@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ensureCore, stopDaemon } from "./daemon/supervisor.ts";
@@ -92,5 +92,29 @@ test("harness create/patch/enable/disable/delete + guard paths + {harnesses,stat
 
     await client.deleteHarness("alias1");
     expect((await client.listHarnesses()).harnesses.some((h) => h.id === "alias1")).toBe(false);
+  });
+}, 30_000);
+
+test("getGitStatus reports uncommitted changes via { hasChanges }", async () => {
+  await withClient(4498, async (client) => {
+    const repo = mkdtempSync(path.join(tmpdir(), "agetor-gs-"));
+    Bun.spawnSync(["git", "init", "-q", repo]);
+    writeFileSync(path.join(repo, "a.txt"), "one\n");
+    Bun.spawnSync(["git", "-C", repo, "add", "-A"]);
+    Bun.spawnSync([
+      "git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t",
+      "commit", "-q", "-m", "init",
+    ]);
+
+    const t = await client.createTask({
+      title: "GS", prompt: "p", agent: "claude-code", isolation: "none", workdir: repo,
+    });
+    expect((await client.getGitStatus(t.id)).hasChanges).toBe(false);
+
+    writeFileSync(path.join(repo, "a.txt"), "two\n"); // modify a tracked file
+    expect((await client.getGitStatus(t.id)).hasChanges).toBe(true);
+
+    await client.deleteTask(t.id);
+    rmSync(repo, { recursive: true, force: true });
   });
 }, 30_000);

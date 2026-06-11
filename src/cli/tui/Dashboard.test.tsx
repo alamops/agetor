@@ -3,6 +3,7 @@ import { render } from "ink-testing-library";
 import { Dashboard } from "./Dashboard.tsx";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task } from "../../shared/types.ts";
+import { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
 
 const ENTER = "\r";
 const wait = (ms = 60) => new Promise((r) => setTimeout(r, ms));
@@ -28,7 +29,8 @@ test("Dashboard mounts the header, empty state, and the new key hints", async ()
   const frame = lastFrame() ?? "";
   expect(frame).toContain("Agetor");
   expect(frame).toContain("no tasks");
-  expect(frame).toContain("m message");
+  expect(frame).toContain("m msg");
+  expect(frame).toContain("c commit");
   expect(frame).toContain("g answer");
   unmount();
 });
@@ -65,5 +67,26 @@ test("compose pins the target task even when the board re-sorts under the cursor
   stdin.write(ENTER);
   await wait(80);
   expect(sends).toEqual([{ runId: "runA", line: "hello" }]);
+  unmount();
+});
+
+test("the 'c' key sends the canned commit & push prompt to the selected task", async () => {
+  const sends: Array<{ runId: string; line: string }> = [];
+  const client = {
+    listTasks: async () => [task({ id: "taskA", column: "review", runId: "runA", hasOpenableRun: true, title: "A" })],
+    getRuns: async () => [],
+    sendInput: async (runId: string, line: string) => {
+      sends.push({ runId, line });
+      return { delivered: true };
+    },
+  } as unknown as AgetorClient;
+
+  const { stdin, unmount } = render(
+    <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
+  );
+  await wait(90);
+  stdin.write("c");
+  await wait(80);
+  expect(sends).toEqual([{ runId: "runA", line: COMMIT_PUSH_PROMPT }]);
   unmount();
 });

@@ -16,6 +16,7 @@ import { cmdDiff } from "./commands/diff.ts";
 import { cmdAttach } from "./commands/attach.ts";
 import { cmdHarness } from "./commands/harness.ts";
 import { cmdProjects } from "./commands/projects.ts";
+import { cmdCommit } from "./commands/commit.ts";
 
 const HELP = `agetor — drive Agetor from the terminal
 
@@ -31,6 +32,7 @@ Commands:
   move <id> <column>  move a task between columns (mark done = move <id> done)
   start <id>          run a not-yet-run task
   send <id> <msg…>    message a running task (resumes a finished one)
+  commit <id>         ask the agent to commit all changes & push the branch
   answer <id>         answer a task that needs input (interactive)
   logs <id>           stream a task's live conversation (--no-follow)
   diff <id>           show the task's git diff
@@ -129,6 +131,8 @@ async function main(): Promise<void> {
     case "send":
     case "msg":
       return cmdSend(args, flags);
+    case "commit":
+      return cmdCommit(args, flags);
     case "answer":
       return cmdAnswer(args, flags);
     case "logs":
