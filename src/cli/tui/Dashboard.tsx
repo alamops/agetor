@@ -1,11 +1,16 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
 import { useTasks } from "./useTasks.ts";
 import { useCoalescedStream, eventKey } from "./useCoalescedStream.ts";
 import { useSpinner } from "./useSpinner.ts";
-import { runControl } from "../run-logic.ts";
+import { useGlobalEvents, type Toast } from "./useGlobalEvents.ts";
+import { Composer } from "./Composer.tsx";
+import { AnswerOverlay } from "./AnswerOverlay.tsx";
+import { runControl, resumableRunId } from "../run-logic.ts";
+
+type Mode = "nav" | "compose" | "answer";
 
 // Surface the most actionable columns first.
 const COLUMN_ORDER = ["running", "blocked", "review", "ready", "backlog", "done"];
@@ -33,14 +38,51 @@ export function Dashboard({
   const selected = sorted[sel];
   const events = useCoalescedStream(selected?.id ?? null, dataDir);
   const [status, setStatus] = useState("");
+  const [mode, setMode] = useState<Mode>("nav");
+  const toast = useGlobalEvents(dataDir);
+
+  // Never let a mode get stranded (and the keyboard dead) if the selected task
+  // disappears from the board while composing / answering.
+  useEffect(() => {
+    if (mode !== "nav" && !selected) setMode("nav");
+  }, [mode, selected]);
 
   const anyRunning = useMemo(() => sorted.some((t) => t.column === "running"), [sorted]);
   const frame = useSpinner(anyRunning);
+
+  const sendMessage = (task: Task, text: string) => {
+    if (task.pendingInteractionCount > 0) {
+      setStatus("answer the pending question first (g)");
+      return;
+    }
+    void (async () => {
+      try {
+        // Mirror `agetor send`: the live run if any, else the newest so the
+        // backend resumes the session.
+        const runs = task.runId ? [] : await client.getRuns(task.id);
+        const runId = resumableRunId(task, runs);
+        if (!runId) {
+          setStatus("no run yet — press s to start");
+          return;
+        }
+        const res = await client.sendInput(runId, text);
+        setStatus(res.delivered === false ? `! ${res.reason ?? "not delivered"}` : "→ sent");
+      } catch (e) {
+        setStatus(`! ${(e as Error).message}`);
+      }
+    })();
+  };
 
   useInput((input, key) => {
     if (input === "q" || (key.ctrl && input === "c")) return exit();
     if (key.upArrow || input === "k") setSel((s) => Math.max(0, s - 1));
     if (key.downArrow || input === "j") setSel((s) => Math.min(sorted.length - 1, s + 1));
+    if (input === "m" && selected) return setMode("compose");
+    if (input === "g" && selected) {
+      if (selected.pendingInteractionCount > 0) return setMode("answer");
+      setStatus("nothing to answer");
+      return;
+    }
     if (input === "s" && selected) {
       const sid = selected.id.slice(0, 8);
       const ctrl = runControl(selected);
@@ -66,7 +108,7 @@ export function Dashboard({
         setStatus("task is not running");
       }
     }
-  });
+  }, { isActive: mode === "nav" });
 
   const rows = process.stdout.rows || 30;
   const cols = process.stdout.columns || 90;
@@ -118,7 +160,28 @@ export function Dashboard({
           )}
         </Box>
       </Box>
-      <Footer status={status} />
+      {mode === "compose" && selected ? (
+        <Composer
+          active
+          label={`→ ${selected.id.slice(0, 8)}`}
+          onSubmit={(t) => sendMessage(selected, t)}
+          onCancel={() => setMode("nav")}
+        />
+      ) : null}
+      {mode === "answer" && selected ? (
+        <Box borderStyle="round" borderColor="yellow" paddingX={1}>
+          <AnswerOverlay
+            client={client}
+            taskId={selected.id}
+            onDone={(msg) => {
+              setStatus(msg);
+              setMode("nav");
+            }}
+            onCancel={() => setMode("nav")}
+          />
+        </Box>
+      ) : null}
+      <Footer status={status} toast={toast} mode={mode} />
     </Box>
   );
 }
@@ -177,7 +240,7 @@ function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
         <Text bold>{task.title}</Text> <Text dimColor>{task.id.slice(0, 8)}</Text>{" "}
         <Text color={columnColor(task.column)}>{task.column}</Text>
         {task.pendingInteractionCount > 0 ? (
-          <Text color="yellow"> · ! answer: agetor answer {task.id.slice(0, 8)}</Text>
+          <Text color="yellow"> · ! press g to answer</Text>
         ) : null}
       </Text>
       <Box flexDirection="column" marginTop={1}>
@@ -231,7 +294,7 @@ const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
     case "interaction":
       return (
         <Text color="yellow" wrap="truncate-end">
-          ! needs answer — agetor answer {e.taskId.slice(0, 8)}
+          ! needs answer — press g
         </Text>
       );
     case "interaction_resolved":
@@ -241,11 +304,31 @@ const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
   }
 });
 
-function Footer({ status }: { status: string }) {
+function Footer({
+  status,
+  toast,
+  mode,
+}: {
+  status: string;
+  toast: Toast | null;
+  mode: Mode;
+}) {
+  const hint =
+    mode === "compose"
+      ? "type a message · enter send · esc cancel"
+      : mode === "answer"
+        ? "↑/↓ move · space toggle · enter submit · esc cancel"
+        : "↑/↓ select · s run · x stop · m message · g answer · q quit";
   return (
     <Box justifyContent="space-between" paddingX={1}>
-      <Text dimColor>↑/↓ select · s run · x stop · q quit</Text>
-      {status ? <Text color="cyan">{status}</Text> : <Text> </Text>}
+      <Text dimColor>{hint}</Text>
+      {toast ? (
+        <Text color={toast.color}>{toast.text}</Text>
+      ) : status ? (
+        <Text color="cyan">{status}</Text>
+      ) : (
+        <Text> </Text>
+      )}
     </Box>
   );
 }
