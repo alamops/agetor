@@ -153,11 +153,12 @@ const TaskRow = memo(function TaskRow({
   const id = task.id.slice(0, 6);
   const needs = task.pendingInteractionCount;
   // Budget the title so the row can never need to wrap, even if a glyph renders
-  // a cell wider than measured in some terminal. Prefix = marker(2) + glyph(1)
-  // + " id " (8) = 11; badge = " !N".
+  // a cell wider than measured in some terminal. The fixed prefix is the marker
+  // (2) + glyph (1) + " <id> " (id length + 2); the badge is " !N".
   const inner = width - 4; // border (2) + paddingX (2)
+  const prefixW = 2 + 1 + (id.length + 2);
   const badgeW = needs > 0 ? String(needs).length + 2 : 0;
-  const titleMax = Math.max(6, inner - 11 - badgeW);
+  const titleMax = Math.max(6, inner - prefixW - badgeW);
   return (
     <Text wrap="truncate">
       <Text color="cyan">{active ? "▸ " : "  "}</Text>

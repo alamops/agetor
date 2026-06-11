@@ -40,13 +40,17 @@ export async function cmdSend(args: string[], flags: Flags): Promise<void> {
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const short = task.id.slice(0, 8);
+  if (task.archivedAt != null) {
+    throw new Error("task is archived — unarchive it in the app before sending");
+  }
   // Match the run panel: a pending question blocks sending — answer it first.
   if (task.pendingInteractionCount > 0) {
     throw new Error(`task is waiting for an answer — respond first with 'agetor answer ${short}'`);
   }
   // Resolve the run to send to the same way the app does: the live run, else
-  // the most recent one so the backend can resume the session.
-  const runs = await client.getRuns(task.id);
+  // the most recent one so the backend can resume the session. Only fetch the
+  // run list when there's no live run — resumableRunId ignores it otherwise.
+  const runs = task.runId ? [] : await client.getRuns(task.id);
   const runId = resumableRunId(task, runs);
   if (!runId) {
     throw new Error(`task has no run yet — start it first: agetor start ${short}`);
