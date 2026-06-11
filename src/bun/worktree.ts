@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { dataDir } from "./db.ts";
-import type { DiffFile, Task, TaskDiff } from "../shared/types.ts";
+import type { BranchInfo, DiffFile, Task, TaskDiff } from "../shared/types.ts";
 
 const WORKTREES_DIR = path.join(dataDir, "worktrees");
 
@@ -93,17 +93,6 @@ export async function resolveRef(dir: string, ref: string): Promise<string | nul
   const res = await git(["rev-parse", "--verify", `${ref}^{commit}`], dir);
   if (!res.ok) return null;
   return /^[0-9a-f]{40}$/.test(res.stdout) ? res.stdout : null;
-}
-
-export interface BranchInfo {
-  /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */
-  name: string;
-  /** Unix-ms timestamp of the tip commit, used to sort recents first. */
-  committedAt: number;
-  /** True for the branch currently checked out at `dir`. */
-  current: boolean;
-  /** True for remote-tracking refs (`refs/remotes/<remote>/<name>`). */
-  remote: boolean;
 }
 
 /**

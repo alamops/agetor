@@ -766,6 +766,19 @@ export interface ToolResultEventData {
  * every time. Auto-populated on `createTask`; explicit entries come from the
  * native folder dialog (POST /projects/pick).
  */
+/** A branch in a project repo, as returned by `GET /projects/branches`.
+ *  Single source of truth shared by the server, webview, and CLI. */
+export interface BranchInfo {
+  /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */
+  name: string;
+  /** Unix-ms timestamp of the tip commit, used to sort recents first. */
+  committedAt: number;
+  /** True for the branch currently checked out at the queried dir. */
+  current: boolean;
+  /** True for remote-tracking refs (`refs/remotes/<remote>/<name>`). */
+  remote: boolean;
+}
+
 export interface Project {
   path: string;
   name: string;

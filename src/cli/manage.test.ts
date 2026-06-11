@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync, existsSync } from "node:fs";
+import { mkdtempSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ensureCore, stopDaemon } from "./daemon/supervisor.ts";
@@ -19,6 +19,7 @@ async function withClient(
     for (let i = 0; i < 30 && existsSync(coreCredsPath(dir)); i++) {
       await Bun.sleep(100);
     }
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -46,6 +47,7 @@ test("projects add/list/remove round-trip + listBranches returns BranchInfo[]", 
 
     await client.removeProject(repo);
     expect(await client.listProjects()).toHaveLength(0);
+    rmSync(repo, { recursive: true, force: true });
   });
 }, 30_000);
 

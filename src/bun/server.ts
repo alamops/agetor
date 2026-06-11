@@ -344,12 +344,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const project = projects.upsert(picked, path.basename(picked) || picked);
           return json({ project }, { headers: corsHeaders(req) });
         }),
-        DELETE: authed(async (req) => {
-          const { path: p } = (await req.json().catch(() => ({}))) as { path?: string };
-          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
-          projects.delete(p);
-          return new Response(null, { status: 204, headers: corsHeaders(req) });
-        }),
+        // Removal-by-path lives on `DELETE /projects` (used by both the webview
+        // and the CLI); /projects/pick is the native add-picker only.
       },
 
       "/projects/branches": {

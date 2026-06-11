@@ -11,11 +11,11 @@ import type {
   HarnessStatus,
   HarnessUsage,
   AgentKind,
+  BranchInfo,
   TaskReference,
   TaskDiff,
 } from "../shared/types.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
-import type { BranchInfo } from "../bun/worktree.ts";
 
 /** A discovered, verified-live Agetor core (the app or a cli-daemon). */
 export type CoreInfo = CoreCreds;

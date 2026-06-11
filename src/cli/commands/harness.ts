@@ -115,7 +115,7 @@ interface HarnessFlags {
   env?: Record<string, string>;
 }
 
-function parseHarnessFlags(args: string[]): HarnessFlags {
+export function parseHarnessFlags(args: string[]): HarnessFlags {
   const f: HarnessFlags = {};
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;

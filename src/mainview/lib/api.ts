@@ -2,6 +2,7 @@ import type {
   AgentKind,
   AgentStatus,
   AppEvent,
+  BranchInfo,
   ColumnId,
   GlobalEvent,
   Harness,
@@ -26,7 +27,7 @@ export interface UpdateSnapshot {
   lastCheckedAt: number | null;
 }
 
-export interface BranchInfo { name: string; committedAt: number; current: boolean }
+export type { BranchInfo };
 
 /** Where a command/extension comes from. `plugin` entries are contributed by an
  *  enabled Claude Code plugin and are namespaced `<plugin>:<name>`; `builtin`
