@@ -102,7 +102,22 @@ export const USAGE: Record<string, string> = {
   harness: `usage: agetor harness <ls | add <id> … | edit <id> … | enable <id> | disable <id> | rm <id>>
 
   Manage agent harnesses (aliases / parallel accounts).
-    add / edit flags:  --label <s>   --kind claude-code   --home <abs|none>   --bin <abs|none>   --env KEY=VAL`,
+  Run 'agetor harness add --help' or 'agetor harness edit --help' for their flags.`,
+
+  // Subcommand-keyed blocks ("<cmd> <sub>") back both `agetor <cmd> <sub> --help`
+  // and that subcommand's bad-argument error. Trivial subcommands (harness
+  // enable/disable/rm, projects rm/branches) fall back to the command block.
+  "projects add": `usage: agetor projects add <path> [--name <name>]
+
+  Register a project folder (shown in the new-task workdir picker).`,
+
+  "harness add": `usage: agetor harness add <id> --label <label> [--kind claude-code] [--home <abs>] [--bin <abs>] [--env KEY=VAL …]
+
+  Create an agent harness — an alias, or a parallel account via a per-harness $HOME.`,
+
+  "harness edit": `usage: agetor harness edit <id> [--label …] [--home <abs>|none] [--bin <abs>|none] [--env KEY=VAL …]
+
+  Update a harness; pass 'none' to clear --home / --bin.`,
 
   daemon: `usage: agetor daemon <status | start | stop>
 
@@ -133,4 +148,13 @@ export function canonical(cmd: string): string {
 export function usageError(cmd: string): Error {
   const block = USAGE[canonical(cmd)];
   return new Error(block ? block.split("\n", 1)[0]! : `unknown command: ${cmd}`);
+}
+
+/** Resolve the help block for `agetor <cmd> [sub] --help` / `agetor help <cmd>
+ *  [sub]`: a subcommand block when one exists, else the command block, else
+ *  undefined (the caller falls back to the global index). */
+export function helpFor(cmd: string | undefined, sub: string | undefined): string | undefined {
+  if (!cmd) return undefined;
+  const name = canonical(cmd);
+  return (sub ? USAGE[`${name} ${sub}`] : undefined) ?? USAGE[name];
 }

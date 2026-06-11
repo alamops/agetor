@@ -17,7 +17,7 @@ import { cmdAttach } from "./commands/attach.ts";
 import { cmdHarness } from "./commands/harness.ts";
 import { cmdProjects } from "./commands/projects.ts";
 import { cmdCommit } from "./commands/commit.ts";
-import { USAGE, canonical } from "./usage.ts";
+import { helpFor } from "./usage.ts";
 
 const HELP = `agetor — drive Agetor from the terminal
 
@@ -101,9 +101,10 @@ async function main(): Promise<void> {
   if (flags.plain || flags.json) setPlain(true);
 
   if (version) return out(pkg.version);
-  if (cmd === "help") return out(HELP);
-  // `agetor <cmd> --help` → that command's block; bare `--help` → the index.
-  if (help) return out((cmd && USAGE[canonical(cmd)]) || HELP);
+  // `agetor help [cmd [sub]]` and `agetor <cmd> [sub] --help` both resolve to a
+  // command/subcommand block; bare `help`/`--help` falls back to the index.
+  if (cmd === "help") return out(helpFor(args[0], args[1]) ?? HELP);
+  if (help) return out(helpFor(cmd, args[0]) ?? HELP);
 
   switch (cmd) {
     case undefined: {

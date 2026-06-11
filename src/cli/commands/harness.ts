@@ -3,6 +3,7 @@ import { c, out, printJson, table } from "../output.ts";
 import { flagValue } from "../args.ts";
 import { ApiError, type HarnessPatchInput } from "../api-client.ts";
 import type { AgentKind } from "../../shared/types.ts";
+import { usageError } from "../usage.ts";
 
 export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
   const sub = args[0] ?? "ls";
@@ -31,9 +32,7 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
     case "add": {
       const id = args[1];
       if (!id || id.startsWith("-")) {
-        throw new Error(
-          "usage: agetor harness add <id> --label <label> [--kind claude-code] [--home <abs>] [--bin <abs>] [--env KEY=VAL …]",
-        );
+        throw usageError("harness add");
       }
       const f = parseHarnessFlags(args.slice(2));
       const created = await client.createHarness({
@@ -51,9 +50,7 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
     case "edit": {
       const id = args[1];
       if (!id) {
-        throw new Error(
-          "usage: agetor harness edit <id> [--label …] [--home <abs>|none] [--bin <abs>|none] [--env KEY=VAL …]",
-        );
+        throw usageError("harness edit");
       }
       const f = parseHarnessFlags(args.slice(2));
       const patch: HarnessPatchInput = {};
@@ -72,7 +69,7 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
     case "enable":
     case "disable": {
       const id = args[1];
-      if (!id) throw new Error(`usage: agetor harness ${sub} <id>`);
+      if (!id) throw usageError("harness");
       const updated = await client.patchHarness(id, { enabled: sub === "enable" });
       if (flags.json) return printJson(updated);
       out(`${sub === "enable" ? c.green("enabled") : c.gray("disabled")} ${c.bold(id)}`);
@@ -81,7 +78,7 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
     case "rm":
     case "remove": {
       const id = args[1];
-      if (!id) throw new Error("usage: agetor harness rm <id>");
+      if (!id) throw usageError("harness");
       try {
         await client.deleteHarness(id);
       } catch (e) {
