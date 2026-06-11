@@ -5,6 +5,7 @@ import type { Task, RunEvent } from "../../shared/types.ts";
 import { useTasks } from "./useTasks.ts";
 import { useCoalescedStream, eventKey } from "./useCoalescedStream.ts";
 import { useSpinner } from "./useSpinner.ts";
+import { runControl } from "../run-logic.ts";
 
 // Surface the most actionable columns first.
 const COLUMN_ORDER = ["running", "blocked", "review", "ready", "backlog", "done"];
@@ -41,16 +42,29 @@ export function Dashboard({
     if (key.upArrow || input === "k") setSel((s) => Math.max(0, s - 1));
     if (key.downArrow || input === "j") setSel((s) => Math.min(sorted.length - 1, s + 1));
     if (input === "s" && selected) {
-      void client
-        .startTask(selected.id)
-        .then(() => setStatus(`▸ started ${selected.id.slice(0, 8)}`))
-        .catch((e) => setStatus(`! ${e.message}`));
+      const sid = selected.id.slice(0, 8);
+      const ctrl = runControl(selected);
+      if (ctrl === "run") {
+        void client
+          .startTask(selected.id)
+          .then(() => setStatus(`▸ started ${sid}`))
+          .catch((e) => setStatus(`! ${e.message}`));
+      } else if (ctrl === "stop") {
+        setStatus("already running — press x to stop");
+      } else {
+        setStatus(`finished — continue with: agetor send ${sid}`);
+      }
     }
-    if (input === "x" && selected?.runId) {
-      void client
-        .cancelRun(selected.runId)
-        .then(() => setStatus(`■ cancel ${selected.id.slice(0, 8)}`))
-        .catch((e) => setStatus(`! ${e.message}`));
+    if (input === "x" && selected) {
+      const sid = selected.id.slice(0, 8);
+      if (runControl(selected) === "stop" && selected.runId) {
+        void client
+          .cancelRun(selected.runId)
+          .then(() => setStatus(`■ stopped ${sid}`))
+          .catch((e) => setStatus(`! ${e.message}`));
+      } else {
+        setStatus("task is not running");
+      }
     }
   });
 
@@ -229,7 +243,7 @@ const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
 function Footer({ status }: { status: string }) {
   return (
     <Box justifyContent="space-between" paddingX={1}>
-      <Text dimColor>↑/↓ select · s start · x cancel · q quit</Text>
+      <Text dimColor>↑/↓ select · s run · x stop · q quit</Text>
       {status ? <Text color="cyan">{status}</Text> : <Text> </Text>}
     </Box>
   );

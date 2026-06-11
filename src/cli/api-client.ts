@@ -192,6 +192,9 @@ export interface CreateTaskInput {
   model?: string | null;
   effort?: string | null;
   taskType?: string;
+  /** Match the app's "Run task", which creates the task in "ready" before
+   *  starting (vs "backlog" when queued). */
+  column?: string;
   references?: TaskReference[];
   baseRef?: string;
 }

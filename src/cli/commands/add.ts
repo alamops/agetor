@@ -69,6 +69,9 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     return;
   }
 
+  // Match the app's "Run task": create in "ready" when starting immediately.
+  if (o.start) input.column = "ready";
+
   const task = await client.createTask(input);
 
   let started = false;
