@@ -136,18 +136,38 @@ It honors the same `AGETOR_DATA_DIR` / `AGETOR_API_PORT` as the app, so e.g. `AG
 ### Commands
 
 ```bash
-agetor                      # full-screen live dashboard (board + streaming detail)
-agetor add                  # create a task (guided wizard, or --title/--prompt[/--start])
-agetor ls                   # list all tasks        (ps = running/blocked only)
-agetor show <id>            # details, runs, pending interactions
-agetor start <id>           # start a task
-agetor send <id> <msg…>     # message a running task
-agetor answer <id>          # answer a task that needs input (interactive picker)
-agetor logs <id>            # stream a task's live conversation (--no-follow for a snapshot)
-agetor cancel <id>          # stop the active run
-agetor rm <id> --yes        # delete a task (worktree + branch)
+agetor                       # full-screen live dashboard (board + streaming detail + inline compose/answer)
+
+# create · inspect
+agetor add                   # create a task (guided wizard, or --title/--prompt[/--start])
+agetor ls [filters]          # list tasks (--column/--agent/--type/--repo/--search/--archived/--all)
+agetor ps                    # list running / blocked tasks only
+agetor show <id>             # details, runs, pending interactions
+
+# run · converse
+agetor start <id>            # run a not-yet-run task
+agetor send <id> <msg…>      # message a running task (resumes a finished one)
+agetor commit <id>           # ask the agent to commit all changes & push the branch
+agetor answer <id>           # answer a task that needs input (interactive picker)
+agetor logs <id>             # stream a task's live conversation (--no-follow for a snapshot)
+agetor cancel <id>           # stop the active run
+agetor attach <id>           # attach your terminal to the live tmux session (claude-code)
+
+# manage
+agetor edit <id> [flags]     # change title/prompt/agent/workdir/model/mode/effort/type/column
+agetor move <id> <column>    # move between columns (mark done = move <id> done)
+agetor archive <id>          # archive a done task · unarchive <id> to restore
+agetor diff <id>             # show the task's git diff
+agetor rm <id> --yes         # delete a task (worktree + branch)
+
+# setup
+agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
+agetor harness <sub>         # list | add | edit | enable | disable | rm  (agent aliases / accounts)
 agetor daemon status|start|stop
+agetor info                  # the connected core's version
 ```
+
+**Dashboard keys:** `↑/↓` (or `j/k`) select · `s` run · `x` stop · `m` message · `c` commit & push · `g` answer · `q` quit. Messages and answers happen inline; run-status toasts flash on success / failure / needs-you.
 
 Every command accepts `--json` for scripting, `--data-dir <dir>` / `--port <n>` to target a specific core, and `--no-daemon` to fail instead of auto-spawning one. Short id prefixes (the 8 chars shown in `agetor ls`) work anywhere an `<id>` is expected. The desktop `.dmg`/`.app` is unchanged — the CLI is an additional surface, not a replacement.
 
