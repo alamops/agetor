@@ -58,7 +58,7 @@ function formatEvent(e: RunEvent): string {
       return e.data;
     case "tool_use": {
       const t = tryJson(e.data) as { name?: string } | null;
-      return c.magenta(`⚙ ${t?.name ?? "tool"}`);
+      return c.magenta(`▸ ${t?.name ?? "tool"}`);
     }
     case "tool_result": {
       const t = tryJson(e.data) as { isError?: boolean } | null;
@@ -67,7 +67,7 @@ function formatEvent(e: RunEvent): string {
     case "interaction": {
       const r = tryJson(e.data) as { kind?: string } | null;
       return c.yellow(
-        `‼ needs answer (${r?.kind ?? "?"}) — agetor answer ${e.taskId.slice(0, 8)}`,
+        `! needs answer (${r?.kind ?? "?"}) — agetor answer ${e.taskId.slice(0, 8)}`,
       );
     }
     case "interaction_resolved":

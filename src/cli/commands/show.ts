@@ -26,7 +26,7 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   if (pending.length > 0) {
     out(
       c.yellow(
-        `  ‼ ${pending.length} pending interaction(s) — answer: agetor answer ${task.id.slice(0, 8)}`,
+        `  ! ${pending.length} pending interaction(s) — answer: agetor answer ${task.id.slice(0, 8)}`,
       ),
     );
   }

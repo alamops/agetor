@@ -6,7 +6,7 @@ const COLUMN_GLYPH: Record<string, string> = {
   backlog: "·",
   ready: "○",
   running: "▸",
-  blocked: "‼",
+  blocked: "!",
   review: "✓",
   done: "✓",
 };
@@ -32,7 +32,7 @@ export async function cmdLs(
     truncate(t.title, 44),
     c.gray(t.agent ?? ""),
     colorColumn(t.column),
-    t.pendingInteractionCount > 0 ? c.yellow(`‼ ${t.pendingInteractionCount}`) : "",
+    t.pendingInteractionCount > 0 ? c.yellow(`! ${t.pendingInteractionCount}`) : "",
   ]);
   out(table(["", "id", "title", "agent", "column", "needs"], rows));
 }

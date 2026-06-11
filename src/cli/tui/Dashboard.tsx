@@ -55,6 +55,11 @@ export function Dashboard({
   });
 
   const rows = process.stdout.rows || 30;
+  const cols = process.stdout.columns || 90;
+  // Fixed character width (not a %) so the rows have a definite budget to
+  // truncate against — percentage widths and double-width glyphs are what make
+  // rows wrap unexpectedly in a real terminal.
+  const listWidth = Math.max(26, Math.min(50, Math.floor(cols * 0.38)));
   const visible = events.slice(-Math.max(8, rows - 9));
 
   return (
@@ -63,17 +68,24 @@ export function Dashboard({
       <Box flexGrow={1} minHeight={0}>
         <Box
           flexDirection="column"
-          width="44%"
+          width={listWidth}
+          flexShrink={0}
           borderStyle="round"
           borderColor="gray"
           paddingX={1}
           overflow="hidden"
         >
           {sorted.length === 0 ? (
-            <Text dimColor>no tasks — run `agetor add` to create one</Text>
+            <Text dimColor>no tasks — run 'agetor add'</Text>
           ) : (
             sorted.map((t, i) => (
-              <TaskRow key={t.id} task={t} active={i === sel} frame={frame} />
+              <TaskRow
+                key={t.id}
+                task={t}
+                active={i === sel}
+                frame={frame}
+                width={listWidth}
+              />
             ))
           )}
         </Box>
@@ -117,19 +129,28 @@ const TaskRow = memo(function TaskRow({
   task,
   active,
   frame,
+  width,
 }: {
   task: Task;
   active: boolean;
   frame: string;
+  width: number;
 }) {
-  const glyph = columnGlyph(task, frame);
-  const id = task.id.slice(0, 8);
-  const title = truncate(task.title, 26);
-  const needs = task.pendingInteractionCount > 0 ? ` ‼${task.pendingInteractionCount}` : "";
+  const id = task.id.slice(0, 6);
+  const needs = task.pendingInteractionCount;
+  // Budget the title so the row can never need to wrap, even if a glyph renders
+  // a cell wider than measured in some terminal. Prefix = marker(2) + glyph(1)
+  // + " id " (8) = 11; badge = " !N".
+  const inner = width - 4; // border (2) + paddingX (2)
+  const badgeW = needs > 0 ? String(needs).length + 2 : 0;
+  const titleMax = Math.max(6, inner - 11 - badgeW);
   return (
-    <Text inverse={active} wrap="truncate">
-      {active ? "›" : " "} {glyph} <Text dimColor>{id}</Text> {title}
-      <Text color="yellow">{needs}</Text>
+    <Text wrap="truncate">
+      <Text color="cyan">{active ? "▸ " : "  "}</Text>
+      {columnGlyph(task, frame)}
+      <Text dimColor> {id} </Text>
+      <Text bold={active}>{truncate(task.title, titleMax)}</Text>
+      {needs > 0 ? <Text color="yellow"> !{needs}</Text> : null}
     </Text>
   );
 });
@@ -141,7 +162,7 @@ function Detail({ task, events }: { task: Task; events: RunEvent[] }) {
         <Text bold>{task.title}</Text> <Text dimColor>{task.id.slice(0, 8)}</Text>{" "}
         <Text color={columnColor(task.column)}>{task.column}</Text>
         {task.pendingInteractionCount > 0 ? (
-          <Text color="yellow"> · ‼ answer: agetor answer {task.id.slice(0, 8)}</Text>
+          <Text color="yellow"> · ! answer: agetor answer {task.id.slice(0, 8)}</Text>
         ) : null}
       </Text>
       <Box flexDirection="column" marginTop={1}>
@@ -187,7 +208,7 @@ const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
     case "tool_use":
       return (
         <Text color="magenta" wrap="truncate-end">
-          ⚙ {jsonField(e.data, "name") ?? "tool"}
+          ▸ {jsonField(e.data, "name") ?? "tool"}
         </Text>
       );
     case "tool_result":
@@ -195,7 +216,7 @@ const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
     case "interaction":
       return (
         <Text color="yellow" wrap="truncate-end">
-          ‼ needs answer — agetor answer {e.taskId.slice(0, 8)}
+          ! needs answer — agetor answer {e.taskId.slice(0, 8)}
         </Text>
       );
     case "interaction_resolved":
@@ -216,10 +237,9 @@ function Footer({ status }: { status: string }) {
 
 function columnGlyph(t: Task, frame: string) {
   if (t.column === "running") return <Text color="cyan">{frame}</Text>;
-  if (t.column === "blocked") return <Text color="yellow">‼</Text>;
-  if (t.column === "review") return <Text color="green">✓</Text>;
-  if (t.column === "done") return <Text color="green">✓</Text>;
-  if (t.column === "ready") return <Text dimColor>○</Text>;
+  if (t.column === "blocked") return <Text color="yellow">!</Text>;
+  if (t.column === "review" || t.column === "done") return <Text color="green">✓</Text>;
+  if (t.column === "ready") return <Text color="blue">○</Text>;
   return <Text dimColor>·</Text>;
 }
 
