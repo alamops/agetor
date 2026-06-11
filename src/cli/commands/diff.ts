@@ -32,7 +32,7 @@ export async function cmdDiff(args: string[], flags: Flags): Promise<void> {
       out(c.dim("  (binary)"));
       continue;
     }
-    for (const line of f.hunks.split("\n")) out(colorDiffLine(line));
+    for (const line of f.hunks.replace(/\n$/, "").split("\n")) out(colorDiffLine(line));
     if (f.truncated) out(c.dim("  … (diff truncated)"));
   }
 }

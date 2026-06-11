@@ -23,9 +23,9 @@ export function Dashboard({
   const tasks = useTasks(client);
   const sorted = useMemo(
     () =>
-      [...tasks].sort(
-        (a, b) => COLUMN_ORDER.indexOf(a.column) - COLUMN_ORDER.indexOf(b.column),
-      ),
+      tasks
+        .filter((t) => t.archivedAt == null)
+        .sort((a, b) => COLUMN_ORDER.indexOf(a.column) - COLUMN_ORDER.indexOf(b.column)),
     [tasks],
   );
   const [rawSel, setSel] = useState(0);

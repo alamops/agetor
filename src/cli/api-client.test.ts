@@ -49,3 +49,31 @@ test("api-client task round-trip + ApiError on 404", async () => {
     }
   }
 }, 30_000);
+
+test("edit/move/archive/unarchive round-trip returns the bare Task", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-mng-"));
+  const core = await ensureCore({ dataDir: dir, port: 4495 });
+  const client = new AgetorClient(core);
+  try {
+    const t = await client.createTask({
+      title: "Orig",
+      prompt: "p",
+      agent: "claude-code",
+      isolation: "none",
+      workdir: dir,
+    });
+    // PATCH returns the bare updated Task (same contract as createTask).
+    const renamed = await client.patchTask(t.id, { title: "Renamed" });
+    expect(renamed.id).toBe(t.id);
+    expect(renamed.title).toBe("Renamed");
+    expect((await client.patchTask(t.id, { column: "done" })).column).toBe("done");
+    expect((await client.archiveTask(t.id)).archivedAt).not.toBeNull();
+    expect((await client.unarchiveTask(t.id)).archivedAt).toBeNull();
+    await client.deleteTask(t.id);
+  } finally {
+    await stopDaemon(dir);
+    for (let i = 0; i < 30 && existsSync(coreCredsPath(dir)); i++) {
+      await Bun.sleep(100);
+    }
+  }
+}, 30_000);

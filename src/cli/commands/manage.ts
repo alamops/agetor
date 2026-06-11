@@ -4,6 +4,7 @@ import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
 import type { PatchTaskInput } from "../api-client.ts";
 import { COLUMNS } from "../../shared/types.ts";
+import { flagValue } from "../args.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
@@ -17,23 +18,23 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   }
   const patch: PatchTaskInput = {};
   for (let i = 1; i < args.length; i++) {
-    const a = args[i];
-    const next = () => args[++i];
+    const a = args[i]!;
+    const val = (allowDash = false) => flagValue(args, ++i, a, allowDash);
     switch (a) {
-      case "--title": patch.title = next(); break;
-      case "--prompt": patch.prompt = next(); break;
+      case "--title": patch.title = val(); break;
+      case "--prompt": patch.prompt = val(); break;
       case "--prompt-file": {
-        const f = next();
-        patch.prompt = f === "-" ? (await Bun.stdin.text()).trim() : readFileSync(f!, "utf8");
+        const f = val(true);
+        patch.prompt = f === "-" ? (await Bun.stdin.text()).trim() : readFileSync(f, "utf8");
         break;
       }
-      case "--agent": patch.agent = next(); break;
-      case "--workdir": patch.workdir = next(); break;
-      case "--model": patch.model = next(); break;
-      case "--mode": patch.mode = next(); break;
-      case "--effort": patch.effort = next(); break;
-      case "--type": patch.taskType = next(); break;
-      case "--column": patch.column = next(); break;
+      case "--agent": patch.agent = val(); break;
+      case "--workdir": patch.workdir = val(); break;
+      case "--model": patch.model = val(); break;
+      case "--mode": patch.mode = val(); break;
+      case "--effort": patch.effort = val(); break;
+      case "--type": patch.taskType = val(); break;
+      case "--column": patch.column = val(); break;
       default: break;
     }
   }

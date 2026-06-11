@@ -30,7 +30,8 @@ export async function cmdAttach(args: string[], flags: Flags): Promise<void> {
   });
   if (alive.exitCode !== 0) {
     throw new Error(
-      `tmux session '${session}' is gone — respawn it with ` +
+      `tmux session '${session}' is unreachable via '${tmuxBin}' — if the app uses bundled ` +
+        `tmux, set AGETOR_TMUX_BIN to match; otherwise respawn it with ` +
         `'agetor send ${task.id.slice(0, 8)} <message>'`,
     );
   }

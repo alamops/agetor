@@ -3,6 +3,7 @@ import * as p from "@clack/prompts";
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, isTTY } from "../output.ts";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
+import { flagValue } from "../args.ts";
 
 interface AddOpts {
   title?: string;
@@ -23,21 +24,21 @@ interface AddOpts {
 function parseAdd(args: string[]): AddOpts {
   const o: AddOpts = { refs: [] };
   for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    const next = () => args[++i];
+    const a = args[i]!;
+    const val = (allowDash = false) => flagValue(args, ++i, a, allowDash);
     switch (a) {
-      case "--title": o.title = next(); break;
-      case "--prompt": o.prompt = next(); break;
-      case "--prompt-file": o.promptFile = next(); break;
-      case "--agent": o.agent = next(); break;
-      case "--model": o.model = next(); break;
-      case "--mode": o.mode = next(); break;
-      case "--effort": o.effort = next(); break;
-      case "--workdir": o.workdir = next(); break;
-      case "--isolation": o.isolation = next() === "none" ? "none" : "worktree"; break;
-      case "--base-ref": o.baseRef = next(); break;
-      case "--type": o.type = next(); break;
-      case "--ref": { const r = next(); if (r) o.refs.push(r); break; }
+      case "--title": o.title = val(); break;
+      case "--prompt": o.prompt = val(); break;
+      case "--prompt-file": o.promptFile = val(true); break;
+      case "--agent": o.agent = val(); break;
+      case "--model": o.model = val(); break;
+      case "--mode": o.mode = val(); break;
+      case "--effort": o.effort = val(); break;
+      case "--workdir": o.workdir = val(); break;
+      case "--isolation": o.isolation = val() === "none" ? "none" : "worktree"; break;
+      case "--base-ref": o.baseRef = val(); break;
+      case "--type": o.type = val(); break;
+      case "--ref": o.refs.push(val()); break;
       case "--start": o.start = true; break;
       default: break;
     }

@@ -1,6 +1,10 @@
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, table } from "../output.ts";
 import type { Task } from "../../shared/types.ts";
+import { COLUMNS } from "../../shared/types.ts";
+import { flagValue } from "../args.ts";
+
+const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
 const COLUMN_GLYPH: Record<string, string> = {
   backlog: "·",
@@ -24,14 +28,14 @@ interface LsFilters {
 function parseLsFilters(args: string[]): LsFilters {
   const f: LsFilters = { columns: [], archived: false, all: false };
   for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    const next = () => args[++i];
+    const a = args[i]!;
+    const val = () => flagValue(args, ++i, a);
     switch (a) {
-      case "--column": case "-c": { const v = next(); if (v) f.columns.push(...v.split(",")); break; }
-      case "--agent": f.agent = next(); break;
-      case "--type": f.type = next(); break;
-      case "--repo": case "--workdir": f.repo = next(); break;
-      case "--search": case "-q": f.search = next(); break;
+      case "--column": case "-c": f.columns.push(...val().split(",")); break;
+      case "--agent": f.agent = val(); break;
+      case "--type": f.type = val(); break;
+      case "--repo": case "--workdir": f.repo = val(); break;
+      case "--search": case "-q": f.search = val(); break;
       case "--archived": f.archived = true; break;
       case "--all": f.all = true; break;
       default: break;
@@ -46,6 +50,14 @@ export async function cmdLs(
   opts: { onlyRunning?: boolean } = {},
 ): Promise<void> {
   const f = parseLsFilters(args);
+  const badCols = f.columns.filter(
+    (col) => !COLUMN_IDS.includes(col as (typeof COLUMN_IDS)[number]),
+  );
+  if (badCols.length) {
+    throw new Error(
+      `unknown column${badCols.length > 1 ? "s" : ""}: ${badCols.join(", ")} — one of: ${COLUMN_IDS.join(", ")}`,
+    );
+  }
   const client = await getClient(flags);
   let tasks = await client.listTasks();
   // Archive view: active-only by default (matches the app); --archived shows
