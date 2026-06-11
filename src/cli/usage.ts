@@ -1,0 +1,136 @@
+import { COLUMNS } from "../shared/types.ts";
+
+const COLUMN_IDS = COLUMNS.map((col) => col.id).join(", ");
+
+/**
+ * Per-command help blocks. `agetor <cmd> --help` prints the whole block;
+ * `usageError(cmd)` throws just the first (`usage:`) line so a bad-argument
+ * error stays concise. One source, so help and the error never drift.
+ *
+ * Each entry's FIRST line is a complete, standalone `usage:` line.
+ */
+export const USAGE: Record<string, string> = {
+  add: `usage: agetor add [flags]   (no flags → guided wizard)
+
+  Create a task.
+    --title <s>        task title          --prompt <s> | --prompt-file <p>
+    --agent <id>       harness id          --workdir <path>   git repo to run in
+    --isolation <m>    worktree | none     --base-ref <ref>   branch base (default HEAD)
+    --model <id>   --mode <id>   --effort <id>
+    --type <t>         task | subtask | epic | feature | bug | spike
+    --ref <path>       attach a file/folder reference (repeatable)
+    --start            run immediately (creates in 'ready', not 'backlog')`,
+
+  ls: `usage: agetor ls [filters]
+
+  List tasks. Filters combine (substring match for --repo/--search):
+    --column <c>   --agent <id>   --type <t>   --repo <s>   --search <s>
+    --archived     archived only        --all   include archived`,
+
+  ps: `usage: agetor ps
+
+  List running / blocked tasks only — the active subset of 'ls'.`,
+
+  show: `usage: agetor show <task-id>
+
+  Task details, run history (newest first), and any pending interactions.`,
+
+  start: `usage: agetor start <task-id>
+
+  Run a not-yet-run task. A finished task continues via 'send'; a running one
+  stops via 'cancel'.`,
+
+  send: `usage: agetor send <task-id> <message…>
+
+  Message a task. Resumes a finished task's session, or folds into the live turn
+  if one is running. Blocked while the task is waiting on an answer.`,
+
+  commit: `usage: agetor commit <task-id>
+
+  Ask the agent to commit all changes and push the branch. Resumes the session
+  like 'send'; refused while the task is still running.`,
+
+  answer: `usage: agetor answer <task-id>
+
+  Answer a task that needs input — an interactive picker for AskUserQuestion
+  options or a tmux prompt.`,
+
+  logs: `usage: agetor logs <task-id> [--no-follow]
+
+  Stream the task's live conversation. --no-follow prints the current scrollback
+  and exits.`,
+
+  cancel: `usage: agetor cancel <task-id>
+
+  Stop the active run. The session stays alive for follow-ups (claude-code).`,
+
+  attach: `usage: agetor attach <task-id>
+
+  Attach your terminal to the task's live tmux session (claude-code only).
+  Detach with Ctrl-b d.`,
+
+  edit: `usage: agetor edit <task-id> [flags]   (at least one flag)
+
+  Patch a task. Changing model / mode / effort applies to a live session mid-run.
+    --title <s>   --prompt <s> | --prompt-file <p>   --agent <id>   --workdir <p>
+    --model <id>   --mode <id>   --effort <id>   --type <t>   --column <c>`,
+
+  move: `usage: agetor move <task-id> <column>   (columns: ${COLUMN_IDS})
+
+  Move a task between columns (mark done = move <id> done).`,
+
+  archive: `usage: agetor archive <task-id>
+
+  Archive a done task (unarchive <id> to restore).`,
+
+  unarchive: `usage: agetor unarchive <task-id>
+
+  Restore an archived task.`,
+
+  diff: `usage: agetor diff <task-id>
+
+  Show the task's git diff (worktree vs its pinned base ref).`,
+
+  rm: `usage: agetor rm <task-id> [--yes]
+
+  Delete a task, its worktree, and its branch. --yes skips the confirmation.`,
+
+  projects: `usage: agetor projects <ls | add <path> [--name <n>] | rm <path> | branches <path>>
+
+  Manage the registered project folders shown in the new-task picker.`,
+
+  harness: `usage: agetor harness <ls | add <id> … | edit <id> … | enable <id> | disable <id> | rm <id>>
+
+  Manage agent harnesses (aliases / parallel accounts).
+    add / edit flags:  --label <s>   --kind claude-code   --home <abs|none>   --bin <abs|none>   --env KEY=VAL`,
+
+  daemon: `usage: agetor daemon <status | start | stop>
+
+  Control the background headless core (used when the desktop app isn't open).`,
+
+  info: `usage: agetor info
+
+  Print the connected core's version.`,
+};
+
+const ALIASES: Record<string, string> = {
+  mv: "move",
+  msg: "send",
+  inspect: "show",
+  tail: "logs",
+  delete: "rm",
+  harnesses: "harness",
+  project: "projects",
+};
+
+/** Resolve a command alias to its canonical name (for USAGE lookup). */
+export function canonical(cmd: string): string {
+  return ALIASES[cmd] ?? cmd;
+}
+
+/** The Error to throw when a command is misused — the centralized `usage:`
+ *  line, so the error and `--help` share one source. */
+export function usageError(cmd: string): Error {
+  const block = USAGE[canonical(cmd)];
+  return new Error(block ? block.split("\n", 1)[0]! : `unknown command: ${cmd}`);
+}

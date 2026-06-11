@@ -1,11 +1,12 @@
 import { getClient, type Flags } from "../context.ts";
+import { usageError } from "../usage.ts";
 import { resolveTask } from "../resolve.ts";
 import { runControl, resumableRunId } from "../run-logic.ts";
 import { c, out, printJson } from "../output.ts";
 
 export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
-  if (!ref) throw new Error("usage: agetor start <task-id>");
+  if (!ref) throw usageError("start");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const short = task.id.slice(0, 8);
@@ -36,7 +37,7 @@ export async function cmdStart(args: string[], flags: Flags): Promise<void> {
 export async function cmdSend(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
   const message = args.slice(1).join(" ").trim();
-  if (!ref || !message) throw new Error("usage: agetor send <task-id> <message…>");
+  if (!ref || !message) throw usageError("send");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const short = task.id.slice(0, 8);
@@ -63,7 +64,7 @@ export async function cmdSend(args: string[], flags: Flags): Promise<void> {
 
 export async function cmdCancel(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
-  if (!ref) throw new Error("usage: agetor cancel <task-id>");
+  if (!ref) throw usageError("cancel");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   // Stop is only meaningful while active (running/blocked) — same as the app.
@@ -79,7 +80,7 @@ export async function cmdRm(args: string[], flags: Flags): Promise<void> {
   const positionals = args.filter((a) => !a.startsWith("-"));
   const ref = positionals[0];
   const yes = args.includes("--yes") || args.includes("-y") || flags.json;
-  if (!ref) throw new Error("usage: agetor rm <task-id> [--yes]");
+  if (!ref) throw usageError("rm");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   if (!yes) {

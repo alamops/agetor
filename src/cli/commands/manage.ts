@@ -5,17 +5,13 @@ import { c, out, printJson } from "../output.ts";
 import type { PatchTaskInput } from "../api-client.ts";
 import { COLUMNS } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
+import { usageError } from "../usage.ts";
 
 const COLUMN_IDS = COLUMNS.map((col) => col.id);
 
 export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
-  if (!ref) {
-    throw new Error(
-      "usage: agetor edit <task-id> [--title …] [--prompt …|--prompt-file …] " +
-        "[--agent …] [--workdir …] [--model …] [--mode …] [--effort …] [--type …] [--column …]",
-    );
-  }
+  if (!ref) throw usageError("edit");
   const patch: PatchTaskInput = {};
   for (let i = 1; i < args.length; i++) {
     const a = args[i]!;
@@ -59,7 +55,7 @@ export async function cmdMove(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
   const column = args[1];
   if (!ref || !column) {
-    throw new Error(`usage: agetor move <task-id> <column>   (columns: ${COLUMN_IDS.join(", ")})`);
+    throw usageError("move");
   }
   if (!COLUMN_IDS.includes(column as (typeof COLUMN_IDS)[number])) {
     throw new Error(`unknown column "${column}" — one of: ${COLUMN_IDS.join(", ")}`);
@@ -73,7 +69,7 @@ export async function cmdMove(args: string[], flags: Flags): Promise<void> {
 
 export async function cmdArchive(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
-  if (!ref) throw new Error("usage: agetor archive <task-id>");
+  if (!ref) throw usageError("archive");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const updated = await client.archiveTask(task.id);
@@ -83,7 +79,7 @@ export async function cmdArchive(args: string[], flags: Flags): Promise<void> {
 
 export async function cmdUnarchive(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
-  if (!ref) throw new Error("usage: agetor unarchive <task-id>");
+  if (!ref) throw usageError("unarchive");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const updated = await client.unarchiveTask(task.id);

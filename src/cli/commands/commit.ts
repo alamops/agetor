@@ -3,6 +3,7 @@ import { resolveTask } from "../resolve.ts";
 import { resumableRunId } from "../run-logic.ts";
 import { c, out, printJson } from "../output.ts";
 import { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
+import { usageError } from "../usage.ts";
 
 /**
  * One-shot "commit & push": ask the agent to commit all changes and push the
@@ -11,7 +12,7 @@ import { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
  */
 export async function cmdCommit(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
-  if (!ref) throw new Error("usage: agetor commit <task-id>");
+  if (!ref) throw usageError("commit");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const short = task.id.slice(0, 8);

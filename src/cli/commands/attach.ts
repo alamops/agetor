@@ -1,6 +1,7 @@
 import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, isTTY } from "../output.ts";
+import { usageError } from "../usage.ts";
 
 /**
  * Attach the current terminal to a claude-code task's live tmux session — the
@@ -10,7 +11,7 @@ import { c, out, isTTY } from "../output.ts";
  */
 export async function cmdAttach(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
-  if (!ref) throw new Error("usage: agetor attach <task-id>");
+  if (!ref) throw usageError("attach");
   if (!isTTY) throw new Error("agetor attach needs an interactive terminal (TTY)");
 
   const client = await getClient(flags);

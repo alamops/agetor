@@ -1,5 +1,6 @@
 import * as p from "@clack/prompts";
 import { getClient, type Flags } from "../context.ts";
+import { usageError } from "../usage.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, isTTY } from "../output.ts";
 import type { AgetorClient } from "../api-client.ts";
@@ -7,7 +8,7 @@ import type { AskQuestionsRequest, TmuxPromptRequest } from "../../bun/interacti
 
 export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
-  if (!ref) throw new Error("usage: agetor answer <task-id>");
+  if (!ref) throw usageError("answer");
   if (!isTTY) {
     throw new Error("agetor answer needs an interactive terminal (TTY)");
   }

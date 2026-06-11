@@ -1,11 +1,12 @@
 import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
+import { usageError } from "../usage.ts";
 import type { Run } from "../../shared/types.ts";
 
 export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
-  if (!ref) throw new Error("usage: agetor show <task-id>");
+  if (!ref) throw usageError("show");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const [runs, pending] = await Promise.all([

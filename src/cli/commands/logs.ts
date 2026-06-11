@@ -2,12 +2,13 @@ import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { streamSse, type SseHandle } from "../sse.ts";
 import { c, out, errln } from "../output.ts";
+import { usageError } from "../usage.ts";
 import type { RunEvent } from "../../shared/types.ts";
 
 export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   const ref = args.find((a) => !a.startsWith("-"));
   const noFollow = args.includes("--no-follow");
-  if (!ref) throw new Error("usage: agetor logs <task-id> [--no-follow]");
+  if (!ref) throw usageError("logs");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
 

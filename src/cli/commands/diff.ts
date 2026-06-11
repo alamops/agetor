@@ -1,11 +1,12 @@
 import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
+import { usageError } from "../usage.ts";
 import type { DiffFile } from "../../shared/types.ts";
 
 export async function cmdDiff(args: string[], flags: Flags): Promise<void> {
   const ref = args.find((a) => !a.startsWith("-"));
-  if (!ref) throw new Error("usage: agetor diff <task-id>");
+  if (!ref) throw usageError("diff");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const diff = await client.getDiff(task.id);
