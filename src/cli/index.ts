@@ -14,6 +14,8 @@ import { cmdLogs } from "./commands/logs.ts";
 import { cmdEdit, cmdMove, cmdArchive, cmdUnarchive } from "./commands/manage.ts";
 import { cmdDiff } from "./commands/diff.ts";
 import { cmdAttach } from "./commands/attach.ts";
+import { cmdHarness } from "./commands/harness.ts";
+import { cmdProjects } from "./commands/projects.ts";
 
 const HELP = `agetor — drive Agetor from the terminal
 
@@ -38,6 +40,8 @@ Commands:
   rm <id> [--yes]     delete a task (worktree + branch)
   info                show the connected core's version
   daemon <sub>        start | stop | status of the background core
+  harness <sub>       list | add | edit | enable | disable | rm agent harnesses
+  projects <sub>      list | add | rm | branches (project folders)
   help                show this help
 
 Global options:
@@ -148,6 +152,12 @@ async function main(): Promise<void> {
       return cmdDiff(args, flags);
     case "attach":
       return cmdAttach(args, flags);
+    case "harness":
+    case "harnesses":
+      return cmdHarness(args, flags);
+    case "projects":
+    case "project":
+      return cmdProjects(args, flags);
     case "info": {
       const client = await getClient(flags);
       const meta = await client.info();

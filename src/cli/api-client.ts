@@ -8,10 +8,14 @@ import type {
   Run,
   Project,
   Harness,
+  HarnessStatus,
+  HarnessUsage,
+  AgentKind,
   TaskReference,
   TaskDiff,
 } from "../shared/types.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
+import type { BranchInfo } from "../bun/worktree.ts";
 
 /** A discovered, verified-live Agetor core (the app or a cli-daemon). */
 export type CoreInfo = CoreCreds;
@@ -167,15 +171,35 @@ export class AgetorClient {
     return this.req("POST", `/tmux-prompts/${id}/answer`, body);
   }
 
-  // ── projects / harnesses / meta ────────────────────────────────────────────
+  // ── projects ───────────────────────────────────────────────────────────────
   listProjects(): Promise<Project[]> {
     return this.req("GET", "/projects");
   }
-  listBranches(path: string): Promise<string[]> {
+  addProject(path: string, name?: string): Promise<Project> {
+    return this.req("POST", "/projects", { path, name });
+  }
+  removeProject(path: string): Promise<void> {
+    return this.req("DELETE", "/projects", { path });
+  }
+  listBranches(path: string): Promise<BranchInfo[]> {
     return this.req("GET", `/projects/branches?path=${encodeURIComponent(path)}`);
   }
-  listHarnesses(): Promise<Array<Harness & { status?: unknown }>> {
+
+  // ── harnesses ──────────────────────────────────────────────────────────────
+  listHarnesses(): Promise<{ harnesses: Harness[]; statuses: HarnessStatus[] }> {
     return this.req("GET", "/harnesses");
+  }
+  createHarness(input: CreateHarnessInput): Promise<Harness> {
+    return this.req("POST", "/harnesses", input);
+  }
+  patchHarness(id: string, patch: HarnessPatchInput): Promise<Harness> {
+    return this.req("PATCH", `/harnesses/${id}`, patch);
+  }
+  deleteHarness(id: string): Promise<void> {
+    return this.req("DELETE", `/harnesses/${id}`);
+  }
+  harnessUsage(id: string): Promise<HarnessUsage> {
+    return this.req("GET", `/harnesses/${id}/usage`);
   }
   info(): Promise<{ version: string }> {
     return this.req("GET", "/info");
@@ -214,6 +238,26 @@ export interface PatchTaskInput {
   model?: string | null;
   effort?: string | null;
   taskType?: string;
+}
+
+/** Body for POST /harnesses (kind must be claude-code; codex is "coming soon"). */
+export interface CreateHarnessInput {
+  id: string;
+  kind: AgentKind;
+  label: string;
+  home?: string | null;
+  bin?: string | null;
+  env?: Record<string, string>;
+}
+
+/** Body for PATCH /harnesses/:id. label/home/bin/env are config edits (rejected
+ *  on built-ins); enabled is a soft-delete toggle allowed even on built-ins. */
+export interface HarnessPatchInput {
+  label?: string;
+  home?: string | null;
+  bin?: string | null;
+  env?: Record<string, string>;
+  enabled?: boolean;
 }
 
 function safeJson(text: string): unknown {

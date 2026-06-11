@@ -290,6 +290,30 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/projects": {
         GET: authed((req) => json(projects.list(), { headers: corsHeaders(req) })),
+        // Register a project by absolute path — the headless/CLI equivalent of
+        // the native folder picker at /projects/pick.
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: unknown; name?: unknown };
+          const p = typeof body.path === "string" ? body.path.trim() : "";
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!path.isAbsolute(p)) {
+            return json({ error: "path must be absolute" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!existsSync(p)) {
+            return json({ error: `path does not exist: ${p}` }, { status: 404, headers: corsHeaders(req) });
+          }
+          const name =
+            typeof body.name === "string" && body.name.trim()
+              ? body.name.trim()
+              : path.basename(p) || p;
+          return json(projects.upsert(p, name), { headers: corsHeaders(req) });
+        }),
+        DELETE: authed(async (req) => {
+          const { path: p } = (await req.json().catch(() => ({}))) as { path?: string };
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          projects.delete(p);
+          return new Response(null, { status: 204, headers: corsHeaders(req) });
+        }),
       },
 
       // Opens a native folder picker and registers whatever the user chose.

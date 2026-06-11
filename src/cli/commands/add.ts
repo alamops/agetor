@@ -141,17 +141,14 @@ async function wizard(
 
   let agent = o.agent;
   if (!agent) {
-    const harnesses = (await client.listHarnesses().catch(() => [])) as Array<{
-      id: string;
-      label?: string;
-      kind?: string;
-      enabled?: boolean;
-    }>;
+    const { harnesses } = await client
+      .listHarnesses()
+      .catch(() => ({ harnesses: [], statuses: [] }));
     const enabled = harnesses.filter((h) => h.enabled !== false);
     if (enabled.length > 0) {
       const pick = await p.select({
         message: "Agent",
-        options: enabled.map((h) => ({ value: h.id, label: h.label ?? h.id, hint: h.kind })),
+        options: enabled.map((h) => ({ value: h.id, label: h.label, hint: h.kind })),
       });
       if (p.isCancel(pick)) return cancelled();
       agent = pick;
