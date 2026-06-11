@@ -18,6 +18,12 @@ export async function cmdCommit(args: string[], flags: Flags): Promise<void> {
   if (task.archivedAt != null) {
     throw new Error("task is archived — unarchive it before committing");
   }
+  // Match the webview, which only offers Commit & push when the run is idle:
+  // committing mid-turn would fold the prompt into the in-flight work and could
+  // capture half-finished changes.
+  if (task.column === "running") {
+    throw new Error(`task is still working — commit after it finishes (watch it with 'agetor logs ${short}')`);
+  }
   if (task.pendingInteractionCount > 0) {
     throw new Error(`task is waiting for an answer — respond first with 'agetor answer ${short}'`);
   }
@@ -30,9 +36,7 @@ export async function cmdCommit(args: string[], flags: Flags): Promise<void> {
   // Best-effort heads-up so a no-op turn (clean tree) isn't a surprise.
   let note = "";
   try {
-    const git = await client.getGitStatus(task.id);
-    if (git.ignored) note = " (not a git worktree)";
-    else if (!git.hasChanges) note = " (working tree clean — push only)";
+    note = commitNote(await client.getGitStatus(task.id));
   } catch {
     /* git-status is advisory — never blocks the request */
   }
@@ -46,4 +50,13 @@ export async function cmdCommit(args: string[], flags: Flags): Promise<void> {
     return;
   }
   out(`${c.green("→")} commit & push requested for ${c.dim(short)}${c.dim(note)}`);
+}
+
+/** The best-effort heads-up appended to the success line. Empty in the normal
+ *  case (uncommitted changes present); `ignored` (not a git repo) wins over a
+ *  clean tree. Pure so the note contract can be unit-tested. */
+export function commitNote(git: { hasChanges: boolean; ignored?: boolean }): string {
+  if (git.ignored) return " (not a git worktree)";
+  if (!git.hasChanges) return " (working tree clean — push only)";
+  return "";
 }

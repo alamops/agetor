@@ -97,6 +97,10 @@ export function Dashboard({
       return;
     }
     if (input === "c" && selected) {
+      if (selected.column === "running") {
+        setStatus("task is still working — commit when it finishes");
+        return;
+      }
       sendMessage(selected, COMMIT_PUSH_PROMPT, "→ commit & push requested");
       return;
     }
