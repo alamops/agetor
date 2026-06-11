@@ -56,10 +56,16 @@ export async function cmdDaemon(args: string[], flags: Flags): Promise<void> {
   }
 }
 
-function tailLog(dataDir: string | undefined, n = 8): void {
+function tailLog(dataDir: string | undefined, n = 6): void {
   const logPath = path.join(dataDir ?? resolveDataDir(), "daemon.log");
   try {
-    const lines = readFileSync(logPath, "utf8").trimEnd().split("\n").filter(Boolean);
+    const lines = readFileSync(logPath, "utf8")
+      .trimEnd()
+      .split("\n")
+      .filter(Boolean)
+      // A status check wants recent activity, not the boot roster — drop the
+      // verbose migration list and the PATH probe.
+      .filter((l) => !/applied migrations|PATH rehydrated/.test(l));
     if (lines.length) {
       out(c.dim(`\n${logPath}:`));
       for (const l of lines.slice(-n)) out(c.dim("  " + l));
