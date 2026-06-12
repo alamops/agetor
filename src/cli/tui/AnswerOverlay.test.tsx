@@ -98,3 +98,56 @@ test("tmux prompt: the trailing Reject entry sends { reject:true }", async () =>
   await wait();
   expect(captured).toEqual({ id: "p2", body: { reject: true } });
 });
+
+test("single-select Other → captures a free-text custom answer", async () => {
+  let captured: unknown = null;
+  const req = {
+    kind: "ask_questions", id: "q3", taskId: "t1", runId: "r1", createdAt: 0,
+    questions: [{ question: "Pick", options: [{ label: "A" }, { label: "B" }] }],
+  } as unknown as AnyRequest;
+  const { stdin } = render(
+    <AnswerOverlay client={fakeClient(req, (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write(DOWN); // B
+  await wait();
+  stdin.write(DOWN); // ✎ Other (index 2)
+  await wait();
+  stdin.write(ENTER); // drop into the text field
+  await wait();
+  stdin.write("my own answer");
+  await wait();
+  stdin.write(ENTER); // submit
+  await wait();
+  expect(captured).toEqual({ id: "q3", answers: [{ selected: [], custom: "my own answer" }] });
+});
+
+test("multi-select Other + an option → submits both", async () => {
+  let captured: unknown = null;
+  const req = {
+    kind: "ask_questions", id: "q4", taskId: "t1", runId: "r1", createdAt: 0,
+    questions: [{ question: "Pick many", multiSelect: true, options: [{ label: "X" }, { label: "Y" }, { label: "Z" }] }],
+  } as unknown as AnyRequest;
+  // labels = [X, Y, Z, ✎ Other] → Other is index 3
+  const { stdin } = render(
+    <AnswerOverlay client={fakeClient(req, (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write(SPACE); // toggle X (index 0)
+  await wait();
+  stdin.write(DOWN);
+  await wait();
+  stdin.write(DOWN);
+  await wait();
+  stdin.write(DOWN); // cursor at Other (index 3)
+  await wait();
+  stdin.write(SPACE); // toggle Other
+  await wait();
+  stdin.write(ENTER); // drop into the text field
+  await wait();
+  stdin.write("extra");
+  await wait();
+  stdin.write(ENTER); // submit
+  await wait();
+  expect(captured).toEqual({ id: "q4", answers: [{ selected: ["X"], custom: "extra" }] });
+});

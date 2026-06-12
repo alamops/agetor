@@ -3,12 +3,15 @@ import { Box, Text, useInput } from "ink";
 import type { AgetorClient } from "../api-client.ts";
 import type { AnyRequest } from "../../bun/interactions.ts";
 
+const OTHER = "✎ Other — type a custom answer";
+
 /**
  * Answer a task's pending interaction inline — the in-dashboard equivalent of
  * `agetor answer`. Walks an ask_questions request question-by-question (↑/↓ to
- * move, space to toggle in multi-select, enter to advance/submit) or a
- * tmux_prompt as a single choice list. Esc cancels. Mounted only in answer
- * mode, so its useInput owns the keyboard while open.
+ * move, space to toggle in multi-select, enter to advance/submit), with an
+ * "Other" row that drops into a one-line text field for a free-text answer; or
+ * a tmux_prompt as a single choice list. Esc cancels (or backs out of the text
+ * field). Mounted only in answer mode, so its useInput owns the keyboard.
  */
 export function AnswerOverlay({
   client,
@@ -27,7 +30,9 @@ export function AnswerOverlay({
   const [qIndex, setQIndex] = useState(0);
   const [cursor, setCursor] = useState(0);
   const [toggled, setToggled] = useState<Set<number>>(new Set());
-  const [answers, setAnswers] = useState<Array<{ selected: string[] }>>([]);
+  const [answers, setAnswers] = useState<Array<{ selected: string[]; custom?: string }>>([]);
+  // null = picking options; a string = typing a custom answer for this question.
+  const [custom, setCustom] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -53,15 +58,56 @@ export function AnswerOverlay({
 
   const labels = optionLabels(req, qIndex);
 
+  // Record this question's answer, then advance or submit the whole set.
+  const commitAnswer = (entry: { selected: string[]; custom?: string }) => {
+    if (!req || req.kind !== "ask_questions") return;
+    const next = [...answers, entry];
+    if (qIndex + 1 < req.questions.length) {
+      setAnswers(next);
+      setQIndex((i) => i + 1);
+      setCursor(0);
+      setToggled(new Set());
+      setCustom(null);
+    } else {
+      setSubmitting(true);
+      client
+        .answerAskQuestions(req.id, next)
+        .then((r) => onDone(r.ok ? "✓ answered" : "answer failed"))
+        .catch((e) => onDone(`! ${(e as Error).message}`));
+    }
+  };
+
   useInput(
     (input, key) => {
+      if (loading || submitting || !req) {
+        if (key.escape) return onCancel();
+        return;
+      }
+
+      // Typing a custom (free-text) answer.
+      if (custom !== null) {
+        if (key.escape) return setCustom(null); // back to the option list
+        if (key.return) {
+          const text = custom.trim();
+          if (!text) return setCustom(null);
+          const q = req.kind === "ask_questions" ? req.questions[qIndex] : undefined;
+          const selected = q?.multiSelect
+            ? [...toggled].filter((i) => i < q.options.length).map((i) => q.options[i]!.label)
+            : [];
+          return commitAnswer({ selected, custom: text });
+        }
+        if (key.backspace || key.delete) return setCustom((s) => (s ?? "").slice(0, -1));
+        if (input && !key.ctrl && !key.meta) return setCustom((s) => (s ?? "") + input);
+        return;
+      }
+
       if (key.escape) return onCancel();
-      if (loading || submitting || !req) return;
       if (key.upArrow || input === "k") return setCursor((c) => Math.max(0, c - 1));
       if (key.downArrow || input === "j") return setCursor((c) => Math.min(labels.length - 1, c + 1));
 
       if (req.kind === "ask_questions") {
         const q = req.questions[qIndex]!;
+        const otherIndex = q.options.length; // the appended "✎ Other" row
         if (q.multiSelect && input === " ") {
           return setToggled((s) => {
             const n = new Set(s);
@@ -71,27 +117,16 @@ export function AnswerOverlay({
           });
         }
         if (key.return) {
-          let selected: string[];
           if (q.multiSelect) {
-            selected = [...toggled].map((i) => q.options[i]!.label);
-          } else {
-            const pick = q.options[cursor];
-            if (!pick) return; // empty/malformed question — nothing to submit
-            selected = [pick.label];
+            if (toggled.has(otherIndex)) return setCustom(""); // collect free text, then submit
+            const selected = [...toggled].map((i) => q.options[i]!.label);
+            if (selected.length === 0) return; // need at least one option (or Other)
+            return commitAnswer({ selected });
           }
-          const next = [...answers, { selected }];
-          if (qIndex + 1 < req.questions.length) {
-            setAnswers(next);
-            setQIndex((i) => i + 1);
-            setCursor(0);
-            setToggled(new Set());
-          } else {
-            setSubmitting(true);
-            client
-              .answerAskQuestions(req.id, next)
-              .then((r) => onDone(r.ok ? "✓ answered" : "answer failed"))
-              .catch((e) => onDone(`! ${(e as Error).message}`));
-          }
+          if (cursor === otherIndex) return setCustom(""); // single-select "Other"
+          const pick = q.options[cursor];
+          if (!pick) return;
+          return commitAnswer({ selected: [pick.label] });
         }
         return;
       }
@@ -129,15 +164,23 @@ export function AnswerOverlay({
           {req.paneText.split("\n").filter(Boolean).slice(-2).join("  ")}
         </Text>
       )}
-      <Box flexDirection="column" marginTop={1}>
-        {labels.map((label, i) => (
-          <Text key={i} color={i === cursor ? "cyan" : undefined}>
-            {i === cursor ? "▸ " : "  "}
-            {multi ? (toggled.has(i) ? "[x] " : "[ ] ") : ""}
-            {label}
-          </Text>
-        ))}
-      </Box>
+      {custom !== null ? (
+        <Box marginTop={1}>
+          <Text color="cyan">✎ </Text>
+          <Text>{custom}</Text>
+          <Text color="cyan">▏</Text>
+        </Box>
+      ) : (
+        <Box flexDirection="column" marginTop={1}>
+          {labels.map((label, i) => (
+            <Text key={i} color={i === cursor ? "cyan" : undefined}>
+              {i === cursor ? "▸ " : "  "}
+              {multi ? (toggled.has(i) ? "[x] " : "[ ] ") : ""}
+              {label}
+            </Text>
+          ))}
+        </Box>
+      )}
     </Box>
   );
 }
@@ -145,7 +188,7 @@ export function AnswerOverlay({
 function optionLabels(req: AnyRequest | null, qIndex: number): string[] {
   if (!req) return [];
   if (req.kind === "ask_questions") {
-    return req.questions[qIndex]?.options.map((o) => o.label) ?? [];
+    return [...(req.questions[qIndex]?.options.map((o) => o.label) ?? []), OTHER];
   }
   return [...req.choices.map((ch) => ch.label), "Reject / Esc"];
 }
