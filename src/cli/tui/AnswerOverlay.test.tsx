@@ -151,3 +151,19 @@ test("multi-select Other + an option → submits both", async () => {
   await wait();
   expect(captured).toEqual({ id: "q4", answers: [{ selected: ["X"], custom: "extra" }] });
 });
+
+test("multi-select: Enter with nothing picked shows a hint and submits nothing", async () => {
+  let captured: unknown = null;
+  const req = {
+    kind: "ask_questions", id: "q5", taskId: "t1", runId: "r1", createdAt: 0,
+    questions: [{ question: "Pick", multiSelect: true, options: [{ label: "A" }, { label: "B" }] }],
+  } as unknown as AnyRequest;
+  const { stdin, lastFrame } = render(
+    <AnswerOverlay client={fakeClient(req, (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write(ENTER); // nothing toggled → no submit
+  await wait();
+  expect(captured).toBeNull();
+  expect(lastFrame() ?? "").toContain("pick an option");
+});

@@ -5,6 +5,7 @@ import { resolveTask } from "../resolve.ts";
 import { c, out, isTTY } from "../output.ts";
 import type { AgetorClient } from "../api-client.ts";
 import type { AskQuestionsRequest, TmuxPromptRequest } from "../../bun/interactions.ts";
+import { buildAskAnswer, CUSTOM_OPTION } from "../answer-logic.ts";
 
 export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -31,48 +32,36 @@ export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
   }
 }
 
-/** Sentinel option value for the "type a free-text answer" choice — distinctive
- *  enough that it can't collide with a real option label. */
-const CUSTOM = "__agetor_custom__";
-
 async function answerAsk(client: AgetorClient, req: AskQuestionsRequest): Promise<boolean> {
   const answers: Array<{ selected: string[]; custom?: string }> = [];
   for (const q of req.questions) {
     p.note(q.question, q.header ?? "question");
     const options = [
       ...q.options.map((o) => ({ value: o.label, label: o.label, hint: o.description })),
-      { value: CUSTOM, label: "✎ Other — type a custom answer" },
+      { value: CUSTOM_OPTION, label: "✎ Other — type a custom answer" },
     ];
-    let selected: string[];
-    let custom: string | undefined;
-    if (q.multiSelect) {
-      const sel = await p.multiselect({ message: "Select (space to pick)", options, required: false });
-      if (p.isCancel(sel)) return cancel();
-      const picks = sel as string[];
-      if (picks.includes(CUSTOM)) {
-        const text = await promptCustom();
-        if (text === null) return cancel();
-        custom = text;
-      }
-      selected = picks.filter((v) => v !== CUSTOM);
-    } else {
-      const sel = await p.select({ message: "Select", options });
-      if (p.isCancel(sel)) return cancel();
-      if (sel === CUSTOM) {
-        const text = await promptCustom();
-        if (text === null) return cancel();
-        custom = text;
-        selected = [];
+    // Re-prompt this question until it has at least one option or custom text.
+    let entry: { selected: string[]; custom?: string } | null = null;
+    while (entry === null) {
+      let picks: string[];
+      if (q.multiSelect) {
+        const sel = await p.multiselect({ message: "Select (space to pick)", options, required: false });
+        if (p.isCancel(sel)) return cancel();
+        picks = sel as string[];
       } else {
-        selected = [sel as string];
+        const sel = await p.select({ message: "Select", options });
+        if (p.isCancel(sel)) return cancel();
+        picks = [sel as string];
       }
+      let custom: string | null = null;
+      if (picks.includes(CUSTOM_OPTION)) {
+        custom = await promptCustom();
+        if (custom === null) return cancel();
+      }
+      entry = buildAskAnswer(picks, custom);
+      if (entry === null) p.note("Pick an option or add a custom answer.", "required");
     }
-    // The contract requires at least one of selected / custom per question.
-    if (selected.length === 0 && !custom) {
-      out(c.red("each question needs an option or a custom answer — nothing submitted"));
-      return true;
-    }
-    answers.push(custom ? { selected, custom } : { selected });
+    answers.push(entry);
   }
   const res = await client.answerAskQuestions(req.id, answers);
   out(res.ok ? c.green("✓ answered") : c.red("failed to answer"));

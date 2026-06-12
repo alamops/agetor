@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import type { AgetorClient } from "../api-client.ts";
 import type { AnyRequest } from "../../bun/interactions.ts";
+import { buildAskAnswer } from "../answer-logic.ts";
 
 const OTHER = "✎ Other — type a custom answer";
 
@@ -33,6 +34,7 @@ export function AnswerOverlay({
   const [answers, setAnswers] = useState<Array<{ selected: string[]; custom?: string }>>([]);
   // null = picking options; a string = typing a custom answer for this question.
   const [custom, setCustom] = useState<string | null>(null);
+  const [hint, setHint] = useState("");
 
   useEffect(() => {
     let alive = true;
@@ -58,9 +60,12 @@ export function AnswerOverlay({
 
   const labels = optionLabels(req, qIndex);
 
-  // Record this question's answer, then advance or submit the whole set.
-  const commitAnswer = (entry: { selected: string[]; custom?: string }) => {
-    if (!req || req.kind !== "ask_questions") return;
+  // Record this question's answer, then advance or submit. Returns false when
+  // the (selected, custom) pair is empty so the caller can surface a hint.
+  const commitAnswer = (selected: string[], customText: string | null): boolean => {
+    if (!req || req.kind !== "ask_questions") return true;
+    const entry = buildAskAnswer(selected, customText);
+    if (!entry) return false;
     const next = [...answers, entry];
     if (qIndex + 1 < req.questions.length) {
       setAnswers(next);
@@ -68,6 +73,7 @@ export function AnswerOverlay({
       setCursor(0);
       setToggled(new Set());
       setCustom(null);
+      setHint("");
     } else {
       setSubmitting(true);
       client
@@ -75,6 +81,7 @@ export function AnswerOverlay({
         .then((r) => onDone(r.ok ? "✓ answered" : "answer failed"))
         .catch((e) => onDone(`! ${(e as Error).message}`));
     }
+    return true;
   };
 
   useInput(
@@ -94,7 +101,8 @@ export function AnswerOverlay({
           const selected = q?.multiSelect
             ? [...toggled].filter((i) => i < q.options.length).map((i) => q.options[i]!.label)
             : [];
-          return commitAnswer({ selected, custom: text });
+          commitAnswer(selected, text);
+          return;
         }
         if (key.backspace || key.delete) return setCustom((s) => (s ?? "").slice(0, -1));
         if (input && !key.ctrl && !key.meta) return setCustom((s) => (s ?? "") + input);
@@ -102,13 +110,20 @@ export function AnswerOverlay({
       }
 
       if (key.escape) return onCancel();
-      if (key.upArrow || input === "k") return setCursor((c) => Math.max(0, c - 1));
-      if (key.downArrow || input === "j") return setCursor((c) => Math.min(labels.length - 1, c + 1));
+      if (key.upArrow || input === "k") {
+        setHint("");
+        return setCursor((c) => Math.max(0, c - 1));
+      }
+      if (key.downArrow || input === "j") {
+        setHint("");
+        return setCursor((c) => Math.min(labels.length - 1, c + 1));
+      }
 
       if (req.kind === "ask_questions") {
         const q = req.questions[qIndex]!;
         const otherIndex = q.options.length; // the appended "✎ Other" row
         if (q.multiSelect && input === " ") {
+          setHint("");
           return setToggled((s) => {
             const n = new Set(s);
             if (n.has(cursor)) n.delete(cursor);
@@ -120,13 +135,14 @@ export function AnswerOverlay({
           if (q.multiSelect) {
             if (toggled.has(otherIndex)) return setCustom(""); // collect free text, then submit
             const selected = [...toggled].map((i) => q.options[i]!.label);
-            if (selected.length === 0) return; // need at least one option (or Other)
-            return commitAnswer({ selected });
+            if (!commitAnswer(selected, null)) setHint("pick an option or ✎ Other to answer");
+            return;
           }
           if (cursor === otherIndex) return setCustom(""); // single-select "Other"
           const pick = q.options[cursor];
           if (!pick) return;
-          return commitAnswer({ selected: [pick.label] });
+          commitAnswer([pick.label], null);
+          return;
         }
         return;
       }
@@ -150,6 +166,7 @@ export function AnswerOverlay({
   if (!req) return <Text dimColor>nothing pending — esc to close</Text>;
 
   const multi = req.kind === "ask_questions" && !!req.questions[qIndex]?.multiSelect;
+  const width = (process.stdout.columns || 80) - 6;
   return (
     <Box flexDirection="column">
       <Text bold color="yellow">
@@ -165,10 +182,12 @@ export function AnswerOverlay({
         </Text>
       )}
       {custom !== null ? (
-        <Box marginTop={1}>
-          <Text color="cyan">✎ </Text>
-          <Text>{custom}</Text>
-          <Text color="cyan">▏</Text>
+        <Box marginTop={1} width={width}>
+          <Text wrap="truncate-start">
+            <Text color="cyan">✎ </Text>
+            {custom}
+            <Text color="cyan">▏</Text>
+          </Text>
         </Box>
       ) : (
         <Box flexDirection="column" marginTop={1}>
@@ -181,6 +200,7 @@ export function AnswerOverlay({
           ))}
         </Box>
       )}
+      {hint ? <Text color="yellow">{hint}</Text> : null}
     </Box>
   );
 }
