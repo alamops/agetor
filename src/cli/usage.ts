@@ -99,10 +99,11 @@ export const USAGE: Record<string, string> = {
 
   Manage the registered project folders shown in the new-task picker.`,
 
-  harness: `usage: agetor harness <ls | add <id> … | edit <id> … | enable <id> | disable <id> | rm <id>>
+  harness: `usage: agetor harness <ls | add <id> … | edit <id> … | enable <id> | disable <id> | rm <id> | shell <id>>
 
   Manage agent harnesses (aliases / parallel accounts).
-  Run 'agetor harness add --help' or 'agetor harness edit --help' for their flags.`,
+  Run 'agetor harness add --help' / 'edit --help' for their flags;
+  'agetor harness shell <id>' opens a shell with the harness env for login.`,
 
   // Subcommand-keyed blocks ("<cmd> <sub>") back both `agetor <cmd> <sub> --help`
   // and that subcommand's bad-argument error. Trivial subcommands (harness
@@ -118,6 +119,12 @@ export const USAGE: Record<string, string> = {
   "harness edit": `usage: agetor harness edit <id> [--label …] [--home <abs>|none] [--bin <abs>|none] [--env KEY=VAL …]
 
   Update a harness; pass 'none' to clear --home / --bin.`,
+
+  "harness shell": `usage: agetor harness shell <id>
+
+  Open your shell with the harness's env applied (CLAUDE_CONFIG_DIR / HOME, custom
+  env, bin on PATH). Run 'claude /login' (or 'codex login') here to authenticate a
+  parallel account against its own config. Ctrl-D to exit.`,
 
   daemon: `usage: agetor daemon <status | start | stop>
 

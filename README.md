@@ -162,7 +162,7 @@ agetor rm <id> --yes         # delete a task (worktree + branch)
 
 # setup
 agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
-agetor harness <sub>         # list | add | edit | enable | disable | rm  (agent aliases / accounts)
+agetor harness <sub>         # list | add | edit | enable | disable | rm | shell  (aliases / accounts; shell = log in)
 agetor daemon status|start|stop
 agetor info                  # the connected core's version
 ```

@@ -95,6 +95,20 @@ test("harness create/patch/enable/disable/delete + guard paths + {harnesses,stat
   });
 }, 30_000);
 
+test("harness shell-env resolves the harness env (CLAUDE_CONFIG_DIR + custom env)", async () => {
+  await withClient(4499, async (client) => {
+    const home = mkdtempSync(path.join(tmpdir(), "agetor-hcfg-"));
+    await client.createHarness({ id: "envalias", kind: "claude-code", label: "Env", home, env: { FOO: "bar" } });
+    const shellEnv = await client.harnessShellEnv("envalias");
+    expect(shellEnv.env.CLAUDE_CONFIG_DIR).toBe(home); // claude-code maps home → CLAUDE_CONFIG_DIR
+    expect(shellEnv.env.FOO).toBe("bar");
+    expect(shellEnv.launch).toBe("claude");
+    expect(shellEnv.kind).toBe("claude-code");
+    expect(shellEnv.binDir).toBeNull();
+    rmSync(home, { recursive: true, force: true });
+  });
+}, 30_000);
+
 test("getGitStatus reports uncommitted changes via { hasChanges }", async () => {
   await withClient(4498, async (client) => {
     const repo = mkdtempSync(path.join(tmpdir(), "agetor-gs-"));

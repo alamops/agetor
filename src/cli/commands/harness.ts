@@ -1,5 +1,5 @@
 import { getClient, type Flags } from "../context.ts";
-import { c, out, printJson, table } from "../output.ts";
+import { c, out, printJson, table, isTTY } from "../output.ts";
 import { flagValue } from "../args.ts";
 import { ApiError, type HarnessPatchInput } from "../api-client.ts";
 import type { AgentKind } from "../../shared/types.ts";
@@ -95,9 +95,32 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
       out(`${c.red("✗")} removed harness ${c.bold(id)}`);
       return;
     }
+    case "shell": {
+      const id = args[1];
+      if (!id) throw usageError("harness shell");
+      if (!isTTY) {
+        throw new Error("agetor harness shell needs an interactive terminal (TTY)");
+      }
+      const { env, binDir, launch, kind } = await client.harnessShellEnv(id);
+      const shell = process.env.SHELL || "/bin/zsh";
+      const childEnv: Record<string, string> = { ...(process.env as Record<string, string>), ...env };
+      if (binDir) childEnv.PATH = `${binDir}:${process.env.PATH ?? ""}`;
+      const loginCmd = kind === "claude-code" ? `${launch} /login` : `${launch} login`;
+      out(
+        `${c.green("●")} harness ${c.bold(id)} — env applied. Run ${c.cyan(loginCmd)} to authenticate · Ctrl-D to exit`,
+      );
+      const proc = Bun.spawn([shell], {
+        env: childEnv,
+        stdin: "inherit",
+        stdout: "inherit",
+        stderr: "inherit",
+      });
+      process.exitCode = (await proc.exited) ?? 0;
+      return;
+    }
     default:
       throw new Error(
-        `unknown harness subcommand: ${sub} (use ls | add | edit | enable | disable | rm)`,
+        `unknown harness subcommand: ${sub} (use ls | add | edit | enable | disable | rm | shell)`,
       );
   }
 }

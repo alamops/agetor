@@ -201,6 +201,9 @@ export class AgetorClient {
   harnessUsage(id: string): Promise<HarnessUsage> {
     return this.req("GET", `/harnesses/${id}/usage`);
   }
+  harnessShellEnv(id: string): Promise<HarnessShellEnv> {
+    return this.req("GET", `/harnesses/${id}/shell-env`);
+  }
   info(): Promise<{ version: string }> {
     return this.req("GET", "/info");
   }
@@ -248,6 +251,14 @@ export interface CreateHarnessInput {
   home?: string | null;
   bin?: string | null;
   env?: Record<string, string>;
+}
+
+/** Resolved harness environment for `agetor harness shell` (GET /harnesses/:id/shell-env). */
+export interface HarnessShellEnv {
+  env: Record<string, string>;
+  binDir: string | null;
+  launch: string;
+  kind: AgentKind;
 }
 
 /** Body for PATCH /harnesses/:id. label/home/bin/env are config edits (rejected

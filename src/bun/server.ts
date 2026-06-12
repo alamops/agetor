@@ -19,7 +19,9 @@ import { archiveTask, createTask, deleteTask, startTask, cancelRun, reconcileTas
 import { checkAllHarnesses } from "./agent-status.ts";
 import {
   buildHarnessTerminalCommand,
+  harnessEnv,
   isValidEnvKey,
+  resolveBin,
   toTerminalAppleScript,
 } from "./agents.ts";
 import type { UpdaterSnapshot } from "./updater.ts";
@@ -686,6 +688,29 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           return json(harnesses.usage(req.params.id), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Resolve a harness's environment for `agetor harness shell` — the CLI
+      // execs a shell with this env applied (drift-free: reuses harnessEnv).
+      // Headless-safe (no native bridge), unlike open-terminal below.
+      "/harnesses/:id/shell-env": {
+        GET: authed((req) => {
+          const harness = harnesses.getByIdOrKind(req.params.id);
+          if (!harness) {
+            return json({ error: "harness not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(
+            {
+              env: harnessEnv(harness),
+              // Only an absolute bin override needs to join PATH (mirrors
+              // buildHarnessTerminalCommand); the default agent is on PATH.
+              binDir: harness.bin && path.isAbsolute(harness.bin) ? path.dirname(harness.bin) : null,
+              launch: path.basename(resolveBin(harness)),
+              kind: harness.kind,
+            },
+            { headers: corsHeaders(req) },
+          );
         }),
       },
 

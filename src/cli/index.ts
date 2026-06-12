@@ -43,7 +43,7 @@ Commands:
   rm <id> [--yes]     delete a task (worktree + branch)
   info                show the connected core's version
   daemon <sub>        start | stop | status of the background core
-  harness <sub>       list | add | edit | enable | disable | rm agent harnesses
+  harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
   projects <sub>      list | add | rm | branches (project folders)
   help                show this help
 
