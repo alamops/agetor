@@ -235,6 +235,9 @@ export class AgetorClient {
     if (branch) params.set("branch", branch);
     return this.req("GET", `/agent-discovery?${params.toString()}`);
   }
+  agentModels(): Promise<Record<string, string[]>> {
+    return this.req("GET", "/agent-models");
+  }
 }
 
 /** Body for POST /tasks (mirrors the server's accepted fields). */

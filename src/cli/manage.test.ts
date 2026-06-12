@@ -124,6 +124,14 @@ test("agentDiscovery returns { commands, extensions } arrays", async () => {
   });
 }, 30_000);
 
+test("agentModels returns discovered model ids per kind", async () => {
+  await withClient(4535, async (client) => {
+    const models = await client.agentModels();
+    expect(Array.isArray(models["claude-code"])).toBe(true);
+    expect(Array.isArray(models["codex"])).toBe(true);
+  });
+}, 30_000);
+
 test("rebuildEvents 404s for an unknown run id", async () => {
   await withClient(4534, async (client) => {
     let err: unknown;

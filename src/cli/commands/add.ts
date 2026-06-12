@@ -153,6 +153,7 @@ async function wizard(
     .listHarnesses()
     .catch(() => ({ harnesses: [], statuses: [] }));
   const prefs = await client.getPreferences().catch(() => ({}) as Record<string, string>);
+  const discovered = await client.agentModels().catch(() => ({}) as Record<string, string[]>);
 
   let agent = o.agent;
   if (!agent) {
@@ -173,7 +174,14 @@ async function wizard(
 
   let model = o.model;
   if (!model) {
-    const picked = await pickOption("Model", AGENT_OPTIONS[kind].models, prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind]);
+    // Curated list + any models discovered by probing the CLI that aren't
+    // already curated, so a newer model shows up without a code change.
+    const known = AGENT_OPTIONS[kind].models;
+    const knownIds = new Set(known.map((m) => m.id));
+    const extra = (discovered[kind] ?? [])
+      .filter((id) => !knownIds.has(id))
+      .map((id) => ({ id, label: id, hint: "discovered" }));
+    const picked = await pickOption("Model", [...known, ...extra], prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind]);
     if (picked === null) return cancelled();
     model = picked;
   }
