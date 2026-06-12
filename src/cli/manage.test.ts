@@ -124,6 +124,19 @@ test("agentDiscovery returns { commands, extensions } arrays", async () => {
   });
 }, 30_000);
 
+test("rebuildEvents 404s for an unknown run id", async () => {
+  await withClient(4534, async (client) => {
+    let err: unknown;
+    try {
+      await client.rebuildEvents("no-such-run");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(404);
+  });
+}, 30_000);
+
 test("harness shell-env resolves the harness env (CLAUDE_CONFIG_DIR + custom env)", async () => {
   await withClient(4499, async (client) => {
     const home = mkdtempSync(path.join(tmpdir(), "agetor-hcfg-"));

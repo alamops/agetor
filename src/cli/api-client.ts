@@ -6,6 +6,7 @@ import {
 import type {
   Task,
   Run,
+  RunEvent,
   Project,
   Harness,
   HarnessStatus,
@@ -153,6 +154,9 @@ export class AgetorClient {
   }
   cancelRun(runId: string): Promise<{ ok?: boolean; cancelled?: boolean }> {
     return this.req("POST", `/runs/${runId}/cancel`);
+  }
+  rebuildEvents(runId: string): Promise<{ events: RunEvent[]; reason?: string }> {
+    return this.req("GET", `/runs/${runId}/rebuild-events`);
   }
 
   // ── interactions (needs-answer) ────────────────────────────────────────────

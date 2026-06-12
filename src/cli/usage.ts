@@ -60,11 +60,12 @@ export const USAGE: Record<string, string> = {
   List the slash commands (/…) and MCP/skill extensions (@…) available to the
   task's agent in its workdir — the CLI view of the app composer's autocomplete.`,
 
-  logs: `usage: agetor logs <task-id> [--no-follow] [--notify]
+  logs: `usage: agetor logs <task-id> [--no-follow] [--notify] [--rebuild]
 
   Stream the task's live conversation. --no-follow prints the current scrollback
   and exits. --notify (while following) rings a desktop notification + bell when
-  the task succeeds / fails / starts waiting on you (macOS).`,
+  the task succeeds / fails / starts waiting on you (macOS). --rebuild prints the
+  latest run reconstructed from the on-disk claude JSONL (recovery).`,
 
   cancel: `usage: agetor cancel <task-id>
 

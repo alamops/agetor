@@ -39,7 +39,7 @@ Commands:
   commit <id>         ask the agent to commit all changes & push the branch
   answer <id>         answer a task that needs input (interactive)
   commands <id>       list the agent's slash commands + extensions for the workdir
-  logs <id>           stream a task's live conversation (--no-follow, --notify)
+  logs <id>           stream a task's live conversation (--no-follow, --notify, --rebuild)
   diff <id>           show the task's git diff
   attach <id>         attach your terminal to the live tmux session (claude-code)
   shell <id>          open a shell in the task's worktree (--print for the path)

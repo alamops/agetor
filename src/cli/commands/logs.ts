@@ -10,9 +10,24 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   const ref = args.find((a) => !a.startsWith("-"));
   const noFollow = args.includes("--no-follow");
   const notify = args.includes("--notify");
+  const rebuild = args.includes("--rebuild");
   if (!ref) throw usageError("logs");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
+
+  // --rebuild: reconstruct the latest run's events from the on-disk claude
+  // JSONL (recovery when the live stream truncated) — a one-shot snapshot.
+  if (rebuild) {
+    const run = (await client.getRuns(task.id))[0];
+    if (!run) {
+      out(c.dim("no runs to rebuild"));
+      return;
+    }
+    const { events, reason } = await client.rebuildEvents(run.id);
+    if (reason) errln(c.dim(reason));
+    for (const e of events) out(flags.json ? JSON.stringify(e) : formatEvent(e));
+    return;
+  }
 
   await new Promise<void>((resolve) => {
     let handle: SseHandle | undefined;

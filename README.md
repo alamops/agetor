@@ -150,7 +150,7 @@ agetor send <id> <msg…>      # message a running task (resumes a finished one)
 agetor commit <id>           # ask the agent to commit all changes & push the branch
 agetor answer <id>           # answer a task that needs input (interactive picker)
 agetor commands <id>         # list the agent's slash commands + extensions (composer autocomplete)
-agetor logs <id>             # stream a task's live conversation (--no-follow snapshot · --notify on state change)
+agetor logs <id>             # stream a task's live conversation (--no-follow snapshot · --notify on state change · --rebuild from JSONL)
 agetor cancel <id>           # stop the active run
 agetor attach <id>           # attach your terminal to the live tmux session (claude-code)
 agetor shell <id>            # open a shell in the task's worktree (--print for the path)
