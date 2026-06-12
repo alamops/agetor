@@ -55,10 +55,11 @@ export const USAGE: Record<string, string> = {
   Answer a task that needs input — an interactive picker for AskUserQuestion
   options or a tmux prompt.`,
 
-  logs: `usage: agetor logs <task-id> [--no-follow]
+  logs: `usage: agetor logs <task-id> [--no-follow] [--notify]
 
   Stream the task's live conversation. --no-follow prints the current scrollback
-  and exits.`,
+  and exits. --notify (while following) rings a desktop notification + bell when
+  the task succeeds / fails / starts waiting on you (macOS).`,
 
   cancel: `usage: agetor cancel <task-id>
 

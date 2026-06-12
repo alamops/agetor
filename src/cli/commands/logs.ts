@@ -3,20 +3,24 @@ import { resolveTask } from "../resolve.ts";
 import { streamSse, type SseHandle } from "../sse.ts";
 import { c, out, errln } from "../output.ts";
 import { usageError } from "../usage.ts";
-import type { RunEvent } from "../../shared/types.ts";
+import { notifyFor, osNotify } from "../notify.ts";
+import type { RunEvent, GlobalEvent } from "../../shared/types.ts";
 
 export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
   const ref = args.find((a) => !a.startsWith("-"));
   const noFollow = args.includes("--no-follow");
+  const notify = args.includes("--notify");
   if (!ref) throw usageError("logs");
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
 
   await new Promise<void>((resolve) => {
     let handle: SseHandle | undefined;
+    let notifyHandle: SseHandle | undefined;
     let quiet: ReturnType<typeof setTimeout> | undefined;
     const finish = () => {
       handle?.close();
+      notifyHandle?.close();
       if (quiet) clearTimeout(quiet);
       resolve();
     };
@@ -34,6 +38,18 @@ export async function cmdLogs(args: string[], flags: Flags): Promise<void> {
         if (!flags.json && !noFollow) errln(c.dim("…reconnecting"));
       },
     });
+    // --notify (only while following): a desktop notification + bell when this
+    // task changes to a terminal status or starts waiting on you.
+    if (notify && !noFollow) {
+      notifyHandle = streamSse<GlobalEvent>(
+        "/events",
+        (e) => {
+          const n = notifyFor(e, task.id);
+          if (n) osNotify(n.title, n.body);
+        },
+        { dataDir: flags.dataDir },
+      );
+    }
     process.on("SIGINT", () => {
       finish();
       process.exit(0);
