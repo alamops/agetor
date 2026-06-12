@@ -165,6 +165,7 @@ agetor projects <sub>        # list | add <path> | rm <path> | branches <path>
 agetor harness <sub>         # list | add | edit | enable | disable | rm | shell  (aliases / accounts; shell = log in)
 agetor daemon status|start|stop
 agetor info                  # the connected core's version
+agetor config [k] [v]        # view / set core preferences (defaultHarness, last model/mode/effort)
 ```
 
 **Dashboard keys:** `↑/↓` (or `j/k`) select · `s` run · `x` stop · `m` message · `c` commit & push · `g` answer · `q` quit. Messages and answers happen inline; run-status toasts flash on success / failure / needs-you.

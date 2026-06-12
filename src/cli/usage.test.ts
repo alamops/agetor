@@ -4,7 +4,7 @@ import { USAGE, canonical, usageError, helpFor } from "./usage.ts";
 const COMMANDS = [
   "add", "ls", "ps", "show", "start", "send", "commit", "answer", "logs",
   "cancel", "attach", "edit", "move", "archive", "unarchive", "diff", "rm",
-  "projects", "harness", "daemon", "info",
+  "projects", "harness", "daemon", "info", "config",
 ];
 
 test("every dispatched command has a USAGE block whose first line is its usage line", () => {

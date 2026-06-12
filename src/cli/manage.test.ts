@@ -95,6 +95,17 @@ test("harness create/patch/enable/disable/delete + guard paths + {harnesses,stat
   });
 }, 30_000);
 
+test("preferences round-trip (get / set) via the client", async () => {
+  await withClient(4500, async (client) => {
+    expect(await client.getPreferences()).toEqual({});
+    await client.setPreference("defaultHarness", "claude-code");
+    await client.setPreference("lastModel:claude-code", "opus-4.7");
+    const prefs = await client.getPreferences();
+    expect(prefs.defaultHarness).toBe("claude-code");
+    expect(prefs["lastModel:claude-code"]).toBe("opus-4.7"); // ':' in the key survives the round-trip
+  });
+}, 30_000);
+
 test("harness shell-env resolves the harness env (CLAUDE_CONFIG_DIR + custom env)", async () => {
   await withClient(4499, async (client) => {
     const home = mkdtempSync(path.join(tmpdir(), "agetor-hcfg-"));

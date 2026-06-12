@@ -17,6 +17,7 @@ import { cmdAttach } from "./commands/attach.ts";
 import { cmdHarness } from "./commands/harness.ts";
 import { cmdProjects } from "./commands/projects.ts";
 import { cmdCommit } from "./commands/commit.ts";
+import { cmdConfig } from "./commands/config.ts";
 import { helpFor } from "./usage.ts";
 
 const HELP = `agetor — drive Agetor from the terminal
@@ -45,6 +46,7 @@ Commands:
   daemon <sub>        start | stop | status of the background core
   harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
   projects <sub>      list | add | rm | branches (project folders)
+  config [k] [v]      view / set core preferences (defaultHarness, last model…)
   help                show this help
 
 Global options:
@@ -166,6 +168,8 @@ async function main(): Promise<void> {
     case "projects":
     case "project":
       return cmdProjects(args, flags);
+    case "config":
+      return cmdConfig(args, flags);
     case "info": {
       const client = await getClient(flags);
       const meta = await client.info();

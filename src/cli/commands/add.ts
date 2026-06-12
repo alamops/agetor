@@ -4,6 +4,14 @@ import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, isTTY } from "../output.ts";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import { flagValue } from "../args.ts";
+import {
+  AGENT_OPTIONS,
+  DEFAULT_MODEL,
+  DEFAULT_EFFORT,
+  supportedEfforts,
+  type AgentKind,
+  type AgentOption,
+} from "../../shared/types.ts";
 
 interface AddOpts {
   title?: string;
@@ -139,19 +147,49 @@ async function wizard(
     }));
   if (p.isCancel(prompt)) return cancelled();
 
+  // Load harnesses + saved preferences once, for the agent / model / mode /
+  // effort defaults — so the common picks are a single Enter.
+  const { harnesses } = await client
+    .listHarnesses()
+    .catch(() => ({ harnesses: [], statuses: [] }));
+  const prefs = await client.getPreferences().catch(() => ({}) as Record<string, string>);
+
   let agent = o.agent;
   if (!agent) {
-    const { harnesses } = await client
-      .listHarnesses()
-      .catch(() => ({ harnesses: [], statuses: [] }));
     const enabled = harnesses.filter((h) => h.enabled !== false);
     if (enabled.length > 0) {
+      const def = prefs.defaultHarness;
       const pick = await p.select({
         message: "Agent",
         options: enabled.map((h) => ({ value: h.id, label: h.label, hint: h.kind })),
+        initialValue: enabled.some((h) => h.id === def) ? def : undefined,
       });
       if (p.isCancel(pick)) return cancelled();
       agent = pick;
+    }
+  }
+
+  const kind: AgentKind = harnesses.find((h) => h.id === agent)?.kind ?? "claude-code";
+
+  let model = o.model;
+  if (!model) {
+    const picked = await pickOption("Model", AGENT_OPTIONS[kind].models, prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind]);
+    if (picked === null) return cancelled();
+    model = picked;
+  }
+  let mode = o.mode;
+  if (!mode) {
+    const picked = await pickOption("Mode", AGENT_OPTIONS[kind].modes, prefs[`lastMode:${kind}`] ?? AGENT_OPTIONS[kind].modes[0]?.id);
+    if (picked === null) return cancelled();
+    mode = picked;
+  }
+  let effort = o.effort;
+  if (!effort) {
+    const efforts = supportedEfforts(kind, model ?? null);
+    if (efforts.length > 0) {
+      const picked = await pickOption("Effort", efforts, prefs[`lastEffort:${kind}`] ?? DEFAULT_EFFORT[kind]);
+      if (picked === null) return cancelled();
+      effort = picked;
     }
   }
 
@@ -182,8 +220,39 @@ async function wizard(
   if (p.isCancel(start)) return cancelled();
   o.start = start;
 
+  // Remember the picks so the next `add` defaults to them.
+  await persistPrefs(client, kind, { model, mode, effort });
+
   p.outro(c.green("creating…"));
-  return baseInput({ ...o, agent, workdir }, title, prompt);
+  return baseInput({ ...o, agent, model, mode, effort, workdir }, title, prompt);
+}
+
+/** A select that returns the chosen value (or null on cancel), pre-selecting
+ *  `initial` when it's a valid option. */
+async function pickOption(
+  message: string,
+  opts: AgentOption[],
+  initial: string | undefined,
+): Promise<string | null> {
+  const pick = await p.select({
+    message,
+    options: opts.map((opt) => ({ value: opt.id, label: opt.label, hint: opt.hint })),
+    initialValue: opts.some((opt) => opt.id === initial) ? initial : opts[0]?.id,
+  });
+  return p.isCancel(pick) ? null : (pick as string);
+}
+
+/** Persist the chosen model/mode/effort as the per-kind last-used defaults. */
+async function persistPrefs(
+  client: AgetorClient,
+  kind: AgentKind,
+  picks: { model?: string; mode?: string; effort?: string },
+): Promise<void> {
+  const writes: Array<Promise<unknown>> = [];
+  if (picks.model) writes.push(client.setPreference(`lastModel:${kind}`, picks.model));
+  if (picks.mode) writes.push(client.setPreference(`lastMode:${kind}`, picks.mode));
+  if (picks.effort) writes.push(client.setPreference(`lastEffort:${kind}`, picks.effort));
+  await Promise.allSettled(writes);
 }
 
 function cancelled(): null {

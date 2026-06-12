@@ -133,6 +133,12 @@ export const USAGE: Record<string, string> = {
   info: `usage: agetor info
 
   Print the connected core's version.`,
+
+  config: `usage: agetor config [<key> [value…]]
+
+  View or set cross-session preferences stored in the core (the same store the
+  app's settings use). No args lists all; one arg gets; key + value sets.
+  Common keys: defaultHarness, lastModel:<kind>, lastMode:<kind>, lastEffort:<kind>.`,
 };
 
 const ALIASES: Record<string, string> = {

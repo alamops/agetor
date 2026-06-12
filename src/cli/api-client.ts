@@ -210,6 +210,14 @@ export class AgetorClient {
   defaults(): Promise<{ home: string; cwd: string; dataDir: string }> {
     return this.req("GET", "/defaults");
   }
+
+  // ── preferences (cross-session key/value store) ────────────────────────────
+  getPreferences(): Promise<Record<string, string>> {
+    return this.req("GET", "/preferences");
+  }
+  setPreference(key: string, value: string): Promise<void> {
+    return this.req("PUT", `/preferences/${encodeURIComponent(key)}`, { value });
+  }
 }
 
 /** Body for POST /tasks (mirrors the server's accepted fields). */
