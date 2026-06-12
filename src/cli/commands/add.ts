@@ -243,7 +243,7 @@ async function pickOption(
 }
 
 /** Persist the chosen model/mode/effort as the per-kind last-used defaults. */
-async function persistPrefs(
+export async function persistPrefs(
   client: AgetorClient,
   kind: AgentKind,
   picks: { model?: string; mode?: string; effort?: string },

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { ensureCore, stopDaemon } from "./daemon/supervisor.ts";
 import { AgetorClient, ApiError } from "./api-client.ts";
+import { cmdConfig } from "./commands/config.ts";
 import { coreCredsPath } from "../bun/core-creds.ts";
 
 async function withClient(
@@ -103,6 +104,13 @@ test("preferences round-trip (get / set) via the client", async () => {
     const prefs = await client.getPreferences();
     expect(prefs.defaultHarness).toBe("claude-code");
     expect(prefs["lastModel:claude-code"]).toBe("opus-4.7"); // ':' in the key survives the round-trip
+  });
+}, 30_000);
+
+test("cmdConfig sets a preference via the command (set path)", async () => {
+  await withClient(4532, async (client, dir) => {
+    await cmdConfig(["mykey", "my value"], { json: true, plain: true, noDaemon: false, dataDir: dir });
+    expect((await client.getPreferences()).mykey).toBe("my value");
   });
 }, 30_000);
 

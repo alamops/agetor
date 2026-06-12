@@ -103,12 +103,15 @@ export async function cmdHarness(args: string[], flags: Flags): Promise<void> {
       }
       const { env, binDir, launch, kind } = await client.harnessShellEnv(id);
       const shell = process.env.SHELL || "/bin/zsh";
-      const childEnv: Record<string, string> = { ...(process.env as Record<string, string>), ...env };
+      const childEnv: Record<string, string | undefined> = { ...process.env, ...env };
       if (binDir) childEnv.PATH = `${binDir}:${process.env.PATH ?? ""}`;
-      const loginCmd = kind === "claude-code" ? `${launch} /login` : `${launch} login`;
-      out(
-        `${c.green("●")} harness ${c.bold(id)} — env applied. Run ${c.cyan(loginCmd)} to authenticate · Ctrl-D to exit`,
-      );
+      // Only claude's login command is certain (`claude /login`); keep the codex
+      // hint generic rather than assert a command we haven't verified.
+      const loginHint =
+        kind === "claude-code"
+          ? `run ${c.cyan(`${launch} /login`)} to authenticate`
+          : `log in to ${c.cyan(launch)} here`;
+      out(`${c.green("●")} harness ${c.bold(id)} — env applied. ${loginHint} · Ctrl-D to exit`);
       const proc = Bun.spawn([shell], {
         env: childEnv,
         stdin: "inherit",
