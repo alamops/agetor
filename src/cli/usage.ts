@@ -69,6 +69,12 @@ export const USAGE: Record<string, string> = {
   Attach your terminal to the task's live tmux session (claude-code only).
   Detach with Ctrl-b d.`,
 
+  shell: `usage: agetor shell <task-id> [--print]
+
+  Open a shell in the task's worktree (or its workdir when isolation is off) —
+  the terminal version of the app's worktree terminal. --print / -p just echoes
+  the directory, e.g. cd "$(agetor shell -p <id>)".`,
+
   edit: `usage: agetor edit <task-id> [flags]   (at least one flag)
 
   Patch a task. Changing model / mode / effort applies to a live session mid-run.

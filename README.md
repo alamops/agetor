@@ -152,6 +152,7 @@ agetor answer <id>           # answer a task that needs input (interactive picke
 agetor logs <id>             # stream a task's live conversation (--no-follow for a snapshot)
 agetor cancel <id>           # stop the active run
 agetor attach <id>           # attach your terminal to the live tmux session (claude-code)
+agetor shell <id>            # open a shell in the task's worktree (--print for the path)
 
 # manage
 agetor edit <id> [flags]     # change title/prompt/agent/workdir/model/mode/effort/type/column

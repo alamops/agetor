@@ -18,6 +18,7 @@ import { cmdHarness } from "./commands/harness.ts";
 import { cmdProjects } from "./commands/projects.ts";
 import { cmdCommit } from "./commands/commit.ts";
 import { cmdConfig } from "./commands/config.ts";
+import { cmdShell } from "./commands/shell.ts";
 import { helpFor } from "./usage.ts";
 
 const HELP = `agetor — drive Agetor from the terminal
@@ -39,6 +40,7 @@ Commands:
   logs <id>           stream a task's live conversation (--no-follow)
   diff <id>           show the task's git diff
   attach <id>         attach your terminal to the live tmux session (claude-code)
+  shell <id>          open a shell in the task's worktree (--print for the path)
   cancel <id>         stop the active run
   archive <id>        archive a done task   (unarchive <id> to restore)
   rm <id> [--yes]     delete a task (worktree + branch)
@@ -162,6 +164,8 @@ async function main(): Promise<void> {
       return cmdDiff(args, flags);
     case "attach":
       return cmdAttach(args, flags);
+    case "shell":
+      return cmdShell(args, flags);
     case "harness":
     case "harnesses":
       return cmdHarness(args, flags);

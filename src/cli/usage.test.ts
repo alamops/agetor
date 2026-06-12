@@ -3,7 +3,7 @@ import { USAGE, canonical, usageError, helpFor } from "./usage.ts";
 
 const COMMANDS = [
   "add", "ls", "ps", "show", "start", "send", "commit", "answer", "logs",
-  "cancel", "attach", "edit", "move", "archive", "unarchive", "diff", "rm",
+  "cancel", "attach", "shell", "edit", "move", "archive", "unarchive", "diff", "rm",
   "projects", "harness", "daemon", "info", "config",
 ];
 
