@@ -16,6 +16,7 @@ import type {
   TaskDiff,
 } from "../shared/types.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
+import type { AvailableCommand, AvailableExtension } from "../bun/commands.ts";
 
 /** A discovered, verified-live Agetor core (the app or a cli-daemon). */
 export type CoreInfo = CoreCreds;
@@ -217,6 +218,18 @@ export class AgetorClient {
   }
   setPreference(key: string, value: string): Promise<void> {
     return this.req("PUT", `/preferences/${encodeURIComponent(key)}`, { value });
+  }
+
+  // ── agent discovery (slash commands + extensions) ──────────────────────────
+  agentDiscovery(
+    agent: string,
+    workdir: string | null,
+    branch: string | null,
+  ): Promise<{ commands: AvailableCommand[]; extensions: AvailableExtension[] }> {
+    const params = new URLSearchParams({ agent });
+    if (workdir) params.set("workdir", workdir);
+    if (branch) params.set("branch", branch);
+    return this.req("GET", `/agent-discovery?${params.toString()}`);
   }
 }
 

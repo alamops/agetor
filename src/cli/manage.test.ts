@@ -114,6 +114,16 @@ test("cmdConfig sets a preference via the command (set path)", async () => {
   });
 }, 30_000);
 
+test("agentDiscovery returns { commands, extensions } arrays", async () => {
+  await withClient(4533, async (client) => {
+    const repo = mkdtempSync(path.join(tmpdir(), "agetor-disc-"));
+    const res = await client.agentDiscovery("claude-code", repo, null);
+    expect(Array.isArray(res.commands)).toBe(true);
+    expect(Array.isArray(res.extensions)).toBe(true);
+    rmSync(repo, { recursive: true, force: true });
+  });
+}, 30_000);
+
 test("harness shell-env resolves the harness env (CLAUDE_CONFIG_DIR + custom env)", async () => {
   await withClient(4499, async (client) => {
     const home = mkdtempSync(path.join(tmpdir(), "agetor-hcfg-"));

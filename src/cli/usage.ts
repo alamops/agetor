@@ -55,6 +55,11 @@ export const USAGE: Record<string, string> = {
   Answer a task that needs input — an interactive picker for AskUserQuestion
   options or a tmux prompt.`,
 
+  commands: `usage: agetor commands <task-id>
+
+  List the slash commands (/…) and MCP/skill extensions (@…) available to the
+  task's agent in its workdir — the CLI view of the app composer's autocomplete.`,
+
   logs: `usage: agetor logs <task-id> [--no-follow] [--notify]
 
   Stream the task's live conversation. --no-follow prints the current scrollback

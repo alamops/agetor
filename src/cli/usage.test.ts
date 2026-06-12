@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { USAGE, canonical, usageError, helpFor } from "./usage.ts";
 
 const COMMANDS = [
-  "add", "ls", "ps", "show", "start", "send", "commit", "answer", "logs",
+  "add", "ls", "ps", "show", "start", "send", "commit", "answer", "commands", "logs",
   "cancel", "attach", "shell", "edit", "move", "archive", "unarchive", "diff", "rm",
   "projects", "harness", "daemon", "info", "config",
 ];

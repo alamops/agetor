@@ -19,6 +19,7 @@ import { cmdProjects } from "./commands/projects.ts";
 import { cmdCommit } from "./commands/commit.ts";
 import { cmdConfig } from "./commands/config.ts";
 import { cmdShell } from "./commands/shell.ts";
+import { cmdCommands } from "./commands/discovery.ts";
 import { helpFor } from "./usage.ts";
 
 const HELP = `agetor — drive Agetor from the terminal
@@ -37,6 +38,7 @@ Commands:
   send <id> <msg…>    message a running task (resumes a finished one)
   commit <id>         ask the agent to commit all changes & push the branch
   answer <id>         answer a task that needs input (interactive)
+  commands <id>       list the agent's slash commands + extensions for the workdir
   logs <id>           stream a task's live conversation (--no-follow, --notify)
   diff <id>           show the task's git diff
   attach <id>         attach your terminal to the live tmux session (claude-code)
@@ -143,6 +145,8 @@ async function main(): Promise<void> {
       return cmdCommit(args, flags);
     case "answer":
       return cmdAnswer(args, flags);
+    case "commands":
+      return cmdCommands(args, flags);
     case "logs":
     case "tail":
       return cmdLogs(args, flags);
