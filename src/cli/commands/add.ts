@@ -174,14 +174,8 @@ async function wizard(
 
   let model = o.model;
   if (!model) {
-    // Curated list + any models discovered by probing the CLI that aren't
-    // already curated, so a newer model shows up without a code change.
-    const known = AGENT_OPTIONS[kind].models;
-    const knownIds = new Set(known.map((m) => m.id));
-    const extra = (discovered[kind] ?? [])
-      .filter((id) => !knownIds.has(id))
-      .map((id) => ({ id, label: id, hint: "discovered" }));
-    const picked = await pickOption("Model", [...known, ...extra], prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind]);
+    const options = mergeModels(AGENT_OPTIONS[kind].models, discovered[kind] ?? []);
+    const picked = await pickOption("Model", options, prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind]);
     if (picked === null) return cancelled();
     model = picked;
   }
@@ -233,6 +227,18 @@ async function wizard(
 
   p.outro(c.green("creating…"));
   return baseInput({ ...o, agent, model, mode, effort, workdir }, title, prompt);
+}
+
+/** Curated model list + any discovered ids not already curated (tagged
+ *  "discovered"), so a newer model shows up without a code change. */
+export function mergeModels(curated: AgentOption[], discovered: string[]): AgentOption[] {
+  const known = new Set(curated.map((m) => m.id));
+  return [
+    ...curated,
+    ...discovered
+      .filter((id) => !known.has(id))
+      .map((id) => ({ id, label: id, hint: "discovered" })),
+  ];
 }
 
 /** A select that returns the chosen value (or null on cancel), pre-selecting
