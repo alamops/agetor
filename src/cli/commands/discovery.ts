@@ -27,8 +27,7 @@ export async function cmdCommands(args: string[], flags: Flags): Promise<void> {
   if (commands.length) {
     out(c.bold(`Slash commands (${commands.length})`));
     for (const cmd of commands) {
-      const name = cmd.name.startsWith("/") ? cmd.name : `/${cmd.name}`;
-      out(`  ${c.cyan(name)}  ${c.dim(brief(cmd.description))}`);
+      out(`  ${c.cyan(commandLabel(cmd.name))}  ${c.dim(brief(cmd.description))}`);
     }
   }
   if (extensions.length) {
@@ -38,9 +37,15 @@ export async function cmdCommands(args: string[], flags: Flags): Promise<void> {
   }
 }
 
+/** Normalize a discovered command name to its slash form — the discovery source
+ *  already includes the leading slash for skills, so don't double it. */
+export function commandLabel(name: string): string {
+  return name.startsWith("/") ? name : `/${name}`;
+}
+
 /** One-line, length-capped description — collapse whitespace so multi-line
  *  skill blurbs don't wreck the list. */
-function brief(s: string, n = 72): string {
+export function brief(s: string, n = 72): string {
   const oneLine = s.replace(/\s+/g, " ").trim();
   return oneLine.length > n ? `${oneLine.slice(0, n - 1)}…` : oneLine;
 }
