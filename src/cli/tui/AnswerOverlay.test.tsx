@@ -167,3 +167,24 @@ test("multi-select: Enter with nothing picked shows a hint and submits nothing",
   expect(captured).toBeNull();
   expect(lastFrame() ?? "").toContain("pick an option");
 });
+
+test("single-select Other: a dragged path is sanitized into the custom answer", async () => {
+  let captured: unknown = null;
+  const req = {
+    kind: "ask_questions", id: "qd", taskId: "t1", runId: "r1", createdAt: 0,
+    questions: [{ question: "Pick", options: [{ label: "A" }] }],
+  } as unknown as AnyRequest;
+  const { stdin } = render(
+    <AnswerOverlay client={fakeClient(req, (a) => { captured = a; })} taskId="t1" onDone={() => {}} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write(DOWN); // A → ✎ Other (index 1)
+  await wait();
+  stdin.write(ENTER); // into the text field
+  await wait();
+  stdin.write("/Users/me/My\\ Shot.png"); // dropped path
+  await wait();
+  stdin.write(ENTER); // submit
+  await wait();
+  expect(captured).toEqual({ id: "qd", answers: [{ selected: [], custom: "/Users/me/My Shot.png" }] });
+});

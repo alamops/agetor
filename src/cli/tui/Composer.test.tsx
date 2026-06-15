@@ -62,3 +62,16 @@ test("Composer cancels on Esc", async () => {
   await wait();
   expect(cancelled).toBe(true);
 });
+
+test("a dragged path (one paste chunk) is sanitized before it lands in the message", async () => {
+  let submitted: string | null = null;
+  const { stdin } = render(
+    <Composer active label="→" onSubmit={(t) => { submitted = t; }} onCancel={() => {}} />,
+  );
+  await wait();
+  stdin.write("/Users/me/My\\ Shot.png"); // dropped path: escaped space, delivered as one chunk
+  await wait();
+  stdin.write(ENTER);
+  await wait();
+  expect(submitted as string | null).toBe("/Users/me/My Shot.png");
+});
