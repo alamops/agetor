@@ -3,6 +3,7 @@ import { Box, Text, useInput } from "ink";
 import type { AgetorClient } from "../api-client.ts";
 import type { AnyRequest } from "../../bun/interactions.ts";
 import { buildAskAnswer } from "../answer-logic.ts";
+import { sanitizeDrop } from "./paste.ts";
 
 const OTHER = "✎ Other — type a custom answer";
 
@@ -105,7 +106,10 @@ export function AnswerOverlay({
           return;
         }
         if (key.backspace || key.delete) return setCustom((s) => (s ?? "").slice(0, -1));
-        if (input && !key.ctrl && !key.meta) return setCustom((s) => (s ?? "") + input);
+        if (input && !key.ctrl && !key.meta) {
+          const chunk = input.length > 1 ? sanitizeDrop(input) : input;
+          return setCustom((s) => (s ?? "") + chunk);
+        }
         return;
       }
 
