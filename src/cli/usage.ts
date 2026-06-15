@@ -40,10 +40,12 @@ export const USAGE: Record<string, string> = {
   Run a not-yet-run task. A finished task continues via 'send'; a running one
   stops via 'cancel'.`,
 
-  send: `usage: agetor send <task-id> <message…>
+  send: `usage: agetor send <task-id> <message…> [--ref <path> …]
 
   Message a task. Resumes a finished task's session, or folds into the live turn
-  if one is running. Blocked while the task is waiting on an answer.`,
+  if one is running. Blocked while the task is waiting on an answer. --ref
+  attaches a file/folder (repeatable, made absolute); image refs are attached to
+  the turn. --ref with no message sends just the attachment(s).`,
 
   commit: `usage: agetor commit <task-id>
 

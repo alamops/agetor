@@ -146,7 +146,7 @@ agetor show <id>             # details, runs, pending interactions
 
 # run · converse
 agetor start <id>            # run a not-yet-run task
-agetor send <id> <msg…>      # message a running task (resumes a finished one)
+agetor send <id> <msg…>      # message a task (--ref <path> to attach a file/image; resumes a finished one)
 agetor commit <id>           # ask the agent to commit all changes & push the branch
 agetor answer <id>           # answer a task that needs input (interactive picker)
 agetor commands <id>         # list the agent's slash commands + extensions (composer autocomplete)

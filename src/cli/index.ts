@@ -35,7 +35,7 @@ Commands:
   edit <id> [flags]   change title/prompt/agent/workdir/model/mode/effort/type/column
   move <id> <column>  move a task between columns (mark done = move <id> done)
   start <id>          run a not-yet-run task
-  send <id> <msg…>    message a running task (resumes a finished one)
+  send <id> <msg…>    message a task (--ref <path> attaches files/images)
   commit <id>         ask the agent to commit all changes & push the branch
   answer <id>         answer a task that needs input (interactive)
   commands <id>       list the agent's slash commands + extensions for the workdir

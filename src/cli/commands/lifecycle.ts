@@ -3,6 +3,8 @@ import { usageError } from "../usage.ts";
 import { resolveTask } from "../resolve.ts";
 import { runControl, resumableRunId } from "../run-logic.ts";
 import { c, out, printJson } from "../output.ts";
+import { resolveRefs } from "../refs.ts";
+import { appendReferences } from "../../shared/refs.ts";
 
 export async function cmdStart(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -35,9 +37,21 @@ export async function cmdStart(args: string[], flags: Flags): Promise<void> {
 }
 
 export async function cmdSend(args: string[], flags: Flags): Promise<void> {
-  const ref = args[0];
-  const message = args.slice(1).join(" ").trim();
-  if (!ref || !message) throw usageError("send");
+  // Pull `--ref <path>` flags out; the remaining positionals are <id> <message…>.
+  const refPaths: string[] = [];
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--ref") {
+      const v = args[++i];
+      if (v) refPaths.push(v);
+    } else {
+      rest.push(args[i]!);
+    }
+  }
+  const ref = rest[0];
+  const message = rest.slice(1).join(" ").trim();
+  if (!ref || (!message && refPaths.length === 0)) throw usageError("send");
+
   const client = await getClient(flags);
   const task = await resolveTask(client, ref);
   const short = task.id.slice(0, 8);
@@ -56,10 +70,14 @@ export async function cmdSend(args: string[], flags: Flags): Promise<void> {
   if (!runId) {
     throw new Error(`task has no run yet — start it first: agetor start ${short}`);
   }
-  const res = await client.sendInput(runId, message);
+  // Inline any --ref paths into the message (absolute, so the agent finds them);
+  // claude attaches image paths. Same plumbing as the app's send box.
+  const body = refPaths.length ? appendReferences(message, resolveRefs(refPaths)) : message;
+  const res = await client.sendInput(runId, body);
   if (!res.delivered) throw new Error(res.reason ?? "message was not delivered");
   if (flags.json) return printJson(res);
-  out(`${c.green("→")} sent to ${c.dim(short)}`);
+  const refNote = refPaths.length ? c.dim(` (+${refPaths.length} ref${refPaths.length > 1 ? "s" : ""})`) : "";
+  out(`${c.green("→")} sent to ${c.dim(short)}${refNote}`);
 }
 
 export async function cmdCancel(args: string[], flags: Flags): Promise<void> {

@@ -1,9 +1,10 @@
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import * as p from "@clack/prompts";
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, isTTY } from "../output.ts";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import { flagValue } from "../args.ts";
+import { resolveRefs } from "../refs.ts";
 import {
   AGENT_OPTIONS,
   DEFAULT_MODEL,
@@ -112,15 +113,7 @@ function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
     isolation: o.isolation,
     baseRef: o.baseRef,
     taskType: o.type,
-    references: o.refs.map((path) => {
-      // Stat so directory refs are typed correctly — the server trusts the
-      // client's isDirectory (it doesn't re-stat in POST /tasks).
-      try {
-        return { path, isDirectory: statSync(path).isDirectory() };
-      } catch {
-        return { path, isDirectory: false };
-      }
-    }),
+    references: resolveRefs(o.refs),
   };
 }
 
