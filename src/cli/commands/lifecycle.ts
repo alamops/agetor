@@ -3,7 +3,7 @@ import { usageError } from "../usage.ts";
 import { resolveTask } from "../resolve.ts";
 import { runControl, resumableRunId } from "../run-logic.ts";
 import { c, out, printJson } from "../output.ts";
-import { resolveRefs } from "../refs.ts";
+import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import { appendReferences } from "../../shared/refs.ts";
 
 export async function cmdStart(args: string[], flags: Flags): Promise<void> {
@@ -72,7 +72,9 @@ export async function cmdSend(args: string[], flags: Flags): Promise<void> {
   }
   // Inline any --ref paths into the message (absolute, so the agent finds them);
   // claude attaches image paths. Same plumbing as the app's send box.
-  const body = refPaths.length ? appendReferences(message, resolveRefs(refPaths)) : message;
+  const refs = resolveRefs(refPaths);
+  warnMissingRefs(refs);
+  const body = refs.length ? appendReferences(message, refs) : message;
   const res = await client.sendInput(runId, body);
   if (!res.delivered) throw new Error(res.reason ?? "message was not delivered");
   if (flags.json) return printJson(res);

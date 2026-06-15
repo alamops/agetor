@@ -4,7 +4,7 @@ import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, isTTY } from "../output.ts";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import { flagValue } from "../args.ts";
-import { resolveRefs } from "../refs.ts";
+import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import {
   AGENT_OPTIONS,
   DEFAULT_MODEL,
@@ -78,6 +78,7 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     out("cancelled");
     return;
   }
+  if (input.references?.length) warnMissingRefs(input.references);
 
   // Match the app's "Run task": create in "ready" when starting immediately.
   if (o.start) input.column = "ready";
