@@ -543,13 +543,13 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Most capable; recommended default." },
-      { id: "gpt-5-codex", label: "GPT-5 Codex" },
-      { id: "gpt-5", label: "GPT-5" },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Recommended default — works on ChatGPT plans." },
+      { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
+      { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
     modes: [
-      { id: "auto", label: "Auto (--full-auto)", hint: "Run without approval prompts." },
-      { id: "ask", label: "Ask before changes", hint: "Codex's default — prompts before each action." },
+      { id: "auto", label: "Auto (workspace-write)", hint: "Edit files without approval prompts." },
+      { id: "ask", label: "Read-only", hint: "Inspect only — codex can't modify files (read-only sandbox)." },
     ],
     efforts: EFFORT_OPTIONS,
   },
@@ -573,9 +573,11 @@ export interface Run {
   endedAt: number | null;
   exitCode: number | null;
   /**
-   * Name of the tmux session that hosted this run's claude-code REPL. Same
-   * value across every run for a given task under the one-session-per-task
-   * model. NULL for codex runs and pre-migration legacy rows.
+   * Name of the tmux session that hosted this run's REPL (claude-code) or
+   * one-shot `codex exec` turn (codex). For claude it's the same value across
+   * every run for a task (one persistent session); for codex each turn spawns
+   * a fresh session that shares the per-task name. NULL for pre-migration
+   * legacy rows.
    */
   tmuxSession: string | null;
   /**
@@ -586,6 +588,14 @@ export interface Run {
    * been torn down. NULL for codex and legacy rows.
    */
   claudeSessionId: string | null;
+  /**
+   * Codex's own conversation/thread id (the `thread_id` from its `--json`
+   * stream's `thread.started` event). Captured when the codex tmux driver
+   * tails the run's JSONL log. Drives `codex exec resume <thread_id>` for
+   * follow-up turns and is the reattach key for a mid-turn codex run. NULL
+   * for claude-code and legacy rows.
+   */
+  codexSessionId: string | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */

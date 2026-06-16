@@ -286,25 +286,32 @@ test("claude-code throws when effort is missing for a model that supports it", (
   ).toThrow(/effort is required/);
 });
 
-test("codex with defaults emits --model gpt-5-codex + reasoning effort + --full-auto", () => {
+// The prompt is delivered on stdin (trailing `-`), not as an argv element, so
+// the driver can pipe it in and a `-`-leading prompt can't be misparsed.
+// `--json --color never --skip-git-repo-check` are the structured-streaming +
+// clean-capture + run-anywhere flags the tmux driver depends on.
+test("codex with defaults emits --model + reasoning effort + structured-stream flags + --sandbox workspace-write, prompt via stdin", () => {
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults });
   expect(cmd).toEqual([
     "codex", "exec",
     "--model", "gpt-5-codex",
     "-c", "model_reasoning_effort=high",
-    "--full-auto",
-    "--", "hi",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
   ]);
 });
 
-test("codex 'ask' mode drops --full-auto so codex prompts as usual", () => {
+test("codex 'ask' mode uses --sandbox read-only so codex can't change anything", () => {
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, mode: "ask" });
-  expect(cmd).not.toContain("--full-auto");
+  expect(cmd).not.toContain("workspace-write");
   expect(cmd).toEqual([
     "codex", "exec",
     "--model", "gpt-5-codex",
     "-c", "model_reasoning_effort=high",
-    "--", "hi",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "read-only",
+    "-",
   ]);
 });
 
@@ -314,20 +321,29 @@ test("codex model 'gpt-5.5' passes through verbatim as --model", () => {
     "codex", "exec",
     "--model", "gpt-5.5",
     "-c", "model_reasoning_effort=high",
-    "--full-auto",
-    "--", "hi",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
   ]);
 });
 
-test("codex model 'gpt-5' adds --model gpt-5 before the prompt", () => {
+test("codex model 'gpt-5' adds --model gpt-5", () => {
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5", mode: "auto" });
   expect(cmd).toEqual([
     "codex", "exec",
     "--model", "gpt-5",
     "-c", "model_reasoning_effort=high",
-    "--full-auto",
-    "--", "hi",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
   ]);
+});
+
+test("codex resume injects the `resume <thread_id>` subcommand before the stdin sentinel", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, resumeSessionId: "thread-abc" });
+  // Parent flags must precede `resume`; the stdin `-` is last.
+  expect(cmd.slice(-3)).toEqual(["resume", "thread-abc", "-"]);
+  expect(cmd.indexOf("--json")).toBeLessThan(cmd.indexOf("resume"));
 });
 
 test("codex effort 'high' adds -c model_reasoning_effort=high", () => {
@@ -374,10 +390,10 @@ test("AGETOR_CLAUDE_ARGS extra args land before the prompt (and before the `--` 
   expect(cmd.slice(-4)).toEqual(["--verbose", "--foo", "--", "p"]);
 });
 
-test("AGETOR_CODEX_ARGS extra args still land before the prompt (and before the `--` terminator)", () => {
+test("AGETOR_CODEX_ARGS extra args land before the stdin sentinel", () => {
   process.env.AGETOR_CODEX_ARGS = "--verbose --foo";
   const { cmd } = buildCommand(builtin("codex"), "p", { ...codexDefaults });
-  expect(cmd.slice(-4)).toEqual(["--verbose", "--foo", "--", "p"]);
+  expect(cmd.slice(-3)).toEqual(["--verbose", "--foo", "-"]);
 });
 
 // Invariant test for AGENT_OPTIONS — guards against re-introducing the
