@@ -475,6 +475,7 @@ type RunRow = {
   started_at: number; ended_at: number | null; exit_code: number | null;
   tmux_session: string | null;
   claude_session_id: string | null;
+  codex_session_id: string | null;
 };
 
 const toRun = (r: RunRow): Run => ({
@@ -487,6 +488,7 @@ const toRun = (r: RunRow): Run => ({
   exitCode: r.exit_code,
   tmuxSession: r.tmux_session,
   claudeSessionId: r.claude_session_id,
+  codexSessionId: r.codex_session_id,
 });
 
 export const runs = {
@@ -501,9 +503,9 @@ export const runs = {
   },
   insert(r: Run): Run {
     db.run(
-      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId],
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId],
     );
     return r;
   },
@@ -513,8 +515,8 @@ export const runs = {
     const current = toRun(row);
     const next: Run = { ...current, ...patch, id };
     db.run(
-      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=? WHERE id=?`,
-      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, id],
+      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=? WHERE id=?`,
+      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, id],
     );
     return next;
   },

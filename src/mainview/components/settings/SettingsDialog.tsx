@@ -530,9 +530,14 @@ function ListView({
                         built-in
                       </span>
                     )}
-                    {!h.enabled && h.kind !== "codex" && (
+                    {!h.enabled && (
                       <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
                         disabled
+                      </span>
+                    )}
+                    {h.kind === "codex" && (
+                      <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
+                        experimental
                       </span>
                     )}
                     <span
@@ -549,26 +554,11 @@ function ListView({
                     {status?.version && <> · {status.version}</>}
                   </div>
                 </div>
-                {h.kind === "codex" ? (
-                  <>
-                    <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
-                      Coming soon
-                    </span>
-                    <Switch
-                      checked={false}
-                      onCheckedChange={() => {}}
-                      disabled
-                      aria-label={`${h.label} is coming soon`}
-                      title="Codex support is coming soon"
-                    />
-                  </>
-                ) : (
-                  <Switch
-                    checked={pendingToggle[h.id] ?? h.enabled}
-                    onCheckedChange={() => onToggleEnabled(h)}
-                    aria-label={h.enabled ? `Disable ${h.label}` : `Enable ${h.label}`}
-                  />
-                )}
+                <Switch
+                  checked={pendingToggle[h.id] ?? h.enabled}
+                  onCheckedChange={() => onToggleEnabled(h)}
+                  aria-label={h.enabled ? `Disable ${h.label}` : `Enable ${h.label}`}
+                />
                 <Button
                   size="icon"
                   variant="ghost"
@@ -610,25 +600,20 @@ function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
       </p>
       <div className="space-y-1.5">
         {HARNESS_TEMPLATES.map((t) => {
-          const comingSoon = t.kind === "codex";
+          const experimental = t.kind === "codex";
           return (
             <button
               key={t.id}
               type="button"
-              onClick={() => { if (!comingSoon) onPick(t); }}
-              disabled={comingSoon}
-              aria-disabled={comingSoon}
-              title={comingSoon ? "Codex support is coming soon" : undefined}
+              onClick={() => onPick(t)}
               className={cn(
                 "flex w-full items-start gap-3 rounded-md border border-border/60 px-3 py-2 text-left",
-                comingSoon
-                  ? "cursor-not-allowed opacity-60"
-                  : "hover:border-primary/60 hover:bg-accent/50",
+                "hover:border-primary/60 hover:bg-accent/50",
               )}
             >
-              {comingSoon && (
+              {experimental && (
                 <span className="mt-0.5 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
-                  Coming soon
+                  Experimental
                 </span>
               )}
               <AgentIcon kind={t.kind} className="mt-0.5 size-4 shrink-0" />
@@ -701,10 +686,6 @@ function Editor({
 
   const submit = () => {
     setLocalError(null);
-    if (!isEdit && kind === "codex") {
-      setLocalError("Codex support is coming soon — new codex harnesses can't be created right now.");
-      return;
-    }
     const trimmedId = id.trim();
     if (!/^[a-z0-9][a-z0-9_-]*$/.test(trimmedId)) {
       setLocalError("id must be a slug — lowercase letters, digits, `_` or `-`, starting with a letter or digit");
@@ -764,25 +745,21 @@ function Editor({
         <label className="text-xs text-muted-foreground">Harness type</label>
         <div className="grid grid-cols-2 gap-1">
           {(["claude-code", "codex"] as AgentKind[]).map((k) => {
-            // Codex is paused — the server rejects new codex harnesses, so
-            // disabling the kind button keeps the UI honest. Lock it in
-            // create mode too, not just edit mode.
-            const lockedComingSoon = k === "codex";
+            const experimental = k === "codex";
             return (
               <Button
                 key={k}
                 size="sm"
                 variant={kind === k ? "default" : "outline"}
                 onClick={() => setKind(k)}
-                disabled={isEdit || lockedComingSoon}
-                title={lockedComingSoon ? "Codex support is coming soon" : undefined}
+                disabled={isEdit}
                 className="justify-start"
               >
                 <AgentIcon kind={k} className="mr-1.5 size-3.5" />
                 {k}
-                {lockedComingSoon && (
+                {experimental && (
                   <span className="ml-1.5 rounded bg-amber-500/15 px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-500">
-                    Soon
+                    Exp
                   </span>
                 )}
               </Button>

@@ -263,11 +263,10 @@ test("PATCH /tasks/:id rejects an unknown harness id with 400", async () => {
   expect(after.agent).toBe("codex");
 });
 
-// Codex is paused — the server matches the UI's "Coming soon" lock so a
-// stale client (or a curl) can't sneak past it. Both branches (create with
-// kind=codex, re-enable an existing codex row) return 400.
+// Codex is now an opt-in harness: creating a codex alias and re-enabling the
+// built-in codex row both succeed (the old "coming soon" lock is gone).
 
-test("POST /harnesses with kind=codex is rejected (coming soon)", async () => {
+test("POST /harnesses with kind=codex is accepted", async () => {
   const res = await fetch(url("/harnesses"), {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -277,26 +276,28 @@ test("POST /harnesses with kind=codex is rejected (coming soon)", async () => {
       label: "Codex (new)",
     }),
   });
-  expect(res.status).toBe(400);
+  expect(res.status).toBe(200);
   const body = await res.json();
-  expect(body.error.toLowerCase()).toContain("coming soon");
+  expect(body.kind).toBe("codex");
+  expect(body.id).toBe("codex-new");
 });
 
-test("PATCH /harnesses/codex enabled=true is rejected (coming soon)", async () => {
-  const res = await fetch(url("/harnesses/codex"), {
+test("PATCH /harnesses/codex enabled toggles both directions", async () => {
+  // Re-enabling the built-in codex row now succeeds (it ships disabled via
+  // migration 016, so the user opts in here).
+  const on = await fetch(url("/harnesses/codex"), {
     method: "PATCH",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ enabled: true }),
   });
-  expect(res.status).toBe(400);
-  const body = await res.json();
-  expect(body.error.toLowerCase()).toContain("coming soon");
+  expect(on.status).toBe(200);
+  expect((await on.json()).enabled).toBe(true);
 
-  // Disabling is still allowed — the lock is one-directional.
   const off = await fetch(url("/harnesses/codex"), {
     method: "PATCH",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ enabled: false }),
   });
   expect(off.status).toBe(200);
+  expect((await off.json()).enabled).toBe(false);
 });
