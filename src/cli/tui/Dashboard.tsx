@@ -10,7 +10,7 @@ import { useGlobalEvents, type Toast } from "./useGlobalEvents.ts";
 import { Composer } from "./Composer.tsx";
 import { AnswerOverlay } from "./AnswerOverlay.tsx";
 import { runControl, resumableRunId } from "../run-logic.ts";
-import { Logo, LOGO_WIDTH } from "./logo.tsx";
+import { Logo } from "./logo.tsx";
 
 type Mode = "nav" | "compose" | "answer";
 
@@ -178,15 +178,13 @@ export function Dashboard({
         >
           {selected ? (
             <Detail task={selected} events={visible} />
-          ) : detailWidth >= LOGO_WIDTH ? (
+          ) : (
             <Box flexDirection="column">
-              <Logo />
+              <Logo maxWidth={detailWidth} />
               <Box marginTop={1}>
                 <Text dimColor>select a task to watch its conversation</Text>
               </Box>
             </Box>
-          ) : (
-            <Text dimColor>select a task to watch its conversation</Text>
           )}
         </Box>
       </Box>
