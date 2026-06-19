@@ -7,6 +7,7 @@ import {
   type ChunkHandler,
   type SpawnedAgent,
 } from "./claude-tmux.ts";
+import { spawnCodexViaTmux } from "./codex-tmux.ts";
 
 export type { SpawnedAgent };
 
@@ -23,10 +24,11 @@ export interface AgentRunOptions {
   /** Friendly reasoning-effort id (codex: minimal|low|medium|high). */
   effort?: string | null;
   /**
-   * For claude-code: existing JSONL session uuid to resume via
-   * `claude --resume <id>`. Lets a follow-up message attach to the prior
-   * conversation (full tool history) instead of starting from scratch.
-   * Ignored by codex.
+   * Existing session id to resume a prior conversation on a follow-up turn.
+   * For claude-code: the JSONL session uuid, resumed via `claude --resume
+   * <id>`. For codex: the `thread_id`, resumed via `codex exec resume <id>`.
+   * Either way the new prompt attaches to the full prior conversation instead
+   * of starting fresh.
    */
   resumeSessionId?: string | null;
   /**
@@ -324,7 +326,9 @@ export function buildCommand(
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
 
-  // codex
+  // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
+  // element: it's delivered on stdin (the trailing `-`), so the driver can
+  // pipe a prompt file in and no user text touches the shell wrapper.
   const extra = (process.env.AGETOR_CODEX_ARGS ?? "").split(/\s+/).filter(Boolean);
 
   const args: string[] = [bin, "exec"];
@@ -340,14 +344,32 @@ export function buildCommand(
     throw new Error(`effort is required for codex model ${opts.model}`);
   }
 
-  const mode = opts.mode ?? "auto";
-  if (mode === "auto") args.push("--full-auto");
+  // Structured streaming + deterministic capture: `--json` emits NDJSON events
+  // on stdout (tailed by the driver); `--color never` guarantees clean JSON
+  // even though codex runs under a tmux pty; `--skip-git-repo-check` lets a
+  // task run in a non-git workdir (agetor has no sandbox philosophy).
+  args.push("--json", "--color", "never", "--skip-git-repo-check");
 
-  // `--` terminates option parsing so a prompt starting with `-` (markdown
-  // checklist, "--flag-like" text) is taken as the positional prompt rather
-  // than misparsed as an option — same failure class as the claude path
-  // above. Standard in clap-based CLIs like codex.
-  args.push(...extra, "--", prompt);
+  // Sandbox policy from the agetor mode. `auto` (hands-off) →
+  // `workspace-write` so codex can edit files in the working dir without
+  // approval prompts (codex exec is non-interactive — it can't prompt anyway).
+  // `ask` → `read-only` (the most it can do without changing anything). We use
+  // `--sandbox` rather than the deprecated `--full-auto`, which prints a
+  // warning to stderr on every turn in codex 0.140+.
+  const mode = opts.mode ?? "auto";
+  args.push("--sandbox", mode === "auto" ? "workspace-write" : "read-only");
+
+  args.push(...extra);
+
+  // Multi-turn: parent flags MUST precede the `resume` subcommand (codex
+  // rejects `--json`/`--color` placed after it). codex loads the prior
+  // conversation from its own rollout via `thread_id`, so the new prompt is
+  // just the user's next line.
+  if (opts.resumeSessionId) {
+    args.push("resume", opts.resumeSessionId);
+  }
+  // Read the prompt from stdin — `-` is codex's stdin sentinel.
+  args.push("-");
   return { cmd: args, env: Object.keys(env).length ? env : undefined };
 }
 
@@ -404,6 +426,10 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
 
 export interface SpawnAgentArgs {
   taskId: string;
+  /** The run row this spawn belongs to. Used by the codex driver to key its
+   *  per-run log/prompt files (so each turn — and its reattach — is isolated).
+   *  Ignored by claude-code. */
+  runId: string;
   harness: Harness;
   prompt: string;
   cwd: string;
@@ -428,7 +454,7 @@ export interface SpawnAgentArgs {
  * same for both agents.
  */
 export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
-  const { taskId, harness, prompt, cwd, onChunk, onSessionId, opts = {} } = args;
+  const { taskId, runId, harness, prompt, cwd, onChunk, onSessionId, opts = {} } = args;
 
   if (harness.kind === "claude-code") {
     if (process.env.AGETOR_CLAUDE_DRIVER === "fake") {
@@ -458,41 +484,27 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
     });
   }
 
+  // codex — hosted in a per-task tmux session via codex-tmux.ts (so a mid-turn
+  // run survives an agetor restart and is reattachable), streaming structured
+  // events by tailing codex's `--json` log.
+  if (process.env.AGETOR_CODEX_DRIVER === "fake") {
+    buildCommand(harness, prompt, opts);
+    // Hand the orchestrator a thread id so it persists `codex_session_id` and
+    // can route follow-ups through `codex exec resume` — mirrors what a real
+    // `thread.started` event would deliver.
+    onSessionId?.(`fake-codex-thread-${taskId}`);
+    return makeFakeAgent(taskId, prompt, onChunk);
+  }
   const built = buildCommand(harness, prompt, opts);
-
-  // codex: classic one-shot Bun.spawn. stdin still piped so sendInput can
-  // forward user-typed lines (some codex modes accept follow-up).
-  const proc = Bun.spawn(built.cmd, {
+  return spawnCodexViaTmux({
+    taskId,
+    runId,
+    argv: built.cmd,
+    env: built.env ?? {},
     cwd,
-    env: { ...process.env, ...(built.env ?? {}) },
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
+    promptText: prompt,
+    onChunk,
+    onSessionId,
   });
-  const pump = async (
-    stream: ReadableStream<Uint8Array> | null,
-    label: "stdout" | "stderr",
-  ) => {
-    if (!stream) return;
-    const reader = stream.getReader();
-    const decoder = new TextDecoder();
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      onChunk(label, decoder.decode(value, { stream: true }));
-    }
-  };
-  void pump(proc.stdout, "stdout");
-  void pump(proc.stderr, "stderr");
-  return {
-    kill: () => proc.kill(),
-    writeInput: (line) => {
-      try {
-        proc.stdin.write(line.endsWith("\n") ? line : line + "\n");
-        return true;
-      } catch { return false; }
-    },
-    done: proc.exited,
-  };
 }
 
