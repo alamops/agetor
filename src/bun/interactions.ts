@@ -34,8 +34,10 @@ export interface AskQuestion {
   header?: string;
   multiSelect?: boolean;
   /** `preview` is the multi-line code/text block claude attaches to an option
-   *  (rendered as a side box in the TUI; only available when the card is sourced
-   *  from the JSONL tool_use, since the pane collapses long ones). */
+   *  (rendered as a side box in the TUI). Two sources populate it: the JSONL
+   *  tool_use (available only after the modal is answered), and the live pane
+   *  scrape, which grows the pane and walks each option to read its panel
+   *  (see `collectAskQuestionsFromPane`). */
   options: Array<{ label: string; description?: string; preview?: string }>;
 }
 

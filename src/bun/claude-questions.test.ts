@@ -3,11 +3,13 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
   detectAskModal,
+  extractFocusedPreview,
   formatAnswersMessage,
   isTabbedAskModal,
   parseAskModal,
   parseModalPane,
   planAskAnswers,
+  stripPreviewColumn,
   type AskAnswer,
   type AskQuestionSpec,
 } from "./claude-questions.ts";
@@ -169,6 +171,81 @@ describe("parseModalPane — reads the visible question off the pane", () => {
   test("returns null on the review screen and on ordinary output", () => {
     expect(parseModalPane(fx("review_submit"))).toBeNull();
     expect(parseModalPane("just some text\n1. not a real modal\n")).toBeNull();
+  });
+
+  test("side-by-side preview panel: clean labels (no bleed) + focused option's full preview", () => {
+    // Real 2.1.170 capture, pane grown so the 12-line preview is not collapsed.
+    const p = parseModalPane(fx("single_preview_full"))!;
+    expect(p.options.map((o) => o.label)).toEqual(["Single-select only (v1)", "Both layouts"]);
+    expect(p.cursorIndex).toBe(0);
+    // The box never bled into the label.
+    expect(p.options[0]!.label).not.toContain("│");
+    expect(p.options[0]!.label).not.toContain("┌");
+    // Focused (cursor) option carries its full preview; the other does not (its
+    // panel isn't on this frame — the caller navigates to capture it).
+    expect(p.options[0]!.preview).toBe(
+      Array.from({ length: 12 }, (_, i) => `preview probe line ${String(i + 1).padStart(2, "0")}`).join("\n"),
+    );
+    expect(p.options[0]!.previewTruncated).toBe(false);
+    expect(p.options[1]!.preview).toBeUndefined();
+  });
+
+  test("collapsed preview panel: marker flips previewTruncated, partial text kept, labels clean", () => {
+    const p = parseModalPane(fx("single_preview_truncated"))!;
+    expect(p.options.map((o) => o.label)).toEqual(["Cap ~40 rows", "Cap ~80 rows", "Fit to tallest preview"]);
+    expect(p.options[0]!.preview).toBe("line 1 of 3");
+    expect(p.options[0]!.previewTruncated).toBe(true);
+    // The "├── ✂ N lines hidden ──┤" divider never leaked into a label.
+    expect(p.options.every((o) => !o.label.includes("✂"))).toBe(true);
+  });
+});
+
+describe("stripPreviewColumn", () => {
+  test("cuts the box off an option row, keeping the label", () => {
+    expect(stripPreviewColumn("❯ 1. Bold 5-row (cand. 3)      ┌──────────────┐"))
+      .toBe("❯ 1. Bold 5-row (cand. 3)");
+  });
+  test("blanks a continuation row that is entirely panel", () => {
+    expect(stripPreviewColumn("                              │ ▄▀█ █▀▀ █▀▀ │")).toBe("");
+  });
+  test("preserves a full-width separator row (bare ─, no corner/vertical anchor)", () => {
+    const sep = "─".repeat(60);
+    expect(stripPreviewColumn(sep)).toBe(sep);
+  });
+  test("leaves a real label with a single stray │ intact (needs ≥2 box chars)", () => {
+    expect(stripPreviewColumn("Use a | pipe in the label")).toBe("Use a | pipe in the label");
+    expect(stripPreviewColumn("Some label with a trailing  │")).toBe("Some label with a trailing  │");
+  });
+  test("no-op when there is no panel", () => {
+    expect(stripPreviewColumn("❯ 1. Just a plain option")).toBe("❯ 1. Just a plain option");
+  });
+});
+
+describe("extractFocusedPreview", () => {
+  test("pulls the full preview from the side panel of a grown capture", () => {
+    const got = extractFocusedPreview(fx("single_preview_full").split("\n"));
+    expect(got?.truncated).toBe(false);
+    expect(got?.text.split("\n").length).toBe(12);
+    expect(got?.text.startsWith("preview probe line 01")).toBe(true);
+  });
+  test("flags truncation when the TUI collapsed the panel", () => {
+    const got = extractFocusedPreview(fx("single_preview_truncated").split("\n"));
+    expect(got).toEqual({ text: "line 1 of 3", truncated: true });
+  });
+  test("preserves interior blank lines and ASCII-art leading indent", () => {
+    const pane = [
+      "❯ 1. Logo                ┌────────────────────┐",
+      "  2. Other               │  ███ wide          │",
+      "                         │                    │",
+      "                         │ narrow             │",
+      "                         └────────────────────┘",
+      "  3. Chat about this",
+      "Enter to select · Esc to cancel",
+    ];
+    expect(extractFocusedPreview(pane)).toEqual({ text: " ███ wide\n\nnarrow", truncated: false });
+  });
+  test("returns null when no panel is present", () => {
+    expect(extractFocusedPreview(["❯ 1. Red", "  2. Green", "Esc to cancel"])).toBeNull();
   });
 });
 
