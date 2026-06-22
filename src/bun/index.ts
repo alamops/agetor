@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import Electrobun, { ApplicationMenu, BrowserWindow, Updater } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN } from "./server.ts";
-import { db, harnesses, pidFilePath, tasks } from "./db.ts";
+import { db, pidFilePath, tasks } from "./db.ts";
 import { reconcileOrphans } from "./orchestrator.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -111,24 +111,6 @@ rehydratePath();
 // Mark any runs that were "running" when we last shut down as orphaned, so the
 // kanban doesn't show stuck cards.
 reconcileOrphans();
-
-// Migration 016 pauses every codex row (built-in + user aliases). The Settings
-// dialog renders the "Coming soon" lock so the state is visible there, but a
-// user who built a codex alias before the pause deserves a breadcrumb in the
-// logs explaining why their alias is dark. Cheap to compute — built-ins are
-// expected, anything else is worth a one-line notice.
-{
-  const paused = harnesses
-    .list()
-    .filter((h) => h.kind === "codex" && !h.isBuiltin && !h.enabled);
-  if (paused.length > 0) {
-    console.log(
-      `[agetor] codex is paused (coming soon) — ${paused.length} user alias${
-        paused.length === 1 ? "" : "es"
-      } disabled: ${paused.map((h) => h.id).join(", ")}`,
-    );
-  }
-}
 
 installNativeMenu();
 

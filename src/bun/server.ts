@@ -443,12 +443,6 @@ export function startApiServer() {
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          if (body.kind === "codex") {
-            return json(
-              { error: "Codex support is coming soon — new codex harnesses can't be created right now." },
-              { status: 400, headers: corsHeaders(req) },
-            );
-          }
           if (typeof body.label !== "string" || !body.label.trim()) {
             return json({ error: "label required" }, { status: 400, headers: corsHeaders(req) });
           }
@@ -535,12 +529,6 @@ export function startApiServer() {
             );
           }
           if (typeof body.enabled === "boolean") {
-            if (body.enabled && current.kind === "codex") {
-              return json(
-                { error: "Codex support is coming soon — it can't be enabled right now." },
-                { status: 400, headers: corsHeaders(req) },
-              );
-            }
             harnesses.setEnabled(req.params.id, body.enabled);
           }
           if (!hasConfigPatch) {

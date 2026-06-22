@@ -263,11 +263,12 @@ test("PATCH /tasks/:id rejects an unknown harness id with 400", async () => {
   expect(after.agent).toBe("codex");
 });
 
-// Codex is paused — the server matches the UI's "Coming soon" lock so a
-// stale client (or a curl) can't sneak past it. Both branches (create with
-// kind=codex, re-enable an existing codex row) return 400.
+// Codex is re-enabled as opt-in: it ships disabled (migration 016) but the
+// server no longer blocks creating a codex alias or toggling the built-in row
+// on. Both branches (create with kind=codex, enable an existing codex row)
+// now succeed.
 
-test("POST /harnesses with kind=codex is rejected (coming soon)", async () => {
+test("POST /harnesses with kind=codex is accepted (opt-in)", async () => {
   const res = await fetch(url("/harnesses"), {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -277,22 +278,23 @@ test("POST /harnesses with kind=codex is rejected (coming soon)", async () => {
       label: "Codex (new)",
     }),
   });
-  expect(res.status).toBe(400);
+  expect(res.status).toBe(200);
   const body = await res.json();
-  expect(body.error.toLowerCase()).toContain("coming soon");
+  expect(body.kind).toBe("codex");
 });
 
-test("PATCH /harnesses/codex enabled=true is rejected (coming soon)", async () => {
+test("PATCH /harnesses/codex enabled=true is accepted (opt-in)", async () => {
   const res = await fetch(url("/harnesses/codex"), {
     method: "PATCH",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ enabled: true }),
   });
-  expect(res.status).toBe(400);
-  const body = await res.json();
-  expect(body.error.toLowerCase()).toContain("coming soon");
+  expect(res.status).toBe(200);
+  // The bug was that the toggle never stuck — assert it actually persisted.
+  const enabled = await res.json();
+  expect(enabled.enabled).toBe(true);
 
-  // Disabling is still allowed — the lock is one-directional.
+  // Disabling still works too.
   const off = await fetch(url("/harnesses/codex"), {
     method: "PATCH",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
