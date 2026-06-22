@@ -530,17 +530,14 @@ function ListView({
                         built-in
                       </span>
                     )}
-                    {h.kind === "codex" && (
-                      <span
-                        className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500"
-                        title="Codex runs as a one-shot — no multi-turn or reattach yet"
-                      >
-                        experimental
-                      </span>
-                    )}
                     {!h.enabled && (
                       <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
                         disabled
+                      </span>
+                    )}
+                    {h.kind === "codex" && (
+                      <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
+                        experimental
                       </span>
                     )}
                     <span
@@ -602,23 +599,31 @@ function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
         Pick a starting point. You can edit every field before saving.
       </p>
       <div className="space-y-1.5">
-        {HARNESS_TEMPLATES.map((t) => (
-          <button
-            key={t.id}
-            type="button"
-            onClick={() => onPick(t)}
-            className={cn(
-              "flex w-full items-start gap-3 rounded-md border border-border/60 px-3 py-2 text-left",
-              "hover:border-primary/60 hover:bg-accent/50",
-            )}
-          >
-            <AgentIcon kind={t.kind} className="mt-0.5 size-4 shrink-0" />
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium">{t.label}</div>
-              <div className="text-[11px] text-muted-foreground">{t.description}</div>
-            </div>
-          </button>
-        ))}
+        {HARNESS_TEMPLATES.map((t) => {
+          const experimental = t.kind === "codex";
+          return (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => onPick(t)}
+              className={cn(
+                "flex w-full items-start gap-3 rounded-md border border-border/60 px-3 py-2 text-left",
+                "hover:border-primary/60 hover:bg-accent/50",
+              )}
+            >
+              {experimental && (
+                <span className="mt-0.5 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
+                  Experimental
+                </span>
+              )}
+              <AgentIcon kind={t.kind} className="mt-0.5 size-4 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium">{t.label}</div>
+                <div className="text-[11px] text-muted-foreground">{t.description}</div>
+              </div>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -740,6 +745,7 @@ function Editor({
         <label className="text-xs text-muted-foreground">Harness type</label>
         <div className="grid grid-cols-2 gap-1">
           {(["claude-code", "codex"] as AgentKind[]).map((k) => {
+            const experimental = k === "codex";
             return (
               <Button
                 key={k}
@@ -751,6 +757,11 @@ function Editor({
               >
                 <AgentIcon kind={k} className="mr-1.5 size-3.5" />
                 {k}
+                {experimental && (
+                  <span className="ml-1.5 rounded bg-amber-500/15 px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-500">
+                    Exp
+                  </span>
+                )}
               </Button>
             );
           })}

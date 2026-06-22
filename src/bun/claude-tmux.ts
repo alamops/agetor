@@ -927,17 +927,6 @@ interface SessionState {
    */
   permissionMode: string | null;
   /**
-   * One-shot listener fired by `dispatchLine` immediately after it updates
-   * `permissionMode` from a JSONL `system` / `permission-mode` event.
-   * Installed by `cycleToMode` so it can verify whether a Shift+Tab press
-   * actually landed on the requested mode (claude's cycle is opaque — the
-   * account may not have `auto` access, the press may have hit a one-time
-   * opt-in modal, etc.). Cleared before invocation so a retry inside the
-   * callback can install a fresh listener for the next press without
-   * racing this fire.
-   */
-  onPermissionMode: ((mode: string) => void) | null;
-  /**
    * Whether `bypassPermissions` is in this session's Shift+Tab cycle. True
    * iff the session was launched with `--dangerously-skip-permissions` (the
    * agetor `bypass` mode emits exactly that). Reattached sessions default
@@ -1106,7 +1095,6 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     // Defaults shared by every site — timers, scrape state, staging buffers.
     watcher: null,
     pollTimer: null,
-    onPermissionMode: null,
     scrapeTimer: null,
     scrapeLastFingerprint: null,
     lastJsonlAppendAt: 0,
@@ -1506,11 +1494,6 @@ function dispatchLine(state: SessionState, line: string): void {
   if ((evt.type === "system" || evt.type === "permission-mode")
     && typeof evt.permissionMode === "string") {
     state.permissionMode = evt.permissionMode;
-    if (state.onPermissionMode) {
-      const cb = state.onPermissionMode;
-      state.onPermissionMode = null;
-      cb(evt.permissionMode);
-    }
   }
 
   // Staging step: the new line either confirms or cancels the pending end_turn.
@@ -2576,40 +2559,131 @@ export type CycleResult =
   | { ok: false; reason: CycleFailureReason; target?: string; attempts?: number; lastObserved?: string | null };
 
 /** How many times `cycleToMode` will resend Shift+Tab presses before giving
- *  up. Each press is verified against the next JSONL `permission-mode`
- *  event; a mismatch (account isn't auto-eligible, cycle width assumed
- *  wrong) triggers another attempt from the newly-observed mode. */
+ *  up. Each press is verified by scraping the tmux status bar; a mismatch
+ *  (account isn't auto-eligible, cycle width assumed wrong) triggers another
+ *  attempt from the newly-observed mode. */
 const MAX_VERIFY_ATTEMPTS = 3;
 
-/** How long to wait for a `permission-mode` JSONL event after sending the
- *  Shift+Tab presses before declaring the press "lost" (most likely
- *  swallowed by claude's one-time auto opt-in modal). 1.5s comfortably
- *  exceeds the ~100ms claude takes to emit the event in practice. */
+/** How long to wait for the tmux status bar to reflect the new permission
+ *  mode after sending the Shift+Tab presses before declaring the press
+ *  "lost" (most likely swallowed by claude's one-time auto opt-in modal,
+ *  which paints over the bar). The bar updates within ~100ms in practice. */
 let modeVerifyTimeoutMs = 1500;
+
+/** How often `cycleToMode` re-captures the tmux pane while waiting for the
+ *  status bar to settle on the new mode. */
+let modePollIntervalMs = 100;
+
+/**
+ * Test seam: how `cycleToMode` reads the live permission mode. Production
+ * captures the tmux pane; the unit suite swaps in a synthetic pane so it can
+ * drive the verifier without a real claude session (the `/bin/echo` tmux stub
+ * the tests use can't paint a status bar).
+ */
+let captureModePane: (state: SessionState) => string = captureTail;
+
+/**
+ * Parse claude's current permission mode out of the tmux status bar. The bar
+ * renders one of these near the bottom of the pane (empirically, claude
+ * v2.1.170):
+ *
+ *   ⏸ plan mode on (shift+tab to cycle)
+ *   ⏵⏵ accept edits on (shift+tab to cycle)
+ *   ⏵⏵ auto mode on (shift+tab to cycle)
+ *   ⏵⏵ bypass permissions on (shift+tab to cycle)
+ *   ? for shortcuts                              ← default mode (no banner)
+ *
+ * Returns the canonical claude mode string, or null when the bar shows none
+ * of these (mid-render, or the auto opt-in / a permission modal is painted
+ * over it — the caller treats null as "couldn't confirm"). Unlike the JSONL
+ * `permission-mode` event, the bar reflects an *idle* Shift+Tab immediately;
+ * claude doesn't journal an idle mode switch until the next turn starts.
+ *
+ * We only read the *trailing* non-empty line of the captured tail and, for
+ * the four explicit modes, require the banner's `(shift+tab to cycle)` hint.
+ * `captureModePane` returns the whole visible-pane tail, so a bare phrase like
+ * "auto mode on" sitting in assistant/user output above the bar would
+ * otherwise be mis-read as the live mode.
+ */
+function readPaneMode(state: SessionState): string | null {
+  const lines = captureModePane(state).split("\n");
+  let bar = "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i]!.trim() !== "") { bar = lines[i]!; break; }
+  }
+  if (/shift\+tab to cycle/i.test(bar)) {
+    if (/accept edits on/i.test(bar)) return CLAUDE_MODE_ACCEPT_EDITS;
+    if (/plan mode on/i.test(bar)) return CLAUDE_MODE_PLAN;
+    if (/auto mode on/i.test(bar)) return CLAUDE_MODE_AUTO;
+    if (/bypass permissions on/i.test(bar)) return CLAUDE_MODE_BYPASS;
+  }
+  // No mode banner. Default mode shows the "? for shortcuts" hint on the
+  // trailing line instead; require that positive marker rather than inferring
+  // default from mere absence, so a half-painted frame doesn't read as a
+  // spurious switch.
+  if (/\? for shortcuts/i.test(bar)) return CLAUDE_MODE_DEFAULT;
+  return null;
+}
+
+/**
+ * Poll the tmux status bar after a batch of Shift+Tab presses until it
+ * confirms where claude landed, starting from mode `from`.
+ *
+ *   - Returns `target` as soon as the bar shows it — the target is the *last*
+ *     mode in the forward press sweep, so once it appears the batch is done.
+ *   - Otherwise waits for the bar to settle on a *different* mode than `from`
+ *     (two consecutive equal reads), which it returns as the observed landing
+ *     so the caller can retry from there. The two-read settle guard keeps an
+ *     intermediate frame — claude repaints the bar through each mode as it
+ *     consumes the rapid key batch — from being mistaken for the final
+ *     landing.
+ *   - Returns null when nothing recognisable appears before
+ *     `modeVerifyTimeoutMs` (e.g. the auto opt-in modal is covering the bar).
+ */
+async function waitForPaneMode(state: SessionState, from: string, target: string): Promise<string | null> {
+  const deadline = Date.now() + modeVerifyTimeoutMs;
+  let prev: string | null = null;
+  for (;;) {
+    const mode = readPaneMode(state);
+    if (mode === target) return mode;
+    // Settled on a moved, non-target mode → that's the landing.
+    if (mode !== null && mode !== from && mode === prev) return mode;
+    prev = mode;
+    if (Date.now() >= deadline) {
+      // Out of time. Prefer a moved, recognised mode over `from`/null so a
+      // genuine (if unsettled) landing still drives a retry.
+      return mode !== null && mode !== from ? mode : null;
+    }
+    await new Promise((r) => setTimeout(r, modePollIntervalMs));
+  }
+}
 
 /**
  * Switch a live claude session's permission mode to `targetAgetorMode` by
- * sending the right number of `Shift+Tab` keystrokes (claude's only
- * mid-session mode-switch mechanism — there's no `/permission-mode` slash
+ * sending the right number of `Shift+Tab` (tmux `BTab`) keystrokes — claude's
+ * only mid-session mode-switch mechanism (there's no `/permission-mode` slash
  * command despite what the prior code assumed). For the `plan` target we
  * prefer the `/plan` slash command instead: it's deterministic, doesn't
  * depend on knowing the current mode, and works from anywhere.
  *
- * After each batch of presses we wait for the next JSONL `permission-mode`
- * event and compare it to the target. A mismatch — account isn't
+ * After each batch of presses we scrape the tmux status bar (see
+ * `readPaneMode`) and compare it to the target. A mismatch — account isn't
  * auto-eligible (cycle is 3-wide instead of 4), assumed press count was
  * off, etc. — triggers another attempt from the newly-observed mode, up
- * to `MAX_VERIFY_ATTEMPTS` times. If the event never arrives within
- * `modeVerifyTimeoutMs` (most likely cause: claude's one-time auto
- * opt-in modal swallowed the keystrokes), we bail with `verification
- * timed out` so the orchestrator can warn the user rather than report
- * a successful mode change that didn't happen.
+ * to `MAX_VERIFY_ATTEMPTS` times. We scrape the bar rather than wait for a
+ * JSONL `permission-mode` event because claude only journals that event at
+ * the *next turn start*; an idle Shift+Tab updates the bar immediately but
+ * writes nothing to the JSONL. If the bar never shows a recognised mode
+ * within `modeVerifyTimeoutMs` (most likely cause: claude's one-time auto
+ * opt-in modal is painted over it), we bail with `verification timed out` so
+ * the orchestrator can warn the user rather than report a successful mode
+ * change that didn't happen.
  *
  * Returns:
  *   - `{ ok: true, via: "noop" }` when the session is already at the target.
  *   - `{ ok: true, via: "slash-plan" }` when we sent `/plan`.
  *   - `{ ok: true, via: "shift-tab", presses: N }` when N tabs got claude
- *     to the target (verified by the JSONL event).
+ *     to the target (verified by scraping the status bar).
  *   - `{ ok: false, reason: "no live session" }` for an unknown task.
  *   - `{ ok: false, reason: "current mode unknown" }` before claude's first
  *     `system` event has arrived.
@@ -2617,11 +2691,11 @@ let modeVerifyTimeoutMs = 1500;
  *     isn't reachable (e.g. `bypassPermissions` without the launch flag —
  *     a respawn is required).
  *   - `{ ok: false, reason: "verification timed out", attempts, lastObserved }`
- *     when no `permission-mode` event followed our keystrokes.
+ *     when the status bar never confirmed the new mode after our keystrokes.
  *   - `{ ok: false, reason: "verification mismatch", attempts, lastObserved }`
  *     when every attempt landed somewhere other than the target.
  */
-export async function cycleToMode(taskId: string, targetAgetorMode: string): Promise<CycleResult> {
+async function cycleToModeInner(taskId: string, targetAgetorMode: string): Promise<CycleResult> {
   const state = sessions.get(taskId);
   if (!state) return { ok: false, reason: "no live session" };
   const target = toClaudeModeString(targetAgetorMode);
@@ -2673,33 +2747,23 @@ export async function cycleToMode(taskId: string, targetAgetorMode: string): Pro
     totalPresses += presses;
     attempts += 1;
 
-    // Install the listener BEFORE sending keys so a fast `permission-mode`
-    // event can't beat us. The Promise executor runs synchronously, so the
-    // assignment is in place before `tmux send-keys` returns.
+    // One tmux invocation with N keys — cleaner than N sync spawns, and
+    // tmux delivers them as a single stream so claude's TUI doesn't get a
+    // chance to debounce them apart on slow terminals.
     //
-    // Identity guard: hold our listener in a local and only clear the
-    // session slot when it still points at *this* call's listener. Without
-    // it, two overlapping `cycleToMode` calls (e.g. a user double-PATCH on
-    // the same task) would have the earlier call's setTimeout-driven
-    // cleanup null out the later call's listener, falsely reporting
-    // `verification timed out` for both.
-    const observed = await new Promise<string | null>((resolve) => {
-      let myListener: ((mode: string) => void) | null = null;
-      const timer = setTimeout(() => {
-        if (state.onPermissionMode === myListener) state.onPermissionMode = null;
-        resolve(null);
-      }, modeVerifyTimeoutMs);
-      myListener = (mode) => {
-        clearTimeout(timer);
-        resolve(mode);
-      };
-      state.onPermissionMode = myListener;
-      // One tmux invocation with N keys — cleaner than N sync spawns, and
-      // tmux delivers them as a single stream so claude's TUI doesn't get
-      // a chance to debounce them apart on slow terminals.
-      const keys = Array<string>(presses).fill("S-Tab");
-      tmux(["send-keys", "-t", state.sessionName, ...keys]);
-    });
+    // `BTab` is tmux's name for the back-tab / Shift+Tab sequence (`\e[Z`),
+    // which is what claude listens for to cycle modes. The obvious-looking
+    // `S-Tab` is NOT recognised by tmux as a modified key — it degrades to a
+    // plain `Tab`, which never cycles the mode (this was the original bug:
+    // every "mode change" silently no-op'd).
+    const keys = Array<string>(presses).fill("BTab");
+    tmux(["send-keys", "-t", state.sessionName, ...keys]);
+
+    // Verify by scraping the status bar, NOT the JSONL: claude only journals
+    // `permission-mode` at the next turn start, so an idle Shift+Tab emits no
+    // event and a JSONL wait would always time out. The bar, by contrast,
+    // flips within a frame.
+    const observed = await waitForPaneMode(state, current, target);
 
     if (observed === null) {
       return {
@@ -2709,11 +2773,15 @@ export async function cycleToMode(taskId: string, targetAgetorMode: string): Pro
         lastObserved: state.permissionMode,
       };
     }
+    // Keep `state.permissionMode` in sync with what the bar now shows so the
+    // next loop iteration recomputes from the live mode (and so a later turn's
+    // guards / `getPermissionMode` don't read a stale value until the JSONL
+    // catches up at the next turn).
+    state.permissionMode = observed;
     if (observed === target) {
       return { ok: true, presses: totalPresses, via: "shift-tab" };
     }
-    // Mismatch — loop and retry from the newly-observed mode. `dispatchLine`
-    // has already updated `state.permissionMode` to `observed`.
+    // Mismatch — loop and retry from the newly-observed mode.
   }
 
   return {
@@ -2722,6 +2790,30 @@ export async function cycleToMode(taskId: string, targetAgetorMode: string): Pro
     attempts,
     lastObserved: state.permissionMode,
   };
+}
+
+/**
+ * Per-task serialization for `cycleToMode`. claude runs one tmux session per
+ * task, and `BTab` batches from two overlapping calls (a rapid double
+ * mode-PATCH — `reconcileTaskSession` is fire-and-forget, so they aren't
+ * naturally serialized) would interleave on the same session and land it on
+ * an unpredictable mode. Chaining makes the second call run from the first's
+ * settled state, so the final mode reflects the latest request.
+ */
+const cycleInFlight = new Map<string, Promise<CycleResult>>();
+
+export function cycleToMode(taskId: string, targetAgetorMode: string): Promise<CycleResult> {
+  const prev = cycleInFlight.get(taskId);
+  const run = (prev ? prev.catch(() => undefined) : Promise.resolve()).then(
+    () => cycleToModeInner(taskId, targetAgetorMode),
+  );
+  cycleInFlight.set(taskId, run);
+  void run.catch(() => undefined).finally(() => {
+    // Only clear the slot if it still points at this run — a newer call may
+    // have already chained on and replaced it.
+    if (cycleInFlight.get(taskId) === run) cycleInFlight.delete(taskId);
+  });
+  return run;
 }
 
 /**
@@ -2752,7 +2844,6 @@ function disposeSessionState(state: SessionState | undefined): void {
   state.scrapeTimer = null;
   state.scrapeLastFingerprint = null;
   state.onEndOfTurn = null;
-  state.onPermissionMode = null;
   state.pendingEndTurn = null;
   const err = new Error("session killed");
   for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
@@ -2840,6 +2931,23 @@ export const __forTest = {
   },
   /** Read-only accessor for the current verify timeout. */
   getModeVerifyTimeoutMs(): number { return modeVerifyTimeoutMs; },
+  /** Override the pane-poll interval used by `cycleToMode`. Tests shrink it
+   *  so the verify loop spins fast. Returns the previous value. */
+  setModePollIntervalMs(ms: number): number {
+    const prev = modePollIntervalMs;
+    modePollIntervalMs = ms;
+    return prev;
+  },
+  /** Override how `cycleToMode` reads the live mode (production scrapes the
+   *  tmux pane). Tests inject a synthetic status bar — pass a function that
+   *  returns the pane text claude would show. Returns the previous reader so
+   *  the test can restore it. */
+  setCaptureModePane(fn: (state: SessionState) => string): (state: SessionState) => string {
+    const prev = captureModePane;
+    captureModePane = fn;
+    return prev;
+  },
+  readPaneMode,
   /** Max attempts cycleToMode will make before reporting `verification
    *  mismatch`. Exposed so tests can assert against the constant rather
    *  than hardcoding "3". */

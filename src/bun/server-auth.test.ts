@@ -263,12 +263,10 @@ test("PATCH /tasks/:id rejects an unknown harness id with 400", async () => {
   expect(after.agent).toBe("codex");
 });
 
-// Codex is re-enabled as opt-in: it ships disabled (migration 016) but the
-// server no longer blocks creating a codex alias or toggling the built-in row
-// on. Both branches (create with kind=codex, enable an existing codex row)
-// now succeed.
+// Codex is now an opt-in harness: creating a codex alias and re-enabling the
+// built-in codex row both succeed (the old "coming soon" lock is gone).
 
-test("POST /harnesses with kind=codex is accepted (opt-in)", async () => {
+test("POST /harnesses with kind=codex is accepted", async () => {
   const res = await fetch(url("/harnesses"), {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -281,24 +279,25 @@ test("POST /harnesses with kind=codex is accepted (opt-in)", async () => {
   expect(res.status).toBe(200);
   const body = await res.json();
   expect(body.kind).toBe("codex");
+  expect(body.id).toBe("codex-new");
 });
 
-test("PATCH /harnesses/codex enabled=true is accepted (opt-in)", async () => {
-  const res = await fetch(url("/harnesses/codex"), {
+test("PATCH /harnesses/codex enabled toggles both directions", async () => {
+  // Re-enabling the built-in codex row now succeeds (it ships disabled via
+  // migration 016, so the user opts in here).
+  const on = await fetch(url("/harnesses/codex"), {
     method: "PATCH",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ enabled: true }),
   });
-  expect(res.status).toBe(200);
-  // The bug was that the toggle never stuck — assert it actually persisted.
-  const enabled = await res.json();
-  expect(enabled.enabled).toBe(true);
+  expect(on.status).toBe(200);
+  expect((await on.json()).enabled).toBe(true);
 
-  // Disabling still works too.
   const off = await fetch(url("/harnesses/codex"), {
     method: "PATCH",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
     body: JSON.stringify({ enabled: false }),
   });
   expect(off.status).toBe(200);
+  expect((await off.json()).enabled).toBe(false);
 });
