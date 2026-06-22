@@ -196,6 +196,47 @@ export interface ParsedQuestionPane {
 /** A numbered option row: optional `❯`/`›` cursor, number, optional `[ ]`/`[✔]`
  *  checkbox, then the label. */
 const OPTION_RE = /^\s*([›❯])?\s*(\d+)\.\s+(?:\[([ xX✔])\]\s*)?(.+?)\s*$/;
+
+/**
+ * When an AskUserQuestion option carries a `preview` example panel, claude
+ * renders a **side-by-side** layout: the option list on the left, a
+ * box-drawn preview panel on the right of the focused option. tmux
+ * `capture-pane` flattens that into text, so the preview box ends up on the
+ * SAME rows as the option labels — e.g.
+ *
+ *     ❯ 1. One combined line            ┌────────────────────────────┐
+ *       2. Separate name + flag         │ Name on one line, role tag  │
+ *                                       │ — or —                      │
+ *                                       ├─── ✂ ─── 2 lines hidden ────┤
+ *                                       └─────────────────────────────┘
+ *                                       Notes: press n to add notes
+ *
+ * Left as-is, `OPTION_RE` swallows the box content into the label and the
+ * description-gather loop scoops up the box rows — so option 2 above renders
+ * as `Separate name + flag | Name on one line, role tag …`. Strip the right-hand
+ * preview column from every captured row before parsing: cut a trailing
+ * `<≥2 spaces gutter><box-corner/border char>…` segment off each line.
+ *
+ * Two guards keep this from eating real text:
+ *  - the trigger char must be a corner/vertical/scissor char, NOT a bare
+ *    `─`/`━`, so full-width separator rows (which start at column 0 with
+ *    horizontals) are preserved; and
+ *  - the candidate segment must contain at least TWO box-drawing chars — a
+ *    genuine panel row always has them (both borders `│ … │`, a `┌──┐`/`└──┘`
+ *    edge, or `├── ✂ ──┤`), whereas a label that merely happens to contain a
+ *    lone `│` after a double space (e.g. `Use A  │ B`) is left intact.
+ *
+ * The JSONL tool_use (which has the real per-option `preview`) is the
+ * authoritative source when available; this only keeps the lossy pane fallback
+ * from garbling labels when it isn't. */
+const PREVIEW_COLUMN_RE = /\s{2,}[┌┐└┘├┤┬┴┼│╭╮╰╯✂].*$/u;
+const BOX_DRAWING_CHAR = /[┌┐└┘├┤┬┴┼│╭╮╰╯✂─━]/gu;
+export function stripPreviewColumn(line: string): string {
+  const m = PREVIEW_COLUMN_RE.exec(line);
+  if (!m) return line;
+  const boxChars = m[0].match(BOX_DRAWING_CHAR)?.length ?? 0;
+  return boxChars >= 2 ? line.slice(0, m.index) : line;
+}
 /** Rows that look like options but are the modal's built-in actions, not real
  *  answers. */
 const EXCLUDED_OPTION = /^(Type something\.?|Chat about this)$/;
@@ -203,44 +244,15 @@ const EXCLUDED_OPTION = /^(Type something\.?|Chat about this)$/;
 /* ────────────────────────────────────────────────────────────────────────── *
  * Side-by-side preview panel
  *
- * When an AskUserQuestion option carries a `preview`, claude renders a box-drawn
- * panel to the RIGHT of the option list showing the FOCUSED option's preview
- * (one panel at a time). `capture-pane` flattens that box onto the same rows as
- * the option labels and onto the blank continuation rows below them — so we both
- * (a) strip it off before parsing labels/descriptions, and (b) extract the
- * focused option's preview text from it. Verified against real 2.1.170 captures
- * (fixtures single_preview_full / single_preview_truncated): borders ┌─┐│├┤└┘,
- * 1-space interior padding, tall previews collapsed to "├── ✂ N lines hidden ──┤".
+ * `stripPreviewColumn` (above) cleans the box OFF each row so it can't bleed
+ * into a label/description. `extractFocusedPreview` (below) does the opposite —
+ * it reads the FOCUSED option's preview text OUT of that box. claude renders the
+ * panel to the RIGHT of the option list, one option at a time;
+ * `collectAskQuestionsFromPane` walks the options to collect them all. Verified
+ * against real 2.1.170 / 2.1.183 captures (fixtures single_preview_full /
+ * single_preview_truncated): borders ┌─┐│├┤└┘, 1-space interior padding, tall
+ * previews collapsed to "├── ✂ N lines hidden ──┤".
  * ────────────────────────────────────────────────────────────────────────── */
-
-/** Box-drawing glyphs that may compose the preview panel (incl. the ✂ collapse
- *  marker). Used only to COUNT box chars in a candidate segment. */
-const BOX_DRAWING_CHAR = /[┌┐└┘├┤┬┴┼│╭╮╰╯╠╣╦╩╬─━┃✂]/u;
-/** A trailing preview-panel segment: a ≥2-space gutter, then a run that STARTS
- *  with a corner/vertical/scissor glyph (never a bare ─/━, so a full-width
- *  separator row — which begins at column 0 — is never matched) and continues
- *  to end of line. */
-const PREVIEW_COLUMN_RE = /\s{2,}([┌┐└┘├┤┬┴┼│╭╮╰╯✂][^\n]*)$/u;
-
-/**
- * Cut the right-hand preview panel off a single captured row so the option /
- * description / question parsers don't ingest it (the "Compact 2-row | ▢▢▢"
- * label-bleed bug). Conservative on purpose:
- *  - anchored on a corner/vertical/✂ glyph, NOT a bare ─, so full-width
- *    separator rows survive untouched;
- *  - requires ≥2 box-drawing chars in the cut segment, so a lone stray `│`
- *    inside a genuine label is never truncated.
- * A blank continuation row that is *entirely* panel (leading gutter + box)
- * collapses to "" — which `isNoise` then treats as a description boundary.
- */
-export function stripPreviewColumn(line: string): string {
-  const m = PREVIEW_COLUMN_RE.exec(line);
-  if (!m) return line;
-  let boxChars = 0;
-  for (const ch of m[1]!) if (BOX_DRAWING_CHAR.test(ch)) boxChars++;
-  if (boxChars < 2) return line;
-  return line.slice(0, m.index).replace(/\s+$/, "");
-}
 
 /**
  * Extract the FOCUSED option's `preview` from a pane capture's side panel.
@@ -289,10 +301,10 @@ export function extractFocusedPreview(
  */
 export function parseModalPane(tail: string): ParsedQuestionPane | null {
   if (!QUESTION_SIGNATURE.test(tail) || !FOOTER_SIGNATURE.test(tail)) return null;
+  // Trim trailing whitespace from each row. Read the focused option's preview
+  // from the side panel BEFORE stripping it off, then strip every row so the
+  // box never bleeds into a label / description / the question text below.
   const rawLines = tail.split("\n").map((l) => l.replace(/\s+$/, ""));
-  // Read the focused option's preview from the side panel BEFORE we strip it —
-  // then strip every row so the box never bleeds into a label / description /
-  // the question text below.
   const focusedPreview = extractFocusedPreview(rawLines);
   const lines = rawLines.map(stripPreviewColumn);
 

@@ -54,7 +54,7 @@ test("reconcileOrphans marks running rows as orphaned and returns tasks to ready
     endedAt: null,
     exitCode: null,
     tmuxSession: null,
-    claudeSessionId: null,
+    claudeSessionId: null, codexSessionId: null,
   });
 
   const reconciled = reconcileOrphans();
@@ -120,7 +120,7 @@ test("reattach pre-seed SQL: detects a prior api-error status row scoped to the 
     runs.insert({
       id, taskId, agent: "claude-code", status: "failed",
       startedAt: now, endedAt: now, exitCode: 1,
-      tmuxSession: null, claudeSessionId: null,
+      tmuxSession: null, claudeSessionId: null, codexSessionId: null,
     });
   }
   // The real api-error status on the target run — must match.
@@ -146,16 +146,18 @@ test("reattach pre-seed SQL: detects a prior api-error status row scoped to the 
   runs.insert({
     id: cleanRunId, taskId, agent: "claude-code", status: "failed",
     startedAt: now, endedAt: now, exitCode: 1,
-    tmuxSession: null, claudeSessionId: null,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null,
   });
   expect(ask(cleanRunId)).toBe(0);
 });
 
 test("startTask honors cancel — exit handler records status 'cancelled'", async () => {
-  // Use codex's branch for this test because it still goes through Bun.spawn
-  // directly (claude now goes through tmux + JSONL, which isn't substitutable
-  // with a sleep script). The cancellation path through proc.kill is identical
-  // between agents, so codex is a fair stand-in.
+  // Codex now hosts its turn in a real tmux session (codex-tmux.ts). Point the
+  // codex bin at a `sleep 30` stub so the session stays alive until cancelled;
+  // cancelRun → kill the session → the driver resolves `done` and the exit
+  // handler records 'cancelled' (it defers to handle.cancelled over exit code).
+  // Uses real tmux (don't stub AGETOR_TMUX_BIN) so there's an actual session to
+  // kill.
   const binDir = mkdtempSync(path.join(tmpdir(), "agetor-cancel-bin-"));
   const fakeBin = path.join(binDir, "fake-codex");
   writeFileSync(fakeBin, "#!/bin/sh\nexec sleep 30\n");
@@ -165,14 +167,13 @@ test("startTask honors cancel — exit handler records status 'cancelled'", asyn
 
   const { createTask, startTask, cancelRun } = await import("./orchestrator.ts");
   const { runs, harnesses } = await import("./db.ts");
-  // Codex is shipped disabled-by-default (see migration 016); the cancel
-  // path being tested only goes through codex's Bun.spawn branch, so flip
-  // the built-in back on for the test database.
+  // Codex is shipped disabled-by-default (see migration 016); re-enable the
+  // built-in for the test database so startTask doesn't reject it.
   harnesses.setEnabled("codex", true);
 
   const created = await createTask({
     title: "long-running",
-    prompt: "30", // sleep 30 → process will block until killed
+    prompt: "30", // sleep 30 → session blocks until killed
     agent: "codex",
     workdir: process.cwd(),
     isolation: "none",
@@ -183,12 +184,12 @@ test("startTask honors cancel — exit handler records status 'cancelled'", asyn
   const started = await startTask(created.task.id);
   if ("error" in started) throw new Error(started.error);
 
-  // Give the spawn a moment to land, then cancel.
-  await new Promise((r) => setTimeout(r, 100));
+  // Give the tmux session a moment to come up, then cancel.
+  await new Promise((r) => setTimeout(r, 250));
   expect(cancelRun(started.runId)).toBe(true);
 
-  // Wait for the exit handler to flip the status row.
-  await new Promise((r) => setTimeout(r, 250));
+  // Wait past the driver's kill grace + the exit handler's status flip.
+  await new Promise((r) => setTimeout(r, 700));
 
   const list = runs.listForTask(created.task.id);
   expect(list[0]?.status).toBe("cancelled");

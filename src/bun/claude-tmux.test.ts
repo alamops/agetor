@@ -1232,55 +1232,60 @@ test("cycleToMode: returns 'current mode unknown' before claude's first event", 
   __forTest.uninstallSession(taskId);
 });
 
-test("cycleToMode: success on first attempt when the JSONL event reports the target", async () => {
+test("cycleToMode: success on first attempt when the status bar shows the target", async () => {
   const { __forTest } = await import("./claude-tmux.ts");
-  const taskId = "task-cycle-success";
-  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
-  state.permissionMode = CLAUDE_MODE_DEFAULT;
-  // cycleToMode installs the listener synchronously inside the Promise
-  // executor before tmux send-keys runs, so a synchronous dispatchLine
-  // call after invoking it (but before the await) fires the listener and
-  // resolves the verification.
-  const pending = cycleToMode(taskId, "auto");
-  __forTest.dispatchLine(state, JSON.stringify({
-    type: "permission-mode",
-    permissionMode: CLAUDE_MODE_AUTO,
-  }));
-  const result = await pending;
-  // Cycle: [default, acceptEdits, plan, auto] — 3 presses.
-  expect(result).toEqual({ ok: true, presses: 3, via: "shift-tab" });
-  __forTest.uninstallSession(taskId);
+  const prevPoll = __forTest.setModePollIntervalMs(1);
+  // The status bar already reports auto once the presses land.
+  const prevPane = __forTest.setCaptureModePane(() => "⏵⏵ auto mode on (shift+tab to cycle)");
+  try {
+    const taskId = "task-cycle-success";
+    const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+    state.permissionMode = CLAUDE_MODE_DEFAULT;
+    const result = await cycleToMode(taskId, "auto");
+    // Cycle: [default, acceptEdits, plan, auto] — 3 presses.
+    expect(result).toEqual({ ok: true, presses: 3, via: "shift-tab" });
+    // The verifier mirrors the observed mode back onto the session.
+    expect(state.permissionMode).toBe(CLAUDE_MODE_AUTO);
+    __forTest.uninstallSession(taskId);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.setModePollIntervalMs(prevPoll);
+  }
 });
 
 test("cycleToMode: retries from the newly-observed mode when the first press lands short", async () => {
   const { __forTest } = await import("./claude-tmux.ts");
-  const taskId = "task-cycle-retry";
-  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
-  state.permissionMode = CLAUDE_MODE_DEFAULT;
-  // First attempt: dispatch a "wrong" mode (acceptEdits) so cycleToMode
-  // observes the mismatch and retries. Second attempt: dispatch the target.
-  const pending = cycleToMode(taskId, "auto");
-  __forTest.dispatchLine(state, JSON.stringify({
-    type: "permission-mode",
-    permissionMode: CLAUDE_MODE_ACCEPT_EDITS,
-  }));
-  // Yield once so cycleToMode's await-continuation can install the next
-  // listener before we fire the next synthetic event.
-  await Promise.resolve();
-  __forTest.dispatchLine(state, JSON.stringify({
-    type: "permission-mode",
-    permissionMode: CLAUDE_MODE_AUTO,
-  }));
-  const result = await pending;
-  // Attempt 1: default → auto = 3 presses (lands on acceptEdits instead).
-  // Attempt 2: acceptEdits → auto = 2 presses. Total: 5.
-  expect(result).toEqual({ ok: true, presses: 5, via: "shift-tab" });
-  __forTest.uninstallSession(taskId);
+  const prevPoll = __forTest.setModePollIntervalMs(1);
+  // Attempt 1 (from default) settles on acceptEdits; once cycleToMode records
+  // that landing on the session, attempt 2's bar reports auto.
+  const prevPane = __forTest.setCaptureModePane((s) =>
+    s.permissionMode === CLAUDE_MODE_ACCEPT_EDITS
+      ? "⏵⏵ auto mode on (shift+tab to cycle)"
+      : "⏵⏵ accept edits on (shift+tab to cycle)",
+  );
+  try {
+    const taskId = "task-cycle-retry";
+    const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+    state.permissionMode = CLAUDE_MODE_DEFAULT;
+    const result = await cycleToMode(taskId, "auto");
+    // Attempt 1: default → auto = 3 presses (lands on acceptEdits instead).
+    // Attempt 2: acceptEdits → auto = 2 presses. Total: 5.
+    expect(result).toEqual({ ok: true, presses: 5, via: "shift-tab" });
+    expect(state.permissionMode).toBe(CLAUDE_MODE_AUTO);
+    __forTest.uninstallSession(taskId);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.setModePollIntervalMs(prevPoll);
+  }
 });
 
-test("cycleToMode: returns 'verification timed out' when no JSONL event follows", async () => {
+test("cycleToMode: returns 'verification timed out' when the status bar never confirms", async () => {
   const { __forTest } = await import("./claude-tmux.ts");
   const prevTimeout = __forTest.setModeVerifyTimeoutMs(20);
+  const prevPoll = __forTest.setModePollIntervalMs(1);
+  // Bar shows no recognisable mode banner (e.g. the auto opt-in modal is
+  // painted over it) — readPaneMode returns null on every poll.
+  const prevPane = __forTest.setCaptureModePane(() => "Some unrelated output\n❯ ");
   try {
     const taskId = "task-cycle-timeout";
     const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
@@ -1290,52 +1295,43 @@ test("cycleToMode: returns 'verification timed out' when no JSONL event follows"
     if (!result.ok) {
       expect(result.reason).toBe("verification timed out");
       expect(result.attempts).toBe(1);
-      // lastObserved should still be the pre-press mode because the JSONL
-      // event never arrived to update it.
+      // lastObserved stays at the pre-press mode — the bar never moved.
       expect(result.lastObserved).toBe(CLAUDE_MODE_DEFAULT);
     }
-    // Listener slot must be cleared after the timeout so a late event
-    // can't fire on a stale resolver.
-    expect(state.onPermissionMode).toBeNull();
     __forTest.uninstallSession(taskId);
   } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.setModePollIntervalMs(prevPoll);
     __forTest.setModeVerifyTimeoutMs(prevTimeout);
   }
 });
 
 test("cycleToMode: gives up with 'verification mismatch' after MAX_VERIFY_ATTEMPTS wrong modes", async () => {
   const { __forTest } = await import("./claude-tmux.ts");
-  const taskId = "task-cycle-mismatch";
-  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
-  state.permissionMode = CLAUDE_MODE_DEFAULT;
-  const pending = cycleToMode(taskId, "auto");
-  // Three wrong modes back to back — exhausts MAX_VERIFY_ATTEMPTS.
-  __forTest.dispatchLine(state, JSON.stringify({
-    type: "permission-mode",
-    permissionMode: CLAUDE_MODE_ACCEPT_EDITS,
-  }));
-  // Yield once so cycleToMode's await-continuation can install the next
-  // listener before we fire the next synthetic event.
-  await Promise.resolve();
-  __forTest.dispatchLine(state, JSON.stringify({
-    type: "permission-mode",
-    permissionMode: CLAUDE_MODE_PLAN,
-  }));
-  // Yield once so cycleToMode's await-continuation can install the next
-  // listener before we fire the next synthetic event.
-  await Promise.resolve();
-  __forTest.dispatchLine(state, JSON.stringify({
-    type: "permission-mode",
-    permissionMode: CLAUDE_MODE_DEFAULT,
-  }));
-  const result = await pending;
-  expect(result.ok).toBe(false);
-  if (!result.ok) {
-    expect(result.reason).toBe("verification mismatch");
-    expect(result.attempts).toBe(__forTest.MAX_VERIFY_ATTEMPTS);
-    expect(result.lastObserved).toBe(CLAUDE_MODE_DEFAULT);
+  const prevPoll = __forTest.setModePollIntervalMs(1);
+  // Each attempt lands on a wrong mode, keyed off where the previous attempt
+  // left the session: default → acceptEdits → plan → default.
+  const prevPane = __forTest.setCaptureModePane((s) => {
+    if (s.permissionMode === CLAUDE_MODE_ACCEPT_EDITS) return "⏸ plan mode on (shift+tab to cycle)";
+    if (s.permissionMode === CLAUDE_MODE_PLAN) return "? for shortcuts";
+    return "⏵⏵ accept edits on (shift+tab to cycle)";
+  });
+  try {
+    const taskId = "task-cycle-mismatch";
+    const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+    state.permissionMode = CLAUDE_MODE_DEFAULT;
+    const result = await cycleToMode(taskId, "auto");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("verification mismatch");
+      expect(result.attempts).toBe(__forTest.MAX_VERIFY_ATTEMPTS);
+      expect(result.lastObserved).toBe(CLAUDE_MODE_DEFAULT);
+    }
+    __forTest.uninstallSession(taskId);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.setModePollIntervalMs(prevPoll);
   }
-  __forTest.uninstallSession(taskId);
 });
 
 test("cycleToMode: /plan target bypasses the verify loop entirely", async () => {
@@ -1343,44 +1339,82 @@ test("cycleToMode: /plan target bypasses the verify loop entirely", async () => 
   const taskId = "task-cycle-plan";
   const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
   state.permissionMode = CLAUDE_MODE_DEFAULT;
-  // No dispatched event — /plan returns immediately without waiting.
+  // No pane scrape — /plan returns immediately without verifying.
   const result = await cycleToMode(taskId, "plan");
   expect(result).toEqual({ ok: true, presses: 0, via: "slash-plan" });
-  expect(state.onPermissionMode).toBeNull();
   __forTest.uninstallSession(taskId);
 });
 
-test("cycleToMode: overlapping calls don't clobber each other's listeners", async () => {
-  // Identity-guard regression test: without the `state.onPermissionMode
-  // === myListener` check in the timeout handler, the earlier call's
-  // setTimeout would null out the *later* call's listener, causing both
-  // calls to falsely time out. With the guard, the later caller wins
-  // (its listener fires on the next JSONL event) and the earlier caller
-  // gracefully times out without affecting the later one.
+test("cycleToMode: overlapping calls on the same task both resolve", async () => {
+  // With pane-scrape verification there are no shared listeners to clobber;
+  // two overlapping calls just both poll the bar. This is a smoke test that
+  // concurrent cycleToMode calls (e.g. a user double-PATCH) each settle.
   const { __forTest } = await import("./claude-tmux.ts");
-  const prevTimeout = __forTest.setModeVerifyTimeoutMs(40);
+  const prevPoll = __forTest.setModePollIntervalMs(1);
+  const prevPane = __forTest.setCaptureModePane(() => "⏵⏵ auto mode on (shift+tab to cycle)");
   try {
     const taskId = "task-cycle-race";
     const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
     state.permissionMode = CLAUDE_MODE_DEFAULT;
-
-    // Two overlapping calls. `b` is launched synchronously after `a`,
-    // so by the time the dispatch fires the session slot holds b's
-    // listener. b should win; a should fall through to timeout.
-    const a = cycleToMode(taskId, "auto");
-    const b = cycleToMode(taskId, "acceptEdits");
-    __forTest.dispatchLine(state, JSON.stringify({
-      type: "permission-mode",
-      permissionMode: CLAUDE_MODE_ACCEPT_EDITS,
-    }));
-    const [ra, rb] = await Promise.all([a, b]);
-
-    expect(rb).toEqual({ ok: true, presses: 1, via: "shift-tab" });
-    expect(ra.ok).toBe(false);
-    if (!ra.ok) expect(ra.reason).toBe("verification timed out");
+    const [ra, rb] = await Promise.all([
+      cycleToMode(taskId, "auto"),
+      cycleToMode(taskId, "auto"),
+    ]);
+    expect(ra.ok).toBe(true);
+    expect(rb.ok).toBe(true);
+    expect(state.permissionMode).toBe(CLAUDE_MODE_AUTO);
     __forTest.uninstallSession(taskId);
   } finally {
-    __forTest.setModeVerifyTimeoutMs(prevTimeout);
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.setModePollIntervalMs(prevPoll);
+  }
+});
+
+test("readPaneMode: reads the trailing status-bar banner, ignoring mode phrases in output above it", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-anchor";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  // A decoy "auto mode on" in assistant output must NOT win over the real
+  // banner on the trailing line.
+  const prevPane = __forTest.setCaptureModePane(() =>
+    [
+      "Assistant: I'll switch to auto mode on your behalf.",
+      "❯ ",
+      "  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
+    ].join("\n"),
+  );
+  try {
+    expect(__forTest.readPaneMode(state)).toBe(CLAUDE_MODE_PLAN);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("readPaneMode: default mode recognised via the '? for shortcuts' trailing hint", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-default";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const prevPane = __forTest.setCaptureModePane(() => "❯ \n  ? for shortcuts · ← for agents");
+  try {
+    expect(__forTest.readPaneMode(state)).toBe(CLAUDE_MODE_DEFAULT);
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("readPaneMode: null when a mode phrase lacks the cycle-hint banner (e.g. modal covering the bar)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-readpane-null";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  // "auto mode on" appears, but not as the trailing `(shift+tab to cycle)` banner.
+  const prevPane = __forTest.setCaptureModePane(() => "talking about auto mode on\n❯ ");
+  try {
+    expect(__forTest.readPaneMode(state)).toBeNull();
+  } finally {
+    __forTest.setCaptureModePane(prevPane);
+    __forTest.uninstallSession(taskId);
   }
 });
 
