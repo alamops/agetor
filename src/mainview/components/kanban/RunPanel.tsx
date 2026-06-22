@@ -29,6 +29,7 @@ import {
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
+import { createEventDeduper } from "@/lib/event-dedup";
 import { AgentIcon } from "./AgentIcon";
 import {
   ReferencesPicker,
@@ -321,28 +322,13 @@ function RunPanelBody({
   // panel shows the whole conversation as a single scrollback.
   useEffect(() => {
     setEvents([]);
-    // Dedup by composite key (ts|runId|stream|first-200-chars-of-data) —
-    // the polling fallback in claude-tmux flushes many JSONL events per
-    // tick, all stamped with the same Date.now() ms.
-    //
-    // Exception for `user` events: each user message is emitted twice —
-    // once live (orchestrator's onChunk in startTask/sendInput, ts=wall
-    // clock) and once from the JSONL parser when claude transcribes it
-    // (ts=Date.now() at flush time, or synthetic baseTs+i during a
-    // rebuild). Drop ts from the key for user events so the two paths
-    // collapse to one bubble per message. Also normalize CR/LF in the
-    // key: tmux's paste-buffer delivers our `\n`-separated prompt to
-    // claude as `\r`, and the JSONL stores those `\r`s verbatim — so
-    // without normalization the live (`\n`) and JSONL (`\r`) copies
-    // differ byte-for-byte in the first 200 chars and slip past dedup.
-    // The bun side normalizes too (claude-tmux.ts); this is belt-and-
-    // suspenders for any other path that might leak a CR through.
-    const seen = new Set<string>();
-    const normalizeForKey = (s: string) => s.replace(/\r\n?/g, "\n");
-    const keyFor = (e: RunEvent) =>
-      e.stream === "user"
-        ? `user|${e.runId}|${normalizeForKey(e.data ?? "").slice(0, 200)}`
-        : `${e.ts}|${e.runId}|${e.stream}|${(e.data ?? "").slice(0, 200)}`;
+    // Collapse the dual-emit + replay duplicates the server stream carries
+    // (live echo + JSONL twin per user message; full-history replay on every
+    // reconnect). The deduper keeps `user` keys in a never-trimmed set so a
+    // follow-up folded into a long in-flight turn — whose live echo and JSONL
+    // twin are separated by thousands of intervening events — still collapses
+    // to a single bubble. See `event-dedup.ts`.
+    const dedupe = createEventDeduper();
     // Coalesce the open-time replay burst into one state update per animation
     // frame. On connect the server streams the whole history as one SSE frame
     // per event; each `onmessage` is its own event-loop task, so React can't
@@ -359,17 +345,7 @@ function RunPanelBody({
       setEvents((cur) => [...cur, ...batch]);
     };
     const unsub = api.subscribeTask(task.id, (e) => {
-      const key = keyFor(e);
-      if (seen.has(key)) return;
-      seen.add(key);
-      if (seen.size > 5000) {
-        const drop = seen.size - 4000;
-        let i = 0;
-        for (const k of seen) {
-          if (i++ >= drop) break;
-          seen.delete(k);
-        }
-      }
+      if (!dedupe.accept(e)) return;
       if (e.stream === "interaction") {
         try {
           const req = JSON.parse(e.data) as PendingInteraction;

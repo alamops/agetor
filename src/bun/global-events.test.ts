@@ -95,7 +95,7 @@ test("reconcileOrphans emits run-status → orphaned + column → ready", async 
     endedAt: null,
     exitCode: null,
     tmuxSession: null,
-    claudeSessionId: null,
+    claudeSessionId: null, codexSessionId: null,
   });
   db.run(`UPDATE tasks SET "column" = 'running', run_id = ? WHERE id = ?`, [runId, taskId]);
 

@@ -375,7 +375,9 @@ export interface AgentOptions {
  * CLI happens to default to.
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
-  "claude-code": "opus-4.7",
+  // Default to Opus 4.8 — Fable 5 sits above it in the picker but costs 2x the
+  // usage, so the default stays on the most-capable non-premium tier.
+  "claude-code": "opus-4.8",
   "codex": "gpt-5.5",
 };
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
@@ -425,7 +427,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "max", label: "Max", hint: "Absolute maximum effort. Slowest, most thorough." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Opus 4.8 / 4.7 / 4.6 / codex only." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Opus 4.8 / 4.7 / 4.6 / codex only." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
@@ -450,12 +452,14 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  */
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
-  // effort parameter is API-supported on Opus 4.8 / 4.7 / 4.6 / Sonnet 4.6
-  // / Opus 4.5 (xhigh is Opus-only; Sonnet 4.6 has no xhigh; Haiku 4.5
-  // doesn't support effort at all). The `/effort` CLI command accepts more
+  // effort parameter is API-supported on Fable 5 / Opus 4.8 / 4.7 / 4.6 /
+  // Sonnet 4.6 / Opus 4.5 (xhigh is Fable-5- and Opus-only; Sonnet 4.6 has no
+  // xhigh; Haiku 4.5 doesn't support effort at all). The `/effort` CLI command accepts more
   // levels but the underlying API request would fail for unsupported pairs,
   // so we filter at the picker rather than letting the user fire bad runs.
   "claude-code": {
+    // Fable 5 shares Opus 4.7/4.8's request surface (effort low→max, xhigh).
+    "fable-5": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.7": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.6": ["max", "xhigh", "high", "medium", "low"],
@@ -500,6 +504,7 @@ export function supportedEfforts(agent: AgentKind, model: string | null): AgentO
  */
 const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   "claude-code": {
+    "fable-5": [],
     "opus-4.8": [],
     "opus-4.7": [],
     "opus-4.6": [],
@@ -522,7 +527,8 @@ export function supportedModes(agent: AgentKind, model: string | null): AgentOpt
 export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   "claude-code": {
     models: [
-      { id: "opus-4.8", label: "Opus 4.8", hint: "Most capable; slower." },
+      { id: "fable-5", label: "Fable 5", hint: "Most powerful tier — above Opus. Uses 2x the usage of Opus." },
+      { id: "opus-4.8", label: "Opus 4.8", hint: "Most capable Opus; slower." },
       { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
       { id: "opus-4.6", label: "Opus 4.6", hint: "Earlier Opus generation." },
       { id: "sonnet-4.6", label: "Sonnet 4.6", hint: "Balanced." },
@@ -543,13 +549,13 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Most capable; recommended default." },
-      { id: "gpt-5-codex", label: "GPT-5 Codex" },
-      { id: "gpt-5", label: "GPT-5" },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Recommended default — works on ChatGPT plans." },
+      { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
+      { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
     modes: [
-      { id: "auto", label: "Auto (--full-auto)", hint: "Run without approval prompts." },
-      { id: "ask", label: "Ask before changes", hint: "Codex's default — prompts before each action." },
+      { id: "auto", label: "Auto (workspace-write)", hint: "Edit files without approval prompts." },
+      { id: "ask", label: "Read-only", hint: "Inspect only — codex can't modify files (read-only sandbox)." },
     ],
     efforts: EFFORT_OPTIONS,
   },
@@ -573,9 +579,11 @@ export interface Run {
   endedAt: number | null;
   exitCode: number | null;
   /**
-   * Name of the tmux session that hosted this run's claude-code REPL. Same
-   * value across every run for a given task under the one-session-per-task
-   * model. NULL for codex runs and pre-migration legacy rows.
+   * Name of the tmux session that hosted this run's REPL (claude-code) or
+   * one-shot `codex exec` turn (codex). For claude it's the same value across
+   * every run for a task (one persistent session); for codex each turn spawns
+   * a fresh session that shares the per-task name. NULL for pre-migration
+   * legacy rows.
    */
   tmuxSession: string | null;
   /**
@@ -586,6 +594,14 @@ export interface Run {
    * been torn down. NULL for codex and legacy rows.
    */
   claudeSessionId: string | null;
+  /**
+   * Codex's own conversation/thread id (the `thread_id` from its `--json`
+   * stream's `thread.started` event). Captured when the codex tmux driver
+   * tails the run's JSONL log. Drives `codex exec resume <thread_id>` for
+   * follow-up turns and is the reattach key for a mid-turn codex run. NULL
+   * for claude-code and legacy rows.
+   */
+  codexSessionId: string | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */

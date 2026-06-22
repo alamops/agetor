@@ -8,6 +8,7 @@ import {
   parseAskModal,
   parseModalPane,
   planAskAnswers,
+  stripPreviewColumn,
   type AskAnswer,
   type AskQuestionSpec,
 } from "./claude-questions.ts";
@@ -80,6 +81,40 @@ describe("parseAskModal", () => {
   });
 });
 
+describe("stripPreviewColumn — removes the side-by-side preview box from a row", () => {
+  test("cuts the box off an option row at the gutter", () => {
+    expect(stripPreviewColumn("❯ 1. One combined line            ┌──────────────┐"))
+      .toBe("❯ 1. One combined line");
+    expect(stripPreviewColumn("  2. Separate name + flag         │ Cancelled by: X │"))
+      .toBe("  2. Separate name + flag");
+  });
+
+  test("blanks an indented box continuation row entirely", () => {
+    expect(stripPreviewColumn("                                  │ — or — │")).toBe("");
+    expect(stripPreviewColumn("                                  ├─── ✂ ─── 2 lines hidden ───┤")).toBe("");
+    expect(stripPreviewColumn("                                  └──────────────┘")).toBe("");
+  });
+
+  test("preserves a full-width separator row (horizontals at column 0)", () => {
+    const sep = "─".repeat(60);
+    expect(stripPreviewColumn(sep)).toBe(sep);
+  });
+
+  test("leaves a label that merely contains a lone box char after a gap (≥2 box-char guard)", () => {
+    // A real panel row has both borders; a label with a single stray `│` does not.
+    expect(stripPreviewColumn("  1. Use A  │ B layout")).toBe("  1. Use A  │ B layout");
+    // …but two box chars after the gutter still strip (defends the real case).
+    expect(stripPreviewColumn("  1. Use A  │ B │")).toBe("  1. Use A");
+  });
+
+  test("rows with no preview box are returned unchanged", () => {
+    expect(stripPreviewColumn("❯ 1. Red")).toBe("❯ 1. Red");
+    expect(stripPreviewColumn("  One main model with others as failover/cost backups.")).toBe(
+      "  One main model with others as failover/cost backups.",
+    );
+  });
+});
+
 describe("parseModalPane — reads the visible question off the pane", () => {
   test("flat single-select (Color): question + options, no tab bar, not multiSelect", () => {
     const p = parseModalPane(fx("single_select"))!;
@@ -138,6 +173,28 @@ describe("parseModalPane — reads the visible question off the pane", () => {
     expect(p.options.map((o) => o.label)).toEqual(["Plugins + curated built-ins", "Plugins only"]);
     expect(p.options[0]!.description).toBe("Enumerate plugins and a curated list.");
     expect(p.options[1]!.description).toBe("Enumerate enabled-plugin items only.");
+  });
+
+  test("side-by-side `preview` panel: the example box never bleeds into option labels/descriptions", () => {
+    // capture-pane flattens claude's side-by-side preview layout so the
+    // box-drawn example panel lands on the SAME rows as the options (to the
+    // right). Before the fix, option 2 rendered as
+    // "Full-width row below shift  │ Supervisor block (240px), 2 stacked lines: │".
+    const p = parseModalPane(fx("multi_preview_panel"))!;
+    expect(p.tabbed).toBe(true);
+    expect(p.tabHeaders).toEqual(["Layout", "Display", "Extras"]);
+    expect(p.questionText).toBe("Where should the new cancellation detail row go?");
+    expect(p.multiSelect).toBe(false);
+    expect(p.options.map((o) => o.label)).toEqual([
+      "Inside the merged cell", "Full-width row below shift",
+    ]);
+    // No preview text, box-drawing chars, or collapse markers anywhere.
+    for (const o of p.options) {
+      expect(o.description ?? "").not.toContain("Supervisor block");
+      expect(`${o.label} ${o.description ?? ""}`).not.toMatch(/[┌┐└┘├┤┬┴┼│✂]/);
+      expect(`${o.label} ${o.description ?? ""}`).not.toContain("lines hidden");
+    }
+    expect(p.options.every((o) => o.description === undefined)).toBe(true);
   });
 
   test("tabbed multiSelect (Toppings): tab headers, checkbox options, multiSelect=true", () => {

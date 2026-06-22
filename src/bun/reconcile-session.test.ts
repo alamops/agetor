@@ -168,8 +168,17 @@ test("reconcileTaskSession refreshes the hook matcher to narrow on ask → auto"
   const state = __forTest.installSession("task-matcher-narrow", jsonl);
   state.permissionMode = "default"; // claude string for agetor's `ask`
 
+  // cycleToMode verifies the switch by scraping the tmux status bar; feed it
+  // the target banner so the switch resolves on the first poll instead of
+  // polling a real pane for the full timeout. Await the reconcile so its
+  // (otherwise fire-and-forget) background poll can't leak `tmux` calls into
+  // a later test's recording bin.
+  const prevPane = __forTest.setCaptureModePane(() => "⏵⏵ auto mode on (shift+tab to cycle)");
+  const prevPoll = __forTest.setModePollIntervalMs(1);
   const after: Task = { ...before, mode: "auto" };
-  reconcileTaskSession("task-matcher-narrow", before, after);
+  await reconcileTaskSession("task-matcher-narrow", before, after);
+  __forTest.setCaptureModePane(prevPane);
+  __forTest.setModePollIntervalMs(prevPoll);
 
   // Agetor no longer installs a PreToolUse hook, so reconcile (which re-runs
   // the installer on a mode change) must leave NO agetor matcher behind.
@@ -205,8 +214,15 @@ test("reconcileTaskSession refreshes the hook matcher to full on auto → ask", 
   const state = __forTest.installSession("task-matcher-full", jsonl);
   state.permissionMode = "auto"; // claude string for agetor's `auto`
 
+  // Target `ask` → claude's `default` mode, whose status bar shows the
+  // "? for shortcuts" hint (no mode banner). Feed that so the switch resolves
+  // promptly, and await so the background poll can't leak `tmux` calls.
+  const prevPane = __forTest.setCaptureModePane(() => "? for shortcuts · ← for agents");
+  const prevPoll = __forTest.setModePollIntervalMs(1);
   const after: Task = { ...before, mode: "ask" };
-  reconcileTaskSession("task-matcher-full", before, after);
+  await reconcileTaskSession("task-matcher-full", before, after);
+  __forTest.setCaptureModePane(prevPane);
+  __forTest.setModePollIntervalMs(prevPoll);
 
   // No agetor PreToolUse hook is installed any more (see the narrow case).
   expect(readMatcher(cwd)).toBeUndefined();

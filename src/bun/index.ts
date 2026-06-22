@@ -114,24 +114,6 @@ rehydratePath();
 // kanban doesn't show stuck cards.
 reconcileOrphans();
 
-// Migration 016 pauses every codex row (built-in + user aliases). The Settings
-// dialog renders the "Coming soon" lock so the state is visible there, but a
-// user who built a codex alias before the pause deserves a breadcrumb in the
-// logs explaining why their alias is dark. Cheap to compute — built-ins are
-// expected, anything else is worth a one-line notice.
-{
-  const paused = harnesses
-    .list()
-    .filter((h) => h.kind === "codex" && !h.isBuiltin && !h.enabled);
-  if (paused.length > 0) {
-    console.log(
-      `[agetor] codex is paused (coming soon) — ${paused.length} user alias${
-        paused.length === 1 ? "" : "es"
-      } disabled: ${paused.map((h) => h.id).join(", ")}`,
-    );
-  }
-}
-
 installNativeMenu();
 
 // Best-effort: probe the agent CLIs for their model lists so the form can

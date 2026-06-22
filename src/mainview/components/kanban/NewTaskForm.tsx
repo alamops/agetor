@@ -485,36 +485,37 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
           startingFolder={workdir || undefined}
         />
 
-        <div className="grid grid-cols-2 gap-2">
-          <div className="min-w-0 space-y-1">
-            <label className="text-muted-foreground">Project</label>
-            <ProjectPicker
-              value={workdir}
-              onChange={(p) => {
-                setWorkdir(p);
-                // The previously-picked branch likely doesn't exist on the new
-                // project — drop back to HEAD so the picker shows a valid default.
-                setBaseRef("");
-              }}
-              autoSelectFirst
-              placement="bottom"
-              title="Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list."
-            />
-          </div>
-          <div className="min-w-0 space-y-1">
-            <label className="text-muted-foreground">Branch</label>
-            <BranchPicker
-              workdir={workdir}
-              value={baseRef}
-              onChange={setBaseRef}
-              placement="bottom"
-              title={
-                isolate
-                  ? "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start."
-                  : "Isolation is off — the value is recorded but the agent will run directly in the project workdir."
-              }
-            />
-          </div>
+        {/* Project + Branch each get their own full-width row. Side-by-side in
+            the ~140px-per-column grid clipped all but the shortest names; full
+            width lets the picker triggers render the full project/branch name. */}
+        <div className="min-w-0 space-y-1">
+          <label className="text-muted-foreground">Project</label>
+          <ProjectPicker
+            value={workdir}
+            onChange={(p) => {
+              setWorkdir(p);
+              // The previously-picked branch likely doesn't exist on the new
+              // project — drop back to HEAD so the picker shows a valid default.
+              setBaseRef("");
+            }}
+            autoSelectFirst
+            placement="bottom"
+            title="Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list."
+          />
+        </div>
+        <div className="min-w-0 space-y-1">
+          <label className="text-muted-foreground">Branch</label>
+          <BranchPicker
+            workdir={workdir}
+            value={baseRef}
+            onChange={setBaseRef}
+            placement="bottom"
+            title={
+              isolate
+                ? "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start."
+                : "Isolation is off — the value is recorded but the agent will run directly in the project workdir."
+            }
+          />
         </div>
 
         <label
@@ -641,6 +642,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
             </Select>
           </div>
         </div>
+
+        {/* Fable 5 sits above Opus in the picker but bills at 2x the usage —
+            surface that under the model row so the cost is obvious before Create. */}
+        {kind === "claude-code" && model === "fable-5" && (
+          <div className="text-[11px] text-muted-foreground">
+            Fable 5 uses 2x the usage of Opus.
+          </div>
+        )}
 
         {/* Surfacing a missing-agent error inline so the user sees install
             guidance before they hit Create and get a delayed failure. */}

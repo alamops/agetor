@@ -192,6 +192,47 @@ export interface ParsedQuestionPane {
 /** A numbered option row: optional `❯`/`›` cursor, number, optional `[ ]`/`[✔]`
  *  checkbox, then the label. */
 const OPTION_RE = /^\s*([›❯])?\s*(\d+)\.\s+(?:\[([ xX✔])\]\s*)?(.+?)\s*$/;
+
+/**
+ * When an AskUserQuestion option carries a `preview` example panel, claude
+ * renders a **side-by-side** layout: the option list on the left, a
+ * box-drawn preview panel on the right of the focused option. tmux
+ * `capture-pane` flattens that into text, so the preview box ends up on the
+ * SAME rows as the option labels — e.g.
+ *
+ *     ❯ 1. One combined line            ┌────────────────────────────┐
+ *       2. Separate name + flag         │ Name on one line, role tag  │
+ *                                       │ — or —                      │
+ *                                       ├─── ✂ ─── 2 lines hidden ────┤
+ *                                       └─────────────────────────────┘
+ *                                       Notes: press n to add notes
+ *
+ * Left as-is, `OPTION_RE` swallows the box content into the label and the
+ * description-gather loop scoops up the box rows — so option 2 above renders
+ * as `Separate name + flag | Name on one line, role tag …`. Strip the right-hand
+ * preview column from every captured row before parsing: cut a trailing
+ * `<≥2 spaces gutter><box-corner/border char>…` segment off each line.
+ *
+ * Two guards keep this from eating real text:
+ *  - the trigger char must be a corner/vertical/scissor char, NOT a bare
+ *    `─`/`━`, so full-width separator rows (which start at column 0 with
+ *    horizontals) are preserved; and
+ *  - the candidate segment must contain at least TWO box-drawing chars — a
+ *    genuine panel row always has them (both borders `│ … │`, a `┌──┐`/`└──┘`
+ *    edge, or `├── ✂ ──┤`), whereas a label that merely happens to contain a
+ *    lone `│` after a double space (e.g. `Use A  │ B`) is left intact.
+ *
+ * The JSONL tool_use (which has the real per-option `preview`) is the
+ * authoritative source when available; this only keeps the lossy pane fallback
+ * from garbling labels when it isn't. */
+const PREVIEW_COLUMN_RE = /\s{2,}[┌┐└┘├┤┬┴┼│╭╮╰╯✂].*$/u;
+const BOX_DRAWING_CHAR = /[┌┐└┘├┤┬┴┼│╭╮╰╯✂─━]/gu;
+export function stripPreviewColumn(line: string): string {
+  const m = PREVIEW_COLUMN_RE.exec(line);
+  if (!m) return line;
+  const boxChars = m[0].match(BOX_DRAWING_CHAR)?.length ?? 0;
+  return boxChars >= 2 ? line.slice(0, m.index) : line;
+}
 /** Rows that look like options but are the modal's built-in actions, not real
  *  answers. */
 const EXCLUDED_OPTION = /^(Type something\.?|Chat about this)$/;
@@ -203,7 +244,10 @@ const EXCLUDED_OPTION = /^(Type something\.?|Chat about this)$/;
  */
 export function parseModalPane(tail: string): ParsedQuestionPane | null {
   if (!QUESTION_SIGNATURE.test(tail) || !FOOTER_SIGNATURE.test(tail)) return null;
-  const lines = tail.split("\n").map((l) => l.replace(/\s+$/, ""));
+  // Trim trailing whitespace, then strip any right-hand `preview` panel column
+  // (see PREVIEW_COLUMN_RE) so an option's example box never bleeds into the
+  // label or description of an adjacent option.
+  const lines = tail.split("\n").map((l) => stripPreviewColumn(l.replace(/\s+$/, "")));
 
   // Tab bar (multi-question only): `←  ☐ Toppings  ☒ Size  ✔ Submit  →`.
   const tabLine = lines.find((l) => /✔\s*Submit/.test(l) && /[☐☒]/.test(l));
