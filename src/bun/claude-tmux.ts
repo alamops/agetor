@@ -24,7 +24,7 @@ import {
   type TmuxPromptChoice,
 } from "./interactions.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
-import { detectAskModal, parseModalPane, type NavKey } from "./claude-questions.ts";
+import { detectAskModal, parseModalPane, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
 /**
  * Driver that hosts Claude Code's interactive REPL inside a per-task tmux
@@ -1405,41 +1405,222 @@ function readPendingAskQuestionsFromJsonl(jsonlPath: string): AskQuestion[] | nu
   return last && !answered.has(last.id) ? last.questions : null;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Per-option preview capture (pane geometry)
+ *
+ * claude renders an AskUserQuestion option's `preview` in a box-drawn panel to
+ * the RIGHT of the option list — but only for the FOCUSED option, and the TUI
+ * collapses anything taller than the available rows to "✂ N lines hidden". So to
+ * surface real per-option previews live (the JSONL tool_use only lands on
+ * answer), we (a) GROW the detached pane so the panel isn't truncated — verified
+ * de-truncating against real 2.1.170 captures — then (b) navigate each option,
+ * scraping its panel. The user views the webview card, never the pane, so the
+ * resize is invisible; it is always restored afterwards.
+ * ────────────────────────────────────────────────────────────────────────── */
+const PREVIEW_PANE_MIN_COLS = 120; // wider never adds label wraps; widens the box for wide previews
+const PREVIEW_PANE_ROWS = 100;     // covers ~any realistic preview; restored after
+const PREVIEW_REFLOW_MS = 450;     // let claude's Ink TUI redraw after a resize
+const OPTION_NAV_MS = 160;         // settle after each Up/Down before capturing
+
+/** The slice of tmux that `collectAskQuestionsFromPane` drives, behind an
+ *  interface so the navigation / grow / restore orchestration is unit-testable
+ *  with a fake pane (the real one shells out to tmux). */
+interface PaneIo {
+  /** Full pane capture (NOT the scrape tail). */
+  capture(): string;
+  /** Send one nav key; false when tmux errored (session gone). */
+  send(key: NavKey): boolean;
+  /** Current `<w>x<h>`, or null. */
+  size(): { w: number; h: number } | null;
+  resize(w: number, h: number): void;
+  restore(w: number, h: number): void;
+  sleep(ms: number): Promise<void>;
+}
+
+function tmuxPaneIo(state: SessionState): PaneIo {
+  return {
+    capture: () => captureFullPane(state),
+    send: (key) => tmux(["send-keys", "-t", state.sessionName, key]).ok,
+    size: () => paneSize(state),
+    resize: (w, h) => resizePane(state, w, h),
+    restore: (w, h) => restorePaneSize(state, w, h),
+    sleep: (ms) => Bun.sleep(ms),
+  };
+}
+
+/** Whether a captured pane shows the right-hand preview panel — a ≥2-space
+ *  gutter then a box border/vertical that closes near end-of-line. Detects even
+ *  a tall panel whose ┌ top border is above the 40-line scrape tail (its
+ *  `│ … │` content rows still match), so we don't skip a tall-preview question.
+ *  Used only for the GROW decision — a false positive (e.g. a boxed scrollback
+ *  row in the tail) costs nothing but a needless, restored resize, never a wrong
+ *  card; the per-option walk keys on the *parsed* focused preview instead. */
+function paneHasPreviewPanel(text: string): boolean {
+  return text.split("\n").some((l) => /\s{2,}[┌│├][^\n]*[┐│┤]\s*$/u.test(l));
+}
+
+/** Current `<w>x<h>` of the session's window, or null. */
+function paneSize(state: SessionState): { w: number; h: number } | null {
+  const r = tmux(["display-message", "-p", "-t", state.sessionName, "#{window_width}x#{window_height}"]);
+  if (!r.ok) return null;
+  const m = r.stdout.trim().match(/^(\d+)x(\d+)$/);
+  return m ? { w: Number(m[1]), h: Number(m[2]) } : null;
+}
+
+/** Force a detached window to a fixed size (`window-size manual` is required for
+ *  `resize-window` to stick on a session no client is attached to). */
+function resizePane(state: SessionState, w: number, h: number): void {
+  tmux(["set-window-option", "-t", state.sessionName, "window-size", "manual"]);
+  tmux(["resize-window", "-t", state.sessionName, "-x", String(w), "-y", String(h)]);
+}
+
+/** Restore the original size and hand sizing back to tmux (`latest`). Best-effort
+ *  — if the process dies between the grow and this call the pane is just left
+ *  larger, which is harmless (claude's TUI reflows to any size and the next
+ *  attach/resize corrects it). */
+function restorePaneSize(state: SessionState, w: number, h: number): void {
+  tmux(["resize-window", "-t", state.sessionName, "-x", String(w), "-y", String(h)]);
+  tmux(["set-window-option", "-t", state.sessionName, "window-size", "latest"]);
+}
+
+/** Full pane capture (NOT the 40-line tail) — a grown preview panel can be much
+ *  taller than the scrape tail. Sliced to the modal region by the caller. */
+function captureFullPane(state: SessionState): string {
+  const cap = tmux(["capture-pane", "-p", "-t", state.sessionName]);
+  return cap.ok ? cap.stdout : "";
+}
+
+/** Trim a full pane capture to just the current modal (header→footer), so a
+ *  numbered list in the scrollback above can't be mis-read as options. The modal
+ *  always sits at the bottom; the footer ("Esc to cancel") marks its end and the
+ *  `☐`/`☒` header (or tab bar) marks its top. */
+function sliceModalRegion(fullText: string): string {
+  const lines = fullText.split("\n");
+  let footer = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/Esc to cancel/.test(lines[i]!)) { footer = i; break; }
+  }
+  if (footer < 0) return fullText;
+  let top = Math.max(0, footer - 80); // bounded fallback if no header is found
+  for (let i = footer; i >= top; i--) {
+    if (/[☐☒]/.test(lines[i]!)) { top = Math.max(0, i - 1); break; }
+  }
+  return lines.slice(top, footer + 1).join("\n");
+}
+
+/** Fill every option's `preview` for the CURRENT tab by walking the option
+ *  cursor (one Down at a time) and scraping the focused option's panel at each
+ *  stop, then restoring the cursor to option 0. `base` is the already-parsed
+ *  (grown) frame for this tab — its focused option's preview is already set.
+ *  Assumes the cursor starts on option 0 (true at modal open and after a tab
+ *  switch). The pane must already be grown by the caller. */
+async function captureTabWithPreviews(
+  io: PaneIo,
+  stillCurrent: () => boolean,
+  base: ParsedQuestionPane,
+): Promise<ParsedQuestionPane> {
+  const previews: Array<string | undefined> = base.options.map((o) => o.preview);
+  let downs = 0;
+  for (let j = 1; j < base.options.length; j++) {
+    if (!io.send("Down")) break;
+    downs++;
+    await io.sleep(OPTION_NAV_MS);
+    if (!stillCurrent()) break;
+    const p = parseModalPane(sliceModalRegion(io.capture()));
+    // Only trust a capture whose cursor AND option count match — a mid-repaint
+    // frame can't then misassign a preview to the wrong option.
+    if (p && p.cursorIndex === j && p.options.length === base.options.length) {
+      previews[j] = p.options[j]?.preview;
+    }
+  }
+  // Restore the cursor to option 0 (exact Up count — no over-pressing, which
+  // could wrap) so the later answer-drive starts where planAskAnswers expects.
+  for (let k = 0; k < downs; k++) {
+    if (!io.send("Up")) break;
+    await io.sleep(OPTION_NAV_MS);
+    if (!stillCurrent()) break;
+  }
+  base.options.forEach((o, j) => { o.preview = previews[j]; });
+  return base;
+}
+
 /** Pane fallback for when the JSONL tool_use isn't on disk yet: scrape the
- *  visible modal, walking tabs for a multi-question modal. Loses `preview`
- *  blocks (collapsed in the TUI) and any long descriptions the TUI truncates. */
-async function collectAskQuestionsFromPane(state: SessionState, firstTail: string): Promise<AskQuestion[] | null> {
+ *  visible modal. A flat no-preview question registers immediately (fast path,
+ *  no added latency). Otherwise — a tabbed modal, or a flat one already showing
+ *  a preview panel — we grow the detached pane once (so previews aren't
+ *  collapsed to "✂ N lines hidden") and walk it: every tab, and within each tab
+ *  whose focused option has a preview, every option. A tabbed modal always grows
+ *  because any of its questions may carry previews we can only detect by visiting
+ *  the tab. The pane is detached (user sees the webview) and always restored.
+ *  `io` is injectable so the orchestration is unit-testable without tmux. */
+async function collectAskQuestionsFromPane(
+  state: SessionState,
+  firstTail: string,
+  io: PaneIo = tmuxPaneIo(state),
+): Promise<AskQuestion[] | null> {
   const first = parseModalPane(firstTail);
   if (!first) return null;
-  const collected = [first];
-  const n = first.tabbed ? Math.max(1, first.tabHeaders.length) : 1;
-  if (n > 1) {
-    // Walk the tabs to read every question, then return to the first tab so the
-    // answer-driving sequence (planAskAnswers) starts from a known state.
-    await queueTmuxOp(state.taskId, async (stillCurrent) => {
-      for (let i = 1; i < n; i++) {
-        if (!tmux(["send-keys", "-t", state.sessionName, "Right"]).ok) return;
-        await Bun.sleep(180);
-        if (!stillCurrent()) return;
-        const p = parseModalPane(captureTail(state));
-        if (p) collected.push(p);
+  const headers = first.tabHeaders;
+  const n = first.tabbed ? Math.max(1, headers.length) : 1;
+
+  const toAsk = (p: ParsedQuestionPane, header: string | undefined): AskQuestion => ({
+    question: p.questionText,
+    header,
+    multiSelect: p.multiSelect,
+    options: p.options.map((o) => ({ label: o.label, description: o.description, preview: o.preview })),
+  });
+
+  // Fast path: a single flat question with no preview panel — nothing to walk.
+  if (n === 1 && !paneHasPreviewPanel(firstTail)) return [toAsk(first, headers[0])];
+
+  const collected: Array<ParsedQuestionPane | null> = [];
+  await queueTmuxOp(state.taskId, async (stillCurrent) => {
+    const orig = io.size();
+    if (orig) {
+      io.resize(Math.max(orig.w, PREVIEW_PANE_MIN_COLS), PREVIEW_PANE_ROWS);
+      await io.sleep(PREVIEW_REFLOW_MS);
+      if (!stillCurrent()) { io.restore(orig.w, orig.h); return; }
+    }
+    try {
+      for (let t = 0; t < n; t++) {
+        if (t > 0) {
+          if (!io.send("Right")) return; // entering a tab resets the cursor to option 0
+          await io.sleep(180);
+          if (!stillCurrent()) return;
+        }
+        const base = parseModalPane(sliceModalRegion(io.capture()));
+        if (!base) { collected.push(null); return; }
+        if (t === 0 && orig) {
+          // Guard the post-resize transient: a mid-reflow capture can drop an
+          // option and mis-drive the answer. Require two consecutive captures to
+          // agree on the option count before trusting this tab.
+          await io.sleep(OPTION_NAV_MS);
+          const recheck = parseModalPane(sliceModalRegion(io.capture()));
+          if (!recheck || recheck.options.length !== base.options.length) { collected.push(null); return; }
+        }
+        // Walk options only when THIS tab's focused option actually has a panel
+        // (keys on the parsed preview, not a loose pane regex). A tab whose
+        // option 0 has no preview but a later option does is the one known gap —
+        // closing it would mean navigating every no-preview question.
+        const focused = base.options[base.cursorIndex];
+        const tabHasPreview = !!focused && (focused.preview != null || focused.previewTruncated === true);
+        collected.push(tabHasPreview ? await captureTabWithPreviews(io, stillCurrent, base) : base);
       }
-      for (let i = 1; i < n; i++) {
-        if (!tmux(["send-keys", "-t", state.sessionName, "Left"]).ok) return;
-        await Bun.sleep(90);
-        if (!stillCurrent()) return;
+      // Back to the first tab so the answer-driving sequence starts known.
+      for (let t = 1; t < n; t++) {
+        if (!io.send("Left")) break;
+        await io.sleep(90);
+        if (!stillCurrent()) break;
       }
-    }, state);
-  }
+    } finally {
+      if (orig) io.restore(orig.w, orig.h);
+    }
+  }, state);
+
   // Don't register a PARTIAL read: a tab that failed to parse (capture landed
   // mid-repaint) would give the wrong question count and mis-drive the answer.
-  if (collected.length !== n) return null;
-  return collected.map((p, i) => ({
-    question: p.questionText,
-    header: first.tabHeaders[i],
-    multiSelect: p.multiSelect,
-    options: p.options.map((o) => ({ label: o.label, description: o.description })),
-  }));
+  if (collected.length !== n || collected.some((p) => p == null)) return null;
+  return collected.map((p, i) => toAsk(p!, headers[i]));
 }
 
 /** Grace window during which we keep waiting for claude to flush its
@@ -2953,6 +3134,10 @@ export const __forTest = {
   readPendingAskQuestionsFromJsonl,
   shouldWaitForAskJsonl,
   resumeJsonlOffset,
+  /** Drive the pane-scrape AskUserQuestion collector against a fake `PaneIo`
+   *  (no tmux), to assert per-option preview capture + cursor restoration for
+   *  the flat and tabbed/multiSelect layouts. */
+  collectAskQuestionsFromPane,
   /** Override the JSONL verification timeout used by `cycleToMode`. Tests
    *  shrink it to keep "timeout" cases fast. Returns the previous value
    *  so the test can restore it in `afterEach`. */
