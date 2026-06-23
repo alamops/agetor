@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 
 import {
+  buildClaudeSessionEnv,
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_MODE_ACCEPT_EDITS,
   CLAUDE_MODE_AUTO,
@@ -53,6 +54,30 @@ test("encodeProjectPath turns every slash and dot into a dash", () => {
 
 test("sessionNameFor uses the first 12 chars of the task id", () => {
   expect(sessionNameFor("abcdef0123456789-rest")).toBe("agetor-abcdef012345");
+});
+
+test("buildClaudeSessionEnv pins the classic renderer and re-injects PATH", () => {
+  const env = buildClaudeSessionEnv({ CLAUDE_CODE_EFFORT_LEVEL: "low" });
+  // Caller env is preserved…
+  expect(env.CLAUDE_CODE_EFFORT_LEVEL).toBe("low");
+  // …and the classic-renderer pin is forced so a user's global `tui`
+  // fullscreen setting can't flip agetor's session into the alternate
+  // screen buffer (which would break the pane scraper's scrollback reads).
+  expect(env.CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN).toBe("1");
+  // PATH is re-injected from the current process.
+  expect(env.PATH).toBe(process.env.PATH ?? "");
+});
+
+test("buildClaudeSessionEnv's classic-renderer pin is not overridable by caller env", () => {
+  // A harness-level env that tried to enable fullscreen must lose: agetor's
+  // pin is layered last. CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN takes precedence
+  // over CLAUDE_CODE_NO_FLICKER per the docs, so the scraper stays safe even
+  // when both are present.
+  const env = buildClaudeSessionEnv({
+    CLAUDE_CODE_NO_FLICKER: "1",
+    CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "0",
+  });
+  expect(env.CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN).toBe("1");
 });
 
 interface Record { stream: string; data: string }
