@@ -183,8 +183,12 @@ export interface ParsedQuestionPane {
   questionText: string;
   /** True when options render as `[ ]`/`[✔]` checkboxes (multiSelect). */
   multiSelect: boolean;
-  /** Real answer options — excludes "Type something" / "Chat about this" / "Next". */
-  options: Array<{ label: string; description?: string; checked: boolean }>;
+  /** Real answer options — excludes "Type something" / "Chat about this" / "Next".
+   *  `preview` is the focused option's example panel scraped from the side box
+   *  (only the highlighted option's preview is ever on the pane); `previewTruncated`
+   *  is true when the TUI collapsed it to "✂ N lines hidden" and a taller pane is
+   *  needed to read it in full. */
+  options: Array<{ label: string; description?: string; checked: boolean; preview?: string; previewTruncated?: boolean }>;
   /** 0-based cursor position among `options`, or -1 when the cursor is elsewhere. */
   cursorIndex: number;
 }
@@ -237,6 +241,59 @@ export function stripPreviewColumn(line: string): string {
  *  answers. */
 const EXCLUDED_OPTION = /^(Type something\.?|Chat about this)$/;
 
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Side-by-side preview panel
+ *
+ * `stripPreviewColumn` (above) cleans the box OFF each row so it can't bleed
+ * into a label/description. `extractFocusedPreview` (below) does the opposite —
+ * it reads the FOCUSED option's preview text OUT of that box. claude renders the
+ * panel to the RIGHT of the option list, one option at a time;
+ * `collectAskQuestionsFromPane` walks the options to collect them all. Verified
+ * against real 2.1.170 / 2.1.183 captures (fixtures single_preview_full /
+ * single_preview_truncated): borders ┌─┐│├┤└┘, 1-space interior padding, tall
+ * previews collapsed to "├── ✂ N lines hidden ──┤".
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Extract the FOCUSED option's `preview` from a pane capture's side panel.
+ * Returns the joined preview text plus whether the TUI truncated it
+ * ("✂ N lines hidden"), or null when no panel is on the pane. Column-anchored on
+ * the ┌…┐ top border so preview content that itself contains box glyphs can't
+ * confuse it. Drops the box's 1-space left padding and trailing padding while
+ * preserving interior (e.g. ASCII-art) indentation and blank lines.
+ */
+export function extractFocusedPreview(
+  lines: string[],
+): { text: string; truncated: boolean } | null {
+  const cp = lines.map((l) => [...l]);
+  let top = -1, left = -1, right = -1;
+  for (let i = 0; i < cp.length; i++) {
+    const l = cp[i]!;
+    const lc = l.indexOf("┌");
+    if (lc < 2 || l[lc - 1] !== " " || l[lc - 2] !== " ") continue; // need a ≥2-space gutter
+    const rc = l.indexOf("┐", lc + 1);
+    if (rc < 0) continue;
+    top = i; left = lc; right = rc; break;
+  }
+  if (top < 0) return null;
+
+  const out: string[] = [];
+  let truncated = false;
+  for (let i = top + 1; i < cp.length; i++) {
+    const l = cp[i]!;
+    const lb = l[left];
+    if (lb === "└") break;                 // bottom border → panel end
+    if (lb === "├") { truncated = true; break; } // "├── ✂ N lines hidden ──┤"
+    if (lb !== "│") break;                 // panel ended unexpectedly (defensive)
+    let inner = l.slice(left + 1, right).join("");
+    if (inner.startsWith(" ")) inner = inner.slice(1); // drop the 1-space left pad
+    out.push(inner.replace(/\s+$/, ""));   // drop right padding; keep interior
+  }
+  while (out.length && out[out.length - 1] === "") out.pop();
+  if (out.length === 0 && !truncated) return null;
+  return { text: out.join("\n"), truncated };
+}
+
 /**
  * Parse the currently-visible AskUserQuestion modal from a tmux pane capture.
  * Returns null when no question modal is on the pane. The review/submit screen
@@ -244,10 +301,12 @@ const EXCLUDED_OPTION = /^(Type something\.?|Chat about this)$/;
  */
 export function parseModalPane(tail: string): ParsedQuestionPane | null {
   if (!QUESTION_SIGNATURE.test(tail) || !FOOTER_SIGNATURE.test(tail)) return null;
-  // Trim trailing whitespace, then strip any right-hand `preview` panel column
-  // (see PREVIEW_COLUMN_RE) so an option's example box never bleeds into the
-  // label or description of an adjacent option.
-  const lines = tail.split("\n").map((l) => stripPreviewColumn(l.replace(/\s+$/, "")));
+  // Trim trailing whitespace from each row. Read the focused option's preview
+  // from the side panel BEFORE stripping it off, then strip every row so the
+  // box never bleeds into a label / description / the question text below.
+  const rawLines = tail.split("\n").map((l) => l.replace(/\s+$/, ""));
+  const focusedPreview = extractFocusedPreview(rawLines);
+  const lines = rawLines.map(stripPreviewColumn);
 
   // Tab bar (multi-question only): `←  ☐ Toppings  ☒ Size  ✔ Submit  →`.
   const tabLine = lines.find((l) => /✔\s*Submit/.test(l) && /[☐☒]/.test(l));
@@ -281,7 +340,7 @@ export function parseModalPane(tail: string): ParsedQuestionPane | null {
     // lines hidden ──", and the "press n to add notes" hint. Never part of a
     // description — keep them out so the card isn't garbled in the pane fallback.
     || /✂|\blines hidden\b/.test(l) || /^Notes:|press n to add notes/i.test(l.trim());
-  const options = kept.map((r) => {
+  const options: ParsedQuestionPane["options"] = kept.map((r) => {
     // A description may hard-wrap across several rows; gather every row between
     // this option and the next noise boundary (next option / separator / blank
     // / footer), not just the first.
@@ -314,6 +373,14 @@ export function parseModalPane(tail: string): ParsedQuestionPane | null {
     qLines.unshift(l);               // a (possibly wrapped) question row
   }
   const questionText = qLines.join(" ");
+
+  // The side panel only ever shows the highlighted option's preview — attach it
+  // to the cursor option. The caller walks the options (one Down at a time),
+  // re-parsing at each focus, to collect every option's preview.
+  if (focusedPreview && cursorIndex >= 0 && options[cursorIndex]) {
+    options[cursorIndex]!.preview = focusedPreview.text;
+    options[cursorIndex]!.previewTruncated = focusedPreview.truncated;
+  }
 
   return { tabbed: tabHeaders.length > 0, tabHeaders, questionText, multiSelect, options, cursorIndex };
 }

@@ -1,0 +1,29 @@
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Layout scope
+
+Last diagnostic question (the tall preview below lets me verify pane-grow
+actually de-truncates). Real scope decision: should the per-option preview
+capture also handle the tabbed multi-question / multiSelect modal, or just the
+flat single-select layout for v1?
+
+❯ 1. Single-select only (v1)      ┌──────────────────────────────────────────┐
+  2. Both layouts                 │ preview probe line 01                    │
+                                  │ preview probe line 02                    │
+                                  │ preview probe line 03                    │
+                                  │ preview probe line 04                    │
+                                  │ preview probe line 05                    │
+                                  │ preview probe line 06                    │
+                                  │ preview probe line 07                    │
+                                  │ preview probe line 08                    │
+                                  │ preview probe line 09                    │
+                                  │ preview probe line 10                    │
+                                  │ preview probe line 11                    │
+                                  │ preview probe line 12                    │
+                                  └──────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel
