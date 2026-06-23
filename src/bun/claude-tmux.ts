@@ -188,6 +188,46 @@ export function sessionNameFor(taskId: string): string {
   return `agetor-${taskId.slice(0, 12)}`;
 }
 
+/**
+ * Build the env every spawned claude session runs with: the caller-supplied
+ * env (model / effort / CLAUDE_CONFIG_DIR vars from `buildCommand`) with two
+ * agetor pins layered on top.
+ *
+ *   - **PATH** is re-injected from the current process because the tmux
+ *     *server* captures env at its first launch and reuses it for every
+ *     subsequent session — passing it per-session via `-e` guarantees the
+ *     spawned claude sees the freshly-rehydrated PATH even if the long-running
+ *     bundled tmux server captured a stale copy (e.g. agetor restarted with a
+ *     different login-shell PATH).
+ *   - **CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1** forces claude's classic
+ *     (inline) renderer regardless of the user's saved `tui` setting. Claude
+ *     Code v2.1.89+ added an opt-in "Fullscreen rendering" mode (`/tui
+ *     fullscreen` / `CLAUDE_CODE_NO_FLICKER=1`) that draws the TUI on the
+ *     terminal's ALTERNATE screen buffer. The spawned claude reads the user's
+ *     global `~/.claude/settings.json`, so a user who enabled fullscreen in
+ *     their own everyday claude usage would flip agetor's sessions into it too
+ *     — which breaks the pane scraper (`scrapeTimer` → `capture-pane`) we rely
+ *     on to catch the permission / AskUserQuestion modals the hook system
+ *     bypasses: the alt screen has NO scrollback, so the AskUserQuestion
+ *     collector's `capture-pane -p -S -200` comes back truncated, and the modal
+ *     geometry the fingerprinting is tuned to changes. agetor never shows the
+ *     tmux pane (its own UI renders the JSONL stream), so fullscreen's
+ *     flicker / memory / mouse wins are irrelevant here. Per the docs this var
+ *     takes precedence over `CLAUDE_CODE_NO_FLICKER` and the `tui` setting.
+ *     Docs: https://code.claude.com/docs/en/fullscreen
+ *
+ * Both pins come AFTER the caller spread on purpose: agetor's classic-renderer
+ * guarantee must not be silently overridable by a harness-level env that set
+ * `CLAUDE_CODE_NO_FLICKER`.
+ */
+export function buildClaudeSessionEnv(callerEnv: Record<string, string>): Record<string, string> {
+  return {
+    ...callerEnv,
+    PATH: process.env.PATH ?? "",
+    CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "1",
+  };
+}
+
 interface ContentBlock {
   type: string;
   text?: string;
@@ -2186,23 +2226,15 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
 
   // Build the tmux command. `-e KEY=VAL` injects env vars into the new
   // session (so the spawned claude inherits them); `--` separates the tmux
-  // flags from the command to run.
-  //
-  // PATH is injected explicitly because the tmux *server* captures env at
-  // its first launch and reuses it for every subsequent session — passing
-  // it per-session via `-e` guarantees the spawned claude sees the
-  // currently-rehydrated PATH even if the server's captured copy is stale
-  // (e.g. agetor restarted with a different login-shell PATH but the
-  // long-running bundled tmux server is still around).
+  // flags from the command to run. `buildClaudeSessionEnv` layers agetor's
+  // forced pins (PATH re-injection, classic-renderer) over the caller env —
+  // see that helper for the full rationale.
   //
   // We no longer inject AGETOR_API_PORT/TOKEN/TASK_ID: with the PreToolUse hook
   // and the ask_user MCP both gone, nothing in the spawned claude reads them,
   // and AGETOR_API_TOKEN gates every orchestration route — no reason to expose
   // it to the agent's environment.
-  const fullEnv: Record<string, string> = {
-    ...opts.env,
-    PATH: process.env.PATH ?? "",
-  };
+  const fullEnv = buildClaudeSessionEnv(opts.env);
   const tmuxArgs: string[] = ["new-session", "-d", "-s", sessionName, "-c", opts.cwd];
   for (const [k, v] of Object.entries(fullEnv)) tmuxArgs.push("-e", `${k}=${v}`);
   tmuxArgs.push("--", ...opts.argv);
