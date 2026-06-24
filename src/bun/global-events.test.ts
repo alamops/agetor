@@ -68,6 +68,51 @@ test("startTask emits column → running and run-status → succeeded", async ()
   tasks.delete(created.task.id);
 });
 
+test("registering and resolving an interaction emits global interaction events", async () => {
+  // Importing the orchestrator installs the interactions broadcaster bridges
+  // (setBroadcaster / setResolvedBroadcaster) that also fan interactions onto
+  // the app-level global bus — the channel the notification hook listens on.
+  const { subscribeGlobal, wireInteractionBroadcast } = await import("./orchestrator.ts");
+  const { registerTmuxPrompt, cancelPendingForTask } = await import("./interactions.ts");
+
+  // The interactions broadcaster is a single process-wide callback; a sibling
+  // test (interactions.test.ts) may have overridden it to capture raw
+  // broadcasts. Re-establish the real wiring so this test is order-independent.
+  wireInteractionBroadcast();
+
+  const taskId = "int-evt-task";
+  const runId = "int-evt-run";
+
+  const events: GlobalEvent[] = [];
+  const unsub = subscribeGlobal((e) => {
+    if (e.kind === "interaction" && e.taskId === taskId) events.push(e);
+  });
+
+  const { id } = registerTmuxPrompt({
+    taskId,
+    runId,
+    paneText: "Proceed?",
+    choices: [{ key: "1", label: "Yes" }],
+    fingerprint: "fp-int-evt",
+  });
+
+  cancelPendingForTask(taskId, "test");
+  unsub();
+
+  const pending = events.find((e) => e.kind === "interaction" && e.state === "pending");
+  expect(pending).toBeDefined();
+  if (pending?.kind === "interaction") {
+    expect(pending.interactionId).toBe(id);
+    expect(pending.runId).toBe(runId);
+  }
+
+  const resolved = events.find((e) => e.kind === "interaction" && e.state === "resolved");
+  expect(resolved).toBeDefined();
+  if (resolved?.kind === "interaction") {
+    expect(resolved.interactionId).toBe(id);
+  }
+});
+
 test("reconcileOrphans emits run-status → orphaned + column → ready", async () => {
   const { createTask, subscribeGlobal, reconcileOrphans } = await import("./orchestrator.ts");
   const { tasks, runs, db } = await import("./db.ts");

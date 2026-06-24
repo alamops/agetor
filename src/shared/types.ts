@@ -720,6 +720,25 @@ export type GlobalEvent =
       /** Human-readable detail (error message, etc). */
       message: string | null;
       ts: number;
+    }
+  | {
+      /**
+       * A question / permission prompt was registered (`pending`) or cleared
+       * (`resolved`). Distinct from the per-task `interaction` SSE event (which
+       * only reaches the open RunPanel): this rides the app-level bus so the
+       * notification hook can alert the user — with a native OS notification
+       * and a "Waiting on you" toast — even when the agetor window is
+       * backgrounded mid-workflow and the panel can't repaint the card.
+       */
+      kind: "interaction";
+      taskId: string;
+      runId: string;
+      state: "pending" | "resolved";
+      /** Stable id of the interaction, so the UI can track which prompts are
+       *  live per task (several can stack) and clear the alert only once the
+       *  last one resolves. */
+      interactionId: string;
+      ts: number;
     };
 
 /**
