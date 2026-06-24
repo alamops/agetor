@@ -173,6 +173,24 @@ export async function listBranches(dir: string): Promise<BranchInfo[]> {
   return branches;
 }
 
+/**
+ * Fetch every remote for the repo containing `dir`, pruning deleted
+ * remote-tracking refs so the branch picker mirrors the remote exactly. After
+ * this resolves, `listBranches` surfaces any newly-fetched `origin/*` branches.
+ *
+ * Network-bound, so it gets a longer budget than the default 30 s git()
+ * timeout. A repo with no remotes succeeds with no output. Returns
+ * `{ ok: false, error }` when `dir` isn't a git repo or the fetch failed — the
+ * stderr (where git writes auth/network errors) is surfaced for the UI.
+ */
+export async function gitFetch(dir: string): Promise<{ ok: boolean; error?: string }> {
+  const root = await repoRoot(dir);
+  if (!root) return { ok: false, error: "not a git repository" };
+  const res = await git(["fetch", "--all", "--prune"], root, 120_000);
+  if (!res.ok) return { ok: false, error: res.stderr || `git fetch failed (exit ${res.exitCode})` };
+  return { ok: true };
+}
+
 function slugify(s: string): string {
   return s
     .toLowerCase()
