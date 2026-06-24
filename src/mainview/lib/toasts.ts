@@ -23,6 +23,12 @@ export interface ToastArgs {
 
 // Track active pending toasts so a column-leaves-blocked transition can
 // dismiss the matching toast without the caller carrying the id around.
+// Single-slot per task, SHARED by every "needs attention" helper here
+// (`toastPending`, `toastApiError`, `notifyWaitingInput`) and cleared by
+// `dismissPending`. Only one such toast shows per task at a time — a second
+// writer dismisses the first. That's fine while these states don't realistically
+// co-occur (an api-error means the turn died, so there's no live modal); if a
+// future caller can overlap them, key this by `(taskId, kind)` instead.
 const pendingByTask = new Map<string, string | number>();
 
 function describe(args: ToastArgs): string {
@@ -98,6 +104,34 @@ export function toastPending(args: ToastArgs): void {
  *  "the agent is waiting on your answer." */
 export function toastApiError(args: ToastArgs): void {
   showBlockingToast({ method: toast.error, heading: "API error — retry" }, args);
+}
+
+/**
+ * Alert the user that a question / permission prompt is waiting on them.
+ * Distinct from `toastPending` (the `blocked`-column path) in one crucial way:
+ * it fires the native OS notification when the window is unfocused **even if
+ * the prompted task is the currently-open panel**. That case — panel open but
+ * the agetor window backgrounded behind a long workflow — is exactly when the
+ * occluded webview can't repaint the question card, so the notification is the
+ * only thing that pulls the user back. The in-app sonner toast is still
+ * suppressed for the open panel (the card is already there, or will be the
+ * instant the window repaints on focus).
+ */
+export function notifyWaitingInput(args: ToastArgs): void {
+  maybeNotifyOS(args, "Waiting on you", describe(args));
+  if (args.isSelected) return;
+  const prior = pendingByTask.get(args.taskId);
+  if (prior !== undefined) toast.dismiss(prior);
+  const detail = describe(args);
+  const id = toast.warning("Waiting on you", {
+    description: detail,
+    duration: Infinity,
+    action: { label: "Open", onClick: args.onOpen },
+    onDismiss: () => {
+      if (pendingByTask.get(args.taskId) === id) pendingByTask.delete(args.taskId);
+    },
+  });
+  pendingByTask.set(args.taskId, id);
 }
 
 /** Clear the pending toast for a task (called when the task leaves `blocked`). */

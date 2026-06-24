@@ -17,7 +17,8 @@ import { UpdateBanner } from "@/components/updater/UpdateBanner";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, toastApiError, toastError, toastPending, toastSuccess } from "@/lib/toasts";
+import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSuccess } from "@/lib/toasts";
+import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { cn } from "@/lib/utils";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
@@ -194,6 +195,10 @@ export default function App() {
   // current state without re-subscribing on every render.
   const tasksRef = useRef<Task[]>(tasks);
   const selectedIdRef = useRef<string | null>(selected?.id ?? null);
+  // Tracks interaction ids awaiting an answer, keyed by task. Lets the
+  // notification hook alert only on the FIRST prompt for a task (not once per
+  // stacked prompt) and clear the alert only when the LAST one resolves.
+  const pendingInputRef = useRef<PendingInputTracker>(new PendingInputTracker());
   useEffect(() => { tasksRef.current = tasks; }, [tasks]);
   useEffect(() => { selectedIdRef.current = selected?.id ?? null; }, [selected]);
 
@@ -261,11 +266,43 @@ export default function App() {
         // many browsers but works inside WKWebView.
         window.focus();
       };
+      if (ev.kind === "interaction") {
+        // A question / permission prompt opened or closed. The tracker raises
+        // the alert only on the first prompt for a task and clears it only when
+        // the last one resolves — stacked prompts don't re-alert.
+        const tracker = pendingInputRef.current;
+        if (ev.state === "pending") {
+          if (tracker.add(ev.taskId, ev.interactionId)) {
+            notifyWaitingInput({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+          }
+        } else if (tracker.remove(ev.taskId, ev.interactionId)) {
+          dismissPending(ev.taskId);
+        }
+        // Optimistically reflect the change in the card's pending count so the
+        // "needs input" amber-pulse flag (TaskCard, gated on
+        // pendingInteractionCount) appears the instant the prompt lands rather
+        // than waiting up to 2s for the next /tasks poll, which then reconciles
+        // the true count.
+        setTasks((cur) =>
+          cur.map((t) => {
+            if (t.id !== ev.taskId) return t;
+            const next = ev.state === "pending"
+              ? t.pendingInteractionCount + 1
+              : Math.max(0, t.pendingInteractionCount - 1);
+            return { ...t, pendingInteractionCount: next };
+          }),
+        );
+        return;
+      }
       if (ev.kind === "run-status") {
         // Any terminal run state supersedes a pending-input prompt — clear the
         // "Waiting on you" toast so it doesn't linger next to the success/
-        // failure toast (or silently after a cancel).
+        // failure toast (or silently after a cancel). Also drop the tracker's
+        // entry: a run that ends with a modal still on the pane may never emit
+        // a resolved interaction, and a stale id would otherwise suppress the
+        // first-prompt alert for this task's next run.
         dismissPending(ev.taskId);
+        pendingInputRef.current.clearTask(ev.taskId);
         if (ev.status === "succeeded") {
           toastSuccess({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.status === "failed" || ev.status === "orphaned") {
