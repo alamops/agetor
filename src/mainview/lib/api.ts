@@ -233,6 +233,14 @@ export const api = {
     }).then((r) => r.refs),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
+  /** `git fetch --all --prune` on the project so newly pushed remote branches
+   *  show up in the branch picker. Resolves once the fetch completes; the
+   *  caller re-lists branches afterwards. */
+  gitFetch: (dir: string) =>
+    j<{ ok: true }>("/projects/fetch", {
+      method: "POST",
+      body: JSON.stringify({ path: dir }),
+    }),
   getTmuxSource: () =>
     j<{
       source: "system" | "bundled";
