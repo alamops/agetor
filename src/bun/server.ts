@@ -42,7 +42,7 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { planAskAnswers } from "./claude-questions.ts";
-import { getTaskDiff, hasUncommittedChanges, listBranches } from "./worktree.ts";
+import { getTaskDiff, gitFetch, hasUncommittedChanges, listBranches } from "./worktree.ts";
 import {
   attachSocket,
   closeTerminal,
@@ -283,6 +283,21 @@ export function startApiServer() {
           const dir = url.searchParams.get("path");
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
           return json(await listBranches(dir), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Fetch all remotes for a project so the branch picker can surface newly
+      // pushed branches without leaving agetor. Network-bound — the helper uses
+      // a longer git timeout than the read-only routes above.
+      "/projects/fetch": {
+        POST: authed(async (req) => {
+          const { path: p } = (await req.json().catch(() => ({}))) as { path?: string };
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitFetch(p);
+          if (!result.ok) {
+            return json({ error: result.error ?? "git fetch failed" }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
 

@@ -341,3 +341,71 @@ test("hasUncommittedChanges returns true for a modified tracked file", async () 
   writeFileSync(path.join(repo, "README"), "changed\n");
   expect(await hasUncommittedChanges(repo)).toBe(true);
 });
+
+test("gitFetch returns an error when the dir isn't a git repo", async () => {
+  const { gitFetch } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-fetch-nongit-"));
+  const r = await gitFetch(dir);
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("not a git repository");
+});
+
+test("gitFetch succeeds (no-op) for a repo with no remotes", async () => {
+  const { gitFetch } = await import("./worktree.ts");
+  // `git fetch --all` with nothing to fetch exits 0 — the picker just sees the
+  // existing local branches, so the button shouldn't surface a spurious error.
+  const repo = await makeRepo();
+  const r = await gitFetch(repo);
+  expect(r.ok).toBe(true);
+  expect(r.error).toBeUndefined();
+});
+
+test("gitFetch pulls a newly pushed branch so listBranches surfaces it", async () => {
+  const { gitFetch, listBranches } = await import("./worktree.ts");
+  // `origin` is a normal repo we point the clone at; a new branch pushed here
+  // after the clone is invisible to the clone until a fetch runs.
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-fetch-clone-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  // The clone starts unaware of a branch created on origin post-clone.
+  await git(["checkout", "-b", "feature/new-remote-branch"], origin);
+  writeFileSync(path.join(origin, "feature.txt"), "remote work\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feature commit"], origin);
+
+  const before = await listBranches(clone);
+  expect(before.some((b) => b.name.endsWith("feature/new-remote-branch"))).toBe(false);
+
+  const r = await gitFetch(clone);
+  expect(r.ok).toBe(true);
+
+  const after = await listBranches(clone);
+  expect(after.some((b) => b.name.endsWith("feature/new-remote-branch"))).toBe(true);
+});
+
+test("gitFetch --prune drops a remote-tracking branch deleted on origin", async () => {
+  const { gitFetch, listBranches } = await import("./worktree.ts");
+  // Prove the `--prune` flag really mirrors the remote: a branch that exists at
+  // clone time but is later deleted on origin must disappear from the picker.
+  const origin = await makeRepo();
+  await git(["checkout", "-b", "feature/short-lived"], origin);
+  writeFileSync(path.join(origin, "tmp.txt"), "x\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "short lived"], origin);
+  // Leave origin checked out on main so the branch can be deleted later.
+  await git(["checkout", "main"], origin);
+
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-fetch-prune-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+  const cloned = await listBranches(clone);
+  expect(cloned.some((b) => b.name.endsWith("feature/short-lived"))).toBe(true);
+
+  // Delete the branch on origin, then fetch+prune from the clone.
+  await git(["branch", "-D", "feature/short-lived"], origin);
+  const r = await gitFetch(clone);
+  expect(r.ok).toBe(true);
+
+  const pruned = await listBranches(clone);
+  expect(pruned.some((b) => b.name.endsWith("feature/short-lived"))).toBe(false);
+});
