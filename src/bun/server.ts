@@ -42,7 +42,7 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { planAskAnswers } from "./claude-questions.ts";
-import { getTaskDiff, gitFetch, hasUncommittedChanges, listBranches } from "./worktree.ts";
+import { getTaskDiff, gitFetch, gitPull, hasUncommittedChanges, listBranches } from "./worktree.ts";
 import {
   attachSocket,
   closeTerminal,
@@ -296,6 +296,23 @@ export function startApiServer() {
           const result = await gitFetch(p);
           if (!result.ok) {
             return json({ error: result.error ?? "git fetch failed" }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Fast-forward a single local branch to its upstream (the branch picker's
+      // Git Pull button). Network-bound like /projects/fetch. `branch` is the
+      // selected branch's short name; the helper picks `git pull --ff-only` for
+      // the checked-out branch and a checkout-free fast-forward otherwise.
+      "/projects/pull": {
+        POST: authed(async (req) => {
+          const { path: p, branch } = (await req.json().catch(() => ({}))) as { path?: string; branch?: string };
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!branch) return json({ error: "branch required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitPull(p, branch);
+          if (!result.ok) {
+            return json({ error: result.error ?? "git pull failed" }, { status: 400, headers: corsHeaders(req) });
           }
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),

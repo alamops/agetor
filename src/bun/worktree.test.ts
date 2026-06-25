@@ -409,3 +409,167 @@ test("gitFetch --prune drops a remote-tracking branch deleted on origin", async 
   const pruned = await listBranches(clone);
   expect(pruned.some((b) => b.name.endsWith("feature/short-lived"))).toBe(false);
 });
+
+test("listBranches reports behind/ahead/upstream once origin moves ahead + fetch", async () => {
+  const { gitFetch, listBranches } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-behind-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  // A fresh clone is in sync with its upstream.
+  const fresh = (await listBranches(clone)).find((b) => b.name === "main");
+  expect(fresh?.upstream).toBe("origin/main");
+  expect(fresh?.behind).toBe(0);
+  expect(fresh?.ahead).toBe(0);
+
+  // Advance origin/main, then fetch so the clone's tracking ref sees it.
+  writeFileSync(path.join(origin, "more.txt"), "x\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "second"], origin);
+  await gitFetch(clone);
+
+  const list = await listBranches(clone);
+  const after = list.find((b) => b.name === "main");
+  expect(after?.behind).toBe(1);
+  expect(after?.ahead).toBe(0);
+  // Regression guard: with the local `main` behind, `origin/main` has a newer
+  // commit date and sorts ahead of it. The dedup must still keep the LOCAL row
+  // (not collapse to the remote-tracking ref), or the picker would lose the
+  // current/behind/upstream signal for the branch the user actually pulls.
+  expect(after?.remote).toBe(false);
+  expect(list.some((b) => b.name === "origin/main")).toBe(false);
+});
+
+test("gitPull fast-forwards the checked-out branch and clears the behind count", async () => {
+  const { gitPull, listBranches } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-current-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  writeFileSync(path.join(origin, "more.txt"), "x\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "second"], origin);
+
+  const r = await gitPull(clone, "main");
+  expect(r.ok).toBe(true);
+  // The fast-forwarded file is now present in the clone's working tree.
+  expect(existsSync(path.join(clone, "more.txt"))).toBe(true);
+  const after = (await listBranches(clone)).find((b) => b.name === "main");
+  expect(after?.behind).toBe(0);
+});
+
+test("gitPull fast-forwards a non-checked-out local branch without a checkout", async () => {
+  const { gitFetch, gitPull, listBranches } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  // Create a feature branch on origin so the clone can track it.
+  await git(["checkout", "-b", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f1\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat1"], origin);
+  await git(["checkout", "main"], origin);
+
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-other-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+  // Materialize a local `feature` tracking origin/feature, then switch back to
+  // main so `feature` is NOT the checked-out branch.
+  await git(["checkout", "feature"], clone);
+  await git(["checkout", "main"], clone);
+
+  // Advance origin/feature.
+  await git(["checkout", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f2\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat2"], origin);
+  await git(["checkout", "main"], origin);
+
+  await gitFetch(clone);
+  expect((await listBranches(clone)).find((b) => b.name === "feature")?.behind).toBe(1);
+
+  const r = await gitPull(clone, "feature");
+  expect(r.ok).toBe(true);
+  expect((await listBranches(clone)).find((b) => b.name === "feature")?.behind).toBe(0);
+  // main is still the checked-out branch — the pull didn't switch worktrees.
+  expect((await listBranches(clone)).find((b) => b.current)?.name).toBe("main");
+});
+
+test("gitPull refuses to fast-forward a diverged branch", async () => {
+  const { gitFetch, gitPull } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-diverged-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  // A local commit on the clone…
+  writeFileSync(path.join(clone, "local.txt"), "L\n");
+  await git(["add", "."], clone);
+  await git(["commit", "-m", "local"], clone);
+  // …and a different commit on origin → divergence.
+  writeFileSync(path.join(origin, "remote.txt"), "R\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "remote"], origin);
+  await gitFetch(clone);
+
+  const r = await gitPull(clone, "main");
+  expect(r.ok).toBe(false);
+  expect(r.error).toBeTruthy();
+});
+
+test("gitPull refuses a non-checked-out branch that has diverged from its upstream", async () => {
+  const { gitFetch, gitPull } = await import("./worktree.ts");
+  // Exercises the `git fetch . <tracking>:<branch>` path's fast-forward-only
+  // guard (distinct from the checked-out `git pull --ff-only` path above).
+  const origin = await makeRepo();
+  await git(["checkout", "-b", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f1\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat1"], origin);
+  await git(["checkout", "main"], origin);
+
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-other-diverged-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+  // Materialize a local `feature`, give it a local-only commit, then switch back
+  // to main so `feature` is the non-checked-out branch we pull.
+  await git(["checkout", "feature"], clone);
+  writeFileSync(path.join(clone, "local.txt"), "L\n");
+  await git(["add", "."], clone);
+  await git(["commit", "-m", "local feat"], clone);
+  await git(["checkout", "main"], clone);
+
+  // A different commit on origin/feature → divergence.
+  await git(["checkout", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f2\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat2"], origin);
+  await git(["checkout", "main"], origin);
+
+  await gitFetch(clone);
+  const r = await gitPull(clone, "feature");
+  expect(r.ok).toBe(false);
+  expect(r.error).toBeTruthy();
+});
+
+test("gitPull returns an error when the dir isn't a git repo", async () => {
+  const { gitPull } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-nongit-"));
+  const r = await gitPull(dir, "main");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("not a git repository");
+});
+
+test("gitPull errors when the selected branch has no upstream", async () => {
+  const { gitPull } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  // A second local branch with no upstream, while `main` stays checked out so
+  // we exercise the non-checked-out path's upstream lookup.
+  await git(["branch", "other"], repo);
+  const r = await gitPull(repo, "other");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("no upstream");
+});
+
+test("gitPull rejects a branch name that could be read as a git flag", async () => {
+  const { gitPull } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const r = await gitPull(repo, "--upload-pack=evil");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("invalid branch name");
+});

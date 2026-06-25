@@ -2,6 +2,7 @@ import type {
   AgentKind,
   AgentStatus,
   AppEvent,
+  BranchInfo,
   ColumnId,
   GlobalEvent,
   Harness,
@@ -26,7 +27,10 @@ export interface UpdateSnapshot {
   lastCheckedAt: number | null;
 }
 
-export interface BranchInfo { name: string; committedAt: number; current: boolean }
+// Re-exported from shared so existing `import { type BranchInfo } from "@/lib/api"`
+// callers (BranchPicker) keep working while the single definition lives in
+// src/shared/types.ts (server + webview share one wire shape).
+export type { BranchInfo };
 
 /** Where a command/extension comes from. `plugin` entries are contributed by an
  *  enabled Claude Code plugin and are namespaced `<plugin>:<name>`; `builtin`
@@ -240,6 +244,15 @@ export const api = {
     j<{ ok: true }>("/projects/fetch", {
       method: "POST",
       body: JSON.stringify({ path: dir }),
+    }),
+  /** Fast-forward a single local `branch` to its upstream (the picker's Git Pull
+   *  button). The caller re-lists branches afterwards so the behind indicator
+   *  refreshes. Rejects (ApiError) on divergence, missing upstream, or network
+   *  failure — the git stderr rides along as the error message. */
+  gitPull: (dir: string, branch: string) =>
+    j<{ ok: true }>("/projects/pull", {
+      method: "POST",
+      body: JSON.stringify({ path: dir, branch }),
     }),
   getTmuxSource: () =>
     j<{
