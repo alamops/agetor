@@ -2483,16 +2483,30 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // soon as it appears regardless.
   const BOOT_TIMEOUT_MS = 30_000;
   (async () => {
-    // Concurrently watch for a one-time startup consent dialog (the
-    // `--dangerously-skip-permissions` bypass warning, or the trust-folder
-    // prompt) blocking claude from ever writing its JSONL. Auto-confirm it —
-    // each maps to a choice the user already made (see STARTUP_CONSENT_DIALOGS).
-    // Without this the dialog sits unanswered until BOOT_TIMEOUT_MS and the run
-    // dies with an empty pane; this is the failure a claude version bump that
-    // re-shows the bypass acceptance reliably triggers. The poller self-stops
+    // Concurrently watch the boot pane for a dialog blocking claude from ever
+    // writing its JSONL. Two classes are handled:
+    //
+    //   (1) Known consent dialogs (the `--dangerously-skip-permissions` bypass
+    //       warning, or the trust-folder prompt). Auto-confirm — each maps to
+    //       a choice the user already made (see STARTUP_CONSENT_DIALOGS).
+    //   (2) Any OTHER interactive question claude poses before its JSONL exists
+    //       — e.g. the "Claude in Chrome extension detected" trust prompt a
+    //       version bump can introduce. We can't answer these for the user, so
+    //       we surface them as a normal interactive tmux_prompt card and let
+    //       the user decide; the boot wait below keeps the run alive while such
+    //       a prompt is outstanding instead of letting it die at the timeout.
+    //
+    // Without this a blocking dialog sits unanswered until BOOT_TIMEOUT_MS and
+    // the run dies with the dialog stranded on the pane. The poller self-stops
     // the moment the JSONL appears, the session dies, or boot settles.
     let bootSettled = false;
     let lastConfirmedFingerprint: string | null = null;
+    let lastGenericFingerprint: string | null = null;
+    // Set by the poller whenever a startup question is on the pane during the
+    // current boot-wait window; read (and reset) by the wait loop so a window
+    // in which the user was being asked something never counts toward the
+    // timeout. Shared scope with the wait loop below.
+    let sawStartupPromptThisWindow = false;
     void (async () => {
       // Wrapped so a stray throw can never become an unhandled rejection on
       // the fire-and-forget IIFE (mirrors `startScraper`'s try/catch posture);
@@ -2507,6 +2521,11 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           if (bootSettled || existsSync(jsonlPath)) return;
           if (!tmux(["has-session", "-t", sessionName]).ok) return;
           const pane = tmux(["capture-pane", "-p", "-t", sessionName]).stdout;
+          // A startup prompt we already surfaced and is still awaiting the
+          // user keeps the boot window from expiring under them.
+          if (activeTmuxPromptsForTask(opts.taskId).length > 0) {
+            sawStartupPromptThisWindow = true;
+          }
           const m = matchStartupConsentDialog(pane);
           // Single-tick action is deliberate (unlike the runtime scraper's
           // two-tick stability gate): this only runs during the bounded boot
@@ -2517,17 +2536,89 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           // landed, so a transient send-keys failure retries next tick instead
           // of stranding the dialog. A genuinely different follow-up dialog
           // (new fingerprint) is still acted on.
-          if (m && m.fingerprint !== lastConfirmedFingerprint) {
-            if (await confirmStartupDialog(sessionName, m)) {
-              lastConfirmedFingerprint = m.fingerprint;
-              opts.onChunk("status", `claude startup dialog auto-confirmed (${m.name})`);
+          if (m) {
+            // A consent dialog is on the pane — never also treat it as a
+            // generic question (its repaint frames must not leak into an
+            // interactive card while we auto-confirm it).
+            lastGenericFingerprint = null;
+            if (m.fingerprint !== lastConfirmedFingerprint) {
+              if (await confirmStartupDialog(sessionName, m)) {
+                lastConfirmedFingerprint = m.fingerprint;
+                opts.onChunk("status", `claude startup dialog auto-confirmed (${m.name})`);
+              }
+            }
+            continue;
+          }
+
+          // Not a known consent dialog. If claude is showing some other
+          // numbered / yes-no question, surface it interactively so the user
+          // can answer and unblock boot. Mirror the runtime scraper's tail
+          // slice, two-tick stability gate, and external-dismissal sweep.
+          const paneLines = pane.split("\n");
+          const tail = paneLines.slice(Math.max(0, paneLines.length - SCRAPE_TAIL_LINES)).join("\n");
+          const generic = matchNumberedModal(tail) ?? matchYesNoModal(tail);
+          if (!generic) { lastGenericFingerprint = null; continue; }
+          // External dismissal: a previously surfaced startup prompt whose
+          // content no longer matches the pane (user answered it from a real
+          // `tmux attach`) — resolve it so the card clears.
+          for (const pending of activeTmuxPromptsForTask(opts.taskId)) {
+            if (pending.fingerprint !== generic.fingerprint) {
+              answerTmuxPrompt(pending.id, { key: "__external__" });
             }
           }
+          if (lastGenericFingerprint !== generic.fingerprint) {
+            lastGenericFingerprint = generic.fingerprint;
+            continue; // require two consecutive identical scrapes
+          }
+          if (findTmuxPromptByFingerprint(opts.taskId, generic.fingerprint)) {
+            sawStartupPromptThisWindow = true;
+            continue; // already on a card
+          }
+          // Just answered this exact dialog? It can linger on the pane for a
+          // tick while tmux/claude repaint — re-carding it would flash a ghost
+          // duplicate. The answer route stamps `recentlyAnsweredFingerprints`
+          // on this same SessionState via `markTmuxPromptAnswered`; honour it
+          // here exactly as the runtime scraper (`scrapeOnce`) does.
+          if (state.recentlyAnsweredFingerprints.has(generic.fingerprint)) continue;
+          // Need an active run to attach the interaction to. The orchestrator
+          // sets task.runId before spawning, so this is populated by boot time.
+          const runId = tasks.get(opts.taskId)?.runId;
+          if (!runId) continue;
+          registerTmuxPrompt({
+            taskId: opts.taskId,
+            runId,
+            paneText: generic.paneText,
+            choices: generic.choices,
+            cursorIndex: generic.cursorIndex,
+            fingerprint: generic.fingerprint,
+          });
+          sawStartupPromptThisWindow = true;
+          opts.onChunk("status", "claude is asking a question on startup — answer it to continue");
         }
       } catch { /* never let the boot poller crash the spawn */ }
     })();
 
-    const found = await waitForJsonlAt(jsonlPath, BOOT_TIMEOUT_MS);
+    // Wait for the JSONL, re-arming for another full window whenever a startup
+    // question was on the pane during the just-elapsed one. This is what keeps
+    // a run that's legitimately waiting on the user from dying at the timeout,
+    // and gives claude a fresh window to write its JSONL after the answer
+    // lands — without it, a question answered late in the window would race
+    // the deadline. A genuinely hung boot (no question ever shown) still fails
+    // at BOOT_TIMEOUT_MS because the flag stays false. We only re-arm while the
+    // tmux session is still alive: a Stop/delete mid-boot kills the session and
+    // resolves any pending prompt, so without this guard a window that *had*
+    // seen a prompt would arm one more full BOOT_TIMEOUT_MS before the cleanup
+    // branch runs.
+    let found = false;
+    for (;;) {
+      sawStartupPromptThisWindow = false;
+      found = await waitForJsonlAt(jsonlPath, BOOT_TIMEOUT_MS);
+      if (found) break;
+      const blockedOnUser =
+        sawStartupPromptThisWindow || activeTmuxPromptsForTask(opts.taskId).length > 0;
+      if (blockedOnUser && tmux(["has-session", "-t", sessionName]).ok) continue;
+      break;
+    }
     bootSettled = true;
     if (!found) {
       const stillAlive = tmux(["has-session", "-t", sessionName]).ok;
