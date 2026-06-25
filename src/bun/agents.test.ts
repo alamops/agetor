@@ -356,6 +356,47 @@ test("codex resume injects the `resume <thread_id>` subcommand before the stdin 
   expect(cmd.indexOf("--json")).toBeLessThan(cmd.indexOf("resume"));
 });
 
+test("codex auto with external git dirs escalates to danger-full-access + approval_policy=never", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    mode: "auto",
+    codexExternalGitDirs: ["/Users/me/Projects/app/.git"],
+  });
+  // Sandbox is dropped to full access (workspace-write can't reach the external
+  // .git), paired with approval_policy=never so headless exec never stalls.
+  expect(cmd).toContain("danger-full-access");
+  expect(cmd).not.toContain("workspace-write");
+  const ap = cmd.indexOf("approval_policy=never");
+  expect(ap).toBeGreaterThan(-1);
+  expect(cmd[ap - 1]).toBe("-c");
+});
+
+test("codex auto + external git dirs keeps the escalation before the `resume` subcommand", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", {
+    ...codexDefaults,
+    mode: "auto",
+    codexExternalGitDirs: ["/repo/.git"],
+    resumeSessionId: "thread-xyz",
+  });
+  // Parent flags (incl. the approval_policy -c) must precede `resume`.
+  expect(cmd.indexOf("danger-full-access")).toBeLessThan(cmd.indexOf("resume"));
+  expect(cmd.indexOf("approval_policy=never")).toBeLessThan(cmd.indexOf("resume"));
+});
+
+test("codex 'ask' mode stays read-only even when external git dirs are present", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, mode: "ask", codexExternalGitDirs: ["/repo/.git"] });
+  expect(cmd).toContain("read-only");
+  expect(cmd).not.toContain("danger-full-access");
+  expect(cmd).not.toContain("approval_policy=never");
+});
+
+test("codex auto with no external git dirs stays on workspace-write (ordinary checkout)", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, mode: "auto", codexExternalGitDirs: [] });
+  expect(cmd).toContain("workspace-write");
+  expect(cmd).not.toContain("danger-full-access");
+  expect(cmd).not.toContain("approval_policy=never");
+});
+
 test("codex effort 'high' adds -c model_reasoning_effort=high", () => {
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, effort: "high", mode: "auto" });
   expect(cmd).toContain("-c");

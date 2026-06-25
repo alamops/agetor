@@ -94,6 +94,70 @@ test("prepareWorkdir creates a worktree + branch inside a git repo", async () =>
   expect(existsSync(path.join(r.cwd, "README"))).toBe(true);
 });
 
+test("gitWritableRootsSync returns the source repo's .git for a linked worktree", async () => {
+  const { prepareWorkdir, gitWritableRootsSync } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+  const r = await prepareWorkdir(task);
+  if ("error" in r) throw new Error(r.error);
+
+  const roots = gitWritableRootsSync(r.cwd);
+  expect(roots).toHaveLength(1);
+  const common = roots[0]!;
+  // It's the shared common dir (objects/refs + worktree registrations live here)…
+  expect(path.basename(common)).toBe(".git");
+  expect(existsSync(path.join(common, "HEAD"))).toBe(true);
+  expect(existsSync(path.join(common, "worktrees"))).toBe(true);
+  // …and it lives OUTSIDE the worktree cwd — the whole reason codex's sandbox
+  // needs it added as a writable root.
+  expect(common.startsWith(r.cwd + path.sep)).toBe(false);
+});
+
+test("gitWritableRootsSync returns [] for an ordinary in-repo checkout", async () => {
+  const { gitWritableRootsSync } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  // `.git` sits inside the cwd, already covered by codex's writable workspace.
+  expect(gitWritableRootsSync(repo)).toEqual([]);
+});
+
+test("gitWritableRootsSync returns [] for a non-git directory", async () => {
+  const { gitWritableRootsSync } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit2-"));
+  expect(gitWritableRootsSync(dir)).toEqual([]);
+});
+
+// End-to-end wiring of the codex spawn path: buildCodexCommand resolves the
+// cwd's external git dirs and feeds them to buildCommand's sandbox decision.
+// This is the seam spawnAgent uses; covering it here (where real worktrees
+// exist) locks the cwd→sandbox contract without standing up tmux.
+const codexHarness = {
+  id: "codex", kind: "codex" as const, label: "codex",
+  isBuiltin: true, home: null, bin: null, env: {}, enabled: true,
+};
+const codexOpts = { mode: "auto", model: "gpt-5-codex", effort: "high" } as const;
+
+test("buildCodexCommand escalates to danger-full-access in a linked worktree", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { buildCodexCommand } = await import("./agents.ts");
+  const repo = await makeRepo();
+  const r = await prepareWorkdir(fakeTask({ workdir: repo }));
+  if ("error" in r) throw new Error(r.error);
+
+  const { cmd } = buildCodexCommand(codexHarness, "hi", { ...codexOpts }, r.cwd);
+  expect(cmd).toContain("danger-full-access");
+  expect(cmd).not.toContain("workspace-write");
+  expect(cmd).toContain("approval_policy=never");
+});
+
+test("buildCodexCommand keeps workspace-write for an ordinary in-repo checkout", async () => {
+  const { buildCodexCommand } = await import("./agents.ts");
+  const repo = await makeRepo();
+
+  const { cmd } = buildCodexCommand(codexHarness, "hi", { ...codexOpts }, repo);
+  expect(cmd).toContain("workspace-write");
+  expect(cmd).not.toContain("danger-full-access");
+});
+
 test("prepareWorkdir is idempotent: second call reuses the recorded worktree", async () => {
   const { prepareWorkdir } = await import("./worktree.ts");
   const repo = await makeRepo();
