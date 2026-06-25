@@ -126,13 +126,12 @@ function discoverSkills(dir: string, source: EntrySource): AvailableCommand[] {
 }
 
 /**
- * Curated snapshot of claude-code's binary-baked built-in commands + skills.
+ * Curated snapshot of binary-baked built-in commands + skills.
  * These have NO on-disk discovery surface (no manifest, no `--list` flag), so
  * enumerating them means hand-maintaining the set worth dropping into a task
- * prompt. Kept deliberately tight: actionable coding-workflow entries only — not
- * interactive/TUI meta (`/clear`, `/compact`, `/config`, `/model`, `/help`, …),
- * which make no sense as a task. Update this when claude-code adds/renames a
- * built-in. claude-code only; codex's built-ins aren't modelled here.
+ * prompt. Kept deliberately tight: actionable coding-workflow entries only,
+ * not interactive/TUI meta (`/clear`, `/compact`, `/config`, `/model`,
+ * `/settings`, `/help`, …), which make no sense as a task.
  */
 const CLAUDE_BUILTINS: ReadonlyArray<{ name: string; description: string; kind: "command" | "skill" }> = [
   { name: "/init", description: "Initialize a new CLAUDE.md file with codebase documentation", kind: "command" },
@@ -144,10 +143,32 @@ const CLAUDE_BUILTINS: ReadonlyArray<{ name: string; description: string; kind: 
   { name: "/run", description: "Launch and drive this project's app to confirm a change works", kind: "skill" },
 ];
 
+const CODEX_BUILTINS: ReadonlyArray<{ name: string; description: string; kind: "command" | "skill" }> = [
+  { name: "/init", description: "Create an AGENTS.md file with project-specific guidance for Codex", kind: "command" },
+  { name: "/review", description: "Review current changes and find issues", kind: "command" },
+];
+
 /** The harness's built-in commands/skills as AvailableCommand rows. */
 function builtinCommands(agent: AgentKind): AvailableCommand[] {
-  if (agent !== "claude-code") return [];
-  return CLAUDE_BUILTINS.map((b) => ({ name: b.name, description: b.description, source: "builtin", kind: b.kind }));
+  const builtins = agent === "claude-code" ? CLAUDE_BUILTINS : CODEX_BUILTINS;
+  return builtins.map((b) => ({ name: b.name, description: b.description, source: "builtin", kind: b.kind }));
+}
+
+function defaultCodexHome(): string {
+  return process.env.CODEX_HOME || path.join(homedir(), ".codex");
+}
+
+function codexHome(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
+  if (opts.harnessEnv?.CODEX_HOME) return opts.harnessEnv.CODEX_HOME;
+  if (opts.harnessHome) return path.join(opts.harnessHome, ".codex");
+  if (opts.harnessEnv?.HOME) return path.join(opts.harnessEnv.HOME, ".codex");
+  return defaultCodexHome();
+}
+
+function codexSystemSkills(home: string): AvailableCommand[] {
+  const primary = discoverSkills(path.join(home, "skills", ".system"), "builtin");
+  if (primary.length > 0 || home === defaultCodexHome()) return primary;
+  return discoverSkills(path.join(defaultCodexHome(), "skills", ".system"), "builtin");
 }
 
 /**
@@ -160,6 +181,7 @@ function builtinCommands(agent: AgentKind): AvailableCommand[] {
  *  - claude-code: CLAUDE_CONFIG_DIR=<harnessHome>, so user commands/skills live
  *    directly under it (no `.claude/` segment, matching what spawned claude sees).
  *  - codex: HOME=<harnessHome>, so user prompts live at <harnessHome>/.codex/prompts.
+ *    CODEX_HOME in harness env wins when present, matching the spawned process.
  *  - NULL: fall back to the agetor process homedir + the default `.claude/`
  *    or `.codex/` layout.
  *
@@ -176,6 +198,7 @@ export async function listAvailableCommands(
     workdir: string | null;
     branch?: string | null;
     harnessHome?: string | null;
+    harnessEnv?: Record<string, string> | null;
   },
   // Pre-resolved active plugins, threaded in by `listAgentCapabilities` so the
   // (settings + installed_plugins) resolution runs once per capabilities request
@@ -202,14 +225,16 @@ export async function listAvailableCommands(
     // wins the dedupe and built-ins only ever fill a gap (matches the CLI).
     all.push(...builtinCommands(opts.agent));
   } else if (opts.agent === "codex") {
-    const userCmdRoot = opts.harnessHome
-      ? path.join(opts.harnessHome, ".codex")
-      : path.join(homedir(), ".codex");
+    const userCmdRoot = codexHome(opts);
     all.push(...discoverCommands(path.join(userCmdRoot, "prompts"), "user"));
+    all.push(...discoverSkills(path.join(userCmdRoot, "skills"), "user"));
     if (opts.workdir) {
       const root = (await repoRoot(opts.workdir)) ?? opts.workdir;
       all.push(...discoverCommands(path.join(root, ".codex", "prompts"), "project"));
+      all.push(...discoverSkills(path.join(root, ".codex", "skills"), "project"));
     }
+    all.push(...builtinCommands(opts.agent));
+    all.push(...codexSystemSkills(userCmdRoot));
   }
 
   // Project overrides user on collision so users can shadow a global command
@@ -478,6 +503,7 @@ interface DiscoveryOpts {
   workdir: string | null;
   branch?: string | null;
   harnessHome?: string | null;
+  harnessEnv?: Record<string, string> | null;
 }
 
 /**
@@ -513,8 +539,11 @@ function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null
     all.push(...pluginSelfExtensions(active));
     all.push(...pluginMcpExtensions(active));
   } else if (opts.agent === "codex") {
-    const codexHome = opts.harnessHome ? path.join(opts.harnessHome, ".codex") : path.join(homedir(), ".codex");
-    all.push(...codexTomlMcpServers(path.join(codexHome, "config.toml"), "user"));
+    const userCodexHome = codexHome(opts);
+    all.push(...codexTomlMcpServers(path.join(userCodexHome, "config.toml"), "user"));
+    if (root) {
+      all.push(...codexTomlMcpServers(path.join(root, ".codex", "config.toml"), "project"));
+    }
   }
   return all;
 }

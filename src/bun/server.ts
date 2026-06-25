@@ -749,6 +749,7 @@ export function startApiServer() {
               workdir,
               branch,
               harnessHome: harness.home,
+              harnessEnv: harness.env,
             }),
             { headers: corsHeaders(req) },
           );
