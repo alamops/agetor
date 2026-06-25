@@ -139,6 +139,29 @@ test("codex reads user prompts from <harnessHome>/.codex/prompts when set", asyn
   expect(alias!.source).toBe("user");
 });
 
+test("codex reads user and project skills", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "codex-skill-home-"));
+  writeCmd(
+    path.join(harness, ".codex", "skills", "user-skill"),
+    "SKILL.md",
+    "---\ndescription: User skill\n---\nbody",
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "codex-skill-proj-"));
+  writeCmd(
+    path.join(project, ".codex", "skills", "project-skill"),
+    "SKILL.md",
+    "---\ndescription: Project skill\n---\nbody",
+  );
+
+  const all = await listAvailableCommands({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+  });
+  expect(all.find((c) => c.name === "/user-skill")?.source).toBe("user");
+  expect(all.find((c) => c.name === "/project-skill")?.source).toBe("project");
+});
+
 test("project entry overrides user entry with the same name", async () => {
   // Drop a same-named file under both locations and assert project wins. We
   // can't safely write into the real ~/.claude/commands here, so we synthesise
@@ -311,6 +334,61 @@ test("extensions: codex reads [mcp_servers.*] from config.toml", async () => {
   });
   expect(all.some((e) => e.name === "context7" && e.kind === "mcp")).toBe(true);
   expect(all.some((e) => e.name === "linear" && e.kind === "mcp")).toBe(true);
+});
+
+test("extensions: codex reads project .codex/config.toml MCP servers", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-codex-project-home-"));
+  const project = mkdtempSync(path.join(tmpRoot, "ext-codex-project-"));
+  mkdirSync(path.join(project, ".codex"), { recursive: true });
+  writeFileSync(
+    path.join(project, ".codex", "config.toml"),
+    `[mcp_servers.projectdb]\ncommand = "npx"\n`,
+  );
+  const all = await listExtensions({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+  });
+  const mcp = all.find((e) => e.kind === "mcp" && e.name === "projectdb");
+  expect(mcp).toBeDefined();
+  expect(mcp!.source).toBe("project");
+});
+
+test("extensions: codex honors explicit CODEX_HOME from harness env", async () => {
+  const harness = mkdtempSync(path.join(tmpRoot, "ext-codex-env-home-"));
+  const envHome = mkdtempSync(path.join(tmpRoot, "ext-codex-env-codexhome-"));
+  writeFileSync(
+    path.join(envHome, "config.toml"),
+    `[mcp_servers.envhome]\ncommand = "npx"\n`,
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-codex-env-proj-"));
+  const all = await listExtensions({
+    agent: "codex",
+    workdir: project,
+    harnessHome: harness,
+    harnessEnv: { CODEX_HOME: envHome },
+  });
+  const mcp = all.find((e) => e.kind === "mcp" && e.name === "envhome");
+  expect(mcp).toBeDefined();
+  expect(mcp!.source).toBe("user");
+});
+
+test("extensions: codex falls back to explicit HOME from harness env", async () => {
+  const envHome = mkdtempSync(path.join(tmpRoot, "ext-codex-env-home-only-"));
+  mkdirSync(path.join(envHome, ".codex"), { recursive: true });
+  writeFileSync(
+    path.join(envHome, ".codex", "config.toml"),
+    `[mcp_servers.homeonly]\ncommand = "npx"\n`,
+  );
+  const project = mkdtempSync(path.join(tmpRoot, "ext-codex-env-home-only-proj-"));
+  const all = await listExtensions({
+    agent: "codex",
+    workdir: project,
+    harnessEnv: { HOME: envHome },
+  });
+  const mcp = all.find((e) => e.kind === "mcp" && e.name === "homeonly");
+  expect(mcp).toBeDefined();
+  expect(mcp!.source).toBe("user");
 });
 
 test("capabilities: returns both commands and extensions in one pass", async () => {
@@ -502,33 +580,47 @@ test("two plugins sharing a bare name collapse to one /name:cmd but both self-ro
 
 // --- Built-in (binary-baked) commands + skills -----------------------------
 
-// An empty harnessHome isolates these from the test runner's real ~/.claude
+// An empty harnessHome isolates these from the test runner's real user config
 // (which may carry user skills like `code-review` that legitimately shadow a
 // same-named built-in — see the shadow test below).
-test("claude-code surfaces curated built-in commands + skills; codex gets none", async () => {
+test("agents surface curated built-in commands and skills", async () => {
   const harness = mkdtempSync(path.join(tmpRoot, "builtin-home-"));
+  writeCmd(
+    path.join(harness, ".codex", "skills", ".system", "openai-docs"),
+    "SKILL.md",
+    "---\ndescription: OpenAI docs\n---\nbody",
+  );
   const project = mkdtempSync(path.join(tmpRoot, "builtin-"));
   const claude = await listAvailableCommands({ agent: "claude-code", workdir: project, harnessHome: harness });
 
-  const init = claude.find((c) => c.name === "/init");
-  expect(init).toBeDefined();
-  expect(init!.source).toBe("builtin");
-  expect(init!.kind).toBe("command");
+  const claudeInit = claude.find((c) => c.name === "/init");
+  expect(claudeInit).toBeDefined();
+  expect(claudeInit!.source).toBe("builtin");
+  expect(claudeInit!.kind).toBe("command");
 
   const codeReview = claude.find((c) => c.name === "/code-review");
   expect(codeReview).toBeDefined();
   expect(codeReview!.source).toBe("builtin");
   expect(codeReview!.kind).toBe("skill");
 
-  // Built-ins are claude-code-specific; codex must not inherit them.
   const codex = await listAvailableCommands({ agent: "codex", workdir: project, harnessHome: harness });
-  expect(codex.some((c) => c.source === "builtin")).toBe(false);
+  const codexInit = codex.find((c) => c.name === "/init");
+  expect(codexInit).toBeDefined();
+  expect(codexInit!.source).toBe("builtin");
+  expect(codexInit!.kind).toBe("command");
+
+  const docs = codex.find((c) => c.name === "/openai-docs");
+  expect(docs).toBeDefined();
+  expect(docs!.source).toBe("builtin");
+  expect(docs!.kind).toBe("skill");
 });
 
 test("built-ins are available even with no workdir", async () => {
   const harness = mkdtempSync(path.join(tmpRoot, "builtin-nowd-"));
-  const all = await listAvailableCommands({ agent: "claude-code", workdir: null, harnessHome: harness });
-  expect(all.some((c) => c.name === "/security-review" && c.source === "builtin")).toBe(true);
+  const claude = await listAvailableCommands({ agent: "claude-code", workdir: null, harnessHome: harness });
+  expect(claude.some((c) => c.name === "/security-review" && c.source === "builtin")).toBe(true);
+  const codex = await listAvailableCommands({ agent: "codex", workdir: null, harnessHome: harness });
+  expect(codex.some((c) => c.name === "/init" && c.source === "builtin")).toBe(true);
 });
 
 test("a user/project command shadows a same-named built-in", async () => {
@@ -549,12 +641,23 @@ test("a user/project command shadows a same-named built-in", async () => {
 
 test("built-in skills surface in the extensions Skills group", async () => {
   const harness = mkdtempSync(path.join(tmpRoot, "builtin-ext-home-"));
+  writeCmd(
+    path.join(harness, ".codex", "skills", ".system", "openai-docs"),
+    "SKILL.md",
+    "---\ndescription: OpenAI docs\n---\nbody",
+  );
   const project = mkdtempSync(path.join(tmpRoot, "builtin-ext-"));
-  const exts = await listExtensions({ agent: "claude-code", workdir: project, harnessHome: harness });
-  const verify = exts.find((e) => e.name === "verify" && e.kind === "skill");
+  const claudeExts = await listExtensions({ agent: "claude-code", workdir: project, harnessHome: harness });
+  const verify = claudeExts.find((e) => e.name === "verify" && e.kind === "skill");
   expect(verify).toBeDefined();
   expect(verify!.insert).toBe("/verify");
   expect(verify!.source).toBe("builtin");
+
+  const codexExts = await listExtensions({ agent: "codex", workdir: project, harnessHome: harness });
+  const docs = codexExts.find((e) => e.name === "openai-docs" && e.kind === "skill");
+  expect(docs).toBeDefined();
+  expect(docs!.insert).toBe("/openai-docs");
+  expect(docs!.source).toBe("builtin");
 });
 
 test("an explicitly enabled plugin contributes its self-row + content", async () => {
