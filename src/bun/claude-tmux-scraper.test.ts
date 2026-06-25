@@ -191,6 +191,42 @@ test("matchStartupConsentDialog — distinct dialogs get distinct fingerprints",
   expect(bypass.fingerprint).not.toBe(trust.fingerprint);
 });
 
+// The "Claude in Chrome extension detected" startup prompt (introduced by a
+// claude version bump) blocks JSONL creation just like the consent dialogs —
+// but enabling/disabling browser tools is NOT a choice agetor can make for the
+// user. It must therefore route through the interactive scraper path (surfaced
+// as a tmux_prompt card the user answers), never the boot auto-confirmer.
+const CHROME_EXTENSION_PANE = `  Claude in Chrome extension detected
+
+  Claude will use your Chrome browser by default — navigating sites, filling
+  forms, and capturing screenshots in your existing session.
+
+  Site-level permissions come from the Chrome extension. Turn browser tools
+  off for future sessions with /chrome.
+
+❯ 1. Yes, use my browser
+  2. No, keep browser tools off
+
+Enter to confirm · Esc to keep browser tools off`;
+
+test("matchStartupConsentDialog — Chrome-extension startup prompt is NOT auto-confirmed", () => {
+  // No startup-consent marker → null, so boot leaves it for the user instead
+  // of guessing whether to grant browser access.
+  expect(matchStartupConsentDialog(CHROME_EXTENSION_PANE)).toBeNull();
+});
+
+test("matchNumberedModal — Chrome-extension startup prompt surfaces as an interactive modal", () => {
+  // The boot poller falls back to this matcher for non-consent startup
+  // questions; a hit is what gets registered as a tmux_prompt card.
+  const m = matchNumberedModal(CHROME_EXTENSION_PANE)!;
+  expect(m).not.toBeNull();
+  expect(m.cursorIndex).toBe(0);
+  expect(m.choices.map((c) => c.label)).toEqual([
+    "Yes, use my browser",
+    "No, keep browser tools off",
+  ]);
+});
+
 test("dispatchLine updates permissionMode BEFORE the dedup guard (reattach safety)", async () => {
   const { __forTest } = await import("./claude-tmux.ts");
   const { mkdtempSync, writeFileSync } = await import("node:fs");
