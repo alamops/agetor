@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { dataDir } from "./db.ts";
 import type { BranchInfo, DiffFile, Task, TaskDiff } from "../shared/types.ts";
@@ -84,6 +85,58 @@ export async function repoRoot(dir: string): Promise<string | null> {
   if (!res.ok) return null;
   repoRootCache.set(dir, res.stdout);
   return res.stdout;
+}
+
+/**
+ * Git directories that live OUTSIDE `cwd` and therefore must be granted to a
+ * codex `workspace-write` sandbox's writable roots for `git commit` (and any
+ * other ref/object-writing command) to succeed.
+ *
+ * For a linked worktree, `cwd`'s `.git` is a *file* pointing at
+ * `<source-repo>/.git/worktrees/<id>`, and the objects + refs a commit writes
+ * live in the shared `<source-repo>/.git` (the "common dir") — entirely
+ * outside the worktree root that codex makes writable by default. Without this,
+ * codex's sandbox blocks the write and `git commit` fails inside an agetor
+ * worktree. The per-worktree gitdir is a child of the common dir, so a single
+ * writable root at the common dir covers both. (The same logic also covers an
+ * isolation=none task whose workdir is a subdirectory of the repo, where
+ * `.git` sits above the writable cwd.)
+ *
+ * Returns the absolute git common dir when it isn't contained in `cwd`;
+ * returns `[]` for an ordinary checkout where `.git` already sits inside the
+ * writable cwd, or when `cwd` isn't a git repo / git is unavailable
+ * (non-throwing — callers just get no extra roots).
+ *
+ * Synchronous on purpose: the codex spawn paths (`spawnCodexTurnNow`,
+ * `spawnAgent`) are synchronous, and a local `git rev-parse` is sub-20ms.
+ * `--path-format=absolute` (git ≥ 2.31) yields an absolute path directly; the
+ * `path.resolve` is belt-and-suspenders for any git that ignores the flag.
+ *
+ * Containment is checked against the realpath'd cwd: git canonicalizes symlinks
+ * in the path it reports (e.g. `/tmp` → `/private/tmp` on macOS), so comparing
+ * the reported common dir against a non-canonical `cwd` would otherwise flag an
+ * ordinary `.git`-inside-cwd checkout as "outside" and add a redundant root.
+ */
+export function gitWritableRootsSync(cwd: string): string[] {
+  let out: string;
+  try {
+    const res = spawnSync(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd, encoding: "utf8", timeout: 5_000 },
+    );
+    if (res.status !== 0 || typeof res.stdout !== "string") return [];
+    out = res.stdout.trim();
+  } catch {
+    return [];
+  }
+  if (!out) return [];
+  const commonDir = path.resolve(cwd, out);
+  let realCwd = cwd;
+  try { realCwd = realpathSync(cwd); } catch { /* cwd missing — compare as-is */ }
+  const rel = path.relative(realCwd, commonDir);
+  const insideCwd = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return insideCwd ? [] : [commonDir];
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   type SpawnedAgent,
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
+import { gitWritableRootsSync } from "./worktree.ts";
 
 export type { SpawnedAgent };
 
@@ -41,6 +42,17 @@ export interface AgentRunOptions {
    * Ignored by codex.
    */
   sessionId?: string | null;
+  /**
+   * Git directories that live OUTSIDE the codex run's cwd — the source repo's
+   * `.git` common dir when a task runs in a linked worktree (or a repo-subdir
+   * workdir). When this is non-empty, a `git commit`'s objects/refs must reach
+   * a dir the cwd-scoped `workspace-write` sandbox doesn't cover, so the codex
+   * `auto` run is escalated to `--sandbox danger-full-access` (see
+   * `buildCommand`). Resolved by `gitWritableRootsSync(cwd)` and only set on the
+   * codex spawn path; ignored by claude-code and by codex's read-only ("ask")
+   * sandbox (which can't write anything regardless).
+   */
+  codexExternalGitDirs?: string[];
 }
 
 // Map friendly model ids to the exact strings the claude-code CLI expects.
@@ -357,7 +369,29 @@ export function buildCommand(
   // `--sandbox` rather than the deprecated `--full-auto`, which prints a
   // warning to stderr on every turn in codex 0.140+.
   const mode = opts.mode ?? "auto";
-  args.push("--sandbox", mode === "auto" ? "workspace-write" : "read-only");
+  // Sandbox policy. `ask` → `read-only` (can't change anything). `auto` →
+  // `workspace-write` (edit the cwd without approval prompts) for the common
+  // case, BUT escalated to `danger-full-access` when the task's git writes have
+  // to land OUTSIDE the cwd: a linked worktree's `.git` is a file pointing at
+  // the source repo's shared `.git`, where a commit's objects/refs go, and
+  // `workspace-write` only makes the cwd writable — so `git commit` is blocked.
+  // Granting the external dir via `sandbox_workspace_write.writable_roots` is
+  // unreliable (codex keeps `.git` read-only under some workspace policies), so
+  // for those runs we drop the sandbox entirely. That's consistent with
+  // agetor's no-sandbox philosophy (CLAUDE.md: "Agents run with the user's full
+  // shell privileges … There is no sandbox") and with claude-code's `auto` mode
+  // (`--dangerously-skip-permissions`). `approval_policy=never` pairs with full
+  // access so a headless `codex exec` never stalls on an approval it can't show
+  // — the empirically-validated combo for full filesystem access. Parent flags
+  // must precede the `resume` subcommand, so emit here.
+  const needsExternalGitWrites = (opts.codexExternalGitDirs?.length ?? 0) > 0;
+  if (mode !== "auto") {
+    args.push("--sandbox", "read-only");
+  } else if (needsExternalGitWrites) {
+    args.push("--sandbox", "danger-full-access", "-c", "approval_policy=never");
+  } else {
+    args.push("--sandbox", "workspace-write");
+  }
 
   args.push(...extra);
 
@@ -371,6 +405,25 @@ export function buildCommand(
   // Read the prompt from stdin — `-` is codex's stdin sentinel.
   args.push("-");
   return { cmd: args, env: Object.keys(env).length ? env : undefined };
+}
+
+/**
+ * Build the codex argv for a specific `cwd`, resolving the cwd-dependent
+ * `codexExternalGitDirs` (the source repo's `.git` for a linked worktree) so
+ * `buildCommand` can decide whether to escalate the sandbox to full access. This
+ * is the seam `spawnAgent` uses — kept separate from the pure `buildCommand` so
+ * the cwd→sandbox wiring is unit-testable without standing up tmux.
+ */
+export function buildCodexCommand(
+  harness: Harness,
+  prompt: string,
+  opts: AgentRunOptions,
+  cwd: string,
+): AgentCommand {
+  return buildCommand(harness, prompt, {
+    ...opts,
+    codexExternalGitDirs: gitWritableRootsSync(cwd),
+  });
 }
 
 /**
@@ -495,7 +548,13 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
     onSessionId?.(`fake-codex-thread-${taskId}`);
     return makeFakeAgent(taskId, prompt, onChunk);
   }
-  const built = buildCommand(harness, prompt, opts);
+  // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
+  // worktree) so a codex `auto` run that has to write there escalates its
+  // sandbox to full access. Computed here — the single choke point every codex
+  // spawn path funnels through — rather than at each orchestrator call site.
+  // No-op for an ordinary checkout or a non-git cwd, so the argv is unchanged
+  // there. `buildCodexCommand` is the testable seam for this wiring.
+  const built = buildCodexCommand(harness, prompt, opts, cwd);
   return spawnCodexViaTmux({
     taskId,
     runId,
