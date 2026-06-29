@@ -9,7 +9,7 @@ process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-scraper-")
 
 import { __forTest } from "./claude-tmux.ts";
 
-const { matchNumberedModal, matchYesNoModal, matchStartupConsentDialog } = __forTest;
+const { matchNumberedModal, matchYesNoModal, matchStartupConsentDialog, clearedStabilityGate } = __forTest;
 
 test("matchNumberedModal — claude plan-mode dialog (cursor on choice 1)", () => {
   const pane = `
@@ -95,6 +95,96 @@ test("matchNumberedModal — changing labels changes the fingerprint", () => {
   const a = matchNumberedModal(`❯ 1. A\n  2. B`)!;
   const b = matchNumberedModal(`❯ 1. A\n  2. C`)!;
   expect(a.fingerprint).not.toBe(b.fingerprint);
+});
+
+test("matchNumberedModal — tool-use permission prompt: wrapped description's '0.' line is not a choice", () => {
+  // Regression: an MCP tool-use permission prompt wraps the tool description
+  // across pane lines. When a line happens to break right before a number —
+  // here "… remaining >" / "0. Use the offset …" — the phantom "0." row is
+  // numerically contiguous with the real "1." option and used to be swallowed
+  // as choice 0 (shifting the cursor index too). The choice set must be exactly
+  // the 1/2/3 options below "Do you want to proceed?".
+  const pane = `  Tool use
+
+    example MCP server – Fetch Records(scope: "demo") (MCP)
+    Fetch records in pages. Keep fetching while remaining >
+    0. Use the offset arg to paginate.
+
+  Do you want to proceed?
+  ❯ 1. Yes
+    2. Yes, and don't ask again for example MCP server – Fetch Records commands in
+       /Users/me/.agetor/worktrees/demo
+    3. No
+
+  Esc to cancel · Tab to amend`;
+  const m = matchNumberedModal(pane);
+  expect(m).not.toBeNull();
+  expect(m!.choices.map((c) => c.key)).toEqual(["1", "2", "3"]);
+  expect(m!.choices[0]!.label).toBe("Yes");
+  expect(m!.cursorIndex).toBe(0);
+  // The wrapped continuation row (the worktree path) is folded into option 2's
+  // label rather than dropped, so the "don't ask again" scope stays legible.
+  expect(m!.choices[1]!.label).toBe(
+    "Yes, and don't ask again for example MCP server – Fetch Records commands in /Users/me/.agetor/worktrees/demo",
+  );
+  expect(m!.choices[2]!.label).toBe("No");
+});
+
+test("matchNumberedModal — a same-indent line under the last option is not folded into its label", () => {
+  // The last option isn't capped by a following numbered row, so it relies on
+  // the indentation rule: only rows indented PAST the option marker are wraps.
+  // A standalone hint at the option's own indent must stay out of the label.
+  const pane = `Do you want to proceed?
+❯ 1. Yes
+  2. No
+  This runs immediately.
+
+Esc to cancel`;
+  const m = matchNumberedModal(pane);
+  expect(m!.choices.map((c) => c.label)).toEqual(["Yes", "No"]);
+});
+
+test("matchNumberedModal — modal footer marks the match high-confidence (skips the two-tick gate)", () => {
+  // A real interactive modal carries an `Esc to cancel …` footer; streamed
+  // numbered output never does. scrapeOnce registers high-confidence matches on
+  // the first sighting so tool-use asks surface promptly instead of ~2s late.
+  const withFooter = matchNumberedModal(`Do you want to proceed?
+❯ 1. Yes
+  2. No
+
+Esc to cancel · Tab to amend`);
+  expect(withFooter!.highConfidence).toBe(true);
+
+  const withoutFooter = matchNumberedModal(`Do you want to proceed?
+❯ 1. Yes
+  2. No`);
+  expect(withoutFooter!.highConfidence).toBeFalsy();
+});
+
+test("matchNumberedModal — footer is found past trailing blank rows (tmux pads the capture)", () => {
+  // `tmux capture-pane` can emit trailing blank rows. The footer detection must
+  // look at the last non-blank lines, not a fixed window of raw lines, or the
+  // fast path silently never engages and the delay fix is a no-op in practice.
+  const m = matchNumberedModal(`Do you want to proceed?
+❯ 1. Yes
+  2. No
+
+Esc to cancel · Tab to amend
+
+
+`);
+  expect(m!.highConfidence).toBe(true);
+});
+
+test("clearedStabilityGate — high-confidence registers on first sighting; others need two ticks", () => {
+  const hi = { fingerprint: "fp", highConfidence: true } as any;
+  const lo = { fingerprint: "fp", highConfidence: false } as any;
+  // High-confidence clears even when the previous tick saw nothing.
+  expect(clearedStabilityGate(hi, null)).toBe(true);
+  // Low-confidence needs the previous tick to have seen the same fingerprint.
+  expect(clearedStabilityGate(lo, null)).toBe(false);
+  expect(clearedStabilityGate(lo, "different")).toBe(false);
+  expect(clearedStabilityGate(lo, "fp")).toBe(true);
 });
 
 test("matchYesNoModal — (y/N) prompt on last line", () => {

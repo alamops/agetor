@@ -1979,6 +1979,11 @@ interface ScrapeMatch {
   /** Stable hash that survives across consecutive scrapes as long as the
    *  modal stays on screen unchanged. */
   fingerprint: string;
+  /** True when the match is bounded by a real modal footer (`Esc to cancel …`),
+   *  which printed numbered output never has. Lets `scrapeOnce` register on the
+   *  first sighting and skip the two-tick stability gate, so tool-use permission
+   *  prompts appear promptly. */
+  highConfidence?: boolean;
 }
 
 /** Recognise claude's standard numbered-choice modal:
@@ -1997,16 +2002,17 @@ interface ScrapeMatch {
  * Enter dismisses the modal exactly the way the user would. */
 function matchNumberedModal(tail: string): ScrapeMatch | null {
   const lines = tail.split("\n");
-  const numbered: Array<{ key: string; label: string; cursorHere: boolean }> = [];
-  for (const raw of lines) {
+  const numbered: Array<{ key: string; label: string; cursorHere: boolean; lineIndex: number }> = [];
+  lines.forEach((raw, idx) => {
     const m = raw.match(/^\s*([›❯])?\s*(\d+)\.\s+(.+?)\s*$/);
-    if (!m) continue;
+    if (!m) return;
     numbered.push({
       cursorHere: !!m[1],
       key: m[2]!,
       label: m[3]!.trim(),
+      lineIndex: idx,
     });
-  }
+  });
   if (numbered.length < 2) return null;
   // Need at least one cursor marker on the numbered block — otherwise
   // we're probably looking at a printed list, not an interactive modal.
@@ -2018,6 +2024,18 @@ function matchNumberedModal(tail: string): ScrapeMatch | null {
     tailRun.unshift(numbered[i]!);
     if (i > 0 && Number(numbered[i - 1]!.key) + 1 !== Number(numbered[i]!.key)) break;
   }
+  // claude's choice modals are always 1-indexed. A tool-use permission prompt
+  // wraps the tool's description across lines, e.g.
+  //   … keep fetching while remaining >
+  //   0. Use the offset arg to paginate.
+  // The phantom "0." row is numerically contiguous with the real "1." option,
+  // so the trailing-run walk above swallows it as choice 0 (and shifts the
+  // cursor index by one). Anchor the run to the real "1." option: drop any
+  // leading rows that precede it. No "1." at all means this isn't a claude
+  // choice modal.
+  const oneAt = tailRun.findIndex((n) => n.key === "1");
+  if (oneAt < 0) return null;
+  if (oneAt > 0) tailRun.splice(0, oneAt);
   if (tailRun.length < 2) return null;
   // Cursor MUST land inside tailRun for the modal to be dismissible —
   // otherwise the `❯` is on a printed list above the actual choice set
@@ -2025,7 +2043,33 @@ function matchNumberedModal(tail: string): ScrapeMatch | null {
   // register a half-known modal.
   const cursorIndex = tailRun.findIndex((n) => n.cursorHere);
   if (cursorIndex < 0) return null;
-  const choices: TmuxPromptChoice[] = tailRun.map((n) => ({ key: n.key, label: n.label }));
+  // Fold wrapped continuation rows into each option's label. claude wraps a
+  // long choice (e.g. "… don't ask again … commands in <worktree path>") across
+  // pane rows; only the first row carries the "N." prefix, so without this the
+  // label truncates mid-sentence and the user can't see, say, which directory a
+  // "don't ask again" scope applies to. An option owns the rows between it and
+  // the next option, stopping at a blank line or the footer.
+  //
+  // A continuation row must be indented PAST its option's own indent: claude
+  // aligns wrapped text under the option label (past the "N." marker), so a
+  // genuine wrap is always more indented. This keeps a same-indent standalone
+  // hint line under the LAST option (which, unlike middle options, isn't capped
+  // by a following numbered row) from being absorbed into its label.
+  const indentOf = (l: string): number => (l.match(/^[ \t]*/)?.[0].length ?? 0);
+  const choices: TmuxPromptChoice[] = tailRun.map((n, i) => {
+    const end = i + 1 < tailRun.length ? tailRun[i + 1]!.lineIndex : lines.length;
+    const optIndent = indentOf(lines[n.lineIndex]!);
+    const extra: string[] = [];
+    for (let j = n.lineIndex + 1; j < end; j++) {
+      const l = lines[j]!;
+      if (l.trim().length === 0) break;            // blank line ends the option
+      if (/Esc to cancel/.test(l)) break;          // footer ends the option
+      if (/^\s*([›❯])?\s*\d+\.\s+/.test(l)) break;  // next numbered row (defensive)
+      if (indentOf(l) <= optIndent) break;         // not a wrap — a sibling line
+      extra.push(l.trim());
+    }
+    return { key: n.key, label: extra.length ? `${n.label} ${extra.join(" ")}` : n.label };
+  });
   // Use the last ~12 lines for the displayed pane snippet so the user
   // sees the question text + the choices, not 40 lines of unrelated
   // context above.
@@ -2039,7 +2083,35 @@ function matchNumberedModal(tail: string): ScrapeMatch | null {
   const fingerprint = sha1(
     `numbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}|@${cursorIndex}`,
   );
-  return { paneText, choices, cursorIndex, fingerprint };
+  // A trailing `Esc to cancel …` footer marks a fully-drawn interactive modal
+  // (the tool-use permission prompt, edit/plan dialogs, …). Streamed numbered
+  // *output* never carries it, so its presence lets the scraper register on the
+  // first sighting instead of waiting out the two-tick stability gate — this is
+  // what makes tool-use asks surface promptly rather than ~2s late. (The
+  // AskUserQuestion modal also has this footer but is routed away from here by
+  // `detectAskModal` before we're ever called.)
+  //
+  // Test the last couple of NON-BLANK lines, not a fixed `slice(-N)` of raw
+  // lines: `tmux capture-pane` can emit trailing blank rows (this is exactly
+  // why `parseAskModal` strips them), which would otherwise push the footer out
+  // of a raw-line window and silently disable the fast path. A real modal's
+  // footer is always the last non-blank line; restricting to the last two keeps
+  // a stray "Esc to cancel" buried mid-output from falsely qualifying.
+  const nonBlank = lines.filter((l) => l.trim().length > 0);
+  const highConfidence = nonBlank.slice(-2).some((l) => /Esc to cancel/.test(l));
+  return { paneText, choices, cursorIndex, fingerprint, highConfidence };
+}
+
+/** Decide whether a scrape match has cleared the stability gate this tick.
+ *  A high-confidence match (bounded by a real `Esc to cancel …` modal footer,
+ *  which streamed numbered output never carries) registers on first sighting,
+ *  so tool-use permission prompts surface promptly instead of ~2s late. Every
+ *  other match must be seen on two consecutive scrapes — the previous tick's
+ *  fingerprint must equal this one — which rejects single-tick blips from a
+ *  numbered list the agent is printing. Pure so the gate is unit-testable
+ *  without a live tmux session. */
+function clearedStabilityGate(match: ScrapeMatch, prevFingerprint: string | null): boolean {
+  return !!match.highConfidence || prevFingerprint === match.fingerprint;
 }
 
 /** Recognise `(y/N)` / `(Y/n)` / `[y/n]` confirmation prompts on the
@@ -2305,13 +2377,13 @@ function scrapeOnce(state: SessionState): void {
     return;
   }
 
-  // Two-tick stability — require the same match on two consecutive
-  // scrapes before registering. Single-tick blips (a numbered list the
-  // agent is printing) never make it through.
-  if (state.scrapeLastFingerprint !== match.fingerprint) {
-    state.scrapeLastFingerprint = match.fingerprint;
-    return;
-  }
+  // Stability gate (see `clearedStabilityGate`): a high-confidence match
+  // registers on first sighting; everything else waits for the same
+  // fingerprint on two consecutive scrapes. Record the fingerprint either way
+  // so the next tick can satisfy the two-tick rule.
+  const cleared = clearedStabilityGate(match, state.scrapeLastFingerprint);
+  state.scrapeLastFingerprint = match.fingerprint;
+  if (!cleared) return;
 
   // Already registered? Nothing to do — the previous tick's broadcast
   // is what the UI is showing.
@@ -3222,6 +3294,7 @@ export const __forTest = {
   matchNumberedModal,
   matchYesNoModal,
   matchStartupConsentDialog,
+  clearedStabilityGate,
   readPendingAskQuestionsFromJsonl,
   shouldWaitForAskJsonl,
   resumeJsonlOffset,
