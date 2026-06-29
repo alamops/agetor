@@ -338,3 +338,144 @@ test("dispatchLine updates permissionMode BEFORE the dedup guard (reattach safet
   expect(state.permissionMode).toBe("plan");
   __forTest.uninstallSession("t-pm-reattach");
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// Idle scrape throttle — regression for "a question raised after the task went
+// to review never appears in the stream (user has to answer it in tmux)".
+//
+// A native AskUserQuestion / permission modal appears with NO JSONL write
+// (claude doesn't persist the tool_use until it's answered), so once a session
+// is JSONL-idle past SCRAPE_IDLE_AFTER_MS the old hard `return` stopped the
+// scraper forever — `lastJsonlAppendAt` never advanced again, so a modal raised
+// after the turn resolved was never captured. The throttle must keep scraping.
+
+const {
+  decideScrapeTick,
+  SCRAPE_IDLE_AFTER_MS,
+  SCRAPE_IDLE_POLL_MS,
+  SCRAPE_DEEP_IDLE_AFTER_MS,
+  SCRAPE_DEEP_IDLE_POLL_MS,
+} = __forTest;
+
+const NOW = 1_000_000;
+// A session that's been JSONL-quiet long enough to be idle, but not yet
+// "deeply" idle — the common "just resolved to review" window (2s cadence).
+const NEAR_IDLE_APPEND = NOW - (SCRAPE_IDLE_AFTER_MS + 1_000);
+// A session quiet past SCRAPE_DEEP_IDLE_AFTER_MS — the slow 10s cadence.
+const DEEP_IDLE_APPEND = NOW - (SCRAPE_DEEP_IDLE_AFTER_MS + 5_000);
+
+test("decideScrapeTick — busy session (turn in flight) always scrapes at full rate", () => {
+  const d = decideScrapeTick({
+    turnInFlight: true,
+    lastJsonlAppendAt: 0,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: 0,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: false });
+});
+
+test("decideScrapeTick — recently-active session (within idle window) scrapes, no idle stamp", () => {
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: NOW - (SCRAPE_IDLE_AFTER_MS - 1), // still 'recent'
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: 0,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: false });
+});
+
+test("decideScrapeTick — near-idle session STILL scrapes once past the 2s throttle (the bug)", () => {
+  // No turn in flight, JSONL silent past SCRAPE_IDLE_AFTER_MS, last idle
+  // capture > SCRAPE_IDLE_POLL_MS ago. The old code returned here and never
+  // looked at the pane again — stranding a modal raised after `review`.
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: NEAR_IDLE_APPEND,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: NOW - SCRAPE_IDLE_POLL_MS - 1,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: true });
+});
+
+test("decideScrapeTick — near-idle but within the 2s throttle skips (keeps idle cost low)", () => {
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: NEAR_IDLE_APPEND,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: NOW - (SCRAPE_IDLE_POLL_MS - 1), // just scraped
+    now: NOW,
+  });
+  expect(d).toEqual({ run: false, stampIdle: false });
+});
+
+test("decideScrapeTick — deeply-idle session backs off to the 10s cadence", () => {
+  // Quiet > SCRAPE_DEEP_IDLE_AFTER_MS, and the last capture was 3s ago. At the
+  // near-idle 2s rate this would scrape; the deep tier must skip it so long-
+  // dead sessions don't fork tmux every 2s forever.
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: DEEP_IDLE_APPEND,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: NOW - 3_000, // > SCRAPE_IDLE_POLL_MS but < SCRAPE_DEEP_IDLE_POLL_MS
+    now: NOW,
+  });
+  expect(d).toEqual({ run: false, stampIdle: false });
+});
+
+test("decideScrapeTick — deeply-idle session still scrapes once past the 10s cadence (very-late modal)", () => {
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: DEEP_IDLE_APPEND,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: NOW - SCRAPE_DEEP_IDLE_POLL_MS - 1,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: true });
+});
+
+test("decideScrapeTick — a live ask-card forces full-rate scraping (modal-gone backstop)", () => {
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: DEEP_IDLE_APPEND,
+    activePromptCount: 0,
+    askCardLive: true, // card up → never idle-gated
+    lastIdleScrapeAt: NOW, // would otherwise be inside the throttle window
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: false });
+});
+
+test("decideScrapeTick — a pending prompt forces full-rate scraping (auto-cancel backstop)", () => {
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: DEEP_IDLE_APPEND,
+    activePromptCount: 1,
+    askCardLive: false,
+    lastIdleScrapeAt: NOW,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: false });
+});
+
+test("decideScrapeTick — a session that never appended (lastJsonlAppendAt === 0) is not idle-gated", () => {
+  // Guards the `lastJsonlAppendAt !== 0` clause: a brand-new session shouldn't
+  // be treated as idle before it has produced any output.
+  const d = decideScrapeTick({
+    turnInFlight: false,
+    lastJsonlAppendAt: 0,
+    activePromptCount: 0,
+    askCardLive: false,
+    lastIdleScrapeAt: 0,
+    now: NOW,
+  });
+  expect(d).toEqual({ run: true, stampIdle: false });
+});
