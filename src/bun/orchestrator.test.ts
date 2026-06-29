@@ -77,6 +77,40 @@ test("createTask + startTask runs to completion and emits stdout", async () => {
   expect(statuses.some((s) => s.startsWith("exit:"))).toBe(true);
 });
 
+test("task.runId survives the resolve-to-review transition (so a question raised in review can still register)", async () => {
+  // Regression guard for the post-review AskUserQuestion fix: the scraper's
+  // collectAndRegisterAskCard (claude-tmux.ts) bails with `if (!runId) return`,
+  // so if the review transition cleared task.runId, a question raised after the
+  // turn resolved would never register — the exact symptom we just fixed. The
+  // updateColumn path must leave run_id intact (only reconcileOrphans / delete
+  // clear it).
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const created = await createTask({
+    title: "runId survives review",
+    prompt: "hello",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const task = created.task;
+
+  const res = await startTask(task.id);
+  if (!("runId" in res)) throw new Error("expected the run to start");
+  const runId = res.runId;
+
+  // Let the fake driver resolve the turn (exit 0 → succeeded → review).
+  await new Promise((r) => setTimeout(r, 250));
+
+  const after = tasks.get(task.id);
+  expect(after?.column).toBe("review");
+  expect(after?.runId).toBe(runId);
+
+  db.run(`DELETE FROM tasks WHERE id = ?`, [task.id]);
+});
+
 test("sendInput folds a follow-up into the in-flight run instead of stranding a new one", async () => {
   // Regression for the "queue status never recovers" bug: a message sent
   // while a claude turn is in flight must fold into the active run (same
