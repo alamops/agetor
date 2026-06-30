@@ -3,11 +3,12 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, Bot, Check, ClipboardList, Copy, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  Archive, ArchiveRestore, Bot, Check, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
   GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
+import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow } from "@/lib/subagent-tabs";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/select";
@@ -25,6 +26,8 @@ import {
   type Harness,
   type Run,
   type RunEvent,
+  type Subagent,
+  type SubagentEvent,
   type Task,
   type TaskReference,
 } from "../../../shared/types.ts";
@@ -242,6 +245,14 @@ function RunPanelBody({
   const [rebuildBusy, setRebuildBusy] = useState(false);
   const [rebuildNote, setRebuildNote] = useState<string | null>(null);
   const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
+  /** Background/sub agents this task's main agent has spawned. Seeded from the
+   *  snapshot endpoint on open + kept live by `stream: "subagent"` SSE deltas
+   *  and a 2s poll backstop. Drives the read-only tab strip. */
+  const [subagentList, setSubagentList] = useState<Subagent[]>([]);
+  /** Which stream the log is showing: "main" (the task's own agent) or a
+   *  subagent id. Background-agent streams are READ-ONLY — the composer is
+   *  hidden while one is active. */
+  const [activeStream, setActiveStream] = useState<string>("main");
   const logRef = useRef<HTMLDivElement>(null);
   // Tracks whether the log was scrolled near the bottom at the last user
   // interaction. Auto-scroll-to-bottom on new events only fires when this is
@@ -258,6 +269,8 @@ function RunPanelBody({
     setRebuilt(null);
     setRebuildNote(null);
     setInteractions([]);
+    setSubagentList([]);
+    setActiveStream("main");
     nearBottomRef.current = true;
   }, [task.id]);
 
@@ -318,6 +331,32 @@ function RunPanelBody({
     return () => { cancelled = true; clearInterval(t); };
   }, [task.id, task.runId]);
 
+  // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
+  // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
+  // runs poll). Merge rather than replace so an in-flight SSE delta isn't
+  // clobbered by a slightly-stale poll.
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const list = await api.listSubagents(task.id);
+        if (cancelled) return;
+        setSubagentList((cur) => {
+          // Union by id: the poll (DB) is authoritative on status, but keep any
+          // id we only know from a just-arrived SSE delta that the poll query
+          // raced. Sort by spawn order so tabs don't reshuffle.
+          const byId = new Map<string, Subagent>();
+          for (const s of cur) byId.set(s.id, s);
+          for (const s of list) byId.set(s.id, s);
+          return [...byId.values()].sort((a, b) => a.startedAt - b.startedAt || (a.id < b.id ? -1 : 1));
+        });
+      } catch { /* task may have been deleted */ }
+    };
+    void load();
+    const t = setInterval(load, 2000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [task.id]);
+
   // One unified task-level stream: every event from every run, merged in
   // chronological order. Replaces the old per-run subscription so the
   // panel shows the whole conversation as a single scrollback.
@@ -372,6 +411,23 @@ function RunPanelBody({
         } catch { /* ignore malformed */ }
         return;
       }
+      if (e.stream === "subagent") {
+        // Live lifecycle delta for a background/sub agent — upsert into the tab
+        // list instead of pushing to the log buffer. The agent's actual
+        // transcript rides the normal user/assistant/tool_* streams (tagged
+        // via `subagentId`) and flows through to `buffer.push` below.
+        try {
+          const { subagent } = JSON.parse(e.data) as SubagentEvent;
+          setSubagentList((cur) => {
+            const i = cur.findIndex((s) => s.id === subagent.id);
+            if (i === -1) return [...cur, subagent];
+            const next = cur.slice();
+            next[i] = subagent;
+            return next;
+          });
+        } catch { /* ignore malformed */ }
+        return;
+      }
       if (e.stream === "interaction_resolved") {
         // Server-side resolution (scraper auto-cancel, run cancellation,
         // delete) — drop the matching card so the UI doesn't keep
@@ -407,7 +463,7 @@ function RunPanelBody({
     if (!nearBottomRef.current) return;
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [events, rebuilt, interactions.length]);
+  }, [events, rebuilt, interactions.length, activeStream]);
 
   useEffect(() => {
     let cancelled = false;
@@ -459,15 +515,33 @@ function RunPanelBody({
     return ids;
   }, [rebuilt, runs]);
 
-  /** Splice `rebuilt` into the live stream by dropping events from runs
-   *  that share its sessionId and appending the rebuilt set. Events from
-   *  earlier sessions (different claudeSessionId) stay visible — the bug
-   *  this fixes was the rebuild silently masking them. */
+  /** The task's own (main) agent events — everything not tagged to a subagent.
+   *  The rebuild-from-JSONL path only ever covers the main session transcript,
+   *  so it splices against these. */
+  const mainEvents = useMemo(() => events.filter((e) => !e.subagentId), [events]);
+
+  /** Background/sub-agent events bucketed by subagent id, in arrival order. */
+  const subagentEventsById = useMemo(() => {
+    const m = new Map<string, RunEvent[]>();
+    for (const e of events) {
+      if (!e.subagentId) continue;
+      const arr = m.get(e.subagentId);
+      if (arr) arr.push(e);
+      else m.set(e.subagentId, [e]);
+    }
+    return m;
+  }, [events]);
+
+  /** Events for whichever stream the tab strip has selected. For "main", splice
+   *  `rebuilt` in by dropping events from runs that share its sessionId and
+   *  appending the rebuilt set (earlier sessions stay visible). A subagent tab
+   *  shows that subagent's transcript directly (no rebuild path applies). */
   const displayedEvents = useMemo(() => {
-    if (!rebuilt || !rebuiltRunIds) return events;
-    const others = events.filter((e) => !rebuiltRunIds.has(e.runId));
+    if (activeStream !== "main") return subagentEventsById.get(activeStream) ?? [];
+    if (!rebuilt || !rebuiltRunIds) return mainEvents;
+    const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId));
     return [...others, ...rebuilt.events];
-  }, [events, rebuilt, rebuiltRunIds]);
+  }, [activeStream, subagentEventsById, mainEvents, rebuilt, rebuiltRunIds]);
 
   /** Indicator mode for the bottom-pinned heartbeat. A follow-up sent while
    *  the agent is working is folded into the active run (the backend pastes it
@@ -475,9 +549,32 @@ function RunPanelBody({
    *  in-flight run per task: the heartbeat is simply on ("Agent is working…")
    *  or off. Hidden while an interaction card is up. */
   const indicatorMode: RunIndicatorMode = useMemo(() => {
+    // A background-agent tab's heartbeat tracks that subagent's own status,
+    // independent of the main turn (the parent turn may already be in `review`
+    // while a background workflow keeps running).
+    if (activeStream !== "main") {
+      const s = subagentList.find((x) => x.id === activeStream);
+      return s?.status === "running" ? "active" : "off";
+    }
     if (interactions.length > 0) return "off";
     return runs.some((r) => r.status === "running") ? "active" : "off";
-  }, [interactions.length, runs]);
+  }, [activeStream, subagentList, interactions.length, runs]);
+
+  // Tabs are shown only while background agents are active (see
+  // `shouldShowSubagentTabs`). Logic is extracted + unit-tested in
+  // lib/subagent-tabs.ts (the repo has no DOM test harness).
+  const parentRunRunning = useMemo(() => runs.some((r) => r.status === "running"), [runs]);
+  const showSubagentTabs = useMemo(
+    () => shouldShowSubagentTabs(subagentList, parentRunRunning),
+    [subagentList, parentRunRunning],
+  );
+
+  // When the strip collapses (or the active subagent disappears), fall back to
+  // the Main stream so the log + composer can't be stranded on a hidden tab.
+  useEffect(() => {
+    const resolved = resolveActiveStream(activeStream, showSubagentTabs, subagentList);
+    if (resolved !== activeStream) setActiveStream(resolved);
+  }, [showSubagentTabs, subagentList, activeStream]);
 
   // Two separate affordances:
   //   • `canControl` — Stop button is only meaningful when there's an in-flight
@@ -827,6 +924,17 @@ function RunPanelBody({
 
       <TerminalsSection task={task} />
 
+      {showSubagentTabs && (
+        <SubagentTabs
+          subagents={subagentList}
+          active={activeStream}
+          onSelect={(id) => {
+            nearBottomRef.current = true; // pin the new stream to its latest message
+            setActiveStream(id);
+          }}
+        />
+      )}
+
       <div
         ref={logRef}
         onScroll={(e) => {
@@ -847,7 +955,7 @@ function RunPanelBody({
         ) : (
           <>
             <div className="mb-2 flex items-center justify-between gap-2">
-              {latestRun?.claudeSessionId ? (
+              {activeStream === "main" && latestRun?.claudeSessionId ? (
                 <button
                   type="button"
                   onClick={() => void rebuildFromJsonl()}
@@ -888,6 +996,23 @@ function RunPanelBody({
       {archived ? (
         <div className="shrink-0 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
           This task is archived. Unarchive it to send messages.
+        </div>
+      ) : activeStream !== "main" ? (
+        // Background-agent streams are read-only — you can watch them but not
+        // talk to them. Switch back to Main to send a message.
+        <div className="flex shrink-0 items-center gap-2 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
+          <Eye className="size-3 shrink-0" />
+          <span>
+            Viewing a background agent — read-only.{" "}
+            <button
+              type="button"
+              onClick={() => setActiveStream("main")}
+              className="text-foreground underline underline-offset-2 hover:no-underline"
+            >
+              Back to Main
+            </button>{" "}
+            to send a message.
+          </span>
         </div>
       ) : (
         <div
@@ -1070,6 +1195,108 @@ function extractFileMentions(events: RunEvent[]): string[] {
 function basename(p: string): string {
   const i = p.lastIndexOf("/");
   return i >= 0 ? p.slice(i + 1) : p;
+}
+
+/**
+ * Read-only tab strip for switching the log between the task's own (Main)
+ * agent stream and each background/sub agent it has spawned. Shown only while
+ * background agents are active (see `showSubagentTabs`). The Main tab is always
+ * first and visually emphasised — it's the one stream you can actually talk to;
+ * the background tabs are watch-only. A running agent shows a pulsing green dot,
+ * a finished one a check.
+ */
+function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean; onSelect: (id: string) => void }) {
+  const label = s.agentType ?? "agent";
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={selected}
+      onClick={() => onSelect(s.id)}
+      title={s.description ?? label}
+      className={cn(
+        "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[11px] transition-colors",
+        selected
+          ? "bg-accent text-accent-foreground ring-1 ring-border"
+          : "text-muted-foreground hover:bg-muted/40",
+      )}
+    >
+      {/* Nested agents (spawned by another subagent, not the main agent) get a
+          depth marker so the hierarchy is legible in a flat strip. */}
+      {s.spawnDepth > 1 && <CornerDownRight className="size-3 shrink-0 text-muted-foreground/60" />}
+      {s.status === "running" ? (
+        <span className="relative inline-flex size-2 shrink-0">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 opacity-75" />
+          <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+        </span>
+      ) : (
+        <Check className="size-3 shrink-0 text-muted-foreground" />
+      )}
+      <span className="max-w-[10rem] truncate">{label}</span>
+      {s.description && (
+        <span className="max-w-[12rem] truncate text-muted-foreground/70">· {s.description}</span>
+      )}
+    </button>
+  );
+}
+
+function SubagentTabs({
+  subagents,
+  active,
+  onSelect,
+}: {
+  subagents: Subagent[];
+  active: string;
+  onSelect: (id: string) => void;
+}) {
+  // Collapse a large fan-out behind a "+N" pill; expanding wraps the strip onto
+  // multiple rows rather than forcing a long horizontal scroll. A running or
+  // currently-active tab is never hidden (see `splitTabsForOverflow`).
+  const [expanded, setExpanded] = useState(false);
+  const { visible, overflow } = splitTabsForOverflow(subagents, active);
+  const shown = expanded ? subagents : visible;
+
+  return (
+    <div
+      role="tablist"
+      aria-label="Agent streams"
+      className={cn(
+        "flex shrink-0 items-center gap-1 border-b border-border/60 bg-card/40 px-2 py-1.5",
+        expanded ? "flex-wrap" : "overflow-x-auto",
+      )}
+    >
+      <button
+        type="button"
+        role="tab"
+        aria-selected={active === "main"}
+        onClick={() => onSelect("main")}
+        className={cn(
+          "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium transition-colors",
+          // Main is always emphasised (primary accent) so it reads as the
+          // controllable stream even when a background tab is selected.
+          active === "main"
+            ? "bg-primary/15 text-primary ring-1 ring-primary/40"
+            : "text-primary/80 hover:bg-primary/10",
+        )}
+      >
+        <Bot className="size-3" />
+        Main
+      </button>
+      {shown.map((s) => (
+        <SubagentTab key={s.id} s={s} selected={active === s.id} onSelect={onSelect} />
+      ))}
+      {overflow.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="shrink-0 rounded-md px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted/40"
+          title={expanded ? "Collapse background-agent tabs" : `Show ${overflow.length} more background agent${overflow.length === 1 ? "" : "s"}`}
+        >
+          {expanded ? "Show less" : `+${overflow.length}`}
+        </button>
+      )}
+    </div>
+  );
 }
 
 /**

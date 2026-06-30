@@ -8,6 +8,7 @@ import { API_TOKEN, getApiPort } from "./api-config.ts";
 import {
   tasks,
   runs,
+  subagents,
   projects,
   preferences,
   harnesses,
@@ -940,6 +941,13 @@ export function startApiServer() {
         GET: authed((req) => json(runs.listForTask(req.params.id), { headers: corsHeaders(req) })),
       },
 
+      // Snapshot of the background/sub agents tracked for a task — drives the
+      // run panel's read-only tab strip on open, and is polled (like /runs)
+      // as a backstop to the live `subagent` SSE deltas.
+      "/tasks/:id/subagents": {
+        GET: authed((req) => json(subagents.listForTask(req.params.id), { headers: corsHeaders(req) })),
+      },
+
       // Everything the task's worktree changed vs its pinned base ref. Returns
       // a friendly `note` (empty `files`) when there's no worktree or no diff.
       "/tasks/:id/diff": {
@@ -1652,6 +1660,7 @@ export function startApiServer() {
                 stream: ev.stream as RunEvent["stream"],
                 data: ev.data,
                 ts: ev.ts,
+                subagentId: ev.subagentId,
               });
             }
             const drained = buffer;
