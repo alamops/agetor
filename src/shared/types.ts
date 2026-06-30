@@ -427,7 +427,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "max", label: "Max", hint: "Absolute maximum effort. Slowest, most thorough." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Opus 4.8 / 4.7 / 4.6 / codex only." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Opus 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
@@ -453,8 +453,9 @@ export const EFFORT_OPTIONS: AgentOption[] = [
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
   // effort parameter is API-supported on Fable 5 / Opus 4.8 / 4.7 / 4.6 /
-  // Sonnet 4.6 / Opus 4.5 (xhigh is Fable-5- and Opus-only; Sonnet 4.6 has no
-  // xhigh; Haiku 4.5 doesn't support effort at all). The `/effort` CLI command accepts more
+  // Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is Fable-5-, Opus-, and Sonnet-5-only;
+  // Sonnet 4.6 has no xhigh; Haiku 4.5 doesn't support effort at all). The
+  // `/effort` CLI command accepts more
   // levels but the underlying API request would fail for unsupported pairs,
   // so we filter at the picker rather than letting the user fire bad runs.
   "claude-code": {
@@ -463,6 +464,8 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.7": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.6": ["max", "xhigh", "high", "medium", "low"],
+    // Sonnet 5 is the first Sonnet-tier model with xhigh (full low→max range).
+    "sonnet-5": ["max", "xhigh", "high", "medium", "low"],
     "sonnet-4.6": ["max", "high", "medium", "low"],
     // Haiku 4.5 doesn't support the effort parameter — `supportedEfforts`
     // returns `[]` and the picker disables itself.
@@ -508,6 +511,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
     "opus-4.8": [],
     "opus-4.7": [],
     "opus-4.6": [],
+    "sonnet-5": [],
     "sonnet-4.6": [],
     "haiku-4.5": [],
   },
@@ -531,7 +535,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "opus-4.8", label: "Opus 4.8", hint: "Most capable Opus; slower." },
       { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
       { id: "opus-4.6", label: "Opus 4.6", hint: "Earlier Opus generation." },
-      { id: "sonnet-4.6", label: "Sonnet 4.6", hint: "Balanced." },
+      { id: "sonnet-5", label: "Sonnet 5", hint: "Near-Opus quality on coding/agentic work at Sonnet cost." },
+      { id: "sonnet-4.6", label: "Sonnet 4.6", hint: "Prior Sonnet generation." },
       { id: "haiku-4.5", label: "Haiku 4.5", hint: "Fast and cheap." },
     ],
     modes: [

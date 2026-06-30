@@ -64,6 +64,7 @@ const CLAUDE_MODEL_FLAG: Record<string, string> = {
   "opus-4.8": "claude-opus-4-8",
   "opus-4.7": "claude-opus-4-7",
   "opus-4.6": "claude-opus-4-6",
+  "sonnet-5": "claude-sonnet-5",
   "sonnet-4.6": "claude-sonnet-4-6",
   "haiku-4.5": "claude-haiku-4-5",
 };
