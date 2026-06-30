@@ -560,6 +560,19 @@ function RunPanelBody({
     return runs.some((r) => r.status === "running") ? "active" : "off";
   }, [activeStream, subagentList, interactions.length, runs]);
 
+  // The run-status RunEventList uses to gate its bottom heartbeat. On a
+  // background-agent tab this must reflect THAT subagent's status, not the main
+  // run's — otherwise a subagent still running after the parent turn resolved
+  // to `review` (the core background-workflow case) would have its heartbeat
+  // suppressed because the main run reads `succeeded`. Map the subagent's
+  // status onto the Run["status"] shape the child expects.
+  const activeRunStatus: Run["status"] | null = useMemo(() => {
+    if (activeStream === "main") return latestRun?.status ?? null;
+    return subagentList.find((s) => s.id === activeStream)?.status === "running"
+      ? "running"
+      : "succeeded";
+  }, [activeStream, subagentList, latestRun?.status]);
+
   // Tabs are shown only while background agents are active (see
   // `shouldShowSubagentTabs`). Logic is extracted + unit-tested in
   // lib/subagent-tabs.ts (the repo has no DOM test harness).
@@ -884,7 +897,10 @@ function RunPanelBody({
           >
             <FolderOpen className="mr-1 size-3" /> Open
           </Button>
-          {!archived && canControl && (
+          {/* Stop targets the main run. Hide it while viewing a read-only
+              background-agent tab so the control doesn't read as "stop this
+              agent" — switch back to Main to stop the task. */}
+          {!archived && canControl && activeStream === "main" && (
             <Button size="sm" variant="destructive" onClick={stop}>
               <Square className="mr-1 size-3" /> Stop
             </Button>
@@ -978,7 +994,7 @@ function RunPanelBody({
               events={displayedEvents}
               interactions={interactions}
               onInteractionResolved={dismissInteraction}
-              runStatus={latestRun?.status ?? null}
+              runStatus={activeRunStatus}
               indicatorMode={indicatorMode}
             />
           </>

@@ -191,6 +191,12 @@ export function attachSubagentWatcher(opts: {
   let timer: ReturnType<typeof setTimeout> | null = null;
   let dirWatcher: FSWatcher | null = null;
   let detached = false;
+  // The first cycle tails EVERY known file (including ones the DB says are
+  // already `completed`) so a reattach picks up any bytes appended while agetor
+  // was down — e.g. a background agent resumed during the gap. Steady-state
+  // polling then only re-reads `running` files; resumes of a finished agent
+  // after that are caught by the dir watcher's append notification.
+  let firstCycle = true;
 
   // Reattach: rehydrate subagents this task already had so we resume their
   // tails from offset 0 (the DB-seeded `seen` set suppresses re-emission of
@@ -290,9 +296,13 @@ export function attachSubagentWatcher(opts: {
       }
       // A previously-finished subagent that started writing again (resumed
       // background agent) flips back to running before we emit its new turn.
+      // Reset the end-of-turn latch so the new turn must produce its OWN
+      // end_turn before `checkDone` can complete it again — otherwise the stale
+      // `sawEndOfTurn` from the prior turn would mark it done mid-resume.
       if (fs.status !== "running") {
         fs.status = "running";
         fs.endedAt = null;
+        fs.sawEndOfTurn = false;
         subagentsDb.setStatus(fs.subagentId, "running", null);
         emitLifecycle(fs, "started");
       }
@@ -334,7 +344,16 @@ export function attachSubagentWatcher(opts: {
     try {
       armDirWatcher();
       discover();
-      for (const fs of files.values()) tailFile(fs);
+      // Steady-state: only re-stat/re-read `running` files. Completed ones keep
+      // no per-tick cost; a resume (rare) re-opens them via the dir watcher's
+      // append notification (see `armDirWatcher`, which tails ALL files). The
+      // first cycle is the exception — it tails everything to drain a reattach
+      // backlog.
+      const tailAll = firstCycle;
+      firstCycle = false;
+      for (const fs of files.values()) {
+        if (tailAll || fs.status === "running") tailFile(fs);
+      }
       checkDone(now);
     } catch { /* swallow — never crash the timer */ }
   }
