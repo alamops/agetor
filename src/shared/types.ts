@@ -720,6 +720,25 @@ export type GlobalEvent =
       /** Human-readable detail (error message, etc). */
       message: string | null;
       ts: number;
+    }
+  | {
+      /**
+       * A question / permission prompt was registered (`pending`) or cleared
+       * (`resolved`). Distinct from the per-task `interaction` SSE event (which
+       * only reaches the open RunPanel): this rides the app-level bus so the
+       * notification hook can alert the user — with a native OS notification
+       * and a "Waiting on you" toast — even when the agetor window is
+       * backgrounded mid-workflow and the panel can't repaint the card.
+       */
+      kind: "interaction";
+      taskId: string;
+      runId: string;
+      state: "pending" | "resolved";
+      /** Stable id of the interaction, so the UI can track which prompts are
+       *  live per task (several can stack) and clear the alert only once the
+       *  last one resolves. */
+      interactionId: string;
+      ts: number;
     };
 
 /**
@@ -807,6 +826,33 @@ export interface Project {
   path: string;
   name: string;
   addedAt: number;
+}
+
+/**
+ * A branch surfaced by the new-task base-ref picker. Shared so the server
+ * (`listBranches` in src/bun/worktree.ts) and the webview (`api.ts` /
+ * `BranchPicker`) agree on a single wire shape — the previous per-side copies
+ * had already silently drifted (the client one omitted `remote`).
+ */
+export interface BranchInfo {
+  /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */
+  name: string;
+  /** Unix-ms timestamp of the tip commit, used to sort recents first. */
+  committedAt: number;
+  /** True for the branch currently checked out at the repo. */
+  current: boolean;
+  /** True for remote-tracking refs (`refs/remotes/<remote>/<name>`). */
+  remote: boolean;
+  /** Short name of the upstream tracking ref (e.g. "origin/main"), or null when
+   *  the branch has no configured upstream or is itself a remote-tracking ref. */
+  upstream: string | null;
+  /** Commits the upstream has that this branch lacks ("behind" count). 0 when up
+   *  to date; null when there's no upstream. Reflects the last fetch (compared
+   *  against the local remote-tracking ref, not the network). */
+  behind: number | null;
+  /** Commits this branch has that the upstream lacks ("ahead" count). Used to
+   *  detect divergence (ahead > 0 && behind > 0). Null when there's no upstream. */
+  ahead: number | null;
 }
 
 /**

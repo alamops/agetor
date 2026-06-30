@@ -24,7 +24,7 @@ import {
   type TmuxPromptChoice,
 } from "./interactions.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
-import { detectAskModal, parseModalPane, type NavKey } from "./claude-questions.ts";
+import { detectAskModal, parseModalPane, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
 /**
  * Driver that hosts Claude Code's interactive REPL inside a per-task tmux
@@ -186,6 +186,46 @@ export function encodeProjectPath(cwd: string): string {
 /** Tmux-safe session name derived from a task id. */
 export function sessionNameFor(taskId: string): string {
   return `agetor-${taskId.slice(0, 12)}`;
+}
+
+/**
+ * Build the env every spawned claude session runs with: the caller-supplied
+ * env (model / effort / CLAUDE_CONFIG_DIR vars from `buildCommand`) with two
+ * agetor pins layered on top.
+ *
+ *   - **PATH** is re-injected from the current process because the tmux
+ *     *server* captures env at its first launch and reuses it for every
+ *     subsequent session — passing it per-session via `-e` guarantees the
+ *     spawned claude sees the freshly-rehydrated PATH even if the long-running
+ *     bundled tmux server captured a stale copy (e.g. agetor restarted with a
+ *     different login-shell PATH).
+ *   - **CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1** forces claude's classic
+ *     (inline) renderer regardless of the user's saved `tui` setting. Claude
+ *     Code v2.1.89+ added an opt-in "Fullscreen rendering" mode (`/tui
+ *     fullscreen` / `CLAUDE_CODE_NO_FLICKER=1`) that draws the TUI on the
+ *     terminal's ALTERNATE screen buffer. The spawned claude reads the user's
+ *     global `~/.claude/settings.json`, so a user who enabled fullscreen in
+ *     their own everyday claude usage would flip agetor's sessions into it too
+ *     — which breaks the pane scraper (`scrapeTimer` → `capture-pane`) we rely
+ *     on to catch the permission / AskUserQuestion modals the hook system
+ *     bypasses: the alt screen has NO scrollback, so the AskUserQuestion
+ *     collector's `capture-pane -p -S -200` comes back truncated, and the modal
+ *     geometry the fingerprinting is tuned to changes. agetor never shows the
+ *     tmux pane (its own UI renders the JSONL stream), so fullscreen's
+ *     flicker / memory / mouse wins are irrelevant here. Per the docs this var
+ *     takes precedence over `CLAUDE_CODE_NO_FLICKER` and the `tui` setting.
+ *     Docs: https://code.claude.com/docs/en/fullscreen
+ *
+ * Both pins come AFTER the caller spread on purpose: agetor's classic-renderer
+ * guarantee must not be silently overridable by a harness-level env that set
+ * `CLAUDE_CODE_NO_FLICKER`.
+ */
+export function buildClaudeSessionEnv(callerEnv: Record<string, string>): Record<string, string> {
+  return {
+    ...callerEnv,
+    PATH: process.env.PATH ?? "",
+    CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "1",
+  };
 }
 
 interface ContentBlock {
@@ -1365,41 +1405,222 @@ function readPendingAskQuestionsFromJsonl(jsonlPath: string): AskQuestion[] | nu
   return last && !answered.has(last.id) ? last.questions : null;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Per-option preview capture (pane geometry)
+ *
+ * claude renders an AskUserQuestion option's `preview` in a box-drawn panel to
+ * the RIGHT of the option list — but only for the FOCUSED option, and the TUI
+ * collapses anything taller than the available rows to "✂ N lines hidden". So to
+ * surface real per-option previews live (the JSONL tool_use only lands on
+ * answer), we (a) GROW the detached pane so the panel isn't truncated — verified
+ * de-truncating against real 2.1.170 captures — then (b) navigate each option,
+ * scraping its panel. The user views the webview card, never the pane, so the
+ * resize is invisible; it is always restored afterwards.
+ * ────────────────────────────────────────────────────────────────────────── */
+const PREVIEW_PANE_MIN_COLS = 120; // wider never adds label wraps; widens the box for wide previews
+const PREVIEW_PANE_ROWS = 100;     // covers ~any realistic preview; restored after
+const PREVIEW_REFLOW_MS = 450;     // let claude's Ink TUI redraw after a resize
+const OPTION_NAV_MS = 160;         // settle after each Up/Down before capturing
+
+/** The slice of tmux that `collectAskQuestionsFromPane` drives, behind an
+ *  interface so the navigation / grow / restore orchestration is unit-testable
+ *  with a fake pane (the real one shells out to tmux). */
+interface PaneIo {
+  /** Full pane capture (NOT the scrape tail). */
+  capture(): string;
+  /** Send one nav key; false when tmux errored (session gone). */
+  send(key: NavKey): boolean;
+  /** Current `<w>x<h>`, or null. */
+  size(): { w: number; h: number } | null;
+  resize(w: number, h: number): void;
+  restore(w: number, h: number): void;
+  sleep(ms: number): Promise<void>;
+}
+
+function tmuxPaneIo(state: SessionState): PaneIo {
+  return {
+    capture: () => captureFullPane(state),
+    send: (key) => tmux(["send-keys", "-t", state.sessionName, key]).ok,
+    size: () => paneSize(state),
+    resize: (w, h) => resizePane(state, w, h),
+    restore: (w, h) => restorePaneSize(state, w, h),
+    sleep: (ms) => Bun.sleep(ms),
+  };
+}
+
+/** Whether a captured pane shows the right-hand preview panel — a ≥2-space
+ *  gutter then a box border/vertical that closes near end-of-line. Detects even
+ *  a tall panel whose ┌ top border is above the 40-line scrape tail (its
+ *  `│ … │` content rows still match), so we don't skip a tall-preview question.
+ *  Used only for the GROW decision — a false positive (e.g. a boxed scrollback
+ *  row in the tail) costs nothing but a needless, restored resize, never a wrong
+ *  card; the per-option walk keys on the *parsed* focused preview instead. */
+function paneHasPreviewPanel(text: string): boolean {
+  return text.split("\n").some((l) => /\s{2,}[┌│├][^\n]*[┐│┤]\s*$/u.test(l));
+}
+
+/** Current `<w>x<h>` of the session's window, or null. */
+function paneSize(state: SessionState): { w: number; h: number } | null {
+  const r = tmux(["display-message", "-p", "-t", state.sessionName, "#{window_width}x#{window_height}"]);
+  if (!r.ok) return null;
+  const m = r.stdout.trim().match(/^(\d+)x(\d+)$/);
+  return m ? { w: Number(m[1]), h: Number(m[2]) } : null;
+}
+
+/** Force a detached window to a fixed size (`window-size manual` is required for
+ *  `resize-window` to stick on a session no client is attached to). */
+function resizePane(state: SessionState, w: number, h: number): void {
+  tmux(["set-window-option", "-t", state.sessionName, "window-size", "manual"]);
+  tmux(["resize-window", "-t", state.sessionName, "-x", String(w), "-y", String(h)]);
+}
+
+/** Restore the original size and hand sizing back to tmux (`latest`). Best-effort
+ *  — if the process dies between the grow and this call the pane is just left
+ *  larger, which is harmless (claude's TUI reflows to any size and the next
+ *  attach/resize corrects it). */
+function restorePaneSize(state: SessionState, w: number, h: number): void {
+  tmux(["resize-window", "-t", state.sessionName, "-x", String(w), "-y", String(h)]);
+  tmux(["set-window-option", "-t", state.sessionName, "window-size", "latest"]);
+}
+
+/** Full pane capture (NOT the 40-line tail) — a grown preview panel can be much
+ *  taller than the scrape tail. Sliced to the modal region by the caller. */
+function captureFullPane(state: SessionState): string {
+  const cap = tmux(["capture-pane", "-p", "-t", state.sessionName]);
+  return cap.ok ? cap.stdout : "";
+}
+
+/** Trim a full pane capture to just the current modal (header→footer), so a
+ *  numbered list in the scrollback above can't be mis-read as options. The modal
+ *  always sits at the bottom; the footer ("Esc to cancel") marks its end and the
+ *  `☐`/`☒` header (or tab bar) marks its top. */
+function sliceModalRegion(fullText: string): string {
+  const lines = fullText.split("\n");
+  let footer = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/Esc to cancel/.test(lines[i]!)) { footer = i; break; }
+  }
+  if (footer < 0) return fullText;
+  let top = Math.max(0, footer - 80); // bounded fallback if no header is found
+  for (let i = footer; i >= top; i--) {
+    if (/[☐☒]/.test(lines[i]!)) { top = Math.max(0, i - 1); break; }
+  }
+  return lines.slice(top, footer + 1).join("\n");
+}
+
+/** Fill every option's `preview` for the CURRENT tab by walking the option
+ *  cursor (one Down at a time) and scraping the focused option's panel at each
+ *  stop, then restoring the cursor to option 0. `base` is the already-parsed
+ *  (grown) frame for this tab — its focused option's preview is already set.
+ *  Assumes the cursor starts on option 0 (true at modal open and after a tab
+ *  switch). The pane must already be grown by the caller. */
+async function captureTabWithPreviews(
+  io: PaneIo,
+  stillCurrent: () => boolean,
+  base: ParsedQuestionPane,
+): Promise<ParsedQuestionPane> {
+  const previews: Array<string | undefined> = base.options.map((o) => o.preview);
+  let downs = 0;
+  for (let j = 1; j < base.options.length; j++) {
+    if (!io.send("Down")) break;
+    downs++;
+    await io.sleep(OPTION_NAV_MS);
+    if (!stillCurrent()) break;
+    const p = parseModalPane(sliceModalRegion(io.capture()));
+    // Only trust a capture whose cursor AND option count match — a mid-repaint
+    // frame can't then misassign a preview to the wrong option.
+    if (p && p.cursorIndex === j && p.options.length === base.options.length) {
+      previews[j] = p.options[j]?.preview;
+    }
+  }
+  // Restore the cursor to option 0 (exact Up count — no over-pressing, which
+  // could wrap) so the later answer-drive starts where planAskAnswers expects.
+  for (let k = 0; k < downs; k++) {
+    if (!io.send("Up")) break;
+    await io.sleep(OPTION_NAV_MS);
+    if (!stillCurrent()) break;
+  }
+  base.options.forEach((o, j) => { o.preview = previews[j]; });
+  return base;
+}
+
 /** Pane fallback for when the JSONL tool_use isn't on disk yet: scrape the
- *  visible modal, walking tabs for a multi-question modal. Loses `preview`
- *  blocks (collapsed in the TUI) and any long descriptions the TUI truncates. */
-async function collectAskQuestionsFromPane(state: SessionState, firstTail: string): Promise<AskQuestion[] | null> {
+ *  visible modal. A flat no-preview question registers immediately (fast path,
+ *  no added latency). Otherwise — a tabbed modal, or a flat one already showing
+ *  a preview panel — we grow the detached pane once (so previews aren't
+ *  collapsed to "✂ N lines hidden") and walk it: every tab, and within each tab
+ *  whose focused option has a preview, every option. A tabbed modal always grows
+ *  because any of its questions may carry previews we can only detect by visiting
+ *  the tab. The pane is detached (user sees the webview) and always restored.
+ *  `io` is injectable so the orchestration is unit-testable without tmux. */
+async function collectAskQuestionsFromPane(
+  state: SessionState,
+  firstTail: string,
+  io: PaneIo = tmuxPaneIo(state),
+): Promise<AskQuestion[] | null> {
   const first = parseModalPane(firstTail);
   if (!first) return null;
-  const collected = [first];
-  const n = first.tabbed ? Math.max(1, first.tabHeaders.length) : 1;
-  if (n > 1) {
-    // Walk the tabs to read every question, then return to the first tab so the
-    // answer-driving sequence (planAskAnswers) starts from a known state.
-    await queueTmuxOp(state.taskId, async (stillCurrent) => {
-      for (let i = 1; i < n; i++) {
-        if (!tmux(["send-keys", "-t", state.sessionName, "Right"]).ok) return;
-        await Bun.sleep(180);
-        if (!stillCurrent()) return;
-        const p = parseModalPane(captureTail(state));
-        if (p) collected.push(p);
+  const headers = first.tabHeaders;
+  const n = first.tabbed ? Math.max(1, headers.length) : 1;
+
+  const toAsk = (p: ParsedQuestionPane, header: string | undefined): AskQuestion => ({
+    question: p.questionText,
+    header,
+    multiSelect: p.multiSelect,
+    options: p.options.map((o) => ({ label: o.label, description: o.description, preview: o.preview })),
+  });
+
+  // Fast path: a single flat question with no preview panel — nothing to walk.
+  if (n === 1 && !paneHasPreviewPanel(firstTail)) return [toAsk(first, headers[0])];
+
+  const collected: Array<ParsedQuestionPane | null> = [];
+  await queueTmuxOp(state.taskId, async (stillCurrent) => {
+    const orig = io.size();
+    if (orig) {
+      io.resize(Math.max(orig.w, PREVIEW_PANE_MIN_COLS), PREVIEW_PANE_ROWS);
+      await io.sleep(PREVIEW_REFLOW_MS);
+      if (!stillCurrent()) { io.restore(orig.w, orig.h); return; }
+    }
+    try {
+      for (let t = 0; t < n; t++) {
+        if (t > 0) {
+          if (!io.send("Right")) return; // entering a tab resets the cursor to option 0
+          await io.sleep(180);
+          if (!stillCurrent()) return;
+        }
+        const base = parseModalPane(sliceModalRegion(io.capture()));
+        if (!base) { collected.push(null); return; }
+        if (t === 0 && orig) {
+          // Guard the post-resize transient: a mid-reflow capture can drop an
+          // option and mis-drive the answer. Require two consecutive captures to
+          // agree on the option count before trusting this tab.
+          await io.sleep(OPTION_NAV_MS);
+          const recheck = parseModalPane(sliceModalRegion(io.capture()));
+          if (!recheck || recheck.options.length !== base.options.length) { collected.push(null); return; }
+        }
+        // Walk options only when THIS tab's focused option actually has a panel
+        // (keys on the parsed preview, not a loose pane regex). A tab whose
+        // option 0 has no preview but a later option does is the one known gap —
+        // closing it would mean navigating every no-preview question.
+        const focused = base.options[base.cursorIndex];
+        const tabHasPreview = !!focused && (focused.preview != null || focused.previewTruncated === true);
+        collected.push(tabHasPreview ? await captureTabWithPreviews(io, stillCurrent, base) : base);
       }
-      for (let i = 1; i < n; i++) {
-        if (!tmux(["send-keys", "-t", state.sessionName, "Left"]).ok) return;
-        await Bun.sleep(90);
-        if (!stillCurrent()) return;
+      // Back to the first tab so the answer-driving sequence starts known.
+      for (let t = 1; t < n; t++) {
+        if (!io.send("Left")) break;
+        await io.sleep(90);
+        if (!stillCurrent()) break;
       }
-    }, state);
-  }
+    } finally {
+      if (orig) io.restore(orig.w, orig.h);
+    }
+  }, state);
+
   // Don't register a PARTIAL read: a tab that failed to parse (capture landed
   // mid-repaint) would give the wrong question count and mis-drive the answer.
-  if (collected.length !== n) return null;
-  return collected.map((p, i) => ({
-    question: p.questionText,
-    header: first.tabHeaders[i],
-    multiSelect: p.multiSelect,
-    options: p.options.map((o) => ({ label: o.label, description: o.description })),
-  }));
+  if (collected.length !== n || collected.some((p) => p == null)) return null;
+  return collected.map((p, i) => toAsk(p!, headers[i]));
 }
 
 /** Grace window during which we keep waiting for claude to flush its
@@ -1758,6 +1979,11 @@ interface ScrapeMatch {
   /** Stable hash that survives across consecutive scrapes as long as the
    *  modal stays on screen unchanged. */
   fingerprint: string;
+  /** True when the match is bounded by a real modal footer (`Esc to cancel …`),
+   *  which printed numbered output never has. Lets `scrapeOnce` register on the
+   *  first sighting and skip the two-tick stability gate, so tool-use permission
+   *  prompts appear promptly. */
+  highConfidence?: boolean;
 }
 
 /** Recognise claude's standard numbered-choice modal:
@@ -1776,16 +2002,17 @@ interface ScrapeMatch {
  * Enter dismisses the modal exactly the way the user would. */
 function matchNumberedModal(tail: string): ScrapeMatch | null {
   const lines = tail.split("\n");
-  const numbered: Array<{ key: string; label: string; cursorHere: boolean }> = [];
-  for (const raw of lines) {
+  const numbered: Array<{ key: string; label: string; cursorHere: boolean; lineIndex: number }> = [];
+  lines.forEach((raw, idx) => {
     const m = raw.match(/^\s*([›❯])?\s*(\d+)\.\s+(.+?)\s*$/);
-    if (!m) continue;
+    if (!m) return;
     numbered.push({
       cursorHere: !!m[1],
       key: m[2]!,
       label: m[3]!.trim(),
+      lineIndex: idx,
     });
-  }
+  });
   if (numbered.length < 2) return null;
   // Need at least one cursor marker on the numbered block — otherwise
   // we're probably looking at a printed list, not an interactive modal.
@@ -1797,6 +2024,18 @@ function matchNumberedModal(tail: string): ScrapeMatch | null {
     tailRun.unshift(numbered[i]!);
     if (i > 0 && Number(numbered[i - 1]!.key) + 1 !== Number(numbered[i]!.key)) break;
   }
+  // claude's choice modals are always 1-indexed. A tool-use permission prompt
+  // wraps the tool's description across lines, e.g.
+  //   … keep fetching while remaining >
+  //   0. Use the offset arg to paginate.
+  // The phantom "0." row is numerically contiguous with the real "1." option,
+  // so the trailing-run walk above swallows it as choice 0 (and shifts the
+  // cursor index by one). Anchor the run to the real "1." option: drop any
+  // leading rows that precede it. No "1." at all means this isn't a claude
+  // choice modal.
+  const oneAt = tailRun.findIndex((n) => n.key === "1");
+  if (oneAt < 0) return null;
+  if (oneAt > 0) tailRun.splice(0, oneAt);
   if (tailRun.length < 2) return null;
   // Cursor MUST land inside tailRun for the modal to be dismissible —
   // otherwise the `❯` is on a printed list above the actual choice set
@@ -1804,7 +2043,33 @@ function matchNumberedModal(tail: string): ScrapeMatch | null {
   // register a half-known modal.
   const cursorIndex = tailRun.findIndex((n) => n.cursorHere);
   if (cursorIndex < 0) return null;
-  const choices: TmuxPromptChoice[] = tailRun.map((n) => ({ key: n.key, label: n.label }));
+  // Fold wrapped continuation rows into each option's label. claude wraps a
+  // long choice (e.g. "… don't ask again … commands in <worktree path>") across
+  // pane rows; only the first row carries the "N." prefix, so without this the
+  // label truncates mid-sentence and the user can't see, say, which directory a
+  // "don't ask again" scope applies to. An option owns the rows between it and
+  // the next option, stopping at a blank line or the footer.
+  //
+  // A continuation row must be indented PAST its option's own indent: claude
+  // aligns wrapped text under the option label (past the "N." marker), so a
+  // genuine wrap is always more indented. This keeps a same-indent standalone
+  // hint line under the LAST option (which, unlike middle options, isn't capped
+  // by a following numbered row) from being absorbed into its label.
+  const indentOf = (l: string): number => (l.match(/^[ \t]*/)?.[0].length ?? 0);
+  const choices: TmuxPromptChoice[] = tailRun.map((n, i) => {
+    const end = i + 1 < tailRun.length ? tailRun[i + 1]!.lineIndex : lines.length;
+    const optIndent = indentOf(lines[n.lineIndex]!);
+    const extra: string[] = [];
+    for (let j = n.lineIndex + 1; j < end; j++) {
+      const l = lines[j]!;
+      if (l.trim().length === 0) break;            // blank line ends the option
+      if (/Esc to cancel/.test(l)) break;          // footer ends the option
+      if (/^\s*([›❯])?\s*\d+\.\s+/.test(l)) break;  // next numbered row (defensive)
+      if (indentOf(l) <= optIndent) break;         // not a wrap — a sibling line
+      extra.push(l.trim());
+    }
+    return { key: n.key, label: extra.length ? `${n.label} ${extra.join(" ")}` : n.label };
+  });
   // Use the last ~12 lines for the displayed pane snippet so the user
   // sees the question text + the choices, not 40 lines of unrelated
   // context above.
@@ -1818,7 +2083,35 @@ function matchNumberedModal(tail: string): ScrapeMatch | null {
   const fingerprint = sha1(
     `numbered:${choices.map((c) => `${c.key}|${c.label}`).join("/")}|@${cursorIndex}`,
   );
-  return { paneText, choices, cursorIndex, fingerprint };
+  // A trailing `Esc to cancel …` footer marks a fully-drawn interactive modal
+  // (the tool-use permission prompt, edit/plan dialogs, …). Streamed numbered
+  // *output* never carries it, so its presence lets the scraper register on the
+  // first sighting instead of waiting out the two-tick stability gate — this is
+  // what makes tool-use asks surface promptly rather than ~2s late. (The
+  // AskUserQuestion modal also has this footer but is routed away from here by
+  // `detectAskModal` before we're ever called.)
+  //
+  // Test the last couple of NON-BLANK lines, not a fixed `slice(-N)` of raw
+  // lines: `tmux capture-pane` can emit trailing blank rows (this is exactly
+  // why `parseAskModal` strips them), which would otherwise push the footer out
+  // of a raw-line window and silently disable the fast path. A real modal's
+  // footer is always the last non-blank line; restricting to the last two keeps
+  // a stray "Esc to cancel" buried mid-output from falsely qualifying.
+  const nonBlank = lines.filter((l) => l.trim().length > 0);
+  const highConfidence = nonBlank.slice(-2).some((l) => /Esc to cancel/.test(l));
+  return { paneText, choices, cursorIndex, fingerprint, highConfidence };
+}
+
+/** Decide whether a scrape match has cleared the stability gate this tick.
+ *  A high-confidence match (bounded by a real `Esc to cancel …` modal footer,
+ *  which streamed numbered output never carries) registers on first sighting,
+ *  so tool-use permission prompts surface promptly instead of ~2s late. Every
+ *  other match must be seen on two consecutive scrapes — the previous tick's
+ *  fingerprint must equal this one — which rejects single-tick blips from a
+ *  numbered list the agent is printing. Pure so the gate is unit-testable
+ *  without a live tmux session. */
+function clearedStabilityGate(match: ScrapeMatch, prevFingerprint: string | null): boolean {
+  return !!match.highConfidence || prevFingerprint === match.fingerprint;
 }
 
 /** Recognise `(y/N)` / `(Y/n)` / `[y/n]` confirmation prompts on the
@@ -2084,13 +2377,13 @@ function scrapeOnce(state: SessionState): void {
     return;
   }
 
-  // Two-tick stability — require the same match on two consecutive
-  // scrapes before registering. Single-tick blips (a numbered list the
-  // agent is printing) never make it through.
-  if (state.scrapeLastFingerprint !== match.fingerprint) {
-    state.scrapeLastFingerprint = match.fingerprint;
-    return;
-  }
+  // Stability gate (see `clearedStabilityGate`): a high-confidence match
+  // registers on first sighting; everything else waits for the same
+  // fingerprint on two consecutive scrapes. Record the fingerprint either way
+  // so the next tick can satisfy the two-tick rule.
+  const cleared = clearedStabilityGate(match, state.scrapeLastFingerprint);
+  state.scrapeLastFingerprint = match.fingerprint;
+  if (!cleared) return;
 
   // Already registered? Nothing to do — the previous tick's broadcast
   // is what the UI is showing.
@@ -2186,23 +2479,15 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
 
   // Build the tmux command. `-e KEY=VAL` injects env vars into the new
   // session (so the spawned claude inherits them); `--` separates the tmux
-  // flags from the command to run.
-  //
-  // PATH is injected explicitly because the tmux *server* captures env at
-  // its first launch and reuses it for every subsequent session — passing
-  // it per-session via `-e` guarantees the spawned claude sees the
-  // currently-rehydrated PATH even if the server's captured copy is stale
-  // (e.g. agetor restarted with a different login-shell PATH but the
-  // long-running bundled tmux server is still around).
+  // flags from the command to run. `buildClaudeSessionEnv` layers agetor's
+  // forced pins (PATH re-injection, classic-renderer) over the caller env —
+  // see that helper for the full rationale.
   //
   // We no longer inject AGETOR_API_PORT/TOKEN/TASK_ID: with the PreToolUse hook
   // and the ask_user MCP both gone, nothing in the spawned claude reads them,
   // and AGETOR_API_TOKEN gates every orchestration route — no reason to expose
   // it to the agent's environment.
-  const fullEnv: Record<string, string> = {
-    ...opts.env,
-    PATH: process.env.PATH ?? "",
-  };
+  const fullEnv = buildClaudeSessionEnv(opts.env);
   const tmuxArgs: string[] = ["new-session", "-d", "-s", sessionName, "-c", opts.cwd];
   for (const [k, v] of Object.entries(fullEnv)) tmuxArgs.push("-e", `${k}=${v}`);
   tmuxArgs.push("--", ...opts.argv);
@@ -2270,16 +2555,30 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // soon as it appears regardless.
   const BOOT_TIMEOUT_MS = 30_000;
   (async () => {
-    // Concurrently watch for a one-time startup consent dialog (the
-    // `--dangerously-skip-permissions` bypass warning, or the trust-folder
-    // prompt) blocking claude from ever writing its JSONL. Auto-confirm it —
-    // each maps to a choice the user already made (see STARTUP_CONSENT_DIALOGS).
-    // Without this the dialog sits unanswered until BOOT_TIMEOUT_MS and the run
-    // dies with an empty pane; this is the failure a claude version bump that
-    // re-shows the bypass acceptance reliably triggers. The poller self-stops
+    // Concurrently watch the boot pane for a dialog blocking claude from ever
+    // writing its JSONL. Two classes are handled:
+    //
+    //   (1) Known consent dialogs (the `--dangerously-skip-permissions` bypass
+    //       warning, or the trust-folder prompt). Auto-confirm — each maps to
+    //       a choice the user already made (see STARTUP_CONSENT_DIALOGS).
+    //   (2) Any OTHER interactive question claude poses before its JSONL exists
+    //       — e.g. the "Claude in Chrome extension detected" trust prompt a
+    //       version bump can introduce. We can't answer these for the user, so
+    //       we surface them as a normal interactive tmux_prompt card and let
+    //       the user decide; the boot wait below keeps the run alive while such
+    //       a prompt is outstanding instead of letting it die at the timeout.
+    //
+    // Without this a blocking dialog sits unanswered until BOOT_TIMEOUT_MS and
+    // the run dies with the dialog stranded on the pane. The poller self-stops
     // the moment the JSONL appears, the session dies, or boot settles.
     let bootSettled = false;
     let lastConfirmedFingerprint: string | null = null;
+    let lastGenericFingerprint: string | null = null;
+    // Set by the poller whenever a startup question is on the pane during the
+    // current boot-wait window; read (and reset) by the wait loop so a window
+    // in which the user was being asked something never counts toward the
+    // timeout. Shared scope with the wait loop below.
+    let sawStartupPromptThisWindow = false;
     void (async () => {
       // Wrapped so a stray throw can never become an unhandled rejection on
       // the fire-and-forget IIFE (mirrors `startScraper`'s try/catch posture);
@@ -2294,6 +2593,11 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           if (bootSettled || existsSync(jsonlPath)) return;
           if (!tmux(["has-session", "-t", sessionName]).ok) return;
           const pane = tmux(["capture-pane", "-p", "-t", sessionName]).stdout;
+          // A startup prompt we already surfaced and is still awaiting the
+          // user keeps the boot window from expiring under them.
+          if (activeTmuxPromptsForTask(opts.taskId).length > 0) {
+            sawStartupPromptThisWindow = true;
+          }
           const m = matchStartupConsentDialog(pane);
           // Single-tick action is deliberate (unlike the runtime scraper's
           // two-tick stability gate): this only runs during the bounded boot
@@ -2304,17 +2608,89 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           // landed, so a transient send-keys failure retries next tick instead
           // of stranding the dialog. A genuinely different follow-up dialog
           // (new fingerprint) is still acted on.
-          if (m && m.fingerprint !== lastConfirmedFingerprint) {
-            if (await confirmStartupDialog(sessionName, m)) {
-              lastConfirmedFingerprint = m.fingerprint;
-              opts.onChunk("status", `claude startup dialog auto-confirmed (${m.name})`);
+          if (m) {
+            // A consent dialog is on the pane — never also treat it as a
+            // generic question (its repaint frames must not leak into an
+            // interactive card while we auto-confirm it).
+            lastGenericFingerprint = null;
+            if (m.fingerprint !== lastConfirmedFingerprint) {
+              if (await confirmStartupDialog(sessionName, m)) {
+                lastConfirmedFingerprint = m.fingerprint;
+                opts.onChunk("status", `claude startup dialog auto-confirmed (${m.name})`);
+              }
+            }
+            continue;
+          }
+
+          // Not a known consent dialog. If claude is showing some other
+          // numbered / yes-no question, surface it interactively so the user
+          // can answer and unblock boot. Mirror the runtime scraper's tail
+          // slice, two-tick stability gate, and external-dismissal sweep.
+          const paneLines = pane.split("\n");
+          const tail = paneLines.slice(Math.max(0, paneLines.length - SCRAPE_TAIL_LINES)).join("\n");
+          const generic = matchNumberedModal(tail) ?? matchYesNoModal(tail);
+          if (!generic) { lastGenericFingerprint = null; continue; }
+          // External dismissal: a previously surfaced startup prompt whose
+          // content no longer matches the pane (user answered it from a real
+          // `tmux attach`) — resolve it so the card clears.
+          for (const pending of activeTmuxPromptsForTask(opts.taskId)) {
+            if (pending.fingerprint !== generic.fingerprint) {
+              answerTmuxPrompt(pending.id, { key: "__external__" });
             }
           }
+          if (lastGenericFingerprint !== generic.fingerprint) {
+            lastGenericFingerprint = generic.fingerprint;
+            continue; // require two consecutive identical scrapes
+          }
+          if (findTmuxPromptByFingerprint(opts.taskId, generic.fingerprint)) {
+            sawStartupPromptThisWindow = true;
+            continue; // already on a card
+          }
+          // Just answered this exact dialog? It can linger on the pane for a
+          // tick while tmux/claude repaint — re-carding it would flash a ghost
+          // duplicate. The answer route stamps `recentlyAnsweredFingerprints`
+          // on this same SessionState via `markTmuxPromptAnswered`; honour it
+          // here exactly as the runtime scraper (`scrapeOnce`) does.
+          if (state.recentlyAnsweredFingerprints.has(generic.fingerprint)) continue;
+          // Need an active run to attach the interaction to. The orchestrator
+          // sets task.runId before spawning, so this is populated by boot time.
+          const runId = tasks.get(opts.taskId)?.runId;
+          if (!runId) continue;
+          registerTmuxPrompt({
+            taskId: opts.taskId,
+            runId,
+            paneText: generic.paneText,
+            choices: generic.choices,
+            cursorIndex: generic.cursorIndex,
+            fingerprint: generic.fingerprint,
+          });
+          sawStartupPromptThisWindow = true;
+          opts.onChunk("status", "claude is asking a question on startup — answer it to continue");
         }
       } catch { /* never let the boot poller crash the spawn */ }
     })();
 
-    const found = await waitForJsonlAt(jsonlPath, BOOT_TIMEOUT_MS);
+    // Wait for the JSONL, re-arming for another full window whenever a startup
+    // question was on the pane during the just-elapsed one. This is what keeps
+    // a run that's legitimately waiting on the user from dying at the timeout,
+    // and gives claude a fresh window to write its JSONL after the answer
+    // lands — without it, a question answered late in the window would race
+    // the deadline. A genuinely hung boot (no question ever shown) still fails
+    // at BOOT_TIMEOUT_MS because the flag stays false. We only re-arm while the
+    // tmux session is still alive: a Stop/delete mid-boot kills the session and
+    // resolves any pending prompt, so without this guard a window that *had*
+    // seen a prompt would arm one more full BOOT_TIMEOUT_MS before the cleanup
+    // branch runs.
+    let found = false;
+    for (;;) {
+      sawStartupPromptThisWindow = false;
+      found = await waitForJsonlAt(jsonlPath, BOOT_TIMEOUT_MS);
+      if (found) break;
+      const blockedOnUser =
+        sawStartupPromptThisWindow || activeTmuxPromptsForTask(opts.taskId).length > 0;
+      if (blockedOnUser && tmux(["has-session", "-t", sessionName]).ok) continue;
+      break;
+    }
     bootSettled = true;
     if (!found) {
       const stillAlive = tmux(["has-session", "-t", sessionName]).ok;
@@ -2918,9 +3294,14 @@ export const __forTest = {
   matchNumberedModal,
   matchYesNoModal,
   matchStartupConsentDialog,
+  clearedStabilityGate,
   readPendingAskQuestionsFromJsonl,
   shouldWaitForAskJsonl,
   resumeJsonlOffset,
+  /** Drive the pane-scrape AskUserQuestion collector against a fake `PaneIo`
+   *  (no tmux), to assert per-option preview capture + cursor restoration for
+   *  the flat and tabbed/multiSelect layouts. */
+  collectAskQuestionsFromPane,
   /** Override the JSONL verification timeout used by `cycleToMode`. Tests
    *  shrink it to keep "timeout" cases fast. Returns the previous value
    *  so the test can restore it in `afterEach`. */

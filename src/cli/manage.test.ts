@@ -72,15 +72,12 @@ test("harness create/patch/enable/disable/delete + guard paths + {harnesses,stat
     expect((await client.patchHarness("alias1", { enabled: false })).enabled).toBe(false);
     expect((await client.patchHarness("alias1", { enabled: true })).enabled).toBe(true);
 
-    // Guard: codex aliases are "coming soon" → 400.
-    let codexErr: unknown;
-    try {
-      await client.createHarness({ id: "cx", kind: "codex", label: "X" });
-    } catch (e) {
-      codexErr = e;
-    }
-    expect(codexErr).toBeInstanceOf(ApiError);
-    expect((codexErr as ApiError).status).toBe(400);
+    // Codex is now an opt-in harness — main removed the old "coming soon" 400
+    // lock (see server-auth.test.ts), so creating a codex alias succeeds.
+    const cx = await client.createHarness({ id: "cx", kind: "codex", label: "X" });
+    expect(cx.id).toBe("cx");
+    expect(cx.isBuiltin).toBe(false);
+    await client.deleteHarness("cx");
 
     // Guard: built-ins can't be deleted.
     let builtinErr: unknown;

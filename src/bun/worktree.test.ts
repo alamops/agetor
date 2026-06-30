@@ -94,6 +94,70 @@ test("prepareWorkdir creates a worktree + branch inside a git repo", async () =>
   expect(existsSync(path.join(r.cwd, "README"))).toBe(true);
 });
 
+test("gitWritableRootsSync returns the source repo's .git for a linked worktree", async () => {
+  const { prepareWorkdir, gitWritableRootsSync } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+  const r = await prepareWorkdir(task);
+  if ("error" in r) throw new Error(r.error);
+
+  const roots = gitWritableRootsSync(r.cwd);
+  expect(roots).toHaveLength(1);
+  const common = roots[0]!;
+  // It's the shared common dir (objects/refs + worktree registrations live here)…
+  expect(path.basename(common)).toBe(".git");
+  expect(existsSync(path.join(common, "HEAD"))).toBe(true);
+  expect(existsSync(path.join(common, "worktrees"))).toBe(true);
+  // …and it lives OUTSIDE the worktree cwd — the whole reason codex's sandbox
+  // needs it added as a writable root.
+  expect(common.startsWith(r.cwd + path.sep)).toBe(false);
+});
+
+test("gitWritableRootsSync returns [] for an ordinary in-repo checkout", async () => {
+  const { gitWritableRootsSync } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  // `.git` sits inside the cwd, already covered by codex's writable workspace.
+  expect(gitWritableRootsSync(repo)).toEqual([]);
+});
+
+test("gitWritableRootsSync returns [] for a non-git directory", async () => {
+  const { gitWritableRootsSync } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit2-"));
+  expect(gitWritableRootsSync(dir)).toEqual([]);
+});
+
+// End-to-end wiring of the codex spawn path: buildCodexCommand resolves the
+// cwd's external git dirs and feeds them to buildCommand's sandbox decision.
+// This is the seam spawnAgent uses; covering it here (where real worktrees
+// exist) locks the cwd→sandbox contract without standing up tmux.
+const codexHarness = {
+  id: "codex", kind: "codex" as const, label: "codex",
+  isBuiltin: true, home: null, bin: null, env: {}, enabled: true,
+};
+const codexOpts = { mode: "auto", model: "gpt-5-codex", effort: "high" } as const;
+
+test("buildCodexCommand escalates to danger-full-access in a linked worktree", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { buildCodexCommand } = await import("./agents.ts");
+  const repo = await makeRepo();
+  const r = await prepareWorkdir(fakeTask({ workdir: repo }));
+  if ("error" in r) throw new Error(r.error);
+
+  const { cmd } = buildCodexCommand(codexHarness, "hi", { ...codexOpts }, r.cwd);
+  expect(cmd).toContain("danger-full-access");
+  expect(cmd).not.toContain("workspace-write");
+  expect(cmd).toContain("approval_policy=never");
+});
+
+test("buildCodexCommand keeps workspace-write for an ordinary in-repo checkout", async () => {
+  const { buildCodexCommand } = await import("./agents.ts");
+  const repo = await makeRepo();
+
+  const { cmd } = buildCodexCommand(codexHarness, "hi", { ...codexOpts }, repo);
+  expect(cmd).toContain("workspace-write");
+  expect(cmd).not.toContain("danger-full-access");
+});
+
 test("prepareWorkdir is idempotent: second call reuses the recorded worktree", async () => {
   const { prepareWorkdir } = await import("./worktree.ts");
   const repo = await makeRepo();
@@ -340,4 +404,236 @@ test("hasUncommittedChanges returns true for a modified tracked file", async () 
   const repo = await makeRepo();
   writeFileSync(path.join(repo, "README"), "changed\n");
   expect(await hasUncommittedChanges(repo)).toBe(true);
+});
+
+test("gitFetch returns an error when the dir isn't a git repo", async () => {
+  const { gitFetch } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-fetch-nongit-"));
+  const r = await gitFetch(dir);
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("not a git repository");
+});
+
+test("gitFetch succeeds (no-op) for a repo with no remotes", async () => {
+  const { gitFetch } = await import("./worktree.ts");
+  // `git fetch --all` with nothing to fetch exits 0 — the picker just sees the
+  // existing local branches, so the button shouldn't surface a spurious error.
+  const repo = await makeRepo();
+  const r = await gitFetch(repo);
+  expect(r.ok).toBe(true);
+  expect(r.error).toBeUndefined();
+});
+
+test("gitFetch pulls a newly pushed branch so listBranches surfaces it", async () => {
+  const { gitFetch, listBranches } = await import("./worktree.ts");
+  // `origin` is a normal repo we point the clone at; a new branch pushed here
+  // after the clone is invisible to the clone until a fetch runs.
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-fetch-clone-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  // The clone starts unaware of a branch created on origin post-clone.
+  await git(["checkout", "-b", "feature/new-remote-branch"], origin);
+  writeFileSync(path.join(origin, "feature.txt"), "remote work\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feature commit"], origin);
+
+  const before = await listBranches(clone);
+  expect(before.some((b) => b.name.endsWith("feature/new-remote-branch"))).toBe(false);
+
+  const r = await gitFetch(clone);
+  expect(r.ok).toBe(true);
+
+  const after = await listBranches(clone);
+  expect(after.some((b) => b.name.endsWith("feature/new-remote-branch"))).toBe(true);
+});
+
+test("gitFetch --prune drops a remote-tracking branch deleted on origin", async () => {
+  const { gitFetch, listBranches } = await import("./worktree.ts");
+  // Prove the `--prune` flag really mirrors the remote: a branch that exists at
+  // clone time but is later deleted on origin must disappear from the picker.
+  const origin = await makeRepo();
+  await git(["checkout", "-b", "feature/short-lived"], origin);
+  writeFileSync(path.join(origin, "tmp.txt"), "x\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "short lived"], origin);
+  // Leave origin checked out on main so the branch can be deleted later.
+  await git(["checkout", "main"], origin);
+
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-fetch-prune-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+  const cloned = await listBranches(clone);
+  expect(cloned.some((b) => b.name.endsWith("feature/short-lived"))).toBe(true);
+
+  // Delete the branch on origin, then fetch+prune from the clone.
+  await git(["branch", "-D", "feature/short-lived"], origin);
+  const r = await gitFetch(clone);
+  expect(r.ok).toBe(true);
+
+  const pruned = await listBranches(clone);
+  expect(pruned.some((b) => b.name.endsWith("feature/short-lived"))).toBe(false);
+});
+
+test("listBranches reports behind/ahead/upstream once origin moves ahead + fetch", async () => {
+  const { gitFetch, listBranches } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-behind-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  // A fresh clone is in sync with its upstream.
+  const fresh = (await listBranches(clone)).find((b) => b.name === "main");
+  expect(fresh?.upstream).toBe("origin/main");
+  expect(fresh?.behind).toBe(0);
+  expect(fresh?.ahead).toBe(0);
+
+  // Advance origin/main, then fetch so the clone's tracking ref sees it.
+  writeFileSync(path.join(origin, "more.txt"), "x\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "second"], origin);
+  await gitFetch(clone);
+
+  const list = await listBranches(clone);
+  const after = list.find((b) => b.name === "main");
+  expect(after?.behind).toBe(1);
+  expect(after?.ahead).toBe(0);
+  // Regression guard: with the local `main` behind, `origin/main` has a newer
+  // commit date and sorts ahead of it. The dedup must still keep the LOCAL row
+  // (not collapse to the remote-tracking ref), or the picker would lose the
+  // current/behind/upstream signal for the branch the user actually pulls.
+  expect(after?.remote).toBe(false);
+  expect(list.some((b) => b.name === "origin/main")).toBe(false);
+});
+
+test("gitPull fast-forwards the checked-out branch and clears the behind count", async () => {
+  const { gitPull, listBranches } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-current-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  writeFileSync(path.join(origin, "more.txt"), "x\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "second"], origin);
+
+  const r = await gitPull(clone, "main");
+  expect(r.ok).toBe(true);
+  // The fast-forwarded file is now present in the clone's working tree.
+  expect(existsSync(path.join(clone, "more.txt"))).toBe(true);
+  const after = (await listBranches(clone)).find((b) => b.name === "main");
+  expect(after?.behind).toBe(0);
+});
+
+test("gitPull fast-forwards a non-checked-out local branch without a checkout", async () => {
+  const { gitFetch, gitPull, listBranches } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  // Create a feature branch on origin so the clone can track it.
+  await git(["checkout", "-b", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f1\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat1"], origin);
+  await git(["checkout", "main"], origin);
+
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-other-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+  // Materialize a local `feature` tracking origin/feature, then switch back to
+  // main so `feature` is NOT the checked-out branch.
+  await git(["checkout", "feature"], clone);
+  await git(["checkout", "main"], clone);
+
+  // Advance origin/feature.
+  await git(["checkout", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f2\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat2"], origin);
+  await git(["checkout", "main"], origin);
+
+  await gitFetch(clone);
+  expect((await listBranches(clone)).find((b) => b.name === "feature")?.behind).toBe(1);
+
+  const r = await gitPull(clone, "feature");
+  expect(r.ok).toBe(true);
+  expect((await listBranches(clone)).find((b) => b.name === "feature")?.behind).toBe(0);
+  // main is still the checked-out branch — the pull didn't switch worktrees.
+  expect((await listBranches(clone)).find((b) => b.current)?.name).toBe("main");
+});
+
+test("gitPull refuses to fast-forward a diverged branch", async () => {
+  const { gitFetch, gitPull } = await import("./worktree.ts");
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-diverged-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  // A local commit on the clone…
+  writeFileSync(path.join(clone, "local.txt"), "L\n");
+  await git(["add", "."], clone);
+  await git(["commit", "-m", "local"], clone);
+  // …and a different commit on origin → divergence.
+  writeFileSync(path.join(origin, "remote.txt"), "R\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "remote"], origin);
+  await gitFetch(clone);
+
+  const r = await gitPull(clone, "main");
+  expect(r.ok).toBe(false);
+  expect(r.error).toBeTruthy();
+});
+
+test("gitPull refuses a non-checked-out branch that has diverged from its upstream", async () => {
+  const { gitFetch, gitPull } = await import("./worktree.ts");
+  // Exercises the `git fetch . <tracking>:<branch>` path's fast-forward-only
+  // guard (distinct from the checked-out `git pull --ff-only` path above).
+  const origin = await makeRepo();
+  await git(["checkout", "-b", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f1\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat1"], origin);
+  await git(["checkout", "main"], origin);
+
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-other-diverged-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+  // Materialize a local `feature`, give it a local-only commit, then switch back
+  // to main so `feature` is the non-checked-out branch we pull.
+  await git(["checkout", "feature"], clone);
+  writeFileSync(path.join(clone, "local.txt"), "L\n");
+  await git(["add", "."], clone);
+  await git(["commit", "-m", "local feat"], clone);
+  await git(["checkout", "main"], clone);
+
+  // A different commit on origin/feature → divergence.
+  await git(["checkout", "feature"], origin);
+  writeFileSync(path.join(origin, "feat.txt"), "f2\n");
+  await git(["add", "."], origin);
+  await git(["commit", "-m", "feat2"], origin);
+  await git(["checkout", "main"], origin);
+
+  await gitFetch(clone);
+  const r = await gitPull(clone, "feature");
+  expect(r.ok).toBe(false);
+  expect(r.error).toBeTruthy();
+});
+
+test("gitPull returns an error when the dir isn't a git repo", async () => {
+  const { gitPull } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-pull-nongit-"));
+  const r = await gitPull(dir, "main");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("not a git repository");
+});
+
+test("gitPull errors when the selected branch has no upstream", async () => {
+  const { gitPull } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  // A second local branch with no upstream, while `main` stays checked out so
+  // we exercise the non-checked-out path's upstream lookup.
+  await git(["branch", "other"], repo);
+  const r = await gitPull(repo, "other");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("no upstream");
+});
+
+test("gitPull rejects a branch name that could be read as a git flag", async () => {
+  const { gitPull } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const r = await gitPull(repo, "--upload-pack=evil");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("invalid branch name");
 });

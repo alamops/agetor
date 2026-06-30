@@ -30,6 +30,7 @@ import {
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
 import { createEventDeduper } from "@/lib/event-dedup";
+import { createEventBuffer } from "@/lib/event-buffer";
 import { AgentIcon } from "./AgentIcon";
 import {
   ReferencesPicker,
@@ -329,21 +330,39 @@ function RunPanelBody({
     // twin are separated by thousands of intervening events — still collapses
     // to a single bubble. See `event-dedup.ts`.
     const dedupe = createEventDeduper();
-    // Coalesce the open-time replay burst into one state update per animation
-    // frame. On connect the server streams the whole history as one SSE frame
-    // per event; each `onmessage` is its own event-loop task, so React can't
-    // auto-batch them. Appending one-at-a-time meant N renders of the full
-    // list = O(N²) on open. Buffering + a single rAF flush makes it O(N).
-    // Dedup (below) stays synchronous so it's unaffected by the batching.
-    let pending: RunEvent[] = [];
-    let raf = 0;
-    const flush = () => {
-      raf = 0;
-      if (pending.length === 0) return;
-      const batch = pending;
-      pending = [];
-      setEvents((cur) => [...cur, ...batch]);
-    };
+    // Coalesce the open-time replay burst into one state update per batch. On
+    // connect the server streams the whole history as one SSE frame per event;
+    // each `onmessage` is its own event-loop task, so React can't auto-batch
+    // them. Appending one-at-a-time meant N renders of the full list = O(N²) on
+    // open. Buffering + a single flush makes it O(N). Dedup (below) stays
+    // synchronous so it's unaffected by the batching.
+    //
+    // BUT a raw rAF is not a safe *delivery* guarantee: Electrobun runs in a
+    // native macOS WKWebView, which suspends requestAnimationFrame while its
+    // window is occluded / minimized / on another Space. If the user
+    // backgrounds agetor mid-turn, the scheduled rAF never fires, buffered
+    // events pile up, and the stream looks frozen until the window is
+    // re-activated (which is why "open the tmux session" — i.e. clicking back
+    // into agetor — appeared to "refresh" it). So the buffer races the rAF
+    // against a setTimeout fallback (for when the webview isn't painting), and
+    // we also drain on visibility/focus the instant the window returns. The
+    // arm/flush bookkeeping (and the re-arm-after-flush invariant that fixes
+    // the freeze) lives in `createEventBuffer` so it can be unit-tested.
+    const FLUSH_FALLBACK_MS = 250;
+    const buffer = createEventBuffer<RunEvent>(
+      (batch) => setEvents((cur) => [...cur, ...batch]),
+      (flush) => {
+        const raf = requestAnimationFrame(flush);
+        const timer = setTimeout(flush, FLUSH_FALLBACK_MS);
+        return () => { cancelAnimationFrame(raf); clearTimeout(timer); };
+      },
+    );
+    // When the window comes back to the foreground, drain immediately rather
+    // than waiting for a throttled timer/rAF to resume on its own.
+    const onVisible = () => { if (document.visibilityState === "visible") buffer.flushNow(); };
+    const onFocus = () => buffer.flushNow();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
     const unsub = api.subscribeTask(task.id, (e) => {
       if (!dedupe.accept(e)) return;
       if (e.stream === "interaction") {
@@ -365,11 +384,12 @@ function RunPanelBody({
         } catch { /* ignore malformed */ }
         return;
       }
-      pending.push(e);
-      if (raf === 0) raf = requestAnimationFrame(flush);
+      buffer.push(e);
     });
     return () => {
-      if (raf !== 0) cancelAnimationFrame(raf);
+      buffer.dispose();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
       unsub();
     };
   }, [task.id]);

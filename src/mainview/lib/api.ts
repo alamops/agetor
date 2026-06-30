@@ -27,6 +27,9 @@ export interface UpdateSnapshot {
   lastCheckedAt: number | null;
 }
 
+// Re-exported from shared so existing `import { type BranchInfo } from "@/lib/api"`
+// callers (BranchPicker) keep working while the single definition lives in
+// src/shared/types.ts (server + webview share one wire shape).
 export type { BranchInfo };
 export { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
 
@@ -235,6 +238,23 @@ export const api = {
     }).then((r) => r.refs),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
+  /** `git fetch --all --prune` on the project so newly pushed remote branches
+   *  show up in the branch picker. Resolves once the fetch completes; the
+   *  caller re-lists branches afterwards. */
+  gitFetch: (dir: string) =>
+    j<{ ok: true }>("/projects/fetch", {
+      method: "POST",
+      body: JSON.stringify({ path: dir }),
+    }),
+  /** Fast-forward a single local `branch` to its upstream (the picker's Git Pull
+   *  button). The caller re-lists branches afterwards so the behind indicator
+   *  refreshes. Rejects (ApiError) on divergence, missing upstream, or network
+   *  failure — the git stderr rides along as the error message. */
+  gitPull: (dir: string, branch: string) =>
+    j<{ ok: true }>("/projects/pull", {
+      method: "POST",
+      body: JSON.stringify({ path: dir, branch }),
+    }),
   getTmuxSource: () =>
     j<{
       source: "system" | "bundled";

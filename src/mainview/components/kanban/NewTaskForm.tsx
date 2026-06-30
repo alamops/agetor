@@ -503,20 +503,18 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
             title="Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list."
           />
         </div>
-        <div className="min-w-0 space-y-1">
-          <label className="text-muted-foreground">Branch</label>
-          <BranchPicker
-            workdir={workdir}
-            value={baseRef}
-            onChange={setBaseRef}
-            placement="bottom"
-            title={
-              isolate
-                ? "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start."
-                : "Isolation is off — the value is recorded but the agent will run directly in the project workdir."
-            }
-          />
-        </div>
+        <BranchPicker
+          label="Branch"
+          workdir={workdir}
+          value={baseRef}
+          onChange={setBaseRef}
+          placement="bottom"
+          title={
+            isolate
+              ? "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start."
+              : "Isolation is off — the value is recorded but the agent will run directly in the project workdir."
+          }
+        />
 
         <label
           className="flex cursor-pointer items-center gap-1.5"

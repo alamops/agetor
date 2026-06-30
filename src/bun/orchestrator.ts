@@ -166,18 +166,67 @@ export function __emitGlobalForTest(e: GlobalEvent): void {
   emitGlobal(e);
 }
 
-// Bridge: interactions.ts publishes new pending entries here so they ride
-// the same SSE stream the UI is already subscribed to. The UI distinguishes
-// them from regular log events via `stream === "interaction"`.
-setBroadcaster((req: AnyRequest) => {
-  emit({
-    runId: req.runId,
-    taskId: req.taskId,
-    stream: "interaction",
-    data: JSON.stringify(req),
-    ts: req.createdAt,
+/**
+ * Bridge: interactions.ts publishes new/resolved entries here so they ride the
+ * same SSE stream the UI is already subscribed to (the UI distinguishes them
+ * from regular log events via `stream === "interaction"`) AND the app-level
+ * global bus so the notification hook can alert the user.
+ *
+ * Exported and idempotent because `setBroadcaster`/`setResolvedBroadcaster`
+ * install a single process-wide callback: any code that overrides it (e.g. a
+ * test capturing raw broadcasts) would otherwise permanently detach the global
+ * emit. Tests that need the real wiring can re-call this to restore it.
+ */
+export function wireInteractionBroadcast(): void {
+  setBroadcaster((req: AnyRequest) => {
+    emit({
+      runId: req.runId,
+      taskId: req.taskId,
+      stream: "interaction",
+      data: JSON.stringify(req),
+      ts: req.createdAt,
+    });
+    // Also ride the app-level bus so the notification hook can alert the user
+    // even when no panel for this task is open (or it's open but the window is
+    // backgrounded and can't repaint the card). The per-task `interaction`
+    // event above only reaches the RunPanel subscribed to this task.
+    emitGlobal({
+      kind: "interaction",
+      taskId: req.taskId,
+      runId: req.runId,
+      state: "pending",
+      interactionId: req.id,
+      ts: req.createdAt,
+    });
   });
-});
+
+  // Companion bridge for the *removal* side. Every answer*/cancel* path in
+  // interactions.ts calls into this, so the run panel can drop the card
+  // immediately instead of waiting for a refresh poll. Without this, scraper
+  // auto-cancel and run-cancellation leave stale cards in the panel (the
+  // existing additions-only SSE plumbing has no way to signal "this is gone").
+  setResolvedBroadcaster((res: InteractionResolved) => {
+    emit({
+      runId: res.runId,
+      taskId: res.taskId,
+      stream: "interaction_resolved",
+      data: JSON.stringify({ id: res.id, kind: res.kind }),
+      ts: Date.now(),
+    });
+    // App-level companion to the pending emit above — lets the notification
+    // hook clear its "Waiting on you" alert once the last prompt is gone.
+    emitGlobal({
+      kind: "interaction",
+      taskId: res.taskId,
+      runId: res.runId,
+      state: "resolved",
+      interactionId: res.id,
+      ts: Date.now(),
+    });
+  });
+}
+
+wireInteractionBroadcast();
 
 // Companion bridge for the *removal* side. Every answer*/cancel* path
 // in interactions.ts calls into this, so the run panel can drop the

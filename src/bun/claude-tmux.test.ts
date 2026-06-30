@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 
 import {
+  buildClaudeSessionEnv,
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_MODE_ACCEPT_EDITS,
   CLAUDE_MODE_AUTO,
@@ -53,6 +54,30 @@ test("encodeProjectPath turns every slash and dot into a dash", () => {
 
 test("sessionNameFor uses the first 12 chars of the task id", () => {
   expect(sessionNameFor("abcdef0123456789-rest")).toBe("agetor-abcdef012345");
+});
+
+test("buildClaudeSessionEnv pins the classic renderer and re-injects PATH", () => {
+  const env = buildClaudeSessionEnv({ CLAUDE_CODE_EFFORT_LEVEL: "low" });
+  // Caller env is preserved…
+  expect(env.CLAUDE_CODE_EFFORT_LEVEL).toBe("low");
+  // …and the classic-renderer pin is forced so a user's global `tui`
+  // fullscreen setting can't flip agetor's session into the alternate
+  // screen buffer (which would break the pane scraper's scrollback reads).
+  expect(env.CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN).toBe("1");
+  // PATH is re-injected from the current process.
+  expect(env.PATH).toBe(process.env.PATH ?? "");
+});
+
+test("buildClaudeSessionEnv's classic-renderer pin is not overridable by caller env", () => {
+  // A harness-level env that tried to enable fullscreen must lose: agetor's
+  // pin is layered last. CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN takes precedence
+  // over CLAUDE_CODE_NO_FLICKER per the docs, so the scraper stays safe even
+  // when both are present.
+  const env = buildClaudeSessionEnv({
+    CLAUDE_CODE_NO_FLICKER: "1",
+    CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "0",
+  });
+  expect(env.CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN).toBe("1");
 });
 
 interface Record { stream: string; data: string }
@@ -1521,4 +1546,169 @@ test("shouldWaitForAskJsonl: stalls only for a lossy pane with no JSONL, inside 
   expect(wait(true, lossy, now, now)).toBe(false);
   // No firstSeenAt recorded → don't wait.
   expect(wait(false, lossy, null, now)).toBe(false);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * collectAskQuestionsFromPane — per-option preview capture orchestration
+ *
+ * Drives the real collector against an in-memory fake pane (no tmux) that
+ * renders claude's side-by-side preview layout for the current (tab, cursor)
+ * and tracks navigation, so we can assert: every option's preview is scraped,
+ * the cursor (and tab) is restored to the start, and the pane was grown.
+ * ────────────────────────────────────────────────────────────────────────── */
+import type { NavKey } from "./claude-questions.ts";
+
+type FakeOption = { label: string; preview?: string[] };
+type FakeTab = { header: string; question: string; multiSelect: boolean; options: FakeOption[] };
+
+/** Render one frame of the modal as tmux would capture it: option list on the
+ *  left, the FOCUSED option's preview in a box to the right (col 30). */
+function renderFakeModal(tabs: FakeTab[], tab: number, cursor: number): string {
+  const COL = 30, W = 28;
+  const cur = tabs[tab]!;
+  const out: string[] = ["─".repeat(80)];
+  out.push(tabs.length > 1
+    ? "←  " + tabs.map((t) => "☐ " + t.header).join("  ") + "  ✔ Submit  →"
+    : " ☐ " + cur.header);
+  out.push("", cur.question, "");
+
+  const leftParts = cur.options.map((o, i) =>
+    (i === cursor ? "❯ " : "  ") + (i + 1) + ". " + (cur.multiSelect ? "[ ] " : "") + o.label);
+  const prev = cur.options[cursor]?.preview;
+  const boxRows: string[] = [];
+  if (prev && prev.length) {
+    boxRows.push("┌" + "─".repeat(W) + "┐");
+    for (const pl of prev) boxRows.push("│ " + pl.padEnd(W - 1) + "│");
+    boxRows.push("└" + "─".repeat(W) + "┘");
+  }
+  const numRows = Math.max(leftParts.length, boxRows.length);
+  for (let r = 0; r < numRows; r++) {
+    const left = leftParts[r] ?? "";
+    const box = boxRows[r] ?? "";
+    out.push(box ? left.padEnd(COL) + box : left);
+  }
+  if (cur.multiSelect) out.push("  Next");
+  out.push("  Chat about this", "─".repeat(80),
+    tabs.length > 1
+      ? "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"
+      : "Enter to select · ↑/↓ to navigate · Esc to cancel");
+  return out.join("\n");
+}
+
+/** In-memory PaneIo: clamps Up at option 0 and Down at the last option (no
+ *  wrap — matching the real TUI), resets the cursor to 0 on a tab switch, and
+ *  logs every key + resize so the test can assert cursor/tab restoration. */
+function makeFakePane(tabs: FakeTab[]) {
+  let tab = 0, cursor = 0, w = 120, h = 30;
+  const log: string[] = [];
+  const io = {
+    capture: () => renderFakeModal(tabs, tab, cursor),
+    send: (key: NavKey) => {
+      log.push(key);
+      if (key === "Down") cursor = Math.min(cursor + 1, tabs[tab]!.options.length - 1);
+      else if (key === "Up") cursor = Math.max(cursor - 1, 0);
+      else if (key === "Right") { tab = Math.min(tab + 1, tabs.length - 1); cursor = 0; }
+      else if (key === "Left") { tab = Math.max(tab - 1, 0); cursor = 0; }
+      return true;
+    },
+    size: () => ({ w, h }),
+    resize: (nw: number, nh: number) => { w = nw; h = nh; log.push(`resize:${nw}x${nh}`); },
+    restore: (nw: number, nh: number) => { w = nw; h = nh; log.push(`restore:${nw}x${nh}`); },
+    sleep: async () => { /* no delay in tests */ },
+  };
+  return { io, log, at: () => ({ tab, cursor, w, h }) };
+}
+
+test("collectAskQuestionsFromPane: flat question scrapes every option's preview and restores the cursor", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [{
+    header: "Pick", question: "Which option?", multiSelect: false,
+    options: [
+      { label: "Alpha", preview: ["a-one", "a-two", "a-three"] },
+      { label: "Beta", preview: ["b-one", "b-two"] },
+      { label: "Gamma", preview: ["g-only"] },
+    ],
+  }];
+  const { io, log, at } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-flat", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res!.length).toBe(1);
+    expect(res![0]!.multiSelect).toBe(false);
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(res![0]!.options[0]!.preview).toBe("a-one\na-two\na-three");
+    expect(res![0]!.options[1]!.preview).toBe("b-one\nb-two");
+    expect(res![0]!.options[2]!.preview).toBe("g-only");
+    // The pane was grown (and restored), and the cursor walked back to option 0.
+    expect(log.some((l) => l.startsWith("resize:"))).toBe(true);
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+    expect(at().cursor).toBe(0);
+    // Net option navigation is balanced (equal Downs and Ups).
+    expect(log.filter((l) => l === "Down").length).toBe(log.filter((l) => l === "Up").length);
+  } finally {
+    __forTest.uninstallSession("ask-flat");
+  }
+});
+
+test("collectAskQuestionsFromPane: tabbed multi-question scrapes previews per tab and restores tab+cursor", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [
+    {
+      header: "Size", question: "Pick sizes", multiSelect: true,
+      options: [
+        { label: "Small", preview: ["s-1", "s-2"] },
+        { label: "Large", preview: ["l-1"] },
+      ],
+    },
+    {
+      header: "Crust", question: "Pick a crust", multiSelect: false,
+      options: [
+        { label: "Thin", preview: ["t-1", "t-2", "t-3"] },
+        { label: "Deep", preview: ["d-1"] },
+      ],
+    },
+  ];
+  const { io, log, at } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-tabbed", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res!.length).toBe(2);
+    expect(res![0]!.header).toBe("Size");
+    expect(res![0]!.multiSelect).toBe(true);
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Small", "Large"]);
+    expect(res![0]!.options[0]!.preview).toBe("s-1\ns-2");
+    expect(res![0]!.options[1]!.preview).toBe("l-1");
+    expect(res![1]!.header).toBe("Crust");
+    expect(res![1]!.multiSelect).toBe(false);
+    expect(res![1]!.options[0]!.preview).toBe("t-1\nt-2\nt-3");
+    expect(res![1]!.options[1]!.preview).toBe("d-1");
+    // Returned to the first tab, cursor at option 0; tab navigation balanced.
+    expect(at().tab).toBe(0);
+    expect(at().cursor).toBe(0);
+    expect(log.filter((l) => l === "Right").length).toBe(log.filter((l) => l === "Left").length);
+  } finally {
+    __forTest.uninstallSession("ask-tabbed");
+  }
+});
+
+test("collectAskQuestionsFromPane: flat no-preview question takes the fast path (no resize, no navigation)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [{
+    header: "Pick", question: "Which option?", multiSelect: false,
+    options: [{ label: "Yes" }, { label: "No" }],
+  }];
+  const { io, log } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-nopreview", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(res![0]!.options.map((o) => o.label)).toEqual(["Yes", "No"]);
+    expect(res![0]!.options.every((o) => o.preview === undefined)).toBe(true);
+    // Fast path: no grow, no keystrokes.
+    expect(log.length).toBe(0);
+  } finally {
+    __forTest.uninstallSession("ask-nopreview");
+  }
 });

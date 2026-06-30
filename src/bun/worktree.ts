@@ -1,7 +1,10 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { dataDir } from "./db.ts";
 import type { BranchInfo, DiffFile, Task, TaskDiff } from "../shared/types.ts";
+
+export type { BranchInfo };
 
 const WORKTREES_DIR = path.join(dataDir, "worktrees");
 
@@ -85,6 +88,58 @@ export async function repoRoot(dir: string): Promise<string | null> {
 }
 
 /**
+ * Git directories that live OUTSIDE `cwd` and therefore must be granted to a
+ * codex `workspace-write` sandbox's writable roots for `git commit` (and any
+ * other ref/object-writing command) to succeed.
+ *
+ * For a linked worktree, `cwd`'s `.git` is a *file* pointing at
+ * `<source-repo>/.git/worktrees/<id>`, and the objects + refs a commit writes
+ * live in the shared `<source-repo>/.git` (the "common dir") — entirely
+ * outside the worktree root that codex makes writable by default. Without this,
+ * codex's sandbox blocks the write and `git commit` fails inside an agetor
+ * worktree. The per-worktree gitdir is a child of the common dir, so a single
+ * writable root at the common dir covers both. (The same logic also covers an
+ * isolation=none task whose workdir is a subdirectory of the repo, where
+ * `.git` sits above the writable cwd.)
+ *
+ * Returns the absolute git common dir when it isn't contained in `cwd`;
+ * returns `[]` for an ordinary checkout where `.git` already sits inside the
+ * writable cwd, or when `cwd` isn't a git repo / git is unavailable
+ * (non-throwing — callers just get no extra roots).
+ *
+ * Synchronous on purpose: the codex spawn paths (`spawnCodexTurnNow`,
+ * `spawnAgent`) are synchronous, and a local `git rev-parse` is sub-20ms.
+ * `--path-format=absolute` (git ≥ 2.31) yields an absolute path directly; the
+ * `path.resolve` is belt-and-suspenders for any git that ignores the flag.
+ *
+ * Containment is checked against the realpath'd cwd: git canonicalizes symlinks
+ * in the path it reports (e.g. `/tmp` → `/private/tmp` on macOS), so comparing
+ * the reported common dir against a non-canonical `cwd` would otherwise flag an
+ * ordinary `.git`-inside-cwd checkout as "outside" and add a redundant root.
+ */
+export function gitWritableRootsSync(cwd: string): string[] {
+  let out: string;
+  try {
+    const res = spawnSync(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd, encoding: "utf8", timeout: 5_000 },
+    );
+    if (res.status !== 0 || typeof res.stdout !== "string") return [];
+    out = res.stdout.trim();
+  } catch {
+    return [];
+  }
+  if (!out) return [];
+  const commonDir = path.resolve(cwd, out);
+  let realCwd = cwd;
+  try { realCwd = realpathSync(cwd); } catch { /* cwd missing — compare as-is */ }
+  const rel = path.relative(realCwd, commonDir);
+  const insideCwd = rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return insideCwd ? [] : [commonDir];
+}
+
+/**
  * Resolve a ref (branch name, tag, "HEAD", or partial sha) to a full 40-char sha
  * relative to `dir`. Returns null if `dir` isn't a git repo or the ref doesn't
  * exist — callers turn that into a user-facing error.
@@ -119,12 +174,15 @@ export async function listBranches(dir: string): Promise<BranchInfo[]> {
   const currentName = head.ok ? head.stdout : null;
   // Tab-separated to keep parsing simple — branch names can't contain tabs.
   // `%(HEAD)` marks the current branch with `*`. Querying both heads and
-  // remotes in one pass keeps the sort stable.
+  // remotes in one pass keeps the sort stable. `%(upstream:short)` /
+  // `%(upstream:track)` give the configured upstream + a "[ahead N, behind M]"
+  // string, computed locally against the remote-tracking ref (no network), so
+  // the behind/ahead counts reflect the last fetch.
   const res = await git(
     [
       "for-each-ref",
       "--sort=-committerdate",
-      "--format=%(refname)\t%(refname:short)\t%(committerdate:unix)",
+      "--format=%(refname)\t%(refname:short)\t%(committerdate:unix)\t%(upstream:short)\t%(upstream:track)",
       "refs/heads/",
       "refs/remotes/",
     ],
@@ -132,7 +190,23 @@ export async function listBranches(dir: string): Promise<BranchInfo[]> {
   );
   if (!res.ok) return [];
 
-  const seen = new Set<string>();
+  // First pass: collect the local head short-names. A remote-tracking ref is
+  // only surfaced when it has no local counterpart — and we decide that up front
+  // rather than via first-seen dedup because `--sort=-committerdate` can place a
+  // remote ref AHEAD of its own local branch when the local branch is behind.
+  // First-seen dedup would then keep `origin/main` and drop local `main`,
+  // mislabeling the row as remote (losing its `current`/`behind`/`upstream`).
+  const localNames = new Set<string>();
+  for (const line of res.stdout.split("\n")) {
+    if (!line) continue;
+    const parts = line.split("\t");
+    if (parts.length < 3) continue;
+    if (parts[0]!.startsWith("refs/heads/") && !parts[1]!.startsWith("agetor/")) {
+      localNames.add(parts[1]!);
+    }
+  }
+
+  const seenRemote = new Set<string>();
   const branches: BranchInfo[] = [];
   for (const line of res.stdout.split("\n")) {
     if (!line) continue;
@@ -141,25 +215,134 @@ export async function listBranches(dir: string): Promise<BranchInfo[]> {
     const fullRef = parts[0]!;
     const shortName = parts[1]!;
     const ts = Number(parts[2]) * 1000;
+    // `for-each-ref` emits all 4 trailing tabs, so these fields are always
+    // present (possibly empty). split("\t") keeps trailing empties.
+    const upstreamShort = parts[3] ?? "";
+    const track = parts[4] ?? "";
     const isRemote = fullRef.startsWith("refs/remotes/");
-    // `origin/HEAD -> origin/main` shows up as an empty timestamp on the
-    // pointer line; the actual `origin/main` row already covers it.
-    if (isRemote && shortName.endsWith("/HEAD")) continue;
-    // The remote's short name keeps the `<remote>/` prefix so a local `main`
-    // and a tracking `origin/main` don't collide; for the dedup key, strip
-    // that prefix so we can prefer the local one.
-    const dedupKey = isRemote ? shortName.replace(/^[^/]+\//, "") : shortName;
-    if (!isRemote && shortName.startsWith("agetor/")) continue;
-    if (seen.has(dedupKey)) continue;
-    seen.add(dedupKey);
+    if (isRemote) {
+      // `origin/HEAD -> origin/main` shows up as a pointer alias; the real
+      // `origin/main` row already covers it.
+      if (shortName.endsWith("/HEAD")) continue;
+      // Strip the `<remote>/` prefix to compare against local names + other
+      // remotes (so `origin/main` and a local `main` don't both show).
+      const bare = shortName.replace(/^[^/]+\//, "");
+      if (localNames.has(bare)) continue; // a local branch with this name wins
+      if (seenRemote.has(bare)) continue; // first remote-tracking ref wins among remotes
+      seenRemote.add(bare);
+    } else {
+      // Branches agetor manages itself aren't the user's own — hide them. Local
+      // short-names are unique, so no further dedup is needed for heads.
+      if (shortName.startsWith("agetor/")) continue;
+    }
+    // Upstream tracking. Only meaningful for local branches with a configured
+    // upstream that still exists. `track` looks like "[ahead 2, behind 3]",
+    // "[behind 1]", "[gone]", or "" (in sync). An empty `upstreamShort` means
+    // no upstream is set; "[gone]" means the upstream ref was deleted — both
+    // leave the counts null ("can't compare") rather than 0 ("up to date").
+    let upstream: string | null = null;
+    let ahead: number | null = null;
+    let behind: number | null = null;
+    if (!isRemote && upstreamShort && track !== "[gone]") {
+      upstream = upstreamShort;
+      ahead = Number(/ahead (\d+)/.exec(track)?.[1] ?? 0);
+      behind = Number(/behind (\d+)/.exec(track)?.[1] ?? 0);
+    }
     branches.push({
       name: shortName,
       committedAt: Number.isFinite(ts) ? ts : 0,
       current: !isRemote && shortName === currentName,
       remote: isRemote,
+      upstream,
+      ahead,
+      behind,
     });
   }
   return branches;
+}
+
+/**
+ * Fetch every remote for the repo containing `dir`, pruning deleted
+ * remote-tracking refs so the branch picker mirrors the remote exactly. After
+ * this resolves, `listBranches` surfaces any newly-fetched `origin/*` branches.
+ *
+ * Network-bound, so it gets a longer budget than the default 30 s git()
+ * timeout. A repo with no remotes succeeds with no output. Returns
+ * `{ ok: false, error }` when `dir` isn't a git repo or the fetch failed — the
+ * stderr (where git writes auth/network errors) is surfaced for the UI.
+ */
+export async function gitFetch(dir: string): Promise<{ ok: boolean; error?: string }> {
+  const root = await repoRoot(dir);
+  if (!root) return { ok: false, error: "not a git repository" };
+  const res = await git(["fetch", "--all", "--prune"], root, 120_000);
+  if (!res.ok) return { ok: false, error: res.stderr || `git fetch failed (exit ${res.exitCode})` };
+  return { ok: true };
+}
+
+/**
+ * Fast-forward a single local `branch` in the repo containing `dir` to its
+ * upstream. Always fast-forward-only, so a pull never creates a merge commit or
+ * leaves conflicts in the user's repo — a diverged branch fails with a clear
+ * message instead.
+ *
+ * Two cases:
+ *  - `branch` is the branch checked out at the repo root → `git pull --ff-only`
+ *    (fetches its upstream and fast-forwards in place, updating tracking refs).
+ *  - `branch` is any other local branch → refresh its remote-tracking ref over
+ *    the network, then fast-forward the local ref from it *without* a checkout.
+ *
+ * Network-bound, so it gets the same longer budget as `gitFetch`. Returns
+ * `{ ok: false, error }` when `dir` isn't a git repo, the branch has no
+ * upstream, the fetch failed, or the branch has diverged (non-ff). The stderr
+ * (where git writes auth/network/ff errors) is surfaced for the UI.
+ */
+export async function gitPull(dir: string, branch: string): Promise<{ ok: boolean; error?: string }> {
+  // Defense-in-depth: branch names from listBranches can never start with "-"
+  // (git's ref-format rules forbid it), but guard anyway so a "-"-leading value
+  // can't be read as a flag by the git invocations below. (We avoid git's
+  // `--end-of-options` here because `git rev-parse` echoes it back into stdout
+  // rather than consuming it, which would corrupt the upstream parse.)
+  if (branch.startsWith("-")) return { ok: false, error: `invalid branch name: ${branch}` };
+  const root = await repoRoot(dir);
+  if (!root) return { ok: false, error: "not a git repository" };
+
+  const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], root, 5_000);
+  const current = head.ok ? head.stdout : null;
+
+  if (branch === current) {
+    // Checked-out branch: fetch + fast-forward in place (also updates tracking refs).
+    const res = await git(["pull", "--ff-only"], root, 120_000);
+    if (!res.ok) return { ok: false, error: res.stderr || res.stdout || `git pull failed (exit ${res.exitCode})` };
+    return { ok: true };
+  }
+
+  // Non-checked-out local branch: resolve its upstream, refresh the tracking ref
+  // from the network, then fast-forward the local ref from the tracking ref.
+  const up = await git(["rev-parse", "--abbrev-ref", `${branch}@{upstream}`], root, 5_000);
+  if (!up.ok) return { ok: false, error: `"${branch}" has no upstream to pull from` };
+  const upstream = up.stdout; // e.g. "origin/main"
+  const slash = upstream.indexOf("/");
+  if (slash < 0) return { ok: false, error: `"${branch}" has an unexpected upstream "${upstream}"` };
+  const remote = upstream.slice(0, slash);
+  const remoteBranch = upstream.slice(slash + 1);
+
+  // Update refs/remotes/<remote>/<remoteBranch> from the network.
+  const fetched = await git(["fetch", remote, remoteBranch], root, 120_000);
+  if (!fetched.ok) return { ok: false, error: fetched.stderr || `git fetch failed (exit ${fetched.exitCode})` };
+
+  // `git fetch .` from the local repo is fast-forward-only — it refuses a non-ff
+  // update, which is exactly the divergence guard we want. Fast-forwarding from
+  // the freshly-updated tracking ref keeps the behind indicator honest afterwards
+  // (a direct `<remoteBranch>:<branch>` fetch would leave the tracking ref stale).
+  const ff = await git(
+    ["fetch", ".", `refs/remotes/${remote}/${remoteBranch}:refs/heads/${branch}`],
+    root,
+    10_000,
+  );
+  if (!ff.ok) {
+    return { ok: false, error: ff.stderr || `"${branch}" has diverged from ${upstream}; fast-forward not possible` };
+  }
+  return { ok: true };
 }
 
 function slugify(s: string): string {

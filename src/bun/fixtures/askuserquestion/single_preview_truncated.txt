@@ -1,0 +1,19 @@
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Pane-grow cap
+
+Capturing the real pane layout now. A real design decision: when agetor grows
+the detached pane to de-truncate previews, what should it cap the pane height
+at? (The previews below are 3/8/15 lines tall on purpose, so I can measure
+exactly where claude's TUI truncates.)
+
+❯ 1. Cap ~40 rows                 ┌──────────────────────────────────────────┐
+  2. Cap ~80 rows                 │ line 1 of 3                              │
+  3. Fit to tallest preview       ├─── ✂ ─── 2 lines hidden ─────────────────┤
+                                  └──────────────────────────────────────────┘
+
+                                  Notes: press n to add notes
+
+────────────────────────────────────────────────────────────────────────────────
+  Chat about this
+
+Enter to select · ↑/↓ to navigate · n to add notes · Esc to cancel
