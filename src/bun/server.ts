@@ -8,6 +8,7 @@ import { removeCoreCreds } from "./core-creds.ts";
 import {
   tasks,
   runs,
+  subagents,
   projects,
   preferences,
   harnesses,
@@ -1040,6 +1041,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => json(runs.listForTask(req.params.id), { headers: corsHeaders(req) })),
       },
 
+      // Snapshot of the background/sub agents tracked for a task — drives the
+      // run panel's read-only tab strip on open, and is polled (like /runs)
+      // as a backstop to the live `subagent` SSE deltas.
+      "/tasks/:id/subagents": {
+        GET: authed((req) => json(subagents.listForTask(req.params.id), { headers: corsHeaders(req) })),
+      },
+
       // Everything the task's worktree changed vs its pinned base ref. Returns
       // a friendly `note` (empty `files`) when there's no worktree or no diff.
       "/tasks/:id/diff": {
@@ -1566,10 +1574,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             let buffer: RunEvent[] | null = [];
             const unsubscribe = subscribe((e) => {
               if (e.runId !== runId) return;
+              // This endpoint is the MAIN run's stream. Background/sub-agent
+              // events are stored under the same parent run_id but belong to
+              // their own (read-only) streams — they surface via
+              // /tasks/:id/subagents + the task-level events endpoint, not here.
+              if (e.subagentId) return;
               if (buffer) buffer.push(e);
               else send(e);
             });
             for (const ev of runs.events(runId)) {
+              if (ev.subagentId) continue;
               send({
                 runId,
                 taskId: "",
@@ -1817,6 +1831,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
                 stream: ev.stream as RunEvent["stream"],
                 data: ev.data,
                 ts: ev.ts,
+                subagentId: ev.subagentId,
               });
             }
             const drained = buffer;

@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { tasks } from "./db.ts";
+import { attachSubagentWatcher, type SubagentWatcherHandle } from "./claude-subagents.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
   activeTmuxPromptsForTask,
@@ -994,6 +995,15 @@ interface SessionState {
    *  and (b) cheaply detect a truly idle session so the 1s scrape
    *  tick can self-throttle. 0 means "no append observed yet". */
   lastJsonlAppendAt: number;
+  /** `Date.now()` of the last pane capture taken while the session was
+   *  JSONL-idle (no turn in flight, no recent append). A native modal —
+   *  AskUserQuestion or a permission dialog — can appear with NO JSONL
+   *  write (claude doesn't persist the tool_use until it's answered), so
+   *  the idle path can't stop scraping entirely or it would never see a
+   *  question raised after the turn already resolved to `review`. Instead
+   *  it throttles to one capture every `SCRAPE_IDLE_POLL_MS`, stamping the
+   *  time here. 0 means "no idle capture taken yet". */
+  lastIdleScrapeAt: number;
   /** Fingerprint → `Date.now()` of when it was answered. The route
    *  handler stamps an entry here right after `dismissTmuxPrompt`; the
    *  scraper skips re-registering a fingerprint that's still inside
@@ -1051,6 +1061,13 @@ interface SessionState {
    *  been quiet for `END_TURN_IDLE_FIRE_MS`. Cleared in `popEndOfTurn` when the
    *  slot finally pops (the whole busy period is over). */
   holdUntilIdle: boolean;
+  /** Watches `<sessionId>/subagents/` for background/sub agents this session
+   *  spawns, tailing each into the task's event stream (tagged by subagent id)
+   *  for the run panel's read-only tabs. Armed in `attachTailer`, released in
+   *  `disposeSessionState`. Read-only — never touches tmux. Null until armed
+   *  (and when AGETOR_TRACK_SUBAGENTS=0, `attachSubagentWatcher` returns a
+   *  no-op handle). */
+  subagentWatcher: SubagentWatcherHandle | null;
 }
 
 interface TurnSlot {
@@ -1138,12 +1155,14 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     scrapeTimer: null,
     scrapeLastFingerprint: null,
     lastJsonlAppendAt: 0,
+    lastIdleScrapeAt: 0,
     recentlyAnsweredFingerprints: new Map(),
     askCardId: null,
     askCollecting: false,
     askFirstSeenAt: null,
     pendingEndTurn: null,
     holdUntilIdle: false,
+    subagentWatcher: null,
   };
 }
 
@@ -2275,31 +2294,86 @@ const RECENTLY_ANSWERED_TTL_MS = 3_000;
  *  stable modal awaiting input. */
 const JSONL_RECENT_WRITE_MS = 500;
 
-/** Beyond this idle window with no active turn, the scraper stops
- *  tick'ing entirely — there's no plausible scenario where a brand-
- *  new modal appears on a session that hasn't seen output in a long
- *  time. Idle sessions cost nothing this way. */
+/** Beyond this idle window with no active turn, the scraper drops to a
+ *  reduced cadence (`SCRAPE_IDLE_POLL_MS`) instead of every tick. It can't
+ *  stop entirely: a native modal — an AskUserQuestion or a permission
+ *  dialog raised by a background workflow after the turn already resolved
+ *  to `review` — appears with NO JSONL write, so `lastJsonlAppendAt` would
+ *  stay frozen and a hard stop would never see the question (the user would
+ *  have to answer it in tmux). The throttle keeps idle sessions cheap while
+ *  still catching a late modal within a couple of seconds. */
 const SCRAPE_IDLE_AFTER_MS = 5_000;
+
+/** While JSONL-idle but recently so, capture the pane at most this often (vs
+ *  every `SCRAPE_INTERVAL_MS`). This is the common "task just resolved to
+ *  `review` and a question is about to pop" window — keep it snappy. */
+const SCRAPE_IDLE_POLL_MS = 2_000;
+
+/** Once a session has been JSONL-quiet this long, drop to the much slower
+ *  deep-idle cadence below. The previous code stopped scraping idle sessions
+ *  entirely ("idle costs nothing"); we can't (a modal writes no JSONL), but a
+ *  session that's been silent for minutes is almost certainly parked at the
+ *  REPL with nothing pending, so polling it every 2s forever is wasteful when
+ *  the board holds many completed-but-undeleted tasks (each keeps its tmux
+ *  session for follow-ups). The deep tier keeps long-dead sessions ~cheap
+ *  while still eventually catching a very-late modal. */
+const SCRAPE_DEEP_IDLE_AFTER_MS = 60_000;
+
+/** Pane-capture cadence for a deeply-idle session (quiet > `SCRAPE_DEEP_IDLE_
+ *  AFTER_MS`). 5× cheaper than the near-idle rate. */
+const SCRAPE_DEEP_IDLE_POLL_MS = 10_000;
+
+/** Pure idle-throttle decision for `scrapeOnce`, factored out so the cadence
+ *  logic is unit-testable without tmux. A session is "JSONL-idle" when no turn
+ *  is in flight, nothing has appended to its JSONL for `SCRAPE_IDLE_AFTER_MS`,
+ *  no prompt is already pending, and no ask-card is live. When idle we still
+ *  scrape — a native modal (AskUserQuestion / permission dialog) can appear
+ *  with NO JSONL write, so a hard stop would never see a question raised after
+ *  the turn resolved to `review`. We throttle, fast right after going idle and
+ *  backing off once the session has been quiet a while (`SCRAPE_DEEP_IDLE_*`),
+ *  using `now - lastJsonlAppendAt` as the idle-depth clock — no extra state.
+ *  `run` says whether to capture the pane this tick; `stampIdle` says whether
+ *  the caller should record this as the latest idle capture. */
+function decideScrapeTick(p: {
+  turnInFlight: boolean;
+  lastJsonlAppendAt: number;
+  activePromptCount: number;
+  askCardLive: boolean;
+  lastIdleScrapeAt: number;
+  now: number;
+}): { run: boolean; stampIdle: boolean } {
+  const idleFor = p.now - p.lastJsonlAppendAt;
+  const idle = !p.turnInFlight
+    && p.lastJsonlAppendAt !== 0
+    && idleFor > SCRAPE_IDLE_AFTER_MS
+    && p.activePromptCount === 0
+    && !p.askCardLive;
+  if (!idle) return { run: true, stampIdle: false };
+  const pollInterval = idleFor > SCRAPE_DEEP_IDLE_AFTER_MS
+    ? SCRAPE_DEEP_IDLE_POLL_MS
+    : SCRAPE_IDLE_POLL_MS;
+  if (p.now - p.lastIdleScrapeAt < pollInterval) return { run: false, stampIdle: false };
+  return { run: true, stampIdle: true };
+}
 
 /** Run a single scrape tick. Idempotent: registers at most one new
  *  TmuxPromptRequest per call, auto-cancels any pending one whose
  *  fingerprint no longer matches the pane. */
 function scrapeOnce(state: SessionState): void {
   const now = Date.now();
-  // Idle gate: skip the syscall entirely when nothing is plausibly
-  // happening. A session with no turn in flight that hasn't appended
-  // to its JSONL in 5s is at the REPL prompt; the user isn't waiting
-  // on a modal we missed.
-  if (state.turnQueue.length === 0
-      && state.lastJsonlAppendAt !== 0
-      && now - state.lastJsonlAppendAt > SCRAPE_IDLE_AFTER_MS
-      && activeTmuxPromptsForTask(state.taskId).length === 0
-      // Keep polling while an AskUserQuestion card is live, so the
-      // resolve-on-modal-gone backstop fires if the user answers it via a real
-      // `tmux attach` (external dismissal) rather than the card.
-      && state.askCardId === null) {
-    return;
-  }
+  const tick = decideScrapeTick({
+    turnInFlight: state.turnQueue.length > 0,
+    lastJsonlAppendAt: state.lastJsonlAppendAt,
+    activePromptCount: activeTmuxPromptsForTask(state.taskId).length,
+    // Keep polling at full rate while an AskUserQuestion card is live, so the
+    // resolve-on-modal-gone backstop fires if the user answers it via a real
+    // `tmux attach` (external dismissal) rather than the card.
+    askCardLive: state.askCardId !== null,
+    lastIdleScrapeAt: state.lastIdleScrapeAt,
+    now,
+  });
+  if (tick.stampIdle) state.lastIdleScrapeAt = now;
+  if (!tick.run) return;
 
   const cap = tmux(["capture-pane", "-p", "-t", state.sessionName]);
   if (!cap.ok) {
@@ -2380,7 +2454,12 @@ function scrapeOnce(state: SessionState): void {
   // Stability gate (see `clearedStabilityGate`): a high-confidence match
   // registers on first sighting; everything else waits for the same
   // fingerprint on two consecutive scrapes. Record the fingerprint either way
-  // so the next tick can satisfy the two-tick rule.
+  // so the next tick can satisfy the two-tick rule. Note: while the session is
+  // JSONL-idle the capturing ticks are spaced by the idle cadence
+  // (`SCRAPE_IDLE_POLL_MS`+), not 1s, so a numbered/yes-no modal raised after
+  // the turn resolved to `review` registers in ~two idle ticks rather than ~2s;
+  // the AskUserQuestion path above and any high-confidence match skip the gate
+  // and surface on the first idle capture.
   const cleared = clearedStabilityGate(match, state.scrapeLastFingerprint);
   state.scrapeLastFingerprint = match.fingerprint;
   if (!cleared) return;
@@ -2450,6 +2529,11 @@ function attachTailer(state: SessionState): void {
   // cheap (one stat + read-if-grew) and bulletproof.
   state.pollTimer = setInterval(() => { void flush(state); }, 400);
   startScraper(state);
+  // Track any background/sub agents this session spawns. Idempotent re-arm:
+  // dispose a prior handle first so a re-attach (reconcileOrphans defensive
+  // overwrite) can't leave two watchers polling the same dir.
+  state.subagentWatcher?.detach();
+  state.subagentWatcher = attachSubagentWatcher({ taskId: state.taskId, jsonlPath: state.jsonlPath });
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -3219,6 +3303,10 @@ function disposeSessionState(state: SessionState | undefined): void {
   if (state.scrapeTimer) clearInterval(state.scrapeTimer);
   state.scrapeTimer = null;
   state.scrapeLastFingerprint = null;
+  // Release the subagent watcher's fs.watch + poll timer. Read-only teardown:
+  // this stops us TAILING the subagent files, never the agent itself.
+  state.subagentWatcher?.detach();
+  state.subagentWatcher = null;
   state.onEndOfTurn = null;
   state.pendingEndTurn = null;
   const err = new Error("session killed");
@@ -3295,6 +3383,15 @@ export const __forTest = {
   matchYesNoModal,
   matchStartupConsentDialog,
   clearedStabilityGate,
+  /** Pure idle-throttle decision used by `scrapeOnce` — exposed so the
+   *  regression test can assert a JSONL-idle session keeps scraping (at the
+   *  throttled cadence) instead of stopping forever, which would strand a
+   *  modal raised after the turn resolved to `review`. */
+  decideScrapeTick,
+  SCRAPE_IDLE_AFTER_MS,
+  SCRAPE_IDLE_POLL_MS,
+  SCRAPE_DEEP_IDLE_AFTER_MS,
+  SCRAPE_DEEP_IDLE_POLL_MS,
   readPendingAskQuestionsFromJsonl,
   shouldWaitForAskJsonl,
   resumeJsonlOffset,
