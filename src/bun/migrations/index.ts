@@ -21,6 +21,7 @@ import m018 from "./018_run_events_dedup.sql" with { type: "text" };
 import m019 from "./019_archived_at.sql" with { type: "text" };
 import m020 from "./020_task_type.sql" with { type: "text" };
 import m021 from "./021_codex_session_id.sql" with { type: "text" };
+import m022 from "./022_subagents.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -46,4 +47,5 @@ export const migrations: Migration[] = [
   { id: "019_archived_at", sql: m019 },
   { id: "020_task_type", sql: m020 },
   { id: "021_codex_session_id", sql: m021 },
+  { id: "022_subagents", sql: m022 },
 ];

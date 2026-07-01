@@ -658,6 +658,12 @@ export interface TaskDiff {
  *   thinking     — claude extended-thinking block
  *   tool_use     — claude tool call (data = JSON { id, name, input })
  *   tool_result  — output of a tool call (data = JSON { toolUseId, content })
+ *   subagent     — background/sub-agent lifecycle delta (data = JSON
+ *                  SubagentEvent). Live-only (never persisted to run_events):
+ *                  the `/tasks/:id/subagents` snapshot covers panel reopen, so
+ *                  this stream just keeps the open panel's tab strip in sync.
+ *                  The subagent's actual transcript content rides the normal
+ *                  user/assistant/tool_* streams, tagged via `subagentId`.
  */
 export type RunEventStream =
   | "stdout"
@@ -669,7 +675,8 @@ export type RunEventStream =
   | "assistant"
   | "thinking"
   | "tool_use"
-  | "tool_result";
+  | "tool_result"
+  | "subagent";
 
 export interface RunEvent {
   runId: string;
@@ -677,6 +684,56 @@ export interface RunEvent {
   stream: RunEventStream;
   data: string;
   ts: number;
+  /**
+   * When set, this event belongs to a background/sub agent's stream rather than
+   * the task's main agent stream (NULL/undefined = main). The run panel
+   * partitions the unified event scrollback by this id to drive the read-only
+   * per-subagent tabs. Threaded from `run_events.subagent_id`.
+   */
+  subagentId?: string | null;
+}
+
+/** Lifecycle state of a tracked background/sub agent. Mirrors `RunStatus` plus
+ *  the subagent-specific transitions. */
+export type SubagentStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "orphaned";
+
+/**
+ * A background / sub agent the main agent spawned, tracked so the run panel can
+ * offer a read-only tab into its live stream. Today every row is a Claude Code
+ * in-session subagent (`parentKind: "subagent"`); `parentKind` leaves room for
+ * future `claude --bg` independent sessions without a schema change.
+ */
+export interface Subagent {
+  /** Claude's agentId — the basename of `subagents/agent-<id>.jsonl`. */
+  id: string;
+  taskId: string;
+  /** Parent run that was in flight when this subagent was spawned. */
+  runId: string | null;
+  parentKind: "subagent" | "bg_session";
+  /** Registered subagent type, e.g. "Explore" / "general-purpose". */
+  agentType: string | null;
+  /** Short human label from the spawning Agent tool call. */
+  description: string | null;
+  /** 1 = spawned by the main agent; >1 = spawned by another subagent. */
+  spawnDepth: number;
+  /** Absolute path to the subagent's JSONL transcript. */
+  sourcePath: string;
+  status: SubagentStatus;
+  startedAt: number;
+  endedAt: number | null;
+}
+
+/** Payload of a `stream: "subagent"` RunEvent (JSON-encoded in `data`). Lets an
+ *  open run panel add/flip a tab the instant a subagent starts or finishes,
+ *  without re-polling the snapshot endpoint. */
+export interface SubagentEvent {
+  phase: "started" | "finished";
+  subagent: Subagent;
 }
 
 /**
