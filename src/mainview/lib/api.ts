@@ -32,6 +32,7 @@ export interface UpdateSnapshot {
 // callers (BranchPicker) keep working while the single definition lives in
 // src/shared/types.ts (server + webview share one wire shape).
 export type { BranchInfo };
+export { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
 
 /** Where a command/extension comes from. `plugin` entries are contributed by an
  *  enabled Claude Code plugin and are namespaced `<plugin>:<name>`; `builtin`

@@ -7,7 +7,7 @@ import {
   GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash,
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
-import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
+import { api, COMMIT_PUSH_PROMPT, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow } from "@/lib/subagent-tabs";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -763,10 +763,7 @@ function RunPanelBody({
   // resulting turn shows up as a normal run row with streamed events.
   const sendCommitPush = async () => {
     if (!resumableRunId || sending) return;
-    const message =
-      "Commit all changes with a clear, conventional commit message " +
-      "summarizing the work and push the current branch to origin. " +
-      "If the branch has no upstream yet, set it with `git push -u origin <branch>`.";
+    const message = COMMIT_PUSH_PROMPT;
     // Intentionally leaves `input` / `sendRefs` alone — Commit & push is a
     // side action that shouldn't discard text the user has typed for the
     // next turn. `send()` clears those because it consumed them.

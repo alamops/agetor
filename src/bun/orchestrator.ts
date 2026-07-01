@@ -236,6 +236,22 @@ export function wireInteractionBroadcast(): void {
 
 wireInteractionBroadcast();
 
+// Companion bridge for the *removal* side. Every answer*/cancel* path
+// in interactions.ts calls into this, so the run panel can drop the
+// card immediately instead of waiting for a refresh poll. Without
+// this, scraper auto-cancel and run-cancellation leave stale cards in
+// the panel (the existing additions-only SSE plumbing has no way to
+// signal "this is gone").
+setResolvedBroadcaster((res: InteractionResolved) => {
+  emit({
+    runId: res.runId,
+    taskId: res.taskId,
+    stream: "interaction_resolved",
+    data: JSON.stringify({ id: res.id, kind: res.kind }),
+    ts: Date.now(),
+  });
+});
+
 /**
  * Decide what to do with runs left in `status='running'` from a previous
  * agetor process. For claude-code runs whose tmux session is still alive

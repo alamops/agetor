@@ -5,6 +5,7 @@ import path from "node:path";
 import type { AgentKind, Harness, HarnessUsage, Project, Task, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
+import { coreCredsPath } from "./core-creds.ts";
 // Interactions live in-memory in `interactions.ts`. The import creates a
 // cycle: db.ts → interactions.ts → db.ts (for `tasks`). It is safe ONLY
 // because both modules access each other's exports exclusively from
@@ -47,6 +48,11 @@ export const dataDir = DATA_DIR;
  *  liveness checks. Single source of truth so a future rename doesn't
  *  leave silent stragglers. */
 export const pidFilePath = path.join(DATA_DIR, "agetor.pid");
+
+/** Core credentials file (port + per-launch API token + owner pid/kind),
+ *  written after the API server binds and read by the CLI/daemon to discover
+ *  and authenticate to the running core. See `core-creds.ts`. */
+export const credsFilePath = coreCredsPath(DATA_DIR);
 
 export const db = new Database(path.join(DATA_DIR, "agetor.sqlite"));
 db.exec("PRAGMA journal_mode = WAL;");
