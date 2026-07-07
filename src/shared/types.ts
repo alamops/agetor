@@ -810,12 +810,19 @@ export type GlobalEvent =
  *   quit_request — main process intercepted Cmd+Q / window close with N
  *                  runs still active. Webview shows a confirm modal; the
  *                  user picks Quit-anyway (POST /app/force-quit) or stays.
+ *   open_task    — a native notification deep-link (`agetor://task/<id>`)
+ *                  was clicked. Webview opens that task's RunPanel.
  */
 export type AppEvent =
   | {
       type: "quit_request";
       runningRunCount: number;
       runningTaskTitles: string[];
+      ts: number;
+    }
+  | {
+      type: "open_task";
+      taskId: string;
       ts: number;
     };
 
