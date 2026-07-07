@@ -106,6 +106,13 @@ export function toastApiError(args: ToastArgs): void {
   showBlockingToast({ method: toast.error, heading: "API error — retry" }, args);
 }
 
+/** Variant of `toastPending` for the `blocked → session-died` transition —
+ *  the task's tmux session ended unexpectedly mid-run. Reads as an unexpected
+ *  interruption to re-run, not "the agent is waiting on you." */
+export function toastSessionEnded(args: ToastArgs): void {
+  showBlockingToast({ method: toast.error, heading: "Session ended" }, args);
+}
+
 /**
  * Alert the user that a question / permission prompt is waiting on them.
  * Distinct from `toastPending` (the `blocked`-column path) in one crucial way:

@@ -17,7 +17,7 @@ import { UpdateBanner } from "@/components/updater/UpdateBanner";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSuccess } from "@/lib/toasts";
+import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { cn } from "@/lib/utils";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
@@ -331,6 +331,8 @@ export default function App() {
       if (ev.column === "blocked") {
         if (ev.reason === "api-error") {
           toastApiError({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.reason === "session-died") {
+          toastSessionEnded({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else {
           toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         }
