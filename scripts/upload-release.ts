@@ -168,7 +168,24 @@ async function main() {
   );
   if (missing.length) fail(`missing ${missing.join(", ")} in ${artifactsDir}/.`);
 
-  const toUpload = [dmg!, tarZst!, updateJson!].map((n) => join(artifactsDir, n));
+  // CLI assets (built by `bun run build:cli`). Optional — a DMG-only release
+  // still works — but a normal release ships all three so the curl|sh installer
+  // at …/latest/download/install.sh + agetor-arm64 stays current. Filenames are
+  // stable across releases, so the unversioned download URLs never change.
+  const cliAssets = ["agetor-arm64", "agetor-arm64.sha256", "install.sh"].filter((n) =>
+    files.includes(n),
+  );
+  if (!cliAssets.length) {
+    console.warn(
+      "[upload-release] no CLI assets in artifacts/ — run 'bun run build:cli' to ship the curl|sh installer",
+    );
+  } else if (cliAssets.length < 3) {
+    console.warn(`[upload-release] partial CLI assets (${cliAssets.join(", ")}) — re-run 'bun run build:cli'`);
+  }
+
+  const toUpload = [dmg!, tarZst!, updateJson!, ...cliAssets].map((n) =>
+    join(artifactsDir, n),
+  );
 
   const notes = process.env.AGETOR_RELEASE_NOTES;
 

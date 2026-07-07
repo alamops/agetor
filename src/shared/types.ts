@@ -427,7 +427,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "max", label: "Max", hint: "Absolute maximum effort. Slowest, most thorough." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Opus 4.8 / 4.7 / 4.6 / codex only." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Opus 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
@@ -453,8 +453,9 @@ export const EFFORT_OPTIONS: AgentOption[] = [
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
   // effort parameter is API-supported on Fable 5 / Opus 4.8 / 4.7 / 4.6 /
-  // Sonnet 4.6 / Opus 4.5 (xhigh is Fable-5- and Opus-only; Sonnet 4.6 has no
-  // xhigh; Haiku 4.5 doesn't support effort at all). The `/effort` CLI command accepts more
+  // Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is Fable-5-, Opus-, and Sonnet-5-only;
+  // Sonnet 4.6 has no xhigh; Haiku 4.5 doesn't support effort at all). The
+  // `/effort` CLI command accepts more
   // levels but the underlying API request would fail for unsupported pairs,
   // so we filter at the picker rather than letting the user fire bad runs.
   "claude-code": {
@@ -463,6 +464,8 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.7": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.6": ["max", "xhigh", "high", "medium", "low"],
+    // Sonnet 5 is the first Sonnet-tier model with xhigh (full low→max range).
+    "sonnet-5": ["max", "xhigh", "high", "medium", "low"],
     "sonnet-4.6": ["max", "high", "medium", "low"],
     // Haiku 4.5 doesn't support the effort parameter — `supportedEfforts`
     // returns `[]` and the picker disables itself.
@@ -508,6 +511,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
     "opus-4.8": [],
     "opus-4.7": [],
     "opus-4.6": [],
+    "sonnet-5": [],
     "sonnet-4.6": [],
     "haiku-4.5": [],
   },
@@ -531,7 +535,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "opus-4.8", label: "Opus 4.8", hint: "Most capable Opus; slower." },
       { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
       { id: "opus-4.6", label: "Opus 4.6", hint: "Earlier Opus generation." },
-      { id: "sonnet-4.6", label: "Sonnet 4.6", hint: "Balanced." },
+      { id: "sonnet-5", label: "Sonnet 5", hint: "Near-Opus quality on coding/agentic work at Sonnet cost." },
+      { id: "sonnet-4.6", label: "Sonnet 4.6", hint: "Prior Sonnet generation." },
       { id: "haiku-4.5", label: "Haiku 4.5", hint: "Fast and cheap." },
     ],
     modes: [
@@ -695,6 +700,12 @@ export interface GitHubListResult {
  *   thinking     — claude extended-thinking block
  *   tool_use     — claude tool call (data = JSON { id, name, input })
  *   tool_result  — output of a tool call (data = JSON { toolUseId, content })
+ *   subagent     — background/sub-agent lifecycle delta (data = JSON
+ *                  SubagentEvent). Live-only (never persisted to run_events):
+ *                  the `/tasks/:id/subagents` snapshot covers panel reopen, so
+ *                  this stream just keeps the open panel's tab strip in sync.
+ *                  The subagent's actual transcript content rides the normal
+ *                  user/assistant/tool_* streams, tagged via `subagentId`.
  */
 export type RunEventStream =
   | "stdout"
@@ -706,7 +717,8 @@ export type RunEventStream =
   | "assistant"
   | "thinking"
   | "tool_use"
-  | "tool_result";
+  | "tool_result"
+  | "subagent";
 
 export interface RunEvent {
   runId: string;
@@ -714,6 +726,56 @@ export interface RunEvent {
   stream: RunEventStream;
   data: string;
   ts: number;
+  /**
+   * When set, this event belongs to a background/sub agent's stream rather than
+   * the task's main agent stream (NULL/undefined = main). The run panel
+   * partitions the unified event scrollback by this id to drive the read-only
+   * per-subagent tabs. Threaded from `run_events.subagent_id`.
+   */
+  subagentId?: string | null;
+}
+
+/** Lifecycle state of a tracked background/sub agent. Mirrors `RunStatus` plus
+ *  the subagent-specific transitions. */
+export type SubagentStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "orphaned";
+
+/**
+ * A background / sub agent the main agent spawned, tracked so the run panel can
+ * offer a read-only tab into its live stream. Today every row is a Claude Code
+ * in-session subagent (`parentKind: "subagent"`); `parentKind` leaves room for
+ * future `claude --bg` independent sessions without a schema change.
+ */
+export interface Subagent {
+  /** Claude's agentId — the basename of `subagents/agent-<id>.jsonl`. */
+  id: string;
+  taskId: string;
+  /** Parent run that was in flight when this subagent was spawned. */
+  runId: string | null;
+  parentKind: "subagent" | "bg_session";
+  /** Registered subagent type, e.g. "Explore" / "general-purpose". */
+  agentType: string | null;
+  /** Short human label from the spawning Agent tool call. */
+  description: string | null;
+  /** 1 = spawned by the main agent; >1 = spawned by another subagent. */
+  spawnDepth: number;
+  /** Absolute path to the subagent's JSONL transcript. */
+  sourcePath: string;
+  status: SubagentStatus;
+  startedAt: number;
+  endedAt: number | null;
+}
+
+/** Payload of a `stream: "subagent"` RunEvent (JSON-encoded in `data`). Lets an
+ *  open run panel add/flip a tab the instant a subagent starts or finishes,
+ *  without re-polling the snapshot endpoint. */
+export interface SubagentEvent {
+  phase: "started" | "finished";
+  subagent: Subagent;
 }
 
 /**
@@ -838,6 +900,27 @@ export interface ToolResultEventData {
  * every time. Auto-populated on `createTask`; explicit entries come from the
  * native folder dialog (POST /projects/pick).
  */
+/** The canned "Commit & push" follow-up prompt, shared by the webview's
+ *  RunPanel chip and the CLI's `agetor commit` / dashboard `c` action so the
+ *  instruction stays identical across surfaces. */
+export const COMMIT_PUSH_PROMPT =
+  "Commit all changes with a clear, conventional commit message " +
+  "summarizing the work and push the current branch to origin. " +
+  "If the branch has no upstream yet, set it with `git push -u origin <branch>`.";
+
+/** A branch in a project repo, as returned by `GET /projects/branches`.
+ *  Single source of truth shared by the server, webview, and CLI. */
+export interface BranchInfo {
+  /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */
+  name: string;
+  /** Unix-ms timestamp of the tip commit, used to sort recents first. */
+  committedAt: number;
+  /** True for the branch currently checked out at the queried dir. */
+  current: boolean;
+  /** True for remote-tracking refs (`refs/remotes/<remote>/<name>`). */
+  remote: boolean;
+}
+
 export interface Project {
   path: string;
   name: string;
