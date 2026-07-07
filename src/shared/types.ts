@@ -663,6 +663,11 @@ export interface GitHubUser {
   htmlUrl: string | null;
 }
 
+export interface GitHubMilestone {
+  number: number;
+  title: string;
+}
+
 export interface GitHubListItem {
   kind: GitHubItemKind;
   number: number;
@@ -671,6 +676,8 @@ export interface GitHubListItem {
   draft: boolean;
   htmlUrl: string;
   author: GitHubUser | null;
+  assignees: GitHubUser[];
+  milestone: GitHubMilestone | null;
   body: string;
   labels: GitHubLabel[];
   comments: number;
@@ -684,6 +691,70 @@ export interface GitHubListResult {
   webUrl: string;
   auth: "token" | "none";
   items: GitHubListItem[];
+}
+
+export interface GitHubComment {
+  id: number;
+  body: string;
+  htmlUrl: string;
+  author: GitHubUser | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GitHubPullLineComment extends GitHubComment {
+  path: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+}
+
+export interface GitHubCommentsResult {
+  repo: string;
+  itemNumber: number;
+  comments: GitHubComment[];
+}
+
+export interface GitHubPullReviewCommentsResult {
+  repo: string;
+  pullNumber: number;
+  comments: GitHubPullLineComment[];
+}
+
+export interface GitHubCheckRun {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  htmlUrl: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export interface GitHubChecksResult {
+  repo: string;
+  pullNumber: number;
+  sha: string;
+  checkRuns: GitHubCheckRun[];
+}
+
+export type GitHubPullReviewEvent = "APPROVE" | "REQUEST_CHANGES";
+export type GitHubPullMergeMethod = "merge" | "squash" | "rebase";
+
+export interface GitHubActionResult {
+  ok: true;
+  message?: string;
+  commentPosted?: boolean;
+}
+
+export interface GitHubPullMergeResult extends GitHubActionResult {
+  merged: boolean;
+  sha: string | null;
+}
+
+export interface GitHubPullDefaultsResult {
+  repo: string;
+  head: string;
+  base: string;
 }
 
 /**

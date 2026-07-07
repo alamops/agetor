@@ -352,6 +352,20 @@ test("getTaskDiff truncates a huge file's body but keeps honest line counts", as
   expect(huge!.additions).toBe(lineCount);
 });
 
+test("parseGitDiff keeps the path for binary-only file sections", async () => {
+  const { parseGitDiff } = await import("./git-diff.ts");
+  const files = parseGitDiff([
+    "diff --git a/assets/logo.png b/assets/logo.png",
+    "index 1234567..89abcde 100644",
+    "Binary files a/assets/logo.png and b/assets/logo.png differ",
+    "",
+  ].join("\n"));
+
+  expect(files).toHaveLength(1);
+  expect(files[0]?.path).toBe("assets/logo.png");
+  expect(files[0]?.binary).toBe(true);
+});
+
 test("removeWorktree tears down both the worktree and the branch", async () => {
   const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
   const repo = await makeRepo();
@@ -636,4 +650,56 @@ test("gitPull rejects a branch name that could be read as a git flag", async () 
   const r = await gitPull(repo, "--upload-pack=evil");
   expect(r.ok).toBe(false);
   expect(r.error).toContain("invalid branch name");
+});
+
+test("gitPush pushes a local-only branch to origin and sets its upstream", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  // origin stays checked out on main; pushing a *different* new branch to a
+  // non-bare repo is allowed (only a push to the checked-out branch is denied).
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-push-clone-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  await git(["checkout", "-b", "feature/pushme"], clone);
+  writeFileSync(path.join(clone, "work.txt"), "local work\n");
+  await git(["add", "."], clone);
+  await git(["commit", "-m", "local work"], clone);
+
+  const r = await gitPush(clone, "feature/pushme");
+  expect(r.ok).toBe(true);
+  expect(r.remote).toBe("origin");
+
+  // origin now has the branch, and the clone tracks it.
+  const onOrigin = Bun.spawnSync(["git", "rev-parse", "--verify", "feature/pushme"], { cwd: origin });
+  expect(onOrigin.exitCode).toBe(0);
+  const upstream = Bun.spawnSync(
+    ["git", "rev-parse", "--abbrev-ref", "feature/pushme@{upstream}"],
+    { cwd: clone },
+  );
+  expect(new TextDecoder().decode(upstream.stdout).trim()).toBe("origin/feature/pushme");
+});
+
+test("gitPush errors when the repo has no remote configured", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  await git(["checkout", "-b", "feature/local"], repo);
+  const r = await gitPush(repo, "feature/local");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("no git remote");
+});
+
+test("gitPush rejects a branch name that could be read as a git flag", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const r = await gitPush(repo, "--upload-pack=evil");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("invalid branch name");
+});
+
+test("gitPush returns an error when the dir isn't a git repo", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-push-nongit-"));
+  const r = await gitPush(dir, "main");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("not a git repository");
 });

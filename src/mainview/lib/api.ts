@@ -7,7 +7,17 @@ import type {
   GlobalEvent,
   GitHubItemKind,
   GitHubItemState,
+  GitHubCheckRun,
+  GitHubComment,
+  GitHubCommentsResult,
+  GitHubChecksResult,
   GitHubListResult,
+  GitHubPullDefaultsResult,
+  GitHubPullLineComment,
+  GitHubPullMergeMethod,
+  GitHubPullReviewCommentsResult,
+  GitHubPullMergeResult,
+  GitHubPullReviewEvent,
   Harness,
   HarnessStatus,
   HarnessUsage,
@@ -35,7 +45,21 @@ export interface UpdateSnapshot {
 // callers (BranchPicker) keep working while the single definition lives in
 // src/shared/types.ts (server + webview share one wire shape).
 export type { BranchInfo };
-export type { GitHubItemKind, GitHubItemState, GitHubListResult };
+export type {
+  GitHubCheckRun,
+  GitHubChecksResult,
+  GitHubComment,
+  GitHubCommentsResult,
+  GitHubItemKind,
+  GitHubItemState,
+  GitHubListResult,
+  GitHubPullDefaultsResult,
+  GitHubPullLineComment,
+  GitHubPullMergeMethod,
+  GitHubPullReviewCommentsResult,
+  GitHubPullMergeResult,
+  GitHubPullReviewEvent,
+};
 export { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
 
 /** Where a command/extension comes from. `plugin` entries are contributed by an
@@ -260,12 +284,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ path: dir, branch }),
     }),
+  /** Push a local `branch` to its remote and set upstream (the New PR composer's
+   *  Push button) so a local-only branch can be opened as a pull request.
+   *  Rejects (ApiError) on a rejected push, missing remote, or network failure —
+   *  the git stderr rides along as the error message. */
+  gitPush: (dir: string, branch: string) =>
+    j<{ ok: true; remote?: string }>("/projects/push", {
+      method: "POST",
+      body: JSON.stringify({ path: dir, branch }),
+    }),
   listGitHubItems: (input: {
     path: string;
     kind: GitHubItemKind;
     state: GitHubItemState;
     query?: string;
     labels?: string[];
+    assignee?: string;
   }) => {
     const q = new URLSearchParams({
       path: input.path,
@@ -274,8 +308,121 @@ export const api = {
     });
     if (input.query) q.set("q", input.query);
     if (input.labels && input.labels.length > 0) q.set("labels", input.labels.join(","));
+    if (input.assignee) q.set("assignee", input.assignee);
     return j<GitHubListResult>(`/github/items?${q.toString()}`);
   },
+  getGitHubPullDiff: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<TaskDiff>(`/github/pull-diff?${q.toString()}`);
+  },
+  getGitHubPullChecks: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubChecksResult>(`/github/pull-checks?${q.toString()}`);
+  },
+  getGitHubPullDefaults: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubPullDefaultsResult>(`/github/pull-defaults?${q.toString()}`);
+  },
+  listGitHubComments: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubCommentsResult>(`/github/comments?${q.toString()}`);
+  },
+  createGitHubComment: (input: { path: string; number: number; body: string }) =>
+    j<{ comment: GitHubComment }>("/github/comments", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  createGitHubPullLineComment: (input: {
+    path: string;
+    number: number;
+    body: string;
+    filePath: string;
+    line: number;
+    side: "LEFT" | "RIGHT";
+  }) =>
+    j<{ comment: GitHubPullLineComment }>("/github/pull-line-comment", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubPullReviewComments: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullReviewCommentsResult>(`/github/pull-review-comments?${q.toString()}`);
+  },
+  replyGitHubPullLineComment: (input: { path: string; number: number; commentId: number; body: string }) =>
+    j<{ comment: GitHubPullLineComment }>("/github/pull-line-comment-reply", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  reviewGitHubPull: (input: { path: string; number: number; event: GitHubPullReviewEvent; body?: string }) =>
+    j<{ ok: true; message?: string }>("/github/pull-review", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  mergeGitHubPull: (input: {
+    path: string;
+    number: number;
+    method: GitHubPullMergeMethod;
+    title?: string;
+    message?: string;
+  }) =>
+    j<GitHubPullMergeResult>("/github/pull-merge", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  closeGitHubPull: (input: { path: string; number: number; comment?: string }) =>
+    j<{ ok: true; message?: string; item?: GitHubListResult["items"][number]; commentPosted?: boolean }>("/github/pull-close", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  createGitHubPull: (input: {
+    path: string;
+    title: string;
+    head: string;
+    base: string;
+    body?: string;
+    draft?: boolean;
+    reviewers?: string[];
+  }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/pull-create", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  createGitHubIssue: (input: {
+    path: string;
+    title: string;
+    body?: string;
+    labels?: string[];
+    assignees?: string[];
+    milestone?: number | null;
+  }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/issue-create", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubIssue: (input: {
+    path: string;
+    number: number;
+    state?: "open" | "closed";
+    labels?: string[];
+    assignees?: string[];
+    milestone?: number | null;
+  }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/issue-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   getTmuxSource: () =>
     j<{
       source: "system" | "bundled";

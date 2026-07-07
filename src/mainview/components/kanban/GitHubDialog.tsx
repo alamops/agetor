@@ -3,20 +3,50 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   AlertCircle,
+  ArrowUpFromLine,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   ExternalLink,
+  FileMinus,
+  FilePen,
+  FilePlus,
+  FileSymlink,
+  GitMerge,
   GitPullRequest,
   Loader2,
   MessageSquare,
+  Plus,
   RefreshCw,
   Search,
+  Tag,
+  XCircle,
 } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
-import { api, type GitHubItemKind, type GitHubItemState, type GitHubListResult } from "@/lib/api";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  api,
+  type GitHubItemKind,
+  type GitHubItemState,
+  type GitHubListResult,
+  type GitHubPullMergeMethod,
+  type GitHubPullReviewEvent,
+} from "@/lib/api";
 import { cn } from "@/lib/utils";
-import type { GitHubListItem, Project } from "../../../shared/types.ts";
+import { toRows, type DiffRow } from "@/lib/diff-rows";
+import type {
+  DiffFile,
+  GitHubCheckRun,
+  GitHubChecksResult,
+  GitHubComment,
+  GitHubListItem,
+  GitHubPullLineComment,
+  Project,
+  TaskDiff,
+} from "../../../shared/types.ts";
 
 interface Props {
   open: boolean;
@@ -42,16 +72,88 @@ function splitLabels(raw: string): string[] {
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+function parseMilestone(raw: string): number | null | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  const n = Number(trimmed);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+const STATUS_META: Record<DiffFile["status"], { icon: typeof FilePlus; cls: string }> = {
+  added: { icon: FilePlus, cls: "text-emerald-400" },
+  modified: { icon: FilePen, cls: "text-amber-400" },
+  deleted: { icon: FileMinus, cls: "text-rose-400" },
+  renamed: { icon: FileSymlink, cls: "text-sky-400" },
+};
+
+interface LineCommentTarget {
+  filePath: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+  body: string;
+}
+
 export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Props) {
   const [projectPath, setProjectPath] = useState("");
   const [kind, setKind] = useState<GitHubItemKind>("pulls");
   const [state, setState] = useState<GitHubItemState>("open");
   const [query, setQuery] = useState("");
   const [labels, setLabels] = useState("");
+  const [assignee, setAssignee] = useState("");
   const [result, setResult] = useState<GitHubListResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestSeq = useRef(0);
+  const diffSeq = useRef(0);
+  const commentSeq = useRef(0);
+  const reviewCommentSeq = useRef(0);
+  const checksSeq = useRef(0);
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [diffs, setDiffs] = useState<Record<number, TaskDiff | undefined>>({});
+  const [diffLoading, setDiffLoading] = useState<Record<number, boolean | undefined>>({});
+  const [diffErrors, setDiffErrors] = useState<Record<number, string | undefined>>({});
+  const [checks, setChecks] = useState<Record<number, GitHubChecksResult | undefined>>({});
+  const [checksLoading, setChecksLoading] = useState<Record<number, boolean | undefined>>({});
+  const [checksErrors, setChecksErrors] = useState<Record<number, string | undefined>>({});
+  const [comments, setComments] = useState<Record<number, GitHubComment[] | undefined>>({});
+  const [commentsLoading, setCommentsLoading] = useState<Record<number, boolean | undefined>>({});
+  const [commentErrors, setCommentErrors] = useState<Record<number, string | undefined>>({});
+  const [commentDrafts, setCommentDrafts] = useState<Record<number, string | undefined>>({});
+  const [commentSubmitting, setCommentSubmitting] = useState<Record<number, boolean | undefined>>({});
+  const [reviewComments, setReviewComments] = useState<Record<number, GitHubPullLineComment[] | undefined>>({});
+  const [reviewCommentsLoading, setReviewCommentsLoading] = useState<Record<number, boolean | undefined>>({});
+  const [reviewCommentErrors, setReviewCommentErrors] = useState<Record<number, string | undefined>>({});
+  const [reviewReplyDrafts, setReviewReplyDrafts] = useState<Record<number, string | undefined>>({});
+  const [reviewReplySubmitting, setReviewReplySubmitting] = useState<Record<number, boolean | undefined>>({});
+  const [reviewDrafts, setReviewDrafts] = useState<Record<number, string | undefined>>({});
+  const [closeDrafts, setCloseDrafts] = useState<Record<number, string | undefined>>({});
+  const [mergeMethods, setMergeMethods] = useState<Record<number, GitHubPullMergeMethod | undefined>>({});
+  const [labelDrafts, setLabelDrafts] = useState<Record<number, string | undefined>>({});
+  const [assigneeDrafts, setAssigneeDrafts] = useState<Record<number, string | undefined>>({});
+  const [milestoneDrafts, setMilestoneDrafts] = useState<Record<number, string | undefined>>({});
+  const [actionBusy, setActionBusy] = useState<Record<number, string | undefined>>({});
+  const [actionErrors, setActionErrors] = useState<Record<number, string | undefined>>({});
+  const [actionMessages, setActionMessages] = useState<Record<number, string | undefined>>({});
+  const [issueComposerOpen, setIssueComposerOpen] = useState(false);
+  const [newIssueTitle, setNewIssueTitle] = useState("");
+  const [newIssueBody, setNewIssueBody] = useState("");
+  const [newIssueLabels, setNewIssueLabels] = useState("");
+  const [newIssueAssignees, setNewIssueAssignees] = useState("");
+  const [newIssueMilestone, setNewIssueMilestone] = useState("");
+  const [newIssueSubmitting, setNewIssueSubmitting] = useState(false);
+  const [newIssueError, setNewIssueError] = useState<string | null>(null);
+  const [pullComposerOpen, setPullComposerOpen] = useState(false);
+  const [newPullTitle, setNewPullTitle] = useState("");
+  const [newPullBody, setNewPullBody] = useState("");
+  const [newPullHead, setNewPullHead] = useState("");
+  const [newPullBase, setNewPullBase] = useState("");
+  const [newPullReviewers, setNewPullReviewers] = useState("");
+  const [newPullDraft, setNewPullDraft] = useState(false);
+  const [newPullSubmitting, setNewPullSubmitting] = useState(false);
+  const [newPullError, setNewPullError] = useState<string | null>(null);
+  const [newPullPushing, setNewPullPushing] = useState(false);
+  const [newPullPushError, setNewPullPushError] = useState<string | null>(null);
+  const [newPullPushMessage, setNewPullPushMessage] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -74,6 +176,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         state,
         query,
         labels: splitLabels(labels),
+        assignee,
       });
       if (requestId !== requestSeq.current) return;
       setResult(next);
@@ -95,7 +198,62 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     const t = setTimeout(() => { void load(requestId); }, 250);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, projectPath, kind, state, query, labels]);
+  }, [open, projectPath, kind, state, query, labels, assignee]);
+
+  useEffect(() => {
+    diffSeq.current += 1;
+    checksSeq.current += 1;
+    reviewCommentSeq.current += 1;
+    setExpandedKey(null);
+    setDiffs({});
+    setDiffLoading({});
+    setDiffErrors({});
+    setChecks({});
+    setChecksLoading({});
+    setChecksErrors({});
+    setComments({});
+    setCommentsLoading({});
+    setCommentErrors({});
+    setCommentDrafts({});
+    setCommentSubmitting({});
+    setReviewComments({});
+    setReviewCommentsLoading({});
+    setReviewCommentErrors({});
+    setReviewReplyDrafts({});
+    setReviewReplySubmitting({});
+    setReviewDrafts({});
+    setCloseDrafts({});
+    setMergeMethods({});
+    setLabelDrafts({});
+    setAssigneeDrafts({});
+    setMilestoneDrafts({});
+    setActionBusy({});
+    setActionErrors({});
+    setActionMessages({});
+  }, [projectPath, kind, state, query, labels, assignee]);
+
+  useEffect(() => {
+    setIssueComposerOpen(false);
+    setNewIssueTitle("");
+    setNewIssueBody("");
+    setNewIssueLabels("");
+    setNewIssueAssignees("");
+    setNewIssueMilestone("");
+    setNewIssueSubmitting(false);
+    setNewIssueError(null);
+    setPullComposerOpen(false);
+    setNewPullTitle("");
+    setNewPullBody("");
+    setNewPullHead("");
+    setNewPullBase("");
+    setNewPullReviewers("");
+    setNewPullDraft(false);
+    setNewPullSubmitting(false);
+    setNewPullError(null);
+    setNewPullPushing(false);
+    setNewPullPushError(null);
+    setNewPullPushMessage(null);
+  }, [projectPath, kind]);
 
   const availableLabels = useMemo(() => {
     const names = new Set<string>();
@@ -112,6 +270,424 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     }
     return opts;
   }, [projects, projectPath]);
+
+  const expandedItem = useMemo(() => {
+    if (!expandedKey) return null;
+    return result?.items.find((item) => `${item.kind}-${item.number}` === expandedKey) ?? null;
+  }, [expandedKey, result]);
+
+  useEffect(() => {
+    if (!open || !projectPath || kind !== "pulls") return;
+    let cancelled = false;
+    api.getGitHubPullDefaults({ path: projectPath })
+      .then((defaults) => {
+        if (cancelled) return;
+        setNewPullHead((cur) => cur || defaults.head);
+        setNewPullBase((cur) => cur || defaults.base);
+      })
+      .catch(() => {
+        // Defaults are convenience only; creation will surface real errors.
+      });
+    return () => { cancelled = true; };
+  }, [open, projectPath, kind]);
+
+  useEffect(() => {
+    if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    const number = expandedItem.number;
+    if (diffs[number] || diffLoading[number] || diffErrors[number]) return;
+
+    const requestId = ++diffSeq.current;
+    setDiffLoading((cur) => ({ ...cur, [number]: true }));
+    setDiffErrors((cur) => ({ ...cur, [number]: undefined }));
+    api.getGitHubPullDiff({ path: projectPath, number })
+      .then((diff) => {
+        if (requestId !== diffSeq.current) return;
+        setDiffs((cur) => ({ ...cur, [number]: diff }));
+      })
+      .catch((e: unknown) => {
+        if (requestId !== diffSeq.current) return;
+        setDiffErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+      })
+      .finally(() => {
+        if (requestId !== diffSeq.current) return;
+        setDiffLoading((cur) => ({ ...cur, [number]: false }));
+      });
+  }, [open, projectPath, expandedItem, diffs, diffLoading, diffErrors]);
+
+  useEffect(() => {
+    if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    const number = expandedItem.number;
+    if (checks[number] || checksLoading[number] || checksErrors[number]) return;
+
+    const requestId = ++checksSeq.current;
+    setChecksLoading((cur) => ({ ...cur, [number]: true }));
+    setChecksErrors((cur) => ({ ...cur, [number]: undefined }));
+    api.getGitHubPullChecks({ path: projectPath, number })
+      .then((payload) => {
+        if (requestId !== checksSeq.current) return;
+        setChecks((cur) => ({ ...cur, [number]: payload }));
+      })
+      .catch((e: unknown) => {
+        if (requestId !== checksSeq.current) return;
+        setChecksErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+      })
+      .finally(() => {
+        if (requestId !== checksSeq.current) return;
+        setChecksLoading((cur) => ({ ...cur, [number]: false }));
+      });
+  }, [open, projectPath, expandedItem, checks, checksLoading, checksErrors]);
+
+  useEffect(() => {
+    if (!open || !projectPath || !expandedItem) return;
+    const number = expandedItem.number;
+    if (comments[number] || commentsLoading[number] || commentErrors[number]) return;
+
+    const requestId = ++commentSeq.current;
+    setCommentsLoading((cur) => ({ ...cur, [number]: true }));
+    setCommentErrors((cur) => ({ ...cur, [number]: undefined }));
+    api.listGitHubComments({ path: projectPath, number })
+      .then((payload) => {
+        if (requestId !== commentSeq.current) return;
+        setComments((cur) => ({ ...cur, [number]: payload.comments }));
+      })
+      .catch((e: unknown) => {
+        if (requestId !== commentSeq.current) return;
+        setCommentErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+      })
+      .finally(() => {
+        if (requestId !== commentSeq.current) return;
+        setCommentsLoading((cur) => ({ ...cur, [number]: false }));
+      });
+  }, [open, projectPath, expandedItem, comments, commentsLoading, commentErrors]);
+
+  useEffect(() => {
+    if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    const number = expandedItem.number;
+    if (reviewComments[number] || reviewCommentsLoading[number] || reviewCommentErrors[number]) return;
+
+    const requestId = ++reviewCommentSeq.current;
+    setReviewCommentsLoading((cur) => ({ ...cur, [number]: true }));
+    setReviewCommentErrors((cur) => ({ ...cur, [number]: undefined }));
+    api.listGitHubPullReviewComments({ path: projectPath, number })
+      .then((payload) => {
+        if (requestId !== reviewCommentSeq.current) return;
+        setReviewComments((cur) => ({ ...cur, [number]: payload.comments }));
+      })
+      .catch((e: unknown) => {
+        if (requestId !== reviewCommentSeq.current) return;
+        setReviewCommentErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+      })
+      .finally(() => {
+        if (requestId !== reviewCommentSeq.current) return;
+        setReviewCommentsLoading((cur) => ({ ...cur, [number]: false }));
+      });
+  }, [open, projectPath, expandedItem, reviewComments, reviewCommentsLoading, reviewCommentErrors]);
+
+  const submitComment = async (item: GitHubListItem) => {
+    const body = (commentDrafts[item.number] ?? "").trim();
+    if (!projectPath || !body || commentSubmitting[item.number]) return;
+    setCommentSubmitting((cur) => ({ ...cur, [item.number]: true }));
+    setCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const { comment } = await api.createGitHubComment({ path: projectPath, number: item.number, body });
+      setComments((cur) => ({ ...cur, [item.number]: [...(cur[item.number] ?? []), comment] }));
+      setCommentDrafts((cur) => ({ ...cur, [item.number]: "" }));
+    } catch (e) {
+      setCommentErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setCommentSubmitting((cur) => ({ ...cur, [item.number]: false }));
+    }
+  };
+
+  const submitLineComment = async (item: GitHubListItem, target: LineCommentTarget) => {
+    if (!projectPath || item.kind !== "pulls") return;
+    const { comment } = await api.createGitHubPullLineComment({
+      path: projectPath,
+      number: item.number,
+      body: target.body,
+      filePath: target.filePath,
+      line: target.line,
+      side: target.side,
+    });
+    setReviewComments((cur) => ({ ...cur, [item.number]: [...(cur[item.number] ?? []), comment] }));
+    setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+  };
+
+  const submitReviewReply = async (item: GitHubListItem, commentId: number) => {
+    const body = (reviewReplyDrafts[commentId] ?? "").trim();
+    if (!projectPath || item.kind !== "pulls" || !body || reviewReplySubmitting[commentId]) return;
+    setReviewReplySubmitting((cur) => ({ ...cur, [commentId]: true }));
+    setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const { comment } = await api.replyGitHubPullLineComment({
+        path: projectPath,
+        number: item.number,
+        commentId,
+        body,
+      });
+      setReviewComments((cur) => ({ ...cur, [item.number]: [...(cur[item.number] ?? []), comment] }));
+      setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: "" }));
+    } catch (e) {
+      setReviewCommentErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setReviewReplySubmitting((cur) => ({ ...cur, [commentId]: false }));
+    }
+  };
+
+  const itemMatchesActiveFilters = (item: GitHubListItem) => {
+    if (item.kind !== kind) return false;
+    if (state !== "all" && item.state !== state) return false;
+    const q = query.trim().toLowerCase();
+    if (q) {
+      const hay = [
+        item.title,
+        item.body,
+        String(item.number),
+        item.author?.login ?? "",
+        item.labels.map((label) => label.name).join(" "),
+      ].join("\n").toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    const requiredLabels = splitLabels(labels).map((label) => label.toLowerCase());
+    if (requiredLabels.length > 0) {
+      const have = new Set(item.labels.map((label) => label.name.toLowerCase()));
+      if (!requiredLabels.every((label) => have.has(label))) return false;
+    }
+    const assigneeFilter = assignee.trim().toLowerCase();
+    if (assigneeFilter) {
+      const have = new Set(item.assignees.map((a) => a.login.toLowerCase()));
+      if (!have.has(assigneeFilter)) return false;
+    }
+    return true;
+  };
+
+  const markPullClosed = (number: number, replacement?: GitHubListItem) => {
+    setResult((cur) => {
+      if (!cur) return cur;
+      let found = false;
+      const items = cur.items.flatMap((item) => {
+        if (item.kind !== "pulls" || item.number !== number) return [item];
+        found = true;
+        const next = replacement ?? { ...item, state: "closed" as const, closedAt: new Date().toISOString() };
+        return itemMatchesActiveFilters(next) ? [next] : [];
+      });
+      return {
+        ...cur,
+        items: found ? items : cur.items,
+      };
+    });
+  };
+
+  const runPullReview = async (item: GitHubListItem, event: GitHubPullReviewEvent) => {
+    const body = (reviewDrafts[item.number] ?? "").trim();
+    if (!projectPath || actionBusy[item.number]) return;
+    if (event === "REQUEST_CHANGES" && !body) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: "Request changes requires a comment." }));
+      return;
+    }
+    setActionBusy((cur) => ({ ...cur, [item.number]: event }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.reviewGitHubPull({ path: projectPath, number: item.number, event, body });
+      setActionMessages((cur) => ({
+        ...cur,
+        [item.number]: result.message ?? (event === "APPROVE" ? "Pull request approved." : "Changes requested."),
+      }));
+      setReviewDrafts((cur) => ({ ...cur, [item.number]: "" }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
+  const runPullMerge = async (item: GitHubListItem) => {
+    if (!projectPath || actionBusy[item.number]) return;
+    const method = mergeMethods[item.number] ?? "merge";
+    setActionBusy((cur) => ({ ...cur, [item.number]: "merge" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.mergeGitHubPull({ path: projectPath, number: item.number, method });
+      if (result.merged) markPullClosed(item.number);
+      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Pull request merged." }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
+  const runPullClose = async (item: GitHubListItem) => {
+    if (!projectPath || actionBusy[item.number]) return;
+    const comment = (closeDrafts[item.number] ?? "").trim();
+    setActionBusy((cur) => ({ ...cur, [item.number]: "close" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.closeGitHubPull({ path: projectPath, number: item.number, comment });
+      markPullClosed(item.number, result.item);
+      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Pull request closed." }));
+      setCloseDrafts((cur) => ({ ...cur, [item.number]: "" }));
+      if (comment && result.commentPosted !== false) {
+        setComments((cur) => ({ ...cur, [item.number]: undefined }));
+        setCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+      }
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
+  const upsertListItem = (replacement: GitHubListItem, prepend = false) => {
+    setResult((cur) => {
+      if (!cur) return cur;
+      const exists = cur.items.some((item) => item.kind === replacement.kind && item.number === replacement.number);
+      if (!itemMatchesActiveFilters(replacement)) {
+        return {
+          ...cur,
+          items: cur.items.filter((item) => item.kind !== replacement.kind || item.number !== replacement.number),
+        };
+      }
+      return {
+        ...cur,
+        items: exists
+          ? cur.items.map((item) => item.kind === replacement.kind && item.number === replacement.number ? replacement : item)
+          : prepend ? [replacement, ...cur.items] : [...cur.items, replacement],
+      };
+    });
+  };
+
+  const createIssue = async () => {
+    const title = newIssueTitle.trim();
+    if (!projectPath || !title || newIssueSubmitting) return;
+    const milestone = parseMilestone(newIssueMilestone);
+    if (milestone === null) {
+      setNewIssueError("Milestone must be a positive number.");
+      return;
+    }
+    setNewIssueSubmitting(true);
+    setNewIssueError(null);
+    try {
+      const result = await api.createGitHubIssue({
+        path: projectPath,
+        title,
+        body: newIssueBody,
+        labels: splitLabels(newIssueLabels),
+        assignees: splitLabels(newIssueAssignees),
+        milestone,
+      });
+      upsertListItem(result.item, true);
+      setIssueComposerOpen(false);
+      setNewIssueTitle("");
+      setNewIssueBody("");
+      setNewIssueLabels("");
+      setNewIssueAssignees("");
+      setNewIssueMilestone("");
+    } catch (e) {
+      setNewIssueError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setNewIssueSubmitting(false);
+    }
+  };
+
+  const pushHead = async () => {
+    const head = newPullHead.trim();
+    if (!projectPath || !head || newPullPushing) return;
+    setNewPullPushing(true);
+    setNewPullPushError(null);
+    setNewPullPushMessage(null);
+    try {
+      const res = await api.gitPush(projectPath, head);
+      setNewPullPushMessage(res.remote ? `Pushed ${head} to ${res.remote}.` : `Pushed ${head}.`);
+    } catch (e) {
+      setNewPullPushError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setNewPullPushing(false);
+    }
+  };
+
+  const createPull = async () => {
+    const title = newPullTitle.trim();
+    const head = newPullHead.trim();
+    const base = newPullBase.trim();
+    if (!projectPath || !title || !head || !base || newPullSubmitting) return;
+    setNewPullSubmitting(true);
+    setNewPullError(null);
+    try {
+      const result = await api.createGitHubPull({
+        path: projectPath,
+        title,
+        head,
+        base,
+        body: newPullBody,
+        draft: newPullDraft,
+        reviewers: splitLabels(newPullReviewers),
+      });
+      upsertListItem(result.item, true);
+      setPullComposerOpen(false);
+      setNewPullTitle("");
+      setNewPullBody("");
+      setNewPullReviewers("");
+      setNewPullDraft(false);
+      setActionMessages((cur) => ({ ...cur, [result.item.number]: result.message ?? "Pull request created." }));
+    } catch (e) {
+      setNewPullError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setNewPullSubmitting(false);
+    }
+  };
+
+  const updateIssueState = async (item: GitHubListItem, nextState: "open" | "closed") => {
+    if (!projectPath || actionBusy[item.number]) return;
+    setActionBusy((cur) => ({ ...cur, [item.number]: nextState }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.updateGitHubIssue({ path: projectPath, number: item.number, state: nextState });
+      upsertListItem(result.item);
+      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Issue updated." }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
+  const updateIssueLabels = async (item: GitHubListItem) => {
+    if (!projectPath || actionBusy[item.number]) return;
+    const nextLabels = splitLabels(labelDrafts[item.number] ?? item.labels.map((label) => label.name).join(", "));
+    const nextAssignees = splitLabels(assigneeDrafts[item.number] ?? item.assignees.map((a) => a.login).join(", "));
+    const rawMilestone = milestoneDrafts[item.number] ?? (item.milestone ? String(item.milestone.number) : "");
+    const nextMilestone = parseMilestone(rawMilestone);
+    if (nextMilestone === null) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: "Milestone must be a positive number." }));
+      return;
+    }
+    setActionBusy((cur) => ({ ...cur, [item.number]: "labels" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.updateGitHubIssue({
+        path: projectPath,
+        number: item.number,
+        labels: nextLabels,
+        assignees: nextAssignees,
+        milestone: rawMilestone.trim() ? nextMilestone : null,
+      });
+      upsertListItem(result.item);
+      setLabelDrafts((cur) => ({ ...cur, [item.number]: result.item.labels.map((label) => label.name).join(", ") }));
+      setAssigneeDrafts((cur) => ({ ...cur, [item.number]: result.item.assignees.map((a) => a.login).join(", ") }));
+      setMilestoneDrafts((cur) => ({ ...cur, [item.number]: result.item.milestone ? String(result.item.milestone.number) : "" }));
+      setActionMessages((cur) => ({ ...cur, [item.number]: "Issue triage updated." }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
 
   return (
     <Dialog
@@ -221,12 +797,64 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           className="h-8 text-xs"
           list="github-dialog-labels"
         />
+        <Input
+          value={assignee}
+          onChange={(e) => setAssignee(e.target.value)}
+          placeholder="Assignee"
+          className="h-8 text-xs"
+        />
         <datalist id="github-dialog-labels">
           {availableLabels.map((label) => <option key={label} value={label} />)}
         </datalist>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        {kind === "pulls" && (
+          <PullComposer
+            open={pullComposerOpen}
+            title={newPullTitle}
+            body={newPullBody}
+            head={newPullHead}
+            base={newPullBase}
+            reviewers={newPullReviewers}
+            draft={newPullDraft}
+            submitting={newPullSubmitting}
+            error={newPullError}
+            pushing={newPullPushing}
+            pushError={newPullPushError}
+            pushMessage={newPullPushMessage}
+            onOpenChange={setPullComposerOpen}
+            onTitleChange={setNewPullTitle}
+            onBodyChange={setNewPullBody}
+            onHeadChange={setNewPullHead}
+            onBaseChange={setNewPullBase}
+            onReviewersChange={setNewPullReviewers}
+            onDraftChange={setNewPullDraft}
+            onPushHead={() => { void pushHead(); }}
+            onSubmit={() => { void createPull(); }}
+          />
+        )}
+
+        {kind === "issues" && (
+          <IssueComposer
+            open={issueComposerOpen}
+            title={newIssueTitle}
+            body={newIssueBody}
+            labels={newIssueLabels}
+            assignees={newIssueAssignees}
+            milestone={newIssueMilestone}
+            submitting={newIssueSubmitting}
+            error={newIssueError}
+            onOpenChange={setIssueComposerOpen}
+            onTitleChange={setNewIssueTitle}
+            onBodyChange={setNewIssueBody}
+            onLabelsChange={setNewIssueLabels}
+            onAssigneesChange={setNewIssueAssignees}
+            onMilestoneChange={setNewIssueMilestone}
+            onSubmit={() => { void createIssue(); }}
+          />
+        )}
+
         {!loading && error && (
           <div className="flex items-center justify-center gap-2 py-12 text-sm text-rose-400">
             <AlertCircle className="size-4" /> {error}
@@ -252,7 +880,81 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               {result.items.length} {kind === "pulls" ? "pull requests" : "issues"}
             </div>
             {result.items.map((item) => (
-              <GitHubItemRow key={`${item.kind}-${item.number}`} item={item} />
+              <GitHubItemRow
+                key={`${item.kind}-${item.number}`}
+                item={item}
+                expanded={expandedKey === `${item.kind}-${item.number}`}
+                diff={item.kind === "pulls" ? diffs[item.number] : undefined}
+                diffLoading={item.kind === "pulls" ? !!diffLoading[item.number] : false}
+                diffError={item.kind === "pulls" ? diffErrors[item.number] : undefined}
+                checks={item.kind === "pulls" ? checks[item.number] : undefined}
+                checksLoading={item.kind === "pulls" ? !!checksLoading[item.number] : false}
+                checksError={item.kind === "pulls" ? checksErrors[item.number] : undefined}
+                reviewComments={item.kind === "pulls" ? reviewComments[item.number] : undefined}
+                reviewCommentsLoading={item.kind === "pulls" ? !!reviewCommentsLoading[item.number] : false}
+                reviewCommentError={item.kind === "pulls" ? reviewCommentErrors[item.number] : undefined}
+                reviewReplyDrafts={reviewReplyDrafts}
+                reviewReplySubmitting={reviewReplySubmitting}
+                comments={comments[item.number]}
+                commentsLoading={!!commentsLoading[item.number]}
+                commentError={commentErrors[item.number]}
+                commentDraft={commentDrafts[item.number] ?? ""}
+                commentSubmitting={!!commentSubmitting[item.number]}
+                reviewDraft={reviewDrafts[item.number] ?? ""}
+                closeDraft={closeDrafts[item.number] ?? ""}
+                mergeMethod={mergeMethods[item.number] ?? "merge"}
+                actionBusy={actionBusy[item.number]}
+                actionError={actionErrors[item.number]}
+                actionMessage={actionMessages[item.number]}
+                labelDraft={labelDrafts[item.number] ?? item.labels.map((label) => label.name).join(", ")}
+                assigneeDraft={assigneeDrafts[item.number] ?? item.assignees.map((a) => a.login).join(", ")}
+                milestoneDraft={milestoneDrafts[item.number] ?? (item.milestone ? String(item.milestone.number) : "")}
+                onReviewDraftChange={(body) => setReviewDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onCloseDraftChange={(body) => setCloseDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onMergeMethodChange={(method) => setMergeMethods((cur) => ({ ...cur, [item.number]: method }))}
+                onReview={(event) => { void runPullReview(item, event); }}
+                onMerge={() => { void runPullMerge(item); }}
+                onClosePull={() => { void runPullClose(item); }}
+                onLineComment={(target) => submitLineComment(item, target)}
+                onReviewReplyDraftChange={(commentId, body) => setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: body }))}
+                onSubmitReviewReply={(commentId) => { void submitReviewReply(item, commentId); }}
+                onRetryReviewComments={() => {
+                  if (item.kind !== "pulls") return;
+                  setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                }}
+                onLabelDraftChange={(body) => setLabelDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onAssigneeDraftChange={(body) => setAssigneeDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onMilestoneDraftChange={(body) => setMilestoneDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onIssueState={(nextState) => { void updateIssueState(item, nextState); }}
+                onIssueLabels={() => { void updateIssueLabels(item); }}
+                onCommentDraftChange={(body) => setCommentDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onSubmitComment={() => { void submitComment(item); }}
+                onRetryComments={() => {
+                  setCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                }}
+                onRetryDiff={() => {
+                  if (item.kind !== "pulls") return;
+                  setDiffErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                }}
+                onRetryChecks={() => {
+                  if (item.kind !== "pulls") return;
+                  setChecksErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                }}
+                onRefreshDiff={() => {
+                  if (item.kind !== "pulls") return;
+                  setDiffs((cur) => ({ ...cur, [item.number]: undefined }));
+                  setDiffErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                }}
+                onRefreshChecks={() => {
+                  if (item.kind !== "pulls") return;
+                  setChecks((cur) => ({ ...cur, [item.number]: undefined }));
+                  setChecksErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                }}
+                onToggle={() => {
+                  const key = `${item.kind}-${item.number}`;
+                  setExpandedKey((cur) => (cur === key ? null : key));
+                }}
+              />
             ))}
           </div>
         )}
@@ -261,7 +963,379 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   );
 }
 
-function GitHubItemRow({ item }: { item: GitHubListItem }) {
+function PullComposer({
+  open,
+  title,
+  body,
+  head,
+  base,
+  reviewers,
+  draft,
+  submitting,
+  error,
+  pushing,
+  pushError,
+  pushMessage,
+  onOpenChange,
+  onTitleChange,
+  onBodyChange,
+  onHeadChange,
+  onBaseChange,
+  onReviewersChange,
+  onDraftChange,
+  onPushHead,
+  onSubmit,
+}: {
+  open: boolean;
+  title: string;
+  body: string;
+  head: string;
+  base: string;
+  reviewers: string;
+  draft: boolean;
+  submitting: boolean;
+  error: string | null;
+  pushing: boolean;
+  pushError: string | null;
+  pushMessage: string | null;
+  onOpenChange: (open: boolean) => void;
+  onTitleChange: (title: string) => void;
+  onBodyChange: (body: string) => void;
+  onHeadChange: (head: string) => void;
+  onBaseChange: (base: string) => void;
+  onReviewersChange: (reviewers: string) => void;
+  onDraftChange: (draft: boolean) => void;
+  onPushHead: () => void;
+  onSubmit: () => void;
+}) {
+  if (!open) {
+    return (
+      <div className="mb-3 flex justify-end">
+        <Button size="sm" onClick={() => onOpenChange(true)}>
+          <Plus className="mr-2 size-3.5" />
+          New PR
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <GitPullRequest className="size-3.5" />
+          New pull request
+        </div>
+        {error && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+            <AlertCircle className="size-3.5" />
+            {error}
+          </span>
+        )}
+      </div>
+      <div className="grid gap-2">
+        <Input
+          value={title}
+          onChange={(e) => onTitleChange(e.target.value)}
+          placeholder="Title"
+          className="h-8 text-sm"
+          disabled={submitting}
+        />
+        <div className="grid gap-2 md:grid-cols-2">
+          <Input
+            value={head}
+            onChange={(e) => onHeadChange(e.target.value)}
+            placeholder="Head branch"
+            className="h-8 text-xs"
+            disabled={submitting}
+          />
+          <Input
+            value={base}
+            onChange={(e) => onBaseChange(e.target.value)}
+            placeholder="Base branch"
+            className="h-8 text-xs"
+            disabled={submitting}
+          />
+        </div>
+        <Textarea
+          value={body}
+          onChange={(e) => onBodyChange(e.target.value)}
+          placeholder="Markdown body..."
+          className="min-h-24 resize-y text-sm"
+          disabled={submitting}
+        />
+        <Input
+          value={reviewers}
+          onChange={(e) => onReviewersChange(e.target.value)}
+          placeholder="Reviewers, comma separated"
+          className="h-8 text-xs"
+          disabled={submitting}
+        />
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={submitting || pushing || !head.trim()}
+            onClick={onPushHead}
+            title="Push the head branch to its remote so GitHub can open the pull request"
+          >
+            {pushing ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <ArrowUpFromLine className="mr-2 size-3.5" />}
+            Push head
+          </Button>
+          {pushMessage && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+              <CheckCircle2 className="size-3.5" />
+              {pushMessage}
+            </span>
+          )}
+          {pushError && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+              <AlertCircle className="size-3.5" />
+              {pushError}
+            </span>
+          )}
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          The head branch must exist on the remote before GitHub can open the pull request — push it first if it's a new local branch.
+        </p>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+        <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={draft}
+            disabled={submitting}
+            onChange={(e) => onDraftChange(e.target.checked)}
+          />
+          Draft
+        </label>
+        <div className="flex justify-end gap-2">
+          <Button size="sm" variant="ghost" disabled={submitting} onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button size="sm" disabled={submitting || !title.trim() || !head.trim() || !base.trim()} onClick={onSubmit}>
+            {submitting ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
+            Create PR
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function IssueComposer({
+  open,
+  title,
+  body,
+  labels,
+  assignees,
+  milestone,
+  submitting,
+  error,
+  onOpenChange,
+  onTitleChange,
+  onBodyChange,
+  onLabelsChange,
+  onAssigneesChange,
+  onMilestoneChange,
+  onSubmit,
+}: {
+  open: boolean;
+  title: string;
+  body: string;
+  labels: string;
+  assignees: string;
+  milestone: string;
+  submitting: boolean;
+  error: string | null;
+  onOpenChange: (open: boolean) => void;
+  onTitleChange: (title: string) => void;
+  onBodyChange: (body: string) => void;
+  onLabelsChange: (labels: string) => void;
+  onAssigneesChange: (assignees: string) => void;
+  onMilestoneChange: (milestone: string) => void;
+  onSubmit: () => void;
+}) {
+  if (!open) {
+    return (
+      <div className="mb-3 flex justify-end">
+        <Button size="sm" onClick={() => onOpenChange(true)}>
+          <Plus className="mr-2 size-3.5" />
+          New issue
+        </Button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <Plus className="size-3.5" />
+          New issue
+        </div>
+        {error && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+            <AlertCircle className="size-3.5" />
+            {error}
+          </span>
+        )}
+      </div>
+      <div className="grid gap-2">
+        <Input
+          value={title}
+          onChange={(e) => onTitleChange(e.target.value)}
+          placeholder="Title"
+          className="h-8 text-sm"
+          disabled={submitting}
+        />
+        <Textarea
+          value={body}
+          onChange={(e) => onBodyChange(e.target.value)}
+          placeholder="Markdown body..."
+          className="min-h-24 resize-y text-sm"
+          disabled={submitting}
+        />
+        <Input
+          value={labels}
+          onChange={(e) => onLabelsChange(e.target.value)}
+          placeholder="Labels, comma separated"
+          className="h-8 text-xs"
+          disabled={submitting}
+        />
+        <div className="grid gap-2 md:grid-cols-2">
+          <Input
+            value={assignees}
+            onChange={(e) => onAssigneesChange(e.target.value)}
+            placeholder="Assignees, comma separated"
+            className="h-8 text-xs"
+            disabled={submitting}
+          />
+          <Input
+            value={milestone}
+            onChange={(e) => onMilestoneChange(e.target.value)}
+            placeholder="Milestone number"
+            className="h-8 text-xs"
+            disabled={submitting}
+          />
+        </div>
+      </div>
+      <div className="mt-3 flex justify-end gap-2">
+        <Button size="sm" variant="ghost" disabled={submitting} onClick={() => onOpenChange(false)}>
+          Cancel
+        </Button>
+        <Button size="sm" disabled={submitting || !title.trim()} onClick={onSubmit}>
+          {submitting ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
+          Create issue
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function GitHubItemRow({
+  item,
+  expanded,
+  diff,
+  diffLoading,
+  diffError,
+  checks,
+  checksLoading,
+  checksError,
+  reviewComments,
+  reviewCommentsLoading,
+  reviewCommentError,
+  reviewReplyDrafts,
+  reviewReplySubmitting,
+  comments,
+  commentsLoading,
+  commentError,
+  commentDraft,
+  commentSubmitting,
+  reviewDraft,
+  closeDraft,
+  mergeMethod,
+  actionBusy,
+  actionError,
+  actionMessage,
+  labelDraft,
+  assigneeDraft,
+  milestoneDraft,
+  onReviewDraftChange,
+  onCloseDraftChange,
+  onMergeMethodChange,
+  onReview,
+  onMerge,
+  onClosePull,
+  onLineComment,
+  onReviewReplyDraftChange,
+  onSubmitReviewReply,
+  onRetryReviewComments,
+  onLabelDraftChange,
+  onAssigneeDraftChange,
+  onMilestoneDraftChange,
+  onIssueState,
+  onIssueLabels,
+  onCommentDraftChange,
+  onSubmitComment,
+  onRetryComments,
+  onRetryDiff,
+  onRetryChecks,
+  onRefreshDiff,
+  onRefreshChecks,
+  onToggle,
+}: {
+  item: GitHubListItem;
+  expanded: boolean;
+  diff?: TaskDiff;
+  diffLoading: boolean;
+  diffError?: string;
+  checks?: GitHubChecksResult;
+  checksLoading: boolean;
+  checksError?: string;
+  reviewComments?: GitHubPullLineComment[];
+  reviewCommentsLoading: boolean;
+  reviewCommentError?: string;
+  reviewReplyDrafts: Record<number, string | undefined>;
+  reviewReplySubmitting: Record<number, boolean | undefined>;
+  comments?: GitHubComment[];
+  commentsLoading: boolean;
+  commentError?: string;
+  commentDraft: string;
+  commentSubmitting: boolean;
+  reviewDraft: string;
+  closeDraft: string;
+  mergeMethod: GitHubPullMergeMethod;
+  actionBusy?: string;
+  actionError?: string;
+  actionMessage?: string;
+  labelDraft: string;
+  assigneeDraft: string;
+  milestoneDraft: string;
+  onReviewDraftChange: (body: string) => void;
+  onCloseDraftChange: (body: string) => void;
+  onMergeMethodChange: (method: GitHubPullMergeMethod) => void;
+  onReview: (event: GitHubPullReviewEvent) => void;
+  onMerge: () => void;
+  onClosePull: () => void;
+  onLineComment: (target: LineCommentTarget) => Promise<void>;
+  onReviewReplyDraftChange: (commentId: number, body: string) => void;
+  onSubmitReviewReply: (commentId: number) => void;
+  onRetryReviewComments: () => void;
+  onLabelDraftChange: (body: string) => void;
+  onAssigneeDraftChange: (body: string) => void;
+  onMilestoneDraftChange: (body: string) => void;
+  onIssueState: (state: "open" | "closed") => void;
+  onIssueLabels: () => void;
+  onCommentDraftChange: (body: string) => void;
+  onSubmitComment: () => void;
+  onRetryComments: () => void;
+  onRetryDiff: () => void;
+  onRetryChecks: () => void;
+  onRefreshDiff: () => void;
+  onRefreshChecks: () => void;
+  onToggle: () => void;
+}) {
   const stateClass = item.state === "open" ? "text-emerald-400" : "text-violet-400";
   return (
     <div className="rounded-md border border-border/60 bg-card">
@@ -272,8 +1346,8 @@ function GitHubItemRow({ item }: { item: GitHubListItem }) {
             <button
               type="button"
               className="min-w-0 truncate text-left text-sm font-medium hover:underline"
-              onClick={() => { void api.openExternal(item.htmlUrl); }}
-              title="Open on GitHub"
+              onClick={onToggle}
+              title="View in Agetor"
             >
               #{item.number} {item.title}
             </button>
@@ -286,6 +1360,8 @@ function GitHubItemRow({ item }: { item: GitHubListItem }) {
           <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
             <span>{item.state}</span>
             {item.author && <span>by {item.author.login}</span>}
+            {item.assignees.length > 0 && <span>assigned {item.assignees.map((a) => a.login).join(", ")}</span>}
+            {item.milestone && <span>milestone {item.milestone.title}</span>}
             <span>updated {fmtDate(item.updatedAt)}</span>
             {item.comments > 0 && (
               <span className="inline-flex items-center gap-1">
@@ -321,6 +1397,15 @@ function GitHubItemRow({ item }: { item: GitHubListItem }) {
         <Button
           size="icon"
           variant="ghost"
+          title={expanded ? "Collapse" : "Expand"}
+          aria-label={`${expanded ? "Collapse" : "Expand"} #${item.number}`}
+          onClick={onToggle}
+        >
+          {expanded ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+        </Button>
+        <Button
+          size="icon"
+          variant="ghost"
           title="Open on GitHub"
           aria-label={`Open #${item.number} on GitHub`}
           onClick={() => { void api.openExternal(item.htmlUrl); }}
@@ -328,6 +1413,862 @@ function GitHubItemRow({ item }: { item: GitHubListItem }) {
           <ExternalLink className="size-4" />
         </Button>
       </div>
+      {expanded && (
+        <div className="border-t border-border/60 bg-background/40 p-3">
+          <div className="max-h-64 overflow-y-auto rounded-md border border-border/50 bg-card px-3 py-2 text-sm">
+            {item.body ? (
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {item.body}
+              </ReactMarkdown>
+            ) : (
+              <div className="text-sm italic text-muted-foreground">No description.</div>
+            )}
+          </div>
+          {item.kind === "pulls" && (
+            <>
+              <PullActions
+                item={item}
+                reviewDraft={reviewDraft}
+                closeDraft={closeDraft}
+                mergeMethod={mergeMethod}
+                busy={actionBusy}
+                error={actionError}
+                message={actionMessage}
+                onReviewDraftChange={onReviewDraftChange}
+                onCloseDraftChange={onCloseDraftChange}
+                onMergeMethodChange={onMergeMethodChange}
+                onReview={onReview}
+                onMerge={onMerge}
+                onClosePull={onClosePull}
+              />
+              <CheckRuns checks={checks} loading={checksLoading} error={checksError} onRetry={onRetryChecks} onRefresh={onRefreshChecks} />
+              <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} />
+              <ReviewComments
+                comments={reviewComments}
+                loading={reviewCommentsLoading}
+                error={reviewCommentError}
+                replyDrafts={reviewReplyDrafts}
+                replySubmitting={reviewReplySubmitting}
+                onDraftChange={onReviewReplyDraftChange}
+                onSubmitReply={onSubmitReviewReply}
+                onRetry={onRetryReviewComments}
+              />
+            </>
+          )}
+          {item.kind === "issues" && (
+            <IssueActions
+              item={item}
+              labelDraft={labelDraft}
+              assigneeDraft={assigneeDraft}
+              milestoneDraft={milestoneDraft}
+              busy={actionBusy}
+              error={actionError}
+              message={actionMessage}
+              onLabelDraftChange={onLabelDraftChange}
+              onAssigneeDraftChange={onAssigneeDraftChange}
+              onMilestoneDraftChange={onMilestoneDraftChange}
+              onIssueState={onIssueState}
+              onIssueLabels={onIssueLabels}
+            />
+          )}
+          <Conversation
+            comments={comments}
+            loading={commentsLoading}
+            error={commentError}
+            draft={commentDraft}
+            submitting={commentSubmitting}
+            onDraftChange={onCommentDraftChange}
+            onSubmit={onSubmitComment}
+            onRetry={onRetryComments}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function checkClass(run: GitHubCheckRun): string {
+  if (run.status !== "completed") return "text-sky-400";
+  if (run.conclusion === "success" || run.conclusion === "neutral" || run.conclusion === "skipped") {
+    return "text-emerald-400";
+  }
+  return "text-rose-400";
+}
+
+function IssueActions({
+  item,
+  labelDraft,
+  assigneeDraft,
+  milestoneDraft,
+  busy,
+  error,
+  message,
+  onLabelDraftChange,
+  onAssigneeDraftChange,
+  onMilestoneDraftChange,
+  onIssueState,
+  onIssueLabels,
+}: {
+  item: GitHubListItem;
+  labelDraft: string;
+  assigneeDraft: string;
+  milestoneDraft: string;
+  busy?: string;
+  error?: string;
+  message?: string;
+  onLabelDraftChange: (body: string) => void;
+  onAssigneeDraftChange: (body: string) => void;
+  onMilestoneDraftChange: (body: string) => void;
+  onIssueState: (state: "open" | "closed") => void;
+  onIssueLabels: () => void;
+}) {
+  const isBusy = !!busy;
+  const nextState = item.state === "open" ? "closed" : "open";
+  return (
+    <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <Tag className="size-3.5" />
+          Issue actions
+        </div>
+        {message && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+            <CheckCircle2 className="size-3.5" />
+            {message}
+          </span>
+        )}
+        {error && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+            <AlertCircle className="size-3.5" />
+            {error}
+          </span>
+        )}
+      </div>
+      <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,0.7fr)_auto]">
+        <Input
+          value={labelDraft}
+          onChange={(e) => onLabelDraftChange(e.target.value)}
+          placeholder="Labels, comma separated"
+          className="h-8 text-xs"
+          disabled={isBusy}
+        />
+        <Input
+          value={assigneeDraft}
+          onChange={(e) => onAssigneeDraftChange(e.target.value)}
+          placeholder="Assignees, comma separated"
+          className="h-8 text-xs"
+          disabled={isBusy}
+        />
+        <Input
+          value={milestoneDraft}
+          onChange={(e) => onMilestoneDraftChange(e.target.value)}
+          placeholder="Milestone number"
+          className="h-8 text-xs"
+          disabled={isBusy}
+        />
+        <Button size="sm" variant="outline" disabled={isBusy} onClick={onIssueLabels}>
+          {busy === "labels" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Tag className="mr-2 size-3.5" />}
+          Save triage
+        </Button>
+      </div>
+      <div className="mt-3 flex justify-end">
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={isBusy}
+          onClick={() => onIssueState(nextState)}
+        >
+          {busy === nextState ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
+          {item.state === "open" ? "Close issue" : "Reopen issue"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function PullActions({
+  item,
+  reviewDraft,
+  closeDraft,
+  mergeMethod,
+  busy,
+  error,
+  message,
+  onReviewDraftChange,
+  onCloseDraftChange,
+  onMergeMethodChange,
+  onReview,
+  onMerge,
+  onClosePull,
+}: {
+  item: GitHubListItem;
+  reviewDraft: string;
+  closeDraft: string;
+  mergeMethod: GitHubPullMergeMethod;
+  busy?: string;
+  error?: string;
+  message?: string;
+  onReviewDraftChange: (body: string) => void;
+  onCloseDraftChange: (body: string) => void;
+  onMergeMethodChange: (method: GitHubPullMergeMethod) => void;
+  onReview: (event: GitHubPullReviewEvent) => void;
+  onMerge: () => void;
+  onClosePull: () => void;
+}) {
+  const disabled = item.state !== "open" || !!busy;
+  return (
+    <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <GitPullRequest className="size-3.5" />
+          Actions
+        </div>
+        {item.state !== "open" && (
+          <span className="text-[11px] text-muted-foreground">This pull request is closed.</span>
+        )}
+        {message && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+            <CheckCircle2 className="size-3.5" />
+            {message}
+          </span>
+        )}
+        {error && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+            <AlertCircle className="size-3.5" />
+            {error}
+          </span>
+        )}
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-3">
+        <div className="min-w-0">
+          <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Review</div>
+          <Textarea
+            value={reviewDraft}
+            onChange={(e) => onReviewDraftChange(e.target.value)}
+            placeholder="Review note..."
+            className="min-h-20 resize-y text-xs"
+            disabled={disabled}
+          />
+          <div className="mt-2 flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={disabled}
+              onClick={() => onReview("APPROVE")}
+            >
+              {busy === "APPROVE" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <CheckCircle2 className="mr-2 size-3.5" />}
+              Approve
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={disabled || !reviewDraft.trim()}
+              onClick={() => onReview("REQUEST_CHANGES")}
+            >
+              {busy === "REQUEST_CHANGES" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
+              Request
+            </Button>
+          </div>
+        </div>
+
+        <div className="min-w-0">
+          <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Merge</div>
+          <Select
+            value={mergeMethod}
+            onChange={(e) => onMergeMethodChange(e.target.value as GitHubPullMergeMethod)}
+            className="h-8 text-xs"
+            disabled={disabled}
+            title="Merge method"
+            aria-label="Merge method"
+          >
+            <option value="merge">Create merge commit</option>
+            <option value="squash">Squash and merge</option>
+            <option value="rebase">Rebase and merge</option>
+          </Select>
+          <Button
+            size="sm"
+            className="mt-2"
+            disabled={disabled}
+            onClick={onMerge}
+          >
+            {busy === "merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
+            Merge
+          </Button>
+        </div>
+
+        <div className="min-w-0">
+          <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Close</div>
+          <Textarea
+            value={closeDraft}
+            onChange={(e) => onCloseDraftChange(e.target.value)}
+            placeholder="Optional close comment..."
+            className="min-h-20 resize-y text-xs"
+            disabled={disabled}
+          />
+          <Button
+            size="sm"
+            variant="outline"
+            className="mt-2"
+            disabled={disabled}
+            onClick={onClosePull}
+          >
+            {busy === "close" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
+            Close PR
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CheckRuns({
+  checks,
+  loading,
+  error,
+  onRetry,
+  onRefresh,
+}: {
+  checks?: GitHubChecksResult;
+  loading: boolean;
+  error?: string;
+  onRetry: () => void;
+  onRefresh: () => void;
+}) {
+  return (
+    <div className="mt-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <GitPullRequest className="size-3.5" />
+          Checks
+        </div>
+        <div className="flex items-center gap-2">
+          {checks && (
+            <div className="font-mono text-[11px] text-muted-foreground">
+              {checks.sha.slice(0, 7)}
+            </div>
+          )}
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-6"
+            title="Refresh checks"
+            aria-label="Refresh checks"
+            disabled={loading}
+            onClick={onRefresh}
+          >
+            {loading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+          </Button>
+        </div>
+      </div>
+
+      {loading && (
+        <div className="flex items-center justify-center gap-2 rounded-md border border-border/60 py-6 text-sm text-muted-foreground">
+          <Loader2 className="size-4 animate-spin" /> Loading checks...
+        </div>
+      )}
+      {!loading && error && (
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-rose-400">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="size-4" /> {error}
+          </div>
+          <Button size="sm" variant="outline" onClick={onRetry}>
+            Retry
+          </Button>
+        </div>
+      )}
+      {!loading && !error && checks && checks.checkRuns.length === 0 && (
+        <div className="rounded-md border border-border/60 px-3 py-6 text-center text-sm text-muted-foreground">
+          No check runs found for this pull request head.
+        </div>
+      )}
+      {!loading && !error && checks && checks.checkRuns.length > 0 && (
+        <div className="overflow-hidden rounded-md border border-border/60">
+          {checks.checkRuns.map((run) => (
+            <div key={run.id} className="flex items-center gap-2 border-b border-border/50 px-3 py-2 last:border-b-0">
+              <span className={cn("size-2 shrink-0 rounded-full bg-current", checkClass(run))} />
+              <span className="min-w-0 flex-1 truncate text-sm">{run.name}</span>
+              <span className={cn("shrink-0 text-xs", checkClass(run))}>
+                {run.status === "completed" ? run.conclusion ?? "completed" : run.status}
+              </span>
+              {run.htmlUrl && (
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  title="Open check on GitHub"
+                  aria-label={`Open ${run.name} check on GitHub`}
+                  onClick={() => { void api.openExternal(run.htmlUrl!); }}
+                >
+                  <ExternalLink className="size-3.5" />
+                </Button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PullDiff({
+  diff,
+  loading,
+  error,
+  onRetry,
+  onRefresh,
+  onLineComment,
+}: {
+  diff?: TaskDiff;
+  loading: boolean;
+  error?: string;
+  onRetry: () => void;
+  onRefresh: () => void;
+  onLineComment: (target: LineCommentTarget) => Promise<void>;
+}) {
+  const totals = useMemo(() => {
+    const files = diff?.files ?? [];
+    return files.reduce(
+      (acc, f) => ({ additions: acc.additions + f.additions, deletions: acc.deletions + f.deletions }),
+      { additions: 0, deletions: 0 },
+    );
+  }, [diff]);
+
+  return (
+    <div className="mt-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <GitPullRequest className="size-3.5" />
+          Diff
+        </div>
+        <div className="flex items-center gap-2">
+          {diff && diff.files.length > 0 && (
+            <div className="shrink-0 font-mono text-[11px] text-muted-foreground">
+              {diff.files.length} {diff.files.length === 1 ? "file" : "files"}
+              {" "}
+              <span className="text-emerald-400">+{totals.additions}</span>{" "}
+              <span className="text-rose-400">-{totals.deletions}</span>
+            </div>
+          )}
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-6"
+            title="Refresh diff"
+            aria-label="Refresh diff"
+            disabled={loading}
+            onClick={onRefresh}
+          >
+            {loading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+          </Button>
+        </div>
+      </div>
+
+      {loading && (
+        <div className="flex items-center justify-center gap-2 rounded-md border border-border/60 py-8 text-sm text-muted-foreground">
+          <Loader2 className="size-4 animate-spin" /> Loading diff...
+        </div>
+      )}
+      {!loading && error && (
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-8 text-center text-sm text-rose-400">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="size-4" /> {error}
+          </div>
+          <Button size="sm" variant="outline" onClick={onRetry}>
+            Retry
+          </Button>
+        </div>
+      )}
+      {!loading && !error && diff && diff.files.length === 0 && (
+        <div className="rounded-md border border-border/60 px-3 py-8 text-center text-sm text-muted-foreground">
+          {diff.note ?? "No diff returned for this pull request."}
+        </div>
+      )}
+      {!loading && !error && diff && diff.files.length > 0 && (
+        <div className="max-h-[55vh] overflow-y-auto rounded-md border border-border/60">
+          {diff.files.map((file) => (
+            <DiffFileBlock
+              key={`${file.oldPath ?? ""}->${file.path}`}
+              file={file}
+              onLineComment={onLineComment}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReviewComments({
+  comments,
+  loading,
+  error,
+  replyDrafts,
+  replySubmitting,
+  onDraftChange,
+  onSubmitReply,
+  onRetry,
+}: {
+  comments?: GitHubPullLineComment[];
+  loading: boolean;
+  error?: string;
+  replyDrafts: Record<number, string | undefined>;
+  replySubmitting: Record<number, boolean | undefined>;
+  onDraftChange: (commentId: number, body: string) => void;
+  onSubmitReply: (commentId: number) => void;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="mt-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <MessageSquare className="size-3.5" />
+          Review comments
+        </div>
+        {comments && (
+          <div className="text-[11px] text-muted-foreground">
+            {comments.length} {comments.length === 1 ? "comment" : "comments"}
+          </div>
+        )}
+      </div>
+
+      {loading && (
+        <div className="flex items-center justify-center gap-2 rounded-md border border-border/60 py-6 text-sm text-muted-foreground">
+          <Loader2 className="size-4 animate-spin" /> Loading review comments...
+        </div>
+      )}
+      {!loading && error && (
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-rose-400">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="size-4" /> {error}
+          </div>
+          <Button size="sm" variant="outline" onClick={onRetry}>
+            Retry
+          </Button>
+        </div>
+      )}
+      {!loading && !error && comments && comments.length === 0 && (
+        <div className="rounded-md border border-border/60 px-3 py-6 text-center text-sm text-muted-foreground">
+          No review comments yet.
+        </div>
+      )}
+      {!loading && !error && comments && comments.length > 0 && (
+        <div className="flex flex-col gap-2">
+          {comments.map((comment) => {
+            const draft = replyDrafts[comment.id] ?? "";
+            const submitting = !!replySubmitting[comment.id];
+            return (
+              <div key={comment.id} className="rounded-md border border-border/60 bg-card">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/50 px-3 py-2 text-xs text-muted-foreground">
+                  <span className="font-medium text-foreground">{comment.author?.login ?? "unknown"}</span>
+                  <span>{comment.path}:{comment.line}</span>
+                  <span>{comment.side === "LEFT" ? "old" : "new"} side</span>
+                  <span>{fmtDate(comment.createdAt)}</span>
+                </div>
+                <div className="px-3 py-2 text-sm">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {comment.body || "_Empty comment._"}
+                  </ReactMarkdown>
+                </div>
+                <div className="border-t border-border/50 p-2">
+                  <Textarea
+                    value={draft}
+                    onChange={(e) => onDraftChange(comment.id, e.target.value)}
+                    placeholder="Reply..."
+                    className="min-h-16 resize-y text-sm"
+                    disabled={submitting}
+                  />
+                  <div className="mt-2 flex justify-end">
+                    <Button size="sm" disabled={submitting || !draft.trim()} onClick={() => onSubmitReply(comment.id)}>
+                      {submitting ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}
+                      Reply
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Conversation({
+  comments,
+  loading,
+  error,
+  draft,
+  submitting,
+  onDraftChange,
+  onSubmit,
+  onRetry,
+}: {
+  comments?: GitHubComment[];
+  loading: boolean;
+  error?: string;
+  draft: string;
+  submitting: boolean;
+  onDraftChange: (body: string) => void;
+  onSubmit: () => void;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="mt-3 border-t border-border/60 pt-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <MessageSquare className="size-3.5" />
+          Conversation
+        </div>
+        {comments && (
+          <div className="text-[11px] text-muted-foreground">
+            {comments.length} {comments.length === 1 ? "comment" : "comments"}
+          </div>
+        )}
+      </div>
+
+      {loading && (
+        <div className="flex items-center justify-center gap-2 rounded-md border border-border/60 py-6 text-sm text-muted-foreground">
+          <Loader2 className="size-4 animate-spin" /> Loading comments...
+        </div>
+      )}
+
+      {!loading && error && (
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-rose-400">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="size-4" /> {error}
+          </div>
+          <Button size="sm" variant="outline" onClick={onRetry}>
+            Retry
+          </Button>
+        </div>
+      )}
+
+      {!loading && !error && comments && (
+        <div className="flex flex-col gap-2">
+          {comments.length === 0 ? (
+            <div className="rounded-md border border-border/60 px-3 py-6 text-center text-sm text-muted-foreground">
+              No comments yet.
+            </div>
+          ) : (
+            comments.map((comment) => <CommentBlock key={comment.id} comment={comment} />)
+          )}
+        </div>
+      )}
+
+      <div className="mt-3 rounded-md border border-border/60 bg-card p-2">
+        <Textarea
+          value={draft}
+          onChange={(e) => onDraftChange(e.target.value)}
+          placeholder="Add a comment..."
+          className="min-h-24 resize-y border-0 px-2 shadow-none focus-visible:ring-0"
+          disabled={submitting}
+        />
+        <div className="mt-2 flex justify-end">
+          <Button
+            size="sm"
+            onClick={onSubmit}
+            disabled={submitting || draft.trim().length === 0}
+          >
+            {submitting ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}
+            Comment
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CommentBlock({ comment }: { comment: GitHubComment }) {
+  return (
+    <div className="rounded-md border border-border/60 bg-card">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/50 px-3 py-2 text-xs text-muted-foreground">
+        <span className="font-medium text-foreground">{comment.author?.login ?? "unknown"}</span>
+        <span>commented {fmtDate(comment.createdAt)}</span>
+        {comment.updatedAt && comment.updatedAt !== comment.createdAt && <span>edited {fmtDate(comment.updatedAt)}</span>}
+      </div>
+      <div className="px-3 py-2 text-sm">
+        {comment.body ? (
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            {comment.body}
+          </ReactMarkdown>
+        ) : (
+          <span className="italic text-muted-foreground">Empty comment.</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DiffFileBlock({
+  file,
+  onLineComment,
+}: {
+  file: DiffFile;
+  onLineComment: (target: LineCommentTarget) => Promise<void>;
+}) {
+  const meta = STATUS_META[file.status];
+  const Icon = meta.icon;
+  return (
+    <div className="border-b border-border/60 last:border-b-0">
+      <div className="flex items-center gap-2 bg-muted/40 px-2 py-1.5">
+        <Icon className={cn("size-3.5 shrink-0", meta.cls)} />
+        <span className="min-w-0 flex-1 truncate font-mono text-xs">
+          {file.oldPath && <span className="text-muted-foreground">{file.oldPath} -&gt; </span>}
+          {file.path}
+        </span>
+        <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+          {file.binary ? "binary" : <><span className="text-emerald-400">+{file.additions}</span> <span className="text-rose-400">-{file.deletions}</span></>}
+        </span>
+      </div>
+      {file.binary ? (
+        <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>
+      ) : (
+        <>
+          <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} />
+          {file.truncated && (
+            <div className="border-t border-border/60 px-3 py-1.5 text-[11px] italic text-muted-foreground">
+              Diff truncated because this file's changes are too large to display in full.
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function DiffBody({
+  file,
+  hunks,
+  onLineComment,
+}: {
+  file: DiffFile;
+  hunks: string;
+  onLineComment: (target: LineCommentTarget) => Promise<void>;
+}) {
+  const rows = useMemo(() => toRows(hunks), [hunks]);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [postedKey, setPostedKey] = useState<string | null>(null);
+
+  const commentTarget = (r: DiffRow): Omit<LineCommentTarget, "body"> | null => {
+    if (r.kind === "del" && r.old) {
+      return { filePath: file.oldPath ?? file.path, line: r.old, side: "LEFT" };
+    }
+    if ((r.kind === "add" || r.kind === "ctx") && r.neu) {
+      return { filePath: file.path, line: r.neu, side: "RIGHT" };
+    }
+    return null;
+  };
+
+  const submit = async (target: Omit<LineCommentTarget, "body">) => {
+    const body = draft.trim();
+    if (!body || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onLineComment({ ...target, body });
+      setPostedKey(selectedKey);
+      setSelectedKey(null);
+      setDraft("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="overflow-x-auto bg-card font-mono text-xs leading-relaxed">
+      {rows.map((r, i) => {
+        const target = commentTarget(r);
+        const rowKey = `${r.kind}-${r.old ?? ""}-${r.neu ?? ""}-${i}`;
+        const selected = selectedKey === rowKey;
+        return (
+          <div key={rowKey}>
+            <div
+              className={cn(
+                "group flex",
+                r.kind === "add" && "bg-emerald-500/10",
+                r.kind === "del" && "bg-rose-500/10",
+                r.kind === "hunk" && "bg-sky-500/10 text-sky-300",
+                r.kind === "meta" && "text-muted-foreground",
+              )}
+            >
+              <span className="w-10 shrink-0 select-none border-r border-border/40 px-1 text-right text-muted-foreground/60">
+                {r.old ?? ""}
+              </span>
+              <span className="w-10 shrink-0 select-none border-r border-border/40 px-1 text-right text-muted-foreground/60">
+                {r.neu ?? ""}
+              </span>
+              <span
+                className={cn(
+                  "shrink-0 select-none px-1 text-center",
+                  r.kind === "add" && "text-emerald-400",
+                  r.kind === "del" && "text-rose-400",
+                )}
+              >
+                {r.kind === "add" ? "+" : r.kind === "del" ? "-" : " "}
+              </span>
+              <span className="min-w-0 flex-1 whitespace-pre px-1">{r.text || " "}</span>
+              {target && (
+                <button
+                  type="button"
+                  className="sticky right-0 hidden shrink-0 items-center bg-card/90 px-1 text-muted-foreground hover:text-foreground group-hover:inline-flex"
+                  title="Comment on this line"
+                  aria-label="Comment on this line"
+                  onClick={() => {
+                    setSelectedKey(selected ? null : rowKey);
+                    setDraft("");
+                    setError(null);
+                  }}
+                >
+                  <MessageSquare className="size-3.5" />
+                </button>
+              )}
+              {postedKey === rowKey && (
+                <span className="sticky right-0 shrink-0 bg-card/90 px-1 text-[11px] text-emerald-400">commented</span>
+              )}
+            </div>
+            {selected && target && (
+              <div className="border-y border-border/50 bg-background px-3 py-2 font-sans">
+                <Textarea
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  placeholder={`Comment on ${target.side === "LEFT" ? "old" : "new"} line ${target.line}...`}
+                  className="min-h-20 resize-y text-sm"
+                  disabled={submitting}
+                />
+                {error && (
+                  <div className="mt-2 flex items-center gap-1 text-xs text-rose-400">
+                    <AlertCircle className="size-3.5" />
+                    {error}
+                  </div>
+                )}
+                <div className="mt-2 flex justify-end gap-2">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={submitting}
+                    onClick={() => {
+                      setSelectedKey(null);
+                      setDraft("");
+                      setError(null);
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                  <Button size="sm" disabled={submitting || !draft.trim()} onClick={() => { void submit(target); }}>
+                    {submitting ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}
+                    Comment
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
