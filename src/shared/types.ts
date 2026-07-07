@@ -737,7 +737,7 @@ export interface GitHubChecksResult {
   checkRuns: GitHubCheckRun[];
 }
 
-export type GitHubPullReviewEvent = "APPROVE" | "REQUEST_CHANGES";
+export type GitHubPullReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
 export type GitHubPullMergeMethod = "merge" | "squash" | "rebase";
 
 export interface GitHubActionResult {

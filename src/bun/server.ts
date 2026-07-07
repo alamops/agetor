@@ -72,6 +72,7 @@ import {
   listGitHubPullReviewComments,
   mergeGitHubPull,
   replyGitHubPullLineComment,
+  requestGitHubPullReviewers,
   reviewGitHubPull,
   updateGitHubIssue,
 } from "./github.ts";
@@ -707,7 +708,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
             return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
           }
-          if (body.event !== "APPROVE" && body.event !== "REQUEST_CHANGES") {
+          if (body.event !== "APPROVE" && body.event !== "REQUEST_CHANGES" && body.event !== "COMMENT") {
             return json({ error: "valid review event required" }, { status: 400, headers: corsHeaders(req) });
           }
           const event = body.event as GitHubPullReviewEvent;
@@ -817,6 +818,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const body = (await req.json().catch(() => ({}))) as {
             path?: string;
             number?: number;
+            kind?: string;
+            title?: string;
+            body?: string;
             state?: string;
             labels?: string[];
             assignees?: string[];
@@ -834,11 +838,41 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const result = await updateGitHubIssue({
             dir,
             number: rawNumber,
+            kind: body.kind === "pulls" ? "pulls" : "issues",
+            title: typeof body.title === "string" ? body.title : undefined,
+            body: typeof body.body === "string" ? body.body : undefined,
             state: body.state === "open" || body.state === "closed" ? body.state : undefined,
             labels: Array.isArray(body.labels) ? body.labels.filter((x): x is string => typeof x === "string") : undefined,
             assignees: Array.isArray(body.assignees) ? body.assignees.filter((x): x is string => typeof x === "string") : undefined,
             milestone: typeof body.milestone === "number" || body.milestone === null ? body.milestone : undefined,
           });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-reviewers": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            reviewers?: string[];
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const reviewers = Array.isArray(body.reviewers)
+            ? body.reviewers.filter((x): x is string => typeof x === "string")
+            : [];
+          if (reviewers.length === 0) {
+            return json({ error: "at least one reviewer required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await requestGitHubPullReviewers({ dir, number: rawNumber, reviewers });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

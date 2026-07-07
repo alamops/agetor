@@ -414,12 +414,20 @@ export const api = {
   updateGitHubIssue: (input: {
     path: string;
     number: number;
+    kind?: GitHubItemKind;
+    title?: string;
+    body?: string;
     state?: "open" | "closed";
     labels?: string[];
     assignees?: string[];
     milestone?: number | null;
   }) =>
     j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/issue-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  requestGitHubPullReviewers: (input: { path: string; number: number; reviewers: string[] }) =>
+    j<{ ok: true; message?: string }>("/github/pull-reviewers", {
       method: "POST",
       body: JSON.stringify(input),
     }),

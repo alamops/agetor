@@ -110,10 +110,20 @@ interface CreateGitHubIssueInput {
 }
 
 interface UpdateGitHubIssueInput extends GitHubItemNumberInput {
+  // The /issues/:number endpoint patches pull requests too (title/body/state/
+  // labels/assignees/milestone). `kind` decides how the response is normalized so
+  // the returned item keeps the caller's kind ("pulls" vs "issues").
+  kind?: GitHubItemKind;
+  title?: string;
+  body?: string;
   state?: "open" | "closed";
   labels?: string[];
   assignees?: string[];
   milestone?: number | null;
+}
+
+interface RequestGitHubPullReviewersInput extends GitHubItemNumberInput {
+  reviewers: string[];
 }
 
 interface GitHubListError {
@@ -823,12 +833,17 @@ export async function reviewGitHubPull(input: ReviewGitHubPullInput): Promise<Gi
   if (!Number.isInteger(input.number) || input.number <= 0) {
     return { ok: false, error: "pull request number must be positive" };
   }
-  if (input.event !== "APPROVE" && input.event !== "REQUEST_CHANGES") {
+  if (input.event !== "APPROVE" && input.event !== "REQUEST_CHANGES" && input.event !== "COMMENT") {
     return { ok: false, error: "unsupported review event" };
   }
   const body = input.body?.trim() ?? "";
-  if (input.event === "REQUEST_CHANGES" && !body) {
-    return { ok: false, error: "request changes requires a comment" };
+  // GitHub rejects a REQUEST_CHANGES or COMMENT review with no body; only
+  // APPROVE may be submitted empty.
+  if (input.event !== "APPROVE" && !body) {
+    return {
+      ok: false,
+      error: input.event === "COMMENT" ? "a review comment requires a body" : "request changes requires a comment",
+    };
   }
 
   const token = await githubToken();
@@ -851,7 +866,11 @@ export async function reviewGitHubPull(input: ReviewGitHubPullInput): Promise<Gi
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
   return {
     ok: true,
-    message: input.event === "APPROVE" ? "Pull request approved." : "Changes requested.",
+    message: input.event === "APPROVE"
+      ? "Pull request approved."
+      : input.event === "COMMENT"
+        ? "Review comment posted."
+        : "Changes requested.",
   };
 }
 
@@ -980,13 +999,28 @@ export async function updateGitHubIssue(input: UpdateGitHubIssueInput): Promise<
 
   const token = await githubToken();
   if (!token) return { ok: false, error: "GitHub authentication required to update an issue" };
-  const patch: { state?: "open" | "closed"; labels?: string[]; assignees?: string[]; milestone?: number | null } = {};
+  const kind = input.kind === "pulls" ? "pulls" : "issues";
+  const noun = kind === "pulls" ? "pull request" : "issue";
+  const patch: {
+    title?: string;
+    body?: string;
+    state?: "open" | "closed";
+    labels?: string[];
+    assignees?: string[];
+    milestone?: number | null;
+  } = {};
+  if (input.title !== undefined) {
+    const title = input.title.trim();
+    if (!title) return { ok: false, error: `${noun} title cannot be empty` };
+    patch.title = title;
+  }
+  if (input.body !== undefined) patch.body = input.body;
   if (input.state) patch.state = input.state;
   if (input.labels) patch.labels = input.labels.map((s) => s.trim()).filter(Boolean);
   if (input.assignees) patch.assignees = input.assignees.map((s) => s.trim()).filter(Boolean);
   if (input.milestone !== undefined) patch.milestone = input.milestone;
-  if (!patch.state && !patch.labels && !patch.assignees && patch.milestone === undefined) {
-    return { ok: false, error: "issue update requires state, labels, assignees, or milestone" };
+  if (Object.keys(patch).length === 0) {
+    return { ok: false, error: `${noun} update requires title, body, state, labels, assignees, or milestone` };
   }
 
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
@@ -999,7 +1033,33 @@ export async function updateGitHubIssue(input: UpdateGitHubIssueInput): Promise<
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
-  const item = normalizeItem("issues", json);
-  if (!item) return { ok: false, error: "GitHub returned an unexpected issue response" };
-  return { ok: true, item, message: "Issue updated." };
+  const item = normalizeItem(kind, json);
+  if (!item) return { ok: false, error: `GitHub returned an unexpected ${noun} response` };
+  return { ok: true, item, message: `${kind === "pulls" ? "Pull request" : "Issue"} updated.` };
+}
+
+export async function requestGitHubPullReviewers(
+  input: RequestGitHubPullReviewersInput,
+): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+  const reviewers = input.reviewers.map((s) => s.trim()).filter(Boolean);
+  if (reviewers.length === 0) return { ok: false, error: "at least one reviewer is required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to request reviewers" };
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/requested_reviewers`;
+  const res = await fetchGitHub(
+    url,
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ reviewers }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  return { ok: true, message: `Requested review from ${reviewers.join(", ")}.` };
 }

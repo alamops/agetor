@@ -131,6 +131,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [labelDrafts, setLabelDrafts] = useState<Record<number, string | undefined>>({});
   const [assigneeDrafts, setAssigneeDrafts] = useState<Record<number, string | undefined>>({});
   const [milestoneDrafts, setMilestoneDrafts] = useState<Record<number, string | undefined>>({});
+  const [reviewerDrafts, setReviewerDrafts] = useState<Record<number, string | undefined>>({});
+  const [editorOpen, setEditorOpen] = useState<Record<number, boolean | undefined>>({});
+  const [titleDrafts, setTitleDrafts] = useState<Record<number, string | undefined>>({});
+  const [bodyDrafts, setBodyDrafts] = useState<Record<number, string | undefined>>({});
   const [actionBusy, setActionBusy] = useState<Record<number, string | undefined>>({});
   const [actionErrors, setActionErrors] = useState<Record<number, string | undefined>>({});
   const [actionMessages, setActionMessages] = useState<Record<number, string | undefined>>({});
@@ -227,6 +231,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setLabelDrafts({});
     setAssigneeDrafts({});
     setMilestoneDrafts({});
+    setReviewerDrafts({});
+    setEditorOpen({});
+    setTitleDrafts({});
+    setBodyDrafts({});
     setActionBusy({});
     setActionErrors({});
     setActionMessages({});
@@ -481,8 +489,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const runPullReview = async (item: GitHubListItem, event: GitHubPullReviewEvent) => {
     const body = (reviewDrafts[item.number] ?? "").trim();
     if (!projectPath || actionBusy[item.number]) return;
-    if (event === "REQUEST_CHANGES" && !body) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: "Request changes requires a comment." }));
+    if (event !== "APPROVE" && !body) {
+      setActionErrors((cur) => ({
+        ...cur,
+        [item.number]: event === "COMMENT" ? "A review comment requires a note." : "Request changes requires a comment.",
+      }));
       return;
     }
     setActionBusy((cur) => ({ ...cur, [item.number]: event }));
@@ -492,7 +503,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       const result = await api.reviewGitHubPull({ path: projectPath, number: item.number, event, body });
       setActionMessages((cur) => ({
         ...cur,
-        [item.number]: result.message ?? (event === "APPROVE" ? "Pull request approved." : "Changes requested."),
+        [item.number]: result.message ?? (event === "APPROVE"
+          ? "Pull request approved."
+          : event === "COMMENT" ? "Review comment posted." : "Changes requested."),
       }));
       setReviewDrafts((cur) => ({ ...cur, [item.number]: "" }));
     } catch (e) {
@@ -673,15 +686,62 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       const result = await api.updateGitHubIssue({
         path: projectPath,
         number: item.number,
+        kind: item.kind,
         labels: nextLabels,
         assignees: nextAssignees,
         milestone: rawMilestone.trim() ? nextMilestone : null,
       });
-      upsertListItem(result.item);
+      // The /issues/:n response drops PR-only fields (e.g. `draft`); keep them
+      // from the item we already have so a triage save can't flip the badge.
+      upsertListItem(item.kind === "pulls" ? { ...result.item, draft: item.draft } : result.item);
       setLabelDrafts((cur) => ({ ...cur, [item.number]: result.item.labels.map((label) => label.name).join(", ") }));
       setAssigneeDrafts((cur) => ({ ...cur, [item.number]: result.item.assignees.map((a) => a.login).join(", ") }));
       setMilestoneDrafts((cur) => ({ ...cur, [item.number]: result.item.milestone ? String(result.item.milestone.number) : "" }));
-      setActionMessages((cur) => ({ ...cur, [item.number]: "Issue triage updated." }));
+      setActionMessages((cur) => ({ ...cur, [item.number]: "Triage updated." }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
+  const saveEdit = async (item: GitHubListItem) => {
+    if (!projectPath || actionBusy[item.number]) return;
+    const title = (titleDrafts[item.number] ?? item.title).trim();
+    const body = bodyDrafts[item.number] ?? item.body;
+    if (!title) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: "Title cannot be empty." }));
+      return;
+    }
+    setActionBusy((cur) => ({ ...cur, [item.number]: "edit" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.updateGitHubIssue({ path: projectPath, number: item.number, kind: item.kind, title, body });
+      upsertListItem(item.kind === "pulls" ? { ...result.item, draft: item.draft } : result.item);
+      setEditorOpen((cur) => ({ ...cur, [item.number]: false }));
+      setActionMessages((cur) => ({ ...cur, [item.number]: `${item.kind === "pulls" ? "Pull request" : "Issue"} updated.` }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
+  const requestReviewers = async (item: GitHubListItem) => {
+    if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
+    const reviewers = splitLabels(reviewerDrafts[item.number] ?? "");
+    if (reviewers.length === 0) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: "Enter at least one reviewer." }));
+      return;
+    }
+    setActionBusy((cur) => ({ ...cur, [item.number]: "reviewers" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.requestGitHubPullReviewers({ path: projectPath, number: item.number, reviewers });
+      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Reviewers requested." }));
+      setReviewerDrafts((cur) => ({ ...cur, [item.number]: "" }));
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
     } finally {
@@ -909,6 +969,22 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 labelDraft={labelDrafts[item.number] ?? item.labels.map((label) => label.name).join(", ")}
                 assigneeDraft={assigneeDrafts[item.number] ?? item.assignees.map((a) => a.login).join(", ")}
                 milestoneDraft={milestoneDrafts[item.number] ?? (item.milestone ? String(item.milestone.number) : "")}
+                reviewerDraft={reviewerDrafts[item.number] ?? ""}
+                editorOpen={!!editorOpen[item.number]}
+                titleDraft={titleDrafts[item.number] ?? item.title}
+                bodyDraft={bodyDrafts[item.number] ?? item.body}
+                onEditToggle={(next) => {
+                  setEditorOpen((cur) => ({ ...cur, [item.number]: next }));
+                  if (next) {
+                    setTitleDrafts((cur) => ({ ...cur, [item.number]: cur[item.number] ?? item.title }));
+                    setBodyDrafts((cur) => ({ ...cur, [item.number]: cur[item.number] ?? item.body }));
+                  }
+                }}
+                onTitleDraftChange={(body) => setTitleDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onBodyDraftChange={(body) => setBodyDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onSaveEdit={() => { void saveEdit(item); }}
+                onReviewerDraftChange={(body) => setReviewerDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onRequestReviewers={() => { void requestReviewers(item); }}
                 onReviewDraftChange={(body) => setReviewDrafts((cur) => ({ ...cur, [item.number]: body }))}
                 onCloseDraftChange={(body) => setCloseDrafts((cur) => ({ ...cur, [item.number]: body }))}
                 onMergeMethodChange={(method) => setMergeMethods((cur) => ({ ...cur, [item.number]: method }))}
@@ -1261,6 +1337,16 @@ function GitHubItemRow({
   labelDraft,
   assigneeDraft,
   milestoneDraft,
+  reviewerDraft,
+  editorOpen,
+  titleDraft,
+  bodyDraft,
+  onEditToggle,
+  onTitleDraftChange,
+  onBodyDraftChange,
+  onSaveEdit,
+  onReviewerDraftChange,
+  onRequestReviewers,
   onReviewDraftChange,
   onCloseDraftChange,
   onMergeMethodChange,
@@ -1312,6 +1398,16 @@ function GitHubItemRow({
   labelDraft: string;
   assigneeDraft: string;
   milestoneDraft: string;
+  reviewerDraft: string;
+  editorOpen: boolean;
+  titleDraft: string;
+  bodyDraft: string;
+  onEditToggle: (next: boolean) => void;
+  onTitleDraftChange: (body: string) => void;
+  onBodyDraftChange: (body: string) => void;
+  onSaveEdit: () => void;
+  onReviewerDraftChange: (body: string) => void;
+  onRequestReviewers: () => void;
   onReviewDraftChange: (body: string) => void;
   onCloseDraftChange: (body: string) => void;
   onMergeMethodChange: (method: GitHubPullMergeMethod) => void;
@@ -1415,15 +1511,38 @@ function GitHubItemRow({
       </div>
       {expanded && (
         <div className="border-t border-border/60 bg-background/40 p-3">
-          <div className="max-h-64 overflow-y-auto rounded-md border border-border/50 bg-card px-3 py-2 text-sm">
-            {item.body ? (
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {item.body}
-              </ReactMarkdown>
-            ) : (
-              <div className="text-sm italic text-muted-foreground">No description.</div>
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <div className="text-[11px] font-medium uppercase text-muted-foreground">
+              {item.kind === "pulls" ? "Pull request" : "Issue"} #{item.number}
+            </div>
+            {!editorOpen && (
+              <Button size="sm" variant="ghost" className="h-7" onClick={() => onEditToggle(true)}>
+                <FilePen className="mr-2 size-3.5" />
+                Edit
+              </Button>
             )}
           </div>
+          {editorOpen ? (
+            <ItemEditor
+              title={titleDraft}
+              body={bodyDraft}
+              busy={actionBusy === "edit"}
+              onTitleChange={onTitleDraftChange}
+              onBodyChange={onBodyDraftChange}
+              onCancel={() => onEditToggle(false)}
+              onSave={onSaveEdit}
+            />
+          ) : (
+            <div className="max-h-64 overflow-y-auto rounded-md border border-border/50 bg-card px-3 py-2 text-sm">
+              {item.body ? (
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {item.body}
+                </ReactMarkdown>
+              ) : (
+                <div className="text-sm italic text-muted-foreground">No description.</div>
+              )}
+            </div>
+          )}
           {item.kind === "pulls" && (
             <>
               <PullActions
@@ -1440,6 +1559,19 @@ function GitHubItemRow({
                 onReview={onReview}
                 onMerge={onMerge}
                 onClosePull={onClosePull}
+              />
+              <PullTriage
+                labelDraft={labelDraft}
+                assigneeDraft={assigneeDraft}
+                milestoneDraft={milestoneDraft}
+                reviewerDraft={reviewerDraft}
+                busy={actionBusy}
+                onLabelDraftChange={onLabelDraftChange}
+                onAssigneeDraftChange={onAssigneeDraftChange}
+                onMilestoneDraftChange={onMilestoneDraftChange}
+                onReviewerDraftChange={onReviewerDraftChange}
+                onSaveTriage={onIssueLabels}
+                onRequestReviewers={onRequestReviewers}
               />
               <CheckRuns checks={checks} loading={checksLoading} error={checksError} onRetry={onRetryChecks} onRefresh={onRefreshChecks} />
               <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} />
@@ -1586,6 +1718,130 @@ function IssueActions({
   );
 }
 
+function ItemEditor({
+  title,
+  body,
+  busy,
+  onTitleChange,
+  onBodyChange,
+  onCancel,
+  onSave,
+}: {
+  title: string;
+  body: string;
+  busy: boolean;
+  onTitleChange: (title: string) => void;
+  onBodyChange: (body: string) => void;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <div className="rounded-md border border-border/60 bg-card p-3">
+      <div className="grid gap-2">
+        <Input
+          value={title}
+          onChange={(e) => onTitleChange(e.target.value)}
+          placeholder="Title"
+          className="h-8 text-sm"
+          disabled={busy}
+        />
+        <Textarea
+          value={body}
+          onChange={(e) => onBodyChange(e.target.value)}
+          placeholder="Markdown body..."
+          className="min-h-32 resize-y text-sm"
+          disabled={busy}
+        />
+      </div>
+      <div className="mt-3 flex justify-end gap-2">
+        <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button size="sm" disabled={busy || !title.trim()} onClick={onSave}>
+          {busy ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <FilePen className="mr-2 size-3.5" />}
+          Save
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function PullTriage({
+  labelDraft,
+  assigneeDraft,
+  milestoneDraft,
+  reviewerDraft,
+  busy,
+  onLabelDraftChange,
+  onAssigneeDraftChange,
+  onMilestoneDraftChange,
+  onReviewerDraftChange,
+  onSaveTriage,
+  onRequestReviewers,
+}: {
+  labelDraft: string;
+  assigneeDraft: string;
+  milestoneDraft: string;
+  reviewerDraft: string;
+  busy?: string;
+  onLabelDraftChange: (body: string) => void;
+  onAssigneeDraftChange: (body: string) => void;
+  onMilestoneDraftChange: (body: string) => void;
+  onReviewerDraftChange: (body: string) => void;
+  onSaveTriage: () => void;
+  onRequestReviewers: () => void;
+}) {
+  const isBusy = !!busy;
+  return (
+    <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-3 flex items-center gap-2 text-xs font-medium text-muted-foreground">
+        <Tag className="size-3.5" />
+        Triage
+      </div>
+      <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,0.7fr)_auto]">
+        <Input
+          value={labelDraft}
+          onChange={(e) => onLabelDraftChange(e.target.value)}
+          placeholder="Labels, comma separated"
+          className="h-8 text-xs"
+          disabled={isBusy}
+        />
+        <Input
+          value={assigneeDraft}
+          onChange={(e) => onAssigneeDraftChange(e.target.value)}
+          placeholder="Assignees, comma separated"
+          className="h-8 text-xs"
+          disabled={isBusy}
+        />
+        <Input
+          value={milestoneDraft}
+          onChange={(e) => onMilestoneDraftChange(e.target.value)}
+          placeholder="Milestone number"
+          className="h-8 text-xs"
+          disabled={isBusy}
+        />
+        <Button size="sm" variant="outline" disabled={isBusy} onClick={onSaveTriage}>
+          {busy === "labels" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Tag className="mr-2 size-3.5" />}
+          Save triage
+        </Button>
+      </div>
+      <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+        <Input
+          value={reviewerDraft}
+          onChange={(e) => onReviewerDraftChange(e.target.value)}
+          placeholder="Request reviewers, comma separated"
+          className="h-8 text-xs"
+          disabled={isBusy}
+        />
+        <Button size="sm" variant="outline" disabled={isBusy || !reviewerDraft.trim()} onClick={onRequestReviewers}>
+          {busy === "reviewers" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitPullRequest className="mr-2 size-3.5" />}
+          Request review
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function PullActions({
   item,
   reviewDraft,
@@ -1659,6 +1915,15 @@ function PullActions({
             >
               {busy === "APPROVE" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <CheckCircle2 className="mr-2 size-3.5" />}
               Approve
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={disabled || !reviewDraft.trim()}
+              onClick={() => onReview("COMMENT")}
+            >
+              {busy === "COMMENT" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}
+              Comment
             </Button>
             <Button
               size="sm"
