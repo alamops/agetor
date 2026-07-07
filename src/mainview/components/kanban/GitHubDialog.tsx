@@ -138,6 +138,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [actionBusy, setActionBusy] = useState<Record<number, string | undefined>>({});
   const [actionErrors, setActionErrors] = useState<Record<number, string | undefined>>({});
   const [actionMessages, setActionMessages] = useState<Record<number, string | undefined>>({});
+  // Which panel triggered the last action, so its error/message renders next to
+  // the control the user used ("actions" | "triage" | "edit"), not in a sibling.
+  const [actionSource, setActionSource] = useState<Record<number, string | undefined>>({});
   const [issueComposerOpen, setIssueComposerOpen] = useState(false);
   const [newIssueTitle, setNewIssueTitle] = useState("");
   const [newIssueBody, setNewIssueBody] = useState("");
@@ -238,6 +241,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setActionBusy({});
     setActionErrors({});
     setActionMessages({});
+    setActionSource({});
   }, [projectPath, kind, state, query, labels, assignee]);
 
   useEffect(() => {
@@ -497,6 +501,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       return;
     }
     setActionBusy((cur) => ({ ...cur, [item.number]: event }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
     setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
     setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
     try {
@@ -519,6 +524,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     if (!projectPath || actionBusy[item.number]) return;
     const method = mergeMethods[item.number] ?? "merge";
     setActionBusy((cur) => ({ ...cur, [item.number]: "merge" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
     setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
     setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
     try {
@@ -536,6 +542,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     if (!projectPath || actionBusy[item.number]) return;
     const comment = (closeDrafts[item.number] ?? "").trim();
     setActionBusy((cur) => ({ ...cur, [item.number]: "close" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
     setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
     setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
     try {
@@ -656,6 +663,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const updateIssueState = async (item: GitHubListItem, nextState: "open" | "closed") => {
     if (!projectPath || actionBusy[item.number]) return;
     setActionBusy((cur) => ({ ...cur, [item.number]: nextState }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
     setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
     setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
     try {
@@ -680,6 +688,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       return;
     }
     setActionBusy((cur) => ({ ...cur, [item.number]: "labels" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "triage" }));
     setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
     setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
     try {
@@ -714,12 +723,16 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       return;
     }
     setActionBusy((cur) => ({ ...cur, [item.number]: "edit" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "edit" }));
     setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
     setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
     try {
       const result = await api.updateGitHubIssue({ path: projectPath, number: item.number, kind: item.kind, title, body });
       upsertListItem(item.kind === "pulls" ? { ...result.item, draft: item.draft } : result.item);
+      // Close and discard the drafts so reopening reflects the freshly-saved item.
       setEditorOpen((cur) => ({ ...cur, [item.number]: false }));
+      setTitleDrafts((cur) => ({ ...cur, [item.number]: undefined }));
+      setBodyDrafts((cur) => ({ ...cur, [item.number]: undefined }));
       setActionMessages((cur) => ({ ...cur, [item.number]: `${item.kind === "pulls" ? "Pull request" : "Issue"} updated.` }));
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
@@ -736,6 +749,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       return;
     }
     setActionBusy((cur) => ({ ...cur, [item.number]: "reviewers" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "triage" }));
     setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
     setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
     try {
@@ -966,6 +980,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 actionBusy={actionBusy[item.number]}
                 actionError={actionErrors[item.number]}
                 actionMessage={actionMessages[item.number]}
+                actionSource={actionSource[item.number]}
                 labelDraft={labelDrafts[item.number] ?? item.labels.map((label) => label.name).join(", ")}
                 assigneeDraft={assigneeDrafts[item.number] ?? item.assignees.map((a) => a.login).join(", ")}
                 milestoneDraft={milestoneDrafts[item.number] ?? (item.milestone ? String(item.milestone.number) : "")}
@@ -978,6 +993,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                   if (next) {
                     setTitleDrafts((cur) => ({ ...cur, [item.number]: cur[item.number] ?? item.title }));
                     setBodyDrafts((cur) => ({ ...cur, [item.number]: cur[item.number] ?? item.body }));
+                  } else {
+                    // Cancel discards the draft so reopening reflects the live item.
+                    setTitleDrafts((cur) => ({ ...cur, [item.number]: undefined }));
+                    setBodyDrafts((cur) => ({ ...cur, [item.number]: undefined }));
+                    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
                   }
                 }}
                 onTitleDraftChange={(body) => setTitleDrafts((cur) => ({ ...cur, [item.number]: body }))}
@@ -1334,6 +1354,7 @@ function GitHubItemRow({
   actionBusy,
   actionError,
   actionMessage,
+  actionSource,
   labelDraft,
   assigneeDraft,
   milestoneDraft,
@@ -1395,6 +1416,7 @@ function GitHubItemRow({
   actionBusy?: string;
   actionError?: string;
   actionMessage?: string;
+  actionSource?: string;
   labelDraft: string;
   assigneeDraft: string;
   milestoneDraft: string;
@@ -1527,6 +1549,7 @@ function GitHubItemRow({
               title={titleDraft}
               body={bodyDraft}
               busy={actionBusy === "edit"}
+              error={actionSource === "edit" ? actionError : undefined}
               onTitleChange={onTitleDraftChange}
               onBodyChange={onBodyDraftChange}
               onCancel={() => onEditToggle(false)}
@@ -1551,8 +1574,8 @@ function GitHubItemRow({
                 closeDraft={closeDraft}
                 mergeMethod={mergeMethod}
                 busy={actionBusy}
-                error={actionError}
-                message={actionMessage}
+                error={actionSource === "actions" ? actionError : undefined}
+                message={actionSource === "actions" ? actionMessage : undefined}
                 onReviewDraftChange={onReviewDraftChange}
                 onCloseDraftChange={onCloseDraftChange}
                 onMergeMethodChange={onMergeMethodChange}
@@ -1566,6 +1589,9 @@ function GitHubItemRow({
                 milestoneDraft={milestoneDraft}
                 reviewerDraft={reviewerDraft}
                 busy={actionBusy}
+                prOpen={item.state === "open"}
+                error={actionSource === "triage" ? actionError : undefined}
+                message={actionSource === "triage" ? actionMessage : undefined}
                 onLabelDraftChange={onLabelDraftChange}
                 onAssigneeDraftChange={onAssigneeDraftChange}
                 onMilestoneDraftChange={onMilestoneDraftChange}
@@ -1594,8 +1620,8 @@ function GitHubItemRow({
               assigneeDraft={assigneeDraft}
               milestoneDraft={milestoneDraft}
               busy={actionBusy}
-              error={actionError}
-              message={actionMessage}
+              error={actionSource === "actions" || actionSource === "triage" ? actionError : undefined}
+              message={actionSource === "actions" || actionSource === "triage" ? actionMessage : undefined}
               onLabelDraftChange={onLabelDraftChange}
               onAssigneeDraftChange={onAssigneeDraftChange}
               onMilestoneDraftChange={onMilestoneDraftChange}
@@ -1722,6 +1748,7 @@ function ItemEditor({
   title,
   body,
   busy,
+  error,
   onTitleChange,
   onBodyChange,
   onCancel,
@@ -1730,6 +1757,7 @@ function ItemEditor({
   title: string;
   body: string;
   busy: boolean;
+  error?: string;
   onTitleChange: (title: string) => void;
   onBodyChange: (body: string) => void;
   onCancel: () => void;
@@ -1737,6 +1765,12 @@ function ItemEditor({
 }) {
   return (
     <div className="rounded-md border border-border/60 bg-card p-3">
+      {error && (
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
       <div className="grid gap-2">
         <Input
           value={title}
@@ -1772,6 +1806,9 @@ function PullTriage({
   milestoneDraft,
   reviewerDraft,
   busy,
+  prOpen,
+  error,
+  message,
   onLabelDraftChange,
   onAssigneeDraftChange,
   onMilestoneDraftChange,
@@ -1784,6 +1821,9 @@ function PullTriage({
   milestoneDraft: string;
   reviewerDraft: string;
   busy?: string;
+  prOpen: boolean;
+  error?: string;
+  message?: string;
   onLabelDraftChange: (body: string) => void;
   onAssigneeDraftChange: (body: string) => void;
   onMilestoneDraftChange: (body: string) => void;
@@ -1794,9 +1834,23 @@ function PullTriage({
   const isBusy = !!busy;
   return (
     <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
-      <div className="mb-3 flex items-center gap-2 text-xs font-medium text-muted-foreground">
-        <Tag className="size-3.5" />
-        Triage
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <Tag className="size-3.5" />
+          Triage
+        </div>
+        {message && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+            <CheckCircle2 className="size-3.5" />
+            {message}
+          </span>
+        )}
+        {error && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+            <AlertCircle className="size-3.5" />
+            {error}
+          </span>
+        )}
       </div>
       <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,0.7fr)_auto]">
         <Input
@@ -1829,11 +1883,17 @@ function PullTriage({
         <Input
           value={reviewerDraft}
           onChange={(e) => onReviewerDraftChange(e.target.value)}
-          placeholder="Request reviewers, comma separated"
+          placeholder={prOpen ? "Request reviewers, comma separated" : "Reviewers can only be requested on open PRs"}
           className="h-8 text-xs"
-          disabled={isBusy}
+          disabled={isBusy || !prOpen}
         />
-        <Button size="sm" variant="outline" disabled={isBusy || !reviewerDraft.trim()} onClick={onRequestReviewers}>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={isBusy || !prOpen || !reviewerDraft.trim()}
+          title={prOpen ? undefined : "Reviewers can only be requested on open pull requests"}
+          onClick={onRequestReviewers}
+        >
           {busy === "reviewers" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitPullRequest className="mr-2 size-3.5" />}
           Request review
         </Button>

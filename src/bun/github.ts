@@ -199,6 +199,58 @@ export function githubRepoFromRemoteForTest(remote: string): string | null {
   return repo ? `${repo.owner}/${repo.name}` : null;
 }
 
+/** Validate a PR review submission. Returns an error string, or null if OK.
+ *  GitHub rejects a REQUEST_CHANGES or COMMENT review with no body; only APPROVE
+ *  may be submitted empty. Pure so it can be unit-tested without the network. */
+function reviewValidationError(event: GitHubPullReviewEvent, body: string): string | null {
+  if (event !== "APPROVE" && event !== "REQUEST_CHANGES" && event !== "COMMENT") {
+    return "unsupported review event";
+  }
+  if (event !== "APPROVE" && !body.trim()) {
+    return event === "COMMENT" ? "a review comment requires a body" : "request changes requires a comment";
+  }
+  return null;
+}
+
+type IssueUpdatePatch = {
+  title?: string;
+  body?: string;
+  state?: "open" | "closed";
+  labels?: string[];
+  assignees?: string[];
+  milestone?: number | null;
+};
+
+/** Assemble the PATCH body for an issue/PR update from a partial input, applying
+ *  the same trimming and "at least one field" rule the endpoint enforces. Pure —
+ *  the network call in `updateGitHubIssue` consumes `patch` on success. */
+function buildIssueUpdatePatch(input: {
+  kind?: GitHubItemKind;
+  title?: string;
+  body?: string;
+  state?: "open" | "closed";
+  labels?: string[];
+  assignees?: string[];
+  milestone?: number | null;
+}): { ok: true; patch: IssueUpdatePatch } | { ok: false; error: string } {
+  const noun = input.kind === "pulls" ? "pull request" : "issue";
+  const patch: IssueUpdatePatch = {};
+  if (input.title !== undefined) {
+    const title = input.title.trim();
+    if (!title) return { ok: false, error: `${noun} title cannot be empty` };
+    patch.title = title;
+  }
+  if (input.body !== undefined) patch.body = input.body;
+  if (input.state) patch.state = input.state;
+  if (input.labels) patch.labels = input.labels.map((s) => s.trim()).filter(Boolean);
+  if (input.assignees) patch.assignees = input.assignees.map((s) => s.trim()).filter(Boolean);
+  if (input.milestone !== undefined) patch.milestone = input.milestone;
+  if (Object.keys(patch).length === 0) {
+    return { ok: false, error: `${noun} update requires title, body, state, labels, assignees, or milestone` };
+  }
+  return { ok: true, patch };
+}
+
 // Internal helpers exposed for unit tests only — no other consumers.
 export const __githubInternals = {
   matchesFilters,
@@ -206,6 +258,8 @@ export const __githubInternals = {
   normalizeComment,
   normalizeLineComment,
   normalizeCheckRun,
+  reviewValidationError,
+  buildIssueUpdatePatch,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -833,18 +887,9 @@ export async function reviewGitHubPull(input: ReviewGitHubPullInput): Promise<Gi
   if (!Number.isInteger(input.number) || input.number <= 0) {
     return { ok: false, error: "pull request number must be positive" };
   }
-  if (input.event !== "APPROVE" && input.event !== "REQUEST_CHANGES" && input.event !== "COMMENT") {
-    return { ok: false, error: "unsupported review event" };
-  }
   const body = input.body?.trim() ?? "";
-  // GitHub rejects a REQUEST_CHANGES or COMMENT review with no body; only
-  // APPROVE may be submitted empty.
-  if (input.event !== "APPROVE" && !body) {
-    return {
-      ok: false,
-      error: input.event === "COMMENT" ? "a review comment requires a body" : "request changes requires a comment",
-    };
-  }
+  const invalid = reviewValidationError(input.event, body);
+  if (invalid) return { ok: false, error: invalid };
 
   const token = await githubToken();
   if (!token) return { ok: false, error: "GitHub authentication required to review" };
@@ -1001,34 +1046,15 @@ export async function updateGitHubIssue(input: UpdateGitHubIssueInput): Promise<
   if (!token) return { ok: false, error: "GitHub authentication required to update an issue" };
   const kind = input.kind === "pulls" ? "pulls" : "issues";
   const noun = kind === "pulls" ? "pull request" : "issue";
-  const patch: {
-    title?: string;
-    body?: string;
-    state?: "open" | "closed";
-    labels?: string[];
-    assignees?: string[];
-    milestone?: number | null;
-  } = {};
-  if (input.title !== undefined) {
-    const title = input.title.trim();
-    if (!title) return { ok: false, error: `${noun} title cannot be empty` };
-    patch.title = title;
-  }
-  if (input.body !== undefined) patch.body = input.body;
-  if (input.state) patch.state = input.state;
-  if (input.labels) patch.labels = input.labels.map((s) => s.trim()).filter(Boolean);
-  if (input.assignees) patch.assignees = input.assignees.map((s) => s.trim()).filter(Boolean);
-  if (input.milestone !== undefined) patch.milestone = input.milestone;
-  if (Object.keys(patch).length === 0) {
-    return { ok: false, error: `${noun} update requires title, body, state, labels, assignees, or milestone` };
-  }
+  const built = buildIssueUpdatePatch(input);
+  if (!built.ok) return built;
 
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
   const res = await fetchGitHub(
     url,
     token,
     "application/vnd.github+json",
-    { method: "PATCH", body: JSON.stringify(patch) },
+    { method: "PATCH", body: JSON.stringify(built.patch) },
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);

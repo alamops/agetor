@@ -2,7 +2,13 @@ import { expect, test } from "bun:test";
 import { __githubInternals, githubRepoFromRemoteForTest } from "./github.ts";
 import type { GitHubListItem } from "../shared/types.ts";
 
-const { matchesFilters, normalizeLineComment, normalizeCheckRun } = __githubInternals;
+const {
+  matchesFilters,
+  normalizeLineComment,
+  normalizeCheckRun,
+  reviewValidationError,
+  buildIssueUpdatePatch,
+} = __githubInternals;
 
 function makeItem(overrides: Partial<GitHubListItem> = {}): GitHubListItem {
   return {
@@ -83,4 +89,36 @@ test("normalizeCheckRun defaults status and rejects runs without id/name", () =>
   expect(normalizeCheckRun({ id: 2, name: "lint" })).toMatchObject({ status: "unknown", conclusion: null });
   expect(normalizeCheckRun({ name: "no-id" })).toBeNull();
   expect(normalizeCheckRun({ id: 3 })).toBeNull();
+});
+
+test("reviewValidationError requires a body for COMMENT and REQUEST_CHANGES but not APPROVE", () => {
+  expect(reviewValidationError("APPROVE", "")).toBeNull();
+  expect(reviewValidationError("APPROVE", "lgtm")).toBeNull();
+  expect(reviewValidationError("COMMENT", "")).toBe("a review comment requires a body");
+  expect(reviewValidationError("COMMENT", "   ")).toBe("a review comment requires a body");
+  expect(reviewValidationError("COMMENT", "note")).toBeNull();
+  expect(reviewValidationError("REQUEST_CHANGES", "")).toBe("request changes requires a comment");
+  expect(reviewValidationError("REQUEST_CHANGES", "fix this")).toBeNull();
+  // @ts-expect-error — exercising the server-cast path with an invalid event
+  expect(reviewValidationError("MERGE", "x")).toBe("unsupported review event");
+});
+
+test("buildIssueUpdatePatch trims fields and rejects an empty patch or blank title", () => {
+  // trims labels/assignees, drops blanks
+  const built = buildIssueUpdatePatch({ labels: [" bug ", "", "p1"], assignees: ["alice", " "] });
+  expect(built).toEqual({ ok: true, patch: { labels: ["bug", "p1"], assignees: ["alice"] } });
+
+  // title is trimmed; empty title after trim is rejected with a kind-aware noun
+  expect(buildIssueUpdatePatch({ kind: "pulls", title: "  " }))
+    .toEqual({ ok: false, error: "pull request title cannot be empty" });
+  expect(buildIssueUpdatePatch({ title: " Fix bug " }))
+    .toEqual({ ok: true, patch: { title: "Fix bug" } });
+
+  // body="" is a real change (clears description); milestone:null is a real change (clears it)
+  expect(buildIssueUpdatePatch({ body: "" })).toEqual({ ok: true, patch: { body: "" } });
+  expect(buildIssueUpdatePatch({ milestone: null })).toEqual({ ok: true, patch: { milestone: null } });
+
+  // no fields at all → error
+  expect(buildIssueUpdatePatch({ kind: "issues" }))
+    .toEqual({ ok: false, error: "issue update requires title, body, state, labels, assignees, or milestone" });
 });
