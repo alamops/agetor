@@ -5,6 +5,13 @@ export default {
     name: "Agetor",
     identifier: "sh.alamops.agetor",
     version: "0.0.16",
+    // Registers agetor:// so a clicked terminal-notifier notification's
+    // `-open agetor://task/<id>` (see src/bun/notifier.ts) routes back into
+    // this app as an "open-url" event, which src/bun/deep-link.ts parses
+    // back into a task id. Hardcoded rather than imported from
+    // src/bun/deep-link.ts (APP_URL_SCHEME) to keep this build-config file
+    // free of app-source imports — keep the two in sync by hand.
+    urlSchemes: ["agetor"],
   },
   release: {
     // GitHub Releases' "latest" download URL — always redirects to the most
@@ -43,6 +50,12 @@ export default {
       // Lands at Contents/Resources/app/bin/ inside the .app, which is what
       // src/bun/tmux-resolution.ts:bundledTmuxPath() points to at runtime.
       "vendor/tmux/arm64": "bin",
+      // Bundled terminal-notifier for deep-linkable notifications — see
+      // scripts/fetch-terminal-notifier.ts. Lands at
+      // Contents/Resources/app/bin/terminal-notifier.app/Contents/MacOS/terminal-notifier
+      // inside the .app, which is what
+      // src/bun/notifier.ts:bundledNotifierCandidates() checks at runtime.
+      "vendor/terminal-notifier": "bin",
     },
     watchIgnore: ["dist/**", ".agetor/**", "vendor/**"],
     mac: {

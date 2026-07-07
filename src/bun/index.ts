@@ -10,6 +10,9 @@ import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
+import { resolveNotifier, buildNotifierArgs } from "./notifier.ts";
+import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
+import { setPendingOpenTask } from "./pending-open.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 /** Drop a pid file in the data dir so out-of-process tools (notably
@@ -121,6 +124,55 @@ installNativeMenu();
 // background — we don't await it so a slow CLI never delays the API/window.
 void refreshDiscoveredModels();
 
+/**
+ * Posts a task notification, deep-linking it to the task when possible.
+ *
+ * Electrobun's own `Utils.showNotification` has no click callback — a click
+ * just dismisses the banner — so it can't carry the user back to the task
+ * that fired it. `terminal-notifier` can (`-open <url>` runs `open <url>` on
+ * click), so when a `taskId` is supplied and terminal-notifier resolves, we
+ * shell out to it with `-open agetor://task/<id>` instead. The resulting
+ * `open <url>` triggers Electrobun's "open-url" event (handled below), which
+ * is macOS's only way to hand a custom-scheme URL back to a running app.
+ *
+ * Fire-and-forget: we don't await the spawned process's exit — the
+ * notification is best-effort UX, not something a caller should block on.
+ * Any failure (missing binary, spawn error, whatever) falls back to the
+ * plain non-deep-linking notification so a notifier problem never means no
+ * notification at all.
+ */
+function showTaskNotification(n: {
+  title: string;
+  body?: string;
+  subtitle?: string;
+  silent?: boolean;
+  taskId?: string;
+}): void {
+  if (n.taskId) {
+    const bin = resolveNotifier();
+    if (bin) {
+      try {
+        Bun.spawn([
+          bin,
+          ...buildNotifierArgs({
+            title: n.title,
+            body: n.body,
+            subtitle: n.subtitle,
+            silent: n.silent,
+            url: buildTaskDeepLink(n.taskId),
+            sender: "sh.alamops.agetor",
+          }),
+        ]);
+        return;
+      } catch (err) {
+        console.error("[agetor] terminal-notifier spawn failed, falling back:", err);
+        // fall through to Utils.showNotification below
+      }
+    }
+  }
+  Utils.showNotification({ title: n.title, body: n.body, subtitle: n.subtitle, silent: n.silent });
+}
+
 // Native-host capabilities the API server needs but that only exist inside
 // Electrobun (file dialogs, OS notifications, open-in-Finder/browser, the
 // self-updater, quit). The headless CLI daemon injects none of these — its
@@ -129,7 +181,7 @@ const native: ApiNative = {
   openFileDialog: (opts) => Utils.openFileDialog(opts),
   openPath: (p) => Utils.openPath(p),
   openExternal: (url) => Utils.openExternal(url),
-  showNotification: (n) => Utils.showNotification(n),
+  showNotification: (n) => showTaskNotification(n),
   quit: () => Utils.quit(),
   updates: {
     snapshot: () => getUpdateSnapshot(),
@@ -337,6 +389,41 @@ Electrobun.events.on("reopen", () => {
   windowLifecycle.createMainWindow().catch((err) => {
     console.error("[agetor] failed to recreate window on reopen:", err);
   });
+});
+
+// Deep-link entry point: macOS routes a click on our custom `agetor://`
+// scheme (e.g. from a terminal-notifier notification — see
+// showTaskNotification above) to `open <url>`, which Electrobun surfaces as
+// this "open-url" event. There's no notification-click callback in
+// Electrobun, so this is the only way a notification click gets back into
+// the app — see the design note at src/mainview/lib/api.ts:424.
+//
+// Two branches, depending on whether a webview is already up to receive it:
+//   - Window exists: the webview is already connected to the /app/events
+//     SSE channel, so we can broadcast the open_task event directly and it
+//     arrives immediately.
+//   - No window (app was fully dismissed / this is a cold start): there's
+//     no SSE subscriber yet to broadcast to, so we stash the taskId in
+//     pending-open.ts and create the window. The freshly-booted webview
+//     will pick it up the moment it subscribes to /app/events (see the
+//     consumePendingOpenTask() flush in server.ts's SSE route).
+// Wrapped so a malformed URL or a window-creation failure never crashes the
+// event dispatcher.
+Electrobun.events.on("open-url", (e: { data: { url: string } }) => {
+  try {
+    const taskId = parseTaskDeepLink(e.data.url);
+    if (!taskId) return;
+    if (getMainWindow()) {
+      broadcastAppEvent({ type: "open_task", taskId, ts: Date.now() });
+    } else {
+      setPendingOpenTask(taskId);
+      windowLifecycle.createMainWindow().catch((err) => {
+        console.error("[agetor] failed to create window for open-url:", err);
+      });
+    }
+  } catch (err) {
+    console.error("[agetor] failed to handle open-url:", err);
+  }
 });
 
 await windowLifecycle.createMainWindow();
