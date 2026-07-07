@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, Harness, HarnessUsage, Project, Task, TaskReference, TaskType, Run, RunEventStream } from "../shared/types.ts";
+import type { AgentKind, BacklogMessage, Harness, HarnessUsage, Project, Task, TaskReference, TaskType, Run, RunEventStream } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 // Interactions live in-memory in `interactions.ts`. The import creates a
@@ -62,6 +63,7 @@ type TaskRow = {
   branch: string | null; worktree_path: string | null; base_ref: string | null;
   mode: string | null; model: string | null; effort: string | null;
   refs: string;
+  backlog: string;
   run_id: string | null; created_at: number; updated_at: number;
   archived_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
@@ -91,6 +93,33 @@ const parseRefs = (raw: string): TaskReference[] => {
   } catch { return []; }
 };
 
+/** Coerce the raw refs value (already a TaskReference[]-ish) through the same
+ *  sanitizer `parseRefs` applies to on-disk JSON, so a backlog item's refs are
+ *  validated identically whether they come from the DB column or a fresh
+ *  client payload. */
+const sanitizeRefs = (value: unknown): TaskReference[] =>
+  Array.isArray(value) ? parseRefs(JSON.stringify(value)) : [];
+
+const parseBacklog = (raw: string): BacklogMessage[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((m): BacklogMessage[] => {
+      if (!m || typeof m !== "object") return [];
+      const id = (m as { id?: unknown }).id;
+      if (typeof id !== "string" || !id) return [];
+      const text = (m as { text?: unknown }).text;
+      const createdAt = (m as { createdAt?: unknown }).createdAt;
+      return [{
+        id,
+        text: typeof text === "string" ? text : "",
+        references: sanitizeRefs((m as { references?: unknown }).references),
+        createdAt: typeof createdAt === "number" ? createdAt : 0,
+      }];
+    });
+  } catch { return []; }
+};
+
 const toTask = (r: TaskRow): Task => ({
   id: r.id,
   title: r.title,
@@ -107,6 +136,7 @@ const toTask = (r: TaskRow): Task => ({
   model: r.model,
   effort: r.effort,
   references: parseRefs(r.refs),
+  backlog: parseBacklog(r.backlog),
   runId: r.run_id,
   // `has_openable_run` comes back as SQLite's 0/1; missing means we didn't
   // join (e.g. insert/update returning the freshly-written shape, where
@@ -149,14 +179,15 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, worktree_path, base_ref, mode, model, effort, refs,
+          branch, worktree_path, base_ref, mode, model, effort, refs, backlog,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
         t.branch, t.worktreePath, t.baseRef, t.mode, t.model, t.effort,
         JSON.stringify(t.references ?? []),
+        JSON.stringify(t.backlog ?? []),
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
       ],
     );
@@ -172,7 +203,7 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?,
+         branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?, backlog=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
@@ -180,6 +211,7 @@ export const tasks = {
         next.taskType,
         next.branch, next.worktreePath, next.baseRef, next.mode, next.model, next.effort,
         JSON.stringify(next.references ?? []),
+        JSON.stringify(next.backlog ?? []),
         next.runId, next.updatedAt, next.archivedAt ?? null, id,
       ],
     );
@@ -193,6 +225,79 @@ export const tasks = {
   },
   delete(id: string) {
     db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  },
+};
+
+/**
+ * Per-task backlog of saved, not-yet-sent draft messages. Every op is a
+ * read-modify-write on the task's `backlog` JSON column (via `tasks.update`)
+ * and returns the freshly-updated Task, or null when the task is gone. Item
+ * ids are minted here so clients never supply their own. Array order is the
+ * display order the UI renders and the user reorders. All ops are pure list
+ * transforms — there is no process side effect, so the server can call them
+ * directly without going through the orchestrator.
+ */
+export const backlog = {
+  add(taskId: string, input: { text: string; references?: TaskReference[] }): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    const item: BacklogMessage = {
+      id: randomUUID(),
+      text: input.text,
+      references: sanitizeRefs(input.references),
+      createdAt: Date.now(),
+    };
+    // Newest draft on top: the thing you just jotted is the one most likely
+    // to be sent or edited next.
+    return tasks.update(taskId, { backlog: [item, ...task.backlog] });
+  },
+  updateItem(
+    taskId: string,
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    // Unknown id → return the task unchanged rather than writing a no-op row.
+    if (!task.backlog.some((m) => m.id === itemId)) return task;
+    const next = task.backlog.map((m) =>
+      m.id === itemId
+        ? {
+            ...m,
+            text: patch.text !== undefined ? patch.text : m.text,
+            references:
+              patch.references !== undefined ? sanitizeRefs(patch.references) : m.references,
+          }
+        : m,
+    );
+    return tasks.update(taskId, { backlog: next });
+  },
+  remove(taskId: string, itemId: string): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    return tasks.update(taskId, {
+      backlog: task.backlog.filter((m) => m.id !== itemId),
+    });
+  },
+  /** Reorder the backlog to match `order` (item ids in the desired sequence).
+   *  Ids not in the current backlog are ignored; items absent from `order` are
+   *  appended in their existing relative order — so a stale or partial `order`
+   *  can never silently drop a saved draft. */
+  reorder(taskId: string, order: string[]): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    const byId = new Map(task.backlog.map((m) => [m.id, m]));
+    const seen = new Set<string>();
+    const next: BacklogMessage[] = [];
+    for (const id of order) {
+      const m = byId.get(id);
+      if (m && !seen.has(id)) {
+        next.push(m);
+        seen.add(id);
+      }
+    }
+    for (const m of task.backlog) if (!seen.has(m.id)) next.push(m);
+    return tasks.update(taskId, { backlog: next });
   },
 };
 

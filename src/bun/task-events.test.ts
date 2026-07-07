@@ -54,7 +54,7 @@ function makeTaskRow(taskId: string, agent: Task["agent"] = "claude-code"): Task
     mode: null,
     model: null,
     effort: null,
-    references: [],
+    references: [],    backlog: [],
     column: "ready",
     runId: null,
     createdAt: Date.now(),

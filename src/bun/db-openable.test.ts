@@ -41,7 +41,7 @@ function makeTask() {
     mode: null,
     model: null,
     effort: null,
-    references: [],
+    references: [],    backlog: [],
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,

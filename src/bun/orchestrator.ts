@@ -1272,6 +1272,9 @@ export async function createTask(
     model,
     effort,
     references: input.references ?? [],
+    // Brand-new tasks start with an empty backlog; drafts are added later from
+    // the run panel.
+    backlog: [],
     runId: null,
     // Derived at fetch time via SQL EXISTS — supply `false` here so the
     // `Task` shape is complete; `tasks.insert` re-fetches and the real

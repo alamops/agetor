@@ -7,6 +7,7 @@ import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, getApiPort } from "./api-config.ts";
 import {
   tasks,
+  backlog,
   runs,
   projects,
   preferences,
@@ -168,6 +169,25 @@ function filterPatch(raw: unknown): Partial<Task> {
     if (ALLOWED_PATCH_FIELDS.has(k as keyof Task)) (patch as Record<string, unknown>)[k] = v;
   }
   return patch;
+}
+
+/** Shared precondition for the backlog-mutation routes: the task must exist
+ *  and not be archived. Returns an error Response to short-circuit with, or
+ *  null when the caller may proceed. Mirrors the archived-freeze that the
+ *  task PATCH route enforces so a direct API caller can't stash/edit drafts on
+ *  a frozen task the UI has already made read-only. */
+function backlogGuard(req: { params: { id: string } } & Request): Response | null {
+  const task = tasks.get(req.params.id);
+  if (!task) {
+    return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+  }
+  if (task.archivedAt != null) {
+    return json(
+      { error: "task is archived — unarchive it before editing the backlog" },
+      { status: 400, headers: corsHeaders(req) },
+    );
+  }
+  return null;
 }
 
 export function startApiServer() {
@@ -1353,6 +1373,92 @@ export function startApiServer() {
       "/tasks/:id/interactions/pending": {
         GET: authed((req) =>
           json(listPendingForTask(req.params.id), { headers: corsHeaders(req) })),
+      },
+
+      // Messages backlog — saved, not-yet-sent drafts for a task. Each mutation
+      // returns the full updated Task so the webview can re-sync optimistically.
+      // Reorder is PUT on the collection (whole-order replace) so it doesn't
+      // collide with DELETE/PATCH on the `/:itemId` member route.
+      "/tasks/:id/backlog": {
+        POST: authed(async (req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as {
+            text?: unknown;
+            references?: unknown;
+          };
+          const text = typeof body.text === "string" ? body.text : "";
+          const references = Array.isArray(body.references)
+            ? (body.references as TaskReference[])
+            : [];
+          if (!text.trim() && references.length === 0) {
+            return json(
+              { error: "text or references required" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const updated = backlog.add(req.params.id, { text, references });
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PUT: authed(async (req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as { order?: unknown };
+          const order = Array.isArray(body.order)
+            ? body.order.filter((x): x is string => typeof x === "string")
+            : [];
+          const updated = backlog.reorder(req.params.id, order);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/backlog/:itemId": {
+        PATCH: authed(async (req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as {
+            text?: unknown;
+            references?: unknown;
+          };
+          const patch: { text?: string; references?: TaskReference[] } = {};
+          if (typeof body.text === "string") patch.text = body.text;
+          if (Array.isArray(body.references)) {
+            patch.references = body.references as TaskReference[];
+          }
+          // Parity with POST: an edit must not leave a draft with neither text
+          // nor references. Only enforced when the item actually exists (an
+          // unknown id is a no-op in `updateItem`, handled below).
+          const current = tasks
+            .get(req.params.id)
+            ?.backlog.find((m) => m.id === req.params.itemId);
+          if (current) {
+            const nextText = patch.text !== undefined ? patch.text : current.text;
+            const nextRefs =
+              patch.references !== undefined ? patch.references : current.references;
+            if (!nextText.trim() && nextRefs.length === 0) {
+              return json(
+                { error: "text or references required" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+          }
+          const updated = backlog.updateItem(req.params.id, req.params.itemId, patch);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const updated = backlog.remove(req.params.id, req.params.itemId);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
       },
 
       "/runs/:id/input": {
