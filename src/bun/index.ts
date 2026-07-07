@@ -11,7 +11,7 @@ import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
 import { resolveNotifier, buildNotifierArgs } from "./notifier.ts";
-import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
+import { buildTaskDeepLink, parseTaskDeepLink, APP_BUNDLE_ID } from "./deep-link.ts";
 import { setPendingOpenTask } from "./pending-open.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -135,11 +135,16 @@ void refreshDiscoveredModels();
  * `open <url>` triggers Electrobun's "open-url" event (handled below), which
  * is macOS's only way to hand a custom-scheme URL back to a running app.
  *
- * Fire-and-forget: we don't await the spawned process's exit — the
- * notification is best-effort UX, not something a caller should block on.
- * Any failure (missing binary, spawn error, whatever) falls back to the
- * plain non-deep-linking notification so a notifier problem never means no
- * notification at all.
+ * Fallback discipline (a notifier problem must never mean NO notification):
+ *   - No taskId or no terminal-notifier on PATH → plain Utils.showNotification.
+ *   - A *synchronous* spawn throw → caught here → plain notification.
+ *   - The spawn launches but exits non-zero (e.g. a wrong-arch binary that
+ *     can't exec, or a denied notification permission for its bundle id) →
+ *     we watch `.exited` and fall back on failure. This async check is
+ *     essential: an exec/launch failure surfaces on the *child*, not as a
+ *     synchronous throw, so the try/catch alone would silently drop the
+ *     notification. terminal-notifier exits 0 on success, so the happy path
+ *     never double-notifies.
  */
 function showTaskNotification(n: {
   title: string;
@@ -148,29 +153,47 @@ function showTaskNotification(n: {
   silent?: boolean;
   taskId?: string;
 }): void {
+  const plain = () =>
+    Utils.showNotification({ title: n.title, body: n.body, subtitle: n.subtitle, silent: n.silent });
+
   if (n.taskId) {
     const bin = resolveNotifier();
     if (bin) {
       try {
-        Bun.spawn([
-          bin,
-          ...buildNotifierArgs({
-            title: n.title,
-            body: n.body,
-            subtitle: n.subtitle,
-            silent: n.silent,
-            url: buildTaskDeepLink(n.taskId),
-            sender: "sh.alamops.agetor",
-          }),
-        ]);
+        const child = Bun.spawn(
+          [
+            bin,
+            ...buildNotifierArgs({
+              title: n.title,
+              body: n.body,
+              subtitle: n.subtitle,
+              silent: n.silent,
+              url: buildTaskDeepLink(n.taskId),
+              sender: APP_BUNDLE_ID,
+            }),
+          ],
+          { stdout: "ignore", stderr: "ignore" },
+        );
+        // Fall back if the process failed to actually show anything.
+        child.exited
+          .then((code) => {
+            if (code !== 0) {
+              console.error(`[agetor] terminal-notifier exited ${code}, falling back to plain notification`);
+              plain();
+            }
+          })
+          .catch((err) => {
+            console.error("[agetor] terminal-notifier failed, falling back:", err);
+            plain();
+          });
         return;
       } catch (err) {
         console.error("[agetor] terminal-notifier spawn failed, falling back:", err);
-        // fall through to Utils.showNotification below
+        // fall through to the plain notification below
       }
     }
   }
-  Utils.showNotification({ title: n.title, body: n.body, subtitle: n.subtitle, silent: n.silent });
+  plain();
 }
 
 // Native-host capabilities the API server needs but that only exist inside
@@ -398,25 +421,30 @@ Electrobun.events.on("reopen", () => {
 // Electrobun, so this is the only way a notification click gets back into
 // the app — see the design note at src/mainview/lib/api.ts:424.
 //
-// Two branches, depending on whether a webview is already up to receive it:
-//   - Window exists: the webview is already connected to the /app/events
-//     SSE channel, so we can broadcast the open_task event directly and it
-//     arrives immediately.
-//   - No window (app was fully dismissed / this is a cold start): there's
-//     no SSE subscriber yet to broadcast to, so we stash the taskId in
-//     pending-open.ts and create the window. The freshly-booted webview
-//     will pick it up the moment it subscribes to /app/events (see the
-//     consumePendingOpenTask() flush in server.ts's SSE route).
-// Wrapped so a malformed URL or a window-creation failure never crashes the
-// event dispatcher.
+// We ALWAYS stash the taskId in pending-open.ts (short-TTL) and, if a window
+// already exists, ALSO broadcast immediately:
+//   - Window exists: the webview is connected to /app/events, so the direct
+//     broadcast arrives instantly. The pending stash is belt-and-suspenders —
+//     if the broadcast happens to land while the webview is mid-reload or
+//     between EventSource reconnects, the next subscriber flushes the pending
+//     entry (within its TTL) so the click isn't silently lost.
+//   - No window (app was fully dismissed / cold start): there's no SSE
+//     subscriber yet, so we rely entirely on the pending flush — create the
+//     window and the freshly-booted webview picks it up when it subscribes
+//     (see the consumePendingOpenTask() flush in server.ts's SSE route).
+// The pending entry's TTL (pending-open.ts) prevents a much-later, unrelated
+// reconnect from resurrecting a stale click. Re-opening the same task is
+// idempotent (webview just re-selects it), so a rare double-delivery is
+// harmless. Wrapped so a malformed URL / window-creation failure never
+// crashes the event dispatcher.
 Electrobun.events.on("open-url", (e: { data: { url: string } }) => {
   try {
     const taskId = parseTaskDeepLink(e.data.url);
     if (!taskId) return;
+    setPendingOpenTask(taskId);
     if (getMainWindow()) {
       broadcastAppEvent({ type: "open_task", taskId, ts: Date.now() });
     } else {
-      setPendingOpenTask(taskId);
       windowLifecycle.createMainWindow().catch((err) => {
         console.error("[agetor] failed to create window for open-url:", err);
       });

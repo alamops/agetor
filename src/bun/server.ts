@@ -1681,10 +1681,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          // taskId is an identifier, not display text — validated but never
-          // truncated so a long id still round-trips through the deep link.
+          // taskId is an identifier, not display text — not truncated (a
+          // truncated id wouldn't match any task), but bounded: real ids are
+          // short, so an over-length value is treated as absent (falls back to
+          // a plain, non-deep-linking notification) rather than flowed into an
+          // argv unbounded.
           const taskId =
-            typeof body.taskId === "string" && body.taskId.length > 0
+            typeof body.taskId === "string" &&
+            body.taskId.length > 0 &&
+            body.taskId.length <= 512
               ? body.taskId
               : undefined;
           native.showNotification({

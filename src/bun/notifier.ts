@@ -6,55 +6,34 @@
  * `Utils.showNotification` cannot carry a click URL, so this is the
  * deep-link-capable path.
  *
- * Pure and side-effect-free at import time (mirrors tmux-resolution.ts's
- * conventions for binary resolution) so both functions are trivially
+ * Pure and side-effect-free at import time so both functions are trivially
  * unit-testable without spawning anything.
- */
-
-import { existsSync } from "node:fs";
-import path from "node:path";
-
-/**
- * Where a bundled terminal-notifier could live inside the packaged .app,
- * mirroring tmux-resolution.ts's bundledTmuxPath(): binaries are copied to
- * `Contents/Resources/app/bin` at build time.
  *
- * terminal-notifier normally ships as a `.app` bundle, so its real
- * executable is nested at
- *   bin/terminal-notifier.app/Contents/MacOS/terminal-notifier
- * We also accept a plain `bin/terminal-notifier` file in case a future
- * packaging step flattens or symlinks it — both candidates are checked and
- * whichever exists on disk wins (bundle path first).
+ * We deliberately do NOT bundle terminal-notifier: the only prebuilt release
+ * (v2.0.0) is x86_64-only, and agetor is arm64-only with a hard no-Rosetta
+ * rule (Apple is sunsetting Rosetta). So the binary is resolved from the
+ * user's PATH — an arm64 build, e.g. `brew install terminal-notifier`. When
+ * it's absent (or a resolved binary fails to launch), callers fall back to a
+ * plain, non-deep-linking notification, so the feature degrades cleanly
+ * rather than depending on a translated x86_64 binary.
  */
-function bundledNotifierCandidates(): string[] {
-  const bin = path.join(path.dirname(process.execPath), "..", "Resources", "app", "bin");
-  return [
-    path.join(bin, "terminal-notifier.app", "Contents", "MacOS", "terminal-notifier"),
-    path.join(bin, "terminal-notifier"),
-  ];
-}
 
 /**
  * Single source of truth for the terminal-notifier binary path. Precedence:
  *   1. AGETOR_TERMINAL_NOTIFIER_BIN env override (tests + power users) —
  *      returned as-is, never bypassed, matching AGETOR_TMUX_BIN's contract.
- *   2. The bundled binary inside the packaged app, checking both the
- *      `.app` bundle shape and a plain-file fallback.
- *   3. System PATH lookup via Bun.which.
+ *   2. System PATH lookup via Bun.which (expects an arm64 build).
  *
- * Returns `null` if nothing resolves — unlike resolveTmuxBin, tmux is a hard
- * prereq for agetor so it falls back to the literal string "tmux" for a
- * deterministic spawn error; terminal-notifier is an optional enhancement
- * (deep-linkable notifications), so callers should treat `null` as "skip
- * notifying" rather than attempt a spawn that will fail.
+ * Returns `null` if nothing resolves. terminal-notifier is an optional
+ * enhancement (deep-linkable notifications), so callers treat `null` as
+ * "post a plain notification instead" rather than attempt a spawn that will
+ * fail. A resolved binary that turns out to be the wrong arch / otherwise
+ * unlaunchable is handled at the call site by falling back on a non-zero
+ * exit (see showTaskNotification in index.ts).
  */
 export function resolveNotifier(): string | null {
   const override = process.env.AGETOR_TERMINAL_NOTIFIER_BIN;
   if (override) return override;
-
-  for (const candidate of bundledNotifierCandidates()) {
-    if (existsSync(candidate)) return candidate;
-  }
 
   return Bun.which("terminal-notifier", { PATH: process.env.PATH }) ?? null;
 }
