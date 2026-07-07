@@ -36,12 +36,12 @@ import {
   cycleToMode,
   type CycleResult,
   dropSession,
-  listAgetorSessions,
   killSessionByName,
   reattachSession,
   pasteFollowUp,
   sendSlashCommand,
   sendTurn,
+  hasSessionState,
   sessionExists,
   sessionExistsByName,
   sessionNameFor,
@@ -260,9 +260,15 @@ setResolvedBroadcaster((res: InteractionResolved) => {
  * where they left off. Anything else (tmux gone, JSONL missing, codex run
  * whose child process died with us) is flipped to `orphaned`.
  *
- * Any leftover `agetor-*` tmux sessions that don't correspond to a still-
- * running DB row are killed at the end — stragglers from a crash or from
- * tasks that were deleted while detached.
+ * We never enumerate-and-kill `agetor-*` sessions here. Agetor runs on the
+ * user's *shared* default tmux socket, so a blind sweep would reap sessions
+ * belonging to a different agetor instance (dev vs release DB) or to a
+ * `bun test` run — the bug this deliberately avoids. Every kill agetor issues
+ * is keyed to a specific task id from *this* instance's own DB (see the
+ * per-row `killSessionByName` below, `killTaskSession` on delete/archive, and
+ * codex's own teardown), so it can never touch a foreign instance's sessions.
+ * A genuinely-leaked session (crash artifact, or a task deleted while agetor
+ * was offline) is simply left alive rather than risk killing a live one.
  *
  * Called once at boot from `src/bun/index.ts`.
  */
@@ -394,30 +400,16 @@ export function reconcileOrphans(): number {
     }
   }
 
-  // Kill any leftover `agetor-*` tmux sessions whose task didn't reattach.
-  // These are real stragglers — crash artifacts or sessions whose task was
-  // deleted while agetor was down. Sessions matched to a reattached run
-  // are spared (they're now driven by the new process's session state).
-  let killedStragglers = 0;
-  for (const name of listAgetorSessions()) {
-    // Session names are `agetor-<taskId-prefix>` (first 12 chars). Spare
-    // any session whose prefix matches a reattached taskId.
-    const matchesReattached = [...reattachedTaskIds].some(
-      (id) => name === sessionNameFor(id),
-    );
-    if (matchesReattached) continue;
-    killSessionByName(name);
-    killedStragglers++;
-  }
-
+  // Deliberately NO straggler sweep here. Sessions live on the shared default
+  // tmux socket, so enumerating + killing every un-reattached `agetor-*`
+  // session would reap a sibling instance's (dev vs release DB) or a test
+  // run's live sessions. We reattach what we can, orphan the rest in the DB,
+  // and leave any unaccounted-for session alive.
   if (reattachedTaskIds.size > 0) {
     console.log(`[agetor] reattached to ${reattachedTaskIds.size} live tmux session(s)`);
   }
   if (orphaned.length > 0) {
     console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
-  }
-  if (killedStragglers > 0) {
-    console.log(`[agetor] killed ${killedStragglers} stale tmux session(s) with no matching run`);
   }
   return orphaned.length;
 }
@@ -1027,12 +1019,12 @@ function findLastCodexSessionId(taskId: string): string | null {
  * Send a follow-up prompt to a claude task. Always creates a new run row so
  * the run history shows each user message as its own entry.
  *
- *   • If the task's tmux session is still alive, we paste the prompt into it
- *     as a fresh turn (`sendTurn`).
- *   • If the session is gone (app restart killed it, the previous run ended
- *     and tmux was torn down, etc.), we spawn a brand-new session and use a
- *     combined "previous context + new user message" prompt so claude has
- *     enough continuity to keep going.
+ *   • If we hold live in-memory session state AND the tmux session is alive,
+ *     we paste the prompt into it as a fresh turn (`sendTurn`).
+ *   • Otherwise (session gone, or a tmux session that outlived our process
+ *     after a restart with no in-memory state) we spawn a brand-new session
+ *     resuming via `claude --resume <sessionId>` so claude reloads the prior
+ *     conversation from its JSONL and keeps going.
  *
  * Returns false only on internal lookup failure (missing task row). Sessions
  * are always recoverable as long as the task itself still exists.
@@ -1041,7 +1033,14 @@ function sendClaudeTurn(taskId: string, line: string): string | null {
   const task = tasks.get(taskId);
   if (!task) return null;
 
-  if (sessionExists(taskId)) {
+  // Route to the live-session paste path only when we BOTH hold in-memory
+  // SessionState AND the tmux session is alive. Boot reconciliation no longer
+  // sweeps idle sessions, so a tmux session can outlive our process with no
+  // SessionState — in which case `sendTurn` would reject with "no live
+  // session". When either is missing, fall through to `spawnResumedSession`,
+  // which (via `spawnClaudeViaTmux`'s own-session pre-kill) cleanly replaces
+  // any stale survivor and resumes via `claude --resume <sessionId>`.
+  if (hasSessionState(taskId) && sessionExists(taskId)) {
     return sendTurnInExistingSession(task, taskId, line);
   }
   return spawnResumedSession(task, taskId, line);
