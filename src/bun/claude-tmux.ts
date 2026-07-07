@@ -740,13 +740,6 @@ export function sessionExistsByName(name: string): boolean {
   return tmux(["has-session", "-t", name]).ok;
 }
 
-/** All currently-running `agetor-*` tmux sessions. Used by reconcileOrphans. */
-export function listAgetorSessions(): string[] {
-  const res = tmux(["list-sessions", "-F", "#{session_name}"]);
-  if (!res.ok) return [];
-  return res.stdout.split("\n").filter((n) => n.startsWith("agetor-"));
-}
-
 /** Kill any tmux session for the given task. Idempotent / silent on miss. */
 export function killTaskSession(taskId: string): void {
   tmux(["kill-session", "-t", sessionNameFor(taskId)]);
@@ -2550,6 +2543,14 @@ function attachTailer(state: SessionState): void {
  */
 export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   const sessionName = sessionNameFor(opts.taskId);
+
+  // Defensively clear any stale same-named session before (re)creating it, so
+  // `tmux new-session` can't fail with "duplicate session". This matters now
+  // that boot reconciliation no longer sweeps un-reattached sessions (see
+  // `reconcileOrphans`): an idle claude session survives a restart, so a fresh
+  // run of the same task must reset it. Own-scoped (only this task's name) and
+  // idempotent/silent on miss — mirrors codex's spawn pre-kill.
+  killTaskSession(opts.taskId);
 
   // Clean up any stale agetor settings before tmux starts so claude reads a
   // tidy `.claude/settings.local.json` on launch. agetor is non-invasive: it

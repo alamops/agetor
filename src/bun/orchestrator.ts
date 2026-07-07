@@ -36,7 +36,6 @@ import {
   cycleToMode,
   type CycleResult,
   dropSession,
-  listAgetorSessions,
   killSessionByName,
   reattachSession,
   pasteFollowUp,
@@ -260,9 +259,15 @@ setResolvedBroadcaster((res: InteractionResolved) => {
  * where they left off. Anything else (tmux gone, JSONL missing, codex run
  * whose child process died with us) is flipped to `orphaned`.
  *
- * Any leftover `agetor-*` tmux sessions that don't correspond to a still-
- * running DB row are killed at the end — stragglers from a crash or from
- * tasks that were deleted while detached.
+ * We never enumerate-and-kill `agetor-*` sessions here. Agetor runs on the
+ * user's *shared* default tmux socket, so a blind sweep would reap sessions
+ * belonging to a different agetor instance (dev vs release DB) or to a
+ * `bun test` run — the bug this deliberately avoids. Every kill agetor issues
+ * is keyed to a specific task id from *this* instance's own DB (see the
+ * per-row `killSessionByName` below, `killTaskSession` on delete/archive, and
+ * codex's own teardown), so it can never touch a foreign instance's sessions.
+ * A genuinely-leaked session (crash artifact, or a task deleted while agetor
+ * was offline) is simply left alive rather than risk killing a live one.
  *
  * Called once at boot from `src/bun/index.ts`.
  */
@@ -394,30 +399,16 @@ export function reconcileOrphans(): number {
     }
   }
 
-  // Kill any leftover `agetor-*` tmux sessions whose task didn't reattach.
-  // These are real stragglers — crash artifacts or sessions whose task was
-  // deleted while agetor was down. Sessions matched to a reattached run
-  // are spared (they're now driven by the new process's session state).
-  let killedStragglers = 0;
-  for (const name of listAgetorSessions()) {
-    // Session names are `agetor-<taskId-prefix>` (first 12 chars). Spare
-    // any session whose prefix matches a reattached taskId.
-    const matchesReattached = [...reattachedTaskIds].some(
-      (id) => name === sessionNameFor(id),
-    );
-    if (matchesReattached) continue;
-    killSessionByName(name);
-    killedStragglers++;
-  }
-
+  // Deliberately NO straggler sweep here. Sessions live on the shared default
+  // tmux socket, so enumerating + killing every un-reattached `agetor-*`
+  // session would reap a sibling instance's (dev vs release DB) or a test
+  // run's live sessions. We reattach what we can, orphan the rest in the DB,
+  // and leave any unaccounted-for session alive.
   if (reattachedTaskIds.size > 0) {
     console.log(`[agetor] reattached to ${reattachedTaskIds.size} live tmux session(s)`);
   }
   if (orphaned.length > 0) {
     console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
-  }
-  if (killedStragglers > 0) {
-    console.log(`[agetor] killed ${killedStragglers} stale tmux session(s) with no matching run`);
   }
   return orphaned.length;
 }
