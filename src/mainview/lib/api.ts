@@ -5,6 +5,9 @@ import type {
   BranchInfo,
   ColumnId,
   GlobalEvent,
+  GitHubItemKind,
+  GitHubItemState,
+  GitHubListResult,
   Harness,
   HarnessStatus,
   HarnessUsage,
@@ -31,6 +34,7 @@ export interface UpdateSnapshot {
 // callers (BranchPicker) keep working while the single definition lives in
 // src/shared/types.ts (server + webview share one wire shape).
 export type { BranchInfo };
+export type { GitHubItemKind, GitHubItemState, GitHubListResult };
 
 /** Where a command/extension comes from. `plugin` entries are contributed by an
  *  enabled Claude Code plugin and are namespaced `<plugin>:<name>`; `builtin`
@@ -254,6 +258,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ path: dir, branch }),
     }),
+  listGitHubItems: (input: {
+    path: string;
+    kind: GitHubItemKind;
+    state: GitHubItemState;
+    query?: string;
+    labels?: string[];
+  }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      kind: input.kind,
+      state: input.state,
+    });
+    if (input.query) q.set("q", input.query);
+    if (input.labels && input.labels.length > 0) q.set("labels", input.labels.join(","));
+    return j<GitHubListResult>(`/github/items?${q.toString()}`);
+  },
   getTmuxSource: () =>
     j<{
       source: "system" | "bundled";

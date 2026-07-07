@@ -55,6 +55,7 @@ import {
   type TerminalSocketData,
 } from "./terminals.ts";
 import { listAgentCapabilities } from "./commands.ts";
+import { listGitHubItems } from "./github.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
@@ -65,7 +66,7 @@ import {
   type AskQuestionsAnswer,
 } from "./interactions.ts";
 import { MODEL_EFFORT_SUPPORT, TASK_TYPES } from "../shared/types.ts";
-import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
+import type { AgentKind, AppEvent, GitHubItemKind, GitHubItemState, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -315,6 +316,41 @@ export function startApiServer() {
             return json({ error: result.error ?? "git pull failed" }, { status: 400, headers: corsHeaders(req) });
           }
           return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Read-only GitHub repo surface for the project selected in the app.
+      // The helper infers owner/repo from the project's GitHub remote and uses
+      // GITHUB_TOKEN/GH_TOKEN or `gh auth token` when available; public repos
+      // still work unauthenticated.
+      "/github/items": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const kind = url.searchParams.get("kind");
+          const state = url.searchParams.get("state") ?? "open";
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (kind !== "pulls" && kind !== "issues") {
+            return json({ error: "kind must be pulls or issues" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (state !== "open" && state !== "closed" && state !== "all") {
+            return json({ error: "state must be open, closed, or all" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const labels = (url.searchParams.get("labels") ?? "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+          const result = await listGitHubItems({
+            dir,
+            kind: kind as GitHubItemKind,
+            state: state as GitHubItemState,
+            query: url.searchParams.get("q") ?? "",
+            labels,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
         }),
       },
 

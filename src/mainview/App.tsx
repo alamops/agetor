@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
-import { AlertTriangle, Settings, X } from "lucide-react";
+import { AlertTriangle, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
+import { GitHubDialog } from "@/components/kanban/GitHubDialog";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -84,6 +85,7 @@ export default function App() {
   const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [githubOpen, setGithubOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -545,6 +547,15 @@ export default function App() {
           <Button
             variant="ghost"
             size="icon"
+            onClick={() => setGithubOpen(true)}
+            aria-label="GitHub"
+            title="GitHub pull requests and issues"
+          >
+            <GitPullRequest className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={() => setSettingsOpen(true)}
             aria-label="Settings"
             title="Settings"
@@ -651,6 +662,12 @@ export default function App() {
         taskId={diffTask?.id ?? null}
         taskTitle={diffTask?.title}
         onClose={() => setDiffTask(null)}
+      />
+      <GitHubDialog
+        open={githubOpen}
+        projects={projects}
+        initialProjectPath={repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        onClose={() => setGithubOpen(false)}
       />
       <SettingsDialog
         open={settingsOpen}

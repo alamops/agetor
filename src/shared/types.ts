@@ -644,6 +644,43 @@ export interface TaskDiff {
   note?: string;
 }
 
+export type GitHubItemKind = "pulls" | "issues";
+export type GitHubItemState = "open" | "closed" | "all";
+
+export interface GitHubLabel {
+  name: string;
+  color: string | null;
+}
+
+export interface GitHubUser {
+  login: string;
+  avatarUrl: string | null;
+  htmlUrl: string | null;
+}
+
+export interface GitHubListItem {
+  kind: GitHubItemKind;
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  draft: boolean;
+  htmlUrl: string;
+  author: GitHubUser | null;
+  body: string;
+  labels: GitHubLabel[];
+  comments: number;
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
+}
+
+export interface GitHubListResult {
+  repo: string;
+  webUrl: string;
+  auth: "token" | "none";
+  items: GitHubListItem[];
+}
+
 /**
  * Streams the run panel listens on. Codex (and any unstructured agent)
  * uses the flat trio: stdout / stderr / status. Claude's JSONL is parsed
