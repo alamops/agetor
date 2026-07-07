@@ -41,6 +41,7 @@ import {
   pasteFollowUp,
   sendSlashCommand,
   sendTurn,
+  hasSessionState,
   sessionExists,
   sessionExistsByName,
   sessionNameFor,
@@ -1018,12 +1019,12 @@ function findLastCodexSessionId(taskId: string): string | null {
  * Send a follow-up prompt to a claude task. Always creates a new run row so
  * the run history shows each user message as its own entry.
  *
- *   • If the task's tmux session is still alive, we paste the prompt into it
- *     as a fresh turn (`sendTurn`).
- *   • If the session is gone (app restart killed it, the previous run ended
- *     and tmux was torn down, etc.), we spawn a brand-new session and use a
- *     combined "previous context + new user message" prompt so claude has
- *     enough continuity to keep going.
+ *   • If we hold live in-memory session state AND the tmux session is alive,
+ *     we paste the prompt into it as a fresh turn (`sendTurn`).
+ *   • Otherwise (session gone, or a tmux session that outlived our process
+ *     after a restart with no in-memory state) we spawn a brand-new session
+ *     resuming via `claude --resume <sessionId>` so claude reloads the prior
+ *     conversation from its JSONL and keeps going.
  *
  * Returns false only on internal lookup failure (missing task row). Sessions
  * are always recoverable as long as the task itself still exists.
@@ -1032,7 +1033,14 @@ function sendClaudeTurn(taskId: string, line: string): string | null {
   const task = tasks.get(taskId);
   if (!task) return null;
 
-  if (sessionExists(taskId)) {
+  // Route to the live-session paste path only when we BOTH hold in-memory
+  // SessionState AND the tmux session is alive. Boot reconciliation no longer
+  // sweeps idle sessions, so a tmux session can outlive our process with no
+  // SessionState — in which case `sendTurn` would reject with "no live
+  // session". When either is missing, fall through to `spawnResumedSession`,
+  // which (via `spawnClaudeViaTmux`'s own-session pre-kill) cleanly replaces
+  // any stale survivor and resumes via `claude --resume <sessionId>`.
+  if (hasSessionState(taskId) && sessionExists(taskId)) {
     return sendTurnInExistingSession(task, taskId, line);
   }
   return spawnResumedSession(task, taskId, line);

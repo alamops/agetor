@@ -734,6 +734,17 @@ export function sessionExists(taskId: string): boolean {
   return tmux(["has-session", "-t", sessionNameFor(taskId)]).ok;
 }
 
+/**
+ * True when we hold in-memory `SessionState` driving this task's session.
+ * Distinct from `sessionExists` (a tmux check): since boot reconciliation no
+ * longer sweeps idle sessions, a tmux session can outlive our process — so
+ * `sessionExists` can be true with no `SessionState` to paste into. The
+ * follow-up router (`sendClaudeTurn`) gates the paste path on BOTH.
+ */
+export function hasSessionState(taskId: string): boolean {
+  return sessions.has(taskId);
+}
+
 /** Name-keyed variant for callers that hold a persisted session name (e.g.
  *  `runs.tmux_session`) and don't want to recompute it from a task id. */
 export function sessionExistsByName(name: string): boolean {
