@@ -422,17 +422,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     return () => { cancelled = true; };
   }, [open, projectPath]);
 
-  const refreshRepoMilestones = async () => {
-    if (!projectPath) return;
-    try {
-      const r = await api.listGitHubMilestones({ path: projectPath });
-      setRepoMilestones(r.milestones);
-    } catch {
-      // Milestones are convenience (manager only); ignore fetch failures.
-    }
-  };
-
   // Sort open milestones before closed, then by due date (undated last), then title.
+  // Applied on every set (load, refresh, and optimistic mutation) so the order is
+  // stable from first paint rather than reshuffling after the first change.
   const sortMilestones = (ms: GitHubRepoMilestone[]) =>
     [...ms].sort((a, b) => {
       if (a.state !== b.state) return a.state === "open" ? -1 : 1;
@@ -443,6 +435,16 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       }
       return a.title.localeCompare(b.title);
     });
+
+  const refreshRepoMilestones = async () => {
+    if (!projectPath) return;
+    try {
+      const r = await api.listGitHubMilestones({ path: projectPath });
+      setRepoMilestones(sortMilestones(r.milestones));
+    } catch {
+      // Milestones are convenience (manager only); ignore fetch failures.
+    }
+  };
 
   const createMilestone = async (title: string, description: string, dueOn: string) => {
     if (!projectPath) throw new Error("no project selected");
@@ -485,7 +487,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     if (!open || !projectPath) { setRepoMilestones([]); return; }
     let cancelled = false;
     api.listGitHubMilestones({ path: projectPath })
-      .then((r) => { if (!cancelled) setRepoMilestones(r.milestones); })
+      .then((r) => { if (!cancelled) setRepoMilestones(sortMilestones(r.milestones)); })
       .catch(() => { if (!cancelled) setRepoMilestones([]); });
     return () => { cancelled = true; };
   }, [open, projectPath]);

@@ -1771,13 +1771,17 @@ function normalizeRepoMilestone(raw: unknown): GitHubRepoMilestone | null {
 }
 
 /** GitHub's milestone `due_on` wants ISO8601. The UI sends a bare `YYYY-MM-DD`
- *  from a date input, which we widen to midnight UTC. A full ISO string passes
- *  through untouched; blank/whitespace becomes undefined (= "no change"). */
+ *  from a date input, which we widen to **noon UTC** — GitHub converts the
+ *  instant to a fixed US (Pacific) timezone and keeps that calendar date, so
+ *  midnight UTC would roll back to the previous day for anyone west of UTC and
+ *  store the milestone a day early. Noon UTC stays on the picked day across
+ *  every timezone GitHub converts to. A full ISO string passes through
+ *  untouched; blank/whitespace becomes undefined (= "no change"). */
 function normalizeDueOn(dueOn: string | null | undefined): string | undefined {
   if (dueOn == null) return undefined;
   const trimmed = dueOn.trim();
   if (!trimmed) return undefined;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return `${trimmed}T00:00:00Z`;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return `${trimmed}T12:00:00Z`;
   return trimmed;
 }
 

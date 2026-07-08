@@ -309,10 +309,11 @@ test("normalizeRepoMilestone maps snake_case, defaults, and drops invalid entrie
   expect(normalizeRepoMilestone(null)).toBeNull();
 });
 
-test("normalizeDueOn widens a bare date, passes through ISO, and blanks to undefined", () => {
-  expect(normalizeDueOn("2026-07-08")).toBe("2026-07-08T00:00:00Z");
+test("normalizeDueOn widens a bare date to noon UTC, passes through ISO, and blanks to undefined", () => {
+  // Noon (not midnight) UTC so GitHub's Pacific-tz date conversion doesn't roll back a day.
+  expect(normalizeDueOn("2026-07-08")).toBe("2026-07-08T12:00:00Z");
   expect(normalizeDueOn("2026-07-08T09:30:00Z")).toBe("2026-07-08T09:30:00Z");
-  expect(normalizeDueOn("  2026-07-08  ")).toBe("2026-07-08T00:00:00Z");
+  expect(normalizeDueOn("  2026-07-08  ")).toBe("2026-07-08T12:00:00Z");
   expect(normalizeDueOn("")).toBeUndefined();
   expect(normalizeDueOn("   ")).toBeUndefined();
   expect(normalizeDueOn(null)).toBeUndefined();
