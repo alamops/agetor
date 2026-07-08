@@ -64,7 +64,9 @@ import {
   createGitHubIssue,
   createGitHubPull,
   createGitHubPullLineComment,
+  deleteGitHubComment,
   getGitHubPullChecks,
+  getGitHubViewer,
   getGitHubPullDefaults,
   getGitHubPullDiff,
   getGitHubPullMergeability,
@@ -77,6 +79,7 @@ import {
   requestGitHubPullReviewers,
   reviewGitHubPull,
   setGitHubPullDraft,
+  updateGitHubComment,
   updateGitHubIssue,
   updateGitHubPullBranch,
 } from "./github.ts";
@@ -489,6 +492,71 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
           }
           const result = await getGitHubPullDiff({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/viewer": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await getGitHubViewer({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/comment-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            commentId?: number;
+            kind?: string;
+            body?: string;
+          };
+          const dir = body.path;
+          const commentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof commentId !== "number" || !Number.isInteger(commentId) || commentId <= 0) {
+            return json({ error: "valid comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.kind !== "issue" && body.kind !== "review") {
+            return json({ error: "valid comment kind required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "comment body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await updateGitHubComment({ dir, commentId, kind: body.kind, body: body.body });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/comment-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            commentId?: number;
+            kind?: string;
+          };
+          const dir = body.path;
+          const commentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof commentId !== "number" || !Number.isInteger(commentId) || commentId <= 0) {
+            return json({ error: "valid comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.kind !== "issue" && body.kind !== "review") {
+            return json({ error: "valid comment kind required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubComment({ dir, commentId, kind: body.kind });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

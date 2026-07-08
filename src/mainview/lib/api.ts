@@ -365,6 +365,20 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  getGitHubViewer: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<{ ok: true; login: string }>(`/github/viewer?${q.toString()}`);
+  },
+  updateGitHubComment: (input: { path: string; commentId: number; kind: "issue" | "review"; body: string }) =>
+    j<{ ok: true; comment: GitHubComment }>("/github/comment-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubComment: (input: { path: string; commentId: number; kind: "issue" | "review" }) =>
+    j<{ ok: true; message?: string }>("/github/comment-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   createGitHubPullLineComment: (input: {
     path: string;
     number: number;

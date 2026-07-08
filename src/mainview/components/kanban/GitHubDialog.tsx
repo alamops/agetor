@@ -105,6 +105,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [result, setResult] = useState<GitHubListResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Authenticated user's login, so edit/delete controls appear only on the
+  // viewer's own comments. Empty when unauthenticated.
+  const [viewerLogin, setViewerLogin] = useState("");
   const requestSeq = useRef(0);
   const diffSeq = useRef(0);
   const commentSeq = useRef(0);
@@ -310,6 +313,15 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   }, [expandedKey, result]);
 
   useEffect(() => {
+    if (!open || !projectPath) return;
+    let cancelled = false;
+    api.getGitHubViewer({ path: projectPath })
+      .then((r) => { if (!cancelled) setViewerLogin(r.login); })
+      .catch(() => { if (!cancelled) setViewerLogin(""); });
+    return () => { cancelled = true; };
+  }, [open, projectPath]);
+
+  useEffect(() => {
     if (!open || !projectPath || kind !== "pulls") return;
     let cancelled = false;
     api.getGitHubPullDefaults({ path: projectPath })
@@ -500,6 +512,45 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     } finally {
       setReviewReplySubmitting((cur) => ({ ...cur, [commentId]: false }));
     }
+  };
+
+  const editConversationComment = async (item: GitHubListItem, commentId: number, body: string) => {
+    if (!projectPath) throw new Error("no project selected");
+    const { comment } = await api.updateGitHubComment({ path: projectPath, commentId, kind: "issue", body });
+    setComments((cur) => ({
+      ...cur,
+      [item.number]: (cur[item.number] ?? []).map((c) => (c.id === commentId ? comment : c)),
+    }));
+  };
+
+  const deleteConversationComment = async (item: GitHubListItem, commentId: number) => {
+    if (!projectPath) throw new Error("no project selected");
+    await api.deleteGitHubComment({ path: projectPath, commentId, kind: "issue" });
+    setComments((cur) => ({
+      ...cur,
+      [item.number]: (cur[item.number] ?? []).filter((c) => c.id !== commentId),
+    }));
+  };
+
+  const editReviewComment = async (item: GitHubListItem, commentId: number, body: string) => {
+    if (!projectPath) throw new Error("no project selected");
+    const { comment } = await api.updateGitHubComment({ path: projectPath, commentId, kind: "review", body });
+    // Keep the line-comment's path/line/side; only body + updatedAt change.
+    setReviewComments((cur) => ({
+      ...cur,
+      [item.number]: (cur[item.number] ?? []).map((c) =>
+        c.id === commentId ? { ...c, body: comment.body, updatedAt: comment.updatedAt } : c,
+      ),
+    }));
+  };
+
+  const deleteReviewComment = async (item: GitHubListItem, commentId: number) => {
+    if (!projectPath) throw new Error("no project selected");
+    await api.deleteGitHubComment({ path: projectPath, commentId, kind: "review" });
+    setReviewComments((cur) => ({
+      ...cur,
+      [item.number]: (cur[item.number] ?? []).filter((c) => c.id !== commentId),
+    }));
   };
 
   const itemMatchesActiveFilters = (item: GitHubListItem) => {
@@ -1187,6 +1238,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onLineComment={(target) => submitLineComment(item, target)}
                 onReviewReplyDraftChange={(commentId, body) => setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: body }))}
                 onSubmitReviewReply={(commentId) => { void submitReviewReply(item, commentId); }}
+                viewerLogin={viewerLogin}
+                onEditReviewComment={(commentId, body) => editReviewComment(item, commentId, body)}
+                onDeleteReviewComment={(commentId) => deleteReviewComment(item, commentId)}
+                onEditComment={(commentId, body) => editConversationComment(item, commentId, body)}
+                onDeleteComment={(commentId) => deleteConversationComment(item, commentId)}
                 onRetryReviewComments={() => {
                   if (item.kind !== "pulls") return;
                   setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
@@ -1570,6 +1626,11 @@ function GitHubItemRow({
   onLineComment,
   onReviewReplyDraftChange,
   onSubmitReviewReply,
+  viewerLogin,
+  onEditReviewComment,
+  onDeleteReviewComment,
+  onEditComment,
+  onDeleteComment,
   onRetryReviewComments,
   onLabelDraftChange,
   onAssigneeDraftChange,
@@ -1643,6 +1704,11 @@ function GitHubItemRow({
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onReviewReplyDraftChange: (commentId: number, body: string) => void;
   onSubmitReviewReply: (commentId: number) => void;
+  viewerLogin: string;
+  onEditReviewComment: (commentId: number, body: string) => Promise<void>;
+  onDeleteReviewComment: (commentId: number) => Promise<void>;
+  onEditComment: (commentId: number, body: string) => Promise<void>;
+  onDeleteComment: (commentId: number) => Promise<void>;
   onRetryReviewComments: () => void;
   onLabelDraftChange: (body: string) => void;
   onAssigneeDraftChange: (body: string) => void;
@@ -1826,6 +1892,9 @@ function GitHubItemRow({
                 error={reviewCommentError}
                 replyDrafts={reviewReplyDrafts}
                 replySubmitting={reviewReplySubmitting}
+                viewerLogin={viewerLogin}
+                onEdit={onEditReviewComment}
+                onDelete={onDeleteReviewComment}
                 onDraftChange={onReviewReplyDraftChange}
                 onSubmitReply={onSubmitReviewReply}
                 onRetry={onRetryReviewComments}
@@ -1854,6 +1923,9 @@ function GitHubItemRow({
             error={commentError}
             draft={commentDraft}
             submitting={commentSubmitting}
+            viewerLogin={viewerLogin}
+            onEdit={onEditComment}
+            onDelete={onDeleteComment}
             onDraftChange={onCommentDraftChange}
             onSubmit={onSubmitComment}
             onRetry={onRetryComments}
@@ -2605,6 +2677,9 @@ function ReviewComments({
   error,
   replyDrafts,
   replySubmitting,
+  viewerLogin,
+  onEdit,
+  onDelete,
   onDraftChange,
   onSubmitReply,
   onRetry,
@@ -2614,6 +2689,9 @@ function ReviewComments({
   error?: string;
   replyDrafts: Record<number, string | undefined>;
   replySubmitting: Record<number, boolean | undefined>;
+  viewerLogin: string;
+  onEdit: (commentId: number, body: string) => Promise<void>;
+  onDelete: (commentId: number) => Promise<void>;
   onDraftChange: (commentId: number, body: string) => void;
   onSubmitReply: (commentId: number) => void;
   onRetry: () => void;
@@ -2665,11 +2743,12 @@ function ReviewComments({
                   <span>{comment.side === "LEFT" ? "old" : "new"} side</span>
                   <span>{fmtDate(comment.createdAt)}</span>
                 </div>
-                <div className="px-3 py-2 text-sm">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {comment.body || "_Empty comment._"}
-                  </ReactMarkdown>
-                </div>
+                <EditableCommentBody
+                  body={comment.body}
+                  canModify={!!viewerLogin && comment.author?.login === viewerLogin}
+                  onEdit={(body) => onEdit(comment.id, body)}
+                  onDelete={() => onDelete(comment.id)}
+                />
                 <div className="border-t border-border/50 p-2">
                   <Textarea
                     value={draft}
@@ -2700,6 +2779,9 @@ function Conversation({
   error,
   draft,
   submitting,
+  viewerLogin,
+  onEdit,
+  onDelete,
   onDraftChange,
   onSubmit,
   onRetry,
@@ -2709,6 +2791,9 @@ function Conversation({
   error?: string;
   draft: string;
   submitting: boolean;
+  viewerLogin: string;
+  onEdit: (commentId: number, body: string) => Promise<void>;
+  onDelete: (commentId: number) => Promise<void>;
   onDraftChange: (body: string) => void;
   onSubmit: () => void;
   onRetry: () => void;
@@ -2751,7 +2836,15 @@ function Conversation({
               No comments yet.
             </div>
           ) : (
-            comments.map((comment) => <CommentBlock key={comment.id} comment={comment} />)
+            comments.map((comment) => (
+              <CommentBlock
+                key={comment.id}
+                comment={comment}
+                canModify={!!viewerLogin && comment.author?.login === viewerLogin}
+                onEdit={(body) => onEdit(comment.id, body)}
+                onDelete={() => onDelete(comment.id)}
+              />
+            ))
           )}
         </div>
       )}
@@ -2779,7 +2872,17 @@ function Conversation({
   );
 }
 
-function CommentBlock({ comment }: { comment: GitHubComment }) {
+function CommentBlock({
+  comment,
+  canModify,
+  onEdit,
+  onDelete,
+}: {
+  comment: GitHubComment;
+  canModify: boolean;
+  onEdit: (body: string) => Promise<void>;
+  onDelete: () => Promise<void>;
+}) {
   return (
     <div className="rounded-md border border-border/60 bg-card">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/50 px-3 py-2 text-xs text-muted-foreground">
@@ -2787,15 +2890,150 @@ function CommentBlock({ comment }: { comment: GitHubComment }) {
         <span>commented {fmtDate(comment.createdAt)}</span>
         {comment.updatedAt && comment.updatedAt !== comment.createdAt && <span>edited {fmtDate(comment.updatedAt)}</span>}
       </div>
-      <div className="px-3 py-2 text-sm">
-        {comment.body ? (
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-            {comment.body}
-          </ReactMarkdown>
-        ) : (
-          <span className="italic text-muted-foreground">Empty comment.</span>
+      <EditableCommentBody body={comment.body} canModify={canModify} onEdit={onEdit} onDelete={onDelete} />
+    </div>
+  );
+}
+
+/** Renders a comment's markdown body, with inline Edit + confirm-Delete controls
+ *  when the viewer owns it. `onEdit`/`onDelete` reject on failure; the parent
+ *  updates/removes the comment from its list on success (which unmounts on delete). */
+function EditableCommentBody({
+  body,
+  canModify,
+  onEdit,
+  onDelete,
+}: {
+  body: string;
+  canModify: boolean;
+  onEdit: (body: string) => Promise<void>;
+  onDelete: () => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(body);
+  const [busy, setBusy] = useState<null | "save" | "delete">(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async () => {
+    const next = draft.trim();
+    if (!next || busy) return;
+    setBusy("save");
+    setError(null);
+    try {
+      await onEdit(next);
+      setEditing(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const del = async () => {
+    if (busy) return;
+    setBusy("delete");
+    setError(null);
+    try {
+      await onDelete();
+      // success unmounts this block (parent removes the comment)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(null);
+      setConfirmDelete(false);
+    }
+  };
+
+  if (editing) {
+    return (
+      <div className="px-3 py-2">
+        <Textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          className="min-h-20 resize-y text-sm"
+          disabled={busy === "save"}
+        />
+        {error && (
+          <div className="mt-2 flex items-center gap-1 text-xs text-rose-400">
+            <AlertCircle className="size-3.5" />
+            {error}
+          </div>
         )}
+        <div className="mt-2 flex justify-end gap-2">
+          <Button size="sm" variant="ghost" disabled={busy === "save"} onClick={() => { setEditing(false); setDraft(body); setError(null); }}>
+            Cancel
+          </Button>
+          <Button size="sm" disabled={busy === "save" || !draft.trim()} onClick={() => { void save(); }}>
+            {busy === "save" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <FilePen className="mr-2 size-3.5" />}
+            Save
+          </Button>
+        </div>
       </div>
+    );
+  }
+
+  return (
+    <div className="px-3 py-2 text-sm">
+      {body ? (
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
+      ) : (
+        <span className="italic text-muted-foreground">Empty comment.</span>
+      )}
+      {error && (
+        <div className="mt-2 flex items-center gap-1 text-xs text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+      {canModify && (
+        <div className="mt-2 flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2 text-[11px]"
+            disabled={!!busy}
+            onClick={() => { setDraft(body); setEditing(true); setError(null); }}
+          >
+            <FilePen className="mr-1 size-3" />
+            Edit
+          </Button>
+          {confirmDelete ? (
+            <>
+              <span className="text-[11px] text-muted-foreground">Delete this comment?</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 px-2 text-[11px] text-rose-400"
+                disabled={busy === "delete"}
+                onClick={() => { void del(); }}
+              >
+                {busy === "delete" ? <Loader2 className="mr-1 size-3 animate-spin" /> : <XCircle className="mr-1 size-3" />}
+                Confirm
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 px-2 text-[11px]"
+                disabled={busy === "delete"}
+                onClick={() => setConfirmDelete(false)}
+              >
+                Cancel
+              </Button>
+            </>
+          ) : (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2 text-[11px] text-muted-foreground hover:text-rose-400"
+              disabled={!!busy}
+              onClick={() => setConfirmDelete(true)}
+            >
+              <XCircle className="mr-1 size-3" />
+              Delete
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

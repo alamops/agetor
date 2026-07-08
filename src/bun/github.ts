@@ -141,6 +141,24 @@ interface SetGitHubPullDraftInput extends GitHubItemNumberInput {
   draft: boolean;
 }
 
+// A "conversation" comment (issue/PR body thread) lives under /issues/comments;
+// an inline "review" comment lives under /pulls/comments. Both share the edit /
+// delete shape, differing only by that path segment.
+type GitHubCommentKind = "issue" | "review";
+
+interface UpdateGitHubCommentInput {
+  dir: string;
+  commentId: number;
+  kind: GitHubCommentKind;
+  body: string;
+}
+
+interface DeleteGitHubCommentInput {
+  dir: string;
+  commentId: number;
+  kind: GitHubCommentKind;
+}
+
 interface GitHubListError {
   ok: false;
   error: string;
@@ -155,6 +173,7 @@ type GitHubPullReviewCommentsResponse = ({ ok: true } & GitHubPullReviewComments
 type GitHubChecksResponse = ({ ok: true } & GitHubChecksResult) | GitHubListError;
 type GitHubMergeabilityResponse = ({ ok: true } & GitHubPullMergeability) | GitHubListError;
 type GitHubPullDraftResponse = ({ ok: true; draft: boolean; message?: string }) | GitHubListError;
+type GitHubViewerResponse = ({ ok: true; login: string }) | GitHubListError;
 type GitHubActionResponse = ({ ok: true; message?: string; item?: GitHubListItem; commentPosted?: boolean }) | GitHubListError;
 type GitHubPullMergeResponse = GitHubPullMergeResult | GitHubListError;
 type GitHubPullDefaultsResponse = ({ ok: true } & GitHubPullDefaultsResult) | GitHubListError;
@@ -1293,4 +1312,77 @@ export async function setGitHubPullDraft(input: SetGitHubPullDraftInput): Promis
   const isDraft = draftFromGraphql(json, field);
   const draft = isDraft ?? input.draft;
   return { ok: true, draft, message: draft ? "Converted to draft." : "Marked ready for review." };
+}
+
+/** The authenticated user's login, so the UI can offer edit/delete only on the
+ *  viewer's own comments. Returns login "" when unauthenticated (nothing is the
+ *  viewer's, so no controls) rather than erroring. */
+export async function getGitHubViewer(input: { dir: string }): Promise<GitHubViewerResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const token = await githubToken();
+  if (!token) return { ok: true, login: "" };
+  const res = await fetchGitHub("https://api.github.com/user", token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const login = json && typeof json === "object" && typeof (json as { login?: unknown }).login === "string"
+    ? (json as { login: string }).login
+    : "";
+  return { ok: true, login };
+}
+
+/** `/issues/comments/:id` for a conversation comment, `/pulls/comments/:id` for
+ *  an inline review comment. GitHub only permits the author (or a maintainer). */
+function commentUrl(repo: GitHubRepo, kind: GitHubCommentKind, commentId: number): string {
+  const seg = kind === "review" ? "pulls" : "issues";
+  return `https://api.github.com/repos/${repo.owner}/${repo.name}/${seg}/comments/${commentId}`;
+}
+
+export async function updateGitHubComment(input: UpdateGitHubCommentInput): Promise<GitHubCommentResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.commentId) || input.commentId <= 0) {
+    return { ok: false, error: "comment id must be positive" };
+  }
+  const body = input.body.trim();
+  if (!body) return { ok: false, error: "comment body required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to edit a comment" };
+  const res = await fetchGitHub(
+    commentUrl(repo, input.kind, input.commentId),
+    token,
+    "application/vnd.github+json",
+    { method: "PATCH", body: JSON.stringify({ body }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const comment = normalizeComment(json);
+  if (!comment) return { ok: false, error: "GitHub returned an unexpected comment response" };
+  return { ok: true, comment };
+}
+
+export async function deleteGitHubComment(input: DeleteGitHubCommentInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.commentId) || input.commentId <= 0) {
+    return { ok: false, error: "comment id must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to delete a comment" };
+  const res = await fetchGitHub(
+    commentUrl(repo, input.kind, input.commentId),
+    token,
+    "application/vnd.github+json",
+    { method: "DELETE" },
+  );
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, message: "Comment deleted." };
 }
