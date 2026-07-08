@@ -17,6 +17,8 @@ import type {
   GitHubPullReviewCommentsResult,
   GitHubPullMergeResult,
   GitHubPullReviewEvent,
+  GitHubPullReviewThreadsResult,
+  GitHubReviewThread,
   GitHubUser,
   TaskDiff,
 } from "../shared/types.ts";
@@ -159,6 +161,12 @@ interface DeleteGitHubCommentInput {
   kind: GitHubCommentKind;
 }
 
+interface SetGitHubReviewThreadResolvedInput {
+  dir: string;
+  threadId: string;
+  resolved: boolean;
+}
+
 interface GitHubListError {
   ok: false;
   error: string;
@@ -174,6 +182,8 @@ type GitHubChecksResponse = ({ ok: true } & GitHubChecksResult) | GitHubListErro
 type GitHubMergeabilityResponse = ({ ok: true } & GitHubPullMergeability) | GitHubListError;
 type GitHubPullDraftResponse = ({ ok: true; draft: boolean; message?: string }) | GitHubListError;
 type GitHubViewerResponse = ({ ok: true; login: string }) | GitHubListError;
+type GitHubReviewThreadsResponse = ({ ok: true } & GitHubPullReviewThreadsResult) | GitHubListError;
+type GitHubThreadResolveResponse = ({ ok: true; resolved: boolean; message?: string }) | GitHubListError;
 type GitHubActionResponse = ({ ok: true; message?: string; item?: GitHubListItem; commentPosted?: boolean }) | GitHubListError;
 type GitHubPullMergeResponse = GitHubPullMergeResult | GitHubListError;
 type GitHubPullDefaultsResponse = ({ ok: true } & GitHubPullDefaultsResult) | GitHubListError;
@@ -319,6 +329,7 @@ export const __githubInternals = {
   graphqlErrorMessage,
   sanitizeReviewComments,
   commentUrl,
+  parseReviewThreads,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -1386,4 +1397,99 @@ export async function deleteGitHubComment(input: DeleteGitHubCommentInput): Prom
     return { ok: false, error: apiError(json, res.status, res.statusText) };
   }
   return { ok: true, message: "Comment deleted." };
+}
+
+/** Pull `reviewThreads` out of a GraphQL response into our flat shape. Each
+ *  thread carries its GraphQL node id (for the resolve mutation), resolution
+ *  state, and the REST databaseId of its first comment (so the UI can match a
+ *  thread to a comment in the flat review-comments list). Pure — unit-tested. */
+function parseReviewThreads(json: unknown): GitHubReviewThread[] {
+  const nodes = ((): unknown[] => {
+    if (!json || typeof json !== "object") return [];
+    const data = (json as { data?: unknown }).data;
+    const pr = data && typeof data === "object"
+      ? ((data as { repository?: { pullRequest?: unknown } }).repository?.pullRequest)
+      : undefined;
+    const threads = pr && typeof pr === "object" ? (pr as { reviewThreads?: { nodes?: unknown } }).reviewThreads : undefined;
+    const arr = threads && typeof threads === "object" ? (threads as { nodes?: unknown }).nodes : undefined;
+    return Array.isArray(arr) ? arr : [];
+  })();
+
+  const threads: GitHubReviewThread[] = [];
+  for (const node of nodes) {
+    if (!node || typeof node !== "object") continue;
+    const o = node as Record<string, unknown>;
+    if (typeof o.id !== "string") continue;
+    const comments = o.comments && typeof o.comments === "object" ? (o.comments as { nodes?: unknown }).nodes : undefined;
+    const first = Array.isArray(comments) && comments[0] && typeof comments[0] === "object"
+      ? (comments[0] as { databaseId?: unknown }).databaseId
+      : undefined;
+    if (typeof first !== "number") continue;
+    threads.push({
+      threadId: o.id,
+      rootCommentId: first,
+      isResolved: o.isResolved === true,
+      isOutdated: o.isOutdated === true,
+    });
+  }
+  return threads;
+}
+
+export async function getGitHubPullReviewThreads(input: GitHubItemNumberInput): Promise<GitHubReviewThreadsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: true, repo: repoSlug(repo), pullNumber: input.number, threads: [] };
+  const query = `query($owner:String!,$name:String!,$number:Int!){`
+    + `repository(owner:$owner,name:$name){pullRequest(number:$number){`
+    + `reviewThreads(first:100){nodes{id isResolved isOutdated comments(first:1){nodes{databaseId}}}}}}}`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name, number: input.number } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: gqlError };
+  return { ok: true, repo: repoSlug(repo), pullNumber: input.number, threads: parseReviewThreads(json) };
+}
+
+export async function setGitHubReviewThreadResolved(
+  input: SetGitHubReviewThreadResolvedInput,
+): Promise<GitHubThreadResolveResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.threadId) return { ok: false, error: "review thread id required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to resolve a thread" };
+  const field = input.resolved ? "resolveReviewThread" : "unresolveReviewThread";
+  const query = `mutation($id:ID!){ ${field}(input:{threadId:$id}){ thread { isResolved } } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { id: input.threadId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: gqlError };
+  const isResolved = ((): boolean | null => {
+    const data = json && typeof json === "object" ? (json as { data?: unknown }).data : undefined;
+    const payload = data && typeof data === "object" ? (data as Record<string, unknown>)[field] : undefined;
+    const thread = payload && typeof payload === "object" ? (payload as { thread?: unknown }).thread : undefined;
+    const r = thread && typeof thread === "object" ? (thread as { isResolved?: unknown }).isResolved : undefined;
+    return typeof r === "boolean" ? r : null;
+  })();
+  const resolved = isResolved ?? input.resolved;
+  return { ok: true, resolved, message: resolved ? "Conversation resolved." : "Conversation reopened." };
 }

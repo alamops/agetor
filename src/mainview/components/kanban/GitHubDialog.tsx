@@ -46,6 +46,7 @@ import type {
   GitHubListItem,
   GitHubPullLineComment,
   GitHubPullMergeability,
+  GitHubReviewThread,
   Project,
   TaskDiff,
 } from "../../../shared/types.ts";
@@ -137,6 +138,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [commentDrafts, setCommentDrafts] = useState<Record<number, string | undefined>>({});
   const [commentSubmitting, setCommentSubmitting] = useState<Record<number, boolean | undefined>>({});
   const [reviewComments, setReviewComments] = useState<Record<number, GitHubPullLineComment[] | undefined>>({});
+  // Resolvable review-comment threads (GraphQL), keyed by PR number; matched to
+  // the flat review-comments list via each thread's rootCommentId.
+  const [reviewThreads, setReviewThreads] = useState<Record<number, GitHubReviewThread[] | undefined>>({});
   const [reviewCommentsLoading, setReviewCommentsLoading] = useState<Record<number, boolean | undefined>>({});
   const [reviewCommentErrors, setReviewCommentErrors] = useState<Record<number, string | undefined>>({});
   const [reviewReplyDrafts, setReviewReplyDrafts] = useState<Record<number, string | undefined>>({});
@@ -251,6 +255,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setCommentDrafts({});
     setCommentSubmitting({});
     setReviewComments({});
+    setReviewThreads({});
     setReviewCommentsLoading({});
     setReviewCommentErrors({});
     setReviewReplyDrafts({});
@@ -454,10 +459,15 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     const requestId = ++reviewCommentSeq.current;
     setReviewCommentsLoading((cur) => ({ ...cur, [number]: true }));
     setReviewCommentErrors((cur) => ({ ...cur, [number]: undefined }));
-    api.listGitHubPullReviewComments({ path: projectPath, number })
-      .then((payload) => {
+    Promise.all([
+      api.listGitHubPullReviewComments({ path: projectPath, number }),
+      // Threads are supplementary (resolve controls) — degrade to none on failure.
+      api.getGitHubPullReviewThreads({ path: projectPath, number }).catch(() => ({ threads: [] as GitHubReviewThread[] })),
+    ])
+      .then(([commentsPayload, threadsPayload]) => {
         if (requestId !== reviewCommentSeq.current) return;
-        setReviewComments((cur) => ({ ...cur, [number]: payload.comments }));
+        setReviewComments((cur) => ({ ...cur, [number]: commentsPayload.comments }));
+        setReviewThreads((cur) => ({ ...cur, [number]: threadsPayload.threads }));
       })
       .catch((e: unknown) => {
         if (requestId !== reviewCommentSeq.current) return;
@@ -559,6 +569,21 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     }));
   };
 
+  const toggleThreadResolved = async (item: GitHubListItem, thread: GitHubReviewThread) => {
+    if (!projectPath) throw new Error("no project selected");
+    const result = await api.setGitHubReviewThreadResolved({
+      path: projectPath,
+      threadId: thread.threadId,
+      resolved: !thread.isResolved,
+    });
+    setReviewThreads((cur) => ({
+      ...cur,
+      [item.number]: (cur[item.number] ?? []).map((t) =>
+        t.threadId === thread.threadId ? { ...t, isResolved: result.resolved } : t,
+      ),
+    }));
+  };
+
   const itemMatchesActiveFilters = (item: GitHubListItem) => {
     if (item.kind !== kind) return false;
     if (state !== "all" && item.state !== state) return false;
@@ -641,6 +666,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         setPendingReview((cur) => ({ ...cur, [item.number]: [] }));
         setPendingStale((cur) => ({ ...cur, [item.number]: false }));
         setReviewComments((cur) => ({ ...cur, [item.number]: undefined }));
+        setReviewThreads((cur) => ({ ...cur, [item.number]: undefined }));
         setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
       }
     } catch (e) {
@@ -1245,6 +1271,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onReviewReplyDraftChange={(commentId, body) => setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: body }))}
                 onSubmitReviewReply={(commentId) => { void submitReviewReply(item, commentId); }}
                 viewerLogin={viewerLogin}
+                reviewThreads={item.kind === "pulls" ? (reviewThreads[item.number] ?? []) : []}
+                onToggleThreadResolved={(thread) => toggleThreadResolved(item, thread)}
                 onEditReviewComment={(commentId, body) => editReviewComment(item, commentId, body)}
                 onDeleteReviewComment={(commentId) => deleteReviewComment(item, commentId)}
                 onEditComment={(commentId, body) => editConversationComment(item, commentId, body)}
@@ -1633,6 +1661,8 @@ function GitHubItemRow({
   onReviewReplyDraftChange,
   onSubmitReviewReply,
   viewerLogin,
+  reviewThreads,
+  onToggleThreadResolved,
   onEditReviewComment,
   onDeleteReviewComment,
   onEditComment,
@@ -1711,6 +1741,8 @@ function GitHubItemRow({
   onReviewReplyDraftChange: (commentId: number, body: string) => void;
   onSubmitReviewReply: (commentId: number) => void;
   viewerLogin: string;
+  reviewThreads: GitHubReviewThread[];
+  onToggleThreadResolved: (thread: GitHubReviewThread) => Promise<void>;
   onEditReviewComment: (commentId: number, body: string) => Promise<void>;
   onDeleteReviewComment: (commentId: number) => Promise<void>;
   onEditComment: (commentId: number, body: string) => Promise<void>;
@@ -1899,6 +1931,8 @@ function GitHubItemRow({
                 replyDrafts={reviewReplyDrafts}
                 replySubmitting={reviewReplySubmitting}
                 viewerLogin={viewerLogin}
+                threads={reviewThreads}
+                onToggleResolved={onToggleThreadResolved}
                 onEdit={onEditReviewComment}
                 onDelete={onDeleteReviewComment}
                 onDraftChange={onReviewReplyDraftChange}
@@ -2684,6 +2718,8 @@ function ReviewComments({
   replyDrafts,
   replySubmitting,
   viewerLogin,
+  threads,
+  onToggleResolved,
   onEdit,
   onDelete,
   onDraftChange,
@@ -2696,12 +2732,29 @@ function ReviewComments({
   replyDrafts: Record<number, string | undefined>;
   replySubmitting: Record<number, boolean | undefined>;
   viewerLogin: string;
+  threads: GitHubReviewThread[];
+  onToggleResolved: (thread: GitHubReviewThread) => Promise<void>;
   onEdit: (commentId: number, body: string) => Promise<void>;
   onDelete: (commentId: number) => Promise<void>;
   onDraftChange: (commentId: number, body: string) => void;
   onSubmitReply: (commentId: number) => void;
   onRetry: () => void;
 }) {
+  const [busyThread, setBusyThread] = useState<string | null>(null);
+  const [threadError, setThreadError] = useState<{ id: string; msg: string } | null>(null);
+  const threadByRoot = new Map(threads.map((t) => [t.rootCommentId, t]));
+  const toggle = async (thread: GitHubReviewThread) => {
+    if (busyThread) return;
+    setBusyThread(thread.threadId);
+    setThreadError(null);
+    try {
+      await onToggleResolved(thread);
+    } catch (e) {
+      setThreadError({ id: thread.threadId, msg: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusyThread(null);
+    }
+  };
   return (
     <div className="mt-3">
       <div className="mb-2 flex items-center justify-between gap-3">
@@ -2741,6 +2794,7 @@ function ReviewComments({
           {comments.map((comment) => {
             const draft = replyDrafts[comment.id] ?? "";
             const submitting = !!replySubmitting[comment.id];
+            const thread = threadByRoot.get(comment.id);
             return (
               <div key={comment.id} className="rounded-md border border-border/60 bg-card">
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/50 px-3 py-2 text-xs text-muted-foreground">
@@ -2748,7 +2802,33 @@ function ReviewComments({
                   <span>{comment.path}:{comment.line}</span>
                   <span>{comment.side === "LEFT" ? "old" : "new"} side</span>
                   <span>{fmtDate(comment.createdAt)}</span>
+                  {thread?.isResolved && (
+                    <span className="inline-flex items-center gap-1 text-emerald-400">
+                      <CheckCircle2 className="size-3" />
+                      resolved
+                    </span>
+                  )}
+                  {thread && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="ml-auto h-6 px-2 text-[11px]"
+                      disabled={busyThread === thread.threadId}
+                      onClick={() => { void toggle(thread); }}
+                    >
+                      {busyThread === thread.threadId
+                        ? <Loader2 className="mr-1 size-3 animate-spin" />
+                        : thread.isResolved ? <RefreshCw className="mr-1 size-3" /> : <CheckCircle2 className="mr-1 size-3" />}
+                      {thread.isResolved ? "Reopen" : "Resolve"}
+                    </Button>
+                  )}
                 </div>
+                {thread && threadError?.id === thread.threadId && (
+                  <div className="flex items-center gap-1 border-b border-border/50 px-3 py-1.5 text-[11px] text-rose-400">
+                    <AlertCircle className="size-3.5" />
+                    {threadError.msg}
+                  </div>
+                )}
                 <EditableCommentBody
                   body={comment.body}
                   canModify={!!viewerLogin && comment.author?.login === viewerLogin}

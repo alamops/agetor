@@ -17,6 +17,7 @@ import type {
   GitHubPullMergeability,
   GitHubPullMergeMethod,
   GitHubPullReviewCommentsResult,
+  GitHubPullReviewThreadsResult,
   GitHubPullMergeResult,
   GitHubPullReviewEvent,
   Harness,
@@ -59,6 +60,7 @@ export type {
   GitHubPullMergeability,
   GitHubPullMergeMethod,
   GitHubPullReviewCommentsResult,
+  GitHubPullReviewThreadsResult,
   GitHubPullMergeResult,
   GitHubPullReviewEvent,
 };
@@ -398,6 +400,18 @@ export const api = {
     });
     return j<GitHubPullReviewCommentsResult>(`/github/pull-review-comments?${q.toString()}`);
   },
+  getGitHubPullReviewThreads: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullReviewThreadsResult>(`/github/pull-review-threads?${q.toString()}`);
+  },
+  setGitHubReviewThreadResolved: (input: { path: string; threadId: string; resolved: boolean }) =>
+    j<{ ok: true; resolved: boolean; message?: string }>("/github/review-thread-resolve", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   replyGitHubPullLineComment: (input: { path: string; number: number; commentId: number; body: string }) =>
     j<{ comment: GitHubPullLineComment }>("/github/pull-line-comment-reply", {
       method: "POST",

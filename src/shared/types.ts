@@ -724,6 +724,22 @@ export interface GitHubPullReviewCommentsResult {
   comments: GitHubPullLineComment[];
 }
 
+/** A resolvable review-comment thread (from GraphQL). `rootCommentId` is the
+ *  REST databaseId of the thread's first comment, so the UI can match a thread
+ *  to a comment in the flat review-comments list. */
+export interface GitHubReviewThread {
+  threadId: string;
+  rootCommentId: number;
+  isResolved: boolean;
+  isOutdated: boolean;
+}
+
+export interface GitHubPullReviewThreadsResult {
+  repo: string;
+  pullNumber: number;
+  threads: GitHubReviewThread[];
+}
+
 export interface GitHubCheckRun {
   id: number;
   name: string;

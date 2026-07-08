@@ -70,6 +70,7 @@ import {
   getGitHubPullDefaults,
   getGitHubPullDiff,
   getGitHubPullMergeability,
+  getGitHubPullReviewThreads,
   listGitHubComments,
   listGitHubItems,
   listGitHubPullReviewComments,
@@ -79,6 +80,7 @@ import {
   requestGitHubPullReviewers,
   reviewGitHubPull,
   setGitHubPullDraft,
+  setGitHubReviewThreadResolved,
   updateGitHubComment,
   updateGitHubIssue,
   updateGitHubPullBranch,
@@ -657,6 +659,42 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
           }
           const result = await listGitHubPullReviewComments({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-review-threads": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubPullReviewThreads({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/review-thread-resolve": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string; resolved?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId) {
+            return json({ error: "review thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.resolved !== "boolean") {
+            return json({ error: "resolved (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubReviewThreadResolved({ dir, threadId: body.threadId, resolved: body.resolved });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

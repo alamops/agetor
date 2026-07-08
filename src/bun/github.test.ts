@@ -13,6 +13,7 @@ const {
   graphqlErrorMessage,
   sanitizeReviewComments,
   commentUrl,
+  parseReviewThreads,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -188,6 +189,31 @@ test("sanitizeReviewComments keeps well-formed inline comments and trims, drops 
   ]);
   expect(sanitizeReviewComments(undefined)).toEqual([]);
   expect(sanitizeReviewComments([])).toEqual([]);
+});
+
+test("parseReviewThreads extracts id, resolution, and root comment databaseId; drops malformed", () => {
+  const json = {
+    data: {
+      repository: {
+        pullRequest: {
+          reviewThreads: {
+            nodes: [
+              { id: "T1", isResolved: true, isOutdated: false, comments: { nodes: [{ databaseId: 100 }] } },
+              { id: "T2", isResolved: false, isOutdated: true, comments: { nodes: [{ databaseId: 200 }] } },
+              { id: "T3", comments: { nodes: [] } }, // no root comment → dropped
+              { isResolved: false, comments: { nodes: [{ databaseId: 300 }] } }, // no thread id → dropped
+            ],
+          },
+        },
+      },
+    },
+  };
+  expect(parseReviewThreads(json)).toEqual([
+    { threadId: "T1", rootCommentId: 100, isResolved: true, isOutdated: false },
+    { threadId: "T2", rootCommentId: 200, isResolved: false, isOutdated: true },
+  ]);
+  expect(parseReviewThreads(null)).toEqual([]);
+  expect(parseReviewThreads({ data: {} })).toEqual([]);
 });
 
 test("commentUrl maps kind to the right endpoint segment", () => {
