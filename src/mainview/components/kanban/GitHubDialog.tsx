@@ -37,6 +37,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
+import { mergeabilityView, type MergeTone } from "@/lib/mergeability";
 import type {
   DiffFile,
   GitHubCheckRun,
@@ -110,6 +111,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const reviewCommentSeq = useRef(0);
   const checksSeq = useRef(0);
   const mergeabilitySeq = useRef(0);
+  // Bounds the self-healing re-poll when GitHub returns mergeable=null.
+  const mergeabilityRetries = useRef<Record<number, number>>({});
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [diffs, setDiffs] = useState<Record<number, TaskDiff | undefined>>({});
   const [diffLoading, setDiffLoading] = useState<Record<number, boolean | undefined>>({});
@@ -227,6 +230,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setMergeability({});
     setMergeabilityLoading({});
     setMergeabilityErrors({});
+    mergeabilityRetries.current = {};
     setComments({});
     setCommentsLoading({});
     setCommentErrors({});
@@ -359,7 +363,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   }, [open, projectPath, expandedItem, checks, checksLoading, checksErrors]);
 
   useEffect(() => {
-    if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    // Only open PRs surface a mergeability verdict — skip closed/merged ones so
+    // we don't burn the server-side poll on data the UI never shows.
+    if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls" || expandedItem.state !== "open") return;
     const number = expandedItem.number;
     if (mergeability[number] || mergeabilityLoading[number] || mergeabilityErrors[number]) return;
 
@@ -370,6 +376,16 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       .then((payload) => {
         if (requestId !== mergeabilitySeq.current) return;
         setMergeability((cur) => ({ ...cur, [number]: payload }));
+        // GitHub may still be computing (`mergeable === null`). Self-heal with a
+        // single delayed re-poll rather than making the user hit refresh.
+        if (payload.mergeable === null && !payload.merged && (mergeabilityRetries.current[number] ?? 0) < 1) {
+          mergeabilityRetries.current[number] = (mergeabilityRetries.current[number] ?? 0) + 1;
+          setTimeout(() => {
+            if (requestId !== mergeabilitySeq.current) return;
+            setMergeability((cur) => ({ ...cur, [number]: undefined }));
+            setMergeabilityErrors((cur) => ({ ...cur, [number]: undefined }));
+          }, 2_500);
+        }
       })
       .catch((e: unknown) => {
         if (requestId !== mergeabilitySeq.current) return;
@@ -579,8 +595,14 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     try {
       const result = await api.updateGitHubPullBranch({ path: projectPath, number: item.number });
       setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Branch update started." }));
+      // update-branch is async (202 Accepted) — GitHub merges the base into the
+      // head in the background. Give it a moment before invalidating the caches,
+      // otherwise the refetch races the merge and shows a stale "behind" verdict.
+      await new Promise((r) => setTimeout(r, 2_000));
       // The head moved, so the cached mergeability, checks, and diff are stale —
-      // clear them so their effects refetch against the new head.
+      // clear them so their effects refetch against the new head. Reset the
+      // mergeability retry budget so it can self-heal on the fresh head.
+      mergeabilityRetries.current[item.number] = 0;
       setMergeability((cur) => ({ ...cur, [item.number]: undefined }));
       setMergeabilityErrors((cur) => ({ ...cur, [item.number]: undefined }));
       setChecks((cur) => ({ ...cur, [item.number]: undefined }));
@@ -1108,6 +1130,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 }}
                 onRefreshMergeability={() => {
                   if (item.kind !== "pulls") return;
+                  mergeabilityRetries.current[item.number] = 0;
                   setMergeability((cur) => ({ ...cur, [item.number]: undefined }));
                   setMergeabilityErrors((cur) => ({ ...cur, [item.number]: undefined }));
                 }}
@@ -1733,48 +1756,12 @@ function checkClass(run: GitHubCheckRun): string {
   return "text-rose-400";
 }
 
-type MergeTone = "ok" | "warn" | "bad" | "muted";
 const MERGE_TONE_CLASS: Record<MergeTone, string> = {
   ok: "text-emerald-400",
   warn: "text-amber-400",
   bad: "text-rose-400",
   muted: "text-muted-foreground",
 };
-
-/** Map GitHub's mergeable/mergeable_state into a label, colour, whether the
- *  Merge button should be enabled, and whether to offer "Update branch". */
-function mergeabilityView(m: GitHubPullMergeability): {
-  label: string;
-  tone: MergeTone;
-  canMerge: boolean;
-  showUpdateBranch: boolean;
-} {
-  if (m.mergeable === null) {
-    return {
-      label: "GitHub is still checking mergeability…",
-      tone: "muted",
-      canMerge: false,
-      showUpdateBranch: m.mergeableState === "behind",
-    };
-  }
-  switch (m.mergeableState) {
-    case "clean":
-    case "has_hooks":
-      return { label: "Ready to merge", tone: "ok", canMerge: m.mergeable, showUpdateBranch: false };
-    case "unstable":
-      return { label: "Mergeable — some checks are pending or failing", tone: "warn", canMerge: m.mergeable, showUpdateBranch: false };
-    case "behind":
-      return { label: "Out of date with the base branch", tone: "warn", canMerge: m.mergeable, showUpdateBranch: true };
-    case "dirty":
-      return { label: "Conflicts must be resolved before merging", tone: "bad", canMerge: false, showUpdateBranch: false };
-    case "blocked":
-      return { label: "Blocked by required reviews or checks", tone: "bad", canMerge: false, showUpdateBranch: false };
-    case "draft":
-      return { label: "Draft — mark ready for review to merge", tone: "muted", canMerge: false, showUpdateBranch: false };
-    default:
-      return { label: `Mergeability: ${m.mergeableState}`, tone: "muted", canMerge: m.mergeable, showUpdateBranch: false };
-  }
-}
 
 function IssueActions({
   item,
