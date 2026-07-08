@@ -16,10 +16,10 @@ process.env.AGETOR_API_PORT = "4401";
 // shims for every common entry on `electrobun/bun` keeps a future test that
 // happens to import `BrowserWindow` / `Updater` / `ApplicationMenu` from
 // crashing on a missing export.
-const recorded: Array<{ title: string; body?: string; subtitle?: string; silent?: boolean }> = [];
+const recorded: Array<{ title: string; body?: string; subtitle?: string; silent?: boolean; taskId?: string }> = [];
 mock.module("electrobun/bun", () => ({
   Utils: {
-    showNotification: (opts: { title: string; body?: string; subtitle?: string; silent?: boolean }) => {
+    showNotification: (opts: { title: string; body?: string; subtitle?: string; silent?: boolean; taskId?: string }) => {
       recorded.push(opts);
     },
     openPath: () => true,
@@ -92,6 +92,43 @@ test("POST /notifications truncates oversized strings", async () => {
   expect(res.status).toBe(200);
   expect(recorded[0]!.title.length).toBe(256);
   expect(recorded[0]!.body!.length).toBe(256);
+});
+
+test("POST /notifications with taskId threads it through to showNotification", async () => {
+  recorded.length = 0;
+  const res = await fetch(url("/notifications"), {
+    method: "POST",
+    body: JSON.stringify({ title: "Done", taskId: "task-123" }),
+    headers: auth(),
+  });
+  expect(res.status).toBe(200);
+  expect(recorded.length).toBe(1);
+  expect(recorded[0]!.taskId).toBe("task-123");
+});
+
+test("POST /notifications with an over-length taskId (>512 chars) is treated as absent", async () => {
+  recorded.length = 0;
+  const bigId = "x".repeat(513);
+  const res = await fetch(url("/notifications"), {
+    method: "POST",
+    body: JSON.stringify({ title: "Done", taskId: bigId }),
+    headers: auth(),
+  });
+  expect(res.status).toBe(200);
+  expect(recorded.length).toBe(1);
+  expect(recorded[0]!.taskId).toBeUndefined();
+});
+
+test("POST /notifications with no taskId leaves it undefined", async () => {
+  recorded.length = 0;
+  const res = await fetch(url("/notifications"), {
+    method: "POST",
+    body: JSON.stringify({ title: "Done" }),
+    headers: auth(),
+  });
+  expect(res.status).toBe(200);
+  expect(recorded.length).toBe(1);
+  expect(recorded[0]!.taskId).toBeUndefined();
 });
 
 test("GET /events route is auth-gated", async () => {

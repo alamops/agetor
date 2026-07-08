@@ -38,7 +38,7 @@ function describe(args: ToastArgs): string {
 function maybeNotifyOS(args: ToastArgs, heading: string, detail?: string): void {
   if (args.isFocused) return;
   // Fire-and-forget — failure (e.g. user denied macOS permission) is silent.
-  api.notifyOS({ title: heading, body: detail }).catch(() => { /* ignore */ });
+  api.notifyOS({ title: heading, body: detail, taskId: args.taskId }).catch(() => { /* ignore */ });
 }
 
 export function toastSuccess(args: ToastArgs): void {
