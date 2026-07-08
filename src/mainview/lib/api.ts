@@ -11,6 +11,8 @@ import type {
   GitHubComment,
   GitHubCommentsResult,
   GitHubChecksResult,
+  GitHubLabelsResult,
+  GitHubRepoLabel,
   GitHubListResult,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
@@ -54,6 +56,8 @@ export type {
   GitHubCommentsResult,
   GitHubItemKind,
   GitHubItemState,
+  GitHubLabelsResult,
+  GitHubRepoLabel,
   GitHubListResult,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
@@ -379,6 +383,25 @@ export const api = {
     const q = new URLSearchParams({ path: input.path });
     return j<{ ok: true; login: string }>(`/github/viewer?${q.toString()}`);
   },
+  listGitHubLabels: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubLabelsResult>(`/github/labels?${q.toString()}`);
+  },
+  createGitHubLabel: (input: { path: string; name: string; color: string; description?: string }) =>
+    j<{ ok: true; label: GitHubRepoLabel }>("/github/labels", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubLabel: (input: { path: string; name: string; newName?: string; color?: string; description?: string }) =>
+    j<{ ok: true; label: GitHubRepoLabel }>("/github/label-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubLabel: (input: { path: string; name: string }) =>
+    j<{ ok: true; message?: string }>("/github/label-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   updateGitHubComment: (input: { path: string; commentId: number; kind: "issue" | "review"; body: string }) =>
     j<{ ok: true; comment: GitHubComment }>("/github/comment-update", {
       method: "POST",

@@ -16,6 +16,7 @@ const {
   parseReviewThreads,
   reviewThreadsHasNextPage,
   buildSearchQuery,
+  normalizeColor,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -246,6 +247,14 @@ test("buildSearchQuery composes repo/kind/state + involvement + label/assignee q
   // a user-typed repo: is stripped so the prepended project scope stays authoritative
   expect(buildSearchQuery("o/r", { ...base, searchQuery: "repo:evil/x is:merged" }))
     .toBe("repo:o/r is:pr is:open is:merged");
+});
+
+test("normalizeColor strips a leading # and lowercases, undefined passes through", () => {
+  expect(normalizeColor("#FF8800")).toBe("ff8800");
+  expect(normalizeColor("00AAff")).toBe("00aaff");
+  expect(normalizeColor("  #abcdef  ")).toBe("abcdef");
+  expect(normalizeColor(undefined)).toBeUndefined();
+  expect(normalizeColor("")).toBe("");
 });
 
 test("commentUrl maps kind to the right endpoint segment", () => {

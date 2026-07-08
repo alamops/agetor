@@ -63,8 +63,10 @@ import {
   createGitHubComment,
   createGitHubIssue,
   createGitHubPull,
+  createGitHubLabel,
   createGitHubPullLineComment,
   deleteGitHubComment,
+  deleteGitHubLabel,
   getGitHubPullChecks,
   getGitHubViewer,
   getGitHubPullDefaults,
@@ -73,6 +75,7 @@ import {
   getGitHubPullReviewThreads,
   listGitHubComments,
   listGitHubItems,
+  listGitHubLabels,
   listGitHubPullReviewComments,
   mergeGitHubPull,
   reopenGitHubPull,
@@ -83,6 +86,7 @@ import {
   setGitHubReviewThreadResolved,
   updateGitHubComment,
   updateGitHubIssue,
+  updateGitHubLabel,
   updateGitHubPullBranch,
 } from "./github.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -514,6 +518,86 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const dir = url.searchParams.get("path");
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
           const result = await getGitHubViewer({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/labels": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubLabels({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            name?: string;
+            color?: string;
+            description?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.name !== "string" || !body.name.trim()) {
+            return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubLabel({
+            dir,
+            name: body.name,
+            color: typeof body.color === "string" ? body.color : "",
+            description: typeof body.description === "string" ? body.description : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/label-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            name?: string;
+            newName?: string;
+            color?: string;
+            description?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.name !== "string" || !body.name.trim()) {
+            return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await updateGitHubLabel({
+            dir,
+            name: body.name,
+            newName: typeof body.newName === "string" ? body.newName : undefined,
+            color: typeof body.color === "string" ? body.color : undefined,
+            description: typeof body.description === "string" ? body.description : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/label-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; name?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.name !== "string" || !body.name.trim()) {
+            return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubLabel({ dir, name: body.name });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

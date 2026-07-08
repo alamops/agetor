@@ -666,6 +666,20 @@ export interface GitHubLabel {
   color: string | null;
 }
 
+/** A repository label as returned by the labels-management endpoints (carries a
+ *  description, unlike the lighter GitHubLabel embedded in an item). `color` is
+ *  6-hex without a leading `#`. */
+export interface GitHubRepoLabel {
+  name: string;
+  color: string;
+  description: string;
+}
+
+export interface GitHubLabelsResult {
+  repo: string;
+  labels: GitHubRepoLabel[];
+}
+
 export interface GitHubUser {
   login: string;
   avatarUrl: string | null;

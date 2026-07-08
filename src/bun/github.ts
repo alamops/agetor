@@ -7,8 +7,10 @@ import type {
   GitHubItemKind,
   GitHubItemState,
   GitHubLabel,
+  GitHubLabelsResult,
   GitHubListItem,
   GitHubListResult,
+  GitHubRepoLabel,
   GitHubMilestone,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
@@ -176,6 +178,26 @@ interface SetGitHubReviewThreadResolvedInput {
   resolved: boolean;
 }
 
+interface CreateGitHubLabelInput {
+  dir: string;
+  name: string;
+  color: string;
+  description?: string;
+}
+
+interface UpdateGitHubLabelInput {
+  dir: string;
+  name: string;
+  newName?: string;
+  color?: string;
+  description?: string;
+}
+
+interface DeleteGitHubLabelInput {
+  dir: string;
+  name: string;
+}
+
 interface GitHubListError {
   ok: false;
   error: string;
@@ -191,6 +213,8 @@ type GitHubChecksResponse = ({ ok: true } & GitHubChecksResult) | GitHubListErro
 type GitHubMergeabilityResponse = ({ ok: true } & GitHubPullMergeability) | GitHubListError;
 type GitHubPullDraftResponse = ({ ok: true; draft: boolean; message?: string }) | GitHubListError;
 type GitHubViewerResponse = ({ ok: true; login: string }) | GitHubListError;
+type GitHubLabelsResponse = ({ ok: true } & GitHubLabelsResult) | GitHubListError;
+type GitHubLabelResponse = ({ ok: true; label: GitHubRepoLabel }) | GitHubListError;
 type GitHubReviewThreadsResponse = ({ ok: true } & GitHubPullReviewThreadsResult) | GitHubListError;
 type GitHubThreadResolveResponse = ({ ok: true; resolved: boolean; message?: string }) | GitHubListError;
 type GitHubActionResponse = ({ ok: true; message?: string; item?: GitHubListItem; commentPosted?: boolean }) | GitHubListError;
@@ -341,6 +365,7 @@ export const __githubInternals = {
   parseReviewThreads,
   reviewThreadsHasNextPage,
   buildSearchQuery,
+  normalizeColor,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -1572,4 +1597,131 @@ export async function setGitHubReviewThreadResolved(
   })();
   const resolved = isResolved ?? input.resolved;
   return { ok: true, resolved, message: resolved ? "Conversation resolved." : "Conversation reopened." };
+}
+
+function normalizeRepoLabel(raw: unknown): GitHubRepoLabel | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.name !== "string") return null;
+  return {
+    name: obj.name,
+    color: typeof obj.color === "string" ? obj.color : "",
+    description: typeof obj.description === "string" ? obj.description : "",
+  };
+}
+
+/** Strip a leading `#` from a hex color — GitHub's labels API wants the bare hex. */
+function normalizeColor(color: string | undefined): string | undefined {
+  if (color === undefined) return undefined;
+  return color.trim().replace(/^#/, "").toLowerCase();
+}
+
+/** `/repos/:o/:r/labels/:name` — the label name goes in the path, so it must be
+ *  URL-encoded ("help wanted", "good first issue", etc. contain spaces). */
+function labelUrl(repo: GitHubRepo, name: string): string {
+  return `https://api.github.com/repos/${repo.owner}/${repo.name}/labels/${encodeURIComponent(name)}`;
+}
+
+export async function listGitHubLabels(input: { dir: string }): Promise<GitHubLabelsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+
+  const token = await githubToken();
+  const labels: GitHubRepoLabel[] = [];
+  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/labels?per_page=100`;
+  for (let page = 0; next && page < 3; page++) {
+    const res = await fetchGitHub(next, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: apiError(body, res.status, res.statusText) };
+    if (!Array.isArray(body)) return { ok: false, error: "GitHub returned an unexpected labels response" };
+    for (const raw of body) {
+      const label = normalizeRepoLabel(raw);
+      if (label) labels.push(label);
+    }
+    next = pageLinks(res.headers.get("link"));
+  }
+  labels.sort((a, b) => a.name.localeCompare(b.name));
+  return { ok: true, repo: repoSlug(repo), labels };
+}
+
+export async function createGitHubLabel(input: CreateGitHubLabelInput): Promise<GitHubLabelResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const name = input.name.trim();
+  if (!name) return { ok: false, error: "label name required" };
+  const color = normalizeColor(input.color) ?? "";
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to create a label" };
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/labels`;
+  const res = await fetchGitHub(
+    url,
+    token,
+    "application/vnd.github+json",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        ...(color ? { color } : {}),
+        ...(input.description?.trim() ? { description: input.description.trim() } : {}),
+      }),
+    },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const label = normalizeRepoLabel(json);
+  if (!label) return { ok: false, error: "GitHub returned an unexpected label response" };
+  return { ok: true, label };
+}
+
+export async function updateGitHubLabel(input: UpdateGitHubLabelInput): Promise<GitHubLabelResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.name.trim()) return { ok: false, error: "label name required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to edit a label" };
+  const patch: { new_name?: string; color?: string; description?: string } = {};
+  if (input.newName !== undefined) {
+    const nn = input.newName.trim();
+    if (!nn) return { ok: false, error: "label name cannot be empty" };
+    patch.new_name = nn;
+  }
+  const color = normalizeColor(input.color);
+  if (color !== undefined) patch.color = color;
+  if (input.description !== undefined) patch.description = input.description;
+  if (Object.keys(patch).length === 0) {
+    return { ok: false, error: "label update requires a new name, color, or description" };
+  }
+
+  const res = await fetchGitHub(
+    labelUrl(repo, input.name),
+    token,
+    "application/vnd.github+json",
+    { method: "PATCH", body: JSON.stringify(patch) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const label = normalizeRepoLabel(json);
+  if (!label) return { ok: false, error: "GitHub returned an unexpected label response" };
+  return { ok: true, label };
+}
+
+export async function deleteGitHubLabel(input: DeleteGitHubLabelInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.name.trim()) return { ok: false, error: "label name required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to delete a label" };
+  const res = await fetchGitHub(labelUrl(repo, input.name), token, "application/vnd.github+json", { method: "DELETE" });
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, message: "Label deleted." };
 }

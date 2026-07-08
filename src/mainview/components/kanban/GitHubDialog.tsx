@@ -46,6 +46,7 @@ import type {
   GitHubListItem,
   GitHubPullLineComment,
   GitHubPullMergeability,
+  GitHubRepoLabel,
   GitHubReviewThread,
   Project,
   TaskDiff,
@@ -120,6 +121,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // Authenticated user's login, so edit/delete controls appear only on the
   // viewer's own comments. Empty when unauthenticated.
   const [viewerLogin, setViewerLogin] = useState("");
+  // All repo labels (powers the label datalist + the label manager).
+  const [repoLabels, setRepoLabels] = useState<GitHubRepoLabel[]>([]);
+  const [labelManagerOpen, setLabelManagerOpen] = useState(false);
   // The viewer login is token-scoped (identical across projects), so resolve it
   // once per session rather than on every open / project switch. A failed lookup
   // (e.g. the first project has no GitHub remote) leaves it unresolved so a later
@@ -328,12 +332,14 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   }, [projectPath, kind]);
 
   const availableLabels = useMemo(() => {
-    const names = new Set<string>();
+    // Prefer the full repo-label list; fall back to labels seen on loaded items
+    // (e.g. before the labels fetch resolves or when unauthenticated).
+    const names = new Set<string>(repoLabels.map((l) => l.name));
     for (const item of result?.items ?? []) {
       for (const label of item.labels) names.add(label.name);
     }
     return Array.from(names).sort((a, b) => a.localeCompare(b));
-  }, [result]);
+  }, [result, repoLabels]);
 
   const projectOptions = useMemo(() => {
     const opts = projects.map((p) => ({ path: p.path, label: p.name || basename(p.path) || p.path }));
@@ -355,6 +361,45 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       .then((r) => { if (!cancelled) { setViewerLogin(r.login); viewerResolved.current = true; } })
       // Leave unresolved on failure (e.g. no remote) so a later project retries.
       .catch(() => { /* keep the current (empty) login */ });
+    return () => { cancelled = true; };
+  }, [open, projectPath]);
+
+  const refreshRepoLabels = async () => {
+    if (!projectPath) return;
+    try {
+      const r = await api.listGitHubLabels({ path: projectPath });
+      setRepoLabels(r.labels);
+    } catch {
+      // Labels are convenience (datalist + manager); ignore fetch failures.
+    }
+  };
+
+  const sortLabels = (ls: GitHubRepoLabel[]) => [...ls].sort((a, b) => a.name.localeCompare(b.name));
+
+  const createLabel = async (name: string, color: string, description: string) => {
+    if (!projectPath) throw new Error("no project selected");
+    const { label } = await api.createGitHubLabel({ path: projectPath, name, color, description });
+    setRepoLabels((cur) => sortLabels([...cur.filter((l) => l.name !== label.name), label]));
+  };
+
+  const editLabel = async (name: string, patch: { newName?: string; color?: string; description?: string }) => {
+    if (!projectPath) throw new Error("no project selected");
+    const { label } = await api.updateGitHubLabel({ path: projectPath, name, ...patch });
+    setRepoLabels((cur) => sortLabels([...cur.filter((l) => l.name !== name), label]));
+  };
+
+  const removeLabel = async (name: string) => {
+    if (!projectPath) throw new Error("no project selected");
+    await api.deleteGitHubLabel({ path: projectPath, name });
+    setRepoLabels((cur) => cur.filter((l) => l.name !== name));
+  };
+
+  useEffect(() => {
+    if (!open || !projectPath) { setRepoLabels([]); return; }
+    let cancelled = false;
+    api.listGitHubLabels({ path: projectPath })
+      .then((r) => { if (!cancelled) setRepoLabels(r.labels); })
+      .catch(() => { if (!cancelled) setRepoLabels([]); });
     return () => { cancelled = true; };
   }, [open, projectPath]);
 
@@ -1071,6 +1116,16 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          <Button
+            size="icon"
+            variant={labelManagerOpen ? "secondary" : "ghost"}
+            title="Manage labels"
+            aria-label="Manage labels"
+            disabled={!projectPath}
+            onClick={() => setLabelManagerOpen((v) => !v)}
+          >
+            <Tag className="size-4" />
+          </Button>
           {result && (
             <Button
               size="icon"
@@ -1233,6 +1288,17 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        {labelManagerOpen && (
+          <LabelManager
+            labels={repoLabels}
+            canModify={result?.auth !== "none"}
+            onCreate={createLabel}
+            onEdit={editLabel}
+            onDelete={removeLabel}
+            onRefresh={() => { void refreshRepoLabels(); }}
+            onClose={() => setLabelManagerOpen(false)}
+          />
+        )}
         {kind === "pulls" && (
           <PullComposer
             open={pullComposerOpen}
@@ -1703,6 +1769,210 @@ function IssueComposer({
           Create issue
         </Button>
       </div>
+    </div>
+  );
+}
+
+function labelSwatch(color: string): string {
+  return color.trim() ? `#${color.replace(/^#/, "")}` : "transparent";
+}
+
+function LabelManager({
+  labels,
+  canModify,
+  onCreate,
+  onEdit,
+  onDelete,
+  onRefresh,
+  onClose,
+}: {
+  labels: GitHubRepoLabel[];
+  canModify: boolean;
+  onCreate: (name: string, color: string, description: string) => Promise<void>;
+  onEdit: (name: string, patch: { newName?: string; color?: string; description?: string }) => Promise<void>;
+  onDelete: (name: string) => Promise<void>;
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [color, setColor] = useState("");
+  const [description, setDescription] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const create = async () => {
+    const n = name.trim();
+    if (!n || creating) return;
+    setCreating(true);
+    setError(null);
+    try {
+      await onCreate(n, color, description);
+      setName("");
+      setColor("");
+      setDescription("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  return (
+    <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <Tag className="size-3.5" />
+          Labels ({labels.length})
+        </div>
+        <div className="flex items-center gap-1">
+          <Button size="icon" variant="ghost" className="size-6" title="Refresh labels" aria-label="Refresh labels" onClick={onRefresh}>
+            <RefreshCw className="size-3.5" />
+          </Button>
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      </div>
+      {canModify && (
+        <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)_auto]">
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" className="h-8 text-xs" disabled={creating} />
+          <div className="flex items-center gap-1">
+            <span className="size-4 shrink-0 rounded-full border border-border/60" style={{ backgroundColor: labelSwatch(color) }} />
+            <Input value={color} onChange={(e) => setColor(e.target.value)} placeholder="hex" className="h-8 w-20 text-xs" disabled={creating} />
+          </div>
+          <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description (optional)" className="h-8 text-xs" disabled={creating} />
+          <Button size="sm" disabled={creating || !name.trim()} onClick={() => { void create(); }}>
+            {creating ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
+            Add
+          </Button>
+        </div>
+      )}
+      {error && (
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+      <div className="max-h-56 space-y-1 overflow-y-auto">
+        {labels.length === 0 ? (
+          <div className="px-1 py-2 text-[11px] text-muted-foreground">No labels in this repository.</div>
+        ) : (
+          labels.map((l) => <LabelRow key={l.name} label={l} canModify={canModify} onEdit={onEdit} onDelete={onDelete} />)
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LabelRow({
+  label,
+  canModify,
+  onEdit,
+  onDelete,
+}: {
+  label: GitHubRepoLabel;
+  canModify: boolean;
+  onEdit: (name: string, patch: { newName?: string; color?: string; description?: string }) => Promise<void>;
+  onDelete: (name: string) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(label.name);
+  const [color, setColor] = useState(label.color);
+  const [description, setDescription] = useState(label.description);
+  const [busy, setBusy] = useState<null | "save" | "delete">(null);
+  const [confirm, setConfirm] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const reset = () => { setName(label.name); setColor(label.color); setDescription(label.description); setError(null); };
+
+  const save = async () => {
+    if (busy || !name.trim()) return;
+    setBusy("save");
+    setError(null);
+    try {
+      await onEdit(label.name, { newName: name.trim(), color, description });
+      setEditing(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const del = async () => {
+    if (busy) return;
+    setBusy("delete");
+    setError(null);
+    try {
+      await onDelete(label.name); // success unmounts this row
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(null);
+      setConfirm(false);
+    }
+  };
+
+  if (editing) {
+    return (
+      <div className="rounded border border-border/60 p-2">
+        <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)]">
+          <Input value={name} onChange={(e) => setName(e.target.value)} className="h-7 text-xs" disabled={busy === "save"} />
+          <div className="flex items-center gap-1">
+            <span className="size-4 shrink-0 rounded-full border border-border/60" style={{ backgroundColor: labelSwatch(color) }} />
+            <Input value={color} onChange={(e) => setColor(e.target.value)} placeholder="hex" className="h-7 w-20 text-xs" disabled={busy === "save"} />
+          </div>
+          <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" className="h-7 text-xs" disabled={busy === "save"} />
+        </div>
+        {error && (
+          <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
+            <AlertCircle className="size-3.5" />
+            {error}
+          </div>
+        )}
+        <div className="mt-1 flex justify-end gap-2">
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" disabled={busy === "save"} onClick={() => { setEditing(false); reset(); }}>
+            Cancel
+          </Button>
+          <Button size="sm" className="h-6 px-2 text-[11px]" disabled={busy === "save" || !name.trim()} onClick={() => { void save(); }}>
+            {busy === "save" ? <Loader2 className="mr-1 size-3 animate-spin" /> : <FilePen className="mr-1 size-3" />}
+            Save
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2 rounded px-1 py-1 text-xs">
+      <span
+        className="shrink-0 rounded border px-1.5 py-0.5 text-[11px]"
+        style={{ borderColor: label.color ? `#${label.color}` : undefined, backgroundColor: label.color ? `#${label.color}22` : undefined }}
+      >
+        {label.name}
+      </span>
+      {label.description && <span className="min-w-0 flex-1 truncate text-muted-foreground">{label.description}</span>}
+      {error && <span className="truncate text-[11px] text-rose-400">{error}</span>}
+      {canModify && (
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          <Button size="icon" variant="ghost" className="size-6" title="Edit label" aria-label={`Edit ${label.name}`} disabled={!!busy} onClick={() => { reset(); setEditing(true); }}>
+            <FilePen className="size-3.5" />
+          </Button>
+          {confirm ? (
+            <>
+              <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-rose-400" disabled={busy === "delete"} onClick={() => { void del(); }}>
+                {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : "Confirm"}
+              </Button>
+              <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" disabled={busy === "delete"} onClick={() => setConfirm(false)}>
+                Cancel
+              </Button>
+            </>
+          ) : (
+            <Button size="icon" variant="ghost" className="size-6 text-muted-foreground hover:text-rose-400" title="Delete label" aria-label={`Delete ${label.name}`} disabled={!!busy} onClick={() => setConfirm(true)}>
+              <XCircle className="size-3.5" />
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
