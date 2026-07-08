@@ -14,6 +14,7 @@ import type {
   GitHubListResult,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
+  GitHubPullMergeability,
   GitHubPullMergeMethod,
   GitHubPullReviewCommentsResult,
   GitHubPullMergeResult,
@@ -55,6 +56,7 @@ export type {
   GitHubListResult,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
+  GitHubPullMergeability,
   GitHubPullMergeMethod,
   GitHubPullReviewCommentsResult,
   GitHubPullMergeResult,
@@ -325,6 +327,18 @@ export const api = {
     });
     return j<GitHubChecksResult>(`/github/pull-checks?${q.toString()}`);
   },
+  getGitHubPullMergeability: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullMergeability>(`/github/pull-mergeability?${q.toString()}`);
+  },
+  updateGitHubPullBranch: (input: { path: string; number: number }) =>
+    j<{ ok: true; message?: string }>("/github/pull-update-branch", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   getGitHubPullDefaults: (input: { path: string }) => {
     const q = new URLSearchParams({ path: input.path });
     return j<GitHubPullDefaultsResult>(`/github/pull-defaults?${q.toString()}`);

@@ -12,6 +12,7 @@ import type {
   GitHubMilestone,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
+  GitHubPullMergeability,
   GitHubPullMergeMethod,
   GitHubPullReviewCommentsResult,
   GitHubPullMergeResult,
@@ -138,6 +139,7 @@ type GitHubCommentResponse = ({ ok: true; comment: GitHubComment }) | GitHubList
 type GitHubPullLineCommentResponse = ({ ok: true; comment: GitHubPullLineComment }) | GitHubListError;
 type GitHubPullReviewCommentsResponse = ({ ok: true } & GitHubPullReviewCommentsResult) | GitHubListError;
 type GitHubChecksResponse = ({ ok: true } & GitHubChecksResult) | GitHubListError;
+type GitHubMergeabilityResponse = ({ ok: true } & GitHubPullMergeability) | GitHubListError;
 type GitHubActionResponse = ({ ok: true; message?: string; item?: GitHubListItem; commentPosted?: boolean }) | GitHubListError;
 type GitHubPullMergeResponse = GitHubPullMergeResult | GitHubListError;
 type GitHubPullDefaultsResponse = ({ ok: true } & GitHubPullDefaultsResult) | GitHubListError;
@@ -260,6 +262,7 @@ export const __githubInternals = {
   normalizeCheckRun,
   reviewValidationError,
   buildIssueUpdatePatch,
+  normalizeMergeability,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -1088,4 +1091,76 @@ export async function requestGitHubPullReviewers(
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
   return { ok: true, message: `Requested review from ${reviewers.join(", ")}.` };
+}
+
+function pickString(obj: Record<string, unknown>, key: string): string {
+  return typeof obj[key] === "string" ? (obj[key] as string) : "";
+}
+
+function normalizeMergeability(repo: GitHubRepo, number: number, raw: unknown): GitHubPullMergeability | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const head = obj.head && typeof obj.head === "object" ? obj.head as Record<string, unknown> : {};
+  const base = obj.base && typeof obj.base === "object" ? obj.base as Record<string, unknown> : {};
+  return {
+    repo: repoSlug(repo),
+    pullNumber: number,
+    mergeable: typeof obj.mergeable === "boolean" ? obj.mergeable : null,
+    mergeableState: pickString(obj, "mergeable_state") || "unknown",
+    rebaseable: typeof obj.rebaseable === "boolean" ? obj.rebaseable : null,
+    merged: obj.merged === true,
+    draft: obj.draft === true,
+    headRef: pickString(head, "ref"),
+    baseRef: pickString(base, "ref"),
+    headSha: pickString(head, "sha"),
+  };
+}
+
+export async function getGitHubPullMergeability(input: GitHubItemNumberInput): Promise<GitHubMergeabilityResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+
+  const token = await githubToken();
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  // GitHub computes `mergeable` asynchronously — the first read after a push can
+  // return null. Poll a couple of times before giving up so the UI usually gets
+  // a real verdict without the user hitting refresh.
+  let last: GitHubPullMergeability | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 1_200));
+    const res = await fetchGitHub(url, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const json = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+    const parsed = normalizeMergeability(repo, input.number, json);
+    if (!parsed) return { ok: false, error: "GitHub returned an unexpected pull request response" };
+    last = parsed;
+    // A merged/closed PR, or a computed verdict, is terminal — stop polling.
+    if (parsed.merged || parsed.mergeable !== null) break;
+  }
+  return last ? { ok: true, ...last } : { ok: false, error: "GitHub did not return mergeability for this pull request" };
+}
+
+export async function updateGitHubPullBranch(input: GitHubItemNumberInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to update the branch" };
+  // Merges the base branch into the PR head. 202 Accepted with a message body.
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/update-branch`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "PUT", body: "{}" });
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const message = json && typeof json === "object" && typeof (json as { message?: unknown }).message === "string"
+    ? (json as { message: string }).message
+    : "Branch update started — GitHub is merging the base branch into this pull request.";
+  return { ok: true, message };
 }

@@ -8,7 +8,10 @@ const {
   normalizeCheckRun,
   reviewValidationError,
   buildIssueUpdatePatch,
+  normalizeMergeability,
 } = __githubInternals;
+
+const REPO = { owner: "o", name: "r" };
 
 function makeItem(overrides: Partial<GitHubListItem> = {}): GitHubListItem {
   return {
@@ -121,4 +124,34 @@ test("buildIssueUpdatePatch trims fields and rejects an empty patch or blank tit
   // no fields at all → error
   expect(buildIssueUpdatePatch({ kind: "issues" }))
     .toEqual({ ok: false, error: "issue update requires title, body, state, labels, assignees, or milestone" });
+});
+
+test("normalizeMergeability reads mergeable/state and refs, defaulting the unknowns", () => {
+  const full = normalizeMergeability(REPO, 7, {
+    mergeable: true,
+    mergeable_state: "clean",
+    rebaseable: true,
+    merged: false,
+    draft: false,
+    head: { ref: "feature", sha: "abc123" },
+    base: { ref: "main", sha: "def456" },
+  });
+  expect(full).toEqual({
+    repo: "o/r",
+    pullNumber: 7,
+    mergeable: true,
+    mergeableState: "clean",
+    rebaseable: true,
+    merged: false,
+    draft: false,
+    headRef: "feature",
+    baseRef: "main",
+    headSha: "abc123",
+  });
+
+  // mergeable still computing → null; missing mergeable_state → "unknown"; missing head/base → empty strings
+  const partial = normalizeMergeability(REPO, 8, { mergeable: null, merged: false });
+  expect(partial).toMatchObject({ mergeable: null, mergeableState: "unknown", rebaseable: null, headRef: "", baseRef: "", headSha: "" });
+
+  expect(normalizeMergeability(REPO, 9, null)).toBeNull();
 });

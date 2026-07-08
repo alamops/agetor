@@ -737,6 +737,24 @@ export interface GitHubChecksResult {
   checkRuns: GitHubCheckRun[];
 }
 
+/** GitHub's mergeability verdict for a PR, from `GET /pulls/:n`.
+ *  `mergeable` is null while GitHub computes it in the background (poll again).
+ *  `mergeableState` is GitHub's coarse status: clean | dirty (conflicts) |
+ *  behind (base moved) | blocked (required reviews/checks) | unstable (checks
+ *  pending/failing but mergeable) | draft | has_hooks | unknown. */
+export interface GitHubPullMergeability {
+  repo: string;
+  pullNumber: number;
+  mergeable: boolean | null;
+  mergeableState: string;
+  rebaseable: boolean | null;
+  merged: boolean;
+  draft: boolean;
+  headRef: string;
+  baseRef: string;
+  headSha: string;
+}
+
 export type GitHubPullReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
 export type GitHubPullMergeMethod = "merge" | "squash" | "rebase";
 

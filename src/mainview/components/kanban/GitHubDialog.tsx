@@ -44,6 +44,7 @@ import type {
   GitHubComment,
   GitHubListItem,
   GitHubPullLineComment,
+  GitHubPullMergeability,
   Project,
   TaskDiff,
 } from "../../../shared/types.ts";
@@ -108,6 +109,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const commentSeq = useRef(0);
   const reviewCommentSeq = useRef(0);
   const checksSeq = useRef(0);
+  const mergeabilitySeq = useRef(0);
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [diffs, setDiffs] = useState<Record<number, TaskDiff | undefined>>({});
   const [diffLoading, setDiffLoading] = useState<Record<number, boolean | undefined>>({});
@@ -115,6 +117,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [checks, setChecks] = useState<Record<number, GitHubChecksResult | undefined>>({});
   const [checksLoading, setChecksLoading] = useState<Record<number, boolean | undefined>>({});
   const [checksErrors, setChecksErrors] = useState<Record<number, string | undefined>>({});
+  const [mergeability, setMergeability] = useState<Record<number, GitHubPullMergeability | undefined>>({});
+  const [mergeabilityLoading, setMergeabilityLoading] = useState<Record<number, boolean | undefined>>({});
+  const [mergeabilityErrors, setMergeabilityErrors] = useState<Record<number, string | undefined>>({});
   const [comments, setComments] = useState<Record<number, GitHubComment[] | undefined>>({});
   const [commentsLoading, setCommentsLoading] = useState<Record<number, boolean | undefined>>({});
   const [commentErrors, setCommentErrors] = useState<Record<number, string | undefined>>({});
@@ -210,6 +215,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   useEffect(() => {
     diffSeq.current += 1;
     checksSeq.current += 1;
+    mergeabilitySeq.current += 1;
     reviewCommentSeq.current += 1;
     setExpandedKey(null);
     setDiffs({});
@@ -218,6 +224,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setChecks({});
     setChecksLoading({});
     setChecksErrors({});
+    setMergeability({});
+    setMergeabilityLoading({});
+    setMergeabilityErrors({});
     setComments({});
     setCommentsLoading({});
     setCommentErrors({});
@@ -348,6 +357,29 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         setChecksLoading((cur) => ({ ...cur, [number]: false }));
       });
   }, [open, projectPath, expandedItem, checks, checksLoading, checksErrors]);
+
+  useEffect(() => {
+    if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    const number = expandedItem.number;
+    if (mergeability[number] || mergeabilityLoading[number] || mergeabilityErrors[number]) return;
+
+    const requestId = ++mergeabilitySeq.current;
+    setMergeabilityLoading((cur) => ({ ...cur, [number]: true }));
+    setMergeabilityErrors((cur) => ({ ...cur, [number]: undefined }));
+    api.getGitHubPullMergeability({ path: projectPath, number })
+      .then((payload) => {
+        if (requestId !== mergeabilitySeq.current) return;
+        setMergeability((cur) => ({ ...cur, [number]: payload }));
+      })
+      .catch((e: unknown) => {
+        if (requestId !== mergeabilitySeq.current) return;
+        setMergeabilityErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+      })
+      .finally(() => {
+        if (requestId !== mergeabilitySeq.current) return;
+        setMergeabilityLoading((cur) => ({ ...cur, [number]: false }));
+      });
+  }, [open, projectPath, expandedItem, mergeability, mergeabilityLoading, mergeabilityErrors]);
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem) return;
@@ -531,6 +563,30 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       const result = await api.mergeGitHubPull({ path: projectPath, number: item.number, method });
       if (result.merged) markPullClosed(item.number);
       setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Pull request merged." }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
+  const runUpdateBranch = async (item: GitHubListItem) => {
+    if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
+    setActionBusy((cur) => ({ ...cur, [item.number]: "update-branch" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.updateGitHubPullBranch({ path: projectPath, number: item.number });
+      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Branch update started." }));
+      // The head moved, so the cached mergeability, checks, and diff are stale —
+      // clear them so their effects refetch against the new head.
+      setMergeability((cur) => ({ ...cur, [item.number]: undefined }));
+      setMergeabilityErrors((cur) => ({ ...cur, [item.number]: undefined }));
+      setChecks((cur) => ({ ...cur, [item.number]: undefined }));
+      setChecksErrors((cur) => ({ ...cur, [item.number]: undefined }));
+      setDiffs((cur) => ({ ...cur, [item.number]: undefined }));
+      setDiffErrors((cur) => ({ ...cur, [item.number]: undefined }));
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
     } finally {
@@ -964,6 +1020,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 checks={item.kind === "pulls" ? checks[item.number] : undefined}
                 checksLoading={item.kind === "pulls" ? !!checksLoading[item.number] : false}
                 checksError={item.kind === "pulls" ? checksErrors[item.number] : undefined}
+                mergeability={item.kind === "pulls" ? mergeability[item.number] : undefined}
+                mergeabilityLoading={item.kind === "pulls" ? !!mergeabilityLoading[item.number] : false}
+                mergeabilityError={item.kind === "pulls" ? mergeabilityErrors[item.number] : undefined}
                 reviewComments={item.kind === "pulls" ? reviewComments[item.number] : undefined}
                 reviewCommentsLoading={item.kind === "pulls" ? !!reviewCommentsLoading[item.number] : false}
                 reviewCommentError={item.kind === "pulls" ? reviewCommentErrors[item.number] : undefined}
@@ -1010,6 +1069,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onMergeMethodChange={(method) => setMergeMethods((cur) => ({ ...cur, [item.number]: method }))}
                 onReview={(event) => { void runPullReview(item, event); }}
                 onMerge={() => { void runPullMerge(item); }}
+                onUpdateBranch={() => { void runUpdateBranch(item); }}
                 onClosePull={() => { void runPullClose(item); }}
                 onLineComment={(target) => submitLineComment(item, target)}
                 onReviewReplyDraftChange={(commentId, body) => setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: body }))}
@@ -1045,6 +1105,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                   if (item.kind !== "pulls") return;
                   setChecks((cur) => ({ ...cur, [item.number]: undefined }));
                   setChecksErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                }}
+                onRefreshMergeability={() => {
+                  if (item.kind !== "pulls") return;
+                  setMergeability((cur) => ({ ...cur, [item.number]: undefined }));
+                  setMergeabilityErrors((cur) => ({ ...cur, [item.number]: undefined }));
                 }}
                 onToggle={() => {
                   const key = `${item.kind}-${item.number}`;
@@ -1338,6 +1403,9 @@ function GitHubItemRow({
   checks,
   checksLoading,
   checksError,
+  mergeability,
+  mergeabilityLoading,
+  mergeabilityError,
   reviewComments,
   reviewCommentsLoading,
   reviewCommentError,
@@ -1373,6 +1441,7 @@ function GitHubItemRow({
   onMergeMethodChange,
   onReview,
   onMerge,
+  onUpdateBranch,
   onClosePull,
   onLineComment,
   onReviewReplyDraftChange,
@@ -1390,6 +1459,7 @@ function GitHubItemRow({
   onRetryChecks,
   onRefreshDiff,
   onRefreshChecks,
+  onRefreshMergeability,
   onToggle,
 }: {
   item: GitHubListItem;
@@ -1400,6 +1470,9 @@ function GitHubItemRow({
   checks?: GitHubChecksResult;
   checksLoading: boolean;
   checksError?: string;
+  mergeability?: GitHubPullMergeability;
+  mergeabilityLoading: boolean;
+  mergeabilityError?: string;
   reviewComments?: GitHubPullLineComment[];
   reviewCommentsLoading: boolean;
   reviewCommentError?: string;
@@ -1435,6 +1508,7 @@ function GitHubItemRow({
   onMergeMethodChange: (method: GitHubPullMergeMethod) => void;
   onReview: (event: GitHubPullReviewEvent) => void;
   onMerge: () => void;
+  onUpdateBranch: () => void;
   onClosePull: () => void;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onReviewReplyDraftChange: (commentId: number, body: string) => void;
@@ -1452,6 +1526,7 @@ function GitHubItemRow({
   onRetryChecks: () => void;
   onRefreshDiff: () => void;
   onRefreshChecks: () => void;
+  onRefreshMergeability: () => void;
   onToggle: () => void;
 }) {
   const stateClass = item.state === "open" ? "text-emerald-400" : "text-violet-400";
@@ -1576,12 +1651,17 @@ function GitHubItemRow({
                 busy={actionBusy}
                 error={actionSource === "actions" ? actionError : undefined}
                 message={actionSource === "actions" ? actionMessage : undefined}
+                mergeability={mergeability}
+                mergeabilityLoading={mergeabilityLoading}
+                mergeabilityError={mergeabilityError}
                 onReviewDraftChange={onReviewDraftChange}
                 onCloseDraftChange={onCloseDraftChange}
                 onMergeMethodChange={onMergeMethodChange}
                 onReview={onReview}
                 onMerge={onMerge}
+                onUpdateBranch={onUpdateBranch}
                 onClosePull={onClosePull}
+                onRefreshMergeability={onRefreshMergeability}
               />
               <PullTriage
                 labelDraft={labelDraft}
@@ -1651,6 +1731,49 @@ function checkClass(run: GitHubCheckRun): string {
     return "text-emerald-400";
   }
   return "text-rose-400";
+}
+
+type MergeTone = "ok" | "warn" | "bad" | "muted";
+const MERGE_TONE_CLASS: Record<MergeTone, string> = {
+  ok: "text-emerald-400",
+  warn: "text-amber-400",
+  bad: "text-rose-400",
+  muted: "text-muted-foreground",
+};
+
+/** Map GitHub's mergeable/mergeable_state into a label, colour, whether the
+ *  Merge button should be enabled, and whether to offer "Update branch". */
+function mergeabilityView(m: GitHubPullMergeability): {
+  label: string;
+  tone: MergeTone;
+  canMerge: boolean;
+  showUpdateBranch: boolean;
+} {
+  if (m.mergeable === null) {
+    return {
+      label: "GitHub is still checking mergeability…",
+      tone: "muted",
+      canMerge: false,
+      showUpdateBranch: m.mergeableState === "behind",
+    };
+  }
+  switch (m.mergeableState) {
+    case "clean":
+    case "has_hooks":
+      return { label: "Ready to merge", tone: "ok", canMerge: m.mergeable, showUpdateBranch: false };
+    case "unstable":
+      return { label: "Mergeable — some checks are pending or failing", tone: "warn", canMerge: m.mergeable, showUpdateBranch: false };
+    case "behind":
+      return { label: "Out of date with the base branch", tone: "warn", canMerge: m.mergeable, showUpdateBranch: true };
+    case "dirty":
+      return { label: "Conflicts must be resolved before merging", tone: "bad", canMerge: false, showUpdateBranch: false };
+    case "blocked":
+      return { label: "Blocked by required reviews or checks", tone: "bad", canMerge: false, showUpdateBranch: false };
+    case "draft":
+      return { label: "Draft — mark ready for review to merge", tone: "muted", canMerge: false, showUpdateBranch: false };
+    default:
+      return { label: `Mergeability: ${m.mergeableState}`, tone: "muted", canMerge: m.mergeable, showUpdateBranch: false };
+  }
 }
 
 function IssueActions({
@@ -1910,12 +2033,17 @@ function PullActions({
   busy,
   error,
   message,
+  mergeability,
+  mergeabilityLoading,
+  mergeabilityError,
   onReviewDraftChange,
   onCloseDraftChange,
   onMergeMethodChange,
   onReview,
   onMerge,
+  onUpdateBranch,
   onClosePull,
+  onRefreshMergeability,
 }: {
   item: GitHubListItem;
   reviewDraft: string;
@@ -1924,14 +2052,21 @@ function PullActions({
   busy?: string;
   error?: string;
   message?: string;
+  mergeability?: GitHubPullMergeability;
+  mergeabilityLoading: boolean;
+  mergeabilityError?: string;
   onReviewDraftChange: (body: string) => void;
   onCloseDraftChange: (body: string) => void;
   onMergeMethodChange: (method: GitHubPullMergeMethod) => void;
   onReview: (event: GitHubPullReviewEvent) => void;
   onMerge: () => void;
+  onUpdateBranch: () => void;
   onClosePull: () => void;
+  onRefreshMergeability: () => void;
 }) {
   const disabled = item.state !== "open" || !!busy;
+  const view = item.state === "open" && mergeability ? mergeabilityView(mergeability) : null;
+  const mergeDisabled = disabled || (view ? !view.canMerge : false);
   return (
     <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -1955,6 +2090,46 @@ function PullActions({
           </span>
         )}
       </div>
+
+      {item.state === "open" && (
+        <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-border/50 bg-background/40 px-3 py-2">
+          {mergeabilityLoading && !mergeability ? (
+            <span className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              <Loader2 className="size-3.5 animate-spin" /> Checking mergeability…
+            </span>
+          ) : mergeabilityError ? (
+            <span className="inline-flex items-center gap-1.5 text-[11px] text-rose-400">
+              <AlertCircle className="size-3.5" /> {mergeabilityError}
+            </span>
+          ) : view ? (
+            <span className={cn("inline-flex items-center gap-1.5 text-[11px]", MERGE_TONE_CLASS[view.tone])}>
+              <span className={cn("size-2 shrink-0 rounded-full bg-current")} />
+              {view.label}
+            </span>
+          ) : (
+            <span className="text-[11px] text-muted-foreground">Mergeability unavailable.</span>
+          )}
+          <div className="ml-auto flex items-center gap-2">
+            {view?.showUpdateBranch && (
+              <Button size="sm" variant="outline" disabled={disabled} onClick={onUpdateBranch}>
+                {busy === "update-branch" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <ArrowUpFromLine className="mr-2 size-3.5" />}
+                Update branch
+              </Button>
+            )}
+            <Button
+              size="icon"
+              variant="ghost"
+              className="size-6"
+              title="Refresh mergeability"
+              aria-label="Refresh mergeability"
+              disabled={mergeabilityLoading}
+              onClick={onRefreshMergeability}
+            >
+              {mergeabilityLoading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+            </Button>
+          </div>
+        </div>
+      )}
 
       <div className="grid gap-3 lg:grid-cols-3">
         <div className="min-w-0">
@@ -2014,7 +2189,8 @@ function PullActions({
           <Button
             size="sm"
             className="mt-2"
-            disabled={disabled}
+            disabled={mergeDisabled}
+            title={view && !view.canMerge ? view.label : undefined}
             onClick={onMerge}
           >
             {busy === "merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
