@@ -601,9 +601,10 @@ function buildSearchQuery(slug: string, input: ListGitHubItemsInput): string {
   if (input.assignedToMe) parts.push("assignee:@me");
   else if (assignee) parts.push(`assignee:${assignee}`);
   if (input.reviewRequested && input.kind === "pulls") parts.push("review-requested:@me");
-  // Raw user-typed qualifiers ride along verbatim (the `repo:` scope above still
-  // applies, so they refine within this project's repo).
-  const raw = input.searchQuery?.trim();
+  // Raw user-typed qualifiers ride along, but strip any `repo:` they typed so the
+  // prepended project scope stays authoritative (a second `repo:` ORs in another
+  // repo, whose numbers/urls the single-repo UI can't render coherently).
+  const raw = (input.searchQuery ?? "").replace(/(?:^|\s)repo:\S+/gi, " ").replace(/\s+/g, " ").trim();
   if (raw) parts.push(raw);
   return parts.join(" ");
 }
@@ -653,6 +654,9 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
       // The Search API is rate-limited far tighter than the core API (~30/min).
       if (useSearch && res.status === 403 && /rate limit/i.test(msg)) {
         msg = "GitHub search is rate-limited (~30 requests/minute) — wait a moment and try again.";
+      } else if (useSearch && res.status === 422) {
+        // GitHub's own "Validation Failed" is opaque — the query syntax is the fault.
+        msg = "Invalid GitHub search query — check your qualifiers (e.g. is:open label:bug sort:updated).";
       }
       return { ok: false, error: msg };
     }

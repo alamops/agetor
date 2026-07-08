@@ -104,6 +104,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // When on, the search box holds raw GitHub search qualifiers sent server-side
   // via the Search API, instead of a client-side substring filter.
   const [searchSyntax, setSearchSyntax] = useState(false);
+  // In GH mode the box is committed explicitly (Enter), not live-searched — so a
+  // half-typed qualifier doesn't fire an invalid Search request on every keystroke.
+  const [searchSubmitted, setSearchSubmitted] = useState("");
+  const effectiveQuery = searchSyntax ? searchSubmitted : query;
   const [labels, setLabels] = useState("");
   const [assignee, setAssignee] = useState("");
   // "Involvement" quick filters (served via the Search API on the backend).
@@ -218,9 +222,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         kind,
         state,
         // The one search box is either a client-side substring filter or raw
-        // GitHub search qualifiers, depending on the GH toggle.
+        // GitHub search qualifiers (committed on Enter), depending on the GH toggle.
         query: searchSyntax ? "" : query,
-        searchQuery: searchSyntax ? query : "",
+        searchQuery: searchSyntax ? searchSubmitted : "",
         labels: splitLabels(labels),
         assignee,
         createdByMe,
@@ -247,7 +251,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     const t = setTimeout(() => { void load(requestId); }, 250);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, projectPath, kind, state, query, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested]);
+  }, [open, projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested]);
 
   useEffect(() => {
     diffSeq.current += 1;
@@ -293,7 +297,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setActionErrors({});
     setActionMessages({});
     setActionSource({});
-  }, [projectPath, kind, state, query, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested]);
+  }, [projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested]);
 
   // "Review requested" is a PR-only qualifier — drop it when viewing issues.
   useEffect(() => {
@@ -1139,7 +1143,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={searchSyntax ? "GitHub search: is:open label:bug sort:updated…" : "Search title, body, number, author…"}
+            onKeyDown={(e) => {
+              if (searchSyntax && e.key === "Enter") {
+                e.preventDefault();
+                setSearchSubmitted(query);
+              }
+            }}
+            placeholder={searchSyntax ? "GitHub search — press Enter (is:open label:bug sort:updated…)" : "Search title, body, number, author…"}
             className="h-8 pl-8 pr-14 text-xs"
           />
           <Button
@@ -1150,9 +1160,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title={
               result?.auth === "none"
                 ? "Sign in to GitHub to use search syntax"
-                : "Toggle GitHub search syntax (is:open author:me label:bug sort:updated…) — runs server-side via the Search API"
+                : "Toggle GitHub search syntax (is:open author:me label:bug sort:updated…) — runs server-side via the Search API on Enter"
             }
-            onClick={() => setSearchSyntax((v) => !v)}
+            onClick={() => {
+              const next = !searchSyntax;
+              setSearchSyntax(next);
+              if (next) setSearchSubmitted(query);
+            }}
           >
             GH
           </Button>
