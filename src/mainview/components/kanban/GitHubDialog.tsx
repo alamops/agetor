@@ -141,6 +141,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // Resolvable review-comment threads (GraphQL), keyed by PR number; matched to
   // the flat review-comments list via each thread's rootCommentId.
   const [reviewThreads, setReviewThreads] = useState<Record<number, GitHubReviewThread[] | undefined>>({});
+  // True when a PR has more than the first 100 review threads (resolve controls
+  // then only cover the first page).
+  const [reviewThreadsTruncated, setReviewThreadsTruncated] = useState<Record<number, boolean | undefined>>({});
   const [reviewCommentsLoading, setReviewCommentsLoading] = useState<Record<number, boolean | undefined>>({});
   const [reviewCommentErrors, setReviewCommentErrors] = useState<Record<number, string | undefined>>({});
   const [reviewReplyDrafts, setReviewReplyDrafts] = useState<Record<number, string | undefined>>({});
@@ -256,6 +259,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setCommentSubmitting({});
     setReviewComments({});
     setReviewThreads({});
+    setReviewThreadsTruncated({});
     setReviewCommentsLoading({});
     setReviewCommentErrors({});
     setReviewReplyDrafts({});
@@ -462,12 +466,14 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     Promise.all([
       api.listGitHubPullReviewComments({ path: projectPath, number }),
       // Threads are supplementary (resolve controls) — degrade to none on failure.
-      api.getGitHubPullReviewThreads({ path: projectPath, number }).catch(() => ({ threads: [] as GitHubReviewThread[] })),
+      api.getGitHubPullReviewThreads({ path: projectPath, number })
+        .catch(() => ({ threads: [] as GitHubReviewThread[], truncated: false })),
     ])
       .then(([commentsPayload, threadsPayload]) => {
         if (requestId !== reviewCommentSeq.current) return;
         setReviewComments((cur) => ({ ...cur, [number]: commentsPayload.comments }));
         setReviewThreads((cur) => ({ ...cur, [number]: threadsPayload.threads }));
+        setReviewThreadsTruncated((cur) => ({ ...cur, [number]: threadsPayload.truncated }));
       })
       .catch((e: unknown) => {
         if (requestId !== reviewCommentSeq.current) return;
@@ -1272,6 +1278,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onSubmitReviewReply={(commentId) => { void submitReviewReply(item, commentId); }}
                 viewerLogin={viewerLogin}
                 reviewThreads={item.kind === "pulls" ? (reviewThreads[item.number] ?? []) : []}
+                reviewThreadsTruncated={item.kind === "pulls" ? !!reviewThreadsTruncated[item.number] : false}
                 onToggleThreadResolved={(thread) => toggleThreadResolved(item, thread)}
                 onEditReviewComment={(commentId, body) => editReviewComment(item, commentId, body)}
                 onDeleteReviewComment={(commentId) => deleteReviewComment(item, commentId)}
@@ -1662,6 +1669,7 @@ function GitHubItemRow({
   onSubmitReviewReply,
   viewerLogin,
   reviewThreads,
+  reviewThreadsTruncated,
   onToggleThreadResolved,
   onEditReviewComment,
   onDeleteReviewComment,
@@ -1742,6 +1750,7 @@ function GitHubItemRow({
   onSubmitReviewReply: (commentId: number) => void;
   viewerLogin: string;
   reviewThreads: GitHubReviewThread[];
+  reviewThreadsTruncated: boolean;
   onToggleThreadResolved: (thread: GitHubReviewThread) => Promise<void>;
   onEditReviewComment: (commentId: number, body: string) => Promise<void>;
   onDeleteReviewComment: (commentId: number) => Promise<void>;
@@ -1932,6 +1941,7 @@ function GitHubItemRow({
                 replySubmitting={reviewReplySubmitting}
                 viewerLogin={viewerLogin}
                 threads={reviewThreads}
+                threadsTruncated={reviewThreadsTruncated}
                 onToggleResolved={onToggleThreadResolved}
                 onEdit={onEditReviewComment}
                 onDelete={onDeleteReviewComment}
@@ -2719,6 +2729,7 @@ function ReviewComments({
   replySubmitting,
   viewerLogin,
   threads,
+  threadsTruncated,
   onToggleResolved,
   onEdit,
   onDelete,
@@ -2733,6 +2744,7 @@ function ReviewComments({
   replySubmitting: Record<number, boolean | undefined>;
   viewerLogin: string;
   threads: GitHubReviewThread[];
+  threadsTruncated: boolean;
   onToggleResolved: (thread: GitHubReviewThread) => Promise<void>;
   onEdit: (commentId: number, body: string) => Promise<void>;
   onDelete: (commentId: number) => Promise<void>;
@@ -2768,6 +2780,13 @@ function ReviewComments({
           </div>
         )}
       </div>
+
+      {threadsTruncated && (
+        <div className="mb-2 flex items-start gap-1.5 text-[11px] text-amber-400">
+          <AlertCircle className="mt-px size-3.5 shrink-0" />
+          This pull request has more than 100 review threads — resolve controls cover only the first 100.
+        </div>
+      )}
 
       {loading && (
         <div className="flex items-center justify-center gap-2 rounded-md border border-border/60 py-6 text-sm text-muted-foreground">
@@ -2806,6 +2825,11 @@ function ReviewComments({
                     <span className="inline-flex items-center gap-1 text-emerald-400">
                       <CheckCircle2 className="size-3" />
                       resolved
+                    </span>
+                  )}
+                  {thread?.isOutdated && (
+                    <span className="rounded border border-border/60 px-1.5 py-0.5 text-[10px] uppercase">
+                      outdated
                     </span>
                   )}
                   {thread && (

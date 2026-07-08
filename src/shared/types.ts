@@ -738,6 +738,9 @@ export interface GitHubPullReviewThreadsResult {
   repo: string;
   pullNumber: number;
   threads: GitHubReviewThread[];
+  /** True when GitHub reported more than the first page of review threads, so
+   *  the resolve controls only cover the first 100. */
+  truncated: boolean;
 }
 
 export interface GitHubCheckRun {

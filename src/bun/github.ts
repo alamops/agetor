@@ -330,6 +330,7 @@ export const __githubInternals = {
   sanitizeReviewComments,
   commentUrl,
   parseReviewThreads,
+  reviewThreadsHasNextPage,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -1435,6 +1436,19 @@ function parseReviewThreads(json: unknown): GitHubReviewThread[] {
   return threads;
 }
 
+/** Whether the reviewThreads connection reported another page (we only fetch
+ *  the first 100), so the UI can flag that later threads lack resolve controls. */
+function reviewThreadsHasNextPage(json: unknown): boolean {
+  if (!json || typeof json !== "object") return false;
+  const data = (json as { data?: unknown }).data;
+  const pr = data && typeof data === "object"
+    ? (data as { repository?: { pullRequest?: unknown } }).repository?.pullRequest
+    : undefined;
+  const threads = pr && typeof pr === "object" ? (pr as { reviewThreads?: unknown }).reviewThreads : undefined;
+  const pageInfo = threads && typeof threads === "object" ? (threads as { pageInfo?: unknown }).pageInfo : undefined;
+  return !!pageInfo && typeof pageInfo === "object" && (pageInfo as { hasNextPage?: unknown }).hasNextPage === true;
+}
+
 export async function getGitHubPullReviewThreads(input: GitHubItemNumberInput): Promise<GitHubReviewThreadsResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
@@ -1443,10 +1457,13 @@ export async function getGitHubPullReviewThreads(input: GitHubItemNumberInput): 
   }
 
   const token = await githubToken();
-  if (!token) return { ok: true, repo: repoSlug(repo), pullNumber: input.number, threads: [] };
+  if (!token) return { ok: true, repo: repoSlug(repo), pullNumber: input.number, threads: [], truncated: false };
+  // `comments(first:1)` is the thread's ROOT comment — GitHub returns a review
+  // thread's comments oldest-first, so the first is the one that started the
+  // thread, and its databaseId matches the REST review-comment id the UI keys on.
   const query = `query($owner:String!,$name:String!,$number:Int!){`
     + `repository(owner:$owner,name:$name){pullRequest(number:$number){`
-    + `reviewThreads(first:100){nodes{id isResolved isOutdated comments(first:1){nodes{databaseId}}}}}}}`;
+    + `reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated comments(first:1){nodes{databaseId}}}}}}}`;
   const res = await fetchGitHub(
     "https://api.github.com/graphql",
     token,
@@ -1458,7 +1475,13 @@ export async function getGitHubPullReviewThreads(input: GitHubItemNumberInput): 
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
   const gqlError = graphqlErrorMessage(json);
   if (gqlError) return { ok: false, error: gqlError };
-  return { ok: true, repo: repoSlug(repo), pullNumber: input.number, threads: parseReviewThreads(json) };
+  return {
+    ok: true,
+    repo: repoSlug(repo),
+    pullNumber: input.number,
+    threads: parseReviewThreads(json),
+    truncated: reviewThreadsHasNextPage(json),
+  };
 }
 
 export async function setGitHubReviewThreadResolved(

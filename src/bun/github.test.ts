@@ -14,6 +14,7 @@ const {
   sanitizeReviewComments,
   commentUrl,
   parseReviewThreads,
+  reviewThreadsHasNextPage,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -214,6 +215,16 @@ test("parseReviewThreads extracts id, resolution, and root comment databaseId; d
   ]);
   expect(parseReviewThreads(null)).toEqual([]);
   expect(parseReviewThreads({ data: {} })).toEqual([]);
+});
+
+test("reviewThreadsHasNextPage reads pageInfo.hasNextPage, defaulting false", () => {
+  const page = (hasNextPage: boolean) => ({
+    data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage } } } } },
+  });
+  expect(reviewThreadsHasNextPage(page(true))).toBe(true);
+  expect(reviewThreadsHasNextPage(page(false))).toBe(false);
+  expect(reviewThreadsHasNextPage({ data: { repository: { pullRequest: {} } } })).toBe(false);
+  expect(reviewThreadsHasNextPage(null)).toBe(false);
 });
 
 test("commentUrl maps kind to the right endpoint segment", () => {
