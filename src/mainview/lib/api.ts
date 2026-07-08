@@ -307,6 +307,7 @@ export const api = {
     createdByMe?: boolean;
     assignedToMe?: boolean;
     reviewRequested?: boolean;
+    searchQuery?: string;
   }) => {
     const q = new URLSearchParams({
       path: input.path,
@@ -319,6 +320,7 @@ export const api = {
     if (input.createdByMe) q.set("createdByMe", "1");
     if (input.assignedToMe) q.set("assignedToMe", "1");
     if (input.reviewRequested) q.set("reviewRequested", "1");
+    if (input.searchQuery) q.set("searchQuery", input.searchQuery);
     return j<GitHubListResult>(`/github/items?${q.toString()}`);
   },
   getGitHubPullDiff: (input: { path: string; number: number }) => {

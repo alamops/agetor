@@ -240,6 +240,9 @@ test("buildSearchQuery composes repo/kind/state + involvement + label/assignee q
   // a free-text assignee is used when assignedToMe is off
   expect(buildSearchQuery("o/r", { ...base, assignee: "alice" }))
     .toBe("repo:o/r is:pr is:open assignee:alice");
+  // raw user qualifiers ride along verbatim, after the composed scope
+  expect(buildSearchQuery("o/r", { ...base, createdByMe: true, searchQuery: "label:bug sort:updated" }))
+    .toBe("repo:o/r is:pr is:open author:@me label:bug sort:updated");
 });
 
 test("commentUrl maps kind to the right endpoint segment", () => {

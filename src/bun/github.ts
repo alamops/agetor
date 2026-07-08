@@ -56,6 +56,9 @@ interface ListGitHubItemsInput {
   createdByMe?: boolean;
   assignedToMe?: boolean;
   reviewRequested?: boolean;
+  // Raw GitHub search qualifiers typed by the user (e.g. `label:bug sort:updated`).
+  // When present, forces the Search API and is appended to the composed query.
+  searchQuery?: string;
 }
 
 interface GetGitHubPullDiffInput {
@@ -598,6 +601,10 @@ function buildSearchQuery(slug: string, input: ListGitHubItemsInput): string {
   if (input.assignedToMe) parts.push("assignee:@me");
   else if (assignee) parts.push(`assignee:${assignee}`);
   if (input.reviewRequested && input.kind === "pulls") parts.push("review-requested:@me");
+  // Raw user-typed qualifiers ride along verbatim (the `repo:` scope above still
+  // applies, so they refine within this project's repo).
+  const raw = input.searchQuery?.trim();
+  if (raw) parts.push(raw);
   return parts.join(" ");
 }
 
@@ -609,11 +616,11 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
   const slug = repoSlug(repo);
   const labels = input.labels?.map((s) => s.trim()).filter(Boolean) ?? [];
   const assignee = input.assignee?.trim() ?? "";
-  // @me / review-requested need the Search API — the list endpoints can't filter
-  // a PR by author or reviewer. Requires auth (`@me` resolves to the token user).
-  const useSearch = !!(input.createdByMe || input.assignedToMe || input.reviewRequested);
+  // @me / review-requested / raw qualifiers need the Search API — the list
+  // endpoints can't filter a PR by author or reviewer. Requires auth.
+  const useSearch = !!(input.createdByMe || input.assignedToMe || input.reviewRequested || input.searchQuery?.trim());
   if (useSearch && !token) {
-    return { ok: false, error: "GitHub authentication required to filter by your own involvement" };
+    return { ok: false, error: "GitHub authentication required for search / involvement filters" };
   }
 
   let url: URL;
