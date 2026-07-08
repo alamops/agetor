@@ -752,6 +752,105 @@ export function sessionExistsByName(name: string): boolean {
   return tmux(["has-session", "-t", name]).ok;
 }
 
+/** Tri-state liveness of a tmux session — the safe signal for the death watch. */
+export type SessionLiveness = "alive" | "gone" | "unreachable";
+
+/**
+ * Classify a tmux session's liveness from a single `has-session` probe,
+ * distinguishing the two states a bare `.ok` boolean fatally conflates:
+ *
+ *   - `alive`       — the session answered; it's up.
+ *   - `gone`        — an UNAMBIGUOUS death: the server answered but this session
+ *                     is absent ("session not found"), or the whole server is
+ *                     down ("no server running" / "lost server"). While a turn
+ *                     is in flight our own session keeps the shared server
+ *                     alive, so a no-server report means our session died too;
+ *                     these strings are never emitted spuriously.
+ *   - `unreachable` — anything else: a busy-server EAGAIN ("resource temporarily
+ *                     unavailable"), an ambiguous bare "error connecting …", an
+ *                     empty message, or an unrecognized error. INCONCLUSIVE —
+ *                     must never be treated as a death.
+ *
+ * The death watch used to fire on any non-zero `has-session` exit after two
+ * ~400ms misses, which abandoned live, working sessions whenever the shared
+ * tmux server hiccuped under load (a heavy git op flooding a pane, many
+ * concurrent agetor sessions). We don't have the incident's exact transient
+ * string, so the bias is deliberately conservative: ONLY known-unambiguous
+ * death strings are `gone`; every ambiguous or unrecognized error is
+ * `unreachable` and cannot trip a death. That guarantees a transient probe
+ * failure never abandons a live session (the original bug), while still
+ * detecting a genuinely-dead session or server the moment tmux says so (instead
+ * of waiting for boot `reconcileOrphans`).
+ */
+export function sessionLiveness(name: string): SessionLiveness {
+  const r = tmux(["has-session", "-t", name]);
+  if (r.ok) return "alive";
+  const err = `${r.stderr} ${r.stdout}`.toLowerCase();
+  // Only UNAMBIGUOUS death strings count as `gone`:
+  //  - server answered, this session absent: "can't find session" /
+  //    "session not found" / "no such session".
+  //  - server itself dead: "no server running" / "lost server". During an
+  //    in-flight turn our own session keeps the shared server alive, so a server
+  //    reporting no-server has died and taken our session with it. These strings
+  //    are never emitted spuriously — a busy-but-alive server still accepts the
+  //    connection, so it can't say "no server running".
+  if (
+    err.includes("find session") ||
+    err.includes("session not found") ||
+    err.includes("no such session") ||
+    err.includes("no server running") ||
+    err.includes("lost server")
+  ) {
+    return "gone";
+  }
+  // Everything else is INCONCLUSIVE → `unreachable`, never a death: a busy-server
+  // EAGAIN ("resource temporarily unavailable"), a bare "error connecting …"
+  // (ambiguous — transient EAGAIN vs. a vanished socket), an empty message from
+  // a torn-down client, or any error string we don't recognize. Biasing the
+  // unknown case to `unreachable` is what guarantees a transient probe failure
+  // can never abandon a live session — the original bug, whose exact transient
+  // string we can't assume. A genuinely-dead session/server that only ever
+  // emits an unrecognized error degrades to boot `reconcileOrphans`.
+  return "unreachable";
+}
+
+/** True when `path` was written within `windowMs` — used as a death-watch veto:
+ *  a log file the agent touched a beat ago proves it's alive even if a single
+ *  `has-session` probe raced a kill/recreate. Silent (false) on a missing file. */
+export function fileWrittenWithin(path: string, windowMs: number): boolean {
+  try {
+    return Date.now() - fsStatSync(path).mtimeMs < windowMs;
+  } catch {
+    return false;
+  }
+}
+
+/** What a single death-watch poll should do given this tick's signals.
+ *   - `reset` — the session is alive/unreachable, or its log was just written
+ *               (provably alive): zero the miss counter.
+ *   - `wait`  — a `gone` probe with a stale log, but not yet enough consecutive
+ *               ones: increment and keep watching.
+ *   - `fire`  — `threshold` consecutive `gone`+stale probes: declare death. */
+export type DeathTickOutcome = "reset" | "wait" | "fire";
+
+/**
+ * Pure per-tick decision for the death watch, factored out so the destructive
+ * branch is unit-testable without real timers or a live tmux server. `misses`
+ * is the run of consecutive death-signalling ticks BEFORE this one.
+ *
+ * Only a definitive `gone` counts toward death; `alive`/`unreachable` (a busy-
+ * server EAGAIN) and a freshly-written log both reset — either proves the
+ * session isn't actually dead, so a transient probe failure can never abandon a
+ * live session.
+ */
+export function deathTickOutcome(
+  args: { liveness: SessionLiveness; logFresh: boolean; misses: number; threshold: number },
+): DeathTickOutcome {
+  if (args.liveness !== "gone") return "reset";
+  if (args.logFresh) return "reset";
+  return args.misses + 1 < args.threshold ? "wait" : "fire";
+}
+
 /** Kill any tmux session for the given task. Idempotent / silent on miss. */
 export function killTaskSession(taskId: string): void {
   tmux(["kill-session", "-t", sessionNameFor(taskId)]);
@@ -2535,9 +2634,17 @@ const DEATH_POLL_MS = 400;
  *  bytes (a real end_turn that landed just before the session died) are
  *  flushed and read first — matches codex-tmux's DEATH_GRACE_MS. */
 const DEATH_GRACE_MS = 250;
-/** Consecutive `has-session` misses required before declaring death — debounces
- *  a lone transient tmux failure. Shared spelling with codex-tmux. */
-const DEATH_MISS_THRESHOLD = 2;
+/** Consecutive definitive `gone` probes required before declaring death —
+ *  debounces a transient tmux failure. Now that only a `gone` (server up,
+ *  session absent) probe counts — an `unreachable` server hiccup resets the
+ *  counter — this is ~1.6s of the session being provably absent. Exported so
+ *  codex-tmux's death watch shares the exact `deathTickOutcome` contract rather
+ *  than a hand-copied "mirror" that could silently drift. */
+export const DEATH_MISS_THRESHOLD = 4;
+/** A log file written within this window vetoes a death: the agent is provably
+ *  alive, so a lone `gone` probe that raced a kill/recreate can't settle it.
+ *  Exported and shared with codex-tmux (see `DEATH_MISS_THRESHOLD`). */
+export const DEATH_JSONL_QUIET_MS = 3_000;
 
 /**
  * Settle an in-flight turn because its tmux session died unexpectedly.
@@ -2605,16 +2712,26 @@ function turnInFlight(state: SessionState): boolean {
  *  Stop/delete can't be mistaken for an unexpected death). */
 function startDeathWatch(state: SessionState): void {
   if (state.deathTimer) return;
-  // Require two consecutive `has-session` misses before declaring death, so a
-  // single transient `tmux has-session` failure (server momentarily busy, a
-  // hiccup on the shared socket) can't be mistaken for a dead session and
-  // wrongly block a live task. Reset on any tick where the session is present
-  // or no turn is running.
+  // Only a definitive `gone` probe (tmux server answered, this session absent)
+  // counts toward death; an `unreachable` server hiccup on the shared socket
+  // resets the counter (see `sessionLiveness`). Require DEATH_MISS_THRESHOLD
+  // consecutive `gone` probes, and veto on recent JSONL writes, so a live task
+  // is never wrongly blocked. Reset on any tick where the session is alive/
+  // unreachable, the JSONL was just written, or no turn is running.
   let misses = 0;
   state.deathTimer = setInterval(() => {
     if (!turnInFlight(state)) { misses = 0; return; } // idle — no running turn; skip the tmux poll
-    if (sessionExistsByName(state.sessionName)) { misses = 0; return; }
-    if (++misses < DEATH_MISS_THRESHOLD) return;
+    // Compute the log-recency veto lazily — it only matters for a `gone` probe,
+    // and `gone` is the rare tick, so we skip a statSync on every `alive` poll.
+    const liveness = sessionLiveness(state.sessionName);
+    const outcome = deathTickOutcome({
+      liveness,
+      logFresh: liveness === "gone" && fileWrittenWithin(state.jsonlPath, DEATH_JSONL_QUIET_MS),
+      misses,
+      threshold: DEATH_MISS_THRESHOLD,
+    });
+    if (outcome === "reset") { misses = 0; return; }
+    if (outcome === "wait") { misses++; return; }
     if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
     setTimeout(() => {
       flushSync(state);

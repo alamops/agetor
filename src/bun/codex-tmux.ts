@@ -17,8 +17,13 @@ import { dataDir } from "./db.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import {
+  DEATH_JSONL_QUIET_MS,
+  DEATH_MISS_THRESHOLD,
+  deathTickOutcome,
+  fileWrittenWithin,
   killSessionByName,
   sessionExistsByName,
+  sessionLiveness,
   sessionNameFor,
   type ChunkHandler,
   type SpawnedAgent,
@@ -245,11 +250,11 @@ const codexSessions = new Map<string, CodexSessionState>(); // taskId -> state
 const POLL_MS = 150;
 const DEATH_POLL_MS = 400;
 /** Grace after the tmux session disappears before we resolve, so the final
- *  appended bytes (turn.completed) are flushed and read. */
+ *  appended bytes (turn.completed) are flushed and read. Poll + grace stay
+ *  driver-local (codex is one-shot); the death-decision inputs
+ *  `DEATH_MISS_THRESHOLD` + `DEATH_JSONL_QUIET_MS` are imported from claude-tmux
+ *  so both watches share one `deathTickOutcome` contract and can't drift. */
 const DEATH_GRACE_MS = 250;
-/** Consecutive `has-session` misses required before declaring death — debounces
- *  a lone transient tmux failure. Mirrors claude-tmux's DEATH_MISS_THRESHOLD. */
-const DEATH_MISS_THRESHOLD = 2;
 
 function disposeCodexState(state: CodexSessionState): void {
   if (state.watcher) { try { state.watcher.close(); } catch { /* noop */ } state.watcher = null; }
@@ -359,14 +364,24 @@ function startCodexTailer(state: CodexSessionState): Promise<number> {
   // Death watch: when the tmux session disappears the `codex exec` process has
   // exited. Flush whatever's left, then resolve. turn.completed/turn.failed
   // normally resolve us first (via the mapper); this catches a crash that
-  // exits without a terminal event. Require two consecutive `has-session`
-  // misses so a single transient tmux failure isn't mistaken for a dead
-  // session (mirrors claude-tmux's DEATH_MISS_THRESHOLD).
+  // exits without a terminal event. Only a definitive `gone` probe (server up,
+  // this session absent) counts toward death — an `unreachable` tmux hiccup on
+  // the shared socket resets the counter, and a codex log written a beat ago
+  // vetoes it — so a live one-shot run is never wrongly torn down (mirrors
+  // claude-tmux's death watch; see `sessionLiveness`).
   let misses = 0;
   state.deathTimer = setInterval(() => {
     tryWatch();
-    if (sessionExistsByName(state.sessionName)) { misses = 0; return; }
-    if (++misses < DEATH_MISS_THRESHOLD) return;
+    // Compute the log-recency veto lazily — only a `gone` probe uses it.
+    const liveness = sessionLiveness(state.sessionName);
+    const outcome = deathTickOutcome({
+      liveness,
+      logFresh: liveness === "gone" && fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),
+      misses,
+      threshold: DEATH_MISS_THRESHOLD,
+    });
+    if (outcome === "reset") { misses = 0; return; }
+    if (outcome === "wait") { misses++; return; }
     // Session gone. Give the FS a beat to surface the final bytes, flush, then
     // resolve with whatever terminal code we saw (default: failed — a codex
     // exec that vanished without `turn.completed` did not succeed).
