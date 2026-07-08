@@ -366,6 +366,7 @@ export const __githubInternals = {
   reviewThreadsHasNextPage,
   buildSearchQuery,
   normalizeColor,
+  normalizeRepoLabel,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {

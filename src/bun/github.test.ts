@@ -17,6 +17,7 @@ const {
   reviewThreadsHasNextPage,
   buildSearchQuery,
   normalizeColor,
+  normalizeRepoLabel,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -255,6 +256,16 @@ test("normalizeColor strips a leading # and lowercases, undefined passes through
   expect(normalizeColor("  #abcdef  ")).toBe("abcdef");
   expect(normalizeColor(undefined)).toBeUndefined();
   expect(normalizeColor("")).toBe("");
+});
+
+test("normalizeRepoLabel defaults color/description and drops nameless entries", () => {
+  expect(normalizeRepoLabel({ name: "bug", color: "d73a4a", description: "a defect" }))
+    .toEqual({ name: "bug", color: "d73a4a", description: "a defect" });
+  // missing color/description default to ""
+  expect(normalizeRepoLabel({ name: "wip" })).toEqual({ name: "wip", color: "", description: "" });
+  // no name / junk → null
+  expect(normalizeRepoLabel({ color: "fff" })).toBeNull();
+  expect(normalizeRepoLabel(null)).toBeNull();
 });
 
 test("commentUrl maps kind to the right endpoint segment", () => {

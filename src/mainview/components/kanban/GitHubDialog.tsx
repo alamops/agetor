@@ -386,12 +386,26 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     if (!projectPath) throw new Error("no project selected");
     const { label } = await api.updateGitHubLabel({ path: projectPath, name, ...patch });
     setRepoLabels((cur) => sortLabels([...cur.filter((l) => l.name !== name), label]));
+    // Reconcile the renamed/recolored label on any loaded item so its badge
+    // doesn't show the stale name/color.
+    setResult((cur) => cur && {
+      ...cur,
+      items: cur.items.map((it) => ({
+        ...it,
+        labels: it.labels.map((l) => (l.name === name ? { name: label.name, color: label.color } : l)),
+      })),
+    });
   };
 
   const removeLabel = async (name: string) => {
     if (!projectPath) throw new Error("no project selected");
     await api.deleteGitHubLabel({ path: projectPath, name });
     setRepoLabels((cur) => cur.filter((l) => l.name !== name));
+    // Drop the deleted label from any loaded item that carried it.
+    setResult((cur) => cur && {
+      ...cur,
+      items: cur.items.map((it) => ({ ...it, labels: it.labels.filter((l) => l.name !== name) })),
+    });
   };
 
   useEffect(() => {
@@ -1291,7 +1305,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         {labelManagerOpen && (
           <LabelManager
             labels={repoLabels}
-            canModify={result?.auth !== "none"}
+            authenticated={result?.auth !== "none"}
             onCreate={createLabel}
             onEdit={editLabel}
             onDelete={removeLabel}
@@ -1779,7 +1793,7 @@ function labelSwatch(color: string): string {
 
 function LabelManager({
   labels,
-  canModify,
+  authenticated,
   onCreate,
   onEdit,
   onDelete,
@@ -1787,7 +1801,9 @@ function LabelManager({
   onClose,
 }: {
   labels: GitHubRepoLabel[];
-  canModify: boolean;
+  // A token is present. Note: GitHub still enforces push access — a read-only
+  // collaborator sees the controls but the mutations 403.
+  authenticated: boolean;
   onCreate: (name: string, color: string, description: string) => Promise<void>;
   onEdit: (name: string, patch: { newName?: string; color?: string; description?: string }) => Promise<void>;
   onDelete: (name: string) => Promise<void>;
@@ -1833,7 +1849,7 @@ function LabelManager({
           </Button>
         </div>
       </div>
-      {canModify && (
+      {authenticated && (
         <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)_auto]">
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" className="h-8 text-xs" disabled={creating} />
           <div className="flex items-center gap-1">
@@ -1857,7 +1873,7 @@ function LabelManager({
         {labels.length === 0 ? (
           <div className="px-1 py-2 text-[11px] text-muted-foreground">No labels in this repository.</div>
         ) : (
-          labels.map((l) => <LabelRow key={l.name} label={l} canModify={canModify} onEdit={onEdit} onDelete={onDelete} />)
+          labels.map((l) => <LabelRow key={l.name} label={l} authenticated={authenticated} onEdit={onEdit} onDelete={onDelete} />)
         )}
       </div>
     </div>
@@ -1866,12 +1882,12 @@ function LabelManager({
 
 function LabelRow({
   label,
-  canModify,
+  authenticated,
   onEdit,
   onDelete,
 }: {
   label: GitHubRepoLabel;
-  canModify: boolean;
+  authenticated: boolean;
   onEdit: (name: string, patch: { newName?: string; color?: string; description?: string }) => Promise<void>;
   onDelete: (name: string) => Promise<void>;
 }) {
@@ -1952,7 +1968,7 @@ function LabelRow({
       </span>
       {label.description && <span className="min-w-0 flex-1 truncate text-muted-foreground">{label.description}</span>}
       {error && <span className="truncate text-[11px] text-rose-400">{error}</span>}
-      {canModify && (
+      {authenticated && (
         <div className="ml-auto flex shrink-0 items-center gap-1">
           <Button size="icon" variant="ghost" className="size-6" title="Edit label" aria-label={`Edit ${label.name}`} disabled={!!busy} onClick={() => { reset(); setEditing(true); }}>
             <FilePen className="size-3.5" />
