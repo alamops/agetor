@@ -12,6 +12,7 @@ const {
   draftFromGraphql,
   graphqlErrorMessage,
   sanitizeReviewComments,
+  commentUrl,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -187,6 +188,11 @@ test("sanitizeReviewComments keeps well-formed inline comments and trims, drops 
   ]);
   expect(sanitizeReviewComments(undefined)).toEqual([]);
   expect(sanitizeReviewComments([])).toEqual([]);
+});
+
+test("commentUrl maps kind to the right endpoint segment", () => {
+  expect(commentUrl(REPO, "issue", 42)).toBe("https://api.github.com/repos/o/r/issues/comments/42");
+  expect(commentUrl(REPO, "review", 42)).toBe("https://api.github.com/repos/o/r/pulls/comments/42");
 });
 
 test("graphqlErrorMessage returns the first error message, else null", () => {

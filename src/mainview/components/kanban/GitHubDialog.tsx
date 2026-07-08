@@ -108,6 +108,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // Authenticated user's login, so edit/delete controls appear only on the
   // viewer's own comments. Empty when unauthenticated.
   const [viewerLogin, setViewerLogin] = useState("");
+  // The viewer login is token-scoped (identical across projects), so resolve it
+  // once per session rather than on every open / project switch. A failed lookup
+  // (e.g. the first project has no GitHub remote) leaves it unresolved so a later
+  // project with a remote can still fill it in.
+  const viewerResolved = useRef(false);
   const requestSeq = useRef(0);
   const diffSeq = useRef(0);
   const commentSeq = useRef(0);
@@ -313,11 +318,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   }, [expandedKey, result]);
 
   useEffect(() => {
-    if (!open || !projectPath) return;
+    if (!open || !projectPath || viewerResolved.current) return;
     let cancelled = false;
     api.getGitHubViewer({ path: projectPath })
-      .then((r) => { if (!cancelled) setViewerLogin(r.login); })
-      .catch(() => { if (!cancelled) setViewerLogin(""); });
+      .then((r) => { if (!cancelled) { setViewerLogin(r.login); viewerResolved.current = true; } })
+      // Leave unresolved on failure (e.g. no remote) so a later project retries.
+      .catch(() => { /* keep the current (empty) login */ });
     return () => { cancelled = true; };
   }, [open, projectPath]);
 

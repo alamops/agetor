@@ -318,6 +318,7 @@ export const __githubInternals = {
   draftFromGraphql,
   graphqlErrorMessage,
   sanitizeReviewComments,
+  commentUrl,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
