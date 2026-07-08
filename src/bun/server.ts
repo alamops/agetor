@@ -776,6 +776,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             number?: number;
             event?: string;
             body?: string;
+            comments?: unknown;
           };
           const dir = body.path;
           const rawNumber = body.number;
@@ -787,11 +788,25 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "valid review event required" }, { status: 400, headers: corsHeaders(req) });
           }
           const event = body.event as GitHubPullReviewEvent;
+          // Inline comments are re-validated/sanitized in reviewGitHubPull; here
+          // we just narrow the wire shape.
+          const comments = Array.isArray(body.comments)
+            ? body.comments.flatMap((c) => {
+                if (!c || typeof c !== "object") return [];
+                const o = c as Record<string, unknown>;
+                if (typeof o.path !== "string" || typeof o.body !== "string") return [];
+                if (typeof o.line !== "number") return [];
+                if (o.side !== "LEFT" && o.side !== "RIGHT") return [];
+                const side: "LEFT" | "RIGHT" = o.side === "LEFT" ? "LEFT" : "RIGHT";
+                return [{ path: o.path, line: o.line, side, body: o.body }];
+              })
+            : undefined;
           const result = await reviewGitHubPull({
             dir,
             number: rawNumber,
             event,
             body: typeof body.body === "string" ? body.body : undefined,
+            comments,
           });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });

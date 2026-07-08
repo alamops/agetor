@@ -134,6 +134,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [reviewReplyDrafts, setReviewReplyDrafts] = useState<Record<number, string | undefined>>({});
   const [reviewReplySubmitting, setReviewReplySubmitting] = useState<Record<number, boolean | undefined>>({});
   const [reviewDrafts, setReviewDrafts] = useState<Record<number, string | undefined>>({});
+  // Inline comments queued for the next review submission (the "pending review"
+  // batched flow), keyed by PR number.
+  const [pendingReview, setPendingReview] = useState<Record<number, LineCommentTarget[] | undefined>>({});
   const [closeDrafts, setCloseDrafts] = useState<Record<number, string | undefined>>({});
   const [mergeMethods, setMergeMethods] = useState<Record<number, GitHubPullMergeMethod | undefined>>({});
   const [labelDrafts, setLabelDrafts] = useState<Record<number, string | undefined>>({});
@@ -242,6 +245,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setReviewReplyDrafts({});
     setReviewReplySubmitting({});
     setReviewDrafts({});
+    setPendingReview({});
     setCloseDrafts({});
     setMergeMethods({});
     setLabelDrafts({});
@@ -540,8 +544,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
 
   const runPullReview = async (item: GitHubListItem, event: GitHubPullReviewEvent) => {
     const body = (reviewDrafts[item.number] ?? "").trim();
+    const pending = pendingReview[item.number] ?? [];
     if (!projectPath || actionBusy[item.number]) return;
-    if (event !== "APPROVE" && !body) {
+    // COMMENT/REQUEST_CHANGES need a summary note OR at least one pending inline
+    // comment; APPROVE can be empty.
+    if (event !== "APPROVE" && !body && pending.length === 0) {
       setActionErrors((cur) => ({
         ...cur,
         [item.number]: event === "COMMENT" ? "A review comment requires a note." : "Request changes requires a comment.",
@@ -553,19 +560,40 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
     setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
     try {
-      const result = await api.reviewGitHubPull({ path: projectPath, number: item.number, event, body });
+      const result = await api.reviewGitHubPull({
+        path: projectPath,
+        number: item.number,
+        event,
+        body,
+        comments: pending.map((c) => ({ path: c.filePath, line: c.line, side: c.side, body: c.body })),
+      });
       setActionMessages((cur) => ({
         ...cur,
         [item.number]: result.message ?? (event === "APPROVE"
           ? "Pull request approved."
-          : event === "COMMENT" ? "Review comment posted." : "Changes requested."),
+          : event === "COMMENT" ? "Review submitted." : "Changes requested."),
       }));
       setReviewDrafts((cur) => ({ ...cur, [item.number]: "" }));
+      // The pending inline comments were posted with the review — clear them and
+      // refetch the review-comments list so they show up.
+      if (pending.length > 0) {
+        setPendingReview((cur) => ({ ...cur, [item.number]: [] }));
+        setReviewComments((cur) => ({ ...cur, [item.number]: undefined }));
+        setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+      }
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
     } finally {
       setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
     }
+  };
+
+  const addToReview = (item: GitHubListItem, target: LineCommentTarget) => {
+    setPendingReview((cur) => ({ ...cur, [item.number]: [...(cur[item.number] ?? []), target] }));
+  };
+
+  const removePendingReview = (item: GitHubListItem, index: number) => {
+    setPendingReview((cur) => ({ ...cur, [item.number]: (cur[item.number] ?? []).filter((_, i) => i !== index) }));
   };
 
   const runPullMerge = async (item: GitHubListItem) => {
@@ -1142,6 +1170,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onReopenPull={() => { void runReopenPull(item); }}
                 onToggleDraft={() => { void runToggleDraft(item); }}
                 onClosePull={() => { void runPullClose(item); }}
+                pendingReview={item.kind === "pulls" ? (pendingReview[item.number] ?? []) : []}
+                onAddToReview={(target) => addToReview(item, target)}
+                onRemovePendingReview={(index) => removePendingReview(item, index)}
                 onLineComment={(target) => submitLineComment(item, target)}
                 onReviewReplyDraftChange={(commentId, body) => setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: body }))}
                 onSubmitReviewReply={(commentId) => { void submitReviewReply(item, commentId); }}
@@ -1517,6 +1548,9 @@ function GitHubItemRow({
   onReopenPull,
   onToggleDraft,
   onClosePull,
+  pendingReview,
+  onAddToReview,
+  onRemovePendingReview,
   onLineComment,
   onReviewReplyDraftChange,
   onSubmitReviewReply,
@@ -1586,6 +1620,9 @@ function GitHubItemRow({
   onReopenPull: () => void;
   onToggleDraft: () => void;
   onClosePull: () => void;
+  pendingReview: LineCommentTarget[];
+  onAddToReview: (target: LineCommentTarget) => void;
+  onRemovePendingReview: (index: number) => void;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onReviewReplyDraftChange: (commentId: number, body: string) => void;
   onSubmitReviewReply: (commentId: number) => void;
@@ -1738,6 +1775,7 @@ function GitHubItemRow({
                 onReviewDraftChange={onReviewDraftChange}
                 onCloseDraftChange={onCloseDraftChange}
                 onMergeMethodChange={onMergeMethodChange}
+                pendingCount={pendingReview.length}
                 onReview={onReview}
                 onMerge={onMerge}
                 onUpdateBranch={onUpdateBranch}
@@ -1763,7 +1801,8 @@ function GitHubItemRow({
                 onRequestReviewers={onRequestReviewers}
               />
               <CheckRuns checks={checks} loading={checksLoading} error={checksError} onRetry={onRetryChecks} onRefresh={onRefreshChecks} />
-              <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} />
+              <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} />
+              <PendingReview comments={pendingReview} onRemove={onRemovePendingReview} />
               <ReviewComments
                 comments={reviewComments}
                 loading={reviewCommentsLoading}
@@ -2083,6 +2122,7 @@ function PullActions({
   mergeability,
   mergeabilityLoading,
   mergeabilityError,
+  pendingCount,
   onReviewDraftChange,
   onCloseDraftChange,
   onMergeMethodChange,
@@ -2104,6 +2144,7 @@ function PullActions({
   mergeability?: GitHubPullMergeability;
   mergeabilityLoading: boolean;
   mergeabilityError?: string;
+  pendingCount: number;
   onReviewDraftChange: (body: string) => void;
   onCloseDraftChange: (body: string) => void;
   onMergeMethodChange: (method: GitHubPullMergeMethod) => void;
@@ -2199,11 +2240,19 @@ function PullActions({
 
       <div className="grid gap-3 lg:grid-cols-3">
         <div className="min-w-0">
-          <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Review</div>
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="text-[11px] font-medium uppercase text-muted-foreground">Review</span>
+            {pendingCount > 0 && (
+              <span className="inline-flex items-center gap-1 text-[11px] text-sky-400">
+                <MessageSquare className="size-3 shrink-0" />
+                {pendingCount} inline comment{pendingCount === 1 ? "" : "s"} queued
+              </span>
+            )}
+          </div>
           <Textarea
             value={reviewDraft}
             onChange={(e) => onReviewDraftChange(e.target.value)}
-            placeholder="Review note..."
+            placeholder={pendingCount > 0 ? "Optional review summary — submits the queued comments" : "Review note..."}
             className="min-h-20 resize-y text-xs"
             disabled={disabled}
           />
@@ -2220,7 +2269,7 @@ function PullActions({
             <Button
               size="sm"
               variant="outline"
-              disabled={disabled || !reviewDraft.trim()}
+              disabled={disabled || (!reviewDraft.trim() && pendingCount === 0)}
               onClick={() => onReview("COMMENT")}
             >
               {busy === "COMMENT" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}
@@ -2229,7 +2278,7 @@ function PullActions({
             <Button
               size="sm"
               variant="outline"
-              disabled={disabled || !reviewDraft.trim()}
+              disabled={disabled || (!reviewDraft.trim() && pendingCount === 0)}
               onClick={() => onReview("REQUEST_CHANGES")}
             >
               {busy === "REQUEST_CHANGES" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
@@ -2384,6 +2433,7 @@ function PullDiff({
   onRetry,
   onRefresh,
   onLineComment,
+  onAddToReview,
 }: {
   diff?: TaskDiff;
   loading: boolean;
@@ -2391,6 +2441,7 @@ function PullDiff({
   onRetry: () => void;
   onRefresh: () => void;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
+  onAddToReview: (target: LineCommentTarget) => void;
 }) {
   const totals = useMemo(() => {
     const files = diff?.files ?? [];
@@ -2457,10 +2508,53 @@ function PullDiff({
               key={`${file.oldPath ?? ""}->${file.path}`}
               file={file}
               onLineComment={onLineComment}
+              onAddToReview={onAddToReview}
             />
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function PendingReview({
+  comments,
+  onRemove,
+}: {
+  comments: LineCommentTarget[];
+  onRemove: (index: number) => void;
+}) {
+  if (comments.length === 0) return null;
+  return (
+    <div className="mt-3">
+      <div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground">
+        <MessageSquare className="size-3.5" />
+        Pending review ({comments.length})
+      </div>
+      <div className="flex flex-col gap-2">
+        {comments.map((c, i) => (
+          <div key={`${c.filePath}-${c.side}-${c.line}-${i}`} className="rounded-md border border-border/60 bg-card">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-border/50 px-3 py-2 text-xs text-muted-foreground">
+              <span className="min-w-0 truncate font-mono">{c.filePath}:{c.line}</span>
+              <span>{c.side === "LEFT" ? "old" : "new"} side</span>
+              <Button
+                size="icon"
+                variant="ghost"
+                className="ml-auto size-6"
+                title="Remove from review"
+                aria-label="Remove from review"
+                onClick={() => onRemove(i)}
+              >
+                <XCircle className="size-3.5" />
+              </Button>
+            </div>
+            <div className="whitespace-pre-wrap px-3 py-2 text-sm">{c.body}</div>
+          </div>
+        ))}
+      </div>
+      <p className="mt-2 text-[11px] text-muted-foreground">
+        Submit these with Approve / Comment / Request in the Actions panel above.
+      </p>
     </div>
   );
 }
@@ -2669,9 +2763,11 @@ function CommentBlock({ comment }: { comment: GitHubComment }) {
 function DiffFileBlock({
   file,
   onLineComment,
+  onAddToReview,
 }: {
   file: DiffFile;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
+  onAddToReview: (target: LineCommentTarget) => void;
 }) {
   const meta = STATUS_META[file.status];
   const Icon = meta.icon;
@@ -2691,7 +2787,7 @@ function DiffFileBlock({
         <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>
       ) : (
         <>
-          <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} />
+          <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} onAddToReview={onAddToReview} />
           {file.truncated && (
             <div className="border-t border-border/60 px-3 py-1.5 text-[11px] italic text-muted-foreground">
               Diff truncated because this file's changes are too large to display in full.
@@ -2707,10 +2803,12 @@ function DiffBody({
   file,
   hunks,
   onLineComment,
+  onAddToReview,
 }: {
   file: DiffFile;
   hunks: string;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
+  onAddToReview: (target: LineCommentTarget) => void;
 }) {
   const rows = useMemo(() => toRows(hunks), [hunks]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -2744,6 +2842,15 @@ function DiffBody({
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const queue = (target: Omit<LineCommentTarget, "body">) => {
+    const body = draft.trim();
+    if (!body || submitting) return;
+    onAddToReview({ ...target, body });
+    setSelectedKey(null);
+    setDraft("");
+    setError(null);
   };
 
   return (
@@ -2825,6 +2932,16 @@ function DiffBody({
                     }}
                   >
                     Cancel
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={submitting || !draft.trim()}
+                    title="Queue this comment for a single review submission"
+                    onClick={() => queue(target)}
+                  >
+                    <Plus className="mr-2 size-3.5" />
+                    Add to review
                   </Button>
                   <Button size="sm" disabled={submitting || !draft.trim()} onClick={() => { void submit(target); }}>
                     {submitting ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}

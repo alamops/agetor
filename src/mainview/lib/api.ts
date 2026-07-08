@@ -389,7 +389,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  reviewGitHubPull: (input: { path: string; number: number; event: GitHubPullReviewEvent; body?: string }) =>
+  reviewGitHubPull: (input: {
+    path: string;
+    number: number;
+    event: GitHubPullReviewEvent;
+    body?: string;
+    comments?: { path: string; line: number; side: "LEFT" | "RIGHT"; body: string }[];
+  }) =>
     j<{ ok: true; message?: string }>("/github/pull-review", {
       method: "POST",
       body: JSON.stringify(input),

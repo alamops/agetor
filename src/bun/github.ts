@@ -76,9 +76,19 @@ interface ReplyGitHubPullLineCommentInput extends GitHubItemNumberInput {
   body: string;
 }
 
+interface ReviewCommentDraft {
+  path: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+  body: string;
+}
+
 interface ReviewGitHubPullInput extends GitHubItemNumberInput {
   event: GitHubPullReviewEvent;
   body?: string;
+  /** Inline comments to attach to this single review (the "pending review" /
+   *  batched-comments flow). Each is posted with the review, not individually. */
+  comments?: ReviewCommentDraft[];
 }
 
 interface MergeGitHubPullInput extends GitHubItemNumberInput {
@@ -209,14 +219,32 @@ export function githubRepoFromRemoteForTest(remote: string): string | null {
 /** Validate a PR review submission. Returns an error string, or null if OK.
  *  GitHub rejects a REQUEST_CHANGES or COMMENT review with no body; only APPROVE
  *  may be submitted empty. Pure so it can be unit-tested without the network. */
-function reviewValidationError(event: GitHubPullReviewEvent, body: string): string | null {
+function reviewValidationError(event: GitHubPullReviewEvent, body: string, hasComments = false): string | null {
   if (event !== "APPROVE" && event !== "REQUEST_CHANGES" && event !== "COMMENT") {
     return "unsupported review event";
   }
-  if (event !== "APPROVE" && !body.trim()) {
+  // APPROVE may be empty; COMMENT/REQUEST_CHANGES need a summary body OR at least
+  // one inline comment (the batched "pending review" path supplies the latter).
+  if (event !== "APPROVE" && !body.trim() && !hasComments) {
     return event === "COMMENT" ? "a review comment requires a body" : "request changes requires a comment";
   }
   return null;
+}
+
+/** Keep only well-formed inline review comments (non-empty path/body, a positive
+ *  line, a valid side) and map them to the GitHub reviews API shape. */
+function sanitizeReviewComments(comments: ReviewCommentDraft[] | undefined): { path: string; line: number; side: "LEFT" | "RIGHT"; body: string }[] {
+  if (!Array.isArray(comments)) return [];
+  const clean: { path: string; line: number; side: "LEFT" | "RIGHT"; body: string }[] = [];
+  for (const c of comments) {
+    const path = typeof c?.path === "string" ? c.path.trim() : "";
+    const body = typeof c?.body === "string" ? c.body.trim() : "";
+    const side = c?.side === "LEFT" || c?.side === "RIGHT" ? c.side : null;
+    if (!path || !body || !side) continue;
+    if (!Number.isInteger(c.line) || c.line <= 0) continue;
+    clean.push({ path, line: c.line, side, body });
+  }
+  return clean;
 }
 
 type IssueUpdatePatch = {
@@ -270,6 +298,7 @@ export const __githubInternals = {
   normalizeMergeability,
   draftFromGraphql,
   graphqlErrorMessage,
+  sanitizeReviewComments,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -899,7 +928,8 @@ export async function reviewGitHubPull(input: ReviewGitHubPullInput): Promise<Gi
     return { ok: false, error: "pull request number must be positive" };
   }
   const body = input.body?.trim() ?? "";
-  const invalid = reviewValidationError(input.event, body);
+  const comments = sanitizeReviewComments(input.comments);
+  const invalid = reviewValidationError(input.event, body, comments.length > 0);
   if (invalid) return { ok: false, error: invalid };
 
   const token = await githubToken();
@@ -914,19 +944,21 @@ export async function reviewGitHubPull(input: ReviewGitHubPullInput): Promise<Gi
       body: JSON.stringify({
         event: input.event,
         ...(body ? { body } : {}),
+        ...(comments.length > 0 ? { comments } : {}),
       }),
     },
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const suffix = comments.length > 0 ? ` (${comments.length} inline comment${comments.length === 1 ? "" : "s"})` : "";
   return {
     ok: true,
-    message: input.event === "APPROVE"
+    message: (input.event === "APPROVE"
       ? "Pull request approved."
       : input.event === "COMMENT"
-        ? "Review comment posted."
-        : "Changes requested.",
+        ? "Review submitted."
+        : "Changes requested.") + suffix,
   };
 }
 

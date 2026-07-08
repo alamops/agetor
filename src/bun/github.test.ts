@@ -11,6 +11,7 @@ const {
   normalizeMergeability,
   draftFromGraphql,
   graphqlErrorMessage,
+  sanitizeReviewComments,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -169,6 +170,23 @@ test("draftFromGraphql digs isDraft out of the mutation payload, else null", () 
   expect(draftFromGraphql({ data: {} }, "markPullRequestReadyForReview")).toBeNull();
   expect(draftFromGraphql({ errors: [{ message: "nope" }] }, "markPullRequestReadyForReview")).toBeNull();
   expect(draftFromGraphql(null, "markPullRequestReadyForReview")).toBeNull();
+});
+
+test("sanitizeReviewComments keeps well-formed inline comments and trims, drops the rest", () => {
+  const out = sanitizeReviewComments([
+    { path: " a.ts ", line: 12, side: "RIGHT", body: " looks off " },
+    { path: "b.ts", line: 3, side: "LEFT", body: "old line" },
+    { path: "", line: 5, side: "RIGHT", body: "no path" },
+    { path: "c.ts", line: 0, side: "RIGHT", body: "bad line" },
+    { path: "d.ts", line: 2, side: "MIDDLE" as unknown as "LEFT", body: "bad side" },
+    { path: "e.ts", line: 4, side: "RIGHT", body: "   " },
+  ]);
+  expect(out).toEqual([
+    { path: "a.ts", line: 12, side: "RIGHT", body: "looks off" },
+    { path: "b.ts", line: 3, side: "LEFT", body: "old line" },
+  ]);
+  expect(sanitizeReviewComments(undefined)).toEqual([]);
+  expect(sanitizeReviewComments([])).toEqual([]);
 });
 
 test("graphqlErrorMessage returns the first error message, else null", () => {
