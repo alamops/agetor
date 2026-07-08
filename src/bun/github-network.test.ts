@@ -6,7 +6,9 @@ import { test, expect, beforeAll } from "bun:test";
 import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
 import {
   addGitHubReaction,
+  addGitHubSubIssue,
   applyGitHubSuggestion,
+  getGitHubIssuePinned,
   getGitHubPullLinkedIssues,
   getGitHubViewer,
   listGitHubAssignees,
@@ -14,9 +16,14 @@ import {
   listGitHubMilestones,
   listGitHubPullCommits,
   listGitHubReactions,
+  listGitHubSubIssues,
   removeGitHubReaction,
+  removeGitHubSubIssue,
   requestGitHubPullReviewers,
+  setGitHubIssueLock,
+  setGitHubIssuePinned,
   setGitHubPullAutoMerge,
+  transferGitHubIssue,
 } from "./github.ts";
 
 let REPO_DIR = "";
@@ -592,6 +599,315 @@ test("getGitHubPullLinkedIssues parses closingIssuesReferences nodes from the Gr
       repo: "acme/widgets",
       pullNumber: 3,
       issues: [{ number: 12, title: "Bug A", url: "https://github.com/acme/widgets/issues/12", state: "OPEN" }],
+    });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubIssueLock locking PUTs the lock endpoint with the lock_reason when given", async () => {
+  const mock = mockGitHubFetch([
+    { method: "PUT", match: "/repos/acme/widgets/issues/9/lock", status: 204 },
+  ]);
+  try {
+    const res = await setGitHubIssueLock({ dir: REPO_DIR, number: 9, locked: true, lockReason: "spam" });
+    expect(res).toEqual({ ok: true, locked: true, message: "Conversation locked." });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.method).toBe("PUT");
+    expect(JSON.parse(mock.calls[0]!.body!)).toEqual({ lock_reason: "spam" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubIssueLock locking without a recognized reason PUTs an empty body", async () => {
+  const mock = mockGitHubFetch([
+    { method: "PUT", match: "/repos/acme/widgets/issues/9/lock", status: 204 },
+  ]);
+  try {
+    const res = await setGitHubIssueLock({ dir: REPO_DIR, number: 9, locked: true, lockReason: "not-a-real-reason" });
+    expect(res).toEqual({ ok: true, locked: true, message: "Conversation locked." });
+    expect(JSON.parse(mock.calls[0]!.body!)).toEqual({});
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubIssueLock unlocking DELETEs the lock endpoint with no body", async () => {
+  const mock = mockGitHubFetch([
+    { method: "DELETE", match: "/repos/acme/widgets/issues/9/lock", status: 204 },
+  ]);
+  try {
+    const res = await setGitHubIssueLock({ dir: REPO_DIR, number: 9, locked: false });
+    expect(res).toEqual({ ok: true, locked: false, message: "Conversation unlocked." });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.method).toBe("DELETE");
+    expect(mock.calls[0]!.body).toBeNull();
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubIssuePinned pins via GraphQL after resolving the issue node id", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/issues/9", json: { node_id: "I_kwabc" } },
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { pinIssue: { issue: { isPinned: true } } } },
+    },
+  ]);
+  try {
+    const res = await setGitHubIssuePinned({ dir: REPO_DIR, number: 9, pinned: true });
+    expect(res).toEqual({ ok: true, pinned: true, message: "Issue pinned." });
+    const gqlCall = mock.calls.find((c) => c.url === "https://api.github.com/graphql");
+    const body = JSON.parse(gqlCall!.body!);
+    expect(body.query).toContain("pinIssue");
+    expect(body.variables).toEqual({ id: "I_kwabc" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubIssuePinned unpins via GraphQL", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/issues/9", json: { node_id: "I_kwabc" } },
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { unpinIssue: { issue: { isPinned: false } } } },
+    },
+  ]);
+  try {
+    const res = await setGitHubIssuePinned({ dir: REPO_DIR, number: 9, pinned: false });
+    expect(res).toEqual({ ok: true, pinned: false, message: "Issue unpinned." });
+    const gqlCall = mock.calls.find((c) => c.url === "https://api.github.com/graphql");
+    const body = JSON.parse(gqlCall!.body!);
+    expect(body.query).toContain("unpinIssue");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubIssuePinned maps the max-pinned-issues GraphQL error to a friendly message", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/issues/9", json: { node_id: "I_kwabc" } },
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { errors: [{ message: "You have reached the maximum number of pinned issues for this repository" }] },
+    },
+  ]);
+  try {
+    const res = await setGitHubIssuePinned({ dir: REPO_DIR, number: 9, pinned: true });
+    expect(res).toEqual({
+      ok: false,
+      error: "This repository already has the maximum of 3 pinned issues — unpin one first.",
+    });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubIssuePinned reads isPinned via a read-only GraphQL query", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { repository: { issue: { isPinned: true } } } },
+    },
+  ]);
+  try {
+    const res = await getGitHubIssuePinned({ dir: REPO_DIR, number: 9 });
+    expect(res).toEqual({ ok: true, pinned: true });
+    expect(mock.calls).toHaveLength(1);
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.variables).toEqual({ owner: "acme", name: "widgets", number: 9 });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubSubIssues follows pagination and normalizes each child issue", async () => {
+  const page1 = [{ id: 1001, number: 5, title: "child A", state: "open", html_url: "https://x/5" }];
+  const page2 = [{ id: 1002, number: 6, title: "child B", state: "closed", html_url: "https://x/6" }];
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/issues/9/sub_issues?per_page=100",
+      json: page1,
+      headers: { link: '<https://api.github.com/repos/acme/widgets/issues/9/sub_issues?page=2>; rel="next"' },
+    },
+    { match: "sub_issues?page=2", json: page2 },
+  ]);
+  try {
+    const res = await listGitHubSubIssues({ dir: REPO_DIR, number: 9 });
+    expect(res).toEqual({
+      ok: true,
+      repo: "acme/widgets",
+      issueNumber: 9,
+      subIssues: [
+        { id: 1001, number: 5, title: "child A", state: "open", htmlUrl: "https://x/5" },
+        { id: 1002, number: 6, title: "child B", state: "closed", htmlUrl: "https://x/6" },
+      ],
+    });
+    expect(mock.calls).toHaveLength(2);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubSubIssues maps a 404 to the feature-gated friendly error", async () => {
+  const mock = mockGitHubFetch([
+    { match: "/repos/acme/widgets/issues/9/sub_issues", status: 404, json: { message: "Not Found" } },
+  ]);
+  try {
+    const res = await listGitHubSubIssues({ dir: REPO_DIR, number: 9 });
+    expect(res).toEqual({
+      ok: false,
+      error: "Sub-issues aren't available here — the feature may not be enabled for this repository, or the issue doesn't exist.",
+    });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubSubIssue resolves the child's id by number, then POSTs sub_issue_id", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/issues/5", json: { id: 1001 } },
+    {
+      method: "POST",
+      match: "/repos/acme/widgets/issues/9/sub_issues",
+      json: { id: 1001, number: 5, title: "child A", state: "open", html_url: "https://x/5" },
+    },
+  ]);
+  try {
+    const res = await addGitHubSubIssue({ dir: REPO_DIR, number: 9, childNumber: 5 });
+    expect(res).toEqual({
+      ok: true,
+      subIssue: { id: 1001, number: 5, title: "child A", state: "open", htmlUrl: "https://x/5" },
+      message: "Added #5 as a sub-issue.",
+    });
+    const postCall = mock.calls.find((c) => c.method === "POST");
+    expect(JSON.parse(postCall!.body!)).toEqual({ sub_issue_id: 1001 });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubSubIssue surfaces a friendly error when the child number doesn't resolve", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/issues/999", status: 404, json: { message: "Not Found" } },
+  ]);
+  try {
+    const res = await addGitHubSubIssue({ dir: REPO_DIR, number: 9, childNumber: 999 });
+    expect(res).toEqual({ ok: false, error: "Couldn't resolve #999: Not Found" });
+    // Never got to POST sub_issues.
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubSubIssue maps a 410 on the add step to the feature-gated friendly error", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/issues/5", json: { id: 1001 } },
+    { method: "POST", match: "/repos/acme/widgets/issues/9/sub_issues", status: 410, json: { message: "Gone" } },
+  ]);
+  try {
+    const res = await addGitHubSubIssue({ dir: REPO_DIR, number: 9, childNumber: 5 });
+    expect(res).toEqual({
+      ok: false,
+      error: "Sub-issues aren't available here — the feature may not be enabled for this repository, or the issue doesn't exist.",
+    });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("removeGitHubSubIssue DELETEs with sub_issue_id in the body", async () => {
+  const mock = mockGitHubFetch([
+    { method: "DELETE", match: "/repos/acme/widgets/issues/9/sub_issue", json: {} },
+  ]);
+  try {
+    const res = await removeGitHubSubIssue({ dir: REPO_DIR, number: 9, childId: 1001 });
+    expect(res).toEqual({ ok: true, message: "Sub-issue removed." });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.method).toBe("DELETE");
+    expect(JSON.parse(mock.calls[0]!.body!)).toEqual({ sub_issue_id: 1001 });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("transferGitHubIssue resolves source + target node ids, then POSTs transferIssue", async () => {
+  // Two sequential GraphQL calls hit the *same* URL with different bodies
+  // (repo-id lookup, then the transfer mutation) — `mockGitHubFetch`'s route
+  // table only matches on URL, so it can't tell them apart. Drive this one
+  // with a hand-rolled fetch stub instead.
+  let call = 0;
+  const original = globalThis.fetch;
+  const calls: { url: string; body: string | null }[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const body = typeof init?.body === "string" ? init.body : null;
+    calls.push({ url, body });
+    if (url.includes("/repos/acme/widgets/issues/9") && (init?.method ?? "GET") === "GET") {
+      return new Response(JSON.stringify({ node_id: "I_source" }), { status: 200 });
+    }
+    if (url === "https://api.github.com/graphql") {
+      call += 1;
+      if (call === 1) {
+        return new Response(JSON.stringify({ data: { repository: { id: "R_target" } } }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({ data: { transferIssue: { issue: { number: 42, url: "https://github.com/dest/repo/issues/42" } } } }),
+        { status: 200 },
+      );
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  }) as typeof fetch;
+
+  try {
+    const res = await transferGitHubIssue({ dir: REPO_DIR, number: 9, targetRepo: "dest/repo" });
+    expect(res).toEqual({
+      ok: true,
+      url: "https://github.com/dest/repo/issues/42",
+      message: "Issue transferred to dest/repo as #42.",
+    });
+    const repoIdCall = calls.find((c) => c.url === "https://api.github.com/graphql" && c.body?.includes("repository(owner"));
+    expect(JSON.parse(repoIdCall!.body!).variables).toEqual({ owner: "dest", name: "repo" });
+    const transferCall = calls.find((c) => c.body?.includes("transferIssue"));
+    expect(JSON.parse(transferCall!.body!).variables).toEqual({ id: "I_source", repo: "R_target" });
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("transferGitHubIssue rejects a malformed target repo before any network call", async () => {
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await transferGitHubIssue({ dir: REPO_DIR, number: 9, targetRepo: "not-a-valid-repo-slug" });
+    expect(res).toEqual({ ok: false, error: "target repo must be in the form owner/name" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("transferGitHubIssue surfaces a friendly error when the target repo isn't found", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/issues/9", json: { node_id: "I_source" } },
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { repository: null } },
+    },
+  ]);
+  try {
+    const res = await transferGitHubIssue({ dir: REPO_DIR, number: 9, targetRepo: "dest/missing" });
+    expect(res).toEqual({
+      ok: false,
+      error: 'Target repository "dest/missing" wasn\'t found or isn\'t accessible.',
     });
   } finally {
     mock.restore();

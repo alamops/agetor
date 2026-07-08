@@ -33,6 +33,8 @@ import type {
   GitHubReactionsResult,
   GitHubReactionSubject,
   GitHubReactionSummary,
+  GitHubSubIssue,
+  GitHubSubIssuesResult,
   Harness,
   HarnessStatus,
   HarnessUsage,
@@ -89,6 +91,8 @@ export type {
   GitHubReactionsResult,
   GitHubReactionSubject,
   GitHubReactionSummary,
+  GitHubSubIssue,
+  GitHubSubIssuesResult,
 };
 export { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
 
@@ -583,6 +587,39 @@ export const api = {
     milestone?: number | null;
   }) =>
     j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/issue-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubIssueLock: (input: { path: string; number: number; locked: boolean; lockReason?: string }) =>
+    j<{ ok: true; locked: boolean; message?: string }>("/github/issue-lock", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubIssuePinned: (input: { path: string; number: number; pinned: boolean }) =>
+    j<{ ok: true; pinned: boolean; message?: string }>("/github/issue-pin", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getGitHubIssuePinned: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({ path: input.path, number: String(input.number) });
+    return j<{ ok: true; pinned: boolean }>(`/github/issue-pinned?${q.toString()}`);
+  },
+  listGitHubSubIssues: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({ path: input.path, number: String(input.number) });
+    return j<GitHubSubIssuesResult>(`/github/sub-issues?${q.toString()}`);
+  },
+  addGitHubSubIssue: (input: { path: string; number: number; childNumber: number }) =>
+    j<{ ok: true; subIssue: GitHubSubIssue; message?: string }>("/github/sub-issue-add", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  removeGitHubSubIssue: (input: { path: string; number: number; childId: number }) =>
+    j<{ ok: true; message?: string }>("/github/sub-issue-remove", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  transferGitHubIssue: (input: { path: string; number: number; targetRepo: string }) =>
+    j<{ ok: true; url: string; message?: string }>("/github/issue-transfer", {
       method: "POST",
       body: JSON.stringify(input),
     }),

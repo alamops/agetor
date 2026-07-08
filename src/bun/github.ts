@@ -32,6 +32,8 @@ import type {
   GitHubReactionSubject,
   GitHubReactionSummary,
   GitHubReviewThread,
+  GitHubSubIssue,
+  GitHubSubIssuesResult,
   GitHubUser,
   TaskDiff,
 } from "../shared/types.ts";
@@ -178,6 +180,30 @@ interface SetGitHubPullAutoMergeInput extends GitHubItemNumberInput {
   mergeMethod?: GitHubPullMergeMethod;
 }
 
+interface SetGitHubIssueLockInput extends GitHubItemNumberInput {
+  locked: boolean;
+  /** Only meaningful when locking (`locked: true`); an unrecognized/omitted
+   *  value locks without a reason rather than erroring. */
+  lockReason?: string;
+}
+
+interface SetGitHubIssuePinnedInput extends GitHubItemNumberInput {
+  pinned: boolean;
+}
+
+interface AddGitHubSubIssueInput extends GitHubItemNumberInput {
+  childNumber: number;
+}
+
+interface RemoveGitHubSubIssueInput extends GitHubItemNumberInput {
+  childId: number;
+}
+
+interface TransferGitHubIssueInput extends GitHubItemNumberInput {
+  /** "owner/name" of the destination repository. */
+  targetRepo: string;
+}
+
 // A "conversation" comment (issue/PR body thread) lives under /issues/comments;
 // an inline "review" comment lives under /pulls/comments. Both share the edit /
 // delete shape, differing only by that path segment.
@@ -294,9 +320,18 @@ type GitHubReactionsResponse = ({ ok: true } & GitHubReactionsResult) | GitHubLi
 type GitHubReactionAddResponse = ({ ok: true; reactionId: number; content: GitHubReactionContent }) | GitHubListError;
 type GitHubReactionRemoveResponse = ({ ok: true }) | GitHubListError;
 type GitHubApplySuggestionResponse = ({ ok: true; message: string }) | GitHubListError;
+type GitHubIssueLockResponse = ({ ok: true; locked: boolean; message?: string }) | GitHubListError;
+type GitHubIssuePinnedResponse = ({ ok: true; pinned: boolean; message?: string }) | GitHubListError;
+type GitHubSubIssuesResponse = ({ ok: true } & GitHubSubIssuesResult) | GitHubListError;
+type GitHubSubIssueAddResponse = ({ ok: true; subIssue: GitHubSubIssue; message?: string }) | GitHubListError;
+type GitHubIssueTransferResponse = ({ ok: true; url: string; message?: string }) | GitHubListError;
 
 const GITHUB_FETCH_TIMEOUT_MS = 30_000;
 const GITHUB_DIFF_BODY_CAP_BYTES = 8_000_000;
+
+/** Valid `lock_reason` values GitHub's lock endpoint accepts. An
+ *  unrecognized/absent value locks without a reason instead of erroring. */
+const ISSUE_LOCK_REASONS = new Set(["off-topic", "too heated", "resolved", "spam"]);
 
 async function run(cmd: string[], cwd?: string, timeoutMs = 10_000): Promise<CommandResult> {
   let proc: PipedProcess;
@@ -534,6 +569,13 @@ export const __githubInternals = {
   parseSuggestion,
   suggestionCommentRange,
   spliceSuggestionLines,
+  normalizeSubIssue,
+  parseTargetRepo,
+  pinnedFromGraphqlMutation,
+  pinnedFromGraphqlQuery,
+  targetRepoIdFromGraphql,
+  transferredIssueFromGraphql,
+  subIssuesApiError,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -618,7 +660,35 @@ function normalizeItem(kind: GitHubItemKind, raw: unknown): GitHubListItem | nul
     updatedAt: typeof obj.updated_at === "string" ? obj.updated_at : "",
     closedAt: typeof obj.closed_at === "string" ? obj.closed_at : null,
     mergedAt: typeof obj.merged_at === "string" ? obj.merged_at : null,
+    locked: typeof obj.locked === "boolean" ? obj.locked : false,
   };
+}
+
+/** A single entry from `GET /issues/:n/sub_issues` — a full issue object, but
+ *  we only keep the fields the sub-issues UI needs. `id` (not `number`) is
+ *  what `DELETE /issues/:n/sub_issue` addresses a child by. Pure — unit-tested. */
+function normalizeSubIssue(raw: unknown): GitHubSubIssue | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.id !== "number" || typeof obj.number !== "number" || typeof obj.title !== "string") return null;
+  if (obj.state !== "open" && obj.state !== "closed") return null;
+  if (typeof obj.html_url !== "string") return null;
+  return {
+    id: obj.id,
+    number: obj.number,
+    title: obj.title,
+    state: obj.state,
+    htmlUrl: obj.html_url,
+  };
+}
+
+/** Parse "owner/name" into parts for the transfer-issue target repo input.
+ *  Rejects empty/malformed/multi-segment input. Pure — unit-tested. */
+function parseTargetRepo(raw: string): { owner: string; name: string } | null {
+  const trimmed = raw.trim();
+  const m = /^([^/\s]+)\/([^/\s]+)$/.exec(trimmed);
+  if (!m) return null;
+  return { owner: m[1]!, name: m[2]! };
 }
 
 function matchesFilters(item: GitHubListItem, query: string, labels: string[], assignee: string): boolean {
@@ -1740,6 +1810,59 @@ function draftFromGraphql(json: unknown, field: string): boolean | null {
   return typeof isDraft === "boolean" ? isDraft : null;
 }
 
+/** Dig `data.<field>.issue.isPinned` out of a `pinIssue`/`unpinIssue`
+ *  mutation response. */
+function pinnedFromGraphqlMutation(json: unknown, field: string): boolean | null {
+  if (!json || typeof json !== "object") return null;
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const payload = (data as Record<string, unknown>)[field];
+  if (!payload || typeof payload !== "object") return null;
+  const issue = (payload as { issue?: unknown }).issue;
+  if (!issue || typeof issue !== "object") return null;
+  const isPinned = (issue as { isPinned?: unknown }).isPinned;
+  return typeof isPinned === "boolean" ? isPinned : null;
+}
+
+/** Dig `data.repository.issue.isPinned` out of the lazy pinned-state read. */
+function pinnedFromGraphqlQuery(json: unknown): boolean | null {
+  if (!json || typeof json !== "object") return null;
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const repository = (data as { repository?: unknown }).repository;
+  if (!repository || typeof repository !== "object") return null;
+  const issue = (repository as { issue?: unknown }).issue;
+  if (!issue || typeof issue !== "object") return null;
+  const isPinned = (issue as { isPinned?: unknown }).isPinned;
+  return typeof isPinned === "boolean" ? isPinned : null;
+}
+
+/** Dig `data.repository.id` out of the transfer flow's target-repo lookup. */
+function targetRepoIdFromGraphql(json: unknown): string | null {
+  if (!json || typeof json !== "object") return null;
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const repository = (data as { repository?: unknown }).repository;
+  if (!repository || typeof repository !== "object") return null;
+  const id = (repository as { id?: unknown }).id;
+  return typeof id === "string" ? id : null;
+}
+
+/** Dig `data.transferIssue.issue.{number,url}` out of the `transferIssue`
+ *  mutation response. */
+function transferredIssueFromGraphql(json: unknown): { number: number; url: string } | null {
+  if (!json || typeof json !== "object") return null;
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const payload = (data as { transferIssue?: unknown }).transferIssue;
+  if (!payload || typeof payload !== "object") return null;
+  const issue = (payload as { issue?: unknown }).issue;
+  if (!issue || typeof issue !== "object") return null;
+  const obj = issue as Record<string, unknown>;
+  if (typeof obj.number !== "number" || typeof obj.url !== "string") return null;
+  return { number: obj.number, url: obj.url };
+}
+
 /** Toggle a PR's draft state. REST has no endpoint for this, so it goes through
  *  the GraphQL `convertPullRequestToDraft` / `markPullRequestReadyForReview`
  *  mutations, keyed on the PR's global node id (read from the REST PR first). */
@@ -1828,6 +1951,290 @@ export async function setGitHubPullAutoMerge(input: SetGitHubPullAutoMergeInput)
     autoMergeEnabled: input.enable,
     message: input.enable ? "Auto-merge enabled." : "Auto-merge disabled.",
   };
+}
+
+/** Lock/unlock an issue or pull request's conversation. Both share the same
+ *  REST endpoint (`/issues/:number/lock` — a PR is an issue under the hood),
+ *  unlike draft/auto-merge which are PR-only GraphQL mutations. Locking
+ *  accepts an optional `lock_reason`; unlocking takes no body. Both directions
+ *  return 204 No Content on success. */
+export async function setGitHubIssueLock(input: SetGitHubIssueLockInput): Promise<GitHubIssueLockResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "item number must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to lock/unlock" };
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/lock`;
+
+  if (!input.locked) {
+    const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "DELETE" });
+    if (!("status" in res)) return res;
+    if (!res.ok) {
+      const json = await res.json().catch(() => null);
+      return { ok: false, error: apiError(json, res.status, res.statusText) };
+    }
+    return { ok: true, locked: false, message: "Conversation unlocked." };
+  }
+
+  const reason = input.lockReason?.trim();
+  const body = reason && ISSUE_LOCK_REASONS.has(reason) ? { lock_reason: reason } : {};
+  const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "PUT", body: JSON.stringify(body) });
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, locked: true, message: "Conversation locked." };
+}
+
+/** Pin/unpin an issue. REST has no endpoint for this — same shape as
+ *  `setGitHubPullDraft`: fetch the REST issue for its node id, then POST the
+ *  GraphQL `pinIssue`/`unpinIssue` mutation. GitHub caps a repo at 3 pinned
+ *  issues; that failure surfaces as a plain `graphqlErrorMessage` string,
+ *  mapped here to a friendlier one. */
+export async function setGitHubIssuePinned(input: SetGitHubIssuePinnedInput): Promise<GitHubIssuePinnedResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "issue number must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to pin/unpin" };
+  const issueUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
+  const issueRes = await fetchGitHub(issueUrl, token, "application/vnd.github+json");
+  if (!("status" in issueRes)) return issueRes;
+  const issue = await issueRes.json().catch(() => null);
+  if (!issueRes.ok) return { ok: false, error: apiError(issue, issueRes.status, issueRes.statusText) };
+  const nodeId = issue && typeof issue === "object" && typeof (issue as { node_id?: unknown }).node_id === "string"
+    ? (issue as { node_id: string }).node_id
+    : null;
+  if (!nodeId) return { ok: false, error: "GitHub returned an issue without a node id" };
+
+  const field = input.pinned ? "pinIssue" : "unpinIssue";
+  const query = `mutation($id: ID!) { ${field}(input: { issueId: $id }) { issue { isPinned } } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { id: nodeId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) {
+    if (/maximum number of pinned issues/i.test(gqlError)) {
+      return { ok: false, error: "This repository already has the maximum of 3 pinned issues — unpin one first." };
+    }
+    return { ok: false, error: gqlError };
+  }
+  const isPinned = pinnedFromGraphqlMutation(json, field);
+  const pinned = isPinned ?? input.pinned;
+  return { ok: true, pinned, message: pinned ? "Issue pinned." : "Issue unpinned." };
+}
+
+/** Lazily read whether an issue is currently pinned (GraphQL — REST doesn't
+ *  expose pin state). Same no-token-means-empty shape as
+ *  `getGitHubPullReviewThreads`: an unauthenticated caller just sees
+ *  `pinned: false` rather than an error. */
+export async function getGitHubIssuePinned(input: GitHubItemNumberInput): Promise<GitHubIssuePinnedResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "issue number must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: true, pinned: false };
+  const query = `query($owner:String!,$name:String!,$number:Int!){`
+    + `repository(owner:$owner,name:$name){issue(number:$number){isPinned}}}`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name, number: input.number } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: gqlError };
+  return { ok: true, pinned: pinnedFromGraphqlQuery(json) ?? false };
+}
+
+/** Friendly wrapper for the two sub-issues-specific non-2xx cases (404 = repo
+ *  doesn't have the feature enabled or the issue doesn't exist; 410 = feature
+ *  retired/unavailable for this repo) — otherwise falls back to the standard
+ *  `message`-field mapping. */
+function subIssuesApiError(body: unknown, status: number, statusText: string): string {
+  if (status === 404 || status === 410) {
+    return "Sub-issues aren't available here — the feature may not be enabled for this repository, or the issue doesn't exist.";
+  }
+  return apiError(body, status, statusText);
+}
+
+/** The children tracked under an issue via GitHub's sub-issues REST API,
+ *  oldest first — same 3-page pagination cap as `listGitHubLabels`. */
+export async function listGitHubSubIssues(input: GitHubItemNumberInput): Promise<GitHubSubIssuesResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "issue number must be positive" };
+  }
+
+  const token = await githubToken();
+  const subIssues: GitHubSubIssue[] = [];
+  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issues?per_page=100`;
+  for (let page = 0; next && page < 3; page++) {
+    const res = await fetchGitHub(next, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: subIssuesApiError(body, res.status, res.statusText) };
+    if (!Array.isArray(body)) return { ok: false, error: "GitHub returned an unexpected sub-issues response" };
+    for (const raw of body) {
+      const sub = normalizeSubIssue(raw);
+      if (sub) subIssues.push(sub);
+    }
+    next = pageLinks(res.headers.get("link"));
+  }
+  return { ok: true, repo: repoSlug(repo), issueNumber: input.number, subIssues };
+}
+
+/** Add a sub-issue by its display number. The sub-issues API wants the
+ *  child's REST database `id`, not its number, so this resolves the id with a
+ *  `GET /issues/:childNumber` first, then POSTs `sub_issue_id`. */
+export async function addGitHubSubIssue(input: AddGitHubSubIssueInput): Promise<GitHubSubIssueAddResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "issue number must be positive" };
+  }
+  if (!Number.isInteger(input.childNumber) || input.childNumber <= 0) {
+    return { ok: false, error: "child issue number must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to add a sub-issue" };
+
+  const childUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.childNumber}`;
+  const childRes = await fetchGitHub(childUrl, token, "application/vnd.github+json");
+  if (!("status" in childRes)) return childRes;
+  const childJson = await childRes.json().catch(() => null);
+  if (!childRes.ok) {
+    return { ok: false, error: `Couldn't resolve #${input.childNumber}: ${apiError(childJson, childRes.status, childRes.statusText)}` };
+  }
+  const childId = childJson && typeof childJson === "object" && typeof (childJson as { id?: unknown }).id === "number"
+    ? (childJson as { id: number }).id
+    : null;
+  if (childId === null) return { ok: false, error: "GitHub returned a child issue without an id" };
+
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issues`;
+  const res = await fetchGitHub(
+    url,
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ sub_issue_id: childId }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: subIssuesApiError(json, res.status, res.statusText) };
+  const subIssue = normalizeSubIssue(json);
+  if (!subIssue) return { ok: false, error: "GitHub returned an unexpected sub-issue response" };
+  return { ok: true, subIssue, message: `Added #${input.childNumber} as a sub-issue.` };
+}
+
+/** Remove a sub-issue by the child's REST id (as returned by
+ *  `listGitHubSubIssues`/`addGitHubSubIssue` — see `GitHubSubIssue.id`). */
+export async function removeGitHubSubIssue(input: RemoveGitHubSubIssueInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "issue number must be positive" };
+  }
+  if (!Number.isInteger(input.childId) || input.childId <= 0) {
+    return { ok: false, error: "child issue id must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to remove a sub-issue" };
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issue`;
+  const res = await fetchGitHub(
+    url,
+    token,
+    "application/vnd.github+json",
+    { method: "DELETE", body: JSON.stringify({ sub_issue_id: input.childId }) },
+  );
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: subIssuesApiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, message: "Sub-issue removed." };
+}
+
+/** Transfer an issue to another repository. GraphQL-only: resolve the source
+ *  issue's node id (REST), resolve the target repo's node id via
+ *  `repository(owner,name){id}`, then POST `transferIssue`. The issue moves
+ *  out of the current repo entirely, so the caller drops it from any list
+ *  it's showing. */
+export async function transferGitHubIssue(input: TransferGitHubIssueInput): Promise<GitHubIssueTransferResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "issue number must be positive" };
+  }
+  const target = parseTargetRepo(input.targetRepo);
+  if (!target) return { ok: false, error: "target repo must be in the form owner/name" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to transfer an issue" };
+
+  const issueUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
+  const issueRes = await fetchGitHub(issueUrl, token, "application/vnd.github+json");
+  if (!("status" in issueRes)) return issueRes;
+  const issueJson = await issueRes.json().catch(() => null);
+  if (!issueRes.ok) return { ok: false, error: apiError(issueJson, issueRes.status, issueRes.statusText) };
+  const nodeId = issueJson && typeof issueJson === "object" && typeof (issueJson as { node_id?: unknown }).node_id === "string"
+    ? (issueJson as { node_id: string }).node_id
+    : null;
+  if (!nodeId) return { ok: false, error: "GitHub returned an issue without a node id" };
+
+  const repoIdQuery = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id}}`;
+  const repoIdRes = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query: repoIdQuery, variables: { owner: target.owner, name: target.name } }) },
+  );
+  if (!("status" in repoIdRes)) return repoIdRes;
+  const repoIdJson = await repoIdRes.json().catch(() => null);
+  if (!repoIdRes.ok) return { ok: false, error: apiError(repoIdJson, repoIdRes.status, repoIdRes.statusText) };
+  const repoIdGqlError = graphqlErrorMessage(repoIdJson);
+  if (repoIdGqlError) return { ok: false, error: repoIdGqlError };
+  const targetId = targetRepoIdFromGraphql(repoIdJson);
+  if (!targetId) {
+    return { ok: false, error: `Target repository "${input.targetRepo}" wasn't found or isn't accessible.` };
+  }
+
+  const transferQuery = `mutation($id:ID!,$repo:ID!){ transferIssue(input:{issueId:$id,repositoryId:$repo}){ issue { number url } } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query: transferQuery, variables: { id: nodeId, repo: targetId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: gqlError };
+  const transferred = transferredIssueFromGraphql(json);
+  if (!transferred) return { ok: false, error: "GitHub returned an unexpected transfer response" };
+  return { ok: true, url: transferred.url, message: `Issue transferred to ${input.targetRepo} as #${transferred.number}.` };
 }
 
 /** The authenticated user's login, so the UI can offer edit/delete only on the

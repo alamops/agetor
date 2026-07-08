@@ -735,6 +735,11 @@ export interface GitHubListItem {
    *  lets the UI distinguish a merged PR from a closed-unmerged one, which the
    *  `state: "closed"` value alone conflates. Always null for issues. */
   mergedAt: string | null;
+  /** Whether the conversation is locked (REST `locked` field). Applies to both
+   *  issues and pull requests — GitHub locks both through the same
+   *  `/issues/:number/lock` endpoint. Defaults to `false` when the source
+   *  response omits the field (some list paths do). */
+  locked: boolean;
 }
 
 export interface GitHubListResult {
@@ -838,6 +843,25 @@ export interface GitHubLinkedIssuesResult {
   repo: string;
   pullNumber: number;
   issues: GitHubLinkedIssue[];
+}
+
+/** A child issue tracked under a parent via GitHub's sub-issues REST API
+ *  (`/issues/:number/sub_issues`). `id` is the child's REST database id —
+ *  distinct from its display `number` — because removing a sub-issue
+ *  (`DELETE /issues/:number/sub_issue`) addresses the child by id, not
+ *  number, so the UI needs it without a second round trip. */
+export interface GitHubSubIssue {
+  id: number;
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  htmlUrl: string;
+}
+
+export interface GitHubSubIssuesResult {
+  repo: string;
+  issueNumber: number;
+  subIssues: GitHubSubIssue[];
 }
 
 /** GitHub's mergeability verdict for a PR, from `GET /pulls/:n`.

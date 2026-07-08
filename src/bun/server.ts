@@ -60,6 +60,7 @@ import {
 import { listAgentCapabilities } from "./commands.ts";
 import {
   addGitHubReaction,
+  addGitHubSubIssue,
   applyGitHubSuggestion,
   closeGitHubPull,
   createGitHubComment,
@@ -71,6 +72,7 @@ import {
   deleteGitHubComment,
   deleteGitHubLabel,
   deleteGitHubMilestone,
+  getGitHubIssuePinned,
   getGitHubPullChecks,
   getGitHubPullLinkedIssues,
   getGitHubViewer,
@@ -86,15 +88,20 @@ import {
   listGitHubPullCommits,
   listGitHubPullReviewComments,
   listGitHubReactions,
+  listGitHubSubIssues,
   mergeGitHubPull,
   removeGitHubReaction,
+  removeGitHubSubIssue,
   reopenGitHubPull,
   replyGitHubPullLineComment,
   requestGitHubPullReviewers,
   reviewGitHubPull,
+  setGitHubIssueLock,
+  setGitHubIssuePinned,
   setGitHubPullAutoMerge,
   setGitHubPullDraft,
   setGitHubReviewThreadResolved,
+  transferGitHubIssue,
   updateGitHubComment,
   updateGitHubIssue,
   updateGitHubLabel,
@@ -1312,6 +1319,152 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             assignees: Array.isArray(body.assignees) ? body.assignees.filter((x): x is string => typeof x === "string") : undefined,
             milestone: typeof body.milestone === "number" || body.milestone === null ? body.milestone : undefined,
           });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-lock": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            locked?: boolean;
+            lockReason?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid item number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.locked !== "boolean") {
+            return json({ error: "locked (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubIssueLock({
+            dir,
+            number: rawNumber,
+            locked: body.locked,
+            lockReason: typeof body.lockReason === "string" ? body.lockReason : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-pin": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; pinned?: boolean };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.pinned !== "boolean") {
+            return json({ error: "pinned (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubIssuePinned({ dir, number: rawNumber, pinned: body.pinned });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-pinned": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubIssuePinned({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/sub-issues": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await listGitHubSubIssues({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/sub-issue-add": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; childNumber?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawChildNumber = body.childNumber;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawChildNumber !== "number" || !Number.isInteger(rawChildNumber) || rawChildNumber <= 0) {
+            return json({ error: "valid child issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await addGitHubSubIssue({ dir, number: rawNumber, childNumber: rawChildNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/sub-issue-remove": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; childId?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawChildId = body.childId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawChildId !== "number" || !Number.isInteger(rawChildId) || rawChildId <= 0) {
+            return json({ error: "valid child issue id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await removeGitHubSubIssue({ dir, number: rawNumber, childId: rawChildId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-transfer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; targetRepo?: string };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.targetRepo !== "string" || !body.targetRepo.trim()) {
+            return json({ error: "target repo required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await transferGitHubIssue({ dir, number: rawNumber, targetRepo: body.targetRepo });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

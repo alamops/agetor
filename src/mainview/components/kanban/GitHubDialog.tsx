@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   AlertCircle,
+  ArrowRightLeft,
   ArrowUpFromLine,
   CheckCircle2,
   ChevronDown,
@@ -14,14 +15,20 @@ import {
   FileSymlink,
   GitMerge,
   GitPullRequest,
+  ListTree,
   Loader2,
+  Lock,
   MessageSquare,
   Milestone,
+  Pin,
+  PinOff,
   Plus,
   RefreshCw,
   Search,
   Sparkles,
   Tag,
+  Unlock,
+  X,
   XCircle,
 } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
@@ -56,6 +63,7 @@ import type {
   GitHubRepoLabel,
   GitHubRepoMilestone,
   GitHubReviewThread,
+  GitHubSubIssue,
   GitHubUser,
   Project,
   TaskDiff,
@@ -392,6 +400,15 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // Which panel triggered the last action, so its error/message renders next to
   // the control the user used ("actions" | "triage" | "edit"), not in a sibling.
   const [actionSource, setActionSource] = useState<Record<number, string | undefined>>({});
+  // Optional `lock_reason` picked before locking an issue/PR conversation.
+  const [lockReasonDrafts, setLockReasonDrafts] = useState<Record<number, string | undefined>>({});
+  // "owner/name" typed into the transfer-issue control, and whether the
+  // disruptive two-step confirm has been armed for that row.
+  const [transferDrafts, setTransferDrafts] = useState<Record<number, string | undefined>>({});
+  const [transferConfirm, setTransferConfirm] = useState<Record<number, boolean | undefined>>({});
+  // Success banner for a completed transfer — shown at the list level since the
+  // transferred item is removed from `result.items` the moment it succeeds.
+  const [transferNotice, setTransferNotice] = useState<{ message: string; url: string } | null>(null);
   const [issueComposerOpen, setIssueComposerOpen] = useState(false);
   const [newIssueTitle, setNewIssueTitle] = useState("");
   const [newIssueBody, setNewIssueBody] = useState("");
@@ -518,6 +535,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setActionErrors({});
     setActionMessages({});
     setActionSource({});
+    setLockReasonDrafts({});
+    setTransferDrafts({});
+    setTransferConfirm({});
+    setTransferNotice(null);
   }, [projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested]);
 
   // "Review requested" is a PR-only qualifier — drop it when viewing issues.
@@ -1282,6 +1303,60 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     }
   };
 
+  const runToggleLock = async (item: GitHubListItem) => {
+    if (!projectPath || actionBusy[item.number]) return;
+    const nextLocked = !item.locked;
+    setActionBusy((cur) => ({ ...cur, [item.number]: "lock" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.setGitHubIssueLock({
+        path: projectPath,
+        number: item.number,
+        locked: nextLocked,
+        lockReason: nextLocked ? (lockReasonDrafts[item.number] || undefined) : undefined,
+      });
+      upsertListItem({ ...item, locked: result.locked }, false, true);
+      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Lock state updated." }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
+  // First click arms a confirm step (transfer is disruptive/irreversible); the
+  // second click actually fires the transfer. Changing the target repo re-arms
+  // the confirm (handled by onTransferDraftChange below).
+  const runTransferIssue = async (item: GitHubListItem) => {
+    if (!projectPath || item.kind !== "issues" || actionBusy[item.number]) return;
+    const targetRepo = (transferDrafts[item.number] ?? "").trim();
+    if (!targetRepo) return;
+    if (!transferConfirm[item.number]) {
+      setTransferConfirm((cur) => ({ ...cur, [item.number]: true }));
+      return;
+    }
+    setActionBusy((cur) => ({ ...cur, [item.number]: "transfer" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.transferGitHubIssue({ path: projectPath, number: item.number, targetRepo });
+      setTransferNotice({ message: result.message ?? `Issue transferred to ${targetRepo}.`, url: result.url });
+      // The issue no longer lives in this repo — drop it from the list rather
+      // than reconciling it in place.
+      setResult((cur) => cur && { ...cur, items: cur.items.filter((it) => !(it.kind === item.kind && it.number === item.number)) });
+      setExpandedKey((cur) => (cur === `${item.kind}-${item.number}` ? null : cur));
+      setTransferDrafts((cur) => ({ ...cur, [item.number]: "" }));
+      setTransferConfirm((cur) => ({ ...cur, [item.number]: false }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
   // `keepIfPresent` updates an existing row in place even when the replacement no
   // longer matches the active filters — used by in-panel state changes (e.g.
   // reopen) so the user sees the result instead of the row silently vanishing;
@@ -1765,6 +1840,23 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           />
         )}
 
+        {transferNotice && (
+          <div className="flex items-center justify-between gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+            <span className="flex items-center gap-1">
+              <CheckCircle2 className="size-3.5" />
+              {transferNotice.message}
+            </span>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button size="sm" variant="ghost" className="h-6 px-2" onClick={() => { void api.openExternal(transferNotice.url); }}>
+                Open
+              </Button>
+              <Button size="sm" variant="ghost" className="h-6 px-2" onClick={() => setTransferNotice(null)}>
+                Dismiss
+              </Button>
+            </div>
+          </div>
+        )}
+
         {!loading && error && (
           <div className="flex items-center justify-center gap-2 py-12 text-sm text-rose-400">
             <AlertCircle className="size-4" /> {error}
@@ -1890,6 +1982,17 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onMilestoneDraftChange={(body) => setMilestoneDrafts((cur) => ({ ...cur, [item.number]: body }))}
                 onIssueState={(nextState) => { void updateIssueState(item, nextState); }}
                 onIssueLabels={() => { void updateIssueLabels(item); }}
+                lockReasonDraft={lockReasonDrafts[item.number] ?? ""}
+                onLockReasonDraftChange={(body) => setLockReasonDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onToggleLock={() => { void runToggleLock(item); }}
+                transferDraft={transferDrafts[item.number] ?? ""}
+                onTransferDraftChange={(body) => {
+                  setTransferDrafts((cur) => ({ ...cur, [item.number]: body }));
+                  setTransferConfirm((cur) => ({ ...cur, [item.number]: false }));
+                }}
+                transferConfirming={!!transferConfirm[item.number]}
+                onTransferIssue={() => { void runTransferIssue(item); }}
+                onCancelTransfer={() => setTransferConfirm((cur) => ({ ...cur, [item.number]: false }))}
                 onCommentDraftChange={(body) => setCommentDrafts((cur) => ({ ...cur, [item.number]: body }))}
                 onSubmitComment={() => { void submitComment(item); }}
                 onRetryComments={() => {
@@ -2739,6 +2842,14 @@ function GitHubItemRow({
   onMilestoneDraftChange,
   onIssueState,
   onIssueLabels,
+  lockReasonDraft,
+  onLockReasonDraftChange,
+  onToggleLock,
+  transferDraft,
+  onTransferDraftChange,
+  transferConfirming,
+  onTransferIssue,
+  onCancelTransfer,
   onCommentDraftChange,
   onSubmitComment,
   onRetryComments,
@@ -2834,6 +2945,14 @@ function GitHubItemRow({
   onMilestoneDraftChange: (body: string) => void;
   onIssueState: (state: "open" | "closed") => void;
   onIssueLabels: () => void;
+  lockReasonDraft: string;
+  onLockReasonDraftChange: (body: string) => void;
+  onToggleLock: () => void;
+  transferDraft: string;
+  onTransferDraftChange: (body: string) => void;
+  transferConfirming: boolean;
+  onTransferIssue: () => void;
+  onCancelTransfer: () => void;
   onCommentDraftChange: (body: string) => void;
   onSubmitComment: () => void;
   onRetryComments: () => void;
@@ -3042,6 +3161,7 @@ function GitHubItemRow({
           {item.kind === "issues" && (
             <IssueActions
               item={item}
+              path={projectPath}
               repoLabels={repoLabels}
               repoAssignees={repoAssignees}
               repoMilestones={repoMilestones}
@@ -3056,6 +3176,14 @@ function GitHubItemRow({
               onMilestoneDraftChange={onMilestoneDraftChange}
               onIssueState={onIssueState}
               onIssueLabels={onIssueLabels}
+              lockReasonDraft={lockReasonDraft}
+              onLockReasonDraftChange={onLockReasonDraftChange}
+              onToggleLock={onToggleLock}
+              transferDraft={transferDraft}
+              onTransferDraftChange={onTransferDraftChange}
+              transferConfirming={transferConfirming}
+              onTransferIssue={onTransferIssue}
+              onCancelTransfer={onCancelTransfer}
             />
           )}
           <Conversation
@@ -3095,6 +3223,7 @@ const MERGE_TONE_CLASS: Record<MergeTone, string> = {
 
 function IssueActions({
   item,
+  path,
   repoLabels,
   repoAssignees,
   repoMilestones,
@@ -3109,8 +3238,17 @@ function IssueActions({
   onMilestoneDraftChange,
   onIssueState,
   onIssueLabels,
+  lockReasonDraft,
+  onLockReasonDraftChange,
+  onToggleLock,
+  transferDraft,
+  onTransferDraftChange,
+  transferConfirming,
+  onTransferIssue,
+  onCancelTransfer,
 }: {
   item: GitHubListItem;
+  path: string;
   repoLabels: GitHubRepoLabel[];
   repoAssignees: GitHubUser[];
   repoMilestones: GitHubRepoMilestone[];
@@ -3125,6 +3263,14 @@ function IssueActions({
   onMilestoneDraftChange: (body: string) => void;
   onIssueState: (state: "open" | "closed") => void;
   onIssueLabels: () => void;
+  lockReasonDraft: string;
+  onLockReasonDraftChange: (body: string) => void;
+  onToggleLock: () => void;
+  transferDraft: string;
+  onTransferDraftChange: (body: string) => void;
+  transferConfirming: boolean;
+  onTransferIssue: () => void;
+  onCancelTransfer: () => void;
 }) {
   const isBusy = !!busy;
   const nextState = item.state === "open" ? "closed" : "open";
@@ -3166,7 +3312,7 @@ function IssueActions({
           Save triage
         </Button>
       </div>
-      <div className="mt-3 flex justify-end">
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
         <Button
           size="sm"
           variant="outline"
@@ -3176,7 +3322,261 @@ function IssueActions({
           {busy === nextState ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
           {item.state === "open" ? "Close issue" : "Reopen issue"}
         </Button>
+        <IssuePinToggle path={path} number={item.number} />
       </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/40 pt-3">
+        <Select
+          value={lockReasonDraft}
+          onChange={(e) => onLockReasonDraftChange(e.target.value)}
+          className="h-8 w-40 text-xs"
+          disabled={isBusy || item.locked}
+          title="Lock reason (optional)"
+          aria-label="Lock reason"
+        >
+          <option value="">No reason</option>
+          <option value="off-topic">Off-topic</option>
+          <option value="too heated">Too heated</option>
+          <option value="resolved">Resolved</option>
+          <option value="spam">Spam</option>
+        </Select>
+        <Button size="sm" variant="outline" disabled={isBusy} onClick={onToggleLock}>
+          {busy === "lock" ? (
+            <Loader2 className="mr-2 size-3.5 animate-spin" />
+          ) : item.locked ? (
+            <Unlock className="mr-2 size-3.5" />
+          ) : (
+            <Lock className="mr-2 size-3.5" />
+          )}
+          {item.locked ? "Unlock conversation" : "Lock conversation"}
+        </Button>
+      </div>
+
+      <SubIssues path={path} issueNumber={item.number} />
+
+      <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/40 pt-3">
+        <Input
+          value={transferDraft}
+          onChange={(e) => onTransferDraftChange(e.target.value)}
+          placeholder="Transfer to owner/repo"
+          className="h-8 w-48 text-xs"
+          disabled={isBusy}
+        />
+        {transferConfirming ? (
+          <>
+            <span className="text-[11px] text-amber-400">
+              Transfer #{item.number} to {transferDraft.trim() || "…"}? This can't be undone.
+            </span>
+            <Button size="sm" variant="destructive" disabled={isBusy || !transferDraft.trim()} onClick={onTransferIssue}>
+              {busy === "transfer" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <ArrowRightLeft className="mr-2 size-3.5" />}
+              Confirm transfer
+            </Button>
+            <Button size="sm" variant="ghost" disabled={isBusy} onClick={onCancelTransfer}>
+              Cancel
+            </Button>
+          </>
+        ) : (
+          <Button size="sm" variant="outline" disabled={isBusy || !transferDraft.trim()} onClick={onTransferIssue}>
+            <ArrowRightLeft className="mr-2 size-3.5" />
+            Transfer issue
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Self-contained pin/unpin control. GitHub's REST issue payload doesn't
+ *  carry pin state (GraphQL-only), so this lazily reads it via
+ *  `getGitHubIssuePinned` on mount rather than threading yet another field
+ *  through the parent's already-large per-item state. */
+function IssuePinToggle({ path, number }: { path: string; number: number }) {
+  const [pinned, setPinned] = useState<boolean | undefined>(undefined);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const seq = useRef(0);
+
+  useEffect(() => {
+    if (!path) return;
+    const requestId = ++seq.current;
+    setLoading(true);
+    setError(null);
+    api.getGitHubIssuePinned({ path, number })
+      .then((r) => { if (requestId === seq.current) setPinned(r.pinned); })
+      .catch((e: unknown) => { if (requestId === seq.current) setError(e instanceof Error ? e.message : String(e)); })
+      .finally(() => { if (requestId === seq.current) setLoading(false); });
+  }, [path, number]);
+
+  const toggle = async () => {
+    if (busy || pinned === undefined) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.setGitHubIssuePinned({ path, number, pinned: !pinned });
+      setPinned(res.pinned);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-2">
+      <Button size="sm" variant="outline" disabled={busy || loading || pinned === undefined} onClick={() => void toggle()}>
+        {busy || loading ? (
+          <Loader2 className="mr-2 size-3.5 animate-spin" />
+        ) : pinned ? (
+          <PinOff className="mr-2 size-3.5" />
+        ) : (
+          <Pin className="mr-2 size-3.5" />
+        )}
+        {pinned ? "Unpin issue" : "Pin issue"}
+      </Button>
+      {error && <span className="text-[11px] text-rose-400">{error}</span>}
+    </div>
+  );
+}
+
+/** Self-contained sub-issues panel: lazily fetches the child list the first
+ *  time it's expanded, and owns its own add/remove busy state. Kept separate
+ *  from the parent's per-item state (like `IssuePinToggle`) since both `path`
+ *  and `issueNumber` fully determine its data. */
+function SubIssues({ path, issueNumber }: { path: string; issueNumber: number }) {
+  const [open, setOpen] = useState(false);
+  const [items, setItems] = useState<GitHubSubIssue[] | undefined>(undefined);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [addDraft, setAddDraft] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const seq = useRef(0);
+
+  const load = () => {
+    if (!path) return;
+    const requestId = ++seq.current;
+    setLoading(true);
+    setError(null);
+    api.listGitHubSubIssues({ path, number: issueNumber })
+      .then((r) => { if (requestId === seq.current) setItems(r.subIssues); })
+      .catch((e: unknown) => { if (requestId === seq.current) setError(e instanceof Error ? e.message : String(e)); })
+      .finally(() => { if (requestId === seq.current) setLoading(false); });
+  };
+
+  useEffect(() => {
+    if (open && items === undefined && !loading) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, path, issueNumber]);
+
+  const add = async () => {
+    const childNumber = Number(addDraft.trim().replace(/^#/, ""));
+    if (!Number.isInteger(childNumber) || childNumber <= 0 || busy) return;
+    setBusy("add");
+    setError(null);
+    try {
+      const res = await api.addGitHubSubIssue({ path, number: issueNumber, childNumber });
+      // Dedupe on id — re-adding an already-linked child can return the existing
+      // link, which would otherwise duplicate the row (and its React key).
+      setItems((cur) => [...(cur ?? []).filter((c) => c.id !== res.subIssue.id), res.subIssue]);
+      setAddDraft("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = async (child: GitHubSubIssue) => {
+    if (busy) return;
+    setBusy(`remove:${child.id}`);
+    setError(null);
+    try {
+      await api.removeGitHubSubIssue({ path, number: issueNumber, childId: child.id });
+      setItems((cur) => (cur ?? []).filter((c) => c.id !== child.id));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
+      <button
+        type="button"
+        className="flex w-full items-center justify-between gap-2 text-left"
+        onClick={() => setOpen((o) => !o)}
+      >
+        <span className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <ListTree className="size-3.5" />
+          Sub-issues{items ? ` (${items.length})` : ""}
+        </span>
+        {open ? <ChevronDown className="size-4 text-muted-foreground" /> : <ChevronRight className="size-4 text-muted-foreground" />}
+      </button>
+      {open && (
+        <div className="mt-3">
+          {loading && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="size-3.5 animate-spin" /> Loading sub-issues…
+            </div>
+          )}
+          {error && (
+            <div className="mb-2 flex items-center justify-between gap-2 text-[11px] text-rose-400">
+              <span className="flex items-center gap-1">
+                <AlertCircle className="size-3.5" /> {error}
+              </span>
+              <Button size="sm" variant="ghost" className="h-6 px-2" onClick={load}>
+                Retry
+              </Button>
+            </div>
+          )}
+          {!loading && !error && items && items.length === 0 && (
+            <div className="text-xs italic text-muted-foreground">No sub-issues yet.</div>
+          )}
+          {items && items.length > 0 && (
+            <ul className="flex flex-col gap-1">
+              {items.map((child) => (
+                <li key={child.id} className="flex items-center justify-between gap-2 rounded border border-border/40 px-2 py-1 text-xs">
+                  <button
+                    type="button"
+                    className="min-w-0 truncate text-left hover:underline"
+                    onClick={() => { void api.openExternal(child.htmlUrl); }}
+                  >
+                    #{child.number} {child.title}
+                  </button>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span className={child.state === "open" ? "text-emerald-400" : "text-rose-400"}>{child.state}</span>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-6"
+                      disabled={busy === `remove:${child.id}`}
+                      title={`Remove #${child.number}`}
+                      aria-label={`Remove #${child.number}`}
+                      onClick={() => void remove(child)}
+                    >
+                      {busy === `remove:${child.id}` ? <Loader2 className="size-3 animate-spin" /> : <X className="size-3" />}
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="mt-2 flex items-center gap-2">
+            <Input
+              value={addDraft}
+              onChange={(e) => setAddDraft(e.target.value)}
+              placeholder="Add by #number"
+              className="h-8 w-32 text-xs"
+              disabled={busy === "add"}
+            />
+            <Button size="sm" variant="outline" disabled={busy === "add" || !addDraft.trim()} onClick={() => void add()}>
+              {busy === "add" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
+              Add
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

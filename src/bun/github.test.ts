@@ -4,6 +4,7 @@ import type { GitHubListItem } from "../shared/types.ts";
 
 const {
   matchesFilters,
+  normalizeItem,
   normalizeLineComment,
   normalizeCheckRun,
   reviewValidationError,
@@ -27,6 +28,13 @@ const {
   parseSuggestion,
   suggestionCommentRange,
   spliceSuggestionLines,
+  normalizeSubIssue,
+  parseTargetRepo,
+  pinnedFromGraphqlMutation,
+  pinnedFromGraphqlQuery,
+  targetRepoIdFromGraphql,
+  transferredIssueFromGraphql,
+  subIssuesApiError,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -49,6 +57,7 @@ function makeItem(overrides: Partial<GitHubListItem> = {}): GitHubListItem {
     updatedAt: "2026-01-02T00:00:00Z",
     closedAt: null,
     mergedAt: null,
+    locked: false,
     ...overrides,
   };
 }
@@ -526,4 +535,73 @@ test("graphqlErrorMessage returns the first error message, else null", () => {
   expect(graphqlErrorMessage({ data: { x: 1 } })).toBeNull();
   expect(graphqlErrorMessage({ errors: [] })).toBeNull();
   expect(graphqlErrorMessage(null)).toBeNull();
+});
+
+test("normalizeItem reads the REST `locked` field, defaulting to false when absent", () => {
+  const base = { number: 1, title: "t", state: "open", html_url: "https://x" };
+  expect(normalizeItem("issues", { ...base, locked: true })).toMatchObject({ locked: true });
+  expect(normalizeItem("issues", { ...base, locked: false })).toMatchObject({ locked: false });
+  // list paths that omit `locked` altogether → defaults false, doesn't reject the item
+  expect(normalizeItem("issues", base)).toMatchObject({ locked: false });
+  // non-boolean `locked` → treated as absent
+  expect(normalizeItem("issues", { ...base, locked: "yes" })).toMatchObject({ locked: false });
+});
+
+test("normalizeSubIssue keeps id (not just number) and rejects malformed shapes", () => {
+  const raw = { id: 555, number: 3, title: "child", state: "open", html_url: "https://x/3" };
+  expect(normalizeSubIssue(raw)).toEqual({ id: 555, number: 3, title: "child", state: "open", htmlUrl: "https://x/3" });
+  // missing id → null (the shape the remove flow depends on)
+  expect(normalizeSubIssue({ number: 3, title: "child", state: "open", html_url: "https://x/3" })).toBeNull();
+  // bad state → null
+  expect(normalizeSubIssue({ ...raw, state: "merged" })).toBeNull();
+  // missing title/html_url → null
+  expect(normalizeSubIssue({ id: 1, number: 2, state: "open" })).toBeNull();
+  expect(normalizeSubIssue(null)).toBeNull();
+});
+
+test("parseTargetRepo accepts owner/name, rejects malformed input", () => {
+  expect(parseTargetRepo("acme/widgets")).toEqual({ owner: "acme", name: "widgets" });
+  expect(parseTargetRepo("  acme/widgets  ")).toEqual({ owner: "acme", name: "widgets" });
+  expect(parseTargetRepo("acme")).toBeNull();
+  expect(parseTargetRepo("acme/widgets/extra")).toBeNull();
+  expect(parseTargetRepo("acme/")).toBeNull();
+  expect(parseTargetRepo("/widgets")).toBeNull();
+  expect(parseTargetRepo("")).toBeNull();
+  expect(parseTargetRepo("acme widgets/x")).toBeNull();
+});
+
+test("pinnedFromGraphqlMutation reads data.<field>.issue.isPinned", () => {
+  expect(pinnedFromGraphqlMutation({ data: { pinIssue: { issue: { isPinned: true } } } }, "pinIssue")).toBe(true);
+  expect(pinnedFromGraphqlMutation({ data: { unpinIssue: { issue: { isPinned: false } } } }, "unpinIssue")).toBe(false);
+  expect(pinnedFromGraphqlMutation({ data: { pinIssue: { issue: {} } } }, "pinIssue")).toBeNull();
+  expect(pinnedFromGraphqlMutation(null, "pinIssue")).toBeNull();
+});
+
+test("pinnedFromGraphqlQuery reads data.repository.issue.isPinned", () => {
+  expect(pinnedFromGraphqlQuery({ data: { repository: { issue: { isPinned: true } } } })).toBe(true);
+  expect(pinnedFromGraphqlQuery({ data: { repository: { issue: null } } })).toBeNull();
+  expect(pinnedFromGraphqlQuery({ data: {} })).toBeNull();
+});
+
+test("targetRepoIdFromGraphql reads data.repository.id, null when repo not found", () => {
+  expect(targetRepoIdFromGraphql({ data: { repository: { id: "R_kw123" } } })).toBe("R_kw123");
+  // GitHub returns `repository: null` for a nonexistent/inaccessible repo
+  expect(targetRepoIdFromGraphql({ data: { repository: null } })).toBeNull();
+  expect(targetRepoIdFromGraphql(null)).toBeNull();
+});
+
+test("transferredIssueFromGraphql reads data.transferIssue.issue.{number,url}", () => {
+  expect(transferredIssueFromGraphql({ data: { transferIssue: { issue: { number: 9, url: "https://x/9" } } } }))
+    .toEqual({ number: 9, url: "https://x/9" });
+  expect(transferredIssueFromGraphql({ data: { transferIssue: { issue: {} } } })).toBeNull();
+  expect(transferredIssueFromGraphql(null)).toBeNull();
+});
+
+test("subIssuesApiError maps 404/410 to a feature-gated friendly message, else falls back to the message field", () => {
+  expect(subIssuesApiError({ message: "Not Found" }, 404, "Not Found"))
+    .toBe("Sub-issues aren't available here — the feature may not be enabled for this repository, or the issue doesn't exist.");
+  expect(subIssuesApiError({ message: "Gone" }, 410, "Gone"))
+    .toBe("Sub-issues aren't available here — the feature may not be enabled for this repository, or the issue doesn't exist.");
+  expect(subIssuesApiError({ message: "Validation Failed" }, 422, "Unprocessable Entity")).toBe("Validation Failed");
+  expect(subIssuesApiError(null, 500, "Internal Server Error")).toBe("500 Internal Server Error");
 });
