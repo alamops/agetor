@@ -60,6 +60,7 @@ import {
 import { listAgentCapabilities } from "./commands.ts";
 import {
   addGitHubReaction,
+  applyGitHubSuggestion,
   closeGitHubPull,
   createGitHubComment,
   createGitHubIssue,
@@ -1324,6 +1325,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             path?: string;
             number?: number;
             reviewers?: string[];
+            teamReviewers?: string[];
           };
           const dir = body.path;
           const rawNumber = body.number;
@@ -1334,10 +1336,38 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const reviewers = Array.isArray(body.reviewers)
             ? body.reviewers.filter((x): x is string => typeof x === "string")
             : [];
-          if (reviewers.length === 0) {
-            return json({ error: "at least one reviewer required" }, { status: 400, headers: corsHeaders(req) });
+          const teamReviewers = Array.isArray(body.teamReviewers)
+            ? body.teamReviewers.filter((x): x is string => typeof x === "string")
+            : [];
+          if (reviewers.length === 0 && teamReviewers.length === 0) {
+            return json({ error: "at least one reviewer or team required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await requestGitHubPullReviewers({ dir, number: rawNumber, reviewers });
+          const result = await requestGitHubPullReviewers({ dir, number: rawNumber, reviewers, teamReviewers });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-apply-suggestion": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            commentId?: number;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawCommentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawCommentId !== "number" || !Number.isInteger(rawCommentId) || rawCommentId <= 0) {
+            return json({ error: "valid review comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await applyGitHubSuggestion({ dir, number: rawNumber, commentId: rawCommentId });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

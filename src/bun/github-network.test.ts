@@ -6,6 +6,7 @@ import { test, expect, beforeAll } from "bun:test";
 import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
 import {
   addGitHubReaction,
+  applyGitHubSuggestion,
   getGitHubPullLinkedIssues,
   getGitHubViewer,
   listGitHubAssignees,
@@ -14,6 +15,7 @@ import {
   listGitHubPullCommits,
   listGitHubReactions,
   removeGitHubReaction,
+  requestGitHubPullReviewers,
   setGitHubPullAutoMerge,
 } from "./github.ts";
 
@@ -309,6 +311,255 @@ test("setGitHubPullAutoMerge maps a GraphQL errors[] response to a friendly erro
   try {
     const res = await setGitHubPullAutoMerge({ dir: REPO_DIR, number: 9, enable: true });
     expect(res).toEqual({ ok: false, error: "Pull request Auto merge is not allowed for this repository" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("requestGitHubPullReviewers POSTs reviewers and team_reviewers together, omitting an empty side", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "/repos/acme/widgets/pulls/9/requested_reviewers",
+      json: { requested_reviewers: [], requested_teams: [] },
+    },
+  ]);
+  try {
+    const res = await requestGitHubPullReviewers({
+      dir: REPO_DIR,
+      number: 9,
+      reviewers: ["alice", " bob "],
+      teamReviewers: ["platform-team"],
+    });
+    expect(res).toEqual({
+      ok: true,
+      message: "Requested review from alice, bob and team platform-team.",
+    });
+    expect(mock.calls).toHaveLength(1);
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body).toEqual({ reviewers: ["alice", "bob"], team_reviewers: ["platform-team"] });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("requestGitHubPullReviewers omits the reviewers key when only teams are requested", async () => {
+  const mock = mockGitHubFetch([
+    { method: "POST", match: "/repos/acme/widgets/pulls/9/requested_reviewers", json: {} },
+  ]);
+  try {
+    const res = await requestGitHubPullReviewers({ dir: REPO_DIR, number: 9, reviewers: [], teamReviewers: ["a-team", "b-team"] });
+    expect(res).toEqual({ ok: true, message: "Requested review from teams a-team, b-team." });
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body).toEqual({ team_reviewers: ["a-team", "b-team"] });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("applyGitHubSuggestion fetches the comment + PR + file, splices the commented line, and PUTs the new content", async () => {
+  const fileContent = "line1\nconst x = 1;\nline3\n";
+  const mock = mockGitHubFetch([
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/comments/55",
+      json: {
+        path: "src/a.ts",
+        line: 2,
+        side: "RIGHT",
+        pull_request_url: "https://api.github.com/repos/acme/widgets/pulls/9",
+        body: "Nit:\n\n```suggestion\nconst x = 2;\n```",
+      },
+    },
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/9",
+      json: { head: { ref: "feature", repo: { full_name: "acme/widgets" } } },
+    },
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/contents/src/a.ts?ref=feature",
+      json: { content: Buffer.from(fileContent, "utf8").toString("base64"), encoding: "base64", sha: "filesha123" },
+    },
+    {
+      method: "PUT",
+      match: "/repos/acme/widgets/contents/src/a.ts",
+      json: { content: { sha: "newsha456" } },
+    },
+  ]);
+  try {
+    const res = await applyGitHubSuggestion({ dir: REPO_DIR, number: 9, commentId: 55 });
+    expect(res).toEqual({ ok: true, message: "Suggestion applied." });
+    const putCall = mock.calls.find((c) => c.method === "PUT");
+    expect(putCall).toBeDefined();
+    const putBody = JSON.parse(putCall!.body!);
+    expect(putBody.message).toBe("Apply suggestion from review comment");
+    expect(putBody.sha).toBe("filesha123");
+    expect(putBody.branch).toBe("feature");
+    expect(Buffer.from(putBody.content, "base64").toString("utf8")).toBe("line1\nconst x = 2;\nline3\n");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("applyGitHubSuggestion refuses to PUT when the comment has no suggestion fence", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/comments/56",
+      json: { path: "src/a.ts", line: 2, side: "RIGHT", body: "just a regular comment, no suggestion" },
+    },
+  ]);
+  try {
+    const res = await applyGitHubSuggestion({ dir: REPO_DIR, number: 9, commentId: 56 });
+    expect(res).toEqual({ ok: false, error: "This comment doesn't contain a suggested change." });
+    // Never got past the comment fetch — no PR/contents/PUT calls fired.
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("applyGitHubSuggestion refuses an outdated comment (line null) before any PR/file fetch", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/comments/57",
+      // line null + original_line set is exactly how GitHub reports an outdated comment.
+      json: { path: "src/a.ts", line: null, side: "RIGHT", original_line: 2, body: "```suggestion\nconst x = 2;\n```" },
+    },
+  ]);
+  try {
+    const res = await applyGitHubSuggestion({ dir: REPO_DIR, number: 9, commentId: 57 });
+    expect(res).toEqual({
+      ok: false,
+      error: "This suggestion is on an outdated diff and can't be applied automatically.",
+    });
+    // Refused at the comment level — no PR/contents/PUT calls fired.
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("applyGitHubSuggestion refuses a LEFT-side (base-file) comment before any write", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/comments/58",
+      json: { path: "src/a.ts", line: 2, side: "LEFT", body: "```suggestion\nconst x = 2;\n```" },
+    },
+  ]);
+  try {
+    const res = await applyGitHubSuggestion({ dir: REPO_DIR, number: 9, commentId: 58 });
+    expect(res).toEqual({ ok: false, error: "Suggestions can only be applied to added or unchanged lines." });
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("applyGitHubSuggestion refuses to PUT when the file no longer has the commented line (splice out of range)", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/comments/59",
+      json: { path: "src/a.ts", line: 40, side: "RIGHT", body: "```suggestion\nconst x = 2;\n```" },
+    },
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/9",
+      json: { head: { ref: "feature", repo: { full_name: "acme/widgets" } } },
+    },
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/contents/src/a.ts?ref=feature",
+      json: { content: Buffer.from("only\nthree\nlines\n", "utf8").toString("base64"), encoding: "base64", sha: "filesha123" },
+    },
+  ]);
+  try {
+    const res = await applyGitHubSuggestion({ dir: REPO_DIR, number: 9, commentId: 59 });
+    expect(res).toEqual({
+      ok: false,
+      error: "This suggestion is outdated — the file no longer matches the commented lines.",
+    });
+    // Guard fired before any PUT.
+    expect(mock.calls.some((c) => c.method === "PUT")).toBe(false);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("applyGitHubSuggestion rejects a comment that belongs to a different pull request", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/comments/60",
+      json: {
+        path: "src/a.ts",
+        line: 2,
+        side: "RIGHT",
+        pull_request_url: "https://api.github.com/repos/acme/widgets/pulls/12",
+        body: "```suggestion\nx\n```",
+      },
+    },
+  ]);
+  try {
+    const res = await applyGitHubSuggestion({ dir: REPO_DIR, number: 9, commentId: 60 });
+    expect(res).toEqual({ ok: false, error: "This review comment doesn't belong to that pull request." });
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("applyGitHubSuggestion rejects a file too large for the Contents API (encoding none)", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/comments/61",
+      json: { path: "src/big.ts", line: 2, side: "RIGHT", body: "```suggestion\nx\n```" },
+    },
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/9",
+      json: { head: { ref: "feature", repo: { full_name: "acme/widgets" } } },
+    },
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/contents/src/big.ts?ref=feature",
+      json: { content: "", encoding: "none", sha: "filesha123" },
+    },
+  ]);
+  try {
+    const res = await applyGitHubSuggestion({ dir: REPO_DIR, number: 9, commentId: 61 });
+    expect(res).toEqual({ ok: false, error: "This file is too large to apply a suggestion via the Contents API." });
+    expect(mock.calls.some((c) => c.method === "PUT")).toBe(false);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("applyGitHubSuggestion rejects a cross-fork head with a friendly error", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/comments/62",
+      json: { path: "src/a.ts", line: 2, side: "RIGHT", body: "```suggestion\nx\n```" },
+    },
+    {
+      method: "GET",
+      match: "/repos/acme/widgets/pulls/9",
+      json: { head: { ref: "feature", repo: { full_name: "someone-else/widgets" } } },
+    },
+  ]);
+  try {
+    const res = await applyGitHubSuggestion({ dir: REPO_DIR, number: 9, commentId: 62 });
+    expect(res).toEqual({
+      ok: false,
+      error: "Applying suggestions isn't supported for pull requests from a fork.",
+    });
+    expect(mock.calls.some((c) => c.url.includes("/contents/"))).toBe(false);
   } finally {
     mock.restore();
   }

@@ -20,6 +20,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Sparkles,
   Tag,
   XCircle,
 } from "lucide-react";
@@ -273,6 +274,18 @@ interface LineCommentTarget {
   body: string;
 }
 
+/** Cheap client-side check for "does this review comment's body contain a
+ *  ```suggestion fence" — gates whether the Apply control renders at all. The
+ *  authoritative extraction (used to actually apply the change) lives
+ *  server-side in `parseSuggestion` (src/bun/github.ts); this only needs to
+ *  detect presence, not extract the body. */
+function hasSuggestion(body: string): boolean {
+  // Require the newline after the info string so this gate matches the
+  // server-side extractor (`parseSuggestion`) exactly — a body ending in a bare
+  // ```suggestion is not an appliable suggestion and mustn't show an Apply button.
+  return /```suggestion\r?\n/.test(body);
+}
+
 export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Props) {
   const [projectPath, setProjectPath] = useState("");
   const [kind, setKind] = useState<GitHubItemKind>("pulls");
@@ -353,6 +366,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [reviewCommentErrors, setReviewCommentErrors] = useState<Record<number, string | undefined>>({});
   const [reviewReplyDrafts, setReviewReplyDrafts] = useState<Record<number, string | undefined>>({});
   const [reviewReplySubmitting, setReviewReplySubmitting] = useState<Record<number, boolean | undefined>>({});
+  // Keyed by review-comment id (not PR number) — apply-suggestion is a
+  // per-comment action, mirroring reviewReplySubmitting's own keying.
+  const [applySuggestionBusy, setApplySuggestionBusy] = useState<Record<number, boolean | undefined>>({});
   const [reviewDrafts, setReviewDrafts] = useState<Record<number, string | undefined>>({});
   // Inline comments queued for the next review submission (the "pending review"
   // batched flow), keyed by PR number.
@@ -366,6 +382,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [assigneeDrafts, setAssigneeDrafts] = useState<Record<number, string | undefined>>({});
   const [milestoneDrafts, setMilestoneDrafts] = useState<Record<number, string | undefined>>({});
   const [reviewerDrafts, setReviewerDrafts] = useState<Record<number, string | undefined>>({});
+  const [teamReviewerDrafts, setTeamReviewerDrafts] = useState<Record<number, string | undefined>>({});
   const [editorOpen, setEditorOpen] = useState<Record<number, boolean | undefined>>({});
   const [titleDrafts, setTitleDrafts] = useState<Record<number, string | undefined>>({});
   const [bodyDrafts, setBodyDrafts] = useState<Record<number, string | undefined>>({});
@@ -483,6 +500,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setReviewCommentErrors({});
     setReviewReplyDrafts({});
     setReviewReplySubmitting({});
+    setApplySuggestionBusy({});
     setReviewDrafts({});
     setPendingReview({});
     setPendingStale({});
@@ -492,6 +510,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setAssigneeDrafts({});
     setMilestoneDrafts({});
     setReviewerDrafts({});
+    setTeamReviewerDrafts({});
     setEditorOpen({});
     setTitleDrafts({});
     setBodyDrafts({});
@@ -937,6 +956,22 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       setReviewCommentErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
     } finally {
       setReviewReplySubmitting((cur) => ({ ...cur, [commentId]: false }));
+    }
+  };
+
+  const applySuggestion = async (item: GitHubListItem, commentId: number) => {
+    if (!projectPath || applySuggestionBusy[commentId]) return;
+    setApplySuggestionBusy((cur) => ({ ...cur, [commentId]: true }));
+    setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      await api.applyGitHubSuggestion({ path: projectPath, number: item.number, commentId });
+      // Refetch — mirrors the "clear to undefined so the loader effect refires"
+      // convention used elsewhere in this file (e.g. runPullReview above).
+      setReviewComments((cur) => ({ ...cur, [item.number]: undefined }));
+    } catch (e) {
+      setReviewCommentErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setApplySuggestionBusy((cur) => ({ ...cur, [commentId]: false }));
     }
   };
 
@@ -1434,8 +1469,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const requestReviewers = async (item: GitHubListItem) => {
     if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
     const reviewers = splitLabels(reviewerDrafts[item.number] ?? "");
-    if (reviewers.length === 0) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: "Enter at least one reviewer." }));
+    const teamReviewers = splitLabels(teamReviewerDrafts[item.number] ?? "");
+    if (reviewers.length === 0 && teamReviewers.length === 0) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: "Enter at least one reviewer or team." }));
       return;
     }
     setActionBusy((cur) => ({ ...cur, [item.number]: "reviewers" }));
@@ -1443,9 +1479,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
     setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
     try {
-      const result = await api.requestGitHubPullReviewers({ path: projectPath, number: item.number, reviewers });
+      const result = await api.requestGitHubPullReviewers({ path: projectPath, number: item.number, reviewers, teamReviewers });
       setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Reviewers requested." }));
       setReviewerDrafts((cur) => ({ ...cur, [item.number]: "" }));
+      setTeamReviewerDrafts((cur) => ({ ...cur, [item.number]: "" }));
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
     } finally {
@@ -1776,6 +1813,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 reviewCommentError={item.kind === "pulls" ? reviewCommentErrors[item.number] : undefined}
                 reviewReplyDrafts={reviewReplyDrafts}
                 reviewReplySubmitting={reviewReplySubmitting}
+                applySuggestionBusy={applySuggestionBusy}
                 comments={comments[item.number]}
                 commentsLoading={!!commentsLoading[item.number]}
                 commentError={commentErrors[item.number]}
@@ -1795,6 +1833,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 assigneeDraft={assigneeDrafts[item.number] ?? item.assignees.map((a) => a.login).join(", ")}
                 milestoneDraft={milestoneDrafts[item.number] ?? (item.milestone ? String(item.milestone.number) : "")}
                 reviewerDraft={reviewerDrafts[item.number] ?? ""}
+                teamReviewerDraft={teamReviewerDrafts[item.number] ?? ""}
                 editorOpen={!!editorOpen[item.number]}
                 titleDraft={titleDrafts[item.number] ?? item.title}
                 bodyDraft={bodyDrafts[item.number] ?? item.body}
@@ -1814,6 +1853,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onBodyDraftChange={(body) => setBodyDrafts((cur) => ({ ...cur, [item.number]: body }))}
                 onSaveEdit={() => { void saveEdit(item); }}
                 onReviewerDraftChange={(body) => setReviewerDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onTeamReviewerDraftChange={(body) => setTeamReviewerDrafts((cur) => ({ ...cur, [item.number]: body }))}
                 onRequestReviewers={() => { void requestReviewers(item); }}
                 onReviewDraftChange={(body) => setReviewDrafts((cur) => ({ ...cur, [item.number]: body }))}
                 onCloseDraftChange={(body) => setCloseDrafts((cur) => ({ ...cur, [item.number]: body }))}
@@ -1838,6 +1878,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onToggleThreadResolved={(thread) => toggleThreadResolved(item, thread)}
                 onEditReviewComment={(commentId, body) => editReviewComment(item, commentId, body)}
                 onDeleteReviewComment={(commentId) => deleteReviewComment(item, commentId)}
+                onApplySuggestion={(commentId) => { void applySuggestion(item, commentId); }}
                 onEditComment={(commentId, body) => editConversationComment(item, commentId, body)}
                 onDeleteComment={(commentId) => deleteConversationComment(item, commentId)}
                 onRetryReviewComments={() => {
@@ -2635,6 +2676,7 @@ function GitHubItemRow({
   reviewCommentError,
   reviewReplyDrafts,
   reviewReplySubmitting,
+  applySuggestionBusy,
   comments,
   commentsLoading,
   commentError,
@@ -2654,6 +2696,7 @@ function GitHubItemRow({
   assigneeDraft,
   milestoneDraft,
   reviewerDraft,
+  teamReviewerDraft,
   editorOpen,
   titleDraft,
   bodyDraft,
@@ -2662,6 +2705,7 @@ function GitHubItemRow({
   onBodyDraftChange,
   onSaveEdit,
   onReviewerDraftChange,
+  onTeamReviewerDraftChange,
   onRequestReviewers,
   onReviewDraftChange,
   onCloseDraftChange,
@@ -2686,6 +2730,7 @@ function GitHubItemRow({
   onToggleThreadResolved,
   onEditReviewComment,
   onDeleteReviewComment,
+  onApplySuggestion,
   onEditComment,
   onDeleteComment,
   onRetryReviewComments,
@@ -2726,6 +2771,7 @@ function GitHubItemRow({
   reviewCommentError?: string;
   reviewReplyDrafts: Record<number, string | undefined>;
   reviewReplySubmitting: Record<number, boolean | undefined>;
+  applySuggestionBusy: Record<number, boolean | undefined>;
   comments?: GitHubComment[];
   commentsLoading: boolean;
   commentError?: string;
@@ -2745,6 +2791,7 @@ function GitHubItemRow({
   assigneeDraft: string;
   milestoneDraft: string;
   reviewerDraft: string;
+  teamReviewerDraft: string;
   editorOpen: boolean;
   titleDraft: string;
   bodyDraft: string;
@@ -2753,6 +2800,7 @@ function GitHubItemRow({
   onBodyDraftChange: (body: string) => void;
   onSaveEdit: () => void;
   onReviewerDraftChange: (body: string) => void;
+  onTeamReviewerDraftChange: (body: string) => void;
   onRequestReviewers: () => void;
   onReviewDraftChange: (body: string) => void;
   onCloseDraftChange: (body: string) => void;
@@ -2777,6 +2825,7 @@ function GitHubItemRow({
   onToggleThreadResolved: (thread: GitHubReviewThread) => Promise<void>;
   onEditReviewComment: (commentId: number, body: string) => Promise<void>;
   onDeleteReviewComment: (commentId: number) => Promise<void>;
+  onApplySuggestion: (commentId: number) => void;
   onEditComment: (commentId: number, body: string) => Promise<void>;
   onDeleteComment: (commentId: number) => Promise<void>;
   onRetryReviewComments: () => void;
@@ -2951,6 +3000,7 @@ function GitHubItemRow({
                 assigneeDraft={assigneeDraft}
                 milestoneDraft={milestoneDraft}
                 reviewerDraft={reviewerDraft}
+                teamReviewerDraft={teamReviewerDraft}
                 busy={actionBusy}
                 prOpen={item.state === "open"}
                 error={actionSource === "triage" ? actionError : undefined}
@@ -2959,6 +3009,7 @@ function GitHubItemRow({
                 onAssigneeDraftChange={onAssigneeDraftChange}
                 onMilestoneDraftChange={onMilestoneDraftChange}
                 onReviewerDraftChange={onReviewerDraftChange}
+                onTeamReviewerDraftChange={onTeamReviewerDraftChange}
                 onSaveTriage={onIssueLabels}
                 onRequestReviewers={onRequestReviewers}
               />
@@ -2976,9 +3027,12 @@ function GitHubItemRow({
                 viewerLogin={viewerLogin}
                 threads={reviewThreads}
                 threadsTruncated={reviewThreadsTruncated}
+                prOpen={item.state === "open"}
+                applyBusy={applySuggestionBusy}
                 onToggleResolved={onToggleThreadResolved}
                 onEdit={onEditReviewComment}
                 onDelete={onDeleteReviewComment}
+                onApply={onApplySuggestion}
                 onDraftChange={onReviewReplyDraftChange}
                 onSubmitReply={onSubmitReviewReply}
                 onRetry={onRetryReviewComments}
@@ -3191,6 +3245,7 @@ function PullTriage({
   assigneeDraft,
   milestoneDraft,
   reviewerDraft,
+  teamReviewerDraft,
   busy,
   prOpen,
   error,
@@ -3199,6 +3254,7 @@ function PullTriage({
   onAssigneeDraftChange,
   onMilestoneDraftChange,
   onReviewerDraftChange,
+  onTeamReviewerDraftChange,
   onSaveTriage,
   onRequestReviewers,
 }: {
@@ -3209,6 +3265,7 @@ function PullTriage({
   assigneeDraft: string;
   milestoneDraft: string;
   reviewerDraft: string;
+  teamReviewerDraft: string;
   busy?: string;
   prOpen: boolean;
   error?: string;
@@ -3217,6 +3274,7 @@ function PullTriage({
   onAssigneeDraftChange: (body: string) => void;
   onMilestoneDraftChange: (body: string) => void;
   onReviewerDraftChange: (body: string) => void;
+  onTeamReviewerDraftChange: (body: string) => void;
   onSaveTriage: () => void;
   onRequestReviewers: () => void;
 }) {
@@ -3259,18 +3317,25 @@ function PullTriage({
           Save triage
         </Button>
       </div>
-      <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+      <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
         <Input
           value={reviewerDraft}
           onChange={(e) => onReviewerDraftChange(e.target.value)}
-          placeholder={prOpen ? "Request reviewers, comma separated" : "Reviewers can only be requested on open PRs"}
+          placeholder={prOpen ? "Reviewers, comma separated" : "Reviewers can only be requested on open PRs"}
+          className="h-8 text-xs"
+          disabled={isBusy || !prOpen}
+        />
+        <Input
+          value={teamReviewerDraft}
+          onChange={(e) => onTeamReviewerDraftChange(e.target.value)}
+          placeholder={prOpen ? "Teams, comma separated (org slugs)" : "Teams can only be requested on open PRs"}
           className="h-8 text-xs"
           disabled={isBusy || !prOpen}
         />
         <Button
           size="sm"
           variant="outline"
-          disabled={isBusy || !prOpen || !reviewerDraft.trim()}
+          disabled={isBusy || !prOpen || (!reviewerDraft.trim() && !teamReviewerDraft.trim())}
           title={prOpen ? undefined : "Reviewers can only be requested on open pull requests"}
           onClick={onRequestReviewers}
         >
@@ -3894,9 +3959,12 @@ function ReviewComments({
   viewerLogin,
   threads,
   threadsTruncated,
+  prOpen,
+  applyBusy,
   onToggleResolved,
   onEdit,
   onDelete,
+  onApply,
   onDraftChange,
   onSubmitReply,
   onRetry,
@@ -3910,9 +3978,14 @@ function ReviewComments({
   viewerLogin: string;
   threads: GitHubReviewThread[];
   threadsTruncated: boolean;
+  // Suggestion "Apply" only makes sense on an open PR with the current file
+  // reachable in the same repo — see applyGitHubSuggestion's cross-fork guard.
+  prOpen: boolean;
+  applyBusy: Record<number, boolean | undefined>;
   onToggleResolved: (thread: GitHubReviewThread) => Promise<void>;
   onEdit: (commentId: number, body: string) => Promise<void>;
   onDelete: (commentId: number) => Promise<void>;
+  onApply: (commentId: number) => void;
   onDraftChange: (commentId: number, body: string) => void;
   onSubmitReply: (commentId: number) => void;
   onRetry: () => void;
@@ -4023,6 +4096,11 @@ function ReviewComments({
                   canModify={!!viewerLogin && comment.author?.login === viewerLogin}
                   onEdit={(body) => onEdit(comment.id, body)}
                   onDelete={() => onDelete(comment.id)}
+                  suggestion={hasSuggestion(comment.body) ? {
+                    canApply: !!viewerLogin && prOpen,
+                    applying: !!applyBusy[comment.id],
+                    onApply: () => onApply(comment.id),
+                  } : undefined}
                 />
                 <div className="px-3 pb-2">
                   <Reactions path={path} subject={{ type: "reviewComment", id: comment.id }} viewer={viewerLogin} />
@@ -4192,11 +4270,17 @@ function EditableCommentBody({
   canModify,
   onEdit,
   onDelete,
+  suggestion,
 }: {
   body: string;
   canModify: boolean;
   onEdit: (body: string) => Promise<void>;
   onDelete: () => Promise<void>;
+  /** When set, `body` contains at least one ```suggestion fence — renders it as
+   *  a distinct "Suggested change" block instead of a plain code block, with an
+   *  Apply button when `canApply`. Undefined when the comment has no suggestion,
+   *  or the caller doesn't support applying one (e.g. conversation comments). */
+  suggestion?: { canApply: boolean; applying: boolean; onApply: () => void };
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(body);
@@ -4264,7 +4348,45 @@ function EditableCommentBody({
   return (
     <div className="px-3 py-2 text-sm">
       {body ? (
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={suggestion ? {
+            code({ className, children }) {
+              if (typeof className === "string" && /language-suggestion/.test(className)) {
+                return (
+                  <span className="my-2 block overflow-hidden rounded-md border border-emerald-500/40 bg-emerald-500/10">
+                    <span className="flex items-center justify-between gap-2 border-b border-emerald-500/30 px-2 py-1">
+                      <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-400">
+                        <Sparkles className="size-3" />
+                        Suggested change
+                      </span>
+                      {suggestion.canApply && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 px-2 text-[11px]"
+                          disabled={suggestion.applying}
+                          onClick={() => suggestion.onApply()}
+                        >
+                          {suggestion.applying
+                            ? <Loader2 className="mr-1 size-3 animate-spin" />
+                            : <CheckCircle2 className="mr-1 size-3" />}
+                          Apply
+                        </Button>
+                      )}
+                    </span>
+                    <span className="block overflow-x-auto whitespace-pre px-3 py-2 font-mono text-xs">
+                      {children}
+                    </span>
+                  </span>
+                );
+              }
+              return <code className={className}>{children}</code>;
+            },
+          } : undefined}
+        >
+          {body}
+        </ReactMarkdown>
       ) : (
         <span className="italic text-muted-foreground">Empty comment.</span>
       )}
@@ -4595,6 +4717,10 @@ function DiffBody({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [postedKey, setPostedKey] = useState<string | null>(null);
+  // When on, the submitted body is wrapped in a ```suggestion fence — GitHub's
+  // "suggested change" syntax. Reset whenever the compose panel closes/reopens
+  // so it never silently leaks onto an unrelated comment.
+  const [suggestMode, setSuggestMode] = useState(false);
 
   const commentTarget = (r: DiffRow): Omit<LineCommentTarget, "body"> | null => {
     if (r.kind === "del" && r.old) {
@@ -4606,16 +4732,22 @@ function DiffBody({
     return null;
   };
 
+  const composedBody = () => {
+    const raw = draft.trim();
+    return suggestMode ? "```suggestion\n" + raw + "\n```" : raw;
+  };
+
   const submit = async (target: Omit<LineCommentTarget, "body">) => {
-    const body = draft.trim();
-    if (!body || submitting) return;
+    const raw = draft.trim();
+    if (!raw || submitting) return;
     setSubmitting(true);
     setError(null);
     try {
-      await onLineComment({ ...target, body });
+      await onLineComment({ ...target, body: composedBody() });
       setPostedKey(selectedKey);
       setSelectedKey(null);
       setDraft("");
+      setSuggestMode(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -4624,11 +4756,12 @@ function DiffBody({
   };
 
   const queue = (target: Omit<LineCommentTarget, "body">) => {
-    const body = draft.trim();
-    if (!body || submitting) return;
-    onAddToReview({ ...target, body });
+    const raw = draft.trim();
+    if (!raw || submitting) return;
+    onAddToReview({ ...target, body: composedBody() });
     setSelectedKey(null);
     setDraft("");
+    setSuggestMode(false);
     setError(null);
   };
 
@@ -4676,6 +4809,7 @@ function DiffBody({
                     setSelectedKey(selected ? null : rowKey);
                     setDraft("");
                     setError(null);
+                    setSuggestMode(false);
                   }}
                 >
                   <MessageSquare className="size-3.5" />
@@ -4693,16 +4827,36 @@ function DiffBody({
                 <Textarea
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
-                  placeholder={`Comment on ${target.side === "LEFT" ? "old" : "new"} line ${target.line}...`}
-                  className="min-h-20 resize-y text-sm"
+                  placeholder={suggestMode
+                    ? "Proposed replacement text..."
+                    : `Comment on ${target.side === "LEFT" ? "old" : "new"} line ${target.line}...`}
+                  className="min-h-20 resize-y text-sm font-mono"
                   disabled={submitting}
                 />
-                {error && (
-                  <div className="mt-2 flex items-center gap-1 text-xs text-rose-400">
-                    <AlertCircle className="size-3.5" />
-                    {error}
-                  </div>
-                )}
+                <div className="mt-2 flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={suggestMode}
+                      disabled={submitting}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setSuggestMode(checked);
+                        // Pre-fill from the target line's current text so the
+                        // user edits from what's already there, not a blank box.
+                        if (checked && !draft.trim()) setDraft(r.text);
+                      }}
+                    />
+                    <Sparkles className="size-3.5" />
+                    Suggest change
+                  </label>
+                  {error && (
+                    <div className="flex items-center gap-1 text-xs text-rose-400">
+                      <AlertCircle className="size-3.5" />
+                      {error}
+                    </div>
+                  )}
+                </div>
                 <div className="mt-2 flex justify-end gap-2">
                   <Button
                     size="sm"
@@ -4712,6 +4866,7 @@ function DiffBody({
                       setSelectedKey(null);
                       setDraft("");
                       setError(null);
+                      setSuggestMode(false);
                     }}
                   >
                     Cancel

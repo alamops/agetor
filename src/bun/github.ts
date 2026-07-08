@@ -159,6 +159,14 @@ interface UpdateGitHubIssueInput extends GitHubItemNumberInput {
 
 interface RequestGitHubPullReviewersInput extends GitHubItemNumberInput {
   reviewers: string[];
+  /** Org team slugs (e.g. "org/team-slug" is NOT the shape GitHub wants here —
+   *  just the bare slug, "team-slug"; the org is implied by the repo). Reviews
+   *  can be requested from teams in addition to (or instead of) individuals. */
+  teamReviewers?: string[];
+}
+
+interface ApplyGitHubSuggestionInput extends GitHubItemNumberInput {
+  commentId: number;
 }
 
 interface SetGitHubPullDraftInput extends GitHubItemNumberInput {
@@ -285,6 +293,7 @@ type GitHubIssueResponse = ({ ok: true; item: GitHubListItem; message?: string }
 type GitHubReactionsResponse = ({ ok: true } & GitHubReactionsResult) | GitHubListError;
 type GitHubReactionAddResponse = ({ ok: true; reactionId: number; content: GitHubReactionContent }) | GitHubListError;
 type GitHubReactionRemoveResponse = ({ ok: true }) | GitHubListError;
+type GitHubApplySuggestionResponse = ({ ok: true; message: string }) | GitHubListError;
 
 const GITHUB_FETCH_TIMEOUT_MS = 30_000;
 const GITHUB_DIFF_BODY_CAP_BYTES = 8_000_000;
@@ -373,6 +382,91 @@ function sanitizeReviewComments(comments: ReviewCommentDraft[] | undefined): { p
   return clean;
 }
 
+/** Extract the first ```suggestion fenced block's body from a review comment's
+ *  markdown, or null when there is none. GitHub's suggested-change syntax is a
+ *  plain fenced code block whose info string is exactly `suggestion`; anything
+ *  before/after the fence (prose) is ignored. The newline immediately before
+ *  the closing fence is stripped (both `\n` and a preceding `\r`) so a
+ *  suggestion doesn't introduce a spurious blank line when applied. An empty
+ *  body (```suggestion\n```) is GitHub's "delete this line" convention and is
+ *  returned as `{ suggestion: "" }`. Pure — unit-tested. */
+function parseSuggestion(markdownBody: string): { suggestion: string } | null {
+  const m = /```suggestion\r?\n([\s\S]*?)```/.exec(markdownBody);
+  if (!m) return null;
+  let suggestion = m[1] ?? "";
+  if (suggestion.endsWith("\n")) suggestion = suggestion.slice(0, -1);
+  if (suggestion.endsWith("\r")) suggestion = suggestion.slice(0, -1);
+  return { suggestion };
+}
+
+/** Resolve the authoritative write position for the apply-suggestion flow from a
+ *  `GET /pulls/comments/:id` response, or a clean friendly error. The position
+ *  must be authoritative or we refuse to write:
+ *   - `side` must be `RIGHT` — a `LEFT` comment's `line` is a BASE-file line
+ *     number, which doesn't map to the HEAD file we fetch/splice.
+ *   - `line` must be a present positive number — GitHub only leaves it null and
+ *     falls back to `original_line` when the comment is OUTDATED (no longer maps
+ *     to head), so an `original_line` write position would corrupt head. We do
+ *     NOT read `original_line`/`original_start_line`.
+ *  `start_line` (multi-line suggestions) is honored when present; a single-line
+ *  comment collapses the range to `endLine`. Pure — unit-tested. */
+function suggestionCommentRange(raw: unknown):
+  | { ok: true; path: string; startLine: number; endLine: number; body: string }
+  | { ok: false; error: string } {
+  const malformed = { ok: false as const, error: "GitHub returned an unexpected review comment response" };
+  if (!raw || typeof raw !== "object") return malformed;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.path !== "string" || typeof obj.body !== "string") return malformed;
+  // `line` present ⇒ the comment still maps to head. When it's null/absent the
+  // comment is outdated (original_line holds the stale position) — refuse.
+  if (typeof obj.line !== "number" || obj.line <= 0) {
+    return { ok: false, error: "This suggestion is on an outdated diff and can't be applied automatically." };
+  }
+  // RIGHT = added/context line in the head file (the file we write). LEFT =
+  // base-file deletion line, whose number doesn't map to head.
+  const side = obj.side === "LEFT" || obj.side === "RIGHT"
+    ? obj.side
+    : obj.original_side === "LEFT" || obj.original_side === "RIGHT"
+      ? obj.original_side
+      : null;
+  if (side !== "RIGHT") {
+    return { ok: false, error: "Suggestions can only be applied to added or unchanged lines." };
+  }
+  const endLine = obj.line;
+  const startLine = typeof obj.start_line === "number" ? obj.start_line : endLine;
+  if (startLine <= 0 || startLine > endLine) return malformed;
+  return { ok: true, path: obj.path, startLine, endLine, body: obj.body };
+}
+
+/** Replace the 1-based inclusive line range [startLine, endLine] in `content`
+ *  with the suggestion's lines. Returns null — a guard, never a throw — when
+ *  the file doesn't have that many lines (an outdated comment), so the caller
+ *  can refuse to PUT rather than risk corrupting the file. Preserves the file's
+ *  dominant line ending (CRLF vs LF — inserted lines match retained ones) and
+ *  whether it had a trailing newline. An empty suggestion (`""`) deletes the
+ *  range (inserts zero lines), matching GitHub's "delete this line" convention.
+ *  Pure — unit-tested. */
+function spliceSuggestionLines(content: string, startLine: number, endLine: number, suggestion: string): string | null {
+  if (startLine < 1 || endLine < startLine) return null;
+  const eol = content.includes("\r\n") ? "\r\n" : "\n";
+  const hadTrailingNewline = /\r?\n$/.test(content);
+  const lines = content.split(/\r?\n/);
+  const body = hadTrailingNewline ? lines.slice(0, -1) : lines;
+  if (endLine > body.length) return null;
+  // Empty body = "delete these lines" (insert nothing); otherwise split the
+  // suggestion on either EOL so its own line endings don't leak through.
+  const suggestionLines = suggestion === "" ? [] : suggestion.split(/\r?\n/);
+  const next = [...body.slice(0, startLine - 1), ...suggestionLines, ...body.slice(endLine)];
+  return next.join(eol) + (hadTrailingNewline ? eol : "");
+}
+
+/** `/repos/:o/:r/contents/:path` — each path segment is URL-encoded but the `/`
+ *  separators are preserved (the Contents API treats them as directories). */
+function contentsUrl(repo: GitHubRepo, filePath: string): string {
+  const encoded = filePath.split("/").map(encodeURIComponent).join("/");
+  return `https://api.github.com/repos/${repo.owner}/${repo.name}/contents/${encoded}`;
+}
+
 type IssueUpdatePatch = {
   title?: string;
   body?: string;
@@ -437,6 +531,9 @@ export const __githubInternals = {
   normalizeDueOn,
   reactionSubjectPath,
   aggregateReactions,
+  parseSuggestion,
+  suggestionCommentRange,
+  spliceSuggestionLines,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -1125,6 +1222,115 @@ export async function replyGitHubPullLineComment(
   return { ok: true, comment };
 }
 
+/** Best-effort "apply this suggested change" for a review comment's ```suggestion
+ *  fence. GitHub has no REST endpoint that applies a suggestion atomically, so
+ *  this stitches one together from the Contents API: fetch the comment (path +
+ *  commented line range + body), fetch the PR (head branch, and reject a
+ *  cross-fork head — the Contents API write only makes sense against a branch in
+ *  *this* repo), fetch the file at the head branch, splice the commented lines
+ *  for the suggestion text, and PUT it back. Every failure path returns a clean
+ *  `{ok:false,error}` — the PUT only fires once the splice matches cleanly, so a
+ *  stale/outdated comment can't corrupt the file. Token required (both the read
+ *  and the write need it; unauthenticated is rejected up front like the other
+ *  mutating endpoints). */
+export async function applyGitHubSuggestion(input: ApplyGitHubSuggestionInput): Promise<GitHubApplySuggestionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+  if (!Number.isInteger(input.commentId) || input.commentId <= 0) {
+    return { ok: false, error: "review comment id must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to apply a suggestion" };
+
+  const reviewCommentUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/comments/${input.commentId}`;
+  const commentRes = await fetchGitHub(reviewCommentUrl, token, "application/vnd.github+json");
+  if (!("status" in commentRes)) return commentRes;
+  const commentJson = await commentRes.json().catch(() => null);
+  if (!commentRes.ok) return { ok: false, error: apiError(commentJson, commentRes.status, commentRes.statusText) };
+  // Cross-check the comment actually belongs to the PR whose number we were
+  // given — otherwise a stray/mismatched id could drive a write against the
+  // wrong PR's head branch. `pull_request_url` looks like `.../pulls/9`.
+  const prUrlOfComment = commentJson && typeof commentJson === "object"
+    && typeof (commentJson as { pull_request_url?: unknown }).pull_request_url === "string"
+    ? (commentJson as { pull_request_url: string }).pull_request_url
+    : null;
+  if (prUrlOfComment && !new RegExp(`/pulls/${input.number}$`).test(prUrlOfComment)) {
+    return { ok: false, error: "This review comment doesn't belong to that pull request." };
+  }
+  const range = suggestionCommentRange(commentJson);
+  if (!range.ok) return range;
+  const parsed = parseSuggestion(range.body);
+  if (!parsed) return { ok: false, error: "This comment doesn't contain a suggested change." };
+
+  const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
+  if (!("status" in prRes)) return prRes;
+  const prJson = await prRes.json().catch(() => null);
+  if (!prRes.ok) return { ok: false, error: apiError(prJson, prRes.status, prRes.statusText) };
+  const pr = prJson && typeof prJson === "object" ? (prJson as Record<string, unknown>) : {};
+  const head = pr.head && typeof pr.head === "object" ? pr.head as Record<string, unknown> : {};
+  const headRef = typeof head.ref === "string" ? head.ref : null;
+  const headRepo = head.repo && typeof head.repo === "object" ? head.repo as Record<string, unknown> : null;
+  const headRepoFullName = headRepo && typeof headRepo.full_name === "string" ? headRepo.full_name : null;
+  if (!headRef || !headRepoFullName) {
+    return { ok: false, error: "GitHub returned a pull request without head branch info" };
+  }
+  if (headRepoFullName.toLowerCase() !== repoSlug(repo).toLowerCase()) {
+    return { ok: false, error: "Applying suggestions isn't supported for pull requests from a fork." };
+  }
+
+  const fileUrl = `${contentsUrl(repo, range.path)}?ref=${encodeURIComponent(headRef)}`;
+  const fileRes = await fetchGitHub(fileUrl, token, "application/vnd.github+json");
+  if (!("status" in fileRes)) return fileRes;
+  const fileJson = await fileRes.json().catch(() => null);
+  if (!fileRes.ok) return { ok: false, error: apiError(fileJson, fileRes.status, fileRes.statusText) };
+  const file = fileJson && typeof fileJson === "object" ? (fileJson as Record<string, unknown>) : {};
+  const encodedContent = typeof file.content === "string" ? file.content : null;
+  const fileSha = typeof file.sha === "string" ? file.sha : null;
+  // The Contents API only inlines base64 for files under ~1MB; larger files come
+  // back with `encoding: "none"` and empty content (they need the blob API).
+  if (typeof file.encoding === "string" && file.encoding !== "base64") {
+    return { ok: false, error: "This file is too large to apply a suggestion via the Contents API." };
+  }
+  if (!encodedContent || !fileSha) {
+    return { ok: false, error: "GitHub returned an unexpected file contents response" };
+  }
+
+  let decoded: string;
+  try {
+    decoded = Buffer.from(encodedContent, "base64").toString("utf8");
+  } catch {
+    return { ok: false, error: "GitHub returned file contents Agetor couldn't decode" };
+  }
+  const spliced = spliceSuggestionLines(decoded, range.startLine, range.endLine, parsed.suggestion);
+  if (spliced === null) {
+    return { ok: false, error: "This suggestion is outdated — the file no longer matches the commented lines." };
+  }
+
+  const putRes = await fetchGitHub(
+    contentsUrl(repo, range.path),
+    token,
+    "application/vnd.github+json",
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        message: "Apply suggestion from review comment",
+        content: Buffer.from(spliced, "utf8").toString("base64"),
+        sha: fileSha,
+        branch: headRef,
+      }),
+    },
+  );
+  if (!("status" in putRes)) return putRes;
+  const putJson = await putRes.json().catch(() => null);
+  if (!putRes.ok) return { ok: false, error: apiError(putJson, putRes.status, putRes.statusText) };
+  return { ok: true, message: "Suggestion applied." };
+}
+
 export async function getGitHubPullChecks(input: GitHubItemNumberInput): Promise<GitHubChecksResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
@@ -1381,7 +1587,10 @@ export async function requestGitHubPullReviewers(
     return { ok: false, error: "pull request number must be positive" };
   }
   const reviewers = input.reviewers.map((s) => s.trim()).filter(Boolean);
-  if (reviewers.length === 0) return { ok: false, error: "at least one reviewer is required" };
+  const teamReviewers = (input.teamReviewers ?? []).map((s) => s.trim()).filter(Boolean);
+  if (reviewers.length === 0 && teamReviewers.length === 0) {
+    return { ok: false, error: "at least one reviewer or team is required" };
+  }
 
   const token = await githubToken();
   if (!token) return { ok: false, error: "GitHub authentication required to request reviewers" };
@@ -1390,12 +1599,21 @@ export async function requestGitHubPullReviewers(
     url,
     token,
     "application/vnd.github+json",
-    { method: "POST", body: JSON.stringify({ reviewers }) },
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ...(reviewers.length > 0 ? { reviewers } : {}),
+        ...(teamReviewers.length > 0 ? { team_reviewers: teamReviewers } : {}),
+      }),
+    },
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
-  return { ok: true, message: `Requested review from ${reviewers.join(", ")}.` };
+  const parts: string[] = [];
+  if (reviewers.length > 0) parts.push(reviewers.join(", "));
+  if (teamReviewers.length > 0) parts.push(`team${teamReviewers.length === 1 ? "" : "s"} ${teamReviewers.join(", ")}`);
+  return { ok: true, message: `Requested review from ${parts.join(" and ")}.` };
 }
 
 function pickString(obj: Record<string, unknown>, key: string): string {

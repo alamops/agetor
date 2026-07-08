@@ -24,6 +24,9 @@ const {
   normalizeDueOn,
   reactionSubjectPath,
   aggregateReactions,
+  parseSuggestion,
+  suggestionCommentRange,
+  spliceSuggestionLines,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -446,6 +449,73 @@ test("aggregateReactions sorts by the fixed content order regardless of input or
     { id: 3, content: "rocket", user: null },
   ];
   expect(aggregateReactions(raw, "").map((r) => r.content)).toEqual(["+1", "rocket", "eyes"]);
+});
+
+test("parseSuggestion extracts the first ```suggestion fence body, null when absent", () => {
+  expect(parseSuggestion("```suggestion\nconst x = 1;\n```")).toEqual({ suggestion: "const x = 1;" });
+  // multi-line suggestion body, preserved verbatim (minus the one trailing newline before the fence)
+  expect(parseSuggestion("```suggestion\nline one\nline two\n```")).toEqual({ suggestion: "line one\nline two" });
+  // surrounding prose is ignored — only the fenced body is returned
+  expect(parseSuggestion("Nit: fix this.\n\n```suggestion\nfixed text\n```\n\nThanks!")).toEqual({ suggestion: "fixed text" });
+  // only the first fence counts when there happen to be two
+  expect(parseSuggestion("```suggestion\nfirst\n```\n```suggestion\nsecond\n```")).toEqual({ suggestion: "first" });
+  // CRLF fence: the trailing \r\n before the closing fence is fully stripped
+  expect(parseSuggestion("```suggestion\r\nconst x = 1;\r\n```")).toEqual({ suggestion: "const x = 1;" });
+  // empty body = GitHub's "delete this line" convention → { suggestion: "" }
+  expect(parseSuggestion("```suggestion\n```")).toEqual({ suggestion: "" });
+  // a plain code fence (no "suggestion" info string) doesn't count
+  expect(parseSuggestion("```ts\nconst x = 1;\n```")).toBeNull();
+  // a bare ```suggestion with no newline after it is not an appliable suggestion
+  expect(parseSuggestion("```suggestion")).toBeNull();
+  expect(parseSuggestion("just a regular comment")).toBeNull();
+  expect(parseSuggestion("")).toBeNull();
+});
+
+test("suggestionCommentRange requires a present line + RIGHT side, refusing outdated/LEFT comments", () => {
+  expect(suggestionCommentRange({ path: "a.ts", line: 12, side: "RIGHT", body: "```suggestion\nx\n```" }))
+    .toEqual({ ok: true, path: "a.ts", startLine: 12, endLine: 12, body: "```suggestion\nx\n```" });
+  // multi-line comment: start_line..line
+  expect(suggestionCommentRange({ path: "a.ts", start_line: 10, line: 12, side: "RIGHT", body: "x" }))
+    .toEqual({ ok: true, path: "a.ts", startLine: 10, endLine: 12, body: "x" });
+  // side falls back to original_side when side is absent but a RIGHT position holds
+  expect(suggestionCommentRange({ path: "a.ts", line: 5, original_side: "RIGHT", body: "x" }))
+    .toMatchObject({ ok: true, startLine: 5, endLine: 5 });
+  // line null/absent (outdated — GitHub would only fill original_line) → refuse, do NOT use original_line
+  expect(suggestionCommentRange({ path: "a.ts", line: null, side: "RIGHT", original_line: 7, body: "x" }))
+    .toEqual({ ok: false, error: "This suggestion is on an outdated diff and can't be applied automatically." });
+  expect(suggestionCommentRange({ path: "a.ts", side: "RIGHT", original_line: 7, body: "x" }))
+    .toEqual({ ok: false, error: "This suggestion is on an outdated diff and can't be applied automatically." });
+  // LEFT-side comment (base-file line, doesn't map to head) → refuse
+  expect(suggestionCommentRange({ path: "a.ts", line: 4, side: "LEFT", body: "x" }))
+    .toEqual({ ok: false, error: "Suggestions can only be applied to added or unchanged lines." });
+  // missing path/body, or an inverted range → malformed
+  expect(suggestionCommentRange({ path: "a.ts", line: 3, side: "RIGHT" }))
+    .toEqual({ ok: false, error: "GitHub returned an unexpected review comment response" });
+  expect(suggestionCommentRange({ path: "a.ts", start_line: 9, line: 3, side: "RIGHT", body: "x" }))
+    .toEqual({ ok: false, error: "GitHub returned an unexpected review comment response" });
+  expect(suggestionCommentRange(null)).toEqual({ ok: false, error: "GitHub returned an unexpected review comment response" });
+});
+
+test("spliceSuggestionLines replaces the inclusive range, preserves EOL/trailing newline, deletes on empty", () => {
+  const lf = "line1\nline2\nline3\n";
+  // one line → one line
+  expect(spliceSuggestionLines(lf, 2, 2, "LINE2")).toBe("line1\nLINE2\nline3\n");
+  // one line → multi-line
+  expect(spliceSuggestionLines(lf, 2, 2, "a\nb")).toBe("line1\na\nb\nline3\n");
+  // multi-line → one line
+  expect(spliceSuggestionLines(lf, 1, 2, "merged")).toBe("merged\nline3\n");
+  // no trailing newline preserved
+  expect(spliceSuggestionLines("a\nb\nc", 2, 2, "B")).toBe("a\nB\nc");
+  // CRLF file: inserted line matches the file's CRLF terminator
+  expect(spliceSuggestionLines("a\r\nb\r\nc\r\n", 2, 2, "B")).toBe("a\r\nB\r\nc\r\n");
+  // endLine == last line
+  expect(spliceSuggestionLines(lf, 3, 3, "LAST")).toBe("line1\nline2\nLAST\n");
+  // empty suggestion deletes the range (inserts zero lines)
+  expect(spliceSuggestionLines(lf, 2, 2, "")).toBe("line1\nline3\n");
+  // out of range → null (never a throw)
+  expect(spliceSuggestionLines(lf, 40, 40, "x")).toBeNull();
+  expect(spliceSuggestionLines(lf, 2, 1, "x")).toBeNull();
+  expect(spliceSuggestionLines(lf, 0, 0, "x")).toBeNull();
 });
 
 test("graphqlErrorMessage returns the first error message, else null", () => {

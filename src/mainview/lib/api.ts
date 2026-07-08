@@ -586,8 +586,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  requestGitHubPullReviewers: (input: { path: string; number: number; reviewers: string[] }) =>
+  requestGitHubPullReviewers: (input: { path: string; number: number; reviewers: string[]; teamReviewers?: string[] }) =>
     j<{ ok: true; message?: string }>("/github/pull-reviewers", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  applyGitHubSuggestion: (input: { path: string; number: number; commentId: number }) =>
+    j<{ ok: true; message: string }>("/github/pull-apply-suggestion", {
       method: "POST",
       body: JSON.stringify(input),
     }),
