@@ -1132,8 +1132,12 @@ function RunPanelBody({
 
       {/* Messages backlog — saved drafts to send later. Sits just above the
           composer so the "stash a thought / send it when ready" loop is one
-          glance apart. Hidden entirely when empty (and on archived tasks). */}
-      {!archived && backlogItems.length > 0 && (
+          glance apart. Hidden when empty, on archived tasks, and on a
+          background-agent (subagent) tab — those streams are read-only, so an
+          interactive tray whose "Send now" targets the main run would sit
+          contradictorily above the read-only footer. Only shown on the Main
+          stream, matching the composer and Stop control. */}
+      {!archived && activeStream === "main" && backlogItems.length > 0 && (
         <BacklogTray
           items={backlogItems}
           canSend={canSend && !modalPending}
