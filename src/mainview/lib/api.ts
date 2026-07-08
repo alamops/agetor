@@ -339,6 +339,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  reopenGitHubPull: (input: { path: string; number: number }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/pull-reopen", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubPullDraft: (input: { path: string; number: number; draft: boolean }) =>
+    j<{ ok: true; draft: boolean; message?: string }>("/github/pull-draft", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   getGitHubPullDefaults: (input: { path: string }) => {
     const q = new URLSearchParams({ path: input.path });
     return j<GitHubPullDefaultsResult>(`/github/pull-defaults?${q.toString()}`);

@@ -72,9 +72,11 @@ import {
   listGitHubItems,
   listGitHubPullReviewComments,
   mergeGitHubPull,
+  reopenGitHubPull,
   replyGitHubPullLineComment,
   requestGitHubPullReviewers,
   reviewGitHubPull,
+  setGitHubPullDraft,
   updateGitHubIssue,
   updateGitHubPullBranch,
 } from "./github.ts";
@@ -672,6 +674,43 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
           }
           const result = await updateGitHubPullBranch({ dir, number: rawNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-reopen": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await reopenGitHubPull({ dir, number: rawNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-draft": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; draft?: boolean };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.draft !== "boolean") {
+            return json({ error: "draft (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubPullDraft({ dir, number: rawNumber, draft: body.draft });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

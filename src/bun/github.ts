@@ -127,6 +127,10 @@ interface RequestGitHubPullReviewersInput extends GitHubItemNumberInput {
   reviewers: string[];
 }
 
+interface SetGitHubPullDraftInput extends GitHubItemNumberInput {
+  draft: boolean;
+}
+
 interface GitHubListError {
   ok: false;
   error: string;
@@ -140,6 +144,7 @@ type GitHubPullLineCommentResponse = ({ ok: true; comment: GitHubPullLineComment
 type GitHubPullReviewCommentsResponse = ({ ok: true } & GitHubPullReviewCommentsResult) | GitHubListError;
 type GitHubChecksResponse = ({ ok: true } & GitHubChecksResult) | GitHubListError;
 type GitHubMergeabilityResponse = ({ ok: true } & GitHubPullMergeability) | GitHubListError;
+type GitHubPullDraftResponse = ({ ok: true; draft: boolean; message?: string }) | GitHubListError;
 type GitHubActionResponse = ({ ok: true; message?: string; item?: GitHubListItem; commentPosted?: boolean }) | GitHubListError;
 type GitHubPullMergeResponse = GitHubPullMergeResult | GitHubListError;
 type GitHubPullDefaultsResponse = ({ ok: true } & GitHubPullDefaultsResult) | GitHubListError;
@@ -263,6 +268,7 @@ export const __githubInternals = {
   reviewValidationError,
   buildIssueUpdatePatch,
   normalizeMergeability,
+  draftFromGraphql,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -1163,4 +1169,90 @@ export async function updateGitHubPullBranch(input: GitHubItemNumberInput): Prom
     ? (json as { message: string }).message
     : "Branch update started — GitHub is merging the base branch into this pull request.";
   return { ok: true, message };
+}
+
+export async function reopenGitHubPull(input: GitHubItemNumberInput): Promise<GitHubIssueResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to reopen a pull request" };
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const res = await fetchGitHub(
+    url,
+    token,
+    "application/vnd.github+json",
+    { method: "PATCH", body: JSON.stringify({ state: "open" }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const item = normalizeItem("pulls", json);
+  if (!item) return { ok: false, error: "GitHub returned an unexpected pull request response" };
+  return { ok: true, item, message: "Pull request reopened." };
+}
+
+/** Dig `data.<field>.pullRequest.isDraft` out of a GraphQL response. */
+function draftFromGraphql(json: unknown, field: string): boolean | null {
+  if (!json || typeof json !== "object") return null;
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const payload = (data as Record<string, unknown>)[field];
+  if (!payload || typeof payload !== "object") return null;
+  const pr = (payload as { pullRequest?: unknown }).pullRequest;
+  if (!pr || typeof pr !== "object") return null;
+  const isDraft = (pr as { isDraft?: unknown }).isDraft;
+  return typeof isDraft === "boolean" ? isDraft : null;
+}
+
+/** Toggle a PR's draft state. REST has no endpoint for this, so it goes through
+ *  the GraphQL `convertPullRequestToDraft` / `markPullRequestReadyForReview`
+ *  mutations, keyed on the PR's global node id (read from the REST PR first). */
+export async function setGitHubPullDraft(input: SetGitHubPullDraftInput): Promise<GitHubPullDraftResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to change draft state" };
+  const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
+  if (!("status" in prRes)) return prRes;
+  const pr = await prRes.json().catch(() => null);
+  if (!prRes.ok) return { ok: false, error: apiError(pr, prRes.status, prRes.statusText) };
+  const nodeId = pr && typeof pr === "object" && typeof (pr as { node_id?: unknown }).node_id === "string"
+    ? (pr as { node_id: string }).node_id
+    : null;
+  if (!nodeId) return { ok: false, error: "GitHub returned a pull request without a node id" };
+
+  const field = input.draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview";
+  const query = `mutation($id: ID!) { ${field}(input: { pullRequestId: $id }) { pullRequest { isDraft } } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { id: nodeId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  // GraphQL reports mutation failures as a 200 with an `errors` array.
+  const errors = json && typeof json === "object" && Array.isArray((json as { errors?: unknown }).errors)
+    ? (json as { errors: unknown[] }).errors
+    : [];
+  if (errors.length > 0) {
+    const first = errors[0];
+    const msg = first && typeof first === "object" && typeof (first as { message?: unknown }).message === "string"
+      ? (first as { message: string }).message
+      : "GitHub rejected the draft change";
+    return { ok: false, error: msg };
+  }
+  const isDraft = draftFromGraphql(json, field);
+  const draft = isDraft ?? input.draft;
+  return { ok: true, draft, message: draft ? "Converted to draft." : "Marked ready for review." };
 }

@@ -639,6 +639,47 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     }
   };
 
+  const runReopenPull = async (item: GitHubListItem) => {
+    if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
+    setActionBusy((cur) => ({ ...cur, [item.number]: "reopen" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.reopenGitHubPull({ path: projectPath, number: item.number });
+      upsertListItem(result.item);
+      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Pull request reopened." }));
+      // Now open again — let the mergeability effect fetch a fresh verdict.
+      mergeabilityRetries.current[item.number] = 0;
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
+  const runToggleDraft = async (item: GitHubListItem) => {
+    if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
+    const nextDraft = !item.draft;
+    setActionBusy((cur) => ({ ...cur, [item.number]: "draft" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.setGitHubPullDraft({ path: projectPath, number: item.number, draft: nextDraft });
+      upsertListItem({ ...item, draft: result.draft });
+      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Draft state updated." }));
+      // Draft ↔ ready flips mergeable_state (draft PRs report "draft"), so refresh.
+      mergeabilityRetries.current[item.number] = 0;
+      setMergeability((cur) => ({ ...cur, [item.number]: undefined }));
+      setMergeabilityErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
   const upsertListItem = (replacement: GitHubListItem, prepend = false) => {
     setResult((cur) => {
       if (!cur) return cur;
@@ -1092,6 +1133,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onReview={(event) => { void runPullReview(item, event); }}
                 onMerge={() => { void runPullMerge(item); }}
                 onUpdateBranch={() => { void runUpdateBranch(item); }}
+                onReopenPull={() => { void runReopenPull(item); }}
+                onToggleDraft={() => { void runToggleDraft(item); }}
                 onClosePull={() => { void runPullClose(item); }}
                 onLineComment={(target) => submitLineComment(item, target)}
                 onReviewReplyDraftChange={(commentId, body) => setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: body }))}
@@ -1465,6 +1508,8 @@ function GitHubItemRow({
   onReview,
   onMerge,
   onUpdateBranch,
+  onReopenPull,
+  onToggleDraft,
   onClosePull,
   onLineComment,
   onReviewReplyDraftChange,
@@ -1532,6 +1577,8 @@ function GitHubItemRow({
   onReview: (event: GitHubPullReviewEvent) => void;
   onMerge: () => void;
   onUpdateBranch: () => void;
+  onReopenPull: () => void;
+  onToggleDraft: () => void;
   onClosePull: () => void;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onReviewReplyDraftChange: (commentId: number, body: string) => void;
@@ -1683,6 +1730,8 @@ function GitHubItemRow({
                 onReview={onReview}
                 onMerge={onMerge}
                 onUpdateBranch={onUpdateBranch}
+                onReopenPull={onReopenPull}
+                onToggleDraft={onToggleDraft}
                 onClosePull={onClosePull}
                 onRefreshMergeability={onRefreshMergeability}
               />
@@ -2029,6 +2078,8 @@ function PullActions({
   onReview,
   onMerge,
   onUpdateBranch,
+  onReopenPull,
+  onToggleDraft,
   onClosePull,
   onRefreshMergeability,
 }: {
@@ -2048,6 +2099,8 @@ function PullActions({
   onReview: (event: GitHubPullReviewEvent) => void;
   onMerge: () => void;
   onUpdateBranch: () => void;
+  onReopenPull: () => void;
+  onToggleDraft: () => void;
   onClosePull: () => void;
   onRefreshMergeability: () => void;
 }) {
@@ -2061,8 +2114,17 @@ function PullActions({
           <GitPullRequest className="size-3.5" />
           Actions
         </div>
+        {item.state === "open" && (
+          <Button size="sm" variant="ghost" className="h-7" disabled={!!busy} onClick={onToggleDraft}>
+            {busy === "draft" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <FilePen className="mr-2 size-3.5" />}
+            {item.draft ? "Mark ready for review" : "Convert to draft"}
+          </Button>
+        )}
         {item.state !== "open" && (
-          <span className="text-[11px] text-muted-foreground">This pull request is closed.</span>
+          <Button size="sm" variant="outline" className="h-7" disabled={!!busy} onClick={onReopenPull}>
+            {busy === "reopen" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitPullRequest className="mr-2 size-3.5" />}
+            Reopen
+          </Button>
         )}
         {message && (
           <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">

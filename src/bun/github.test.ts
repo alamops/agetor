@@ -9,6 +9,7 @@ const {
   reviewValidationError,
   buildIssueUpdatePatch,
   normalizeMergeability,
+  draftFromGraphql,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -154,4 +155,16 @@ test("normalizeMergeability reads mergeable/state and refs, defaulting the unkno
   expect(partial).toMatchObject({ mergeable: null, mergeableState: "unknown", rebaseable: null, headRef: "", baseRef: "", headSha: "" });
 
   expect(normalizeMergeability(REPO, 9, null)).toBeNull();
+});
+
+test("draftFromGraphql digs isDraft out of the mutation payload, else null", () => {
+  const ready = { data: { markPullRequestReadyForReview: { pullRequest: { isDraft: false } } } };
+  expect(draftFromGraphql(ready, "markPullRequestReadyForReview")).toBe(false);
+  const toDraft = { data: { convertPullRequestToDraft: { pullRequest: { isDraft: true } } } };
+  expect(draftFromGraphql(toDraft, "convertPullRequestToDraft")).toBe(true);
+  // wrong field, missing nesting, or junk → null (caller falls back to requested state)
+  expect(draftFromGraphql(ready, "convertPullRequestToDraft")).toBeNull();
+  expect(draftFromGraphql({ data: {} }, "markPullRequestReadyForReview")).toBeNull();
+  expect(draftFromGraphql({ errors: [{ message: "nope" }] }, "markPullRequestReadyForReview")).toBeNull();
+  expect(draftFromGraphql(null, "markPullRequestReadyForReview")).toBeNull();
 });
