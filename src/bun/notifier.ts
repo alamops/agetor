@@ -59,6 +59,22 @@ export function resolveNotifier(): string | null {
   return null;
 }
 
+/**
+ * The resolved helper's `.app` bundle path (the parent of Contents/MacOS/…),
+ * or null when the helper isn't a real bundle (e.g. an `AGETOR_NOTIFIER_BIN`
+ * override pointing at a bare binary, or nothing resolved). Used to register
+ * the bundle with LaunchServices so a notification click can relaunch it — we
+ * spawn the inner Mach-O directly, which doesn't guarantee LS registration.
+ */
+export function resolveNotifierApp(): string | null {
+  const exe = resolveNotifier();
+  if (!exe) return null;
+  const suffix = path.join("AgetorNotifier.app", "Contents", "MacOS", "notifier");
+  if (!exe.endsWith(suffix)) return null;
+  // <app>/Contents/MacOS/notifier -> <app>
+  return path.dirname(path.dirname(path.dirname(exe)));
+}
+
 export interface NotifierOptions {
   title: string;
   body?: string;

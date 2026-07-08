@@ -95,9 +95,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exit(0) }
       }
     }
-    // Safety net if the auth callback never returns (e.g. an unexpected TCC
-    // state) so the helper can't linger.
-    scheduleExit(after: 15)
+    // Safety net if neither the auth callback nor `add` ever completes. Uses a
+    // generous window so a first-run user has time to answer the permission
+    // dialog (grant -> `add` -> exit 0 well before this fires), and exits
+    // NON-zero: if we get here we never posted, so agetor should treat it as a
+    // failed post. 120s so an AFK first-run doesn't drop the notification
+    // prematurely.
+    scheduleExit(after: 120, code: 2)
   }
 
   // Click handling: fires in this process, whether it stayed alive or was
@@ -109,7 +113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   ) {
     if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
       let urlString = response.notification.request.content.userInfo["url"] as? String,
-      let url = URL(string: urlString)
+      let url = URL(string: urlString),
+      url.scheme == "agetor"  // defense in depth: only ever open our own deep links
     {
       NSWorkspace.shared.open(url)
     }
@@ -124,11 +129,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     willPresent notification: UNNotification,
     withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
   ) {
-    completionHandler([.banner, .sound])
+    // Respect --silent even on the foreground-present path (the helper is
+    // briefly frontmost right after posting).
+    completionHandler(opts.silent ? [.banner] : [.banner, .sound])
   }
 
-  private func scheduleExit(after seconds: Double) {
-    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { exit(0) }
+  private func scheduleExit(after seconds: Double, code: Int32 = 0) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { exit(code) }
   }
 }
 

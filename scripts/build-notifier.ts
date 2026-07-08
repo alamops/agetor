@@ -68,7 +68,11 @@ async function main() {
   // into a release (with ELECTROBUN_DEVELOPER_ID set) unsigned-for-notarization.
   if (existsSync(EXE) && existsSync(STAMP)) {
     const exeMtime = statSync(EXE).mtimeMs;
-    const newestSource = Math.max(statSync(SRC).mtimeMs, statSync(PLIST).mtimeMs);
+    // Rebuild when any input changed: the Swift source, the Info.plist, the
+    // iconset dir (catches icon add/remove), or this build script itself.
+    const selfPath = new URL(import.meta.url).pathname;
+    const sources = [SRC, PLIST, selfPath, ...(existsSync(ICONSET) ? [ICONSET] : [])];
+    const newestSource = Math.max(...sources.map((s) => statSync(s).mtimeMs));
     const stamp = (await readFile(STAMP, "utf8")).trim();
     if (exeMtime >= newestSource && stamp === desiredIdentity) {
       console.log(`[build-notifier] cached at ${path.relative(REPO_ROOT, APP)} — skipping`);

@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { writeFileSync, existsSync } from "node:fs";
 import Electrobun, { ApplicationMenu, BrowserWindow, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
@@ -10,7 +10,7 @@ import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
-import { resolveNotifier, buildNotifierArgs } from "./notifier.ts";
+import { resolveNotifier, resolveNotifierApp, buildNotifierArgs } from "./notifier.ts";
 import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
 import { setPendingOpenTask } from "./pending-open.ts";
 import pkg from "../../package.json" with { type: "json" };
@@ -175,10 +175,20 @@ function showTaskNotification(n: {
         // Fall back if the helper failed to actually show anything.
         child.exited
           .then((code) => {
-            if (code !== 0) {
-              console.error(`[agetor] notifier helper exited ${code}, falling back to plain notification`);
-              plain();
+            // 0 = posted. 2 = the user denied notification permission (or never
+            // answered the one-time prompt). On denial we deliberately do NOT
+            // fall back to Utils.showNotification: that posts under agetor's
+            // MAIN bundle id — a second "Agetor" identity — which would
+            // re-prompt for a permission the user just declined. Respect the
+            // choice (no notification). Any OTHER non-zero code is an
+            // unexpected helper failure, so fall back to a plain notification.
+            if (code === 0) return;
+            if (code === 2) {
+              console.error("[agetor] notifier helper: notification permission not granted; skipping fallback");
+              return;
             }
+            console.error(`[agetor] notifier helper exited ${code}, falling back to plain notification`);
+            plain();
           })
           .catch((err) => {
             console.error("[agetor] notifier helper failed, falling back:", err);
@@ -193,6 +203,29 @@ function showTaskNotification(n: {
   }
   plain();
 }
+
+// Best-effort: register the notifier helper bundle with LaunchServices at
+// startup. We spawn the helper's inner Mach-O directly (not via `open`), which
+// does not guarantee the bundle is in the LaunchServices database — and a
+// notification CLICK needs LS to be able to relaunch the bundle by identity to
+// deliver the response (which runs `open agetor://…`). Registering it here
+// maximizes the chance the cold-relaunch-on-click path works. Fully non-fatal:
+// posting notifications works regardless; only the click-relaunch depends on it
+// (and that is a manual-QA item on a notarized build either way).
+function registerNotifierBundle(): void {
+  try {
+    const app = resolveNotifierApp();
+    if (!app) return;
+    const lsregister =
+      "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister";
+    if (!existsSync(lsregister)) return;
+    // Fire-and-forget; lsregister is fast and idempotent.
+    Bun.spawn([lsregister, "-f", app], { stdout: "ignore", stderr: "ignore" });
+  } catch (err) {
+    console.error("[agetor] failed to register notifier bundle with LaunchServices:", err);
+  }
+}
+registerNotifierBundle();
 
 // Native-host capabilities the API server needs but that only exist inside
 // Electrobun (file dialogs, OS notifications, open-in-Finder/browser, the
