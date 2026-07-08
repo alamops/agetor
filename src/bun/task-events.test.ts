@@ -168,7 +168,10 @@ test("sendInput on a finished claude-code task inserts a NEW run row with status
   const { tasks, runs, db } = await import("./db.ts");
   const { sendInput } = await import("./orchestrator.ts");
   const taskId = randomUUID();
-  tasks.insert(makeTaskRow(taskId));
+  // model/effort must be set: a finished task has no in-memory SessionState, so
+  // sendClaudeTurn routes through spawnResumedSession → spawnAgent, and
+  // buildCommand (called even on the fake-driver path) requires them.
+  tasks.insert({ ...makeTaskRow(taskId), model: "claude-opus-4-7", effort: "medium" });
   const firstRunId = randomUUID();
   const now = Date.now();
   runs.insert({
@@ -182,10 +185,10 @@ test("sendInput on a finished claude-code task inserts a NEW run row with status
   ).get(taskId)?.n ?? 0;
   expect(countRows()).toBe(1);
 
-  // AGETOR_TMUX_BIN is unset → `tmux has-session` fails → sessionExists
-  // returns false → sendClaudeTurn routes through spawnResumedSession,
-  // which uses the fake driver (AGETOR_CLAUDE_DRIVER=fake) and inserts a
-  // fresh run row.
+  // A finished task has no in-memory SessionState, so sendClaudeTurn routes
+  // through spawnResumedSession deterministically (regardless of whether a
+  // stray tmux session with this name exists), which uses the fake driver
+  // (AGETOR_CLAUDE_DRIVER=fake) and inserts a fresh run row.
   const result = sendInput(firstRunId, "follow-up");
   if (!result.delivered) throw new Error(`sendInput failed: ${result.reason}`);
   expect(result.runId).not.toBe(firstRunId);

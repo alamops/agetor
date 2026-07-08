@@ -8,6 +8,15 @@ export type ColumnId = "backlog" | "ready" | "running" | "blocked" | "review" | 
  */
 export const TMUX_MISSING_REASON = "tmux is required to drive claude-code interactively";
 
+/**
+ * Sentinel prefix for the `status` chunk a driver emits when it detects that a
+ * *running* task's tmux session has died unexpectedly mid-turn (crash, external
+ * kill, tmux server gone). The orchestrator's chunk handler pattern-matches this
+ * prefix to flip the card to `blocked` and settle the run, mirroring the
+ * claude API-error path. Lives here (not in a driver file) because BOTH the
+ * claude and codex drivers emit it and the orchestrator consumes it. */
+export const SESSION_DIED_STATUS_PREFIX = "session ended: ";
+
 export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "backlog", label: "Backlog" },
   { id: "ready", label: "Ready" },
@@ -798,7 +807,7 @@ export type GlobalEvent =
        *  than the generic "waiting on you" used for permission prompts.
        *  Unset for transitions whose reason is fully implied by the
        *  (prev, column) pair (e.g. plain success → review). */
-      reason?: "api-error" | "approval";
+      reason?: "api-error" | "approval" | "session-died";
     }
   | {
       kind: "update";
@@ -836,12 +845,19 @@ export type GlobalEvent =
  *   quit_request — main process intercepted Cmd+Q / window close with N
  *                  runs still active. Webview shows a confirm modal; the
  *                  user picks Quit-anyway (POST /app/force-quit) or stays.
+ *   open_task    — a native notification deep-link (`agetor://task/<id>`)
+ *                  was clicked. Webview opens that task's RunPanel.
  */
 export type AppEvent =
   | {
       type: "quit_request";
       runningRunCount: number;
       runningTaskTitles: string[];
+      ts: number;
+    }
+  | {
+      type: "open_task";
+      taskId: string;
       ts: number;
     };
 
