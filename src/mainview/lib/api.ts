@@ -16,7 +16,11 @@ import type {
   GitHubRepoLabel,
   GitHubMilestonesResult,
   GitHubRepoMilestone,
+  GitHubLinkedIssue,
+  GitHubLinkedIssuesResult,
   GitHubListResult,
+  GitHubPullCommit,
+  GitHubPullCommitsResult,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
   GitHubPullMergeability,
@@ -68,7 +72,11 @@ export type {
   GitHubRepoLabel,
   GitHubMilestonesResult,
   GitHubRepoMilestone,
+  GitHubLinkedIssue,
+  GitHubLinkedIssuesResult,
   GitHubListResult,
+  GitHubPullCommit,
+  GitHubPullCommitsResult,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
   GitHubPullMergeability,
@@ -377,6 +385,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  setGitHubPullAutoMerge: (input: { path: string; number: number; enable: boolean; mergeMethod?: GitHubPullMergeMethod }) =>
+    j<{ ok: true; autoMergeEnabled: boolean; message?: string }>("/github/pull-auto-merge", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubPullCommits: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullCommitsResult>(`/github/pull-commits?${q.toString()}`);
+  },
+  getGitHubPullLinkedIssues: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubLinkedIssuesResult>(`/github/pull-linked-issues?${q.toString()}`);
+  },
   getGitHubPullDefaults: (input: { path: string }) => {
     const q = new URLSearchParams({ path: input.path });
     return j<GitHubPullDefaultsResult>(`/github/pull-defaults?${q.toString()}`);

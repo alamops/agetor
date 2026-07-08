@@ -14,6 +14,7 @@ function m(overrides: Partial<GitHubPullMergeability>): GitHubPullMergeability {
     headRef: "feature",
     baseRef: "main",
     headSha: "abc",
+    autoMerge: false,
     ...overrides,
   };
 }

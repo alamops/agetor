@@ -807,11 +807,45 @@ export interface GitHubChecksResult {
   checkRuns: GitHubCheckRun[];
 }
 
+/** A single commit on a pull request, from `GET /pulls/:n/commits`.
+ *  `messageHeadline` is the first line of the commit message; `author` prefers
+ *  the top-level GitHub-user `author` (has a `login`) over the raw git author,
+ *  falling back to null when the commit's author isn't a known GitHub user. */
+export interface GitHubPullCommit {
+  sha: string;
+  messageHeadline: string;
+  author: GitHubUser | null;
+  authoredDate: string;
+  htmlUrl: string;
+}
+
+export interface GitHubPullCommitsResult {
+  repo: string;
+  pullNumber: number;
+  commits: GitHubPullCommit[];
+}
+
+/** An issue a pull request will close on merge (GraphQL
+ *  `closingIssuesReferences`), read-only — surfaced as a "Closes: #N" line. */
+export interface GitHubLinkedIssue {
+  number: number;
+  title: string;
+  url: string;
+  state: "OPEN" | "CLOSED";
+}
+
+export interface GitHubLinkedIssuesResult {
+  repo: string;
+  pullNumber: number;
+  issues: GitHubLinkedIssue[];
+}
+
 /** GitHub's mergeability verdict for a PR, from `GET /pulls/:n`.
  *  `mergeable` is null while GitHub computes it in the background (poll again).
  *  `mergeableState` is GitHub's coarse status: clean | dirty (conflicts) |
  *  behind (base moved) | blocked (required reviews/checks) | unstable (checks
- *  pending/failing but mergeable) | draft | has_hooks | unknown. */
+ *  pending/failing but mergeable) | draft | has_hooks | unknown.
+ *  `autoMerge` reflects the REST `auto_merge` field (non-null once enabled). */
 export interface GitHubPullMergeability {
   repo: string;
   pullNumber: number;
@@ -823,6 +857,7 @@ export interface GitHubPullMergeability {
   headRef: string;
   baseRef: string;
   headSha: string;
+  autoMerge: boolean;
 }
 
 export type GitHubPullReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";

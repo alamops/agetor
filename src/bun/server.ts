@@ -71,6 +71,7 @@ import {
   deleteGitHubLabel,
   deleteGitHubMilestone,
   getGitHubPullChecks,
+  getGitHubPullLinkedIssues,
   getGitHubViewer,
   getGitHubPullDefaults,
   getGitHubPullDiff,
@@ -81,6 +82,7 @@ import {
   listGitHubItems,
   listGitHubLabels,
   listGitHubMilestones,
+  listGitHubPullCommits,
   listGitHubPullReviewComments,
   listGitHubReactions,
   mergeGitHubPull,
@@ -89,6 +91,7 @@ import {
   replyGitHubPullLineComment,
   requestGitHubPullReviewers,
   reviewGitHubPull,
+  setGitHubPullAutoMerge,
   setGitHubPullDraft,
   setGitHubReviewThreadResolved,
   updateGitHubComment,
@@ -1019,6 +1022,70 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "draft (boolean) required" }, { status: 400, headers: corsHeaders(req) });
           }
           const result = await setGitHubPullDraft({ dir, number: rawNumber, draft: body.draft });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-auto-merge": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            enable?: boolean;
+            mergeMethod?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.enable !== "boolean") {
+            return json({ error: "enable (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.enable && body.mergeMethod !== undefined
+            && body.mergeMethod !== "merge" && body.mergeMethod !== "squash" && body.mergeMethod !== "rebase") {
+            return json({ error: "valid merge method required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const mergeMethod = (body.mergeMethod as GitHubPullMergeMethod | undefined) ?? "merge";
+          const result = await setGitHubPullAutoMerge({ dir, number: rawNumber, enable: body.enable, mergeMethod });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-commits": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await listGitHubPullCommits({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-linked-issues": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubPullLinkedIssues({ dir, number });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

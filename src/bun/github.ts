@@ -9,12 +9,16 @@ import type {
   GitHubItemState,
   GitHubLabel,
   GitHubLabelsResult,
+  GitHubLinkedIssue,
+  GitHubLinkedIssuesResult,
   GitHubListItem,
   GitHubListResult,
   GitHubRepoLabel,
   GitHubMilestone,
   GitHubMilestonesResult,
   GitHubRepoMilestone,
+  GitHubPullCommit,
+  GitHubPullCommitsResult,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
   GitHubPullMergeability,
@@ -161,6 +165,11 @@ interface SetGitHubPullDraftInput extends GitHubItemNumberInput {
   draft: boolean;
 }
 
+interface SetGitHubPullAutoMergeInput extends GitHubItemNumberInput {
+  enable: boolean;
+  mergeMethod?: GitHubPullMergeMethod;
+}
+
 // A "conversation" comment (issue/PR body thread) lives under /issues/comments;
 // an inline "review" comment lives under /pulls/comments. Both share the edit /
 // delete shape, differing only by that path segment.
@@ -258,6 +267,9 @@ type GitHubPullReviewCommentsResponse = ({ ok: true } & GitHubPullReviewComments
 type GitHubChecksResponse = ({ ok: true } & GitHubChecksResult) | GitHubListError;
 type GitHubMergeabilityResponse = ({ ok: true } & GitHubPullMergeability) | GitHubListError;
 type GitHubPullDraftResponse = ({ ok: true; draft: boolean; message?: string }) | GitHubListError;
+type GitHubPullAutoMergeResponse = ({ ok: true; autoMergeEnabled: boolean; message?: string }) | GitHubListError;
+type GitHubPullCommitsResponse = ({ ok: true } & GitHubPullCommitsResult) | GitHubListError;
+type GitHubLinkedIssuesResponse = ({ ok: true } & GitHubLinkedIssuesResult) | GitHubListError;
 type GitHubViewerResponse = ({ ok: true; login: string }) | GitHubListError;
 type GitHubLabelsResponse = ({ ok: true } & GitHubLabelsResult) | GitHubListError;
 type GitHubLabelResponse = ({ ok: true; label: GitHubRepoLabel }) | GitHubListError;
@@ -410,6 +422,8 @@ export const __githubInternals = {
   reviewValidationError,
   buildIssueUpdatePatch,
   normalizeMergeability,
+  normalizePullCommit,
+  parseLinkedIssues,
   draftFromGraphql,
   graphqlErrorMessage,
   sanitizeReviewComments,
@@ -629,6 +643,59 @@ function normalizeCheckRun(raw: unknown): GitHubCheckRun | null {
     startedAt: typeof obj.started_at === "string" ? obj.started_at : null,
     completedAt: typeof obj.completed_at === "string" ? obj.completed_at : null,
   };
+}
+
+/** A single `GET /pulls/:n/commits` entry. `messageHeadline` is the commit
+ *  message's first line; `author` prefers the top-level GitHub-user `author`
+ *  (present when the committer's email is linked to a GitHub account) over
+ *  the raw git `commit.author`, falling back to null. Pure — unit-tested. */
+function normalizePullCommit(raw: unknown): GitHubPullCommit | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.sha !== "string" || !obj.sha) return null;
+  const commit = obj.commit && typeof obj.commit === "object" ? obj.commit as Record<string, unknown> : null;
+  if (!commit || typeof commit.message !== "string") return null;
+  const commitAuthor = commit.author && typeof commit.author === "object"
+    ? commit.author as Record<string, unknown>
+    : {};
+  return {
+    sha: obj.sha,
+    messageHeadline: commit.message.split("\n")[0] ?? "",
+    author: normalizeUser(obj.author),
+    authoredDate: typeof commitAuthor.date === "string" ? commitAuthor.date : "",
+    htmlUrl: typeof obj.html_url === "string" ? obj.html_url : "",
+  };
+}
+
+/** Dig `data.repository.pullRequest.closingIssuesReferences.nodes` out of a
+ *  GraphQL response, defensively — `[]` on any unexpected shape. Pure —
+ *  unit-tested. */
+function parseLinkedIssues(json: unknown): GitHubLinkedIssue[] {
+  if (!json || typeof json !== "object") return [];
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return [];
+  const repository = (data as { repository?: unknown }).repository;
+  if (!repository || typeof repository !== "object") return [];
+  const pr = (repository as { pullRequest?: unknown }).pullRequest;
+  if (!pr || typeof pr !== "object") return [];
+  const closing = (pr as { closingIssuesReferences?: unknown }).closingIssuesReferences;
+  if (!closing || typeof closing !== "object") return [];
+  const nodes = (closing as { nodes?: unknown }).nodes;
+  if (!Array.isArray(nodes)) return [];
+
+  const issues: GitHubLinkedIssue[] = [];
+  for (const node of nodes) {
+    if (!node || typeof node !== "object") continue;
+    const obj = node as Record<string, unknown>;
+    if (typeof obj.number !== "number" || typeof obj.title !== "string" || typeof obj.url !== "string") continue;
+    issues.push({
+      number: obj.number,
+      title: obj.title,
+      url: obj.url,
+      state: obj.state === "CLOSED" ? "CLOSED" : "OPEN",
+    });
+  }
+  return issues;
 }
 
 function repoSlug(repo: GitHubRepo): string {
@@ -1092,6 +1159,33 @@ export async function getGitHubPullChecks(input: GitHubItemNumberInput): Promise
   };
 }
 
+/** The PR's commits, oldest first — same pagination shape as `listGitHubLabels`
+ *  (3-page cap, follow the `link: rel="next"` header). */
+export async function listGitHubPullCommits(input: GitHubItemNumberInput): Promise<GitHubPullCommitsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+
+  const token = await githubToken();
+  const commits: GitHubPullCommit[] = [];
+  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/commits?per_page=100`;
+  for (let page = 0; next && page < 3; page++) {
+    const res = await fetchGitHub(next, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: apiError(body, res.status, res.statusText) };
+    if (!Array.isArray(body)) return { ok: false, error: "GitHub returned an unexpected commits response" };
+    for (const raw of body) {
+      const commit = normalizePullCommit(raw);
+      if (commit) commits.push(commit);
+    }
+    next = pageLinks(res.headers.get("link"));
+  }
+  return { ok: true, repo: repoSlug(repo), pullNumber: input.number, commits };
+}
+
 export async function reviewGitHubPull(input: ReviewGitHubPullInput): Promise<GitHubActionResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
@@ -1324,6 +1418,8 @@ function normalizeMergeability(repo: GitHubRepo, number: number, raw: unknown): 
     headRef: pickString(head, "ref"),
     baseRef: pickString(base, "ref"),
     headSha: pickString(head, "sha"),
+    // `auto_merge` is null when disabled, else an object ({enabled_by, merge_method, ...}).
+    autoMerge: !!(obj.auto_merge && typeof obj.auto_merge === "object"),
   };
 }
 
@@ -1464,6 +1560,56 @@ export async function setGitHubPullDraft(input: SetGitHubPullDraftInput): Promis
   const isDraft = draftFromGraphql(json, field);
   const draft = isDraft ?? input.draft;
   return { ok: true, draft, message: draft ? "Converted to draft." : "Marked ready for review." };
+}
+
+/** Enable/disable GitHub auto-merge on a PR. REST has no endpoint for this
+ *  either, so — same shape as `setGitHubPullDraft` — it goes through the
+ *  GraphQL `enablePullRequestAutoMerge` / `disablePullRequestAutoMerge`
+ *  mutations, keyed on the PR's global node id. GitHub rejects enabling when
+ *  the repo doesn't require any status checks/reviews on this branch, which
+ *  surfaces here as a plain `graphqlErrorMessage` string (e.g. "Pull request
+ *  Auto merge is not allowed for this repository"). */
+export async function setGitHubPullAutoMerge(input: SetGitHubPullAutoMergeInput): Promise<GitHubPullAutoMergeResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to change auto-merge" };
+  const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
+  if (!("status" in prRes)) return prRes;
+  const pr = await prRes.json().catch(() => null);
+  if (!prRes.ok) return { ok: false, error: apiError(pr, prRes.status, prRes.statusText) };
+  const nodeId = pr && typeof pr === "object" && typeof (pr as { node_id?: unknown }).node_id === "string"
+    ? (pr as { node_id: string }).node_id
+    : null;
+  if (!nodeId) return { ok: false, error: "GitHub returned a pull request without a node id" };
+
+  const query = input.enable
+    ? "mutation($id: ID!, $method: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $method }) { pullRequest { number } } }"
+    : "mutation($id: ID!) { disablePullRequestAutoMerge(input: { pullRequestId: $id }) { pullRequest { number } } }";
+  const variables = input.enable
+    ? { id: nodeId, method: (input.mergeMethod ?? "merge").toUpperCase() }
+    : { id: nodeId };
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: gqlError };
+  return {
+    ok: true,
+    autoMergeEnabled: input.enable,
+    message: input.enable ? "Auto-merge enabled." : "Auto-merge disabled.",
+  };
 }
 
 /** The authenticated user's login, so the UI can offer edit/delete only on the
@@ -1621,6 +1767,36 @@ export async function getGitHubPullReviewThreads(input: GitHubItemNumberInput): 
     threads: parseReviewThreads(json),
     truncated: reviewThreadsHasNextPage(json),
   };
+}
+
+/** Issues this PR will close on merge (GraphQL `closingIssuesReferences`),
+ *  read-only — no mutation counterpart. Same no-token-means-empty shape as
+ *  `getGitHubPullReviewThreads` (an unauthenticated caller just sees nothing
+ *  rather than an error). */
+export async function getGitHubPullLinkedIssues(input: GitHubItemNumberInput): Promise<GitHubLinkedIssuesResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: true, repo: repoSlug(repo), pullNumber: input.number, issues: [] };
+  const query = `query($owner:String!,$name:String!,$number:Int!){`
+    + `repository(owner:$owner,name:$name){pullRequest(number:$number){`
+    + `closingIssuesReferences(first:20){nodes{number title url state}}}}}`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name, number: input.number } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: gqlError };
+  return { ok: true, repo: repoSlug(repo), pullNumber: input.number, issues: parseLinkedIssues(json) };
 }
 
 export async function setGitHubReviewThreadResolved(

@@ -6,12 +6,15 @@ import { test, expect, beforeAll } from "bun:test";
 import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
 import {
   addGitHubReaction,
+  getGitHubPullLinkedIssues,
   getGitHubViewer,
   listGitHubAssignees,
   listGitHubLabels,
   listGitHubMilestones,
+  listGitHubPullCommits,
   listGitHubReactions,
   removeGitHubReaction,
+  setGitHubPullAutoMerge,
 } from "./github.ts";
 
 let REPO_DIR = "";
@@ -210,6 +213,135 @@ test("a non-2xx response is mapped to a friendly error via the `message` field",
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("expected failure");
     expect(res.error).toBe("Not Found");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubPullCommits hits the pull commits endpoint and maps sha/headline/author/date", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/pulls/7/commits?per_page=100",
+      json: [
+        {
+          sha: "abc123",
+          html_url: "https://github.com/acme/widgets/commit/abc123",
+          commit: { message: "Fix bug\n\nDetails here", author: { date: "2026-01-01T00:00:00Z" } },
+          author: { login: "octocat", avatar_url: null, html_url: null },
+        },
+      ],
+    },
+  ]);
+  try {
+    const res = await listGitHubPullCommits({ dir: REPO_DIR, number: 7 });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.repo).toBe("acme/widgets");
+    expect(res.pullNumber).toBe(7);
+    expect(res.commits).toEqual([
+      {
+        sha: "abc123",
+        messageHeadline: "Fix bug",
+        author: { login: "octocat", avatarUrl: null, htmlUrl: null },
+        authoredDate: "2026-01-01T00:00:00Z",
+        htmlUrl: "https://github.com/acme/widgets/commit/abc123",
+      },
+    ]);
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/pulls/7/commits?per_page=100");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubPullAutoMerge enable POSTs enablePullRequestAutoMerge with the uppercased merge method", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/pulls/9", json: { node_id: "PR_kwabc" } },
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { enablePullRequestAutoMerge: { pullRequest: { number: 9 } } } },
+    },
+  ]);
+  try {
+    const res = await setGitHubPullAutoMerge({ dir: REPO_DIR, number: 9, enable: true, mergeMethod: "squash" });
+    expect(res).toEqual({ ok: true, autoMergeEnabled: true, message: "Auto-merge enabled." });
+    const gqlCall = mock.calls.find((c) => c.url === "https://api.github.com/graphql");
+    expect(gqlCall).toBeDefined();
+    const body = JSON.parse(gqlCall!.body!);
+    expect(body.query).toContain("enablePullRequestAutoMerge");
+    expect(body.variables).toEqual({ id: "PR_kwabc", method: "SQUASH" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubPullAutoMerge disable POSTs disablePullRequestAutoMerge with just the pull request id", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/pulls/9", json: { node_id: "PR_kwabc" } },
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { disablePullRequestAutoMerge: { pullRequest: { number: 9 } } } },
+    },
+  ]);
+  try {
+    const res = await setGitHubPullAutoMerge({ dir: REPO_DIR, number: 9, enable: false });
+    expect(res).toEqual({ ok: true, autoMergeEnabled: false, message: "Auto-merge disabled." });
+    const gqlCall = mock.calls.find((c) => c.url === "https://api.github.com/graphql");
+    const body = JSON.parse(gqlCall!.body!);
+    expect(body.query).toContain("disablePullRequestAutoMerge");
+    expect(body.variables).toEqual({ id: "PR_kwabc" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubPullAutoMerge maps a GraphQL errors[] response to a friendly error", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/pulls/9", json: { node_id: "PR_kwabc" } },
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { errors: [{ message: "Pull request Auto merge is not allowed for this repository" }] },
+    },
+  ]);
+  try {
+    const res = await setGitHubPullAutoMerge({ dir: REPO_DIR, number: 9, enable: true });
+    expect(res).toEqual({ ok: false, error: "Pull request Auto merge is not allowed for this repository" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubPullLinkedIssues parses closingIssuesReferences nodes from the GraphQL response", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: {
+        data: {
+          repository: {
+            pullRequest: {
+              closingIssuesReferences: {
+                nodes: [
+                  { number: 12, title: "Bug A", url: "https://github.com/acme/widgets/issues/12", state: "OPEN" },
+                ],
+              },
+            },
+          },
+        },
+      },
+    },
+  ]);
+  try {
+    const res = await getGitHubPullLinkedIssues({ dir: REPO_DIR, number: 3 });
+    expect(res).toEqual({
+      ok: true,
+      repo: "acme/widgets",
+      pullNumber: 3,
+      issues: [{ number: 12, title: "Bug A", url: "https://github.com/acme/widgets/issues/12", state: "OPEN" }],
+    });
   } finally {
     mock.restore();
   }

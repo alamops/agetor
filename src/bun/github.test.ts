@@ -9,6 +9,8 @@ const {
   reviewValidationError,
   buildIssueUpdatePatch,
   normalizeMergeability,
+  normalizePullCommit,
+  parseLinkedIssues,
   draftFromGraphql,
   graphqlErrorMessage,
   sanitizeReviewComments,
@@ -161,13 +163,83 @@ test("normalizeMergeability reads mergeable/state and refs, defaulting the unkno
     headRef: "feature",
     baseRef: "main",
     headSha: "abc123",
+    autoMerge: false,
   });
 
   // mergeable still computing → null; missing mergeable_state → "unknown"; missing head/base → empty strings
   const partial = normalizeMergeability(REPO, 8, { mergeable: null, merged: false });
-  expect(partial).toMatchObject({ mergeable: null, mergeableState: "unknown", rebaseable: null, headRef: "", baseRef: "", headSha: "" });
+  expect(partial).toMatchObject({ mergeable: null, mergeableState: "unknown", rebaseable: null, headRef: "", baseRef: "", headSha: "", autoMerge: false });
+
+  // auto_merge is a non-null object once enabled
+  const autoMergeOn = normalizeMergeability(REPO, 10, { mergeable: true, merged: false, auto_merge: { enabled_by: { login: "bob" }, merge_method: "squash" } });
+  expect(autoMergeOn).toMatchObject({ autoMerge: true });
 
   expect(normalizeMergeability(REPO, 9, null)).toBeNull();
+});
+
+test("normalizePullCommit splits the headline, prefers the top-level author, rejects malformed shapes", () => {
+  const withAuthor = normalizePullCommit({
+    sha: "abc123",
+    html_url: "https://github.com/o/r/commit/abc123",
+    commit: { message: "Fix bug\n\nLonger body here", author: { date: "2026-01-01T00:00:00Z" } },
+    author: { login: "alice", avatar_url: null, html_url: null },
+  });
+  expect(withAuthor).toEqual({
+    sha: "abc123",
+    messageHeadline: "Fix bug",
+    author: { login: "alice", avatarUrl: null, htmlUrl: null },
+    authoredDate: "2026-01-01T00:00:00Z",
+    htmlUrl: "https://github.com/o/r/commit/abc123",
+  });
+
+  // no top-level GitHub-user author (e.g. an unlinked git commit) → null, not the raw git author
+  const noAuthor = normalizePullCommit({
+    sha: "def456",
+    commit: { message: "Single line", author: { date: "2026-01-02T00:00:00Z", name: "Bob", email: "bob@x.com" } },
+    author: null,
+  });
+  expect(noAuthor).toMatchObject({ sha: "def456", messageHeadline: "Single line", author: null });
+
+  // missing sha / missing commit.message → null
+  expect(normalizePullCommit({ commit: { message: "x" } })).toBeNull();
+  expect(normalizePullCommit({ sha: "abc" })).toBeNull();
+  expect(normalizePullCommit(null)).toBeNull();
+});
+
+test("parseLinkedIssues digs closingIssuesReferences nodes out of a GraphQL response, [] on anything unexpected", () => {
+  const happy = {
+    data: {
+      repository: {
+        pullRequest: {
+          closingIssuesReferences: {
+            nodes: [
+              { number: 12, title: "Bug A", url: "https://github.com/o/r/issues/12", state: "OPEN" },
+              { number: 34, title: "Bug B", url: "https://github.com/o/r/issues/34", state: "CLOSED" },
+            ],
+          },
+        },
+      },
+    },
+  };
+  expect(parseLinkedIssues(happy)).toEqual([
+    { number: 12, title: "Bug A", url: "https://github.com/o/r/issues/12", state: "OPEN" },
+    { number: 34, title: "Bug B", url: "https://github.com/o/r/issues/34", state: "CLOSED" },
+  ]);
+
+  // malformed node (missing fields) is dropped, not thrown
+  const partiallyMalformed = {
+    data: { repository: { pullRequest: { closingIssuesReferences: { nodes: [
+      { number: 1, title: "ok", url: "https://x/1", state: "OPEN" },
+      { number: 2, title: "missing url" },
+    ] } } } },
+  };
+  expect(parseLinkedIssues(partiallyMalformed)).toEqual([{ number: 1, title: "ok", url: "https://x/1", state: "OPEN" }]);
+
+  expect(parseLinkedIssues(null)).toEqual([]);
+  expect(parseLinkedIssues({})).toEqual([]);
+  expect(parseLinkedIssues({ data: {} })).toEqual([]);
+  expect(parseLinkedIssues({ data: { repository: null } })).toEqual([]);
+  expect(parseLinkedIssues({ data: { repository: { pullRequest: { closingIssuesReferences: { nodes: "not an array" } } } } })).toEqual([]);
 });
 
 test("draftFromGraphql digs isDraft out of the mutation payload, else null", () => {

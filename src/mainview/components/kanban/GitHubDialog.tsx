@@ -47,7 +47,9 @@ import type {
   GitHubCheckRun,
   GitHubChecksResult,
   GitHubComment,
+  GitHubLinkedIssue,
   GitHubListItem,
+  GitHubPullCommit,
   GitHubPullLineComment,
   GitHubPullMergeability,
   GitHubRepoLabel,
@@ -76,6 +78,20 @@ const fmtDate = (value: string) => {
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return "";
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(d);
+};
+
+// A coarse "today" / "3d ago" for compact commit rows; falls back to the plain
+// date once it's more than a month old, where the exact day matters more than
+// the relative distance.
+const fmtRelativeDate = (value: string) => {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "";
+  const diffDays = Math.floor((Date.now() - d.getTime()) / 86_400_000);
+  if (diffDays <= 0) return "today";
+  if (diffDays === 1) return "yesterday";
+  if (diffDays < 30) return `${diffDays}d ago`;
+  return fmtDate(value);
 };
 
 function splitLabels(raw: string): string[] {
@@ -301,6 +317,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const reviewCommentSeq = useRef(0);
   const checksSeq = useRef(0);
   const mergeabilitySeq = useRef(0);
+  const commitsSeq = useRef(0);
+  const linkedIssuesSeq = useRef(0);
   // Bounds the self-healing re-poll when GitHub returns mergeable=null.
   const mergeabilityRetries = useRef<Record<number, number>>({});
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
@@ -313,6 +331,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [mergeability, setMergeability] = useState<Record<number, GitHubPullMergeability | undefined>>({});
   const [mergeabilityLoading, setMergeabilityLoading] = useState<Record<number, boolean | undefined>>({});
   const [mergeabilityErrors, setMergeabilityErrors] = useState<Record<number, string | undefined>>({});
+  const [commits, setCommits] = useState<Record<number, GitHubPullCommit[] | undefined>>({});
+  const [commitsLoading, setCommitsLoading] = useState<Record<number, boolean | undefined>>({});
+  const [commitsErrors, setCommitsErrors] = useState<Record<number, string | undefined>>({});
+  const [linkedIssues, setLinkedIssues] = useState<Record<number, GitHubLinkedIssue[] | undefined>>({});
+  const [linkedIssuesLoading, setLinkedIssuesLoading] = useState<Record<number, boolean | undefined>>({});
+  const [linkedIssuesErrors, setLinkedIssuesErrors] = useState<Record<number, string | undefined>>({});
   const [comments, setComments] = useState<Record<number, GitHubComment[] | undefined>>({});
   const [commentsLoading, setCommentsLoading] = useState<Record<number, boolean | undefined>>({});
   const [commentErrors, setCommentErrors] = useState<Record<number, string | undefined>>({});
@@ -427,6 +451,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     diffSeq.current += 1;
     checksSeq.current += 1;
     mergeabilitySeq.current += 1;
+    commitsSeq.current += 1;
+    linkedIssuesSeq.current += 1;
     reviewCommentSeq.current += 1;
     setExpandedKey(null);
     setDiffs({});
@@ -439,6 +465,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setMergeabilityLoading({});
     setMergeabilityErrors({});
     mergeabilityRetries.current = {};
+    setCommits({});
+    setCommitsLoading({});
+    setCommitsErrors({});
+    setLinkedIssues({});
+    setLinkedIssuesLoading({});
+    setLinkedIssuesErrors({});
     setComments({});
     setCommentsLoading({});
     setCommentErrors({});
@@ -757,6 +789,52 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         setMergeabilityLoading((cur) => ({ ...cur, [number]: false }));
       });
   }, [open, projectPath, expandedItem, mergeability, mergeabilityLoading, mergeabilityErrors]);
+
+  useEffect(() => {
+    if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    const number = expandedItem.number;
+    if (commits[number] || commitsLoading[number] || commitsErrors[number]) return;
+
+    const requestId = ++commitsSeq.current;
+    setCommitsLoading((cur) => ({ ...cur, [number]: true }));
+    setCommitsErrors((cur) => ({ ...cur, [number]: undefined }));
+    api.listGitHubPullCommits({ path: projectPath, number })
+      .then((payload) => {
+        if (requestId !== commitsSeq.current) return;
+        setCommits((cur) => ({ ...cur, [number]: payload.commits }));
+      })
+      .catch((e: unknown) => {
+        if (requestId !== commitsSeq.current) return;
+        setCommitsErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+      })
+      .finally(() => {
+        if (requestId !== commitsSeq.current) return;
+        setCommitsLoading((cur) => ({ ...cur, [number]: false }));
+      });
+  }, [open, projectPath, expandedItem, commits, commitsLoading, commitsErrors]);
+
+  useEffect(() => {
+    if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    const number = expandedItem.number;
+    if (linkedIssues[number] || linkedIssuesLoading[number] || linkedIssuesErrors[number]) return;
+
+    const requestId = ++linkedIssuesSeq.current;
+    setLinkedIssuesLoading((cur) => ({ ...cur, [number]: true }));
+    setLinkedIssuesErrors((cur) => ({ ...cur, [number]: undefined }));
+    api.getGitHubPullLinkedIssues({ path: projectPath, number })
+      .then((payload) => {
+        if (requestId !== linkedIssuesSeq.current) return;
+        setLinkedIssues((cur) => ({ ...cur, [number]: payload.issues }));
+      })
+      .catch((e: unknown) => {
+        if (requestId !== linkedIssuesSeq.current) return;
+        setLinkedIssuesErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+      })
+      .finally(() => {
+        if (requestId !== linkedIssuesSeq.current) return;
+        setLinkedIssuesLoading((cur) => ({ ...cur, [number]: false }));
+      });
+  }, [open, projectPath, expandedItem, linkedIssues, linkedIssuesLoading, linkedIssuesErrors]);
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem) return;
@@ -1137,6 +1215,31 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       mergeabilityRetries.current[item.number] = 0;
       setMergeability((cur) => ({ ...cur, [item.number]: undefined }));
       setMergeabilityErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    } catch (e) {
+      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+    }
+  };
+
+  const runToggleAutoMerge = async (item: GitHubListItem) => {
+    if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
+    const enable = !mergeability[item.number]?.autoMerge;
+    const mergeMethod = mergeMethods[item.number] ?? "merge";
+    setActionBusy((cur) => ({ ...cur, [item.number]: "auto-merge" }));
+    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    try {
+      const result = await api.setGitHubPullAutoMerge({ path: projectPath, number: item.number, enable, mergeMethod });
+      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Auto-merge updated." }));
+      // Optimistically flip the cached mergeability rather than refetching —
+      // GitHub's mergeable computation isn't affected by this toggle.
+      setMergeability((cur) => {
+        const existing = cur[item.number];
+        if (!existing) return cur;
+        return { ...cur, [item.number]: { ...existing, autoMerge: result.autoMergeEnabled } };
+      });
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
     } finally {
@@ -1664,6 +1767,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 mergeability={item.kind === "pulls" ? mergeability[item.number] : undefined}
                 mergeabilityLoading={item.kind === "pulls" ? !!mergeabilityLoading[item.number] : false}
                 mergeabilityError={item.kind === "pulls" ? mergeabilityErrors[item.number] : undefined}
+                commits={item.kind === "pulls" ? commits[item.number] : undefined}
+                commitsLoading={item.kind === "pulls" ? !!commitsLoading[item.number] : false}
+                commitsError={item.kind === "pulls" ? commitsErrors[item.number] : undefined}
+                linkedIssues={item.kind === "pulls" ? linkedIssues[item.number] : undefined}
                 reviewComments={item.kind === "pulls" ? reviewComments[item.number] : undefined}
                 reviewCommentsLoading={item.kind === "pulls" ? !!reviewCommentsLoading[item.number] : false}
                 reviewCommentError={item.kind === "pulls" ? reviewCommentErrors[item.number] : undefined}
@@ -1716,6 +1823,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onUpdateBranch={() => { void runUpdateBranch(item); }}
                 onReopenPull={() => { void runReopenPull(item); }}
                 onToggleDraft={() => { void runToggleDraft(item); }}
+                onToggleAutoMerge={() => { void runToggleAutoMerge(item); }}
                 onClosePull={() => { void runPullClose(item); }}
                 pendingReview={item.kind === "pulls" ? (pendingReview[item.number] ?? []) : []}
                 pendingStale={item.kind === "pulls" ? !!pendingStale[item.number] : false}
@@ -1773,6 +1881,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                   mergeabilityRetries.current[item.number] = 0;
                   setMergeability((cur) => ({ ...cur, [item.number]: undefined }));
                   setMergeabilityErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                }}
+                onRetryCommits={() => {
+                  if (item.kind !== "pulls") return;
+                  setCommitsErrors((cur) => ({ ...cur, [item.number]: undefined }));
                 }}
                 onToggle={() => {
                   const key = `${item.kind}-${item.number}`;
@@ -2514,6 +2626,10 @@ function GitHubItemRow({
   mergeability,
   mergeabilityLoading,
   mergeabilityError,
+  commits,
+  commitsLoading,
+  commitsError,
+  linkedIssues,
   reviewComments,
   reviewCommentsLoading,
   reviewCommentError,
@@ -2555,6 +2671,7 @@ function GitHubItemRow({
   onUpdateBranch,
   onReopenPull,
   onToggleDraft,
+  onToggleAutoMerge,
   onClosePull,
   pendingReview,
   pendingStale,
@@ -2585,6 +2702,7 @@ function GitHubItemRow({
   onRefreshDiff,
   onRefreshChecks,
   onRefreshMergeability,
+  onRetryCommits,
   onToggle,
 }: {
   item: GitHubListItem;
@@ -2599,6 +2717,10 @@ function GitHubItemRow({
   mergeability?: GitHubPullMergeability;
   mergeabilityLoading: boolean;
   mergeabilityError?: string;
+  commits?: GitHubPullCommit[];
+  commitsLoading: boolean;
+  commitsError?: string;
+  linkedIssues?: GitHubLinkedIssue[];
   reviewComments?: GitHubPullLineComment[];
   reviewCommentsLoading: boolean;
   reviewCommentError?: string;
@@ -2640,6 +2762,7 @@ function GitHubItemRow({
   onUpdateBranch: () => void;
   onReopenPull: () => void;
   onToggleDraft: () => void;
+  onToggleAutoMerge: () => void;
   onClosePull: () => void;
   pendingReview: LineCommentTarget[];
   pendingStale: boolean;
@@ -2670,6 +2793,7 @@ function GitHubItemRow({
   onRefreshDiff: () => void;
   onRefreshChecks: () => void;
   onRefreshMergeability: () => void;
+  onRetryCommits: () => void;
   onToggle: () => void;
 }) {
   const merged = item.kind === "pulls" && !!item.mergedAt;
@@ -2767,6 +2891,9 @@ function GitHubItemRow({
               </Button>
             )}
           </div>
+          {item.kind === "pulls" && linkedIssues && linkedIssues.length > 0 && (
+            <LinkedIssuesLine issues={linkedIssues} />
+          )}
           {editorOpen ? (
             <ItemEditor
               title={titleDraft}
@@ -2812,6 +2939,7 @@ function GitHubItemRow({
                 onUpdateBranch={onUpdateBranch}
                 onReopenPull={onReopenPull}
                 onToggleDraft={onToggleDraft}
+                onToggleAutoMerge={onToggleAutoMerge}
                 onClosePull={onClosePull}
                 onRefreshMergeability={onRefreshMergeability}
               />
@@ -2835,6 +2963,7 @@ function GitHubItemRow({
                 onRequestReviewers={onRequestReviewers}
               />
               <CheckRuns checks={checks} loading={checksLoading} error={checksError} onRetry={onRetryChecks} onRefresh={onRefreshChecks} />
+              <PullCommits commits={commits} loading={commitsLoading} error={commitsError} onRetry={onRetryCommits} />
               <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} />
               <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
               <ReviewComments
@@ -3173,6 +3302,7 @@ function PullActions({
   onUpdateBranch,
   onReopenPull,
   onToggleDraft,
+  onToggleAutoMerge,
   onClosePull,
   onRefreshMergeability,
 }: {
@@ -3195,6 +3325,7 @@ function PullActions({
   onUpdateBranch: () => void;
   onReopenPull: () => void;
   onToggleDraft: () => void;
+  onToggleAutoMerge: () => void;
   onClosePull: () => void;
   onRefreshMergeability: () => void;
 }) {
@@ -3353,6 +3484,32 @@ function PullActions({
             {busy === "merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
             Merge
           </Button>
+          {item.state === "open" && (
+            <div className="mt-2 flex items-center gap-2">
+              {mergeability?.autoMerge ? (
+                <>
+                  <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+                    <CheckCircle2 className="size-3.5" /> Auto-merge enabled
+                  </span>
+                  <Button size="sm" variant="outline" disabled={disabled} onClick={onToggleAutoMerge}>
+                    {busy === "auto-merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : null}
+                    Disable
+                  </Button>
+                </>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={disabled || !mergeability}
+                  title={!mergeability ? "Waiting for mergeability…" : undefined}
+                  onClick={onToggleAutoMerge}
+                >
+                  {busy === "auto-merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
+                  Enable auto-merge
+                </Button>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="min-w-0">
@@ -3381,6 +3538,109 @@ function PullActions({
         <div className="mt-3 flex items-start gap-1.5 text-[11px] text-amber-400">
           <AlertCircle className="mt-px size-3.5 shrink-0" />
           {pendingCount} review comment{pendingCount === 1 ? "" : "s"} queued — submit via Approve / Comment / Request; merging or closing won't post {pendingCount === 1 ? "it" : "them"}.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Compact "Closes: #12 #34" line for the issues a PR will close on merge —
+ *  read-only, so just a row of links (closed ones dimmed/struck through). */
+function LinkedIssuesLine({ issues }: { issues: GitHubLinkedIssue[] }) {
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+      <span className="font-medium text-foreground/80">Closes:</span>
+      {issues.map((issue) => (
+        <button
+          key={issue.number}
+          type="button"
+          className={cn(
+            "hover:underline",
+            issue.state === "CLOSED" && "text-muted-foreground/60 line-through",
+          )}
+          title={issue.title}
+          onClick={() => { void api.openExternal(issue.url); }}
+        >
+          #{issue.number}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Collapsible "Commits (N)" section for the PR's commits — data is fetched
+ *  automatically once the row expands (mirrors `checks`/`mergeability`); this
+ *  local `open` state only controls whether the fetched list is shown. */
+function PullCommits({
+  commits,
+  loading,
+  error,
+  onRetry,
+}: {
+  commits?: GitHubPullCommit[];
+  loading: boolean;
+  error?: string;
+  onRetry: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-3">
+      <button
+        type="button"
+        className="flex w-full items-center justify-between gap-2 text-xs font-medium text-muted-foreground hover:text-foreground"
+        onClick={() => setOpen((cur) => !cur)}
+        aria-expanded={open}
+      >
+        <span className="flex items-center gap-2">
+          {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+          Commits{commits ? ` (${commits.length})` : ""}
+        </span>
+        {loading && <Loader2 className="size-3.5 animate-spin" />}
+      </button>
+      {open && (
+        <div className="mt-2">
+          {loading && !commits && (
+            <div className="flex items-center justify-center gap-2 rounded-md border border-border/60 py-6 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" /> Loading commits...
+            </div>
+          )}
+          {!loading && error && (
+            <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-rose-400">
+              <div className="flex items-center gap-2">
+                <AlertCircle className="size-4" /> {error}
+              </div>
+              <Button size="sm" variant="outline" onClick={onRetry}>
+                Retry
+              </Button>
+            </div>
+          )}
+          {!loading && !error && commits && commits.length === 0 && (
+            <div className="rounded-md border border-border/60 px-3 py-6 text-center text-sm text-muted-foreground">
+              No commits found for this pull request.
+            </div>
+          )}
+          {!loading && !error && commits && commits.length > 0 && (
+            <div className="overflow-hidden rounded-md border border-border/60">
+              {commits.map((commit) => (
+                <div key={commit.sha} className="flex items-center gap-2 border-b border-border/50 px-3 py-2 last:border-b-0">
+                  <button
+                    type="button"
+                    className="shrink-0 font-mono text-[11px] text-muted-foreground hover:underline"
+                    title="Open commit on GitHub"
+                    aria-label={`Open commit ${commit.sha.slice(0, 7)} on GitHub`}
+                    onClick={() => { void api.openExternal(commit.htmlUrl); }}
+                  >
+                    {commit.sha.slice(0, 7)}
+                  </button>
+                  <span className="min-w-0 flex-1 truncate text-sm">{commit.messageHeadline}</span>
+                  {commit.author && (
+                    <span className="shrink-0 text-xs text-muted-foreground">{commit.author.login}</span>
+                  )}
+                  <span className="shrink-0 text-xs text-muted-foreground">{fmtRelativeDate(commit.authoredDate)}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
