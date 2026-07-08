@@ -8,6 +8,7 @@ import {
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
   MODEL_EFFORT_SUPPORT,
+  SESSION_DIED_STATUS_PREFIX,
   TASK_TYPES,
   type AgentKind,
   type Harness,
@@ -87,6 +88,12 @@ interface ActiveRun {
    *  keep the column at `blocked` (instead of bouncing to `ready`) and
    *  record the run as `failed`. */
   apiError: boolean;
+  /** Set when the run's tmux session died unexpectedly mid-turn (the driver
+   *  emitted the `SESSION_DIED_STATUS_PREFIX` sentinel). Like `apiError`, the
+   *  chunk handler flips the column to `blocked` immediately and the done
+   *  handler reads this on resolution to keep it there (record the run as
+   *  `failed`, not bounce to `ready`). */
+  sessionDied: boolean;
 }
 const active = new Map<string, ActiveRun>(); // runId -> handle
 
@@ -151,7 +158,7 @@ function updateColumn(
   taskId: string,
   runId: string | null,
   next: ColumnId,
-  reason?: "api-error" | "approval",
+  reason?: "api-error" | "approval" | "session-died",
 ): void {
   const before = tasks.get(taskId);
   const prev: ColumnId | null = before?.column ?? null;
@@ -559,6 +566,20 @@ function makeChunkHandler(
         }
       }
     }
+    // Session-died path (both agents): the driver emits this sentinel when a
+    // running turn's tmux session vanished. Flip to `blocked` so the card
+    // stops sitting in `running`, and mark the handle so `attachDoneHandler`
+    // keeps it there (and records `failed`) when the run settles a beat later.
+    if (stream === "status" && data.startsWith(SESSION_DIED_STATUS_PREFIX)) {
+      const handle = active.get(runId);
+      if (handle && !handle.sessionDied) {
+        handle.sessionDied = true;
+        const task = tasks.get(taskId);
+        if (task && task.runId === runId) {
+          updateColumn(taskId, runId, "blocked", "session-died");
+        }
+      }
+    }
   };
 }
 
@@ -574,6 +595,7 @@ function registerActiveRun(
     kill: () => agent.kill(),
     cancelled: false,
     apiError: false,
+    sessionDied: false,
     writeInput: (line) => agent.writeInput(line),
   });
 }
@@ -593,15 +615,16 @@ function attachDoneHandler(
       const handle = active.get(runId);
       const wasCancelled = handle?.cancelled ?? false;
       const wasApiError = handle?.apiError ?? false;
+      const wasSessionDied = handle?.sessionDied ?? false;
       active.delete(runId);
 
-      // API error overrides the exit-code mapping: claude resolves the turn
-      // with code 0 (the synthetic message stages a clean end_turn), but the
+      // API error / session-death override the exit-code mapping: the driver
+      // resolves the turn with code 0 (a clean end_turn was staged), but the
       // run really failed — record it as such so the badge and history are
       // honest.
       const newStatus: RunStatus = wasCancelled
         ? "cancelled"
-        : wasApiError ? "failed"
+        : (wasApiError || wasSessionDied) ? "failed"
         : code === 0 ? "succeeded" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: code });
       // Only flip the task's column when the run that just resolved is
@@ -620,7 +643,7 @@ function attachDoneHandler(
         // `blocked` just because it had previously hit an API error.
         const nextColumn: ColumnId = wasCancelled
           ? "ready"
-          : wasApiError ? "blocked"
+          : (wasApiError || wasSessionDied) ? "blocked"
           : newStatus === "succeeded" ? "review" : "ready";
         updateColumn(taskId, runId, nextColumn);
       }
@@ -640,13 +663,17 @@ function attachDoneHandler(
     .catch((err) => {
       const handle = active.get(runId);
       const wasCancelled = handle?.cancelled ?? false;
+      const wasSessionDied = handle?.sessionDied ?? false;
       active.delete(runId);
       const newStatus: RunStatus = wasCancelled ? "cancelled" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: -1 });
       const task = tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
-        updateColumn(taskId, runId, "ready");
+        // A session-death that reaches the reject path (not the case today —
+        // both drivers resolve on death — but keep the column consistent with
+        // the resolve path if a future refactor ever rejects instead).
+        updateColumn(taskId, runId, wasSessionDied ? "blocked" : "ready");
       }
       emit({
         runId,

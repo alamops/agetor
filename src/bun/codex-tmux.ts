@@ -15,6 +15,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
+import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import {
   killSessionByName,
   sessionExistsByName,
@@ -246,6 +247,9 @@ const DEATH_POLL_MS = 400;
 /** Grace after the tmux session disappears before we resolve, so the final
  *  appended bytes (turn.completed) are flushed and read. */
 const DEATH_GRACE_MS = 250;
+/** Consecutive `has-session` misses required before declaring death — debounces
+ *  a lone transient tmux failure. Mirrors claude-tmux's DEATH_MISS_THRESHOLD. */
+const DEATH_MISS_THRESHOLD = 2;
 
 function disposeCodexState(state: CodexSessionState): void {
   if (state.watcher) { try { state.watcher.close(); } catch { /* noop */ } state.watcher = null; }
@@ -355,15 +359,31 @@ function startCodexTailer(state: CodexSessionState): Promise<number> {
   // Death watch: when the tmux session disappears the `codex exec` process has
   // exited. Flush whatever's left, then resolve. turn.completed/turn.failed
   // normally resolve us first (via the mapper); this catches a crash that
-  // exits without a terminal event.
+  // exits without a terminal event. Require two consecutive `has-session`
+  // misses so a single transient tmux failure isn't mistaken for a dead
+  // session (mirrors claude-tmux's DEATH_MISS_THRESHOLD).
+  let misses = 0;
   state.deathTimer = setInterval(() => {
     tryWatch();
-    if (sessionExistsByName(state.sessionName)) return;
+    if (sessionExistsByName(state.sessionName)) { misses = 0; return; }
+    if (++misses < DEATH_MISS_THRESHOLD) return;
     // Session gone. Give the FS a beat to surface the final bytes, flush, then
     // resolve with whatever terminal code we saw (default: failed — a codex
     // exec that vanished without `turn.completed` did not succeed).
     setTimeout(() => {
       flushCodexLog(state);
+      // If the final flush surfaced a terminal event (turn.completed/failed),
+      // resolveCodexDone already fired — this was an orderly finish, not a
+      // death, so don't emit the "session ended" sentinel.
+      if (!state.resolved) {
+        // Emit the shared sentinel so the orchestrator flips the card to
+        // `blocked` (via makeChunkHandler) and the user sees WHY the run
+        // stopped in the stream, instead of a silent drop to `ready`.
+        state.onChunk(
+          "status",
+          `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
+        );
+      }
       resolveCodexDone(state, state.lastCode ?? 1);
     }, DEATH_GRACE_MS);
     if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
