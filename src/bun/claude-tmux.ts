@@ -24,7 +24,7 @@ import {
   type AskQuestion,
   type TmuxPromptChoice,
 } from "./interactions.ts";
-import { resolveTmuxBin } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
 import { detectAskModal, parseModalPane, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
 /**
@@ -710,10 +710,13 @@ interface RunResult {
   stderr: string;
 }
 
-/** Run a one-shot tmux command. Never throws — callers check `ok`. */
+/** Run a one-shot tmux command. Never throws — callers check `ok`. Always
+ *  threads `tmuxSocketArgs()` in right after the binary — see
+ *  `tmuxSocketName()` in tmux-resolution.ts for why every invocation (this is
+ *  the single choke point all of them share) must carry the socket args. */
 function tmux(args: string[], opts: { stdinText?: string } = {}): RunResult {
   try {
-    const proc = Bun.spawnSync([resolveTmuxBin(), ...args], {
+    const proc = Bun.spawnSync([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
       stdin: opts.stdinText !== undefined
         ? new TextEncoder().encode(opts.stdinText)
         : "ignore",
@@ -730,9 +733,12 @@ function tmux(args: string[], opts: { stdinText?: string } = {}): RunResult {
   }
 }
 
-/** True when `tmux has-session -t <name>` returns 0. */
+/** True when `tmux has-session -t =<name>` returns 0. The `=` prefix forces
+ *  an exact match — without it, a probe for an absent name PREFIX-MATCHES
+ *  and can report a live, unrelated session as "exists" (empirically proven
+ *  on this task's sibling `agetor-<id>` names). */
 export function sessionExists(taskId: string): boolean {
-  return tmux(["has-session", "-t", sessionNameFor(taskId)]).ok;
+  return tmux(["has-session", "-t", "=" + sessionNameFor(taskId)]).ok;
 }
 
 /**
@@ -747,9 +753,10 @@ export function hasSessionState(taskId: string): boolean {
 }
 
 /** Name-keyed variant for callers that hold a persisted session name (e.g.
- *  `runs.tmux_session`) and don't want to recompute it from a task id. */
+ *  `runs.tmux_session`) and don't want to recompute it from a task id.
+ *  Exact-match `=` prefix — see `sessionExists`. */
 export function sessionExistsByName(name: string): boolean {
-  return tmux(["has-session", "-t", name]).ok;
+  return tmux(["has-session", "-t", "=" + name]).ok;
 }
 
 /** Tri-state liveness of a tmux session — the safe signal for the death watch. */
@@ -783,7 +790,10 @@ export type SessionLiveness = "alive" | "gone" | "unreachable";
  * of waiting for boot `reconcileOrphans`).
  */
 export function sessionLiveness(name: string): SessionLiveness {
-  const r = tmux(["has-session", "-t", name]);
+  // Exact-match `=` prefix — see `sessionExists`. tmux's error string becomes
+  // e.g. "can't find session: =x", which still contains "find session" below,
+  // so the classification is unaffected by the prefix.
+  const r = tmux(["has-session", "-t", "=" + name]);
   if (r.ok) return "alive";
   const err = `${r.stderr} ${r.stdout}`.toLowerCase();
   // Only UNAMBIGUOUS death strings count as `gone`:
@@ -851,14 +861,17 @@ export function deathTickOutcome(
   return args.misses + 1 < args.threshold ? "wait" : "fire";
 }
 
-/** Kill any tmux session for the given task. Idempotent / silent on miss. */
+/** Kill any tmux session for the given task. Idempotent / silent on miss.
+ *  Exact-match `=` prefix — see `sessionExists`; without it a kill for an
+ *  absent exact name can prefix-match and kill an unrelated live session. */
 export function killTaskSession(taskId: string): void {
-  tmux(["kill-session", "-t", sessionNameFor(taskId)]);
+  tmux(["kill-session", "-t", "=" + sessionNameFor(taskId)]);
 }
 
-/** Kill an arbitrary session name. Used by reconcileOrphans. */
+/** Kill an arbitrary session name. Used by reconcileOrphans. Exact-match `=`
+ *  prefix — see `sessionExists`. */
 export function killSessionByName(name: string): void {
-  tmux(["kill-session", "-t", name]);
+  tmux(["kill-session", "-t", "=" + name]);
 }
 
 /**

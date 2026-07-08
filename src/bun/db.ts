@@ -594,13 +594,21 @@ export const runs = {
    *  re-emit them onto the reattached (still-`running`) run's chunk
    *  handler — corrupting its event history and, worse, firing
    *  `onEndOfTurn` on the wrong turn and prematurely resolving the
-   *  current run. */
+   *  current run.
+   *
+   *  `subagent_id IS NULL`: this seeds the MAIN session tailer's dedup set
+   *  only — subagent transcripts live in separate sidechain files and are
+   *  deduped independently via `seenLineUuidsForSubagent`, keyed by
+   *  `(run_id, subagent_id, line_uuid)`. Mixing subagent uuids into this set
+   *  is a no-op in practice (uuid namespaces don't collide) but is the wrong
+   *  scope conceptually, and matches the same filter applied elsewhere for
+   *  subagent-tagged rows. */
   seenLineUuidsForTask(taskId: string): Set<string> {
     const rows = db.query<{ line_uuid: string }, [string]>(
       `SELECT e.line_uuid
        FROM run_events e
        JOIN runs r ON r.id = e.run_id
-       WHERE r.task_id = ? AND e.line_uuid IS NOT NULL`,
+       WHERE r.task_id = ? AND e.line_uuid IS NOT NULL AND e.subagent_id IS NULL`,
     ).all(taskId);
     return new Set(rows.map((r) => r.line_uuid));
   },

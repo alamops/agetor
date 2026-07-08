@@ -202,23 +202,29 @@ export function attachSubagentWatcher(opts: {
   // tails from offset 0 (the DB-seeded `seen` set suppresses re-emission of
   // already-persisted lines). A row left `running` whose transcript is actually
   // finished gets reconciled by the normal done-check on the next tick.
-  for (const row of subagentsDb.listForTask(taskId)) {
-    files.set(row.id, {
-      subagentId: row.id,
-      runId: row.runId ?? resolveRunId(taskId) ?? row.id,
-      offset: 0,
-      seen: runs.seenLineUuidsForSubagent(row.id),
-      sawEndOfTurn: false,
-      lastAppendAt: 0,
-      status: row.status,
-      sourcePath: row.sourcePath,
-      agentType: row.agentType,
-      description: row.description,
-      spawnDepth: row.spawnDepth,
-      startedAt: row.startedAt,
-      endedAt: row.endedAt,
-    });
-  }
+  // Never let a bad row (or a DB hiccup) crash the caller — this loop runs
+  // synchronously inside `reattachSession`/the spawn IIFE, outside any tick's
+  // try/catch, so it's the one place in this file that must guard itself
+  // rather than rely on `cycle()`'s wrapper.
+  try {
+    for (const row of subagentsDb.listForTask(taskId)) {
+      files.set(row.id, {
+        subagentId: row.id,
+        runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+        offset: 0,
+        seen: runs.seenLineUuidsForSubagent(row.id),
+        sawEndOfTurn: false,
+        lastAppendAt: 0,
+        status: row.status,
+        sourcePath: row.sourcePath,
+        agentType: row.agentType,
+        description: row.description,
+        spawnDepth: row.spawnDepth,
+        startedAt: row.startedAt,
+        endedAt: row.endedAt,
+      });
+    }
+  } catch { /* degrade gracefully — a bad rehydration row must not crash reattach */ }
 
   function emitLifecycle(fs: FileState, phase: "started" | "finished"): void {
     const payload: SubagentEvent = { phase, subagent: toSubagentShape(fs, taskId) };

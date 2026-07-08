@@ -45,6 +45,7 @@ import {
   hasSessionState,
   sessionExists,
   sessionExistsByName,
+  sessionLiveness,
   sessionNameFor,
 } from "./claude-tmux.ts";
 import {
@@ -350,10 +351,12 @@ export function reconcileOrphans(): number {
         // (correctly-persisted) `blocked` back to `review` on the first
         // pending-end-turn fire. `EXISTS` short-circuits on first match
         // and reads more clearly than `COUNT(*) > 0`.
+        // subagent_id IS NULL: a subagent tailer's own transient api-error
+        // status row (since #81) must not seed the main run's apiError.
         const priorApiError = db.query<{ found: 0 | 1 }, [string, string]>(
           `SELECT EXISTS(
              SELECT 1 FROM run_events
-             WHERE run_id = ? AND stream = 'status' AND data LIKE ?
+             WHERE run_id = ? AND stream = 'status' AND data LIKE ? AND subagent_id IS NULL
            ) AS found`,
         ).get(row.id, `${CLAUDE_API_ERROR_STATUS_PREFIX}%`)?.found ?? 0;
         if (priorApiError === 1) {
@@ -1046,8 +1049,9 @@ function findLastCodexSessionId(taskId: string): string | null {
  * Send a follow-up prompt to a claude task. Always creates a new run row so
  * the run history shows each user message as its own entry.
  *
- *   • If we hold live in-memory session state AND the tmux session is alive,
- *     we paste the prompt into it as a fresh turn (`sendTurn`).
+ *   • If we hold live in-memory session state AND the tmux session is not
+ *     unambiguously gone, we paste the prompt into it as a fresh turn
+ *     (`sendTurn`).
  *   • Otherwise (session gone, or a tmux session that outlived our process
  *     after a restart with no in-memory state) we spawn a brand-new session
  *     resuming via `claude --resume <sessionId>` so claude reloads the prior
@@ -1060,14 +1064,22 @@ function sendClaudeTurn(taskId: string, line: string): string | null {
   const task = tasks.get(taskId);
   if (!task) return null;
 
-  // Route to the live-session paste path only when we BOTH hold in-memory
-  // SessionState AND the tmux session is alive. Boot reconciliation no longer
-  // sweeps idle sessions, so a tmux session can outlive our process with no
-  // SessionState — in which case `sendTurn` would reject with "no live
-  // session". When either is missing, fall through to `spawnResumedSession`,
-  // which (via `spawnClaudeViaTmux`'s own-session pre-kill) cleanly replaces
-  // any stale survivor and resumes via `claude --resume <sessionId>`.
-  if (hasSessionState(taskId) && sessionExists(taskId)) {
+  // Route to the live-session paste path unless we're SURE the session is
+  // dead. `sessionLiveness` (not the raw `sessionExists` boolean it replaces
+  // here) distinguishes an unambiguous `gone` from an `unreachable` probe —
+  // the same tri-state #88 introduced for the death watch, because a bare
+  // `.ok` boolean conflates "session absent" with "tmux hiccuped" (busy-server
+  // EAGAIN under load). Boot reconciliation no longer sweeps idle sessions, so
+  // a tmux session can outlive our process with no SessionState — in which
+  // case `sendTurn` would reject with "no live session" — so we also require
+  // in-memory state. `unreachable` (inconclusive) deliberately still takes the
+  // non-destructive paste path: if the session really is dead the paste fails
+  // gracefully and the death-watch/boot-reconcile recovers it later; routing
+  // it to `spawnResumedSession` instead would risk its unconditional
+  // pre-kill (`spawnClaudeViaTmux`) tearing down a live, possibly mid-turn
+  // session over a transient probe failure. Only an unambiguous `gone` (or no
+  // in-memory state at all) reaches the destructive respawn path.
+  if (hasSessionState(taskId) && sessionLiveness(sessionNameFor(taskId)) !== "gone") {
     return sendTurnInExistingSession(task, taskId, line);
   }
   return spawnResumedSession(task, taskId, line);
