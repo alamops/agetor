@@ -269,6 +269,7 @@ export const __githubInternals = {
   buildIssueUpdatePatch,
   normalizeMergeability,
   draftFromGraphql,
+  graphqlErrorMessage,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -352,6 +353,7 @@ function normalizeItem(kind: GitHubItemKind, raw: unknown): GitHubListItem | nul
     createdAt: typeof obj.created_at === "string" ? obj.created_at : "",
     updatedAt: typeof obj.updated_at === "string" ? obj.updated_at : "",
     closedAt: typeof obj.closed_at === "string" ? obj.closed_at : null,
+    mergedAt: typeof obj.merged_at === "string" ? obj.merged_at : null,
   };
 }
 
@@ -1195,6 +1197,19 @@ export async function reopenGitHubPull(input: GitHubItemNumberInput): Promise<Gi
   return { ok: true, item, message: "Pull request reopened." };
 }
 
+/** First error message from a GraphQL 200-with-`errors` response, or null when
+ *  there are none. GraphQL reports mutation failures in an `errors` array on an
+ *  HTTP 200, so this is the real failure path a caller sees. */
+function graphqlErrorMessage(json: unknown): string | null {
+  if (!json || typeof json !== "object") return null;
+  const errors = (json as { errors?: unknown }).errors;
+  if (!Array.isArray(errors) || errors.length === 0) return null;
+  const first = errors[0];
+  return first && typeof first === "object" && typeof (first as { message?: unknown }).message === "string"
+    ? (first as { message: string }).message
+    : "GitHub rejected the request";
+}
+
 /** Dig `data.<field>.pullRequest.isDraft` out of a GraphQL response. */
 function draftFromGraphql(json: unknown, field: string): boolean | null {
   if (!json || typeof json !== "object") return null;
@@ -1241,17 +1256,8 @@ export async function setGitHubPullDraft(input: SetGitHubPullDraftInput): Promis
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
-  // GraphQL reports mutation failures as a 200 with an `errors` array.
-  const errors = json && typeof json === "object" && Array.isArray((json as { errors?: unknown }).errors)
-    ? (json as { errors: unknown[] }).errors
-    : [];
-  if (errors.length > 0) {
-    const first = errors[0];
-    const msg = first && typeof first === "object" && typeof (first as { message?: unknown }).message === "string"
-      ? (first as { message: string }).message
-      : "GitHub rejected the draft change";
-    return { ok: false, error: msg };
-  }
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: gqlError };
   const isDraft = draftFromGraphql(json, field);
   const draft = isDraft ?? input.draft;
   return { ok: true, draft, message: draft ? "Converted to draft." : "Marked ready for review." };

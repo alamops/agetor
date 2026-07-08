@@ -647,7 +647,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
     try {
       const result = await api.reopenGitHubPull({ path: projectPath, number: item.number });
-      upsertListItem(result.item);
+      // Keep the row visible even under a "closed" filter so the reopen is
+      // legible; it drops out on the next refresh.
+      upsertListItem(result.item, false, true);
       setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Pull request reopened." }));
       // Now open again — let the mergeability effect fetch a fresh verdict.
       mergeabilityRetries.current[item.number] = 0;
@@ -680,11 +682,15 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     }
   };
 
-  const upsertListItem = (replacement: GitHubListItem, prepend = false) => {
+  // `keepIfPresent` updates an existing row in place even when the replacement no
+  // longer matches the active filters — used by in-panel state changes (e.g.
+  // reopen) so the user sees the result instead of the row silently vanishing;
+  // it drops out naturally on the next refresh.
+  const upsertListItem = (replacement: GitHubListItem, prepend = false, keepIfPresent = false) => {
     setResult((cur) => {
       if (!cur) return cur;
       const exists = cur.items.some((item) => item.kind === replacement.kind && item.number === replacement.number);
-      if (!itemMatchesActiveFilters(replacement)) {
+      if (!itemMatchesActiveFilters(replacement) && !(keepIfPresent && exists)) {
         return {
           ...cur,
           items: cur.items.filter((item) => item.kind !== replacement.kind || item.number !== replacement.number),
@@ -1599,7 +1605,12 @@ function GitHubItemRow({
   onRefreshMergeability: () => void;
   onToggle: () => void;
 }) {
-  const stateClass = item.state === "open" ? "text-emerald-400" : "text-violet-400";
+  const merged = item.kind === "pulls" && !!item.mergedAt;
+  const stateClass = item.state === "open"
+    ? "text-emerald-400"
+    : merged
+      ? "text-violet-400"
+      : "text-rose-400";
   return (
     <div className="rounded-md border border-border/60 bg-card">
       <div className="flex items-start gap-3 p-3">
@@ -1621,7 +1632,7 @@ function GitHubItemRow({
             )}
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-            <span>{item.state}</span>
+            <span>{merged ? "merged" : item.state}</span>
             {item.author && <span>by {item.author.login}</span>}
             {item.assignees.length > 0 && <span>assigned {item.assignees.map((a) => a.login).join(", ")}</span>}
             {item.milestone && <span>milestone {item.milestone.title}</span>}
@@ -2120,7 +2131,13 @@ function PullActions({
             {item.draft ? "Mark ready for review" : "Convert to draft"}
           </Button>
         )}
-        {item.state !== "open" && (
+        {item.state !== "open" && item.mergedAt && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-violet-400">
+            <GitMerge className="size-3.5" />
+            Merged
+          </span>
+        )}
+        {item.state !== "open" && !item.mergedAt && (
           <Button size="sm" variant="outline" className="h-7" disabled={!!busy} onClick={onReopenPull}>
             {busy === "reopen" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitPullRequest className="mr-2 size-3.5" />}
             Reopen

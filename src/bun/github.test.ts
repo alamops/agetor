@@ -10,6 +10,7 @@ const {
   buildIssueUpdatePatch,
   normalizeMergeability,
   draftFromGraphql,
+  graphqlErrorMessage,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -31,6 +32,7 @@ function makeItem(overrides: Partial<GitHubListItem> = {}): GitHubListItem {
     createdAt: "2026-01-01T00:00:00Z",
     updatedAt: "2026-01-02T00:00:00Z",
     closedAt: null,
+    mergedAt: null,
     ...overrides,
   };
 }
@@ -167,4 +169,14 @@ test("draftFromGraphql digs isDraft out of the mutation payload, else null", () 
   expect(draftFromGraphql({ data: {} }, "markPullRequestReadyForReview")).toBeNull();
   expect(draftFromGraphql({ errors: [{ message: "nope" }] }, "markPullRequestReadyForReview")).toBeNull();
   expect(draftFromGraphql(null, "markPullRequestReadyForReview")).toBeNull();
+});
+
+test("graphqlErrorMessage returns the first error message, else null", () => {
+  expect(graphqlErrorMessage({ errors: [{ message: "already a draft" }, { message: "second" }] })).toBe("already a draft");
+  // errors present but no string message → generic fallback
+  expect(graphqlErrorMessage({ errors: [{ code: 42 }] })).toBe("GitHub rejected the request");
+  // no errors / success payload / junk → null (caller proceeds)
+  expect(graphqlErrorMessage({ data: { x: 1 } })).toBeNull();
+  expect(graphqlErrorMessage({ errors: [] })).toBeNull();
+  expect(graphqlErrorMessage(null)).toBeNull();
 });

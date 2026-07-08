@@ -684,6 +684,10 @@ export interface GitHubListItem {
   createdAt: string;
   updatedAt: string;
   closedAt: string | null;
+  /** Set (to a timestamp) only for a merged pull request; null otherwise —
+   *  lets the UI distinguish a merged PR from a closed-unmerged one, which the
+   *  `state: "closed"` value alone conflates. Always null for issues. */
+  mergedAt: string | null;
 }
 
 export interface GitHubListResult {
