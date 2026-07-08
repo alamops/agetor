@@ -137,6 +137,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // Inline comments queued for the next review submission (the "pending review"
   // batched flow), keyed by PR number.
   const [pendingReview, setPendingReview] = useState<Record<number, LineCommentTarget[] | undefined>>({});
+  // True when the diff was invalidated (refreshed / branch updated) after comments
+  // were queued — their line numbers may no longer match, so warn before submit.
+  const [pendingStale, setPendingStale] = useState<Record<number, boolean | undefined>>({});
   const [closeDrafts, setCloseDrafts] = useState<Record<number, string | undefined>>({});
   const [mergeMethods, setMergeMethods] = useState<Record<number, GitHubPullMergeMethod | undefined>>({});
   const [labelDrafts, setLabelDrafts] = useState<Record<number, string | undefined>>({});
@@ -246,6 +249,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setReviewReplySubmitting({});
     setReviewDrafts({});
     setPendingReview({});
+    setPendingStale({});
     setCloseDrafts({});
     setMergeMethods({});
     setLabelDrafts({});
@@ -578,6 +582,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       // refetch the review-comments list so they show up.
       if (pending.length > 0) {
         setPendingReview((cur) => ({ ...cur, [item.number]: [] }));
+        setPendingStale((cur) => ({ ...cur, [item.number]: false }));
         setReviewComments((cur) => ({ ...cur, [item.number]: undefined }));
         setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
       }
@@ -589,7 +594,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   };
 
   const addToReview = (item: GitHubListItem, target: LineCommentTarget) => {
+    // A comment queued against the current diff starts a fresh (non-stale) queue.
+    const wasEmpty = (pendingReview[item.number] ?? []).length === 0;
     setPendingReview((cur) => ({ ...cur, [item.number]: [...(cur[item.number] ?? []), target] }));
+    if (wasEmpty) setPendingStale((cur) => ({ ...cur, [item.number]: false }));
   };
 
   const removePendingReview = (item: GitHubListItem, index: number) => {
@@ -637,6 +645,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       setChecksErrors((cur) => ({ ...cur, [item.number]: undefined }));
       setDiffs((cur) => ({ ...cur, [item.number]: undefined }));
       setDiffErrors((cur) => ({ ...cur, [item.number]: undefined }));
+      // The head moved — any queued review comments now reference stale lines.
+      setPendingStale((cur) => ({ ...cur, [item.number]: true }));
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
     } finally {
@@ -1171,6 +1181,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onToggleDraft={() => { void runToggleDraft(item); }}
                 onClosePull={() => { void runPullClose(item); }}
                 pendingReview={item.kind === "pulls" ? (pendingReview[item.number] ?? []) : []}
+                pendingStale={item.kind === "pulls" ? !!pendingStale[item.number] : false}
                 onAddToReview={(target) => addToReview(item, target)}
                 onRemovePendingReview={(index) => removePendingReview(item, index)}
                 onLineComment={(target) => submitLineComment(item, target)}
@@ -1202,6 +1213,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                   if (item.kind !== "pulls") return;
                   setDiffs((cur) => ({ ...cur, [item.number]: undefined }));
                   setDiffErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                  // A refreshed diff may renumber lines under any queued comments.
+                  if ((pendingReview[item.number] ?? []).length > 0) {
+                    setPendingStale((cur) => ({ ...cur, [item.number]: true }));
+                  }
                 }}
                 onRefreshChecks={() => {
                   if (item.kind !== "pulls") return;
@@ -1549,6 +1564,7 @@ function GitHubItemRow({
   onToggleDraft,
   onClosePull,
   pendingReview,
+  pendingStale,
   onAddToReview,
   onRemovePendingReview,
   onLineComment,
@@ -1621,6 +1637,7 @@ function GitHubItemRow({
   onToggleDraft: () => void;
   onClosePull: () => void;
   pendingReview: LineCommentTarget[];
+  pendingStale: boolean;
   onAddToReview: (target: LineCommentTarget) => void;
   onRemovePendingReview: (index: number) => void;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
@@ -1801,8 +1818,8 @@ function GitHubItemRow({
                 onRequestReviewers={onRequestReviewers}
               />
               <CheckRuns checks={checks} loading={checksLoading} error={checksError} onRetry={onRetryChecks} onRefresh={onRefreshChecks} />
-              <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} />
-              <PendingReview comments={pendingReview} onRemove={onRemovePendingReview} />
+              <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} />
+              <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
               <ReviewComments
                 comments={reviewComments}
                 loading={reviewCommentsLoading}
@@ -2334,6 +2351,13 @@ function PullActions({
           </Button>
         </div>
       </div>
+
+      {pendingCount > 0 && (
+        <div className="mt-3 flex items-start gap-1.5 text-[11px] text-amber-400">
+          <AlertCircle className="mt-px size-3.5 shrink-0" />
+          {pendingCount} review comment{pendingCount === 1 ? "" : "s"} queued — submit via Approve / Comment / Request; merging or closing won't post {pendingCount === 1 ? "it" : "them"}.
+        </div>
+      )}
     </div>
   );
 }
@@ -2434,6 +2458,7 @@ function PullDiff({
   onRefresh,
   onLineComment,
   onAddToReview,
+  pending,
 }: {
   diff?: TaskDiff;
   loading: boolean;
@@ -2442,6 +2467,7 @@ function PullDiff({
   onRefresh: () => void;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onAddToReview: (target: LineCommentTarget) => void;
+  pending: LineCommentTarget[];
 }) {
   const totals = useMemo(() => {
     const files = diff?.files ?? [];
@@ -2450,6 +2476,11 @@ function PullDiff({
       { additions: 0, deletions: 0 },
     );
   }, [diff]);
+
+  const queuedKeys = useMemo(
+    () => new Set(pending.map((c) => `${c.filePath}|${c.line}|${c.side}`)),
+    [pending],
+  );
 
   return (
     <div className="mt-3">
@@ -2509,6 +2540,7 @@ function PullDiff({
               file={file}
               onLineComment={onLineComment}
               onAddToReview={onAddToReview}
+              queuedKeys={queuedKeys}
             />
           ))}
         </div>
@@ -2519,9 +2551,11 @@ function PullDiff({
 
 function PendingReview({
   comments,
+  stale,
   onRemove,
 }: {
   comments: LineCommentTarget[];
+  stale: boolean;
   onRemove: (index: number) => void;
 }) {
   if (comments.length === 0) return null;
@@ -2531,6 +2565,12 @@ function PendingReview({
         <MessageSquare className="size-3.5" />
         Pending review ({comments.length})
       </div>
+      {stale && (
+        <div className="mb-2 flex items-start gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-400">
+          <AlertCircle className="mt-px size-3.5 shrink-0" />
+          The diff changed since these were queued — their line numbers may be stale, and GitHub rejects the whole review if any line no longer matches. Re-queue them against the current diff before submitting.
+        </div>
+      )}
       <div className="flex flex-col gap-2">
         {comments.map((c, i) => (
           <div key={`${c.filePath}-${c.side}-${c.line}-${i}`} className="rounded-md border border-border/60 bg-card">
@@ -2764,10 +2804,12 @@ function DiffFileBlock({
   file,
   onLineComment,
   onAddToReview,
+  queuedKeys,
 }: {
   file: DiffFile;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onAddToReview: (target: LineCommentTarget) => void;
+  queuedKeys: Set<string>;
 }) {
   const meta = STATUS_META[file.status];
   const Icon = meta.icon;
@@ -2787,7 +2829,7 @@ function DiffFileBlock({
         <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>
       ) : (
         <>
-          <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} onAddToReview={onAddToReview} />
+          <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} onAddToReview={onAddToReview} queuedKeys={queuedKeys} />
           {file.truncated && (
             <div className="border-t border-border/60 px-3 py-1.5 text-[11px] italic text-muted-foreground">
               Diff truncated because this file's changes are too large to display in full.
@@ -2804,11 +2846,13 @@ function DiffBody({
   hunks,
   onLineComment,
   onAddToReview,
+  queuedKeys,
 }: {
   file: DiffFile;
   hunks: string;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onAddToReview: (target: LineCommentTarget) => void;
+  queuedKeys: Set<string>;
 }) {
   const rows = useMemo(() => toRows(hunks), [hunks]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -2859,6 +2903,7 @@ function DiffBody({
         const target = commentTarget(r);
         const rowKey = `${r.kind}-${r.old ?? ""}-${r.neu ?? ""}-${i}`;
         const selected = selectedKey === rowKey;
+        const queued = target ? queuedKeys.has(`${target.filePath}|${target.line}|${target.side}`) : false;
         return (
           <div key={rowKey}>
             <div
@@ -2903,6 +2948,9 @@ function DiffBody({
               )}
               {postedKey === rowKey && (
                 <span className="sticky right-0 shrink-0 bg-card/90 px-1 text-[11px] text-emerald-400">commented</span>
+              )}
+              {queued && postedKey !== rowKey && (
+                <span className="sticky right-0 shrink-0 bg-card/90 px-1 text-[11px] text-sky-400">queued</span>
               )}
             </div>
             {selected && target && (
