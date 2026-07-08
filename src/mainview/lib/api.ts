@@ -661,10 +661,16 @@ export const api = {
     ),
 
   /** Fire a native macOS notification via the Bun process. Fire-and-forget
-   *  — the OS handles display; clicking the notification just focuses the
-   *  app (Electrobun's bridge doesn't expose a click callback). The
-   *  matching in-app toast carries the deep-link. */
-  notifyOS: (input: { title: string; body?: string; subtitle?: string; silent?: boolean }) =>
+   *  — the OS handles display. When `taskId` is provided, the Bun side
+   *  encodes it into an `agetor://task/<id>` deep-link so clicking the
+   *  notification opens straight to that task, not just app focus. */
+  notifyOS: (input: {
+    title: string;
+    body?: string;
+    subtitle?: string;
+    silent?: boolean;
+    taskId?: string;
+  }) =>
     j<{ ok: boolean }>("/notifications", {
       method: "POST",
       body: JSON.stringify(input),

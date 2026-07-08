@@ -38,7 +38,7 @@ function describe(args: ToastArgs): string {
 function maybeNotifyOS(args: ToastArgs, heading: string, detail?: string): void {
   if (args.isFocused) return;
   // Fire-and-forget — failure (e.g. user denied macOS permission) is silent.
-  api.notifyOS({ title: heading, body: detail }).catch(() => { /* ignore */ });
+  api.notifyOS({ title: heading, body: detail, taskId: args.taskId }).catch(() => { /* ignore */ });
 }
 
 export function toastSuccess(args: ToastArgs): void {
@@ -104,6 +104,13 @@ export function toastPending(args: ToastArgs): void {
  *  "the agent is waiting on your answer." */
 export function toastApiError(args: ToastArgs): void {
   showBlockingToast({ method: toast.error, heading: "API error — retry" }, args);
+}
+
+/** Variant of `toastPending` for the `blocked → session-died` transition —
+ *  the task's tmux session ended unexpectedly mid-run. Reads as an unexpected
+ *  interruption to re-run, not "the agent is waiting on you." */
+export function toastSessionEnded(args: ToastArgs): void {
+  showBlockingToast({ method: toast.error, heading: "Session ended" }, args);
 }
 
 /**

@@ -46,6 +46,7 @@ import { detectAskModal, parseModalPane, type NavKey, type ParsedQuestionPane } 
  */
 
 import type { RunEventStream } from "../shared/types.ts";
+import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 
 /**
  * Stream chunk callback. `lineUuid` is the JSONL line's `uuid` field (claude
@@ -734,17 +735,120 @@ export function sessionExists(taskId: string): boolean {
   return tmux(["has-session", "-t", sessionNameFor(taskId)]).ok;
 }
 
+/**
+ * True when we hold in-memory `SessionState` driving this task's session.
+ * Distinct from `sessionExists` (a tmux check): since boot reconciliation no
+ * longer sweeps idle sessions, a tmux session can outlive our process — so
+ * `sessionExists` can be true with no `SessionState` to paste into. The
+ * follow-up router (`sendClaudeTurn`) gates the paste path on BOTH.
+ */
+export function hasSessionState(taskId: string): boolean {
+  return sessions.has(taskId);
+}
+
 /** Name-keyed variant for callers that hold a persisted session name (e.g.
  *  `runs.tmux_session`) and don't want to recompute it from a task id. */
 export function sessionExistsByName(name: string): boolean {
   return tmux(["has-session", "-t", name]).ok;
 }
 
-/** All currently-running `agetor-*` tmux sessions. Used by reconcileOrphans. */
-export function listAgetorSessions(): string[] {
-  const res = tmux(["list-sessions", "-F", "#{session_name}"]);
-  if (!res.ok) return [];
-  return res.stdout.split("\n").filter((n) => n.startsWith("agetor-"));
+/** Tri-state liveness of a tmux session — the safe signal for the death watch. */
+export type SessionLiveness = "alive" | "gone" | "unreachable";
+
+/**
+ * Classify a tmux session's liveness from a single `has-session` probe,
+ * distinguishing the two states a bare `.ok` boolean fatally conflates:
+ *
+ *   - `alive`       — the session answered; it's up.
+ *   - `gone`        — an UNAMBIGUOUS death: the server answered but this session
+ *                     is absent ("session not found"), or the whole server is
+ *                     down ("no server running" / "lost server"). While a turn
+ *                     is in flight our own session keeps the shared server
+ *                     alive, so a no-server report means our session died too;
+ *                     these strings are never emitted spuriously.
+ *   - `unreachable` — anything else: a busy-server EAGAIN ("resource temporarily
+ *                     unavailable"), an ambiguous bare "error connecting …", an
+ *                     empty message, or an unrecognized error. INCONCLUSIVE —
+ *                     must never be treated as a death.
+ *
+ * The death watch used to fire on any non-zero `has-session` exit after two
+ * ~400ms misses, which abandoned live, working sessions whenever the shared
+ * tmux server hiccuped under load (a heavy git op flooding a pane, many
+ * concurrent agetor sessions). We don't have the incident's exact transient
+ * string, so the bias is deliberately conservative: ONLY known-unambiguous
+ * death strings are `gone`; every ambiguous or unrecognized error is
+ * `unreachable` and cannot trip a death. That guarantees a transient probe
+ * failure never abandons a live session (the original bug), while still
+ * detecting a genuinely-dead session or server the moment tmux says so (instead
+ * of waiting for boot `reconcileOrphans`).
+ */
+export function sessionLiveness(name: string): SessionLiveness {
+  const r = tmux(["has-session", "-t", name]);
+  if (r.ok) return "alive";
+  const err = `${r.stderr} ${r.stdout}`.toLowerCase();
+  // Only UNAMBIGUOUS death strings count as `gone`:
+  //  - server answered, this session absent: "can't find session" /
+  //    "session not found" / "no such session".
+  //  - server itself dead: "no server running" / "lost server". During an
+  //    in-flight turn our own session keeps the shared server alive, so a server
+  //    reporting no-server has died and taken our session with it. These strings
+  //    are never emitted spuriously — a busy-but-alive server still accepts the
+  //    connection, so it can't say "no server running".
+  if (
+    err.includes("find session") ||
+    err.includes("session not found") ||
+    err.includes("no such session") ||
+    err.includes("no server running") ||
+    err.includes("lost server")
+  ) {
+    return "gone";
+  }
+  // Everything else is INCONCLUSIVE → `unreachable`, never a death: a busy-server
+  // EAGAIN ("resource temporarily unavailable"), a bare "error connecting …"
+  // (ambiguous — transient EAGAIN vs. a vanished socket), an empty message from
+  // a torn-down client, or any error string we don't recognize. Biasing the
+  // unknown case to `unreachable` is what guarantees a transient probe failure
+  // can never abandon a live session — the original bug, whose exact transient
+  // string we can't assume. A genuinely-dead session/server that only ever
+  // emits an unrecognized error degrades to boot `reconcileOrphans`.
+  return "unreachable";
+}
+
+/** True when `path` was written within `windowMs` — used as a death-watch veto:
+ *  a log file the agent touched a beat ago proves it's alive even if a single
+ *  `has-session` probe raced a kill/recreate. Silent (false) on a missing file. */
+export function fileWrittenWithin(path: string, windowMs: number): boolean {
+  try {
+    return Date.now() - fsStatSync(path).mtimeMs < windowMs;
+  } catch {
+    return false;
+  }
+}
+
+/** What a single death-watch poll should do given this tick's signals.
+ *   - `reset` — the session is alive/unreachable, or its log was just written
+ *               (provably alive): zero the miss counter.
+ *   - `wait`  — a `gone` probe with a stale log, but not yet enough consecutive
+ *               ones: increment and keep watching.
+ *   - `fire`  — `threshold` consecutive `gone`+stale probes: declare death. */
+export type DeathTickOutcome = "reset" | "wait" | "fire";
+
+/**
+ * Pure per-tick decision for the death watch, factored out so the destructive
+ * branch is unit-testable without real timers or a live tmux server. `misses`
+ * is the run of consecutive death-signalling ticks BEFORE this one.
+ *
+ * Only a definitive `gone` counts toward death; `alive`/`unreachable` (a busy-
+ * server EAGAIN) and a freshly-written log both reset — either proves the
+ * session isn't actually dead, so a transient probe failure can never abandon a
+ * live session.
+ */
+export function deathTickOutcome(
+  args: { liveness: SessionLiveness; logFresh: boolean; misses: number; threshold: number },
+): DeathTickOutcome {
+  if (args.liveness !== "gone") return "reset";
+  if (args.logFresh) return "reset";
+  return args.misses + 1 < args.threshold ? "wait" : "fire";
 }
 
 /** Kill any tmux session for the given task. Idempotent / silent on miss. */
@@ -982,6 +1086,14 @@ interface SessionState {
    *  Lazily armed when a turn enters the queue; torn down with the
    *  pollTimer. */
   scrapeTimer: ReturnType<typeof setInterval> | null;
+  /** Periodic poll of `tmux has-session` while a turn is in flight. Fires
+   *  when the session dies unexpectedly mid-run (crash / external kill /
+   *  tmux server gone) so we can settle the run and flip the card to
+   *  `blocked` LIVE, instead of leaving it stranded in `running` until the
+   *  next boot's `reconcileOrphans`. Armed in `attachTailer`, cleared by
+   *  `disposeSessionState` and by `signalSessionDeath` itself (one-shot —
+   *  a dead session never revives). */
+  deathTimer: ReturnType<typeof setInterval> | null;
   /** Last fingerprint the scraper saw; an entry must match the previous
    *  scrape (i.e. two consecutive ticks) before we register a real
    *  TmuxPromptRequest. Suppresses false positives where a numbered list
@@ -1153,6 +1265,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     watcher: null,
     pollTimer: null,
     scrapeTimer: null,
+    deathTimer: null,
     scrapeLastFingerprint: null,
     lastJsonlAppendAt: 0,
     lastIdleScrapeAt: 0,
@@ -2515,6 +2628,118 @@ function startScraper(state: SessionState): void {
   }, SCRAPE_INTERVAL_MS);
 }
 
+/** How often the death watch polls `tmux has-session`. */
+const DEATH_POLL_MS = 400;
+/** Grace after the session disappears before we settle, so any final JSONL
+ *  bytes (a real end_turn that landed just before the session died) are
+ *  flushed and read first — matches codex-tmux's DEATH_GRACE_MS. */
+const DEATH_GRACE_MS = 250;
+/** Consecutive definitive `gone` probes required before declaring death —
+ *  debounces a transient tmux failure. Now that only a `gone` (server up,
+ *  session absent) probe counts — an `unreachable` server hiccup resets the
+ *  counter — this is ~1.6s of the session being provably absent. Exported so
+ *  codex-tmux's death watch shares the exact `deathTickOutcome` contract rather
+ *  than a hand-copied "mirror" that could silently drift. */
+export const DEATH_MISS_THRESHOLD = 4;
+/** A log file written within this window vetoes a death: the agent is provably
+ *  alive, so a lone `gone` probe that raced a kill/recreate can't settle it.
+ *  Exported and shared with codex-tmux (see `DEATH_MISS_THRESHOLD`). */
+export const DEATH_JSONL_QUIET_MS = 3_000;
+
+/**
+ * Settle an in-flight turn because its tmux session died unexpectedly.
+ *
+ * Emits the shared `SESSION_DIED_STATUS_PREFIX` sentinel (which the
+ * orchestrator's chunk handler pattern-matches to flip the card to `blocked`
+ * and mark the run's handle), then resolves the active turn so the done
+ * handler runs — exactly mirroring the claude API-error path, where the
+ * outcome is driven by the handle flag, not the exit code.
+ *
+ * No-ops when no turn is in flight: if the final flush already popped the slot
+ * (the turn genuinely completed a beat before the session vanished) there's
+ * nothing to settle, and an idle session dying between turns is out of scope
+ * (the card isn't "running"; a re-run self-heals via spawn's pre-kill).
+ */
+function signalSessionDeath(state: SessionState): void {
+  if (!turnInFlight(state)) return;
+  const slot = state.turnQueue[0];
+  const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
+  onChunk(
+    "status",
+    `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
+  );
+  if (slot && slot.resolve) {
+    state.turnQueue.shift();
+    state.lastChunk = slot.onChunk;
+    const resolve = slot.resolve;
+    slot.resolve = null;
+    slot.reject = null;
+    resolve(0);
+  } else if (state.onEndOfTurn) {
+    const handler = state.onEndOfTurn;
+    state.onEndOfTurn = null;
+    handler();
+  }
+  // The session is a corpse — stop tailing it. Leave the sessions map entry +
+  // the (now-empty) turnQueue intact; a subsequent re-run replaces this state
+  // via spawnClaudeViaTmux's pre-kill. Deliberately do NOT reject remaining
+  // slots (the only in-flight one was just resolved) — a spurious "session
+  // killed" rejection would double-settle the run.
+  state.watcher?.close();
+  state.watcher = null;
+  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  if (state.scrapeTimer) { clearInterval(state.scrapeTimer); state.scrapeTimer = null; }
+  state.subagentWatcher?.detach();
+  state.subagentWatcher = null;
+}
+
+/** Whether a turn is currently in flight on this session — a live head slot
+ *  (fresh-spawn / live-stream path) or a pending reattach `onEndOfTurn`. Only
+ *  then is there a "running" run to protect from a dead session. */
+function turnInFlight(state: SessionState): boolean {
+  const slot = state.turnQueue[0];
+  return !!(slot && slot.resolve) || !!state.onEndOfTurn;
+}
+
+/** Arm the mid-run death watch. Unlike codex (one-shot sessions), a claude
+ *  session is long-lived and idle between turns, so we gate the actual
+ *  `tmux has-session` subprocess on a turn being in flight — an idle session
+ *  dying isn't a "running task" problem (and `signalSessionDeath` would no-op
+ *  anyway). While a turn IS in flight, when the session vanishes we one-shot
+ *  stop the poll, give the FS a grace beat to surface any final bytes, flush,
+ *  then settle the run via `signalSessionDeath`. Torn down by
+ *  `disposeSessionState` (intentional teardown clears it before the kill, so a
+ *  Stop/delete can't be mistaken for an unexpected death). */
+function startDeathWatch(state: SessionState): void {
+  if (state.deathTimer) return;
+  // Only a definitive `gone` probe (tmux server answered, this session absent)
+  // counts toward death; an `unreachable` server hiccup on the shared socket
+  // resets the counter (see `sessionLiveness`). Require DEATH_MISS_THRESHOLD
+  // consecutive `gone` probes, and veto on recent JSONL writes, so a live task
+  // is never wrongly blocked. Reset on any tick where the session is alive/
+  // unreachable, the JSONL was just written, or no turn is running.
+  let misses = 0;
+  state.deathTimer = setInterval(() => {
+    if (!turnInFlight(state)) { misses = 0; return; } // idle — no running turn; skip the tmux poll
+    // Compute the log-recency veto lazily — it only matters for a `gone` probe,
+    // and `gone` is the rare tick, so we skip a statSync on every `alive` poll.
+    const liveness = sessionLiveness(state.sessionName);
+    const outcome = deathTickOutcome({
+      liveness,
+      logFresh: liveness === "gone" && fileWrittenWithin(state.jsonlPath, DEATH_JSONL_QUIET_MS),
+      misses,
+      threshold: DEATH_MISS_THRESHOLD,
+    });
+    if (outcome === "reset") { misses = 0; return; }
+    if (outcome === "wait") { misses++; return; }
+    if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
+    setTimeout(() => {
+      flushSync(state);
+      signalSessionDeath(state);
+    }, DEATH_GRACE_MS);
+  }, DEATH_POLL_MS);
+}
+
 function attachTailer(state: SessionState): void {
   // Drain whatever's already in the file (claude may have written events
   // before our watcher attached).
@@ -2529,6 +2754,7 @@ function attachTailer(state: SessionState): void {
   // cheap (one stat + read-if-grew) and bulletproof.
   state.pollTimer = setInterval(() => { void flush(state); }, 400);
   startScraper(state);
+  startDeathWatch(state);
   // Track any background/sub agents this session spawns. Idempotent re-arm:
   // dispose a prior handle first so a re-attach (reconcileOrphans defensive
   // overwrite) can't leave two watchers polling the same dir.
@@ -2550,6 +2776,14 @@ function attachTailer(state: SessionState): void {
  */
 export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   const sessionName = sessionNameFor(opts.taskId);
+
+  // Defensively clear any stale same-named session before (re)creating it, so
+  // `tmux new-session` can't fail with "duplicate session". This matters now
+  // that boot reconciliation no longer sweeps un-reattached sessions (see
+  // `reconcileOrphans`): an idle claude session survives a restart, so a fresh
+  // run of the same task must reset it. Own-scoped (only this task's name) and
+  // idempotent/silent on miss — mirrors codex's spawn pre-kill.
+  killTaskSession(opts.taskId);
 
   // Clean up any stale agetor settings before tmux starts so claude reads a
   // tidy `.claude/settings.local.json` on launch. agetor is non-invasive: it
@@ -2621,6 +2855,13 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
     // `bypassPermissions` into the Shift+Tab cycle.
     bypassEnabled: opts.mode === "bypass",
   });
+  // Dispose any prior state for this task before overwriting the map entry, so
+  // a re-run (the previous session persisted, then the user hit Run again)
+  // doesn't leak the old state's watcher + poll/scrape/death timers. Mirrors
+  // reattachSession's defensive pre-dispose. Safe on a fresh task (no-op on
+  // undefined); on a re-run the old turn is already terminal so no queued slot
+  // is rejected.
+  disposeSessionState(sessions.get(opts.taskId));
   sessions.set(opts.taskId, state);
 
   const done = new Promise<number>((resolve, reject) => {
@@ -3302,6 +3543,8 @@ function disposeSessionState(state: SessionState | undefined): void {
   state.pollTimer = null;
   if (state.scrapeTimer) clearInterval(state.scrapeTimer);
   state.scrapeTimer = null;
+  if (state.deathTimer) clearInterval(state.deathTimer);
+  state.deathTimer = null;
   state.scrapeLastFingerprint = null;
   // Release the subagent watcher's fs.watch + poll timer. Read-only teardown:
   // this stops us TAILING the subagent files, never the agent itself.
@@ -3379,6 +3622,10 @@ export const __forTest = {
   flush,
   dispatchLine,
   firePendingEndTurn,
+  /** Death-watch settlement — exposed so the death test can drive it against a
+   *  synthetic session without a real tmux server. */
+  signalSessionDeath,
+  turnInFlight,
   matchNumberedModal,
   matchYesNoModal,
   matchStartupConsentDialog,

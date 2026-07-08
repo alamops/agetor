@@ -8,9 +8,9 @@ import { randomUUID } from "node:crypto";
  * (or a no-op resolve) until the user answers.
  *
  * Everything here is in-memory. Pending interactions don't survive an agetor
- * restart, by design: on boot we kill / reattach `agetor-*` tmux sessions, so
- * the children waiting on these promises are re-derived from the live pane
- * rather than persisted.
+ * restart, by design: on boot we reattach or orphan `agetor-*` tmux sessions
+ * (we never blind-kill), so the children waiting on these promises are
+ * re-derived from the live pane rather than persisted.
  */
 
 export type InteractionKind =

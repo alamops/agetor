@@ -1,0 +1,52 @@
+# AGENTS_CONFIG.yml — model routing for the /implement skill
+# Preset: balanced
+# Regenerate anytime with: /implement --config
+#
+# Each phase maps to one or more runners.
+#   type: self   -> the orchestrator does it inline (planning / interaction only)
+#   type: claude -> a Claude Code sub-agent; model is opus | sonnet | haiku | fable
+#   type: shell  -> an external CLI harness (command template with {PROMPT}/{TASK_FILE}/{CWD})
+
+defaults:
+  fallback_model: sonnet
+  allow_orchestrator_override: true
+
+phases:
+  investigate:
+    strategy: distribute
+    runners:
+      - type: claude
+        model: sonnet
+
+  planning:
+    runners:
+      - type: self
+
+  implementation:
+    strategy: distribute
+    runners:
+      - type: claude
+        model: sonnet
+
+  code_review:
+    strategy: distribute
+    runners:
+      - type: claude
+        model: opus
+
+  tests_creation:
+    strategy: distribute
+    runners:
+      - type: claude
+        model: sonnet
+
+  tests_running:
+    runners:
+      - type: claude
+        model: haiku
+
+  tests_fixes:
+    strategy: distribute
+    runners:
+      - type: claude
+        model: sonnet
