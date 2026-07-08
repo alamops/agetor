@@ -14,7 +14,7 @@ import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { dataDir } from "./db.ts";
-import { resolveTmuxBin } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import {
   DEATH_JSONL_QUIET_MS,
@@ -456,6 +456,7 @@ export function spawnCodexViaTmux(opts: CodexLaunchOptions): SpawnedAgent {
   for (const [k, v] of Object.entries(opts.env)) envArgs.push("-e", `${k}=${v}`);
 
   const args = [
+    ...tmuxSocketArgs(),
     "new-session", "-d", "-s", sessionName,
     "-x", "200", "-y", "50",
     "-c", opts.cwd,

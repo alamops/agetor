@@ -32,6 +32,7 @@ import {
   getTmuxSource,
   resolveTmuxBin,
   setTmuxSource,
+  tmuxSocketArgs,
   type TmuxSource,
 } from "./tmux-resolution.ts";
 import {
@@ -1118,8 +1119,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // contain `agetor-<hex>` so they don't strictly need escaping, but
           // we apply the same helper for symmetry.
           const shellEscape = (s: string) => s.replace(/(["\\$`])/g, "\\$1");
+          // Honor an active non-default socket (test isolation / a future
+          // dedicated production socket) so "Open in Terminal" attaches to
+          // the same server the session actually lives on, not whatever the
+          // default socket happens to be. Empty in production today.
+          const socketArgsStr = tmuxSocketArgs()
+            .map((a) => `\\"${shellEscape(a)}\\"`)
+            .join(" ");
           const script =
-            `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\" attach -t \\"${shellEscape(sessionName)}\\""\n` +
+            `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\"${socketArgsStr ? " " + socketArgsStr : ""} attach -t \\"${shellEscape(sessionName)}\\""\n` +
             `activate application "Terminal"`;
           const proc = Bun.spawn(["osascript", "-e", script], {
             stdout: "ignore",

@@ -1,4 +1,4 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll, afterAll } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,6 +9,24 @@ process.env.AGETOR_DATA_DIR = DATA_DIR;
 
 beforeAll(async () => {
   await import("./db.ts");
+});
+
+afterAll(async () => {
+  // Hygiene: the real-tmux cancel test below spins up sessions on the
+  // isolated test socket (NODE_ENV=test → "agetor-test"); kill that whole
+  // test server so it doesn't linger after the suite. Best-effort — never
+  // throws — and ONLY when tmuxSocketName() is non-null: we must NEVER
+  // kill-server the user's default tmux socket (that is the exact incident
+  // socket isolation exists to prevent).
+  try {
+    const { resolveTmuxBin, tmuxSocketName, tmuxSocketArgs } = await import(
+      "./tmux-resolution.ts"
+    );
+    if (tmuxSocketName() === null) return;
+    Bun.spawnSync([resolveTmuxBin(), ...tmuxSocketArgs(), "kill-server"]);
+  } catch {
+    // best-effort only — a missing tmux bin or dead server is fine.
+  }
 });
 
 test("reconcileOrphans marks running rows as orphaned and returns tasks to ready", async () => {

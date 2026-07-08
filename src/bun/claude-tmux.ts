@@ -24,7 +24,7 @@ import {
   type AskQuestion,
   type TmuxPromptChoice,
 } from "./interactions.ts";
-import { resolveTmuxBin } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
 import { detectAskModal, parseModalPane, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
 /**
@@ -710,10 +710,13 @@ interface RunResult {
   stderr: string;
 }
 
-/** Run a one-shot tmux command. Never throws — callers check `ok`. */
+/** Run a one-shot tmux command. Never throws — callers check `ok`. Always
+ *  threads `tmuxSocketArgs()` in right after the binary — see
+ *  `tmuxSocketName()` in tmux-resolution.ts for why every invocation (this is
+ *  the single choke point all of them share) must carry the socket args. */
 function tmux(args: string[], opts: { stdinText?: string } = {}): RunResult {
   try {
-    const proc = Bun.spawnSync([resolveTmuxBin(), ...args], {
+    const proc = Bun.spawnSync([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
       stdin: opts.stdinText !== undefined
         ? new TextEncoder().encode(opts.stdinText)
         : "ignore",
@@ -730,9 +733,12 @@ function tmux(args: string[], opts: { stdinText?: string } = {}): RunResult {
   }
 }
 
-/** True when `tmux has-session -t <name>` returns 0. */
+/** True when `tmux has-session -t =<name>` returns 0. The `=` prefix forces
+ *  an exact match — without it, a probe for an absent name PREFIX-MATCHES
+ *  and can report a live, unrelated session as "exists" (empirically proven
+ *  on this task's sibling `agetor-<id>` names). */
 export function sessionExists(taskId: string): boolean {
-  return tmux(["has-session", "-t", sessionNameFor(taskId)]).ok;
+  return tmux(["has-session", "-t", "=" + sessionNameFor(taskId)]).ok;
 }
 
 /**
@@ -747,9 +753,10 @@ export function hasSessionState(taskId: string): boolean {
 }
 
 /** Name-keyed variant for callers that hold a persisted session name (e.g.
- *  `runs.tmux_session`) and don't want to recompute it from a task id. */
+ *  `runs.tmux_session`) and don't want to recompute it from a task id.
+ *  Exact-match `=` prefix — see `sessionExists`. */
 export function sessionExistsByName(name: string): boolean {
-  return tmux(["has-session", "-t", name]).ok;
+  return tmux(["has-session", "-t", "=" + name]).ok;
 }
 
 /** Tri-state liveness of a tmux session — the safe signal for the death watch. */
@@ -783,7 +790,10 @@ export type SessionLiveness = "alive" | "gone" | "unreachable";
  * of waiting for boot `reconcileOrphans`).
  */
 export function sessionLiveness(name: string): SessionLiveness {
-  const r = tmux(["has-session", "-t", name]);
+  // Exact-match `=` prefix — see `sessionExists`. tmux's error string becomes
+  // e.g. "can't find session: =x", which still contains "find session" below,
+  // so the classification is unaffected by the prefix.
+  const r = tmux(["has-session", "-t", "=" + name]);
   if (r.ok) return "alive";
   const err = `${r.stderr} ${r.stdout}`.toLowerCase();
   // Only UNAMBIGUOUS death strings count as `gone`:
@@ -851,14 +861,17 @@ export function deathTickOutcome(
   return args.misses + 1 < args.threshold ? "wait" : "fire";
 }
 
-/** Kill any tmux session for the given task. Idempotent / silent on miss. */
+/** Kill any tmux session for the given task. Idempotent / silent on miss.
+ *  Exact-match `=` prefix — see `sessionExists`; without it a kill for an
+ *  absent exact name can prefix-match and kill an unrelated live session. */
 export function killTaskSession(taskId: string): void {
-  tmux(["kill-session", "-t", sessionNameFor(taskId)]);
+  tmux(["kill-session", "-t", "=" + sessionNameFor(taskId)]);
 }
 
-/** Kill an arbitrary session name. Used by reconcileOrphans. */
+/** Kill an arbitrary session name. Used by reconcileOrphans. Exact-match `=`
+ *  prefix — see `sessionExists`. */
 export function killSessionByName(name: string): void {
-  tmux(["kill-session", "-t", name]);
+  tmux(["kill-session", "-t", "=" + name]);
 }
 
 /**
@@ -2916,7 +2929,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           // a re-shown consent dialog on resume is out of scope (bypass
           // acceptance is global + persistent once accepted).
           if (bootSettled || existsSync(jsonlPath)) return;
-          if (!tmux(["has-session", "-t", sessionName]).ok) return;
+          if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return;
           const pane = tmux(["capture-pane", "-p", "-t", sessionName]).stdout;
           // A startup prompt we already surfaced and is still awaiting the
           // user keeps the boot window from expiring under them.
@@ -3013,12 +3026,12 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
       if (found) break;
       const blockedOnUser =
         sawStartupPromptThisWindow || activeTmuxPromptsForTask(opts.taskId).length > 0;
-      if (blockedOnUser && tmux(["has-session", "-t", sessionName]).ok) continue;
+      if (blockedOnUser && tmux(["has-session", "-t", "=" + sessionName]).ok) continue;
       break;
     }
     bootSettled = true;
     if (!found) {
-      const stillAlive = tmux(["has-session", "-t", sessionName]).ok;
+      const stillAlive = tmux(["has-session", "-t", "=" + sessionName]).ok;
       // Capture whatever claude actually printed inside the pane so the user
       // sees the real cause (unknown flag, MCP initialize hung, auth prompt
       // waiting, …) rather than just "no JSONL".
@@ -3171,15 +3184,43 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
   // pop it immediately. After flushSync, the queue head reflects the
   // truly in-flight turn (or is empty if the previous turn just ended).
   flushSync(state);
+  // Keep a handle on the pushed slot (rather than only closing over
+  // resolve/reject) so a paste failure below can settle *this specific*
+  // slot in-process instead of leaving the run stuck `running` until the
+  // next boot-reconcile. `sendTurn` is only ever called on an idle session
+  // (a turn already in flight folds through `pasteFollowUp` instead, which
+  // pushes no slot), so `turnQueue` is empty before this push and the slot
+  // we just pushed is unambiguously the one at the head.
+  const slot: TurnSlot = { onChunk, resolve: null, reject: null };
   const done = new Promise<number>((resolve, reject) => {
-    state.turnQueue.push({ onChunk, resolve, reject });
+    slot.resolve = resolve;
+    slot.reject = reject;
   });
+  state.turnQueue.push(slot);
   // Claude's TUI input buffer accepts keystrokes even mid-response —
   // anything we paste while the agent is thinking gets queued there and
   // replayed as a new user turn once the current one finishes. Our
   // `turnQueue` mirrors that: subsequent end_turn events pop slots in
   // FIFO order.
-  void queuePaste(taskId, state.sessionName, prompt, 0, state, { bracketed: true });
+  void queuePaste(taskId, state.sessionName, prompt, 0, state, {
+    bracketed: true,
+    onPasteFailure: () => {
+      // Guard against a (theoretical) race where the slot already popped
+      // normally between the push above and this failure callback firing —
+      // `popEndOfTurn` nulls both `resolve`/`reject` before invoking them,
+      // so a non-null `reject` here means the slot is still genuinely
+      // pending. Remove it from the queue (if still present) so a later
+      // end_turn doesn't try to pop an already-settled slot, then reject
+      // `done` so the orchestrator's run settles instead of hanging.
+      if (!slot.reject) return;
+      const idx = state.turnQueue.indexOf(slot);
+      if (idx !== -1) state.turnQueue.splice(idx, 1);
+      const reject = slot.reject;
+      slot.resolve = null;
+      slot.reject = null;
+      reject(new Error("paste failed"));
+    },
+  });
   return makeAgent(taskId, done);
 }
 
@@ -3794,16 +3835,20 @@ const IMAGE_ATTACH_SETTLE_MAX_MS = 3_000;
  *
  * Callers go through `queuePaste` so back-to-back pastes for the same
  * task can't interleave at the tmux layer. See `queuePaste` for why.
+ *
+ * Returns a `PasteOutcome` so a persistent tmux failure (socket gone, server
+ * wedged, …) is visible to the caller instead of silently swallowed — see
+ * `queuePaste`'s handling of a non-`ok` result.
  */
 function pastePromptSync(
   sessionName: string,
   text: string,
   opts: { bracketed?: boolean; skipEnter?: boolean } = {},
-): void {
+): PasteOutcome {
   // load-buffer reads from stdin; -b names a tmux buffer we can target.
   const buf = `agetor-${sessionName}`;
   const load = tmux(["load-buffer", "-b", buf, "-"], { stdinText: text });
-  if (!load.ok) return;
+  if (!load.ok) return { ok: false, op: "load-buffer", stderr: load.stderr };
   // `-p` wraps the paste in bracketed-paste codes (ESC[200~ … ESC[201~) when
   // the app has requested bracketed-paste mode (claude's Ink TUI does). Long
   // prompts otherwise arrive across multiple terminal reads, claude's paste
@@ -3814,16 +3859,29 @@ function pastePromptSync(
   // typically insert pasted text verbatim instead of dispatching it as a
   // command, which would silently break the mode/model switchers.
   const pasteFlags = opts.bracketed ? ["-p"] : [];
-  tmux(["paste-buffer", ...pasteFlags, "-b", buf, "-t", sessionName]);
+  const paste = tmux(["paste-buffer", ...pasteFlags, "-b", buf, "-t", sessionName]);
   tmux(["delete-buffer", "-b", buf]);
+  if (!paste.ok) return { ok: false, op: "paste-buffer", stderr: paste.stderr };
   // `skipEnter` defers the trailing Enter to the caller so it can sleep
   // between the bracketed paste and the Enter — see `queuePaste`. Without
   // that gap, a follow-up turn pasted mid-stream gets rendered as `[Pasted
   // text +N lines]` in claude's TUI but the immediately-following `\r` is
   // absorbed as part of the same paste event, so the queued bubble sits
   // unsubmitted until the user (or a later Enter) commits it.
-  if (!opts.skipEnter) tmux(["send-keys", "-t", sessionName, "Enter"]);
+  if (!opts.skipEnter) {
+    const enter = tmux(["send-keys", "-t", sessionName, "Enter"]);
+    if (!enter.ok) return { ok: false, op: "send-keys", stderr: enter.stderr };
+  }
+  return { ok: true };
 }
+
+/** Result of `pastePromptSync` / the deferred bracketed-paste Enter in
+ *  `queuePaste`. `ok: false` means the tmux subprocess for `op` exited
+ *  non-zero — a real signal that the paste didn't land (dead server, socket
+ *  gone, session vanished mid-op), not just "nothing happened yet". */
+type PasteOutcome =
+  | { ok: true }
+  | { ok: false; op: "load-buffer" | "paste-buffer" | "send-keys"; stderr: string };
 
 /**
  * Settle window after a slash-command paste before releasing the chain.
@@ -3978,7 +4036,16 @@ function queuePaste(
   text: string,
   settleMs: number,
   expectedState?: SessionState,
-  opts: { bracketed?: boolean } = {},
+  opts: {
+    bracketed?: boolean;
+    /** Called with the failing outcome when the paste (or its deferred
+     *  bracketed Enter) doesn't land — i.e. any `PasteOutcome` with
+     *  `ok: false`. Lets a caller that pushed a turn slot for this paste
+     *  (currently only `sendTurn`) settle that slot instead of leaving the
+     *  run stuck `running` forever. `reportPasteFailure` (the visible-chunk
+     *  + log side of this) always runs regardless of whether this is set. */
+    onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void;
+  } = {},
 ): Promise<void> {
   // Non-bracketed path: load-buffer + paste-buffer + delete-buffer +
   // send-keys Enter all happen synchronously inside pastePromptSync, so
@@ -4007,19 +4074,73 @@ function queuePaste(
   // The deferred Enter is re-gated through `stillCurrent()` so a
   // `dropSession` landing in the gap can't leak the Enter into a
   // respawned pane.
+  //
+  // Every tmux op below is checked for `.ok`. A `false` result is a real
+  // signal (dead tmux server, socket gone, session vanished mid-op) — not
+  // "nothing happened yet" — so on failure we surface it via
+  // `reportPasteFailure` (a visible `status` chunk + a console log) and
+  // bail out of this op without sleeping the settle window. A transient
+  // failure that still succeeds on `.ok` behaves exactly as before this
+  // change; only genuine `.ok === false` results take the new path.
   return queueTmuxOp(taskId, async (stillCurrent) => {
     if (opts.bracketed) {
-      pastePromptSync(sessionName, text, { ...opts, skipEnter: true });
+      const result = pastePromptSync(sessionName, text, { bracketed: true, skipEnter: true });
+      if (!result.ok) {
+        reportPasteFailure(taskId, expectedState, result);
+        opts.onPasteFailure?.(result);
+        return;
+      }
       const imageCount = countImagePaths(text);
       const gap = imageCount > 0
         ? Math.min(imageAttachSettleMs * imageCount, IMAGE_ATTACH_SETTLE_MAX_MS)
         : bracketedEnterGapMs;
       if (gap > 0) await Bun.sleep(gap);
       if (!stillCurrent()) return;
-      tmux(["send-keys", "-t", sessionName, "Enter"]);
+      const enter = tmux(["send-keys", "-t", sessionName, "Enter"]);
+      if (!enter.ok) {
+        const outcome: Extract<PasteOutcome, { ok: false }> =
+          { ok: false, op: "send-keys", stderr: enter.stderr };
+        reportPasteFailure(taskId, expectedState, outcome);
+        opts.onPasteFailure?.(outcome);
+        return;
+      }
     } else {
-      pastePromptSync(sessionName, text, opts);
+      const result = pastePromptSync(sessionName, text, { bracketed: opts.bracketed });
+      if (!result.ok) {
+        reportPasteFailure(taskId, expectedState, result);
+        opts.onPasteFailure?.(result);
+        return;
+      }
     }
     if (settleMs > 0) await Bun.sleep(settleMs);
   }, expectedState);
+}
+
+/**
+ * Surface a persistent paste failure so a run never sits `running` forever
+ * with no signal of what happened. Emits a `status` chunk (mirroring the
+ * `SESSION_DIED_STATUS_PREFIX` / `CLAUDE_API_ERROR_STATUS_PREFIX` convention
+ * of routing failures through the normal chunk stream rather than a separate
+ * channel) on whichever handler is currently active for the session — the
+ * head turn slot if one exists, else the hangover `lastChunk` — and logs to
+ * the console for operator visibility (matches `queueTmuxOp`'s existing
+ * `console.error` convention).
+ *
+ * Deliberately does NOT invent a new sentinel prefix the orchestrator would
+ * pattern-match into a column move: this path can fire on a plain slash
+ * command or a folded follow-up where there's no turn slot to settle, so
+ * moving the whole task would be too broad a blast radius. Settling the
+ * *run* (when a slot exists) is the caller's job via `onPasteFailure` — see
+ * `sendTurn`.
+ */
+function reportPasteFailure(
+  taskId: string,
+  state: SessionState | undefined,
+  outcome: Extract<PasteOutcome, { ok: false }>,
+): void {
+  const onChunk = state?.turnQueue[0]?.onChunk ?? state?.lastChunk;
+  const detail = outcome.stderr || "(no stderr)";
+  const message = `paste failed: tmux ${outcome.op} — ${detail}`;
+  onChunk?.("status", message);
+  console.error(`[claude-tmux] ${message} (task ${taskId})`);
 }
