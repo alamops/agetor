@@ -752,6 +752,57 @@ export function sessionExistsByName(name: string): boolean {
   return tmux(["has-session", "-t", name]).ok;
 }
 
+/** Tri-state liveness of a tmux session — the safe signal for the death watch. */
+export type SessionLiveness = "alive" | "gone" | "unreachable";
+
+/**
+ * Classify a tmux session's liveness from a single `has-session` probe,
+ * distinguishing the two states a bare `.ok` boolean fatally conflates:
+ *
+ *   - `alive`       — the session answered; it's up.
+ *   - `gone`        — the server answered but this session is genuinely absent
+ *                     (killed, or the hosting process exited). A real death.
+ *   - `unreachable` — the probe failed for a reason that is NOT "this session
+ *                     is gone": the tmux server was momentarily busy/unreachable
+ *                     on the shared default socket, the whole server is down, or
+ *                     an error we can't confidently read as "session not found".
+ *                     INCONCLUSIVE — must never be treated as a death.
+ *
+ * The death watch used to fire on any non-zero `has-session` exit after two
+ * ~400ms misses, which abandoned live, working sessions whenever the shared
+ * tmux server hiccuped under load (a heavy git op flooding a pane, many
+ * concurrent agetor sessions). Only `gone` — server up, this session absent —
+ * is a trustworthy death signal. Anything not clearly "session not found" is
+ * biased to `unreachable` so an ambiguous probe can't trigger the destructive,
+ * irreversible teardown; a genuinely-dead whole server is caught at next boot
+ * by `reconcileOrphans` instead.
+ */
+export function sessionLiveness(name: string): SessionLiveness {
+  const r = tmux(["has-session", "-t", name]);
+  if (r.ok) return "alive";
+  const err = `${r.stderr} ${r.stdout}`.toLowerCase();
+  // Messages tmux prints when the server is up but the target session isn't:
+  // "can't find session: <name>" / "session not found" / "no such session".
+  if (err.includes("find session") || err.includes("session not found") || err.includes("no such session")) {
+    return "gone";
+  }
+  // Everything else — "no server running on …", "error connecting to …",
+  // "lost server", "resource temporarily unavailable", an empty stderr from a
+  // torn-down client, or any unrecognized error — is inconclusive.
+  return "unreachable";
+}
+
+/** True when `path` was written within `windowMs` — used as a death-watch veto:
+ *  a log file the agent touched a beat ago proves it's alive even if a single
+ *  `has-session` probe raced a kill/recreate. Silent (false) on a missing file. */
+export function fileWrittenWithin(path: string, windowMs: number): boolean {
+  try {
+    return Date.now() - fsStatSync(path).mtimeMs < windowMs;
+  } catch {
+    return false;
+  }
+}
+
 /** Kill any tmux session for the given task. Idempotent / silent on miss. */
 export function killTaskSession(taskId: string): void {
   tmux(["kill-session", "-t", sessionNameFor(taskId)]);
@@ -2535,9 +2586,15 @@ const DEATH_POLL_MS = 400;
  *  bytes (a real end_turn that landed just before the session died) are
  *  flushed and read first — matches codex-tmux's DEATH_GRACE_MS. */
 const DEATH_GRACE_MS = 250;
-/** Consecutive `has-session` misses required before declaring death — debounces
- *  a lone transient tmux failure. Shared spelling with codex-tmux. */
-const DEATH_MISS_THRESHOLD = 2;
+/** Consecutive definitive `gone` probes required before declaring death —
+ *  debounces a transient tmux failure. Now that only a `gone` (server up,
+ *  session absent) probe counts — an `unreachable` server hiccup resets the
+ *  counter — this is ~1.6s of the session being provably absent. Shared
+ *  spelling with codex-tmux. */
+const DEATH_MISS_THRESHOLD = 4;
+/** A log file written within this window vetoes a death: the agent is provably
+ *  alive, so a lone `gone` probe that raced a kill/recreate can't settle it. */
+const DEATH_JSONL_QUIET_MS = 3_000;
 
 /**
  * Settle an in-flight turn because its tmux session died unexpectedly.
@@ -2605,15 +2662,23 @@ function turnInFlight(state: SessionState): boolean {
  *  Stop/delete can't be mistaken for an unexpected death). */
 function startDeathWatch(state: SessionState): void {
   if (state.deathTimer) return;
-  // Require two consecutive `has-session` misses before declaring death, so a
-  // single transient `tmux has-session` failure (server momentarily busy, a
-  // hiccup on the shared socket) can't be mistaken for a dead session and
-  // wrongly block a live task. Reset on any tick where the session is present
-  // or no turn is running.
+  // Only a definitive `gone` probe (tmux server answered, this session absent)
+  // counts toward death; an `unreachable` server hiccup on the shared socket
+  // resets the counter (see `sessionLiveness`). Require DEATH_MISS_THRESHOLD
+  // consecutive `gone` probes, and veto on recent JSONL writes, so a live task
+  // is never wrongly blocked. Reset on any tick where the session is alive/
+  // unreachable, the JSONL was just written, or no turn is running.
   let misses = 0;
   state.deathTimer = setInterval(() => {
     if (!turnInFlight(state)) { misses = 0; return; } // idle — no running turn; skip the tmux poll
-    if (sessionExistsByName(state.sessionName)) { misses = 0; return; }
+    // Only a definitive `gone` (server answered, this session absent) is a death
+    // signal. `alive` obviously resets; `unreachable` (the shared tmux server
+    // momentarily busy/unreachable) is INCONCLUSIVE and must NOT be mistaken for
+    // a dead session — that false positive abandoned live, working sessions.
+    if (sessionLiveness(state.sessionName) !== "gone") { misses = 0; return; }
+    // Veto: if claude wrote its JSONL a beat ago it's provably alive, so a lone
+    // `gone` probe that raced a kill/recreate can't tear the run down.
+    if (fileWrittenWithin(state.jsonlPath, DEATH_JSONL_QUIET_MS)) { misses = 0; return; }
     if (++misses < DEATH_MISS_THRESHOLD) return;
     if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
     setTimeout(() => {
