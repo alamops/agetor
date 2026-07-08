@@ -20,6 +20,8 @@ const {
   normalizeRepoLabel,
   normalizeRepoMilestone,
   normalizeDueOn,
+  reactionSubjectPath,
+  aggregateReactions,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -323,6 +325,55 @@ test("normalizeDueOn widens a bare date to noon UTC, passes through ISO, and bla
 test("commentUrl maps kind to the right endpoint segment", () => {
   expect(commentUrl(REPO, "issue", 42)).toBe("https://api.github.com/repos/o/r/issues/comments/42");
   expect(commentUrl(REPO, "review", 42)).toBe("https://api.github.com/repos/o/r/pulls/comments/42");
+});
+
+test("reactionSubjectPath maps each subject kind to the right endpoint", () => {
+  expect(reactionSubjectPath(REPO, { type: "issue", id: 7 })).toBe("https://api.github.com/repos/o/r/issues/7/reactions");
+  expect(reactionSubjectPath(REPO, { type: "issueComment", id: 42 })).toBe("https://api.github.com/repos/o/r/issues/comments/42/reactions");
+  expect(reactionSubjectPath(REPO, { type: "reviewComment", id: 42 })).toBe("https://api.github.com/repos/o/r/pulls/comments/42/reactions");
+});
+
+test("aggregateReactions counts by content, tags the viewer's own reaction id, and drops unknown content", () => {
+  const raw = [
+    { id: 1, content: "+1", user: { login: "alice" } },
+    { id: 2, content: "+1", user: { login: "bob" } },
+    { id: 3, content: "heart", user: { login: "alice" } },
+    { id: 4, content: "party-parrot", user: { login: "alice" } }, // unknown content — dropped
+  ];
+  expect(aggregateReactions(raw, "alice")).toEqual([
+    { content: "+1", count: 2, viewerReactionId: 1 },
+    { content: "heart", count: 1, viewerReactionId: 3 },
+  ]);
+  // case-insensitive login match
+  expect(aggregateReactions(raw, "ALICE")).toEqual([
+    { content: "+1", count: 2, viewerReactionId: 1 },
+    { content: "heart", count: 1, viewerReactionId: 3 },
+  ]);
+  // no match for this viewer → every viewerReactionId is null
+  expect(aggregateReactions(raw, "carol")).toEqual([
+    { content: "+1", count: 2, viewerReactionId: null },
+    { content: "heart", count: 1, viewerReactionId: null },
+  ]);
+  // empty viewer (unauthenticated) → counts still work, no viewer id
+  expect(aggregateReactions(raw, "")).toEqual([
+    { content: "+1", count: 2, viewerReactionId: null },
+    { content: "heart", count: 1, viewerReactionId: null },
+  ]);
+  // no reactions at all → empty list
+  expect(aggregateReactions([], "alice")).toEqual([]);
+  // malformed entries are skipped, not thrown
+  expect(aggregateReactions([null, { content: 5 }, { content: "eyes" }], "alice")).toEqual([
+    { content: "eyes", count: 1, viewerReactionId: null },
+  ]);
+});
+
+test("aggregateReactions sorts by the fixed content order regardless of input order", () => {
+  const raw = [
+    { id: 1, content: "eyes", user: null },
+    { id: 2, content: "+1", user: null },
+    { id: 3, content: "rocket", user: null },
+  ];
+  expect(aggregateReactions(raw, "").map((r) => r.content)).toEqual(["+1", "rocket", "eyes"]);
 });
 
 test("graphqlErrorMessage returns the first error message, else null", () => {

@@ -59,6 +59,7 @@ import {
 } from "./terminals.ts";
 import { listAgentCapabilities } from "./commands.ts";
 import {
+  addGitHubReaction,
   closeGitHubPull,
   createGitHubComment,
   createGitHubIssue,
@@ -81,7 +82,9 @@ import {
   listGitHubLabels,
   listGitHubMilestones,
   listGitHubPullReviewComments,
+  listGitHubReactions,
   mergeGitHubPull,
+  removeGitHubReaction,
   reopenGitHubPull,
   replyGitHubPullLineComment,
   requestGitHubPullReviewers,
@@ -111,6 +114,8 @@ import type {
   GitHubItemState,
   GitHubPullMergeMethod,
   GitHubPullReviewEvent,
+  GitHubReactionContent,
+  GitHubReactionSubject,
   GlobalEvent,
   RunEvent,
   Task,
@@ -221,6 +226,11 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
   "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "taskType",
 ]);
+
+/** The 8 reaction contents GitHub's API accepts — validated here before the
+ *  request ever reaches `addGitHubReaction` (which re-validates independently,
+ *  same defense-in-depth as the other GitHub POST routes). */
+const REACTION_CONTENTS = new Set<string>(["+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"]);
 
 function filterPatch(raw: unknown): Partial<Task> {
   if (!raw || typeof raw !== "object") return {};
@@ -1261,6 +1271,93 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "at least one reviewer required" }, { status: 400, headers: corsHeaders(req) });
           }
           const result = await requestGitHubPullReviewers({ dir, number: rawNumber, reviewers });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Reactions (👍 👎 😄 🎉 😕 ❤️ 🚀 👀) on an issue/PR or a comment.
+      // `subjectType`/`subjectId` identify the target — see
+      // `GitHubReactionSubject` in shared/types.ts for the id semantics
+      // (an "issue" subject's id is the issue/PR *number*; comment subjects
+      // carry a comment's REST id).
+      "/github/reactions": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const subjectType = url.searchParams.get("subjectType");
+          const subjectId = Number(url.searchParams.get("subjectId"));
+          const viewer = url.searchParams.get("viewer") ?? "";
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (subjectType !== "issue" && subjectType !== "issueComment" && subjectType !== "reviewComment") {
+            return json({ error: "valid subject type required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!Number.isInteger(subjectId) || subjectId <= 0) {
+            return json({ error: "valid subject id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await listGitHubReactions({
+            dir,
+            subject: { type: subjectType, id: subjectId },
+            viewer,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/reaction-add": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            subjectType?: string;
+            subjectId?: number;
+            content?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (body.subjectType !== "issue" && body.subjectType !== "issueComment" && body.subjectType !== "reviewComment") {
+            return json({ error: "valid subject type required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.subjectId !== "number" || !Number.isInteger(body.subjectId) || body.subjectId <= 0) {
+            return json({ error: "valid subject id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!REACTION_CONTENTS.has(body.content ?? "")) {
+            return json({ error: "valid reaction content required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const subject: GitHubReactionSubject = { type: body.subjectType, id: body.subjectId };
+          const result = await addGitHubReaction({ dir, subject, content: body.content as GitHubReactionContent });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/reaction-remove": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            subjectType?: string;
+            subjectId?: number;
+            reactionId?: number;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (body.subjectType !== "issue" && body.subjectType !== "issueComment" && body.subjectType !== "reviewComment") {
+            return json({ error: "valid subject type required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.subjectId !== "number" || !Number.isInteger(body.subjectId) || body.subjectId <= 0) {
+            return json({ error: "valid subject id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.reactionId !== "number" || !Number.isInteger(body.reactionId) || body.reactionId <= 0) {
+            return json({ error: "valid reaction id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const subject: GitHubReactionSubject = { type: body.subjectType, id: body.subjectId };
+          const result = await removeGitHubReaction({ dir, subject, reactionId: body.reactionId });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

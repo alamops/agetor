@@ -4,7 +4,15 @@
 // the pure helpers in isolation.
 import { test, expect, beforeAll } from "bun:test";
 import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
-import { getGitHubViewer, listGitHubAssignees, listGitHubLabels, listGitHubMilestones } from "./github.ts";
+import {
+  addGitHubReaction,
+  getGitHubViewer,
+  listGitHubAssignees,
+  listGitHubLabels,
+  listGitHubMilestones,
+  listGitHubReactions,
+  removeGitHubReaction,
+} from "./github.ts";
 
 let REPO_DIR = "";
 
@@ -94,6 +102,102 @@ test("listGitHubMilestones maps snake_case fields from the API response", async 
     if (!res.ok) throw new Error(res.error);
     expect(res.milestones).toHaveLength(1);
     expect(res.milestones[0]).toMatchObject({ number: 1, title: "v1", openIssues: 3, closedIssues: 1 });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubReactions hits the issue reactions endpoint and aggregates by content", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/issues/9/reactions",
+      json: [
+        { id: 100, content: "+1", user: { login: "octocat" } },
+        { id: 101, content: "+1", user: { login: "hubot" } },
+        { id: 102, content: "heart", user: { login: "octocat" } },
+      ],
+    },
+  ]);
+  try {
+    const res = await listGitHubReactions({ dir: REPO_DIR, subject: { type: "issue", id: 9 }, viewer: "octocat" });
+    expect(res).toEqual({
+      ok: true,
+      reactions: [
+        { content: "+1", count: 2, viewerReactionId: 100 },
+        { content: "heart", count: 1, viewerReactionId: 102 },
+      ],
+    });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/issues/9/reactions?per_page=100");
+    expect(mock.calls[0]!.method).toBe("GET");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubReaction POSTs the content to the comment reactions endpoint and returns the new id", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "/repos/acme/widgets/issues/comments/55/reactions",
+      json: { id: 777, content: "rocket" },
+    },
+  ]);
+  try {
+    const res = await addGitHubReaction({
+      dir: REPO_DIR,
+      subject: { type: "issueComment", id: 55 },
+      content: "rocket",
+    });
+    expect(res).toEqual({ ok: true, reactionId: 777, content: "rocket" });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/issues/comments/55/reactions");
+    expect(mock.calls[0]!.method).toBe("POST");
+    expect(mock.calls[0]!.body).toBe(JSON.stringify({ content: "rocket" }));
+    expect(mock.calls[0]!.headers.authorization).toBe("Bearer test-token");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("removeGitHubReaction DELETEs the review-comment reaction by id", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "DELETE",
+      match: "/repos/acme/widgets/pulls/comments/12/reactions/999",
+    },
+  ]);
+  try {
+    const res = await removeGitHubReaction({
+      dir: REPO_DIR,
+      subject: { type: "reviewComment", id: 12 },
+      reactionId: 999,
+    });
+    expect(res).toEqual({ ok: true });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/pulls/comments/12/reactions/999");
+    expect(mock.calls[0]!.method).toBe("DELETE");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubReaction maps a non-2xx response to the friendly `message` error", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "/reactions",
+      status: 422,
+      json: { message: "Content cannot be blank" },
+    },
+  ]);
+  try {
+    const res = await addGitHubReaction({
+      dir: REPO_DIR,
+      subject: { type: "issue", id: 1 },
+      content: "eyes",
+    });
+    expect(res).toEqual({ ok: false, error: "Content cannot be blank" });
   } finally {
     mock.restore();
   }

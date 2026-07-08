@@ -845,6 +845,30 @@ export interface GitHubPullDefaultsResult {
   base: string;
 }
 
+export type GitHubReactionContent = "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" | "rocket" | "eyes";
+
+/** Discriminates which entity a reaction (or reaction list) targets. For `issue`,
+ *  `id` is the issue/PR **number** — issues and PRs share the
+ *  `/issues/:number/reactions` endpoint. `issueComment` / `reviewComment` carry a
+ *  comment's REST id (`/issues/comments/:id` vs `/pulls/comments/:id`). */
+export interface GitHubReactionSubject {
+  type: "issue" | "issueComment" | "reviewComment";
+  id: number;
+}
+
+/** One content's aggregated reaction count for a subject, plus the viewer's own
+ *  reaction id (non-null only when the viewer has reacted with this content) so
+ *  the UI can toggle a chip off via DELETE without a second lookup. */
+export interface GitHubReactionSummary {
+  content: GitHubReactionContent;
+  count: number;
+  viewerReactionId: number | null;
+}
+
+export interface GitHubReactionsResult {
+  reactions: GitHubReactionSummary[];
+}
+
 /**
  * Streams the run panel listens on. Codex (and any unstructured agent)
  * uses the flat trio: stdout / stderr / status. Claude's JSONL is parsed

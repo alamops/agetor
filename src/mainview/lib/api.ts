@@ -25,6 +25,10 @@ import type {
   GitHubPullReviewThreadsResult,
   GitHubPullMergeResult,
   GitHubPullReviewEvent,
+  GitHubReactionContent,
+  GitHubReactionsResult,
+  GitHubReactionSubject,
+  GitHubReactionSummary,
   Harness,
   HarnessStatus,
   HarnessUsage,
@@ -73,6 +77,10 @@ export type {
   GitHubPullReviewThreadsResult,
   GitHubPullMergeResult,
   GitHubPullReviewEvent,
+  GitHubReactionContent,
+  GitHubReactionsResult,
+  GitHubReactionSubject,
+  GitHubReactionSummary,
 };
 export { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
 
@@ -555,6 +563,35 @@ export const api = {
     j<{ ok: true; message?: string }>("/github/pull-reviewers", {
       method: "POST",
       body: JSON.stringify(input),
+    }),
+  listGitHubReactions: (input: { path: string; subject: GitHubReactionSubject; viewer?: string }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      subjectType: input.subject.type,
+      subjectId: String(input.subject.id),
+    });
+    if (input.viewer) q.set("viewer", input.viewer);
+    return j<GitHubReactionsResult>(`/github/reactions?${q.toString()}`);
+  },
+  addGitHubReaction: (input: { path: string; subject: GitHubReactionSubject; content: GitHubReactionContent }) =>
+    j<{ ok: true; reactionId: number; content: GitHubReactionContent }>("/github/reaction-add", {
+      method: "POST",
+      body: JSON.stringify({
+        path: input.path,
+        subjectType: input.subject.type,
+        subjectId: input.subject.id,
+        content: input.content,
+      }),
+    }),
+  removeGitHubReaction: (input: { path: string; subject: GitHubReactionSubject; reactionId: number }) =>
+    j<{ ok: true }>("/github/reaction-remove", {
+      method: "POST",
+      body: JSON.stringify({
+        path: input.path,
+        subjectType: input.subject.type,
+        subjectId: input.subject.id,
+        reactionId: input.reactionId,
+      }),
     }),
   getTmuxSource: () =>
     j<{

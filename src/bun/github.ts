@@ -23,6 +23,10 @@ import type {
   GitHubPullMergeResult,
   GitHubPullReviewEvent,
   GitHubPullReviewThreadsResult,
+  GitHubReactionContent,
+  GitHubReactionsResult,
+  GitHubReactionSubject,
+  GitHubReactionSummary,
   GitHubReviewThread,
   GitHubUser,
   TaskDiff,
@@ -222,6 +226,24 @@ interface DeleteGitHubMilestoneInput {
   number: number;
 }
 
+interface ListGitHubReactionsInput {
+  dir: string;
+  subject: GitHubReactionSubject;
+  viewer: string;
+}
+
+interface AddGitHubReactionInput {
+  dir: string;
+  subject: GitHubReactionSubject;
+  content: GitHubReactionContent;
+}
+
+interface RemoveGitHubReactionInput {
+  dir: string;
+  subject: GitHubReactionSubject;
+  reactionId: number;
+}
+
 interface GitHubListError {
   ok: false;
   error: string;
@@ -248,6 +270,9 @@ type GitHubActionResponse = ({ ok: true; message?: string; item?: GitHubListItem
 type GitHubPullMergeResponse = GitHubPullMergeResult | GitHubListError;
 type GitHubPullDefaultsResponse = ({ ok: true } & GitHubPullDefaultsResult) | GitHubListError;
 type GitHubIssueResponse = ({ ok: true; item: GitHubListItem; message?: string }) | GitHubListError;
+type GitHubReactionsResponse = ({ ok: true } & GitHubReactionsResult) | GitHubListError;
+type GitHubReactionAddResponse = ({ ok: true; reactionId: number; content: GitHubReactionContent }) | GitHubListError;
+type GitHubReactionRemoveResponse = ({ ok: true }) | GitHubListError;
 
 const GITHUB_FETCH_TIMEOUT_MS = 30_000;
 const GITHUB_DIFF_BODY_CAP_BYTES = 8_000_000;
@@ -396,6 +421,8 @@ export const __githubInternals = {
   normalizeRepoLabel,
   normalizeRepoMilestone,
   normalizeDueOn,
+  reactionSubjectPath,
+  aggregateReactions,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -1892,6 +1919,137 @@ export async function updateGitHubMilestone(input: UpdateGitHubMilestoneInput): 
   const milestone = normalizeRepoMilestone(json);
   if (!milestone) return { ok: false, error: "GitHub returned an unexpected milestone response" };
   return { ok: true, milestone };
+}
+
+/** The 8 reaction contents GitHub supports, in the order the UI renders both the
+ *  emoji picker and the resulting chips. `aggregateReactions` sorts by this order
+ *  and drops any content GitHub returns that isn't in this set (defensive —
+ *  GitHub hasn't added a 9th reaction, but a fixed allowlist means one wouldn't
+ *  silently render as an unlabeled chip). Also doubles as the add-reaction
+ *  content validator, mirroring `reviewValidationError`'s own-input checks. */
+const REACTION_CONTENT_ORDER: GitHubReactionContent[] = [
+  "+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes",
+];
+
+/** `/issues/:id/reactions` for an issue/PR (both share the `issues` endpoint —
+ *  GitHub has no separate `/pulls/:id/reactions`), `/issues/comments/:id/reactions`
+ *  for a conversation comment, `/pulls/comments/:id/reactions` for an inline
+ *  review comment. Pure — unit-tested. */
+function reactionSubjectPath(repo: GitHubRepo, subject: GitHubReactionSubject): string {
+  const base = `https://api.github.com/repos/${repo.owner}/${repo.name}`;
+  switch (subject.type) {
+    case "issue":
+      return `${base}/issues/${subject.id}/reactions`;
+    case "issueComment":
+      return `${base}/issues/comments/${subject.id}/reactions`;
+    case "reviewComment":
+      return `${base}/pulls/comments/${subject.id}/reactions`;
+  }
+}
+
+/** Group raw `{ id, content, user: { login } }` reaction objects by content,
+ *  counting each and recording the viewer's own reaction id (case-insensitive
+ *  login match) so the UI can toggle a chip off without a second lookup.
+ *  Unknown contents (outside the 8 GitHub supports) are dropped; the result is
+ *  sorted by `REACTION_CONTENT_ORDER` and omits contents with zero reactions.
+ *  Pure — unit-tested. */
+function aggregateReactions(rawList: unknown[], viewerLogin: string): GitHubReactionSummary[] {
+  const known = new Set<string>(REACTION_CONTENT_ORDER);
+  const counts = new Map<GitHubReactionContent, number>();
+  const viewerIds = new Map<GitHubReactionContent, number>();
+  const viewer = viewerLogin.trim().toLowerCase();
+  for (const raw of rawList) {
+    if (!raw || typeof raw !== "object") continue;
+    const obj = raw as Record<string, unknown>;
+    const content = obj.content;
+    if (typeof content !== "string" || !known.has(content)) continue;
+    const c = content as GitHubReactionContent;
+    counts.set(c, (counts.get(c) ?? 0) + 1);
+    if (viewer && typeof obj.id === "number") {
+      const user = obj.user && typeof obj.user === "object" ? (obj.user as Record<string, unknown>) : null;
+      const login = user && typeof user.login === "string" ? user.login.trim().toLowerCase() : "";
+      if (login === viewer) viewerIds.set(c, obj.id);
+    }
+  }
+  return REACTION_CONTENT_ORDER
+    .filter((c) => (counts.get(c) ?? 0) > 0)
+    .map((c) => ({ content: c, count: counts.get(c)!, viewerReactionId: viewerIds.get(c) ?? null }));
+}
+
+export async function listGitHubReactions(input: ListGitHubReactionsInput): Promise<GitHubReactionsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.subject.id) || input.subject.id <= 0) {
+    return { ok: false, error: "reaction subject id must be positive" };
+  }
+
+  const token = await githubToken();
+  const raw: unknown[] = [];
+  let next: string | null = `${reactionSubjectPath(repo, input.subject)}?per_page=100`;
+  for (let page = 0; next && page < 3; page++) {
+    const res = await fetchGitHub(next, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: apiError(body, res.status, res.statusText) };
+    if (!Array.isArray(body)) return { ok: false, error: "GitHub returned an unexpected reactions response" };
+    raw.push(...body);
+    next = pageLinks(res.headers.get("link"));
+  }
+  return { ok: true, reactions: aggregateReactions(raw, input.viewer) };
+}
+
+export async function addGitHubReaction(input: AddGitHubReactionInput): Promise<GitHubReactionAddResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.subject.id) || input.subject.id <= 0) {
+    return { ok: false, error: "reaction subject id must be positive" };
+  }
+  if (!REACTION_CONTENT_ORDER.includes(input.content)) {
+    return { ok: false, error: "unsupported reaction content" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to react" };
+  const res = await fetchGitHub(
+    reactionSubjectPath(repo, input.subject),
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ content: input.content }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const reactionId = json && typeof json === "object" && typeof (json as { id?: unknown }).id === "number"
+    ? (json as { id: number }).id
+    : null;
+  if (reactionId === null) return { ok: false, error: "GitHub returned an unexpected reaction response" };
+  return { ok: true, reactionId, content: input.content };
+}
+
+export async function removeGitHubReaction(input: RemoveGitHubReactionInput): Promise<GitHubReactionRemoveResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.subject.id) || input.subject.id <= 0) {
+    return { ok: false, error: "reaction subject id must be positive" };
+  }
+  if (!Number.isInteger(input.reactionId) || input.reactionId <= 0) {
+    return { ok: false, error: "reaction id must be positive" };
+  }
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to remove a reaction" };
+  const res = await fetchGitHub(
+    `${reactionSubjectPath(repo, input.subject)}/${input.reactionId}`,
+    token,
+    "application/vnd.github+json",
+    { method: "DELETE" },
+  );
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true };
 }
 
 export async function deleteGitHubMilestone(input: DeleteGitHubMilestoneInput): Promise<GitHubActionResponse> {

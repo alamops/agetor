@@ -35,6 +35,9 @@ import {
   type GitHubListResult,
   type GitHubPullMergeMethod,
   type GitHubPullReviewEvent,
+  type GitHubReactionContent,
+  type GitHubReactionSubject,
+  type GitHubReactionSummary,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
@@ -1650,6 +1653,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               <GitHubItemRow
                 key={`${item.kind}-${item.number}`}
                 item={item}
+                projectPath={projectPath}
                 expanded={expandedKey === `${item.kind}-${item.number}`}
                 diff={item.kind === "pulls" ? diffs[item.number] : undefined}
                 diffLoading={item.kind === "pulls" ? !!diffLoading[item.number] : false}
@@ -2499,6 +2503,7 @@ function MilestoneRow({
 
 function GitHubItemRow({
   item,
+  projectPath,
   expanded,
   diff,
   diffLoading,
@@ -2583,6 +2588,7 @@ function GitHubItemRow({
   onToggle,
 }: {
   item: GitHubListItem;
+  projectPath: string;
   expanded: boolean;
   diff?: TaskDiff;
   diffLoading: boolean;
@@ -2783,6 +2789,7 @@ function GitHubItemRow({
               )}
             </div>
           )}
+          <Reactions path={projectPath} subject={{ type: "issue", id: item.number }} viewer={viewerLogin} />
           {item.kind === "pulls" && (
             <>
               <PullActions
@@ -2831,6 +2838,7 @@ function GitHubItemRow({
               <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} />
               <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
               <ReviewComments
+                path={projectPath}
                 comments={reviewComments}
                 loading={reviewCommentsLoading}
                 error={reviewCommentError}
@@ -2868,6 +2876,7 @@ function GitHubItemRow({
             />
           )}
           <Conversation
+            path={projectPath}
             comments={comments}
             loading={commentsLoading}
             error={commentError}
@@ -3616,6 +3625,7 @@ function PendingReview({
 }
 
 function ReviewComments({
+  path,
   comments,
   loading,
   error,
@@ -3631,6 +3641,7 @@ function ReviewComments({
   onSubmitReply,
   onRetry,
 }: {
+  path: string;
   comments?: GitHubPullLineComment[];
   loading: boolean;
   error?: string;
@@ -3753,6 +3764,9 @@ function ReviewComments({
                   onEdit={(body) => onEdit(comment.id, body)}
                   onDelete={() => onDelete(comment.id)}
                 />
+                <div className="px-3 pb-2">
+                  <Reactions path={path} subject={{ type: "reviewComment", id: comment.id }} viewer={viewerLogin} />
+                </div>
                 <div className="border-t border-border/50 p-2">
                   <Textarea
                     value={draft}
@@ -3778,6 +3792,7 @@ function ReviewComments({
 }
 
 function Conversation({
+  path,
   comments,
   loading,
   error,
@@ -3790,6 +3805,7 @@ function Conversation({
   onSubmit,
   onRetry,
 }: {
+  path: string;
   comments?: GitHubComment[];
   loading: boolean;
   error?: string;
@@ -3843,7 +3859,9 @@ function Conversation({
             comments.map((comment) => (
               <CommentBlock
                 key={comment.id}
+                path={path}
                 comment={comment}
+                viewerLogin={viewerLogin}
                 canModify={!!viewerLogin && comment.author?.login === viewerLogin}
                 onEdit={(body) => onEdit(comment.id, body)}
                 onDelete={() => onDelete(comment.id)}
@@ -3877,12 +3895,16 @@ function Conversation({
 }
 
 function CommentBlock({
+  path,
   comment,
+  viewerLogin,
   canModify,
   onEdit,
   onDelete,
 }: {
+  path: string;
   comment: GitHubComment;
+  viewerLogin: string;
   canModify: boolean;
   onEdit: (body: string) => Promise<void>;
   onDelete: () => Promise<void>;
@@ -3895,6 +3917,9 @@ function CommentBlock({
         {comment.updatedAt && comment.updatedAt !== comment.createdAt && <span>edited {fmtDate(comment.updatedAt)}</span>}
       </div>
       <EditableCommentBody body={comment.body} canModify={canModify} onEdit={onEdit} onDelete={onDelete} />
+      <div className="px-3 pb-2">
+        <Reactions path={path} subject={{ type: "issueComment", id: comment.id }} viewer={viewerLogin} />
+      </div>
     </div>
   );
 }
@@ -4037,6 +4062,214 @@ function EditableCommentBody({
             </Button>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+// Fixed render order for both the picker and the resulting chips — mirrors
+// `REACTION_CONTENT_ORDER` in src/bun/github.ts (kept as a separate literal
+// here since api.ts only re-exports types, not backend consts).
+const REACTION_CONTENTS: GitHubReactionContent[] = [
+  "+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes",
+];
+const REACTION_EMOJI: Record<GitHubReactionContent, string> = {
+  "+1": "👍",
+  "-1": "👎",
+  laugh: "😄",
+  hooray: "🎉",
+  confused: "😕",
+  heart: "❤️",
+  rocket: "🚀",
+  eyes: "👀",
+};
+const REACTION_LABEL: Record<GitHubReactionContent, string> = {
+  "+1": "thumbs up",
+  "-1": "thumbs down",
+  laugh: "laugh",
+  hooray: "hooray",
+  confused: "confused",
+  heart: "heart",
+  rocket: "rocket",
+  eyes: "eyes",
+};
+
+/** Reaction chips (👍 👎 😄 🎉 😕 ❤️ 🚀 👀) for an issue/PR or a comment, plus a
+ *  "+" picker to add one. Self-contained: fetches its own list lazily on mount
+ *  (i.e. whenever the parent renders it — the parent panels already gate that on
+ *  "row expanded" / "comments loaded"), tracks its own busy/error state, and
+ *  guards the fetch with its own request-seq ref, mirroring the other panels'
+ *  pattern for their own per-item fetches. Clicking a highlighted (viewer-owned)
+ *  chip removes the reaction; clicking the picker adds one — both optimistic. */
+function Reactions({
+  path,
+  subject,
+  viewer,
+}: {
+  path: string;
+  subject: GitHubReactionSubject;
+  viewer: string;
+}) {
+  const [reactions, setReactions] = useState<GitHubReactionSummary[] | undefined>(undefined);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<GitHubReactionContent | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const seq = useRef(0);
+  const subjectKey = `${subject.type}:${subject.id}`;
+
+  useEffect(() => {
+    if (!path) return;
+    const requestId = ++seq.current;
+    setLoading(true);
+    setError(null);
+    api.listGitHubReactions({ path, subject, viewer })
+      .then((payload) => {
+        if (requestId !== seq.current) return;
+        setReactions(payload.reactions);
+      })
+      .catch((e: unknown) => {
+        if (requestId !== seq.current) return;
+        setError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (requestId !== seq.current) return;
+        setLoading(false);
+      });
+    // `subject`/`viewer` are re-derived from `subjectKey`/`viewer` below; the
+    // subject object identity changes every render, so we key off its
+    // primitive fields instead to avoid re-fetching in a loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path, subjectKey, viewer]);
+
+  // Keep optimistic inserts in the same fixed order the backend returns.
+  const sortReactions = (list: GitHubReactionSummary[]) =>
+    [...list].sort((a, b) => REACTION_CONTENTS.indexOf(a.content) - REACTION_CONTENTS.indexOf(b.content));
+
+  const add = async (content: GitHubReactionContent) => {
+    // Don't mutate before the first list load resolves — an in-flight GET would
+    // otherwise clobber the optimistic entry (or drop peers' reactions).
+    if (busy || !path || reactions === undefined) return;
+    setBusy(content);
+    setPickerOpen(false);
+    setError(null);
+    // Bump the seq so the (already-resolved) fetch effect can't overwrite us.
+    seq.current++;
+    setReactions((cur) => {
+      const list = cur ?? [];
+      const existing = list.find((r) => r.content === content);
+      return existing
+        ? list.map((r) => (r.content === content ? { ...r, count: r.count + 1 } : r))
+        : sortReactions([...list, { content, count: 1, viewerReactionId: null }]);
+    });
+    try {
+      const res = await api.addGitHubReaction({ path, subject, content });
+      setReactions((cur) => (cur ?? []).map((r) => (r.content === content ? { ...r, viewerReactionId: res.reactionId } : r)));
+    } catch (e) {
+      setReactions((cur) => (cur ?? [])
+        .map((r) => (r.content === content ? { ...r, count: Math.max(0, r.count - 1) } : r))
+        .filter((r) => r.count > 0));
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = async (summary: GitHubReactionSummary) => {
+    if (busy || !path || summary.viewerReactionId == null) return;
+    const reactionId = summary.viewerReactionId;
+    setBusy(summary.content);
+    setPickerOpen(false);
+    setError(null);
+    seq.current++;
+    setReactions((cur) => (cur ?? [])
+      .map((r) => (r.content === summary.content ? { ...r, count: Math.max(0, r.count - 1), viewerReactionId: null } : r))
+      .filter((r) => r.count > 0));
+    try {
+      await api.removeGitHubReaction({ path, subject, reactionId });
+    } catch (e) {
+      setReactions((cur) => {
+        const list = cur ?? [];
+        const existing = list.find((r) => r.content === summary.content);
+        return existing
+          ? list.map((r) => (r.content === summary.content ? { ...r, count: r.count + 1, viewerReactionId: reactionId } : r))
+          : sortReactions([...list, { ...summary }]);
+      });
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Picker click mirrors the chip: toggle off if the viewer already owns it.
+  const toggle = (content: GitHubReactionContent) => {
+    const existing = (reactions ?? []).find((r) => r.content === content);
+    if (existing?.viewerReactionId != null) void remove(existing);
+    else void add(content);
+  };
+
+  const owns = (content: GitHubReactionContent) =>
+    (reactions ?? []).some((r) => r.content === content && r.viewerReactionId != null);
+
+  const visible = (reactions ?? []).filter((r) => r.count > 0);
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-1" onMouseLeave={() => setPickerOpen(false)}>
+      {loading && reactions === undefined && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
+      {visible.map((r) => (
+        <button
+          key={r.content}
+          type="button"
+          disabled={busy === r.content}
+          title={REACTION_LABEL[r.content]}
+          onClick={() => { void (r.viewerReactionId != null ? remove(r) : add(r.content)); }}
+          className={cn(
+            "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs leading-none",
+            r.viewerReactionId != null
+              ? "border-primary/60 bg-primary/10 text-foreground"
+              : "border-border/60 text-muted-foreground hover:bg-accent",
+          )}
+        >
+          <span>{REACTION_EMOJI[r.content]}</span>
+          <span>{r.count}</span>
+        </button>
+      ))}
+      <div className="relative">
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-6"
+          title="Add reaction"
+          aria-label="Add reaction"
+          disabled={!!busy || reactions === undefined}
+          onClick={() => setPickerOpen((cur) => !cur)}
+        >
+          <Plus className="size-3.5" />
+        </Button>
+        {pickerOpen && (
+          <div className="absolute left-0 top-7 z-10 flex gap-0.5 rounded-md border border-border/60 bg-popover p-1 shadow-md">
+            {REACTION_CONTENTS.map((content) => (
+              <button
+                key={content}
+                type="button"
+                title={REACTION_LABEL[content]}
+                disabled={busy === content}
+                onClick={() => toggle(content)}
+                className={cn(
+                  "rounded px-1 py-0.5 text-sm hover:bg-accent",
+                  owns(content) && "bg-primary/15 ring-1 ring-primary/50",
+                )}
+              >
+                {REACTION_EMOJI[content]}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      {error && (
+        <span className="text-[11px] text-rose-400" title={error}>
+          {error}
+        </span>
       )}
     </div>
   );
