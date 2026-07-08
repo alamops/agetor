@@ -50,6 +50,7 @@ import {
   dropCodexSession,
   reattachCodexSession,
 } from "./codex-tmux.ts";
+import { setSubagentEmitter } from "./claude-subagents.ts";
 import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName } from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -97,6 +98,13 @@ export function subscribe(fn: Listener): () => void {
 function emit(e: RunEvent) {
   for (const fn of listeners) fn(e);
 }
+
+// The subagent watcher (armed inside the claude-tmux tailer) persists its
+// tagged events itself but needs the orchestrator's SSE fan-out to reach the
+// run panel. Register `emit` as its sink once, at module load — there's exactly
+// one listener set and the subagent stream rides the same `/tasks/:id/events`
+// channel the UI already subscribes to.
+setSubagentEmitter(emit);
 
 /**
  * Subscribe to the app-wide lifecycle stream — terminal run-status
@@ -227,6 +235,22 @@ export function wireInteractionBroadcast(): void {
 }
 
 wireInteractionBroadcast();
+
+// Companion bridge for the *removal* side. Every answer*/cancel* path
+// in interactions.ts calls into this, so the run panel can drop the
+// card immediately instead of waiting for a refresh poll. Without
+// this, scraper auto-cancel and run-cancellation leave stale cards in
+// the panel (the existing additions-only SSE plumbing has no way to
+// signal "this is gone").
+setResolvedBroadcaster((res: InteractionResolved) => {
+  emit({
+    runId: res.runId,
+    taskId: res.taskId,
+    stream: "interaction_resolved",
+    data: JSON.stringify({ id: res.id, kind: res.kind }),
+    ts: Date.now(),
+  });
+});
 
 /**
  * Decide what to do with runs left in `status='running'` from a previous

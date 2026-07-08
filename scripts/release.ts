@@ -215,6 +215,9 @@ async function main() {
   console.log("[release] build:stable…");
   await run(["bun", "run", "build:stable"]);
 
+  console.log("[release] build:cli (standalone CLI binary + installer)…");
+  await run(["bun", "run", "build:cli"]);
+
   console.log("[release] verify…");
   await run(["bun", "scripts/verify-release.ts"]);
 

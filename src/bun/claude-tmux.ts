@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { tasks } from "./db.ts";
+import { attachSubagentWatcher, type SubagentWatcherHandle } from "./claude-subagents.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
   activeTmuxPromptsForTask,
@@ -1060,6 +1061,13 @@ interface SessionState {
    *  been quiet for `END_TURN_IDLE_FIRE_MS`. Cleared in `popEndOfTurn` when the
    *  slot finally pops (the whole busy period is over). */
   holdUntilIdle: boolean;
+  /** Watches `<sessionId>/subagents/` for background/sub agents this session
+   *  spawns, tailing each into the task's event stream (tagged by subagent id)
+   *  for the run panel's read-only tabs. Armed in `attachTailer`, released in
+   *  `disposeSessionState`. Read-only — never touches tmux. Null until armed
+   *  (and when AGETOR_TRACK_SUBAGENTS=0, `attachSubagentWatcher` returns a
+   *  no-op handle). */
+  subagentWatcher: SubagentWatcherHandle | null;
 }
 
 interface TurnSlot {
@@ -1154,6 +1162,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     askFirstSeenAt: null,
     pendingEndTurn: null,
     holdUntilIdle: false,
+    subagentWatcher: null,
   };
 }
 
@@ -2520,6 +2529,11 @@ function attachTailer(state: SessionState): void {
   // cheap (one stat + read-if-grew) and bulletproof.
   state.pollTimer = setInterval(() => { void flush(state); }, 400);
   startScraper(state);
+  // Track any background/sub agents this session spawns. Idempotent re-arm:
+  // dispose a prior handle first so a re-attach (reconcileOrphans defensive
+  // overwrite) can't leave two watchers polling the same dir.
+  state.subagentWatcher?.detach();
+  state.subagentWatcher = attachSubagentWatcher({ taskId: state.taskId, jsonlPath: state.jsonlPath });
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -3289,6 +3303,10 @@ function disposeSessionState(state: SessionState | undefined): void {
   if (state.scrapeTimer) clearInterval(state.scrapeTimer);
   state.scrapeTimer = null;
   state.scrapeLastFingerprint = null;
+  // Release the subagent watcher's fs.watch + poll timer. Read-only teardown:
+  // this stops us TAILING the subagent files, never the agent itself.
+  state.subagentWatcher?.detach();
+  state.subagentWatcher = null;
   state.onEndOfTurn = null;
   state.pendingEndTurn = null;
   const err = new Error("session killed");

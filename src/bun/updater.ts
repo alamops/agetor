@@ -21,7 +21,7 @@ import type { UpdateStatus } from "../shared/types.ts";
 
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
-interface UpdaterSnapshot {
+export interface UpdaterSnapshot {
   status: UpdateStatus;
   version: string | null;
   /** Last error message, surfaced for diagnostics. Cleared on next successful tick. */
