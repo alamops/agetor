@@ -99,12 +99,16 @@ test("sessionLiveness: 'can't find session' with a responsive server is gone", (
   try { expect(sessionLiveness("agetor-x")).toBe("gone"); } finally { restore(); }
 });
 
-test("sessionLiveness: ONLY a busy-server EAGAIN (or empty message) is unreachable", () => {
-  // The regression: the busy shared tmux server too swamped to answer must never
-  // be read as a dead session — that's what abandoned live, working sessions.
+test("sessionLiveness: any ambiguous / unknown failure is unreachable, never a death", () => {
+  // The regression: a busy shared tmux server too swamped to answer, an ambiguous
+  // connect error, or ANY string we don't recognize must never be read as a dead
+  // session — that's what abandoned live, working sessions. We don't know the
+  // incident's exact transient string, so the unknown case must be conservative.
   for (const stderr of [
     "error connecting to /tmp/tmux-501/default (Resource temporarily unavailable)",
     "resource temporarily unavailable",
+    "error connecting to /tmp/tmux-501/default (No such file or directory)", // ambiguous
+    "some unrecognized tmux error", // unknown → conservative
     "", // a torn-down client can exit non-zero with no diagnostics
   ]) {
     const restore = fakeTmux(1, stderr);
@@ -112,18 +116,17 @@ test("sessionLiveness: ONLY a busy-server EAGAIN (or empty message) is unreachab
   }
 });
 
-test("sessionLiveness: a definitively-dead session OR server is gone", () => {
-  // During an in-flight turn our own session keeps the shared server alive, so a
-  // server reporting "no server running"/"lost server" has died WITH our session
-  // — a real death, not a transient. Keeps live death detection (finding: don't
-  // lump these into `unreachable`).
+test("sessionLiveness: only an UNAMBIGUOUS dead session or dead server is gone", () => {
+  // During an in-flight turn our own session keeps the shared server alive, so
+  // "no server running"/"lost server" means the server died WITH our session — a
+  // real death. "session not found" is the server saying our session is absent.
+  // These strings are never emitted spuriously, so they're safe to fire on.
   for (const stderr of [
     "can't find session: agetor-x",
     "session not found: agetor-x",
+    "no such session: agetor-x",
     "no server running on /tmp/tmux-501/default",
     "lost server",
-    "error connecting to /tmp/tmux-501/default (No such file or directory)",
-    "some unrecognized tmux error",
   ]) {
     const restore = fakeTmux(1, stderr);
     try { expect(sessionLiveness("agetor-x")).toBe("gone"); } finally { restore(); }

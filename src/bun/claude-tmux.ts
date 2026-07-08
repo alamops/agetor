@@ -760,48 +760,58 @@ export type SessionLiveness = "alive" | "gone" | "unreachable";
  * distinguishing the two states a bare `.ok` boolean fatally conflates:
  *
  *   - `alive`       — the session answered; it's up.
- *   - `gone`        — the session is genuinely absent (killed, hosting process
- *                     exited) OR the whole server is down. A real death: while a
- *                     turn is in flight our own session keeps the shared server
- *                     alive, so a server that reports "no server running" /
- *                     "lost server" has died and taken our session with it.
- *   - `unreachable` — the probe failed because the server was momentarily unable
- *                     to answer while still alive (EAGAIN / "resource temporarily
- *                     unavailable" on the busy shared socket), or with no message
- *                     at all. INCONCLUSIVE — must never be treated as a death.
+ *   - `gone`        — an UNAMBIGUOUS death: the server answered but this session
+ *                     is absent ("session not found"), or the whole server is
+ *                     down ("no server running" / "lost server"). While a turn
+ *                     is in flight our own session keeps the shared server
+ *                     alive, so a no-server report means our session died too;
+ *                     these strings are never emitted spuriously.
+ *   - `unreachable` — anything else: a busy-server EAGAIN ("resource temporarily
+ *                     unavailable"), an ambiguous bare "error connecting …", an
+ *                     empty message, or an unrecognized error. INCONCLUSIVE —
+ *                     must never be treated as a death.
  *
  * The death watch used to fire on any non-zero `has-session` exit after two
  * ~400ms misses, which abandoned live, working sessions whenever the shared
  * tmux server hiccuped under load (a heavy git op flooding a pane, many
- * concurrent agetor sessions). The ONLY failure that false-positived a proven-
- * alive session was the transient busy-server EAGAIN — so that (and an empty
- * message) is the sole `unreachable` class; every other error is a trustworthy
- * `gone`. This keeps the false-positive fix while preserving live detection of
- * a genuinely-dead session or server (which would otherwise wait for boot
- * `reconcileOrphans`). Note the bias direction: an *unrecognized* error is read
- * as `gone` and can only delay a real death by the miss threshold, but is still
- * vetoed by a recent log write (`startDeathWatch`), so it can't abandon a live
- * session.
+ * concurrent agetor sessions). We don't have the incident's exact transient
+ * string, so the bias is deliberately conservative: ONLY known-unambiguous
+ * death strings are `gone`; every ambiguous or unrecognized error is
+ * `unreachable` and cannot trip a death. That guarantees a transient probe
+ * failure never abandons a live session (the original bug), while still
+ * detecting a genuinely-dead session or server the moment tmux says so (instead
+ * of waiting for boot `reconcileOrphans`).
  */
 export function sessionLiveness(name: string): SessionLiveness {
   const r = tmux(["has-session", "-t", name]);
   if (r.ok) return "alive";
   const err = `${r.stderr} ${r.stdout}`.toLowerCase();
-  // The one failure mode observed to hit a PROVEN-alive session: the shared
-  // tmux server too busy to answer a control command (EAGAIN). An empty message
-  // (a torn-down client that exited without diagnostics) is likewise ambiguous.
+  // Only UNAMBIGUOUS death strings count as `gone`:
+  //  - server answered, this session absent: "can't find session" /
+  //    "session not found" / "no such session".
+  //  - server itself dead: "no server running" / "lost server". During an
+  //    in-flight turn our own session keeps the shared server alive, so a server
+  //    reporting no-server has died and taken our session with it. These strings
+  //    are never emitted spuriously — a busy-but-alive server still accepts the
+  //    connection, so it can't say "no server running".
   if (
-    err.includes("resource temporarily unavailable") ||
-    err.includes("try again") ||
-    err.trim() === ""
+    err.includes("find session") ||
+    err.includes("session not found") ||
+    err.includes("no such session") ||
+    err.includes("no server running") ||
+    err.includes("lost server")
   ) {
-    return "unreachable";
+    return "gone";
   }
-  // Everything else — "can't find session" / "session not found" /
-  // "no such session" (server up, this session absent) and "no server running"
-  // / "lost server" / "error connecting" (server itself gone, which during an
-  // in-flight turn means our session died with it) — is a genuine death.
-  return "gone";
+  // Everything else is INCONCLUSIVE → `unreachable`, never a death: a busy-server
+  // EAGAIN ("resource temporarily unavailable"), a bare "error connecting …"
+  // (ambiguous — transient EAGAIN vs. a vanished socket), an empty message from
+  // a torn-down client, or any error string we don't recognize. Biasing the
+  // unknown case to `unreachable` is what guarantees a transient probe failure
+  // can never abandon a live session — the original bug, whose exact transient
+  // string we can't assume. A genuinely-dead session/server that only ever
+  // emits an unrecognized error degrades to boot `reconcileOrphans`.
+  return "unreachable";
 }
 
 /** True when `path` was written within `windowMs` — used as a death-watch veto:
