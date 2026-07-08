@@ -468,7 +468,13 @@ function readTmuxLog(logPath: string): Array<{ ms: number; argv: string[] }> {
   } catch {
     return [];
   }
-  return raw.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  return raw.split("\n").filter(Boolean).map((l) => JSON.parse(l)).map((entry) => {
+    // Every tmux spawn now leads with `tmuxSocketArgs()` (["-L", <name>]
+    // under bun test); strip that pair so command-name assertions here don't
+    // have to know about socket isolation.
+    const [a, , ...rest] = entry.argv;
+    return a === "-L" ? { ...entry, argv: rest } : entry;
+  });
 }
 
 test("queuePaste: chained pastes run in FIFO order", async () => {

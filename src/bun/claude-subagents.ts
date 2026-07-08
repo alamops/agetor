@@ -224,7 +224,11 @@ export function attachSubagentWatcher(opts: {
         endedAt: row.endedAt,
       });
     }
-  } catch { /* degrade gracefully — a bad rehydration row must not crash reattach */ }
+  } catch (e) {
+    // degrade gracefully — a bad rehydration row must not crash reattach —
+    // but still log so a silently-empty subagent list is diagnosable.
+    console.error(`[claude-subagents] rehydration failed for task ${taskId}:`, e);
+  }
 
   function emitLifecycle(fs: FileState, phase: "started" | "finished"): void {
     const payload: SubagentEvent = { phase, subagent: toSubagentShape(fs, taskId) };
