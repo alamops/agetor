@@ -17,6 +17,8 @@ import { dataDir } from "./db.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import {
+  DEATH_JSONL_QUIET_MS,
+  DEATH_MISS_THRESHOLD,
   deathTickOutcome,
   fileWrittenWithin,
   killSessionByName,
@@ -248,15 +250,11 @@ const codexSessions = new Map<string, CodexSessionState>(); // taskId -> state
 const POLL_MS = 150;
 const DEATH_POLL_MS = 400;
 /** Grace after the tmux session disappears before we resolve, so the final
- *  appended bytes (turn.completed) are flushed and read. */
+ *  appended bytes (turn.completed) are flushed and read. Poll + grace stay
+ *  driver-local (codex is one-shot); the death-decision inputs
+ *  `DEATH_MISS_THRESHOLD` + `DEATH_JSONL_QUIET_MS` are imported from claude-tmux
+ *  so both watches share one `deathTickOutcome` contract and can't drift. */
 const DEATH_GRACE_MS = 250;
-/** Consecutive definitive `gone` probes required before declaring death — an
- *  `unreachable` tmux hiccup resets the counter. Mirrors claude-tmux's
- *  DEATH_MISS_THRESHOLD. */
-const DEATH_MISS_THRESHOLD = 4;
-/** A codex log written within this window vetoes a death: the run is provably
- *  alive. Mirrors claude-tmux's DEATH_JSONL_QUIET_MS. */
-const DEATH_JSONL_QUIET_MS = 3_000;
 
 function disposeCodexState(state: CodexSessionState): void {
   if (state.watcher) { try { state.watcher.close(); } catch { /* noop */ } state.watcher = null; }
@@ -374,9 +372,11 @@ function startCodexTailer(state: CodexSessionState): Promise<number> {
   let misses = 0;
   state.deathTimer = setInterval(() => {
     tryWatch();
+    // Compute the log-recency veto lazily — only a `gone` probe uses it.
+    const liveness = sessionLiveness(state.sessionName);
     const outcome = deathTickOutcome({
-      liveness: sessionLiveness(state.sessionName),
-      logFresh: fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),
+      liveness,
+      logFresh: liveness === "gone" && fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),
       misses,
       threshold: DEATH_MISS_THRESHOLD,
     });

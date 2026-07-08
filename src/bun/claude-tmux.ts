@@ -2637,12 +2637,14 @@ const DEATH_GRACE_MS = 250;
 /** Consecutive definitive `gone` probes required before declaring death —
  *  debounces a transient tmux failure. Now that only a `gone` (server up,
  *  session absent) probe counts — an `unreachable` server hiccup resets the
- *  counter — this is ~1.6s of the session being provably absent. Shared
- *  spelling with codex-tmux. */
-const DEATH_MISS_THRESHOLD = 4;
+ *  counter — this is ~1.6s of the session being provably absent. Exported so
+ *  codex-tmux's death watch shares the exact `deathTickOutcome` contract rather
+ *  than a hand-copied "mirror" that could silently drift. */
+export const DEATH_MISS_THRESHOLD = 4;
 /** A log file written within this window vetoes a death: the agent is provably
- *  alive, so a lone `gone` probe that raced a kill/recreate can't settle it. */
-const DEATH_JSONL_QUIET_MS = 3_000;
+ *  alive, so a lone `gone` probe that raced a kill/recreate can't settle it.
+ *  Exported and shared with codex-tmux (see `DEATH_MISS_THRESHOLD`). */
+export const DEATH_JSONL_QUIET_MS = 3_000;
 
 /**
  * Settle an in-flight turn because its tmux session died unexpectedly.
@@ -2719,9 +2721,12 @@ function startDeathWatch(state: SessionState): void {
   let misses = 0;
   state.deathTimer = setInterval(() => {
     if (!turnInFlight(state)) { misses = 0; return; } // idle — no running turn; skip the tmux poll
+    // Compute the log-recency veto lazily — it only matters for a `gone` probe,
+    // and `gone` is the rare tick, so we skip a statSync on every `alive` poll.
+    const liveness = sessionLiveness(state.sessionName);
     const outcome = deathTickOutcome({
-      liveness: sessionLiveness(state.sessionName),
-      logFresh: fileWrittenWithin(state.jsonlPath, DEATH_JSONL_QUIET_MS),
+      liveness,
+      logFresh: liveness === "gone" && fileWrittenWithin(state.jsonlPath, DEATH_JSONL_QUIET_MS),
       misses,
       threshold: DEATH_MISS_THRESHOLD,
     });
