@@ -50,12 +50,14 @@ export default {
       // Lands at Contents/Resources/app/bin/ inside the .app, which is what
       // src/bun/tmux-resolution.ts:bundledTmuxPath() points to at runtime.
       "vendor/tmux/arm64": "bin",
-      // NOTE: terminal-notifier is intentionally NOT bundled. Its only
-      // prebuilt release is x86_64-only and agetor is arm64-only / no-Rosetta,
-      // so src/bun/notifier.ts resolves an arm64 terminal-notifier from the
-      // user's PATH (e.g. `brew install terminal-notifier`) and falls back to
-      // a plain notification when it's absent. The agetor:// scheme above is
-      // still registered so a click routes back in when a notifier is present.
+      // Our own native arm64 notifier helper (AgetorNotifier.app) — posts
+      // deep-linkable notifications via UNUserNotificationCenter and opens
+      // agetor://task/<id> on click (built by scripts/build-notifier.ts from
+      // native/notifier/). Lands at Contents/Resources/app/bin/
+      // AgetorNotifier.app; src/bun/notifier.ts:resolveNotifier() points at its
+      // inner executable. No third-party binary, no Rosetta. The agetor://
+      // scheme registered above is what the click routes back through.
+      "vendor/notifier": "bin",
     },
     watchIgnore: ["dist/**", ".agetor/**", "vendor/**"],
     mac: {

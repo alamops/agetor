@@ -11,7 +11,7 @@ import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
 import { resolveNotifier, buildNotifierArgs } from "./notifier.ts";
-import { buildTaskDeepLink, parseTaskDeepLink, APP_BUNDLE_ID } from "./deep-link.ts";
+import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
 import { setPendingOpenTask } from "./pending-open.ts";
 import pkg from "../../package.json" with { type: "json" };
 
@@ -128,23 +128,22 @@ void refreshDiscoveredModels();
  * Posts a task notification, deep-linking it to the task when possible.
  *
  * Electrobun's own `Utils.showNotification` has no click callback — a click
- * just dismisses the banner — so it can't carry the user back to the task
- * that fired it. `terminal-notifier` can (`-open <url>` runs `open <url>` on
- * click), so when a `taskId` is supplied and terminal-notifier resolves, we
- * shell out to it with `-open agetor://task/<id>` instead. The resulting
- * `open <url>` triggers Electrobun's "open-url" event (handled below), which
- * is macOS's only way to hand a custom-scheme URL back to a running app.
+ * just dismisses the banner — so it can't carry the user back to the task that
+ * fired it. Our bundled native helper (AgetorNotifier.app, see notifier.ts)
+ * can: it posts via UNUserNotificationCenter with the deep link in userInfo,
+ * and on click opens `agetor://task/<id>`, which triggers Electrobun's
+ * "open-url" event (handled below) on the already-running app. So when a
+ * `taskId` is supplied and the helper resolves, we spawn it instead.
  *
  * Fallback discipline (a notifier problem must never mean NO notification):
- *   - No taskId or no terminal-notifier on PATH → plain Utils.showNotification.
+ *   - No taskId or no helper resolved → plain Utils.showNotification.
  *   - A *synchronous* spawn throw → caught here → plain notification.
- *   - The spawn launches but exits non-zero (e.g. a wrong-arch binary that
- *     can't exec, or a denied notification permission for its bundle id) →
- *     we watch `.exited` and fall back on failure. This async check is
- *     essential: an exec/launch failure surfaces on the *child*, not as a
- *     synchronous throw, so the try/catch alone would silently drop the
- *     notification. terminal-notifier exits 0 on success, so the happy path
- *     never double-notifies.
+ *   - The helper launches but exits non-zero (e.g. the user denied
+ *     notification permission — the helper exits 2 then) → we watch `.exited`
+ *     and fall back on failure. This async check is essential: a
+ *     launch/permission failure surfaces on the *child*, not as a synchronous
+ *     throw. The helper exits 0 once it has posted, so the happy path never
+ *     double-notifies.
  */
 function showTaskNotification(n: {
   title: string;
@@ -169,26 +168,25 @@ function showTaskNotification(n: {
               subtitle: n.subtitle,
               silent: n.silent,
               url: buildTaskDeepLink(n.taskId),
-              sender: APP_BUNDLE_ID,
             }),
           ],
           { stdout: "ignore", stderr: "ignore" },
         );
-        // Fall back if the process failed to actually show anything.
+        // Fall back if the helper failed to actually show anything.
         child.exited
           .then((code) => {
             if (code !== 0) {
-              console.error(`[agetor] terminal-notifier exited ${code}, falling back to plain notification`);
+              console.error(`[agetor] notifier helper exited ${code}, falling back to plain notification`);
               plain();
             }
           })
           .catch((err) => {
-            console.error("[agetor] terminal-notifier failed, falling back:", err);
+            console.error("[agetor] notifier helper failed, falling back:", err);
             plain();
           });
         return;
       } catch (err) {
-        console.error("[agetor] terminal-notifier spawn failed, falling back:", err);
+        console.error("[agetor] notifier helper spawn failed, falling back:", err);
         // fall through to the plain notification below
       }
     }

@@ -13,16 +13,6 @@
 export const APP_URL_SCHEME = "agetor";
 
 /**
- * The app's macOS bundle identifier — kept here (alongside the URL scheme) as
- * a single source of truth so it can't drift across call sites. Mirrors
- * `identifier` in electrobun.config.ts (which keeps its own hand-synced copy,
- * since a build-config file shouldn't import app source). Used as
- * terminal-notifier's `-sender` so a deep-link notification posts under
- * agetor's own icon/identity.
- */
-export const APP_BUNDLE_ID = "sh.alamops.agetor";
-
-/**
  * Builds a deep link that opens a given task, e.g.
  *   buildTaskDeepLink("abc123") -> "agetor://task/abc123"
  * The taskId is percent-encoded so ids containing "/", "?", "#", etc. still

@@ -1,13 +1,9 @@
 import { test, expect, describe } from "bun:test";
-import { APP_URL_SCHEME, APP_BUNDLE_ID, buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
+import { APP_URL_SCHEME, buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
 
 describe("constants", () => {
   test("APP_URL_SCHEME is agetor", () => {
     expect(APP_URL_SCHEME).toBe("agetor");
-  });
-
-  test("APP_BUNDLE_ID is sh.alamops.agetor", () => {
-    expect(APP_BUNDLE_ID).toBe("sh.alamops.agetor");
   });
 });
 

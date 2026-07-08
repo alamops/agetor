@@ -1,41 +1,62 @@
 /**
- * Resolves and builds argv for `terminal-notifier`, a macOS CLI that can
- * post a notification whose click runs `open <url>` — the mechanism agetor
- * uses to deep-link a notification click back into a task via
- * `agetor://task/<id>` (see deep-link.ts). Electrobun's own
- * `Utils.showNotification` cannot carry a click URL, so this is the
- * deep-link-capable path.
+ * Resolves and builds argv for AgetorNotifier.app — our own native arm64
+ * helper (native/notifier/, built by scripts/build-notifier.ts) that posts a
+ * notification whose click opens `agetor://task/<id>` (see deep-link.ts).
+ * Electrobun's own `Utils.showNotification` cannot carry a click URL, and
+ * terminal-notifier's only prebuilt release is x86_64-only — so we ship our
+ * own signed arm64 UNUserNotificationCenter helper. No third-party binary, no
+ * Rosetta.
  *
  * Pure and side-effect-free at import time so both functions are trivially
  * unit-testable without spawning anything.
- *
- * We deliberately do NOT bundle terminal-notifier: the only prebuilt release
- * (v2.0.0) is x86_64-only, and agetor is arm64-only with a hard no-Rosetta
- * rule (Apple is sunsetting Rosetta). So the binary is resolved from the
- * user's PATH — an arm64 build, e.g. `brew install terminal-notifier`. When
- * it's absent (or a resolved binary fails to launch), callers fall back to a
- * plain, non-deep-linking notification, so the feature degrades cleanly
- * rather than depending on a translated x86_64 binary.
  */
+
+import { existsSync } from "node:fs";
+import path from "node:path";
 
 /**
- * Single source of truth for the terminal-notifier binary path. Precedence:
- *   1. AGETOR_TERMINAL_NOTIFIER_BIN env override (tests + power users) —
- *      returned as-is, never bypassed, matching AGETOR_TMUX_BIN's contract.
- *   2. System PATH lookup via Bun.which (expects an arm64 build).
+ * The helper's executable path inside the packaged .app, mirroring
+ * tmux-resolution.ts's bundled-path shape: binaries are copied under
+ * `Contents/Resources/app/bin` at build time (electrobun.config.ts build.copy
+ * maps `vendor/notifier` there, giving `bin/AgetorNotifier.app`).
+ */
+function bundledNotifierExe(): string {
+  const bin = path.join(path.dirname(process.execPath), "..", "Resources", "app", "bin");
+  return path.join(bin, "AgetorNotifier.app", "Contents", "MacOS", "notifier");
+}
+
+/**
+ * The locally-built helper, used when running from source (`bun run dev`)
+ * rather than the packaged .app. Resolved relative to this module's location
+ * inside the repo (src/bun/ -> repo root -> vendor/notifier/...).
+ */
+function devNotifierExe(): string {
+  return path.join(
+    import.meta.dir, "..", "..",
+    "vendor", "notifier", "AgetorNotifier.app", "Contents", "MacOS", "notifier",
+  );
+}
+
+/**
+ * Single source of truth for the notifier helper path. Precedence:
+ *   1. AGETOR_NOTIFIER_BIN env override (tests + power users) — returned
+ *      as-is, matching AGETOR_TMUX_BIN's contract.
+ *   2. The helper bundled inside the packaged app.
+ *   3. The locally-built helper under vendor/ (dev runs from source).
  *
- * Returns `null` if nothing resolves. terminal-notifier is an optional
- * enhancement (deep-linkable notifications), so callers treat `null` as
- * "post a plain notification instead" rather than attempt a spawn that will
- * fail. A resolved binary that turns out to be the wrong arch / otherwise
- * unlaunchable is handled at the call site by falling back on a non-zero
- * exit (see showTaskNotification in index.ts).
+ * Returns `null` if nothing resolves. The deep-link notification is an
+ * enhancement, so callers treat `null` (and a non-zero exit — e.g. the user
+ * denied notification permission) as "post a plain Utils.showNotification
+ * instead" (see showTaskNotification in index.ts).
  */
 export function resolveNotifier(): string | null {
-  const override = process.env.AGETOR_TERMINAL_NOTIFIER_BIN;
+  const override = process.env.AGETOR_NOTIFIER_BIN;
   if (override) return override;
 
-  return Bun.which("terminal-notifier", { PATH: process.env.PATH }) ?? null;
+  for (const candidate of [bundledNotifierExe(), devNotifierExe()]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
 }
 
 export interface NotifierOptions {
@@ -43,35 +64,28 @@ export interface NotifierOptions {
   body?: string;
   subtitle?: string;
   /**
-   * terminal-notifier is silent by default and only plays a sound when
-   * `-sound <name>` is passed. We mirror that default: only an *explicit*
-   * `silent === false` opts into a sound; `undefined` or `true` stays
-   * silent. See buildNotifierArgs for the exact mapping.
+   * The helper plays the default sound unless muted. Only an explicit
+   * `silent === true` passes `--silent`; `false`/`undefined` let the sound
+   * play (the normal case — the /notifications route sends a real boolean).
    */
   silent?: boolean;
   /** Deep-link URL to open on click, e.g. buildTaskDeepLink(taskId). */
   url?: string;
-  /** Bundle id to post under (icon/identity), e.g. "sh.alamops.agetor". */
-  sender?: string;
 }
 
 /**
- * Builds the argv to pass to terminal-notifier AFTER the binary path.
- * Flag order is fixed (title, message, subtitle, open, sender, sound) so
- * output is deterministic and easy to assert on in tests.
+ * Builds the argv to pass to the notifier helper AFTER its path. Flag order is
+ * fixed (title, message, subtitle, url, silent) so output is deterministic and
+ * easy to assert on in tests. The helper requires `--message` (empty allowed).
+ * Identity/icon come from the helper's own signed bundle ("Agetor"), so there
+ * is no `--sender`.
  */
 export function buildNotifierArgs(o: NotifierOptions): string[] {
-  // -message is required by terminal-notifier even with no body.
-  const args: string[] = ["-title", o.title, "-message", o.body ?? ""];
+  const args: string[] = ["--title", o.title, "--message", o.body ?? ""];
 
-  if (o.subtitle) args.push("-subtitle", o.subtitle);
-  if (o.url) args.push("-open", o.url);
-  if (o.sender) args.push("-sender", o.sender);
-
-  // Sound mapping: terminal-notifier plays no sound unless told to. Only an
-  // explicit `silent: false` requests the default sound; `silent: true` and
-  // the unset/undefined default both stay silent.
-  if (o.silent === false) args.push("-sound", "default");
+  if (o.subtitle) args.push("--subtitle", o.subtitle);
+  if (o.url) args.push("--url", o.url);
+  if (o.silent === true) args.push("--silent");
 
   return args;
 }

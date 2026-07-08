@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Branded "Agetor" so the one-time notification-permission prompt and the
+       System Settings > Notifications row read as Agetor, even though this
+       helper posts under its own bundle id (below). -->
+  <key>CFBundleName</key>
+  <string>Agetor</string>
+  <key>CFBundleDisplayName</key>
+  <string>Agetor</string>
+  <!-- Distinct from the main app's sh.alamops.agetor. MUST stay stable across
+       releases: TCC keys the granted notification permission on this id, so
+       changing it would re-prompt the user. -->
+  <key>CFBundleIdentifier</key>
+  <string>sh.alamops.agetor.notifier</string>
+  <key>CFBundleExecutable</key>
+  <string>notifier</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <!-- Agent app: no Dock icon, no menu bar. -->
+  <key>LSUIElement</key>
+  <true/>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>CFBundleIconFile</key>
+  <string>icon</string>
+</dict>
+</plist>
