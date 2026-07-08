@@ -4,7 +4,7 @@
 // the pure helpers in isolation.
 import { test, expect, beforeAll } from "bun:test";
 import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
-import { getGitHubViewer, listGitHubLabels, listGitHubMilestones } from "./github.ts";
+import { getGitHubViewer, listGitHubAssignees, listGitHubLabels, listGitHubMilestones } from "./github.ts";
 
 let REPO_DIR = "";
 
@@ -46,6 +46,34 @@ test("listGitHubLabels resolves the repo from the git remote and follows paginat
     expect(res.repo).toBe("acme/widgets");
     expect(res.labels.map((l) => l.name).sort()).toEqual(["bug", "wip"]);
     expect(mock.calls).toHaveLength(2); // followed the `next` link
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubAssignees hits the assignees endpoint and maps logins through normalizeUser", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/assignees",
+      json: [
+        { login: "octocat", avatar_url: "https://example.com/o.png", html_url: "https://github.com/octocat" },
+        { login: "hubot", avatar_url: null, html_url: null },
+      ],
+    },
+  ]);
+  try {
+    const res = await listGitHubAssignees({ dir: REPO_DIR });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.repo).toBe("acme/widgets");
+    expect(res.assignees.map((a) => a.login)).toEqual(["hubot", "octocat"]);
+    expect(res.assignees.find((a) => a.login === "octocat")).toEqual({
+      login: "octocat",
+      avatarUrl: "https://example.com/o.png",
+      htmlUrl: "https://github.com/octocat",
+    });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/assignees?per_page=100");
   } finally {
     mock.restore();
   }

@@ -11,6 +11,7 @@ import type {
   GitHubComment,
   GitHubCommentsResult,
   GitHubChecksResult,
+  GitHubAssigneesResult,
   GitHubLabelsResult,
   GitHubRepoLabel,
   GitHubMilestonesResult,
@@ -58,6 +59,7 @@ export type {
   GitHubCommentsResult,
   GitHubItemKind,
   GitHubItemState,
+  GitHubAssigneesResult,
   GitHubLabelsResult,
   GitHubRepoLabel,
   GitHubMilestonesResult,
@@ -406,6 +408,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  listGitHubAssignees: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubAssigneesResult>(`/github/assignees?${q.toString()}`);
+  },
   listGitHubMilestones: (input: { path: string }) => {
     const q = new URLSearchParams({ path: input.path });
     return j<GitHubMilestonesResult>(`/github/milestones?${q.toString()}`);

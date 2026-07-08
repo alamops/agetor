@@ -686,6 +686,11 @@ export interface GitHubUser {
   htmlUrl: string | null;
 }
 
+export interface GitHubAssigneesResult {
+  repo: string;
+  assignees: GitHubUser[];
+}
+
 export interface GitHubMilestone {
   number: number;
   title: string;

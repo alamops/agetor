@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import type {
+  GitHubAssigneesResult,
   GitHubCheckRun,
   GitHubChecksResult,
   GitHubComment,
@@ -238,6 +239,7 @@ type GitHubPullDraftResponse = ({ ok: true; draft: boolean; message?: string }) 
 type GitHubViewerResponse = ({ ok: true; login: string }) | GitHubListError;
 type GitHubLabelsResponse = ({ ok: true } & GitHubLabelsResult) | GitHubListError;
 type GitHubLabelResponse = ({ ok: true; label: GitHubRepoLabel }) | GitHubListError;
+type GitHubAssigneesResponse = ({ ok: true } & GitHubAssigneesResult) | GitHubListError;
 type GitHubMilestonesResponse = ({ ok: true } & GitHubMilestonesResult) | GitHubListError;
 type GitHubMilestoneResponse = ({ ok: true; milestone: GitHubRepoMilestone }) | GitHubListError;
 type GitHubReviewThreadsResponse = ({ ok: true } & GitHubPullReviewThreadsResult) | GitHubListError;
@@ -1671,6 +1673,29 @@ export async function listGitHubLabels(input: { dir: string }): Promise<GitHubLa
   }
   labels.sort((a, b) => a.name.localeCompare(b.name));
   return { ok: true, repo: repoSlug(repo), labels };
+}
+
+export async function listGitHubAssignees(input: { dir: string }): Promise<GitHubAssigneesResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+
+  const token = await githubToken();
+  const assignees: GitHubUser[] = [];
+  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/assignees?per_page=100`;
+  for (let page = 0; next && page < 3; page++) {
+    const res = await fetchGitHub(next, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: apiError(body, res.status, res.statusText) };
+    if (!Array.isArray(body)) return { ok: false, error: "GitHub returned an unexpected assignees response" };
+    for (const raw of body) {
+      const user = normalizeUser(raw);
+      if (user) assignees.push(user);
+    }
+    next = pageLinks(res.headers.get("link"));
+  }
+  assignees.sort((a, b) => a.login.localeCompare(b.login));
+  return { ok: true, repo: repoSlug(repo), assignees };
 }
 
 export async function createGitHubLabel(input: CreateGitHubLabelInput): Promise<GitHubLabelResponse> {

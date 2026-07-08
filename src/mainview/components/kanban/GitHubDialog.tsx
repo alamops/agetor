@@ -50,6 +50,7 @@ import type {
   GitHubRepoLabel,
   GitHubRepoMilestone,
   GitHubReviewThread,
+  GitHubUser,
   Project,
   TaskDiff,
 } from "../../../shared/types.ts";
@@ -83,6 +84,160 @@ function parseMilestone(raw: string): number | null | undefined {
   if (!trimmed) return undefined;
   const n = Number(trimmed);
   return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** The label / assignee / milestone controls shared by <IssueActions> and
+ *  <PullTriage>. Drives real pickers off the already-fetched repo labels,
+ *  assignees, and milestones, falling back to the original free-text inputs
+ *  when that repo data hasn't loaded (or the project is unauthenticated) so
+ *  triage never regresses to "no way to set this". The drafts stay the same
+ *  comma-joined strings the save path (`updateIssueLabels`) already parses
+ *  with `splitLabels`/`parseMilestone`, so no save-path changes are needed. */
+function LabelAssigneeMilestoneFields({
+  repoLabels,
+  repoAssignees,
+  repoMilestones,
+  labelDraft,
+  assigneeDraft,
+  milestoneDraft,
+  disabled,
+  onLabelDraftChange,
+  onAssigneeDraftChange,
+  onMilestoneDraftChange,
+}: {
+  repoLabels: GitHubRepoLabel[];
+  repoAssignees: GitHubUser[];
+  repoMilestones: GitHubRepoMilestone[];
+  labelDraft: string;
+  assigneeDraft: string;
+  milestoneDraft: string;
+  disabled?: boolean;
+  onLabelDraftChange: (body: string) => void;
+  onAssigneeDraftChange: (body: string) => void;
+  onMilestoneDraftChange: (body: string) => void;
+}) {
+  const selectedLabels = useMemo(() => new Set(splitLabels(labelDraft)), [labelDraft]);
+  const selectedAssignees = useMemo(() => new Set(splitLabels(assigneeDraft)), [assigneeDraft]);
+
+  const toggleLabel = (name: string) => {
+    const next = new Set(selectedLabels);
+    if (next.has(name)) next.delete(name); else next.add(name);
+    onLabelDraftChange(Array.from(next).join(", "));
+  };
+  const toggleAssignee = (login: string) => {
+    const next = new Set(selectedAssignees);
+    if (next.has(login)) next.delete(login); else next.add(login);
+    onAssigneeDraftChange(Array.from(next).join(", "));
+  };
+
+  // Render the repo list PLUS any currently-set value missing from it (a label
+  // removed from the repo, an assignee no longer assignable, a milestone past
+  // the fetch cap) so set-but-unlisted values stay visible and de-selectable
+  // rather than silently stranded.
+  const labelNames = useMemo(() => {
+    const names = repoLabels.map((l) => l.name);
+    return [...names, ...[...selectedLabels].filter((n) => !names.includes(n))];
+  }, [repoLabels, selectedLabels]);
+  const assigneeLogins = useMemo(() => {
+    const logins = repoAssignees.map((u) => u.login);
+    return [...logins, ...[...selectedAssignees].filter((l) => !logins.includes(l))];
+  }, [repoAssignees, selectedAssignees]);
+  const milestoneOptions = useMemo(() => {
+    const opts = repoMilestones.map((m) => ({ value: String(m.number), label: m.title }));
+    if (milestoneDraft && !opts.some((o) => o.value === milestoneDraft)) {
+      opts.push({ value: milestoneDraft, label: `#${milestoneDraft}` });
+    }
+    return opts;
+  }, [repoMilestones, milestoneDraft]);
+
+  const chipCls = (active: boolean) =>
+    cn(
+      "rounded-full border px-2 py-0.5 text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+      active
+        ? "border-primary bg-primary/20 text-foreground"
+        : "border-input text-muted-foreground hover:text-foreground",
+    );
+
+  return (
+    <>
+      {repoLabels.length > 0 ? (
+        <div
+          className="flex h-8 flex-wrap items-center gap-1 overflow-y-auto rounded-md border border-input bg-transparent px-1.5 py-1"
+          title="Labels"
+        >
+          {labelNames.map((name) => (
+            <button
+              key={name}
+              type="button"
+              disabled={disabled}
+              onClick={() => toggleLabel(name)}
+              className={chipCls(selectedLabels.has(name))}
+            >
+              {name}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <Input
+          value={labelDraft}
+          onChange={(e) => onLabelDraftChange(e.target.value)}
+          placeholder="Labels, comma separated"
+          className="h-8 text-xs"
+          disabled={disabled}
+        />
+      )}
+      {repoAssignees.length > 0 ? (
+        <div
+          className="flex h-8 flex-wrap items-center gap-1 overflow-y-auto rounded-md border border-input bg-transparent px-1.5 py-1"
+          title="Assignees"
+        >
+          {assigneeLogins.map((login) => (
+            <button
+              key={login}
+              type="button"
+              disabled={disabled}
+              onClick={() => toggleAssignee(login)}
+              className={chipCls(selectedAssignees.has(login))}
+            >
+              {login}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <Input
+          value={assigneeDraft}
+          onChange={(e) => onAssigneeDraftChange(e.target.value)}
+          placeholder="Assignees, comma separated"
+          className="h-8 text-xs"
+          disabled={disabled}
+        />
+      )}
+      {repoMilestones.length > 0 ? (
+        <Select
+          value={milestoneDraft}
+          onChange={(e) => onMilestoneDraftChange(e.target.value)}
+          className="h-8 text-xs"
+          disabled={disabled}
+          aria-label="Milestone"
+        >
+          <option value="">— none —</option>
+          {milestoneOptions.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </Select>
+      ) : (
+        <Input
+          value={milestoneDraft}
+          onChange={(e) => onMilestoneDraftChange(e.target.value)}
+          placeholder="Milestone number"
+          className="h-8 text-xs"
+          disabled={disabled}
+        />
+      )}
+    </>
+  );
 }
 
 const STATUS_META: Record<DiffFile["status"], { icon: typeof FilePlus; cls: string }> = {
@@ -129,6 +284,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // All repo milestones (powers the milestone manager).
   const [repoMilestones, setRepoMilestones] = useState<GitHubRepoMilestone[]>([]);
   const [milestoneManagerOpen, setMilestoneManagerOpen] = useState(false);
+  // All assignable repo users (powers the triage assignee picker). Convenience
+  // data only — no manager UI, so failures are swallowed like labels/milestones.
+  const [repoAssignees, setRepoAssignees] = useState<GitHubUser[]>([]);
   // The viewer login is token-scoped (identical across projects), so resolve it
   // once per session rather than on every open / project switch. A failed lookup
   // (e.g. the first project has no GitHub remote) leaves it unresolved so a later
@@ -489,6 +647,15 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     api.listGitHubMilestones({ path: projectPath })
       .then((r) => { if (!cancelled) setRepoMilestones(sortMilestones(r.milestones)); })
       .catch(() => { if (!cancelled) setRepoMilestones([]); });
+    return () => { cancelled = true; };
+  }, [open, projectPath]);
+
+  useEffect(() => {
+    if (!open || !projectPath) { setRepoAssignees([]); return; }
+    let cancelled = false;
+    api.listGitHubAssignees({ path: projectPath })
+      .then((r) => { if (!cancelled) setRepoAssignees(r.assignees); })
+      .catch(() => { if (!cancelled) setRepoAssignees([]); });
     return () => { cancelled = true; };
   }, [open, projectPath]);
 
@@ -1510,6 +1677,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 actionError={actionErrors[item.number]}
                 actionMessage={actionMessages[item.number]}
                 actionSource={actionSource[item.number]}
+                repoLabels={repoLabels}
+                repoAssignees={repoAssignees}
+                repoMilestones={repoMilestones}
                 labelDraft={labelDrafts[item.number] ?? item.labels.map((label) => label.name).join(", ")}
                 assigneeDraft={assigneeDrafts[item.number] ?? item.assignees.map((a) => a.login).join(", ")}
                 milestoneDraft={milestoneDrafts[item.number] ?? (item.milestone ? String(item.milestone.number) : "")}
@@ -2356,6 +2526,9 @@ function GitHubItemRow({
   actionError,
   actionMessage,
   actionSource,
+  repoLabels,
+  repoAssignees,
+  repoMilestones,
   labelDraft,
   assigneeDraft,
   milestoneDraft,
@@ -2437,6 +2610,9 @@ function GitHubItemRow({
   actionError?: string;
   actionMessage?: string;
   actionSource?: string;
+  repoLabels: GitHubRepoLabel[];
+  repoAssignees: GitHubUser[];
+  repoMilestones: GitHubRepoMilestone[];
   labelDraft: string;
   assigneeDraft: string;
   milestoneDraft: string;
@@ -2633,6 +2809,9 @@ function GitHubItemRow({
                 onRefreshMergeability={onRefreshMergeability}
               />
               <PullTriage
+                repoLabels={repoLabels}
+                repoAssignees={repoAssignees}
+                repoMilestones={repoMilestones}
                 labelDraft={labelDraft}
                 assigneeDraft={assigneeDraft}
                 milestoneDraft={milestoneDraft}
@@ -2672,6 +2851,9 @@ function GitHubItemRow({
           {item.kind === "issues" && (
             <IssueActions
               item={item}
+              repoLabels={repoLabels}
+              repoAssignees={repoAssignees}
+              repoMilestones={repoMilestones}
               labelDraft={labelDraft}
               assigneeDraft={assigneeDraft}
               milestoneDraft={milestoneDraft}
@@ -2721,6 +2903,9 @@ const MERGE_TONE_CLASS: Record<MergeTone, string> = {
 
 function IssueActions({
   item,
+  repoLabels,
+  repoAssignees,
+  repoMilestones,
   labelDraft,
   assigneeDraft,
   milestoneDraft,
@@ -2734,6 +2919,9 @@ function IssueActions({
   onIssueLabels,
 }: {
   item: GitHubListItem;
+  repoLabels: GitHubRepoLabel[];
+  repoAssignees: GitHubUser[];
+  repoMilestones: GitHubRepoMilestone[];
   labelDraft: string;
   assigneeDraft: string;
   milestoneDraft: string;
@@ -2769,26 +2957,17 @@ function IssueActions({
         )}
       </div>
       <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,0.7fr)_auto]">
-        <Input
-          value={labelDraft}
-          onChange={(e) => onLabelDraftChange(e.target.value)}
-          placeholder="Labels, comma separated"
-          className="h-8 text-xs"
+        <LabelAssigneeMilestoneFields
+          repoLabels={repoLabels}
+          repoAssignees={repoAssignees}
+          repoMilestones={repoMilestones}
+          labelDraft={labelDraft}
+          assigneeDraft={assigneeDraft}
+          milestoneDraft={milestoneDraft}
           disabled={isBusy}
-        />
-        <Input
-          value={assigneeDraft}
-          onChange={(e) => onAssigneeDraftChange(e.target.value)}
-          placeholder="Assignees, comma separated"
-          className="h-8 text-xs"
-          disabled={isBusy}
-        />
-        <Input
-          value={milestoneDraft}
-          onChange={(e) => onMilestoneDraftChange(e.target.value)}
-          placeholder="Milestone number"
-          className="h-8 text-xs"
-          disabled={isBusy}
+          onLabelDraftChange={onLabelDraftChange}
+          onAssigneeDraftChange={onAssigneeDraftChange}
+          onMilestoneDraftChange={onMilestoneDraftChange}
         />
         <Button size="sm" variant="outline" disabled={isBusy} onClick={onIssueLabels}>
           {busy === "labels" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Tag className="mr-2 size-3.5" />}
@@ -2867,6 +3046,9 @@ function ItemEditor({
 }
 
 function PullTriage({
+  repoLabels,
+  repoAssignees,
+  repoMilestones,
   labelDraft,
   assigneeDraft,
   milestoneDraft,
@@ -2882,6 +3064,9 @@ function PullTriage({
   onSaveTriage,
   onRequestReviewers,
 }: {
+  repoLabels: GitHubRepoLabel[];
+  repoAssignees: GitHubUser[];
+  repoMilestones: GitHubRepoMilestone[];
   labelDraft: string;
   assigneeDraft: string;
   milestoneDraft: string;
@@ -2919,26 +3104,17 @@ function PullTriage({
         )}
       </div>
       <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,0.7fr)_auto]">
-        <Input
-          value={labelDraft}
-          onChange={(e) => onLabelDraftChange(e.target.value)}
-          placeholder="Labels, comma separated"
-          className="h-8 text-xs"
+        <LabelAssigneeMilestoneFields
+          repoLabels={repoLabels}
+          repoAssignees={repoAssignees}
+          repoMilestones={repoMilestones}
+          labelDraft={labelDraft}
+          assigneeDraft={assigneeDraft}
+          milestoneDraft={milestoneDraft}
           disabled={isBusy}
-        />
-        <Input
-          value={assigneeDraft}
-          onChange={(e) => onAssigneeDraftChange(e.target.value)}
-          placeholder="Assignees, comma separated"
-          className="h-8 text-xs"
-          disabled={isBusy}
-        />
-        <Input
-          value={milestoneDraft}
-          onChange={(e) => onMilestoneDraftChange(e.target.value)}
-          placeholder="Milestone number"
-          className="h-8 text-xs"
-          disabled={isBusy}
+          onLabelDraftChange={onLabelDraftChange}
+          onAssigneeDraftChange={onAssigneeDraftChange}
+          onMilestoneDraftChange={onMilestoneDraftChange}
         />
         <Button size="sm" variant="outline" disabled={isBusy} onClick={onSaveTriage}>
           {busy === "labels" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Tag className="mr-2 size-3.5" />}

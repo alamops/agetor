@@ -75,6 +75,7 @@ import {
   getGitHubPullDiff,
   getGitHubPullMergeability,
   getGitHubPullReviewThreads,
+  listGitHubAssignees,
   listGitHubComments,
   listGitHubItems,
   listGitHubLabels,
@@ -602,6 +603,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
           }
           const result = await deleteGitHubLabel({ dir, name: body.name });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/assignees": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubAssignees({ dir });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
