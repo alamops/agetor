@@ -618,9 +618,11 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
 
   let url: URL;
   if (useSearch) {
+    // One page of 100 keeps the tighter Search rate limit (~30/min) from being
+    // hit by the 3× fan-out the list endpoints use.
     url = new URL("https://api.github.com/search/issues");
     url.searchParams.set("q", buildSearchQuery(slug, input));
-    url.searchParams.set("per_page", "50");
+    url.searchParams.set("per_page", "100");
   } else {
     const endpoint = input.kind === "pulls" ? "pulls" : "issues";
     url = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/${endpoint}`);
@@ -630,16 +632,21 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
     if (input.kind === "issues" && assignee) url.searchParams.set("assignee", assignee);
   }
 
+  const maxPages = useSearch ? 1 : 3;
   const items: GitHubListItem[] = [];
   let next: string | null = url.toString();
-  for (let page = 0; next && page < 3; page++) {
+  for (let page = 0; next && page < maxPages; page++) {
     const res = await fetchGitHub(next, token, "application/vnd.github+json");
     if (!("status" in res)) return res;
     const body = await res.json().catch(() => null);
     if (!res.ok) {
-      const msg = body && typeof body === "object" && "message" in body
+      let msg = body && typeof body === "object" && "message" in body
         ? String((body as { message: unknown }).message)
         : `${res.status} ${res.statusText}`;
+      // The Search API is rate-limited far tighter than the core API (~30/min).
+      if (useSearch && res.status === 403 && /rate limit/i.test(msg)) {
+        msg = "GitHub search is rate-limited (~30 requests/minute) — wait a moment and try again.";
+      }
       return { ok: false, error: msg };
     }
     // The list endpoints return a bare array; search wraps items in `.items`.

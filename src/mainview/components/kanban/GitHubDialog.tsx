@@ -626,6 +626,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       const have = new Set(item.assignees.map((a) => a.login.toLowerCase()));
       if (!have.has(assigneeFilter)) return false;
     }
+    // Involvement filters are served by the Search API; re-apply the ones a list
+    // item can prove so an optimistic upsert doesn't insert a non-matching item
+    // (`reviewRequested` isn't derivable from a list item, so it's accepted).
+    if (viewerLogin) {
+      if (createdByMe && item.author?.login !== viewerLogin) return false;
+      if (assignedToMe && !item.assignees.some((a) => a.login === viewerLogin)) return false;
+    }
     return true;
   };
 
@@ -1146,32 +1153,46 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         </datalist>
         <div className="col-span-full flex flex-wrap items-center gap-1.5">
           <span className="text-[11px] text-muted-foreground">Mine:</span>
-          <Button
-            size="sm"
-            variant={createdByMe ? "secondary" : "ghost"}
-            className="h-6 px-2 text-[11px]"
-            onClick={() => setCreatedByMe((v) => !v)}
-          >
-            Created
-          </Button>
-          <Button
-            size="sm"
-            variant={assignedToMe ? "secondary" : "ghost"}
-            className="h-6 px-2 text-[11px]"
-            onClick={() => setAssignedToMe((v) => !v)}
-          >
-            Assigned
-          </Button>
-          {kind === "pulls" && (
-            <Button
-              size="sm"
-              variant={reviewRequested ? "secondary" : "ghost"}
-              className="h-6 px-2 text-[11px]"
-              onClick={() => setReviewRequested((v) => !v)}
-            >
-              Review requested
-            </Button>
-          )}
+          {(() => {
+            const unauth = result?.auth === "none";
+            const hint = unauth ? "Sign in to GitHub to filter by your own involvement" : undefined;
+            return (
+              <>
+                <Button
+                  size="sm"
+                  variant={createdByMe ? "secondary" : "ghost"}
+                  className="h-6 px-2 text-[11px]"
+                  disabled={unauth}
+                  title={hint}
+                  onClick={() => setCreatedByMe((v) => !v)}
+                >
+                  Created
+                </Button>
+                <Button
+                  size="sm"
+                  variant={assignedToMe ? "secondary" : "ghost"}
+                  className="h-6 px-2 text-[11px]"
+                  disabled={unauth}
+                  title={hint}
+                  onClick={() => setAssignedToMe((v) => !v)}
+                >
+                  Assigned
+                </Button>
+                {kind === "pulls" && (
+                  <Button
+                    size="sm"
+                    variant={reviewRequested ? "secondary" : "ghost"}
+                    className="h-6 px-2 text-[11px]"
+                    disabled={unauth}
+                    title={hint}
+                    onClick={() => setReviewRequested((v) => !v)}
+                  >
+                    Review requested
+                  </Button>
+                )}
+              </>
+            );
+          })()}
         </div>
       </div>
 
