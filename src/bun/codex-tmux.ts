@@ -17,6 +17,7 @@ import { dataDir } from "./db.ts";
 import { resolveTmuxBin } from "./tmux-resolution.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import {
+  deathTickOutcome,
   fileWrittenWithin,
   killSessionByName,
   sessionExistsByName,
@@ -373,9 +374,14 @@ function startCodexTailer(state: CodexSessionState): Promise<number> {
   let misses = 0;
   state.deathTimer = setInterval(() => {
     tryWatch();
-    if (sessionLiveness(state.sessionName) !== "gone") { misses = 0; return; }
-    if (fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS)) { misses = 0; return; }
-    if (++misses < DEATH_MISS_THRESHOLD) return;
+    const outcome = deathTickOutcome({
+      liveness: sessionLiveness(state.sessionName),
+      logFresh: fileWrittenWithin(state.logPath, DEATH_JSONL_QUIET_MS),
+      misses,
+      threshold: DEATH_MISS_THRESHOLD,
+    });
+    if (outcome === "reset") { misses = 0; return; }
+    if (outcome === "wait") { misses++; return; }
     // Session gone. Give the FS a beat to surface the final bytes, flush, then
     // resolve with whatever terminal code we saw (default: failed — a codex
     // exec that vanished without `turn.completed` did not succeed).

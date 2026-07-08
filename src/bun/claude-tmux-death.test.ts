@@ -8,7 +8,7 @@ import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-death-"));
 
-const { __forTest, sessionLiveness, fileWrittenWithin } = await import("./claude-tmux.ts");
+const { __forTest, sessionLiveness, fileWrittenWithin, deathTickOutcome } = await import("./claude-tmux.ts");
 
 /** Write an executable fake `tmux` that emits `stderr` and exits `code`, then
  *  point AGETOR_TMUX_BIN at it. Returns a restore fn. */
@@ -99,18 +99,48 @@ test("sessionLiveness: 'can't find session' with a responsive server is gone", (
   try { expect(sessionLiveness("agetor-x")).toBe("gone"); } finally { restore(); }
 });
 
-test("sessionLiveness: a transient server failure is unreachable, NOT gone", () => {
-  // The regression: a busy/unreachable shared tmux server must never be read as
-  // a dead session — that abandoned live, working sessions.
+test("sessionLiveness: ONLY a busy-server EAGAIN (or empty message) is unreachable", () => {
+  // The regression: the busy shared tmux server too swamped to answer must never
+  // be read as a dead session — that's what abandoned live, working sessions.
   for (const stderr of [
-    "no server running on /tmp/tmux-501/default",
     "error connecting to /tmp/tmux-501/default (Resource temporarily unavailable)",
-    "lost server",
-    "", // a torn-down client can exit non-zero with no message
+    "resource temporarily unavailable",
+    "", // a torn-down client can exit non-zero with no diagnostics
   ]) {
     const restore = fakeTmux(1, stderr);
     try { expect(sessionLiveness("agetor-x")).toBe("unreachable"); } finally { restore(); }
   }
+});
+
+test("sessionLiveness: a definitively-dead session OR server is gone", () => {
+  // During an in-flight turn our own session keeps the shared server alive, so a
+  // server reporting "no server running"/"lost server" has died WITH our session
+  // — a real death, not a transient. Keeps live death detection (finding: don't
+  // lump these into `unreachable`).
+  for (const stderr of [
+    "can't find session: agetor-x",
+    "session not found: agetor-x",
+    "no server running on /tmp/tmux-501/default",
+    "lost server",
+    "error connecting to /tmp/tmux-501/default (No such file or directory)",
+    "some unrecognized tmux error",
+  ]) {
+    const restore = fakeTmux(1, stderr);
+    try { expect(sessionLiveness("agetor-x")).toBe("gone"); } finally { restore(); }
+  }
+});
+
+test("deathTickOutcome: only consecutive gone+stale ticks fire; alive/unreachable/fresh-log reset", () => {
+  const t = 4;
+  // A live or merely-unreachable probe always resets, regardless of accumulated misses.
+  expect(deathTickOutcome({ liveness: "alive", logFresh: false, misses: 3, threshold: t })).toBe("reset");
+  expect(deathTickOutcome({ liveness: "unreachable", logFresh: false, misses: 3, threshold: t })).toBe("reset");
+  // A `gone` probe is vetoed by a freshly-written log (agent provably alive).
+  expect(deathTickOutcome({ liveness: "gone", logFresh: true, misses: 3, threshold: t })).toBe("reset");
+  // `gone` + stale log accumulates, then fires on the threshold-th consecutive tick.
+  expect(deathTickOutcome({ liveness: "gone", logFresh: false, misses: 0, threshold: t })).toBe("wait");
+  expect(deathTickOutcome({ liveness: "gone", logFresh: false, misses: 2, threshold: t })).toBe("wait");
+  expect(deathTickOutcome({ liveness: "gone", logFresh: false, misses: 3, threshold: t })).toBe("fire");
 });
 
 test("fileWrittenWithin: true for a just-written file, false once it ages out, false when missing", () => {
