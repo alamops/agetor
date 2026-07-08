@@ -476,6 +476,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             query: url.searchParams.get("q") ?? "",
             labels,
             assignee,
+            createdByMe: url.searchParams.get("createdByMe") === "1",
+            assignedToMe: url.searchParams.get("assignedToMe") === "1",
+            reviewRequested: url.searchParams.get("reviewRequested") === "1",
           });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });

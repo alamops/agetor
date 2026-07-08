@@ -103,6 +103,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [query, setQuery] = useState("");
   const [labels, setLabels] = useState("");
   const [assignee, setAssignee] = useState("");
+  // "Involvement" quick filters (served via the Search API on the backend).
+  const [createdByMe, setCreatedByMe] = useState(false);
+  const [assignedToMe, setAssignedToMe] = useState(false);
+  const [reviewRequested, setReviewRequested] = useState(false);
   const [result, setResult] = useState<GitHubListResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -213,6 +217,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         query,
         labels: splitLabels(labels),
         assignee,
+        createdByMe,
+        assignedToMe,
+        reviewRequested: kind === "pulls" && reviewRequested,
       });
       if (requestId !== requestSeq.current) return;
       setResult(next);
@@ -234,7 +241,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     const t = setTimeout(() => { void load(requestId); }, 250);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, projectPath, kind, state, query, labels, assignee]);
+  }, [open, projectPath, kind, state, query, labels, assignee, createdByMe, assignedToMe, reviewRequested]);
 
   useEffect(() => {
     diffSeq.current += 1;
@@ -280,7 +287,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setActionErrors({});
     setActionMessages({});
     setActionSource({});
-  }, [projectPath, kind, state, query, labels, assignee]);
+  }, [projectPath, kind, state, query, labels, assignee, createdByMe, assignedToMe, reviewRequested]);
+
+  // "Review requested" is a PR-only qualifier — drop it when viewing issues.
+  useEffect(() => {
+    if (kind !== "pulls") setReviewRequested(false);
+  }, [kind]);
 
   useEffect(() => {
     setIssueComposerOpen(false);
@@ -1132,6 +1144,35 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         <datalist id="github-dialog-labels">
           {availableLabels.map((label) => <option key={label} value={label} />)}
         </datalist>
+        <div className="col-span-full flex flex-wrap items-center gap-1.5">
+          <span className="text-[11px] text-muted-foreground">Mine:</span>
+          <Button
+            size="sm"
+            variant={createdByMe ? "secondary" : "ghost"}
+            className="h-6 px-2 text-[11px]"
+            onClick={() => setCreatedByMe((v) => !v)}
+          >
+            Created
+          </Button>
+          <Button
+            size="sm"
+            variant={assignedToMe ? "secondary" : "ghost"}
+            className="h-6 px-2 text-[11px]"
+            onClick={() => setAssignedToMe((v) => !v)}
+          >
+            Assigned
+          </Button>
+          {kind === "pulls" && (
+            <Button
+              size="sm"
+              variant={reviewRequested ? "secondary" : "ghost"}
+              className="h-6 px-2 text-[11px]"
+              onClick={() => setReviewRequested((v) => !v)}
+            >
+              Review requested
+            </Button>
+          )}
+        </div>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">

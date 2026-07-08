@@ -50,6 +50,12 @@ interface ListGitHubItemsInput {
   query?: string;
   labels?: string[];
   assignee?: string;
+  // "Involvement" filters keyed to the authenticated user. When any is set the
+  // list is served by the Search API (`author:@me` etc.), since the plain
+  // /pulls and /issues list endpoints can't filter a PR by author/reviewer.
+  createdByMe?: boolean;
+  assignedToMe?: boolean;
+  reviewRequested?: boolean;
 }
 
 interface GetGitHubPullDiffInput {
@@ -331,6 +337,7 @@ export const __githubInternals = {
   commentUrl,
   parseReviewThreads,
   reviewThreadsHasNextPage,
+  buildSearchQuery,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -580,22 +587,47 @@ async function pullHeadSha(repo: GitHubRepo, token: string | null, number: numbe
   return sha ?? { ok: false, error: "GitHub returned a pull request without a head sha" };
 }
 
+/** Build the `q` for the Search API from the "involvement" filters (and labels /
+ *  assignee / state, which search can also express). Pure — unit-tested. */
+function buildSearchQuery(slug: string, input: ListGitHubItemsInput): string {
+  const parts: string[] = [`repo:${slug}`, `is:${input.kind === "pulls" ? "pr" : "issue"}`];
+  if (input.state === "open" || input.state === "closed") parts.push(`is:${input.state}`);
+  for (const l of input.labels?.map((s) => s.trim()).filter(Boolean) ?? []) parts.push(`label:${JSON.stringify(l)}`);
+  if (input.createdByMe) parts.push("author:@me");
+  const assignee = input.assignee?.trim();
+  if (input.assignedToMe) parts.push("assignee:@me");
+  else if (assignee) parts.push(`assignee:${assignee}`);
+  if (input.reviewRequested && input.kind === "pulls") parts.push("review-requested:@me");
+  return parts.join(" ");
+}
+
 export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitHubListResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
   const token = await githubToken();
+  const slug = repoSlug(repo);
   const labels = input.labels?.map((s) => s.trim()).filter(Boolean) ?? [];
   const assignee = input.assignee?.trim() ?? "";
-  const endpoint = input.kind === "pulls" ? "pulls" : "issues";
-  const url = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/${endpoint}`);
-  url.searchParams.set("state", input.state);
-  url.searchParams.set("per_page", "50");
-  if (input.kind === "issues" && labels.length > 0) {
-    url.searchParams.set("labels", labels.join(","));
+  // @me / review-requested need the Search API — the list endpoints can't filter
+  // a PR by author or reviewer. Requires auth (`@me` resolves to the token user).
+  const useSearch = !!(input.createdByMe || input.assignedToMe || input.reviewRequested);
+  if (useSearch && !token) {
+    return { ok: false, error: "GitHub authentication required to filter by your own involvement" };
   }
-  if (input.kind === "issues" && assignee) {
-    url.searchParams.set("assignee", assignee);
+
+  let url: URL;
+  if (useSearch) {
+    url = new URL("https://api.github.com/search/issues");
+    url.searchParams.set("q", buildSearchQuery(slug, input));
+    url.searchParams.set("per_page", "50");
+  } else {
+    const endpoint = input.kind === "pulls" ? "pulls" : "issues";
+    url = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/${endpoint}`);
+    url.searchParams.set("state", input.state);
+    url.searchParams.set("per_page", "50");
+    if (input.kind === "issues" && labels.length > 0) url.searchParams.set("labels", labels.join(","));
+    if (input.kind === "issues" && assignee) url.searchParams.set("assignee", assignee);
   }
 
   const items: GitHubListItem[] = [];
@@ -610,18 +642,25 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
         : `${res.status} ${res.statusText}`;
       return { ok: false, error: msg };
     }
-    if (!Array.isArray(body)) return { ok: false, error: "GitHub returned an unexpected response" };
-    for (const raw of body) {
-      if (input.kind === "issues" && raw && typeof raw === "object" && "pull_request" in raw) continue;
+    // The list endpoints return a bare array; search wraps items in `.items`.
+    const raws = useSearch
+      ? (body && typeof body === "object" && Array.isArray((body as { items?: unknown }).items) ? (body as { items: unknown[] }).items : null)
+      : (Array.isArray(body) ? body : null);
+    if (!raws) return { ok: false, error: "GitHub returned an unexpected response" };
+    // In search mode the qualifiers already scoped labels/assignee server-side,
+    // so only the free-text query is refined client-side.
+    const clientLabels = useSearch ? [] : (input.kind === "pulls" ? labels : []);
+    const clientAssignee = useSearch ? "" : (input.kind === "pulls" ? assignee : "");
+    for (const raw of raws) {
+      if (!useSearch && input.kind === "issues" && raw && typeof raw === "object" && "pull_request" in raw) continue;
       const item = normalizeItem(input.kind, raw);
-      if (item && matchesFilters(item, input.query ?? "", input.kind === "pulls" ? labels : [], input.kind === "pulls" ? assignee : "")) {
+      if (item && matchesFilters(item, input.query ?? "", clientLabels, clientAssignee)) {
         items.push(item);
       }
     }
     next = pageLinks(res.headers.get("link"));
   }
 
-  const slug = repoSlug(repo);
   return {
     ok: true,
     repo: slug,

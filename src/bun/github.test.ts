@@ -15,6 +15,7 @@ const {
   commentUrl,
   parseReviewThreads,
   reviewThreadsHasNextPage,
+  buildSearchQuery,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -225,6 +226,20 @@ test("reviewThreadsHasNextPage reads pageInfo.hasNextPage, defaulting false", ()
   expect(reviewThreadsHasNextPage(page(false))).toBe(false);
   expect(reviewThreadsHasNextPage({ data: { repository: { pullRequest: {} } } })).toBe(false);
   expect(reviewThreadsHasNextPage(null)).toBe(false);
+});
+
+test("buildSearchQuery composes repo/kind/state + involvement + label/assignee qualifiers", () => {
+  const base = { dir: "/x", kind: "pulls" as const, state: "open" as const };
+  expect(buildSearchQuery("o/r", { ...base, createdByMe: true }))
+    .toBe("repo:o/r is:pr is:open author:@me");
+  expect(buildSearchQuery("o/r", { ...base, assignedToMe: true, reviewRequested: true }))
+    .toBe("repo:o/r is:pr is:open assignee:@me review-requested:@me");
+  // review-requested is PR-only; a label with a space is quoted; "all" state omits is:
+  expect(buildSearchQuery("o/r", { dir: "/x", kind: "issues", state: "all", labels: ["needs review", "bug"], reviewRequested: true, assignedToMe: true }))
+    .toBe('repo:o/r is:issue label:"needs review" label:"bug" assignee:@me');
+  // a free-text assignee is used when assignedToMe is off
+  expect(buildSearchQuery("o/r", { ...base, assignee: "alice" }))
+    .toBe("repo:o/r is:pr is:open assignee:alice");
 });
 
 test("commentUrl maps kind to the right endpoint segment", () => {
