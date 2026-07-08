@@ -64,9 +64,11 @@ import {
   createGitHubIssue,
   createGitHubPull,
   createGitHubLabel,
+  createGitHubMilestone,
   createGitHubPullLineComment,
   deleteGitHubComment,
   deleteGitHubLabel,
+  deleteGitHubMilestone,
   getGitHubPullChecks,
   getGitHubViewer,
   getGitHubPullDefaults,
@@ -76,6 +78,7 @@ import {
   listGitHubComments,
   listGitHubItems,
   listGitHubLabels,
+  listGitHubMilestones,
   listGitHubPullReviewComments,
   mergeGitHubPull,
   reopenGitHubPull,
@@ -87,6 +90,7 @@ import {
   updateGitHubComment,
   updateGitHubIssue,
   updateGitHubLabel,
+  updateGitHubMilestone,
   updateGitHubPullBranch,
 } from "./github.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -598,6 +602,89 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
           }
           const result = await deleteGitHubLabel({ dir, name: body.name });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/milestones": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubMilestones({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            title?: string;
+            description?: string;
+            dueOn?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.title !== "string" || !body.title.trim()) {
+            return json({ error: "milestone title required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubMilestone({
+            dir,
+            title: body.title,
+            description: typeof body.description === "string" ? body.description : undefined,
+            dueOn: typeof body.dueOn === "string" ? body.dueOn : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/milestone-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            title?: string;
+            description?: string;
+            dueOn?: string | null;
+            state?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.number !== "number") {
+            return json({ error: "milestone number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const state = body.state === "open" || body.state === "closed" ? body.state : undefined;
+          const result = await updateGitHubMilestone({
+            dir,
+            number: body.number,
+            title: typeof body.title === "string" ? body.title : undefined,
+            description: typeof body.description === "string" ? body.description : undefined,
+            dueOn: body.dueOn === null || typeof body.dueOn === "string" ? body.dueOn : undefined,
+            state,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/milestone-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.number !== "number") {
+            return json({ error: "milestone number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubMilestone({ dir, number: body.number });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

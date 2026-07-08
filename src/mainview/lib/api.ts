@@ -13,6 +13,8 @@ import type {
   GitHubChecksResult,
   GitHubLabelsResult,
   GitHubRepoLabel,
+  GitHubMilestonesResult,
+  GitHubRepoMilestone,
   GitHubListResult,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
@@ -58,6 +60,8 @@ export type {
   GitHubItemState,
   GitHubLabelsResult,
   GitHubRepoLabel,
+  GitHubMilestonesResult,
+  GitHubRepoMilestone,
   GitHubListResult,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
@@ -399,6 +403,32 @@ export const api = {
     }),
   deleteGitHubLabel: (input: { path: string; name: string }) =>
     j<{ ok: true; message?: string }>("/github/label-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubMilestones: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubMilestonesResult>(`/github/milestones?${q.toString()}`);
+  },
+  createGitHubMilestone: (input: { path: string; title: string; description?: string; dueOn?: string }) =>
+    j<{ ok: true; milestone: GitHubRepoMilestone }>("/github/milestones", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubMilestone: (input: {
+    path: string;
+    number: number;
+    title?: string;
+    description?: string;
+    dueOn?: string | null;
+    state?: "open" | "closed";
+  }) =>
+    j<{ ok: true; milestone: GitHubRepoMilestone }>("/github/milestone-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubMilestone: (input: { path: string; number: number }) =>
+    j<{ ok: true; message?: string }>("/github/milestone-delete", {
       method: "POST",
       body: JSON.stringify(input),
     }),

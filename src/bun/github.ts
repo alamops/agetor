@@ -12,6 +12,8 @@ import type {
   GitHubListResult,
   GitHubRepoLabel,
   GitHubMilestone,
+  GitHubMilestonesResult,
+  GitHubRepoMilestone,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
   GitHubPullMergeability,
@@ -198,6 +200,27 @@ interface DeleteGitHubLabelInput {
   name: string;
 }
 
+interface CreateGitHubMilestoneInput {
+  dir: string;
+  title: string;
+  description?: string;
+  dueOn?: string;
+}
+
+interface UpdateGitHubMilestoneInput {
+  dir: string;
+  number: number;
+  title?: string;
+  description?: string;
+  dueOn?: string | null;
+  state?: "open" | "closed";
+}
+
+interface DeleteGitHubMilestoneInput {
+  dir: string;
+  number: number;
+}
+
 interface GitHubListError {
   ok: false;
   error: string;
@@ -215,6 +238,8 @@ type GitHubPullDraftResponse = ({ ok: true; draft: boolean; message?: string }) 
 type GitHubViewerResponse = ({ ok: true; login: string }) | GitHubListError;
 type GitHubLabelsResponse = ({ ok: true } & GitHubLabelsResult) | GitHubListError;
 type GitHubLabelResponse = ({ ok: true; label: GitHubRepoLabel }) | GitHubListError;
+type GitHubMilestonesResponse = ({ ok: true } & GitHubMilestonesResult) | GitHubListError;
+type GitHubMilestoneResponse = ({ ok: true; milestone: GitHubRepoMilestone }) | GitHubListError;
 type GitHubReviewThreadsResponse = ({ ok: true } & GitHubPullReviewThreadsResult) | GitHubListError;
 type GitHubThreadResolveResponse = ({ ok: true; resolved: boolean; message?: string }) | GitHubListError;
 type GitHubActionResponse = ({ ok: true; message?: string; item?: GitHubListItem; commentPosted?: boolean }) | GitHubListError;
@@ -367,6 +392,8 @@ export const __githubInternals = {
   buildSearchQuery,
   normalizeColor,
   normalizeRepoLabel,
+  normalizeRepoMilestone,
+  normalizeDueOn,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -1725,4 +1752,132 @@ export async function deleteGitHubLabel(input: DeleteGitHubLabelInput): Promise<
     return { ok: false, error: apiError(json, res.status, res.statusText) };
   }
   return { ok: true, message: "Label deleted." };
+}
+
+function normalizeRepoMilestone(raw: unknown): GitHubRepoMilestone | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.number !== "number" || typeof obj.title !== "string") return null;
+  return {
+    number: obj.number,
+    title: obj.title,
+    state: obj.state === "closed" ? "closed" : "open",
+    description: typeof obj.description === "string" ? obj.description : "",
+    dueOn: typeof obj.due_on === "string" ? obj.due_on : null,
+    openIssues: typeof obj.open_issues === "number" ? obj.open_issues : 0,
+    closedIssues: typeof obj.closed_issues === "number" ? obj.closed_issues : 0,
+    htmlUrl: typeof obj.html_url === "string" ? obj.html_url : "",
+  };
+}
+
+/** GitHub's milestone `due_on` wants ISO8601. The UI sends a bare `YYYY-MM-DD`
+ *  from a date input, which we widen to midnight UTC. A full ISO string passes
+ *  through untouched; blank/whitespace becomes undefined (= "no change"). */
+function normalizeDueOn(dueOn: string | null | undefined): string | undefined {
+  if (dueOn == null) return undefined;
+  const trimmed = dueOn.trim();
+  if (!trimmed) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return `${trimmed}T00:00:00Z`;
+  return trimmed;
+}
+
+export async function listGitHubMilestones(input: { dir: string }): Promise<GitHubMilestonesResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+
+  const token = await githubToken();
+  const milestones: GitHubRepoMilestone[] = [];
+  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones?state=all&per_page=100&sort=due_on&direction=asc`;
+  for (let page = 0; next && page < 3; page++) {
+    const res = await fetchGitHub(next, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: apiError(body, res.status, res.statusText) };
+    if (!Array.isArray(body)) return { ok: false, error: "GitHub returned an unexpected milestones response" };
+    for (const raw of body) {
+      const milestone = normalizeRepoMilestone(raw);
+      if (milestone) milestones.push(milestone);
+    }
+    next = pageLinks(res.headers.get("link"));
+  }
+  return { ok: true, repo: repoSlug(repo), milestones };
+}
+
+export async function createGitHubMilestone(input: CreateGitHubMilestoneInput): Promise<GitHubMilestoneResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const title = input.title.trim();
+  if (!title) return { ok: false, error: "milestone title required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to create a milestone" };
+  const dueOn = normalizeDueOn(input.dueOn);
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones`;
+  const res = await fetchGitHub(
+    url,
+    token,
+    "application/vnd.github+json",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        title,
+        ...(input.description?.trim() ? { description: input.description.trim() } : {}),
+        ...(dueOn ? { due_on: dueOn } : {}),
+      }),
+    },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const milestone = normalizeRepoMilestone(json);
+  if (!milestone) return { ok: false, error: "GitHub returned an unexpected milestone response" };
+  return { ok: true, milestone };
+}
+
+export async function updateGitHubMilestone(input: UpdateGitHubMilestoneInput): Promise<GitHubMilestoneResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) return { ok: false, error: "valid milestone number required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to edit a milestone" };
+  const patch: { title?: string; description?: string; due_on?: string; state?: "open" | "closed" } = {};
+  if (input.title !== undefined) {
+    const t = input.title.trim();
+    if (!t) return { ok: false, error: "milestone title cannot be empty" };
+    patch.title = t;
+  }
+  if (input.description !== undefined) patch.description = input.description;
+  const dueOn = normalizeDueOn(input.dueOn);
+  if (dueOn !== undefined) patch.due_on = dueOn;
+  if (input.state) patch.state = input.state;
+  if (Object.keys(patch).length === 0) {
+    return { ok: false, error: "milestone update requires a title, description, due date, or state" };
+  }
+
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones/${input.number}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "PATCH", body: JSON.stringify(patch) });
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const milestone = normalizeRepoMilestone(json);
+  if (!milestone) return { ok: false, error: "GitHub returned an unexpected milestone response" };
+  return { ok: true, milestone };
+}
+
+export async function deleteGitHubMilestone(input: DeleteGitHubMilestoneInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) return { ok: false, error: "valid milestone number required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to delete a milestone" };
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones/${input.number}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "DELETE" });
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, message: "Milestone deleted." };
 }

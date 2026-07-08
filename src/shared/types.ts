@@ -691,6 +691,25 @@ export interface GitHubMilestone {
   title: string;
 }
 
+/** A repository milestone as returned by the milestone-management endpoints
+ *  (carries state, description, due date and issue counts, unlike the lighter
+ *  GitHubMilestone embedded in an item). `dueOn` is an ISO8601 string or null. */
+export interface GitHubRepoMilestone {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  description: string;
+  dueOn: string | null;
+  openIssues: number;
+  closedIssues: number;
+  htmlUrl: string;
+}
+
+export interface GitHubMilestonesResult {
+  repo: string;
+  milestones: GitHubRepoMilestone[];
+}
+
 export interface GitHubListItem {
   kind: GitHubItemKind;
   number: number;

@@ -18,6 +18,8 @@ const {
   buildSearchQuery,
   normalizeColor,
   normalizeRepoLabel,
+  normalizeRepoMilestone,
+  normalizeDueOn,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -266,6 +268,55 @@ test("normalizeRepoLabel defaults color/description and drops nameless entries",
   // no name / junk → null
   expect(normalizeRepoLabel({ color: "fff" })).toBeNull();
   expect(normalizeRepoLabel(null)).toBeNull();
+});
+
+test("normalizeRepoMilestone maps snake_case, defaults, and drops invalid entries", () => {
+  expect(
+    normalizeRepoMilestone({
+      number: 3,
+      title: "v1.0",
+      state: "closed",
+      description: "first release",
+      due_on: "2026-07-08T00:00:00Z",
+      open_issues: 2,
+      closed_issues: 5,
+      html_url: "https://github.com/o/r/milestone/3",
+    }),
+  ).toEqual({
+    number: 3,
+    title: "v1.0",
+    state: "closed",
+    description: "first release",
+    dueOn: "2026-07-08T00:00:00Z",
+    openIssues: 2,
+    closedIssues: 5,
+    htmlUrl: "https://github.com/o/r/milestone/3",
+  });
+  // missing fields default; unknown state → "open"
+  expect(normalizeRepoMilestone({ number: 1, title: "backlog" })).toEqual({
+    number: 1,
+    title: "backlog",
+    state: "open",
+    description: "",
+    dueOn: null,
+    openIssues: 0,
+    closedIssues: 0,
+    htmlUrl: "",
+  });
+  // no number/title → null
+  expect(normalizeRepoMilestone({ title: "x" })).toBeNull();
+  expect(normalizeRepoMilestone({ number: 2 })).toBeNull();
+  expect(normalizeRepoMilestone(null)).toBeNull();
+});
+
+test("normalizeDueOn widens a bare date, passes through ISO, and blanks to undefined", () => {
+  expect(normalizeDueOn("2026-07-08")).toBe("2026-07-08T00:00:00Z");
+  expect(normalizeDueOn("2026-07-08T09:30:00Z")).toBe("2026-07-08T09:30:00Z");
+  expect(normalizeDueOn("  2026-07-08  ")).toBe("2026-07-08T00:00:00Z");
+  expect(normalizeDueOn("")).toBeUndefined();
+  expect(normalizeDueOn("   ")).toBeUndefined();
+  expect(normalizeDueOn(null)).toBeUndefined();
+  expect(normalizeDueOn(undefined)).toBeUndefined();
 });
 
 test("commentUrl maps kind to the right endpoint segment", () => {

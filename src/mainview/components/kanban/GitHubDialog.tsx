@@ -16,6 +16,7 @@ import {
   GitPullRequest,
   Loader2,
   MessageSquare,
+  Milestone,
   Plus,
   RefreshCw,
   Search,
@@ -47,6 +48,7 @@ import type {
   GitHubPullLineComment,
   GitHubPullMergeability,
   GitHubRepoLabel,
+  GitHubRepoMilestone,
   GitHubReviewThread,
   Project,
   TaskDiff,
@@ -124,6 +126,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // All repo labels (powers the label datalist + the label manager).
   const [repoLabels, setRepoLabels] = useState<GitHubRepoLabel[]>([]);
   const [labelManagerOpen, setLabelManagerOpen] = useState(false);
+  // All repo milestones (powers the milestone manager).
+  const [repoMilestones, setRepoMilestones] = useState<GitHubRepoMilestone[]>([]);
+  const [milestoneManagerOpen, setMilestoneManagerOpen] = useState(false);
   // The viewer login is token-scoped (identical across projects), so resolve it
   // once per session rather than on every open / project switch. A failed lookup
   // (e.g. the first project has no GitHub remote) leaves it unresolved so a later
@@ -414,6 +419,74 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     api.listGitHubLabels({ path: projectPath })
       .then((r) => { if (!cancelled) setRepoLabels(r.labels); })
       .catch(() => { if (!cancelled) setRepoLabels([]); });
+    return () => { cancelled = true; };
+  }, [open, projectPath]);
+
+  const refreshRepoMilestones = async () => {
+    if (!projectPath) return;
+    try {
+      const r = await api.listGitHubMilestones({ path: projectPath });
+      setRepoMilestones(r.milestones);
+    } catch {
+      // Milestones are convenience (manager only); ignore fetch failures.
+    }
+  };
+
+  // Sort open milestones before closed, then by due date (undated last), then title.
+  const sortMilestones = (ms: GitHubRepoMilestone[]) =>
+    [...ms].sort((a, b) => {
+      if (a.state !== b.state) return a.state === "open" ? -1 : 1;
+      if (a.dueOn !== b.dueOn) {
+        if (!a.dueOn) return 1;
+        if (!b.dueOn) return -1;
+        return a.dueOn.localeCompare(b.dueOn);
+      }
+      return a.title.localeCompare(b.title);
+    });
+
+  const createMilestone = async (title: string, description: string, dueOn: string) => {
+    if (!projectPath) throw new Error("no project selected");
+    const { milestone } = await api.createGitHubMilestone({ path: projectPath, title, description, dueOn: dueOn || undefined });
+    setRepoMilestones((cur) => sortMilestones([...cur, milestone]));
+  };
+
+  const editMilestone = async (
+    number: number,
+    patch: { title?: string; description?: string; dueOn?: string | null; state?: "open" | "closed" },
+  ) => {
+    if (!projectPath) throw new Error("no project selected");
+    const { milestone } = await api.updateGitHubMilestone({ path: projectPath, number, ...patch });
+    setRepoMilestones((cur) => sortMilestones(cur.map((m) => (m.number === number ? milestone : m))));
+    // Reconcile the renamed milestone on any loaded item so its badge stays fresh.
+    setResult((cur) => cur && {
+      ...cur,
+      items: cur.items.map((it) =>
+        it.milestone && it.milestone.number === number
+          ? { ...it, milestone: { number: milestone.number, title: milestone.title } }
+          : it,
+      ),
+    });
+  };
+
+  const removeMilestone = async (number: number) => {
+    if (!projectPath) throw new Error("no project selected");
+    await api.deleteGitHubMilestone({ path: projectPath, number });
+    setRepoMilestones((cur) => cur.filter((m) => m.number !== number));
+    // Drop the deleted milestone from any loaded item that carried it.
+    setResult((cur) => cur && {
+      ...cur,
+      items: cur.items.map((it) =>
+        it.milestone && it.milestone.number === number ? { ...it, milestone: null } : it,
+      ),
+    });
+  };
+
+  useEffect(() => {
+    if (!open || !projectPath) { setRepoMilestones([]); return; }
+    let cancelled = false;
+    api.listGitHubMilestones({ path: projectPath })
+      .then((r) => { if (!cancelled) setRepoMilestones(r.milestones); })
+      .catch(() => { if (!cancelled) setRepoMilestones([]); });
     return () => { cancelled = true; };
   }, [open, projectPath]);
 
@@ -1136,9 +1209,19 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title="Manage labels"
             aria-label="Manage labels"
             disabled={!projectPath}
-            onClick={() => setLabelManagerOpen((v) => !v)}
+            onClick={() => { setLabelManagerOpen((v) => !v); setMilestoneManagerOpen(false); }}
           >
             <Tag className="size-4" />
+          </Button>
+          <Button
+            size="icon"
+            variant={milestoneManagerOpen ? "secondary" : "ghost"}
+            title="Manage milestones"
+            aria-label="Manage milestones"
+            disabled={!projectPath}
+            onClick={() => { setMilestoneManagerOpen((v) => !v); setLabelManagerOpen(false); }}
+          >
+            <Milestone className="size-4" />
           </Button>
           {result && (
             <Button
@@ -1311,6 +1394,17 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onDelete={removeLabel}
             onRefresh={() => { void refreshRepoLabels(); }}
             onClose={() => setLabelManagerOpen(false)}
+          />
+        )}
+        {milestoneManagerOpen && (
+          <MilestoneManager
+            milestones={repoMilestones}
+            authenticated={result?.auth !== "none"}
+            onCreate={createMilestone}
+            onEdit={editMilestone}
+            onDelete={removeMilestone}
+            onRefresh={() => { void refreshRepoMilestones(); }}
+            onClose={() => setMilestoneManagerOpen(false)}
           />
         )}
         {kind === "pulls" && (
@@ -1984,6 +2078,244 @@ function LabelRow({
             </>
           ) : (
             <Button size="icon" variant="ghost" className="size-6 text-muted-foreground hover:text-rose-400" title="Delete label" aria-label={`Delete ${label.name}`} disabled={!!busy} onClick={() => setConfirm(true)}>
+              <XCircle className="size-3.5" />
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** An ISO due date → the bare `YYYY-MM-DD` a native date input expects. */
+function dueDateInput(dueOn: string | null): string {
+  return dueOn ? dueOn.slice(0, 10) : "";
+}
+
+function MilestoneManager({
+  milestones,
+  authenticated,
+  onCreate,
+  onEdit,
+  onDelete,
+  onRefresh,
+  onClose,
+}: {
+  milestones: GitHubRepoMilestone[];
+  // A token is present. Note: GitHub still enforces push access — a read-only
+  // collaborator sees the controls but the mutations 403.
+  authenticated: boolean;
+  onCreate: (title: string, description: string, dueOn: string) => Promise<void>;
+  onEdit: (
+    number: number,
+    patch: { title?: string; description?: string; dueOn?: string | null; state?: "open" | "closed" },
+  ) => Promise<void>;
+  onDelete: (number: number) => Promise<void>;
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  const [title, setTitle] = useState("");
+  const [dueOn, setDueOn] = useState("");
+  const [description, setDescription] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const create = async () => {
+    const t = title.trim();
+    if (!t || creating) return;
+    setCreating(true);
+    setError(null);
+    try {
+      await onCreate(t, description, dueOn);
+      setTitle("");
+      setDueOn("");
+      setDescription("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  return (
+    <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <Milestone className="size-3.5" />
+          Milestones ({milestones.length})
+        </div>
+        <div className="flex items-center gap-1">
+          <Button size="icon" variant="ghost" className="size-6" title="Refresh milestones" aria-label="Refresh milestones" onClick={onRefresh}>
+            <RefreshCw className="size-3.5" />
+          </Button>
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      </div>
+      {authenticated && (
+        <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)_auto]">
+          <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" className="h-8 text-xs" disabled={creating} />
+          <Input type="date" value={dueOn} onChange={(e) => setDueOn(e.target.value)} title="Due date (optional)" className="h-8 w-36 text-xs" disabled={creating} />
+          <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description (optional)" className="h-8 text-xs" disabled={creating} />
+          <Button size="sm" disabled={creating || !title.trim()} onClick={() => { void create(); }}>
+            {creating ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
+            Add
+          </Button>
+        </div>
+      )}
+      {error && (
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+      <div className="max-h-56 space-y-1 overflow-y-auto">
+        {milestones.length === 0 ? (
+          <div className="px-1 py-2 text-[11px] text-muted-foreground">No milestones in this repository.</div>
+        ) : (
+          milestones.map((m) => <MilestoneRow key={m.number} milestone={m} authenticated={authenticated} onEdit={onEdit} onDelete={onDelete} />)
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MilestoneRow({
+  milestone,
+  authenticated,
+  onEdit,
+  onDelete,
+}: {
+  milestone: GitHubRepoMilestone;
+  authenticated: boolean;
+  onEdit: (
+    number: number,
+    patch: { title?: string; description?: string; dueOn?: string | null; state?: "open" | "closed" },
+  ) => Promise<void>;
+  onDelete: (number: number) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [title, setTitle] = useState(milestone.title);
+  const [dueOn, setDueOn] = useState(dueDateInput(milestone.dueOn));
+  const [description, setDescription] = useState(milestone.description);
+  const [busy, setBusy] = useState<null | "save" | "delete" | "state">(null);
+  const [confirm, setConfirm] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const reset = () => {
+    setTitle(milestone.title);
+    setDueOn(dueDateInput(milestone.dueOn));
+    setDescription(milestone.description);
+    setError(null);
+  };
+
+  const save = async () => {
+    if (busy || !title.trim()) return;
+    setBusy("save");
+    setError(null);
+    try {
+      // Send dueOn only when the field is non-empty (the API can't clear a due
+      // date), so leaving it blank preserves the existing one.
+      await onEdit(milestone.number, { title: title.trim(), description, ...(dueOn ? { dueOn } : {}) });
+      setEditing(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const toggleState = async () => {
+    if (busy) return;
+    setBusy("state");
+    setError(null);
+    try {
+      await onEdit(milestone.number, { state: milestone.state === "open" ? "closed" : "open" });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const del = async () => {
+    if (busy) return;
+    setBusy("delete");
+    setError(null);
+    try {
+      await onDelete(milestone.number); // success unmounts this row
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(null);
+      setConfirm(false);
+    }
+  };
+
+  if (editing) {
+    return (
+      <div className="rounded border border-border/60 p-2">
+        <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)]">
+          <Input value={title} onChange={(e) => setTitle(e.target.value)} className="h-7 text-xs" disabled={busy === "save"} />
+          <Input type="date" value={dueOn} onChange={(e) => setDueOn(e.target.value)} title="Due date" className="h-7 w-36 text-xs" disabled={busy === "save"} />
+          <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" className="h-7 text-xs" disabled={busy === "save"} />
+        </div>
+        {error && (
+          <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
+            <AlertCircle className="size-3.5" />
+            {error}
+          </div>
+        )}
+        <div className="mt-1 flex justify-end gap-2">
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" disabled={busy === "save"} onClick={() => { setEditing(false); reset(); }}>
+            Cancel
+          </Button>
+          <Button size="sm" className="h-6 px-2 text-[11px]" disabled={busy === "save" || !title.trim()} onClick={() => { void save(); }}>
+            {busy === "save" ? <Loader2 className="mr-1 size-3 animate-spin" /> : <FilePen className="mr-1 size-3" />}
+            Save
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2 rounded px-1 py-1 text-xs">
+      <Milestone className={cn("size-3.5 shrink-0", milestone.state === "closed" ? "text-muted-foreground" : "text-emerald-400")} />
+      <span className={cn("min-w-0 shrink truncate font-medium", milestone.state === "closed" && "text-muted-foreground line-through")}>
+        {milestone.title}
+      </span>
+      <span className="shrink-0 text-[11px] text-muted-foreground">
+        {milestone.openIssues} open · {milestone.closedIssues} closed
+        {milestone.dueOn && ` · due ${dueDateInput(milestone.dueOn)}`}
+      </span>
+      {error && <span className="truncate text-[11px] text-rose-400">{error}</span>}
+      {authenticated && (
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          <Button size="icon" variant="ghost" className="size-6" title="Edit milestone" aria-label={`Edit ${milestone.title}`} disabled={!!busy} onClick={() => { reset(); setEditing(true); }}>
+            <FilePen className="size-3.5" />
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-1.5 text-[11px]"
+            title={milestone.state === "open" ? "Close milestone" : "Reopen milestone"}
+            disabled={!!busy}
+            onClick={() => { void toggleState(); }}
+          >
+            {busy === "state" ? <Loader2 className="size-3 animate-spin" /> : milestone.state === "open" ? "Close" : "Reopen"}
+          </Button>
+          {confirm ? (
+            <>
+              <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-rose-400" disabled={busy === "delete"} onClick={() => { void del(); }}>
+                {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : "Confirm"}
+              </Button>
+              <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" disabled={busy === "delete"} onClick={() => setConfirm(false)}>
+                Cancel
+              </Button>
+            </>
+          ) : (
+            <Button size="icon" variant="ghost" className="size-6 text-muted-foreground hover:text-rose-400" title="Delete milestone" aria-label={`Delete ${milestone.title}`} disabled={!!busy} onClick={() => setConfirm(true)}>
               <XCircle className="size-3.5" />
             </Button>
           )}
