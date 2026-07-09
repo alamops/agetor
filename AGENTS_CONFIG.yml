@@ -1,0 +1,67 @@
+# AGENTS_CONFIG.yml — per-phase model/harness routing for /implement
+#
+# Copy this to your repo root as AGENTS_CONFIG.yml, or let `/implement`
+# generate it for you on first run. Re-run `/implement --config` to change it.
+#
+# A "runner" executes a phase. Three types:
+#   self   — the orchestrator (current session model) does it inline. Only for `planning`.
+#   claude — a Claude Code sub-agent. model: opus | sonnet | haiku | fable
+#   shell  — an external CLI harness invoked via Bash, with a command template.
+#            Placeholders: {PROMPT} {TASK_FILE} {CWD}
+#
+# When a phase lists >1 runner, `strategy` decides:
+#   distribute — split independent tasks across runners (throughput). Default.
+#   race       — run the same task on all runners, orchestrator keeps the best (quality).
+#
+# See references/agents-config.md for the full schema.
+
+version: 1
+
+defaults:
+  strategy: distribute
+  allow_orchestrator_override: true   # let the orchestrator race a risky task in a distribute phase
+  fallback_model: sonnet              # used when a runner can't be resolved
+
+phases:
+  # 1 — parallel research of codebase, git history, and web best practices (read-only)
+  investigate:
+    runners:
+      - { type: claude, model: sonnet, subagent_type: Explore }
+
+  # 3 — the orchestrator writes the plan inline and saves it to docs/plans/
+  planning:
+    runners:
+      - { type: self }
+
+  # 4 — parallel agents on independent, file-disjoint implementation tasks
+  implementation:
+    strategy: distribute
+    runners:
+      - { type: claude, model: sonnet }
+      # Example second harness (uncomment + adjust if you have the Codex CLI):
+      # - type: shell
+      #   model: gpt-5.4-mini
+      #   command: "codex exec --model gpt-5.4-mini --cd {CWD} --full-auto {TASK_FILE}"
+      #   unavailable_fallback: sonnet
+
+  # 5 — review the diff using the code-review skill as the rubric
+  code_review:
+    runners:
+      - { type: claude, model: opus }
+
+  # 6 — parallel agents authoring tests, partitioned by module under test
+  tests_creation:
+    strategy: distribute
+    runners:
+      - { type: claude, model: sonnet }
+
+  # 7 — a single background agent runs the suite and reports results
+  tests_running:
+    runners:
+      - { type: claude, model: haiku }
+
+  # 8 — (conditional) parallel agents fixing failures / must-fix review findings
+  tests_fixes:
+    strategy: distribute
+    runners:
+      - { type: claude, model: sonnet }
