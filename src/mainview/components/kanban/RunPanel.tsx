@@ -1132,16 +1132,17 @@ function RunPanelBody({
 
       {/* Messages backlog — saved drafts to send later. Sits just above the
           composer so the "stash a thought / send it when ready" loop is one
-          glance apart. Hidden when empty, on archived tasks, and on a
-          background-agent (subagent) tab — those streams are read-only, so an
-          interactive tray whose "Send now" targets the main run would sit
-          contradictorily above the read-only footer. Only shown on the Main
-          stream, matching the composer and Stop control. */}
-      {!archived && activeStream === "main" && backlogItems.length > 0 && (
+          glance apart. Hidden when empty and on a background-agent (subagent)
+          tab — those streams are read-only, so an interactive tray whose "Send
+          now" targets the main run would sit contradictorily above the
+          read-only footer. On an archived task the tray still renders, but
+          view-only (`readOnly`), so saved drafts aren't silently invisible. */}
+      {activeStream === "main" && backlogItems.length > 0 && (
         <BacklogTray
           items={backlogItems}
           canSend={canSend && !modalPending}
           busy={sending || backlogBusy}
+          readOnly={archived}
           startingFolder={task.worktreePath ?? task.workdir}
           onSend={sendBacklogItem}
           onEdit={editBacklogItem}
@@ -1189,28 +1190,35 @@ function RunPanelBody({
           onDragLeave={onSendDragLeave}
           onDrop={onSendDrop}
         >
-          {canSend && (
-            <ReferencesPicker
-              variant="inline"
-              refs={sendRefs}
-              onChange={setSendRefs}
-              startingFolder={task.worktreePath ?? task.workdir}
-            />
-          )}
-          {canSend && (
-            // Picker on the left; "Commit & push" (when offered) pushed to the
-            // right so it isn't stacked directly on top of the picker.
+          {/* Always available: refs can be attached to a draft you're only
+              stashing, before the task has ever run. */}
+          <ReferencesPicker
+            variant="inline"
+            refs={sendRefs}
+            onChange={setSendRefs}
+            startingFolder={task.worktreePath ?? task.workdir}
+          />
+          {/* Shown once the task is sendable, OR as soon as there's something to
+              stash — that's what lets "Save for later" work pre-run. */}
+          {(canSend || input.trim() || sendRefs.length > 0) && (
+            // Picker on the left; "Save for later" / "Commit & push" pushed to
+            // the right so they aren't stacked directly on top of the picker.
             <div className="flex items-center justify-between gap-2">
-              <ExtensionPicker
-                extensions={sendExtensions}
-                value={input}
-                onChange={setInput}
-                textareaRef={sendRef}
-                placement="above"
-                // Already gated by the enclosing `canSend &&`, so only the
-                // in-flight send needs to disable the trigger here.
-                disabled={sending}
-              />
+              {canSend ? (
+                <ExtensionPicker
+                  extensions={sendExtensions}
+                  value={input}
+                  onChange={setInput}
+                  textareaRef={sendRef}
+                  placement="above"
+                  // Only the in-flight send needs to disable the trigger here.
+                  disabled={sending}
+                />
+              ) : (
+                // Keep `justify-between` pushing the buttons right when the
+                // picker isn't offered (pre-run).
+                <span />
+              )}
               <div className="flex items-center gap-2">
                 {(input.trim() || sendRefs.length > 0) && (
                   <Button
@@ -1223,6 +1231,8 @@ function RunPanelBody({
                     <BookmarkPlus className="mr-1 size-3" /> Save for later
                   </Button>
                 )}
+                {/* `latestRun.status === "succeeded"` already implies the task
+                    has run, so this can never show pre-run. */}
                 {latestRun?.status === "succeeded" && hasChanges && !sending && (
                   <Button
                     size="sm"
@@ -1265,10 +1275,15 @@ function RunPanelBody({
                       : task.column === "blocked"
                         ? "Answer the question, or send any follow-up. Type / for commands."
                         : "Send a message — resumes the conversation in a fresh session. Type / for commands."
-                    : "Press Run task first to start a conversation."
+                    : "Not running yet — type a message and Save it for later, ready to send once the task runs."
                 }
                 rows={2}
-                disabled={!canSend || sending || modalPending}
+                // Typing is allowed even when the task can't be sent to yet:
+                // that's the whole point of "Save for later" — you stash the
+                // draft now and send it once the task is running. Sending stays
+                // gated on `canSend` (button below + the guard in `send()`),
+                // so Enter is a harmless no-op pre-run.
+                disabled={sending || backlogBusy || modalPending}
                 className="h-16 min-h-0 w-full resize-none text-xs"
               />
               <SlashAutocomplete
@@ -1326,6 +1341,7 @@ function BacklogTray({
   items,
   canSend,
   busy,
+  readOnly,
   startingFolder,
   onSend,
   onEdit,
@@ -1337,6 +1353,10 @@ function BacklogTray({
   canSend: boolean;
   /** A send / backlog mutation is in flight — disables destructive actions. */
   busy: boolean;
+  /** View-only mode (archived task): render the drafts but strip every
+   *  mutation affordance, since the server freezes backlog edits on archived
+   *  tasks. The drafts stay visible so they aren't silently hidden. */
+  readOnly: boolean;
   startingFolder: string;
   onSend: (item: BacklogMessage) => void;
   onEdit: (
@@ -1354,7 +1374,9 @@ function BacklogTray({
         <span>Backlog</span>
         <span className="rounded bg-muted px-1 text-[10px]">{items.length}</span>
         <span className="ml-1 font-normal text-muted-foreground/70">
-          saved messages — send when you're ready
+          {readOnly
+            ? "saved messages — unarchive the task to edit or send"
+            : "saved messages — send when you're ready"}
         </span>
       </div>
       <div className="max-h-40 space-y-1 overflow-y-auto px-2 pb-2">
@@ -1366,6 +1388,7 @@ function BacklogTray({
             total={items.length}
             canSend={canSend}
             busy={busy}
+            readOnly={readOnly}
             editing={editingId === item.id}
             startingFolder={startingFolder}
             onStartEdit={() => setEditingId(item.id)}
@@ -1392,6 +1415,7 @@ function BacklogItemRow({
   total,
   canSend,
   busy,
+  readOnly,
   editing,
   startingFolder,
   onStartEdit,
@@ -1406,6 +1430,7 @@ function BacklogItemRow({
   total: number;
   canSend: boolean;
   busy: boolean;
+  readOnly: boolean;
   editing: boolean;
   startingFolder: string;
   onStartEdit: () => void;
@@ -1431,7 +1456,10 @@ function BacklogItemRow({
     }
   }, [editing]);
 
-  if (editing) {
+  // `readOnly` wins over `editing` — an archived task can never open the editor
+  // (the Edit button is hidden), but guard here too so a stale `editingId` from
+  // just before an archive can't strand the row in an uncommittable form.
+  if (editing && !readOnly) {
     const canSave = draft.trim().length > 0 || draftRefs.length > 0;
     return (
       <div className="space-y-1.5 rounded-md border border-border/60 bg-background/50 p-2">
@@ -1490,52 +1518,54 @@ function BacklogItemRow({
           </div>
         )}
       </div>
-      <div className="flex shrink-0 items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
-        <button
-          type="button"
-          className={BACKLOG_ICON_BTN}
-          disabled={index === 0 || busy}
-          onClick={() => onMove(-1)}
-          title="Move up"
-        >
-          <ArrowUp className="size-3.5" />
-        </button>
-        <button
-          type="button"
-          className={BACKLOG_ICON_BTN}
-          disabled={index === total - 1 || busy}
-          onClick={() => onMove(1)}
-          title="Move down"
-        >
-          <ArrowDown className="size-3.5" />
-        </button>
-        <button
-          type="button"
-          className={BACKLOG_ICON_BTN}
-          onClick={onStartEdit}
-          title="Edit"
-        >
-          <FilePenLine className="size-3.5" />
-        </button>
-        <button
-          type="button"
-          className={BACKLOG_ICON_BTN}
-          disabled={!canSend || busy}
-          onClick={onSend}
-          title={canSend ? "Send now" : "Run the task first, then you can send this"}
-        >
-          <Send className="size-3.5" />
-        </button>
-        <button
-          type="button"
-          className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
-          disabled={busy}
-          onClick={onDelete}
-          title="Delete"
-        >
-          <Trash2 className="size-3.5" />
-        </button>
-      </div>
+      {!readOnly && (
+        <div className="flex shrink-0 items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={index === 0 || busy}
+            onClick={() => onMove(-1)}
+            title="Move up"
+          >
+            <ArrowUp className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={index === total - 1 || busy}
+            onClick={() => onMove(1)}
+            title="Move down"
+          >
+            <ArrowDown className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            onClick={onStartEdit}
+            title="Edit"
+          >
+            <FilePenLine className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={!canSend || busy}
+            onClick={onSend}
+            title={canSend ? "Send now" : "Run the task first, then you can send this"}
+          >
+            <Send className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
+            disabled={busy}
+            onClick={onDelete}
+            title="Delete"
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        </div>
+      )}
     </div>
   );
 }

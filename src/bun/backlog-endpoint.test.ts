@@ -152,6 +152,53 @@ test("POST accepts a references-only draft", async () => {
   }
 });
 
+test("a never-run task accepts backlog drafts (pre-run stashing)", async () => {
+  // The composer lets you stash a draft before the task's first run — sending
+  // is gated on a resumable run, but saving is not. Pin that server-side.
+  const id = await newTask(); // created, never started
+  try {
+    const res = await call(`/tasks/${id}/backlog`, {
+      method: "POST",
+      body: JSON.stringify({ text: "first follow-up" }),
+    });
+    expect(res.status).toBe(200);
+    const task = (await res.json()) as Task;
+    expect(task.runId).toBeNull(); // never ran
+    expect(task.backlog.map((m) => m.text)).toEqual(["first follow-up"]);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  }
+});
+
+test("archiving preserves the backlog and still returns it (tray renders read-only)", async () => {
+  const id = await newTask();
+  try {
+    const add = await call(`/tasks/${id}/backlog`, {
+      method: "POST",
+      body: JSON.stringify({ text: "draft survives archive" }),
+    });
+    expect(add.status).toBe(200);
+
+    tasks.update(id, { archivedAt: Date.now() });
+
+    // Still readable on the task payload — this is what lets the UI render the
+    // tray read-only instead of silently hiding saved drafts.
+    const res = await call(`/tasks/${id}`);
+    expect(res.status).toBe(200);
+    const task = (await res.json()) as Task;
+    expect(task.archivedAt).not.toBeNull();
+    expect(task.backlog.map((m) => m.text)).toEqual(["draft survives archive"]);
+
+    // ...but every mutation stays frozen while archived.
+    const del = await call(`/tasks/${id}/backlog/${task.backlog[0]!.id}`, {
+      method: "DELETE",
+    });
+    expect(del.status).toBe(400);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  }
+});
+
 test("backlog mutations are rejected on an archived task", async () => {
   const id = await newTask();
   try {
