@@ -8,15 +8,20 @@ import path from "node:path";
 import { test, expect, beforeAll } from "bun:test";
 import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
 import {
+  addGitHubDiscussionComment,
   addGitHubProjectItem,
   addGitHubReaction,
   addGitHubSubIssue,
   applyGitHubSuggestion,
   cancelGitHubWorkflowRun,
+  createGitHubDiscussion,
   createGitHubRelease,
+  deleteGitHubDiscussion,
+  deleteGitHubDiscussionComment,
   deleteGitHubRelease,
   dispatchGitHubWorkflow,
   getGitHubCommitStatus,
+  getGitHubDiscussion,
   getGitHubIssuePinned,
   getGitHubProjectItems,
   getGitHubPullLinkedIssues,
@@ -24,6 +29,7 @@ import {
   getGitHubThreadSubscription,
   getGitHubViewer,
   listGitHubAssignees,
+  listGitHubDiscussions,
   listGitHubItems,
   listGitHubItemsAcrossRepos,
   listGitHubLabels,
@@ -44,6 +50,7 @@ import {
   removeGitHubSubIssue,
   requestGitHubPullReviewers,
   rerunGitHubWorkflowRun,
+  setGitHubDiscussionAnswer,
   setGitHubIssueLock,
   setGitHubIssuePinned,
   setGitHubProjectItemStatus,
@@ -2146,5 +2153,341 @@ test("setGitHubProjectItemStatus rejects a blank optionId without a network call
     expect(mock.calls).toHaveLength(0);
   } finally {
     mock.restore();
+  }
+});
+
+test("listGitHubDiscussions POSTs the discussions+categories query and parses both, with auth: token", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: {
+        data: {
+          repository: {
+            discussions: {
+              nodes: [
+                {
+                  id: "D_1",
+                  number: 3,
+                  title: "How do I configure X?",
+                  url: "https://github.com/acme/widgets/discussions/3",
+                  createdAt: "2026-01-01T00:00:00Z",
+                  isAnswered: true,
+                  category: { name: "Q&A" },
+                  author: { login: "alice" },
+                },
+              ],
+            },
+            discussionCategories: {
+              nodes: [{ id: "DIC_1", name: "Q&A" }, { id: "DIC_2", name: "Ideas" }],
+            },
+          },
+        },
+      },
+    },
+  ]);
+  try {
+    const res = await listGitHubDiscussions({ dir: REPO_DIR });
+    expect(res).toEqual({
+      ok: true,
+      discussions: [
+        {
+          id: "D_1",
+          number: 3,
+          title: "How do I configure X?",
+          url: "https://github.com/acme/widgets/discussions/3",
+          category: "Q&A",
+          author: "alice",
+          createdAt: "2026-01-01T00:00:00Z",
+          answered: true,
+        },
+      ],
+      categories: [{ id: "DIC_1", name: "Q&A" }, { id: "DIC_2", name: "Ideas" }],
+      auth: "token",
+    });
+    expect(mock.calls).toHaveLength(1);
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.query).toContain("discussions");
+    expect(body.query).toContain("discussionCategories");
+    expect(body.variables).toEqual({ owner: "acme", name: "widgets" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubDiscussions is read-only — still fetches (auth: none, no Authorization header) without a token", async () => {
+  const priorToken = process.env.GITHUB_TOKEN;
+  const priorGhToken = process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { repository: { discussions: { nodes: [] }, discussionCategories: { nodes: [] } } } },
+    },
+  ]);
+  try {
+    const res = await listGitHubDiscussions({ dir: REPO_DIR });
+    expect(res).toEqual({ ok: true, discussions: [], categories: [], auth: "none" });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.headers.authorization).toBeUndefined();
+  } finally {
+    mock.restore();
+    if (priorToken !== undefined) process.env.GITHUB_TOKEN = priorToken;
+    if (priorGhToken !== undefined) process.env.GH_TOKEN = priorGhToken;
+  }
+});
+
+test("listGitHubDiscussions maps a disabled-Discussions GraphQL error to a friendly message", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { errors: [{ message: "Discussions are not enabled for this repository." }] },
+    },
+  ]);
+  try {
+    const res = await listGitHubDiscussions({ dir: REPO_DIR });
+    expect(res).toEqual({ ok: false, error: "Discussions aren't enabled for this repository." });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubDiscussion POSTs the discussion detail query and parses body/comments/answerable", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: {
+        data: {
+          repository: {
+            discussion: {
+              id: "D_1",
+              title: "How do I configure X?",
+              body: "Some **markdown**.",
+              category: { isAnswerable: true },
+              comments: {
+                nodes: [
+                  { id: "DC_1", body: "Try this.", createdAt: "2026-01-01T00:00:00Z", isAnswer: true, author: { login: "alice" } },
+                ],
+              },
+            },
+          },
+        },
+      },
+    },
+  ]);
+  try {
+    const res = await getGitHubDiscussion({ dir: REPO_DIR, number: 3 });
+    expect(res).toEqual({
+      ok: true,
+      detail: {
+        id: "D_1",
+        title: "How do I configure X?",
+        body: "Some **markdown**.",
+        answerable: true,
+        comments: [{ id: "DC_1", body: "Try this.", author: "alice", createdAt: "2026-01-01T00:00:00Z", isAnswer: true }],
+      },
+    });
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.query).toContain("isAnswerable");
+    expect(body.variables).toEqual({ owner: "acme", name: "widgets", number: 3 });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubDiscussion rejects an invalid discussion number without a network call", async () => {
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getGitHubDiscussion({ dir: REPO_DIR, number: 0 });
+    expect(res).toEqual({ ok: false, error: "discussion number must be positive" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("createGitHubDiscussion resolves the repo node id, then POSTs createDiscussion", async () => {
+  // Same two-sequential-GraphQL-calls shape as `transferGitHubIssue` — the
+  // route table can't tell apart two POSTs to the same URL, so this uses a
+  // hand-rolled fetch stub instead of `mockGitHubFetch`.
+  let call = 0;
+  const original = globalThis.fetch;
+  const calls: { url: string; body: string | null }[] = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const body = typeof init?.body === "string" ? init.body : null;
+    calls.push({ url, body });
+    if (url === "https://api.github.com/graphql") {
+      call += 1;
+      if (call === 1) {
+        return new Response(JSON.stringify({ data: { repository: { id: "R_widgets" } } }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({ data: { createDiscussion: { discussion: { number: 9, url: "https://github.com/acme/widgets/discussions/9" } } } }),
+        { status: 200 },
+      );
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  }) as typeof fetch;
+
+  try {
+    const res = await createGitHubDiscussion({ dir: REPO_DIR, categoryId: "DIC_1", title: "New thread", body: "Hello" });
+    expect(res).toEqual({ ok: true, number: 9, url: "https://github.com/acme/widgets/discussions/9" });
+    const repoIdCall = calls.find((c) => c.body?.includes("repository(owner"));
+    expect(JSON.parse(repoIdCall!.body!).variables).toEqual({ owner: "acme", name: "widgets" });
+    const createCall = calls.find((c) => c.body?.includes("createDiscussion"));
+    expect(JSON.parse(createCall!.body!).variables).toEqual({ r: "R_widgets", c: "DIC_1", t: "New thread", b: "Hello" });
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("createGitHubDiscussion rejects a blank category/title/body before any network call", async () => {
+  const mock = mockGitHubFetch([]);
+  try {
+    expect(await createGitHubDiscussion({ dir: REPO_DIR, categoryId: "", title: "t", body: "b" }))
+      .toEqual({ ok: false, error: "category required" });
+    expect(await createGitHubDiscussion({ dir: REPO_DIR, categoryId: "DIC_1", title: "  ", body: "b" }))
+      .toEqual({ ok: false, error: "discussion title required" });
+    expect(await createGitHubDiscussion({ dir: REPO_DIR, categoryId: "DIC_1", title: "t", body: "  " }))
+      .toEqual({ ok: false, error: "discussion body required" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubDiscussionComment POSTs addDiscussionComment and returns the new comment's id", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { addDiscussionComment: { comment: { id: "DC_new" } } } },
+    },
+  ]);
+  try {
+    const res = await addGitHubDiscussionComment({ dir: REPO_DIR, discussionId: "D_1", body: "Thanks!" });
+    expect(res).toEqual({ ok: true, commentId: "DC_new" });
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.query).toContain("addDiscussionComment");
+    expect(body.variables).toEqual({ d: "D_1", b: "Thanks!" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubDiscussionComment rejects a blank body without a network call", async () => {
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await addGitHubDiscussionComment({ dir: REPO_DIR, discussionId: "D_1", body: "   " });
+    expect(res).toEqual({ ok: false, error: "comment body required" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubDiscussionAnswer POSTs markDiscussionCommentAsAnswer when answer: true", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { markDiscussionCommentAsAnswer: { clientMutationId: null } } },
+    },
+  ]);
+  try {
+    const res = await setGitHubDiscussionAnswer({ dir: REPO_DIR, commentId: "DC_1", answer: true });
+    expect(res).toEqual({ ok: true, isAnswer: true });
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.query).toContain("markDiscussionCommentAsAnswer");
+    expect(body.variables).toEqual({ id: "DC_1" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubDiscussionAnswer POSTs unmarkDiscussionCommentAsAnswer when answer: false", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { unmarkDiscussionCommentAsAnswer: { clientMutationId: null } } },
+    },
+  ]);
+  try {
+    const res = await setGitHubDiscussionAnswer({ dir: REPO_DIR, commentId: "DC_1", answer: false });
+    expect(res).toEqual({ ok: true, isAnswer: false });
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.query).toContain("unmarkDiscussionCommentAsAnswer");
+    expect(body.variables).toEqual({ id: "DC_1" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("deleteGitHubDiscussion POSTs deleteDiscussion", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { deleteDiscussion: { clientMutationId: null } } },
+    },
+  ]);
+  try {
+    const res = await deleteGitHubDiscussion({ dir: REPO_DIR, discussionId: "D_1" });
+    expect(res).toEqual({ ok: true, message: "Discussion deleted." });
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.query).toContain("deleteDiscussion");
+    expect(body.variables).toEqual({ id: "D_1" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("deleteGitHubDiscussionComment POSTs deleteDiscussionComment", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { deleteDiscussionComment: { clientMutationId: null } } },
+    },
+  ]);
+  try {
+    const res = await deleteGitHubDiscussionComment({ dir: REPO_DIR, commentId: "DC_1" });
+    expect(res).toEqual({ ok: true, message: "Comment deleted." });
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.query).toContain("deleteDiscussionComment");
+    expect(body.variables).toEqual({ id: "DC_1" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubDiscussionComment / setGitHubDiscussionAnswer / deleteGitHubDiscussion require a token — error without a network call when unauthenticated", async () => {
+  const priorToken = process.env.GITHUB_TOKEN;
+  const priorGhToken = process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  const mock = mockGitHubFetch([]);
+  try {
+    expect(await addGitHubDiscussionComment({ dir: REPO_DIR, discussionId: "D_1", body: "hi" }))
+      .toEqual({ ok: false, error: "GitHub authentication required to comment" });
+    expect(await setGitHubDiscussionAnswer({ dir: REPO_DIR, commentId: "DC_1", answer: true }))
+      .toEqual({ ok: false, error: "GitHub authentication required to mark an answer" });
+    expect(await deleteGitHubDiscussion({ dir: REPO_DIR, discussionId: "D_1" }))
+      .toEqual({ ok: false, error: "GitHub authentication required to delete a discussion" });
+    expect(await deleteGitHubDiscussionComment({ dir: REPO_DIR, commentId: "DC_1" }))
+      .toEqual({ ok: false, error: "GitHub authentication required to delete a comment" });
+    expect(await createGitHubDiscussion({ dir: REPO_DIR, categoryId: "DIC_1", title: "t", body: "b" }))
+      .toEqual({ ok: false, error: "GitHub authentication required to create a discussion" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+    if (priorToken !== undefined) process.env.GITHUB_TOKEN = priorToken;
+    if (priorGhToken !== undefined) process.env.GH_TOKEN = priorGhToken;
   }
 });

@@ -28,6 +28,7 @@ import {
   Loader2,
   Lock,
   MessageSquare,
+  MessagesSquare,
   Milestone,
   Pin,
   PinOff,
@@ -69,6 +70,10 @@ import type {
   GitHubChecksResult,
   GitHubComment,
   GitHubCommitStatusResult,
+  GitHubDiscussion,
+  GitHubDiscussionCategory,
+  GitHubDiscussionComment,
+  GitHubDiscussionDetail,
   GitHubLinkedIssue,
   GitHubListItem,
   GitHubNotification,
@@ -1481,6 +1486,237 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     }
   };
 
+  // Discussions (GraphQL-only — F22/G12). Lazy, like Projects/Actions/
+  // Notifications: only fetched while the manager is open. `discussionsAuth`
+  // mirrors `GitHubListResult.auth` — create/comment/answer are gated on
+  // `discussionsAuth !== "none"` (any authenticated user), NOT on `canPush`,
+  // per the G12 gating note; delete is gated on own-content OR `canPush`.
+  const [discussions, setDiscussions] = useState<GitHubDiscussion[]>([]);
+  const [discussionCategories, setDiscussionCategories] = useState<GitHubDiscussionCategory[]>([]);
+  const [discussionsAuth, setDiscussionsAuth] = useState<"token" | "none">("none");
+  const [discussionsManagerOpen, setDiscussionsManagerOpen] = useState(false);
+  const [discussionsLoading, setDiscussionsLoading] = useState(false);
+  const [discussionsError, setDiscussionsError] = useState<string | null>(null);
+  const discussionsSeq = useRef(0);
+  // The selected thread's detail (body + comments), fetched once a discussion
+  // row is expanded.
+  const [selectedDiscussion, setSelectedDiscussion] = useState<GitHubDiscussion | null>(null);
+  const [discussionDetail, setDiscussionDetail] = useState<GitHubDiscussionDetail | null>(null);
+  const [discussionDetailLoading, setDiscussionDetailLoading] = useState(false);
+  const [discussionDetailError, setDiscussionDetailError] = useState<string | null>(null);
+  const discussionDetailSeq = useRef(0);
+  const [discussionCommentDraft, setDiscussionCommentDraft] = useState("");
+  const [discussionCommentBusy, setDiscussionCommentBusy] = useState(false);
+  const [discussionCommentError, setDiscussionCommentError] = useState<string | null>(null);
+  // Per-comment in-flight action ("answer" | "delete") and last error, keyed
+  // by comment id — mirrors `projectItemBusy`/`projectItemErrors`.
+  const [discussionCommentBusyMap, setDiscussionCommentBusyMap] = useState<Record<string, string | undefined>>({});
+  const [discussionCommentErrors, setDiscussionCommentErrors] = useState<Record<string, string | undefined>>({});
+  // Per-row (list) busy/error for deleting a whole discussion.
+  const [discussionRowBusy, setDiscussionRowBusy] = useState<Record<string, boolean>>({});
+  const [discussionRowErrors, setDiscussionRowErrors] = useState<Record<string, string | undefined>>({});
+  // "New discussion" composer.
+  const [discussionCreateOpen, setDiscussionCreateOpen] = useState(false);
+  const [newDiscussionCategoryId, setNewDiscussionCategoryId] = useState("");
+  const [newDiscussionTitle, setNewDiscussionTitle] = useState("");
+  const [newDiscussionBody, setNewDiscussionBody] = useState("");
+  const [discussionCreateBusy, setDiscussionCreateBusy] = useState(false);
+  const [discussionCreateError, setDiscussionCreateError] = useState<string | null>(null);
+
+  useEffect(() => {
+    // The toolbar button that opens this panel is disabled in aggregate mode
+    // (Discussions is single-repo), so `isAggregate` is defense-in-depth.
+    if (!open || !discussionsManagerOpen || !projectPath || isAggregate) return;
+    const requestId = ++discussionsSeq.current;
+    setDiscussionsLoading(true);
+    setDiscussionsError(null);
+    api.listGitHubDiscussions({ path: projectPath })
+      .then((r) => {
+        if (requestId !== discussionsSeq.current) return;
+        setDiscussions(r.discussions);
+        setDiscussionCategories(r.categories);
+        setDiscussionsAuth(r.auth);
+      })
+      .catch((e) => { if (requestId === discussionsSeq.current) setDiscussionsError(e instanceof Error ? e.message : String(e)); })
+      .finally(() => { if (requestId === discussionsSeq.current) setDiscussionsLoading(false); });
+  }, [open, discussionsManagerOpen, projectPath, isAggregate]);
+
+  const refreshDiscussions = async () => {
+    if (!projectPath || !discussionsManagerOpen) return;
+    const requestId = ++discussionsSeq.current;
+    setDiscussionsLoading(true);
+    setDiscussionsError(null);
+    try {
+      const r = await api.listGitHubDiscussions({ path: projectPath });
+      if (requestId === discussionsSeq.current) {
+        setDiscussions(r.discussions);
+        setDiscussionCategories(r.categories);
+        setDiscussionsAuth(r.auth);
+      }
+    } catch (e) {
+      if (requestId === discussionsSeq.current) setDiscussionsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (requestId === discussionsSeq.current) setDiscussionsLoading(false);
+    }
+  };
+
+  // A project switch (or the panel closing) drops the previously selected
+  // thread and any composer drafts tied to it — same reasoning as
+  // `useEffect` clearing `selectedProjectId` on project switch.
+  useEffect(() => {
+    setSelectedDiscussion(null);
+    setDiscussionDetail(null);
+    setDiscussionDetailError(null);
+    setDiscussionCreateOpen(false);
+    setDiscussionCreateError(null);
+    setNewDiscussionCategoryId("");
+    setNewDiscussionTitle("");
+    setNewDiscussionBody("");
+  }, [projectPath, isAggregate, discussionsManagerOpen]);
+
+  // Default the create form's category picker to the first one loaded, so the
+  // <Select> isn't left on a blank option once categories arrive.
+  useEffect(() => {
+    if (discussionCategories.length === 0) return;
+    setNewDiscussionCategoryId((cur) => cur || discussionCategories[0]!.id);
+  }, [discussionCategories]);
+
+  useEffect(() => {
+    setDiscussionCommentDraft("");
+    setDiscussionCommentError(null);
+    setDiscussionCommentBusyMap({});
+    setDiscussionCommentErrors({});
+  }, [selectedDiscussion]);
+
+  useEffect(() => {
+    if (!open || !discussionsManagerOpen || !projectPath || isAggregate || !selectedDiscussion) return;
+    const requestId = ++discussionDetailSeq.current;
+    setDiscussionDetailLoading(true);
+    setDiscussionDetailError(null);
+    api.getGitHubDiscussion({ path: projectPath, number: selectedDiscussion.number })
+      .then((r) => { if (requestId === discussionDetailSeq.current) setDiscussionDetail(r.detail); })
+      .catch((e) => { if (requestId === discussionDetailSeq.current) setDiscussionDetailError(e instanceof Error ? e.message : String(e)); })
+      .finally(() => { if (requestId === discussionDetailSeq.current) setDiscussionDetailLoading(false); });
+  }, [open, discussionsManagerOpen, projectPath, isAggregate, selectedDiscussion]);
+
+  const refreshDiscussionDetail = async () => {
+    if (!projectPath || !selectedDiscussion) return;
+    const requestId = ++discussionDetailSeq.current;
+    setDiscussionDetailLoading(true);
+    setDiscussionDetailError(null);
+    try {
+      const r = await api.getGitHubDiscussion({ path: projectPath, number: selectedDiscussion.number });
+      if (requestId === discussionDetailSeq.current) setDiscussionDetail(r.detail);
+    } catch (e) {
+      if (requestId === discussionDetailSeq.current) setDiscussionDetailError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (requestId === discussionDetailSeq.current) setDiscussionDetailLoading(false);
+    }
+  };
+
+  const toggleDiscussion = (discussion: GitHubDiscussion) => {
+    setSelectedDiscussion((cur) => (cur && cur.id === discussion.id ? null : discussion));
+  };
+
+  const submitDiscussionComment = async () => {
+    if (!projectPath || !selectedDiscussion || discussionCommentBusy) return;
+    const body = discussionCommentDraft.trim();
+    if (!body) return;
+    setDiscussionCommentBusy(true);
+    setDiscussionCommentError(null);
+    try {
+      // The mutation only returns the new comment's id, not its author/timestamp
+      // — refetch to pick those up (same tradeoff as `addProjectItem`).
+      await api.addGitHubDiscussionComment({ path: projectPath, discussionId: selectedDiscussion.id, body });
+      setDiscussionCommentDraft("");
+      await refreshDiscussionDetail();
+    } catch (e) {
+      setDiscussionCommentError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDiscussionCommentBusy(false);
+    }
+  };
+
+  const setDiscussionAnswer = async (comment: GitHubDiscussionComment, answer: boolean) => {
+    if (!projectPath) return;
+    setDiscussionCommentBusyMap((cur) => ({ ...cur, [comment.id]: "answer" }));
+    setDiscussionCommentErrors((cur) => ({ ...cur, [comment.id]: undefined }));
+    // Optimistic — GitHub only allows one accepted answer per discussion, so
+    // marking one clears any other locally too; reverted on failure below.
+    const discussionId = discussionDetail?.id;
+    const priorAnswers = new Map((discussionDetail?.comments ?? []).map((c) => [c.id, c.isAnswer]));
+    setDiscussionDetail((cur) => cur && ({
+      ...cur,
+      comments: cur.comments.map((c) => (c.id === comment.id ? { ...c, isAnswer: answer } : answer ? { ...c, isAnswer: false } : c)),
+    }));
+    try {
+      await api.setGitHubDiscussionAnswer({ path: projectPath, commentId: comment.id, answer });
+      // Keep the collapsed list row's "answered" badge in sync (the list is lazy,
+      // not polled) — one accepted answer per discussion, so mark ⇒ answered.
+      if (discussionId) setDiscussions((cur) => cur.map((d) => (d.id === discussionId ? { ...d, answered: answer } : d)));
+    } catch (e) {
+      setDiscussionCommentErrors((cur) => ({ ...cur, [comment.id]: e instanceof Error ? e.message : String(e) }));
+      // Restore only the isAnswer flags from the snapshot, functionally — so a
+      // comment appended concurrently (or other field edits) isn't clobbered.
+      setDiscussionDetail((cur) => cur && ({
+        ...cur,
+        comments: cur.comments.map((c) => (priorAnswers.has(c.id) ? { ...c, isAnswer: priorAnswers.get(c.id)! } : c)),
+      }));
+    } finally {
+      setDiscussionCommentBusyMap((cur) => ({ ...cur, [comment.id]: undefined }));
+    }
+  };
+
+  const deleteDiscussionComment = async (comment: GitHubDiscussionComment) => {
+    if (!projectPath) return;
+    setDiscussionCommentBusyMap((cur) => ({ ...cur, [comment.id]: "delete" }));
+    setDiscussionCommentErrors((cur) => ({ ...cur, [comment.id]: undefined }));
+    try {
+      await api.deleteGitHubDiscussionComment({ path: projectPath, commentId: comment.id });
+      setDiscussionDetail((cur) => cur && ({ ...cur, comments: cur.comments.filter((c) => c.id !== comment.id) })); // success unmounts this row
+    } catch (e) {
+      setDiscussionCommentErrors((cur) => ({ ...cur, [comment.id]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setDiscussionCommentBusyMap((cur) => ({ ...cur, [comment.id]: undefined }));
+    }
+  };
+
+  const deleteDiscussionRow = async (discussion: GitHubDiscussion) => {
+    if (!projectPath) return;
+    setDiscussionRowBusy((cur) => ({ ...cur, [discussion.id]: true }));
+    setDiscussionRowErrors((cur) => ({ ...cur, [discussion.id]: undefined }));
+    try {
+      await api.deleteGitHubDiscussion({ path: projectPath, discussionId: discussion.id });
+      setDiscussions((cur) => cur.filter((d) => d.id !== discussion.id)); // success unmounts this row
+      setSelectedDiscussion((cur) => (cur && cur.id === discussion.id ? null : cur));
+    } catch (e) {
+      setDiscussionRowErrors((cur) => ({ ...cur, [discussion.id]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setDiscussionRowBusy((cur) => ({ ...cur, [discussion.id]: false }));
+    }
+  };
+
+  const createDiscussion = async () => {
+    if (!projectPath || discussionCreateBusy) return;
+    const title = newDiscussionTitle.trim();
+    const body = newDiscussionBody.trim();
+    if (!newDiscussionCategoryId || !title || !body) return;
+    setDiscussionCreateBusy(true);
+    setDiscussionCreateError(null);
+    try {
+      await api.createGitHubDiscussion({ path: projectPath, categoryId: newDiscussionCategoryId, title, body });
+      setNewDiscussionTitle("");
+      setNewDiscussionBody("");
+      setDiscussionCreateOpen(false);
+      // The create mutation only returns number/url — refetch for the full row.
+      await refreshDiscussions();
+    } catch (e) {
+      setDiscussionCreateError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDiscussionCreateBusy(false);
+    }
+  };
+
   useEffect(() => {
     // The New PR composer is hidden in aggregate mode (needs a concrete repo).
     if (!open || !projectPath || kind !== "pulls" || isAggregate) return;
@@ -2421,6 +2657,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setNotificationsOpen(false);
               setActionsManagerOpen(false);
               setProjectsManagerOpen(false);
+              setDiscussionsManagerOpen(false);
             }}
           >
             <Tag className="size-4" />
@@ -2438,6 +2675,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setNotificationsOpen(false);
               setActionsManagerOpen(false);
               setProjectsManagerOpen(false);
+              setDiscussionsManagerOpen(false);
             }}
           >
             <Milestone className="size-4" />
@@ -2455,6 +2693,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setNotificationsOpen(false);
               setActionsManagerOpen(false);
               setProjectsManagerOpen(false);
+              setDiscussionsManagerOpen(false);
             }}
           >
             <Rocket className="size-4" />
@@ -2472,6 +2711,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setReleaseManagerOpen(false);
               setActionsManagerOpen(false);
               setProjectsManagerOpen(false);
+              setDiscussionsManagerOpen(false);
             }}
           >
             <Bell className="size-4" />
@@ -2489,6 +2729,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setReleaseManagerOpen(false);
               setNotificationsOpen(false);
               setProjectsManagerOpen(false);
+              setDiscussionsManagerOpen(false);
             }}
           >
             <Workflow className="size-4" />
@@ -2506,9 +2747,28 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setReleaseManagerOpen(false);
               setNotificationsOpen(false);
               setActionsManagerOpen(false);
+              setDiscussionsManagerOpen(false);
             }}
           >
             <Kanban className="size-4" />
+          </Button>
+          <Button
+            size="icon"
+            variant={discussionsManagerOpen ? "secondary" : "ghost"}
+            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Discussions"}
+            aria-label="Discussions"
+            disabled={!projectPath || isAggregate}
+            onClick={() => {
+              setDiscussionsManagerOpen((v) => !v);
+              setLabelManagerOpen(false);
+              setMilestoneManagerOpen(false);
+              setReleaseManagerOpen(false);
+              setNotificationsOpen(false);
+              setActionsManagerOpen(false);
+              setProjectsManagerOpen(false);
+            }}
+          >
+            <MessagesSquare className="size-4" />
           </Button>
           {result && result.webUrl && (
             <Button
@@ -2803,6 +3063,47 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onRefresh={() => { void refreshProjects(); }}
             onRefreshItems={() => { void refreshProjectItems(); }}
             onClose={() => setProjectsManagerOpen(false)}
+          />
+        )}
+        {discussionsManagerOpen && (
+          <DiscussionsPanel
+            discussions={discussions}
+            categories={discussionCategories}
+            auth={discussionsAuth}
+            canPush={canPush}
+            viewerLogin={viewerLogin}
+            loading={discussionsLoading}
+            error={discussionsError}
+            rowBusy={discussionRowBusy}
+            rowErrors={discussionRowErrors}
+            onSelect={toggleDiscussion}
+            onDelete={(discussion) => { void deleteDiscussionRow(discussion); }}
+            selected={selectedDiscussion}
+            detail={discussionDetail}
+            detailLoading={discussionDetailLoading}
+            detailError={discussionDetailError}
+            commentDraft={discussionCommentDraft}
+            onCommentDraftChange={setDiscussionCommentDraft}
+            commentBusy={discussionCommentBusy}
+            commentError={discussionCommentError}
+            onSubmitComment={() => { void submitDiscussionComment(); }}
+            commentBusyMap={discussionCommentBusyMap}
+            commentErrors={discussionCommentErrors}
+            onSetAnswer={(comment, answer) => { void setDiscussionAnswer(comment, answer); }}
+            onDeleteComment={(comment) => { void deleteDiscussionComment(comment); }}
+            createOpen={discussionCreateOpen}
+            onCreateOpenChange={setDiscussionCreateOpen}
+            newCategoryId={newDiscussionCategoryId}
+            onNewCategoryIdChange={setNewDiscussionCategoryId}
+            newTitle={newDiscussionTitle}
+            onNewTitleChange={setNewDiscussionTitle}
+            newBody={newDiscussionBody}
+            onNewBodyChange={setNewDiscussionBody}
+            createBusy={discussionCreateBusy}
+            createError={discussionCreateError}
+            onCreate={() => { void createDiscussion(); }}
+            onRefresh={() => { void refreshDiscussions(); }}
+            onClose={() => setDiscussionsManagerOpen(false)}
           />
         )}
         {kind === "pulls" && !isAggregate && (
@@ -4891,6 +5192,471 @@ function ProjectItemRow({
       </div>
       {error && (
         <div className="mt-0.5 flex items-center gap-1 pl-0.5 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Discussions (GraphQL-only — F22/G12) — toolbar-toggled manager panel,
+ *  mirroring `ProjectsPanel`'s structure (list + lazy detail-on-select).
+ *  Gating differs from every other manager panel here: create/comment/answer
+ *  need only a token (`auth !== "none"`), NOT `canPush` — see the G12 gating
+ *  note. Delete (discussion or comment) allows own content OR `canPush`. */
+function DiscussionsPanel({
+  discussions,
+  categories,
+  auth,
+  canPush,
+  viewerLogin,
+  loading,
+  error,
+  rowBusy,
+  rowErrors,
+  onSelect,
+  onDelete,
+  selected,
+  detail,
+  detailLoading,
+  detailError,
+  commentDraft,
+  onCommentDraftChange,
+  commentBusy,
+  commentError,
+  onSubmitComment,
+  commentBusyMap,
+  commentErrors,
+  onSetAnswer,
+  onDeleteComment,
+  createOpen,
+  onCreateOpenChange,
+  newCategoryId,
+  onNewCategoryIdChange,
+  newTitle,
+  onNewTitleChange,
+  newBody,
+  onNewBodyChange,
+  createBusy,
+  createError,
+  onCreate,
+  onRefresh,
+  onClose,
+}: {
+  discussions: GitHubDiscussion[];
+  categories: GitHubDiscussionCategory[];
+  auth: "token" | "none";
+  canPush: boolean;
+  viewerLogin: string;
+  loading: boolean;
+  error: string | null;
+  rowBusy: Record<string, boolean>;
+  rowErrors: Record<string, string | undefined>;
+  onSelect: (discussion: GitHubDiscussion) => void;
+  onDelete: (discussion: GitHubDiscussion) => void;
+  selected: GitHubDiscussion | null;
+  detail: GitHubDiscussionDetail | null;
+  detailLoading: boolean;
+  detailError: string | null;
+  commentDraft: string;
+  onCommentDraftChange: (v: string) => void;
+  commentBusy: boolean;
+  commentError: string | null;
+  onSubmitComment: () => void;
+  commentBusyMap: Record<string, string | undefined>;
+  commentErrors: Record<string, string | undefined>;
+  onSetAnswer: (comment: GitHubDiscussionComment, answer: boolean) => void;
+  onDeleteComment: (comment: GitHubDiscussionComment) => void;
+  createOpen: boolean;
+  onCreateOpenChange: (v: boolean) => void;
+  newCategoryId: string;
+  onNewCategoryIdChange: (v: string) => void;
+  newTitle: string;
+  onNewTitleChange: (v: string) => void;
+  newBody: string;
+  onNewBodyChange: (v: string) => void;
+  createBusy: boolean;
+  createError: string | null;
+  onCreate: () => void;
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  const authenticated = auth !== "none";
+  const createDisabled = createBusy || !authenticated || !newCategoryId || !newTitle.trim() || !newBody.trim();
+  return (
+    <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <MessagesSquare className="size-3.5" />
+          <span>Discussions{discussions.length > 0 && ` (${discussions.length})`}</span>
+          {!authenticated && <span className="text-[10px]">· unauthenticated</span>}
+        </div>
+        <div className="flex items-center gap-1">
+          <Button
+            size="sm"
+            variant={createOpen ? "secondary" : "ghost"}
+            className="h-6 px-2 text-[11px]"
+            disabled={!authenticated}
+            title={authenticated ? undefined : "Sign in to GitHub to start a discussion"}
+            onClick={() => onCreateOpenChange(!createOpen)}
+          >
+            <Plus className="mr-1 size-3.5" />
+            New
+          </Button>
+          <Button size="icon" variant="ghost" className="size-6" title="Refresh discussions" aria-label="Refresh discussions" disabled={loading} onClick={onRefresh}>
+            {loading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+          </Button>
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      </div>
+      {error && (
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+
+      {createOpen && (
+        <div className="mb-3 rounded-md border border-border/60 bg-background/40 p-2">
+          <div className="mb-1.5 flex items-center gap-1.5">
+            <Select
+              value={newCategoryId}
+              onChange={(e) => onNewCategoryIdChange(e.target.value)}
+              title="Category"
+              aria-label="Category"
+              className="h-8 w-36 shrink-0 text-xs"
+              disabled={createBusy || categories.length === 0}
+            >
+              {categories.length === 0 && <option value="">No categories</option>}
+              {categories.map((c) => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </Select>
+            <Input
+              value={newTitle}
+              onChange={(e) => onNewTitleChange(e.target.value)}
+              placeholder="Title"
+              className="h-8 flex-1 text-xs"
+              disabled={createBusy}
+            />
+          </div>
+          <Textarea
+            value={newBody}
+            onChange={(e) => onNewBodyChange(e.target.value)}
+            placeholder="Write your discussion…"
+            className="min-h-20 resize-y text-xs"
+            disabled={createBusy}
+          />
+          <div className="mt-1.5 flex justify-end">
+            <Button size="sm" disabled={createDisabled} onClick={onCreate}>
+              {createBusy ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
+              Create
+            </Button>
+          </div>
+          {createError && (
+            <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
+              <AlertCircle className="size-3.5" />
+              {createError}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="max-h-96 space-y-1 overflow-y-auto">
+        {!error && discussions.length === 0 ? (
+          <div className="px-1 py-2 text-[11px] text-muted-foreground">
+            {loading ? "Loading…" : "No discussions yet."}
+          </div>
+        ) : (
+          discussions.map((d) => (
+            <DiscussionRow
+              key={d.id}
+              discussion={d}
+              expanded={selected?.id === d.id}
+              canDelete={canPush || (!!viewerLogin && d.author === viewerLogin)}
+              busy={!!rowBusy[d.id]}
+              error={rowErrors[d.id]}
+              onToggle={() => onSelect(d)}
+              onDelete={() => onDelete(d)}
+            >
+              {selected?.id === d.id && (
+                <DiscussionDetailView
+                  detail={detail}
+                  loading={detailLoading}
+                  error={detailError}
+                  authenticated={authenticated}
+                  canPush={canPush}
+                  viewerLogin={viewerLogin}
+                  commentDraft={commentDraft}
+                  onCommentDraftChange={onCommentDraftChange}
+                  commentBusy={commentBusy}
+                  commentError={commentError}
+                  onSubmitComment={onSubmitComment}
+                  commentBusyMap={commentBusyMap}
+                  commentErrors={commentErrors}
+                  onSetAnswer={onSetAnswer}
+                  onDeleteComment={onDeleteComment}
+                />
+              )}
+            </DiscussionRow>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DiscussionRow({
+  discussion,
+  expanded,
+  canDelete,
+  busy,
+  error,
+  onToggle,
+  onDelete,
+  children,
+}: {
+  discussion: GitHubDiscussion;
+  expanded: boolean;
+  canDelete: boolean;
+  busy: boolean;
+  error: string | undefined;
+  onToggle: () => void;
+  onDelete: () => void;
+  children?: React.ReactNode;
+}) {
+  return (
+    <div className="rounded-md border border-border/50 bg-background/30">
+      <div className="flex items-center gap-2 px-2 py-1.5 text-xs">
+        <MessagesSquare className="size-3.5 shrink-0 text-sky-400" />
+        <span className="min-w-0 flex-1 truncate font-medium" title={discussion.title}>
+          #{discussion.number} {discussion.title}
+        </span>
+        {discussion.category && (
+          <span className="shrink-0 rounded border border-border/60 px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            {discussion.category}
+          </span>
+        )}
+        {discussion.answered && (
+          <span title="Answered">
+            <CheckCircle2 className="size-3.5 shrink-0 text-emerald-400" />
+          </span>
+        )}
+        <span className="shrink-0 text-[10px] text-muted-foreground">{discussion.author ?? "unknown"}</span>
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-6 shrink-0"
+          title="Open on GitHub"
+          aria-label={`Open discussion #${discussion.number} on GitHub`}
+          onClick={() => { void api.openExternal(discussion.url); }}
+        >
+          <ExternalLink className="size-3.5" />
+        </Button>
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-6 shrink-0 text-muted-foreground hover:text-rose-400"
+          title={canDelete ? "Delete discussion" : PUSH_ONLY_TITLE}
+          aria-label={`Delete discussion #${discussion.number}`}
+          disabled={busy || !canDelete}
+          onClick={onDelete}
+        >
+          {busy ? <Loader2 className="size-3.5 animate-spin" /> : <X className="size-3.5" />}
+        </Button>
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-6 shrink-0"
+          title={expanded ? "Collapse" : "Expand"}
+          aria-label={`${expanded ? "Collapse" : "Expand"} discussion #${discussion.number}`}
+          onClick={onToggle}
+        >
+          {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+        </Button>
+      </div>
+      {error && (
+        <div className="flex items-center gap-1 px-2 pb-1.5 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+      {children}
+    </div>
+  );
+}
+
+function DiscussionDetailView({
+  detail,
+  loading,
+  error,
+  authenticated,
+  canPush,
+  viewerLogin,
+  commentDraft,
+  onCommentDraftChange,
+  commentBusy,
+  commentError,
+  onSubmitComment,
+  commentBusyMap,
+  commentErrors,
+  onSetAnswer,
+  onDeleteComment,
+}: {
+  detail: GitHubDiscussionDetail | null;
+  loading: boolean;
+  error: string | null;
+  authenticated: boolean;
+  canPush: boolean;
+  viewerLogin: string;
+  commentDraft: string;
+  onCommentDraftChange: (v: string) => void;
+  commentBusy: boolean;
+  commentError: string | null;
+  onSubmitComment: () => void;
+  commentBusyMap: Record<string, string | undefined>;
+  commentErrors: Record<string, string | undefined>;
+  onSetAnswer: (comment: GitHubDiscussionComment, answer: boolean) => void;
+  onDeleteComment: (comment: GitHubDiscussionComment) => void;
+}) {
+  return (
+    <div className="border-t border-border/50 bg-card p-2">
+      {loading && !detail && (
+        <div className="flex items-center justify-center gap-2 py-4 text-xs text-muted-foreground">
+          <Loader2 className="size-3.5 animate-spin" /> Loading discussion…
+        </div>
+      )}
+      {!loading && error && (
+        <div className="flex items-center gap-1 py-2 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+      {detail && (
+        <>
+          {detail.body && (
+            <div className="markdown-body mb-2 max-h-40 overflow-y-auto rounded border border-border/50 bg-background/40 px-2 py-1.5 text-xs">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{detail.body}</ReactMarkdown>
+            </div>
+          )}
+          <div className="space-y-1.5">
+            {detail.comments.length === 0 ? (
+              <div className="px-1 py-1.5 text-[11px] text-muted-foreground">No comments yet.</div>
+            ) : (
+              detail.comments.map((c) => (
+                <DiscussionCommentRow
+                  key={c.id}
+                  comment={c}
+                  answerable={detail.answerable}
+                  canDelete={canPush || (!!viewerLogin && c.author === viewerLogin)}
+                  canAnswer={authenticated}
+                  busy={commentBusyMap[c.id]}
+                  error={commentErrors[c.id]}
+                  onSetAnswer={(answer) => onSetAnswer(c, answer)}
+                  onDelete={() => onDeleteComment(c)}
+                />
+              ))
+            )}
+          </div>
+          <div className="mt-2 rounded border border-border/50 bg-background/40 p-1.5">
+            <Textarea
+              value={commentDraft}
+              onChange={(e) => onCommentDraftChange(e.target.value)}
+              placeholder={authenticated ? "Add a comment…" : "Sign in to GitHub to comment"}
+              className="min-h-16 resize-y border-0 bg-transparent px-1 text-xs shadow-none focus-visible:ring-0"
+              disabled={commentBusy || !authenticated}
+            />
+            <div className="mt-1 flex items-center justify-between gap-2">
+              {commentError && (
+                <div className="flex items-center gap-1 text-[11px] text-rose-400">
+                  <AlertCircle className="size-3.5" />
+                  {commentError}
+                </div>
+              )}
+              <div className="ml-auto">
+                <Button
+                  size="sm"
+                  className="h-7"
+                  disabled={commentBusy || !authenticated || !commentDraft.trim()}
+                  title={authenticated ? undefined : "Sign in to GitHub to comment"}
+                  onClick={onSubmitComment}
+                >
+                  {commentBusy ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}
+                  Comment
+                </Button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function DiscussionCommentRow({
+  comment,
+  answerable,
+  canDelete,
+  canAnswer,
+  busy,
+  error,
+  onSetAnswer,
+  onDelete,
+}: {
+  comment: GitHubDiscussionComment;
+  answerable: boolean;
+  canDelete: boolean;
+  canAnswer: boolean;
+  busy: string | undefined;
+  error: string | undefined;
+  onSetAnswer: (answer: boolean) => void;
+  onDelete: () => void;
+}) {
+  const isBusy = !!busy;
+  return (
+    <div className="rounded border border-border/50 bg-background/40 px-2 py-1.5 text-xs">
+      <div className="mb-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+        <span className="font-medium text-foreground">{comment.author ?? "unknown"}</span>
+        <span>{fmtDate(comment.createdAt)}</span>
+        {comment.isAnswer && (
+          <span className="flex items-center gap-0.5 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
+            <Check className="size-3" /> Answer
+          </span>
+        )}
+        <div className="ml-auto flex items-center gap-1">
+          {answerable && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-1.5 text-[10px]"
+              disabled={isBusy || !canAnswer}
+              title={canAnswer ? undefined : "Sign in to GitHub to mark an answer"}
+              onClick={() => onSetAnswer(!comment.isAnswer)}
+            >
+              {busy === "answer" ? <Loader2 className="size-3 animate-spin" /> : comment.isAnswer ? "Unmark answer" : "Mark answer"}
+            </Button>
+          )}
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-5 text-muted-foreground hover:text-rose-400"
+            title={canDelete ? "Delete comment" : PUSH_ONLY_TITLE}
+            aria-label="Delete comment"
+            disabled={isBusy || !canDelete}
+            onClick={onDelete}
+          >
+            {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : <X className="size-3" />}
+          </Button>
+        </div>
+      </div>
+      <div className="markdown-body text-xs">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{comment.body}</ReactMarkdown>
+      </div>
+      {error && (
+        <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
           <AlertCircle className="size-3.5" />
           {error}
         </div>

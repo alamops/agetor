@@ -48,6 +48,12 @@ const {
   parseProjectItems,
   projectsScopeErrorMessage,
   addedProjectItemIdFromGraphql,
+  discussionsDisabledErrorMessage,
+  parseDiscussions,
+  parseDiscussionCategories,
+  parseDiscussionDetail,
+  createdDiscussionFromGraphql,
+  addedDiscussionCommentIdFromGraphql,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -1026,4 +1032,179 @@ test("addedProjectItemIdFromGraphql digs data.addProjectV2ItemById.item.id out o
   expect(addedProjectItemIdFromGraphql({})).toBeNull();
   expect(addedProjectItemIdFromGraphql({ data: { addProjectV2ItemById: null } })).toBeNull();
   expect(addedProjectItemIdFromGraphql({ data: { addProjectV2ItemById: { item: {} } } })).toBeNull();
+});
+
+test("discussionsDisabledErrorMessage maps a disabled-Discussions GraphQL error to a friendly message", () => {
+  expect(discussionsDisabledErrorMessage("Discussions are not enabled for this repository."))
+    .toBe("Discussions aren't enabled for this repository.");
+  expect(discussionsDisabledErrorMessage("Discussion comments are disabled for this repository."))
+    .toBe("Discussions aren't enabled for this repository.");
+  // Unrelated errors pass through untouched.
+  expect(discussionsDisabledErrorMessage("Could not resolve to a Discussion with the number 9.")).toBe(
+    "Could not resolve to a Discussion with the number 9.",
+  );
+  expect(discussionsDisabledErrorMessage("Your token has not been granted the required scopes to execute this query.")).toBe(
+    "Your token has not been granted the required scopes to execute this query.",
+  );
+});
+
+test("parseDiscussions digs repository.discussions.nodes out of a GraphQL response, deriving `answered`", () => {
+  const happy = {
+    data: {
+      repository: {
+        discussions: {
+          nodes: [
+            {
+              id: "D_1",
+              number: 3,
+              title: "How do I configure X?",
+              url: "https://github.com/o/r/discussions/3",
+              createdAt: "2026-01-01T00:00:00Z",
+              isAnswered: true,
+              category: { name: "Q&A" },
+              author: { login: "alice" },
+            },
+            {
+              id: "D_2",
+              number: 4,
+              title: "Feature idea",
+              url: "https://github.com/o/r/discussions/4",
+              createdAt: "2026-01-02T00:00:00Z",
+              isAnswered: false,
+              answerChosenAt: "2026-01-03T00:00:00Z", // defensive: answered even without isAnswered
+              category: { name: "Ideas" },
+              author: null, // deleted account
+            },
+            {
+              id: "D_3",
+              number: 5,
+              title: "Unanswered",
+              url: "https://github.com/o/r/discussions/5",
+              createdAt: "2026-01-04T00:00:00Z",
+              isAnswered: false,
+              category: { name: "Q&A" },
+              author: { login: "bob" },
+            },
+          ],
+        },
+      },
+    },
+  };
+  expect(parseDiscussions(happy)).toEqual([
+    { id: "D_1", number: 3, title: "How do I configure X?", url: "https://github.com/o/r/discussions/3", category: "Q&A", author: "alice", createdAt: "2026-01-01T00:00:00Z", answered: true },
+    { id: "D_2", number: 4, title: "Feature idea", url: "https://github.com/o/r/discussions/4", category: "Ideas", author: null, createdAt: "2026-01-02T00:00:00Z", answered: true },
+    { id: "D_3", number: 5, title: "Unanswered", url: "https://github.com/o/r/discussions/5", category: "Q&A", author: "bob", createdAt: "2026-01-04T00:00:00Z", answered: false },
+  ]);
+
+  // A node missing id/number/title is dropped rather than crashing the whole parse.
+  const partiallyMalformed = {
+    data: { repository: { discussions: { nodes: [{ id: "D_1", number: 1, title: "ok" }, { number: 2, title: "no id" }] } } },
+  };
+  expect(parseDiscussions(partiallyMalformed)).toEqual([
+    { id: "D_1", number: 1, title: "ok", url: "", category: "", author: null, createdAt: "", answered: false },
+  ]);
+
+  expect(parseDiscussions(null)).toEqual([]);
+  expect(parseDiscussions({})).toEqual([]);
+  expect(parseDiscussions({ data: {} })).toEqual([]);
+  expect(parseDiscussions({ data: { repository: null } })).toEqual([]);
+  expect(parseDiscussions({ data: { repository: { discussions: { nodes: "not an array" } } } })).toEqual([]);
+});
+
+test("parseDiscussionCategories digs repository.discussionCategories.nodes out of a GraphQL response", () => {
+  const happy = {
+    data: {
+      repository: {
+        discussionCategories: {
+          nodes: [{ id: "DIC_1", name: "Q&A" }, { id: "DIC_2", name: "Ideas" }],
+        },
+      },
+    },
+  };
+  expect(parseDiscussionCategories(happy)).toEqual([{ id: "DIC_1", name: "Q&A" }, { id: "DIC_2", name: "Ideas" }]);
+
+  expect(parseDiscussionCategories({ data: { repository: { discussionCategories: { nodes: [{ id: "DIC_1" }, { name: "no id" }] } } } }))
+    .toEqual([]);
+  expect(parseDiscussionCategories(null)).toEqual([]);
+  expect(parseDiscussionCategories({})).toEqual([]);
+  expect(parseDiscussionCategories({ data: { repository: null } })).toEqual([]);
+  expect(parseDiscussionCategories({ data: { repository: { discussionCategories: { nodes: "not an array" } } } })).toEqual([]);
+});
+
+test("parseDiscussionDetail digs repository.discussion out of a GraphQL response, with its comments and answerable flag", () => {
+  const happy = {
+    data: {
+      repository: {
+        discussion: {
+          id: "D_1",
+          title: "How do I configure X?",
+          body: "Some **markdown** body.",
+          category: { isAnswerable: true },
+          comments: {
+            nodes: [
+              { id: "DC_1", body: "Try this.", createdAt: "2026-01-01T00:00:00Z", isAnswer: true, author: { login: "alice" } },
+              { id: "DC_2", body: "Thanks!", createdAt: "2026-01-02T00:00:00Z", isAnswer: false, author: null },
+            ],
+          },
+        },
+      },
+    },
+  };
+  expect(parseDiscussionDetail(happy)).toEqual({
+    id: "D_1",
+    title: "How do I configure X?",
+    body: "Some **markdown** body.",
+    answerable: true,
+    comments: [
+      { id: "DC_1", body: "Try this.", author: "alice", createdAt: "2026-01-01T00:00:00Z", isAnswer: true },
+      { id: "DC_2", body: "Thanks!", author: null, createdAt: "2026-01-02T00:00:00Z", isAnswer: false },
+    ],
+  });
+
+  // Non-answerable category (e.g. "Announcements") and no comments.
+  expect(parseDiscussionDetail({
+    data: { repository: { discussion: { id: "D_2", title: "Heads up", body: "", category: { isAnswerable: false }, comments: { nodes: [] } } } },
+  })).toEqual({ id: "D_2", title: "Heads up", body: "", answerable: false, comments: [] });
+
+  // A malformed comment is dropped rather than failing the whole detail.
+  expect(parseDiscussionDetail({
+    data: {
+      repository: {
+        discussion: {
+          id: "D_3",
+          title: "x",
+          comments: { nodes: [{ id: "DC_1", body: "ok" }, { body: "no id" }] },
+        },
+      },
+    },
+  })).toEqual({
+    id: "D_3",
+    title: "x",
+    body: "",
+    answerable: false,
+    comments: [{ id: "DC_1", body: "ok", author: null, createdAt: "", isAnswer: false }],
+  });
+
+  expect(parseDiscussionDetail(null)).toBeNull();
+  expect(parseDiscussionDetail({})).toBeNull();
+  expect(parseDiscussionDetail({ data: { repository: null } })).toBeNull();
+  expect(parseDiscussionDetail({ data: { repository: { discussion: null } } })).toBeNull();
+  expect(parseDiscussionDetail({ data: { repository: { discussion: { title: "no id" } } } })).toBeNull();
+});
+
+test("createdDiscussionFromGraphql digs data.createDiscussion.discussion.{number,url} out of the mutation response", () => {
+  expect(createdDiscussionFromGraphql({ data: { createDiscussion: { discussion: { number: 7, url: "https://github.com/o/r/discussions/7" } } } }))
+    .toEqual({ number: 7, url: "https://github.com/o/r/discussions/7" });
+  expect(createdDiscussionFromGraphql(null)).toBeNull();
+  expect(createdDiscussionFromGraphql({})).toBeNull();
+  expect(createdDiscussionFromGraphql({ data: { createDiscussion: null } })).toBeNull();
+  expect(createdDiscussionFromGraphql({ data: { createDiscussion: { discussion: {} } } })).toBeNull();
+});
+
+test("addedDiscussionCommentIdFromGraphql digs data.addDiscussionComment.comment.id out of the mutation response", () => {
+  expect(addedDiscussionCommentIdFromGraphql({ data: { addDiscussionComment: { comment: { id: "DC_new" } } } })).toBe("DC_new");
+  expect(addedDiscussionCommentIdFromGraphql(null)).toBeNull();
+  expect(addedDiscussionCommentIdFromGraphql({})).toBeNull();
+  expect(addedDiscussionCommentIdFromGraphql({ data: { addDiscussionComment: null } })).toBeNull();
+  expect(addedDiscussionCommentIdFromGraphql({ data: { addDiscussionComment: { comment: {} } } })).toBeNull();
 });

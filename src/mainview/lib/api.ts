@@ -14,6 +14,11 @@ import type {
   GitHubCommitStatus,
   GitHubCommitStatusResult,
   GitHubAssigneesResult,
+  GitHubDiscussion,
+  GitHubDiscussionCategory,
+  GitHubDiscussionComment,
+  GitHubDiscussionDetail,
+  GitHubDiscussionsResult,
   GitHubLabelsResult,
   GitHubRepoLabel,
   GitHubMilestonesResult,
@@ -90,6 +95,11 @@ export type {
   GitHubItemKind,
   GitHubItemState,
   GitHubAssigneesResult,
+  GitHubDiscussion,
+  GitHubDiscussionCategory,
+  GitHubDiscussionComment,
+  GitHubDiscussionDetail,
+  GitHubDiscussionsResult,
   GitHubLabelsResult,
   GitHubRepoLabel,
   GitHubMilestonesResult,
@@ -791,6 +801,39 @@ export const api = {
     }),
   setGitHubProjectItemStatus: (input: { path: string; projectId: string; itemId: string; fieldId: string; optionId: string }) =>
     j<{ ok: true; message?: string }>("/github/project-item-status", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubDiscussions: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubDiscussionsResult>(`/github/discussions?${q.toString()}`);
+  },
+  getGitHubDiscussion: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({ path: input.path, number: String(input.number) });
+    return j<{ ok: true; detail: GitHubDiscussionDetail }>(`/github/discussion?${q.toString()}`);
+  },
+  createGitHubDiscussion: (input: { path: string; categoryId: string; title: string; body: string }) =>
+    j<{ ok: true; number: number; url: string }>("/github/discussion-create", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  addGitHubDiscussionComment: (input: { path: string; discussionId: string; body: string }) =>
+    j<{ ok: true; commentId: string }>("/github/discussion-comment", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubDiscussionAnswer: (input: { path: string; commentId: string; answer: boolean }) =>
+    j<{ ok: true; isAnswer: boolean }>("/github/discussion-answer", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubDiscussion: (input: { path: string; discussionId: string }) =>
+    j<{ ok: true; message?: string }>("/github/discussion-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubDiscussionComment: (input: { path: string; commentId: string }) =>
+    j<{ ok: true; message?: string }>("/github/discussion-comment-delete", {
       method: "POST",
       body: JSON.stringify(input),
     }),

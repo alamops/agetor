@@ -8,6 +8,11 @@ import type {
   GitHubCommitStatus,
   GitHubCommitStatusContext,
   GitHubCommitStatusResult,
+  GitHubDiscussion,
+  GitHubDiscussionCategory,
+  GitHubDiscussionComment,
+  GitHubDiscussionDetail,
+  GitHubDiscussionsResult,
   GitHubItemKind,
   GitHubItemState,
   GitHubLabel,
@@ -264,6 +269,40 @@ interface SetGitHubProjectItemStatusInput {
   optionId: string;
 }
 
+interface GetGitHubDiscussionInput {
+  dir: string;
+  number: number;
+}
+
+interface CreateGitHubDiscussionInput {
+  dir: string;
+  categoryId: string;
+  title: string;
+  body: string;
+}
+
+interface AddGitHubDiscussionCommentInput {
+  dir: string;
+  discussionId: string;
+  body: string;
+}
+
+interface SetGitHubDiscussionAnswerInput {
+  dir: string;
+  commentId: string;
+  answer: boolean;
+}
+
+interface DeleteGitHubDiscussionInput {
+  dir: string;
+  discussionId: string;
+}
+
+interface DeleteGitHubDiscussionCommentInput {
+  dir: string;
+  commentId: string;
+}
+
 // A "conversation" comment (issue/PR body thread) lives under /issues/comments;
 // an inline "review" comment lives under /pulls/comments. Both share the edit /
 // delete shape, differing only by that path segment.
@@ -468,6 +507,11 @@ type GitHubWorkflowActionResponse = ({ ok: true; message: string }) | GitHubList
 type GitHubProjectsV2Response = ({ ok: true } & GitHubProjectsV2Result) | GitHubListError;
 type GitHubProjectItemsResponse = ({ ok: true } & GitHubProjectItemsResult) | GitHubListError;
 type GitHubProjectItemAddResponse = ({ ok: true; itemId: string }) | GitHubListError;
+type GitHubDiscussionsResponse = ({ ok: true } & GitHubDiscussionsResult) | GitHubListError;
+type GitHubDiscussionResponse = ({ ok: true; detail: GitHubDiscussionDetail }) | GitHubListError;
+type GitHubDiscussionCreateResponse = ({ ok: true; number: number; url: string }) | GitHubListError;
+type GitHubDiscussionCommentResponse = ({ ok: true; commentId: string }) | GitHubListError;
+type GitHubDiscussionAnswerResponse = ({ ok: true; isAnswer: boolean }) | GitHubListError;
 
 const GITHUB_FETCH_TIMEOUT_MS = 30_000;
 const GITHUB_DIFF_BODY_CAP_BYTES = 8_000_000;
@@ -732,6 +776,12 @@ export const __githubInternals = {
   parseProjectItems,
   projectsScopeErrorMessage,
   addedProjectItemIdFromGraphql,
+  discussionsDisabledErrorMessage,
+  parseDiscussions,
+  parseDiscussionCategories,
+  parseDiscussionDetail,
+  createdDiscussionFromGraphql,
+  addedDiscussionCommentIdFromGraphql,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -2512,6 +2562,157 @@ function addedProjectItemIdFromGraphql(json: unknown): string | null {
   return typeof id === "string" ? id : null;
 }
 
+/** Map a GraphQL error touching Discussions to a friendly message when the
+ *  repo simply doesn't have the feature enabled (F22/G12) — matches loosely
+ *  on "discussion" alongside "not enabled"/"disabled"/"not available" rather
+ *  than one exact string, since GitHub's own wording for a disabled feature
+ *  isn't stable across query vs mutation. Leaves any other error untouched
+ *  (same shape as `projectsScopeErrorMessage`). Pure — unit-tested. */
+function discussionsDisabledErrorMessage(raw: string): string {
+  if (/discussion/i.test(raw) && /(not enabled|disabled|not available|not have discussions)/i.test(raw)) {
+    return "Discussions aren't enabled for this repository.";
+  }
+  return raw;
+}
+
+/** Dig `data.repository.discussions.nodes` out of the `listGitHubDiscussions`
+ *  GraphQL response (F22/G12). `answered` is true when either `isAnswered` is
+ *  true or `answerChosenAt` is non-null — the production query only requests
+ *  `isAnswered`, but this stays defensive against either shape. Malformed
+ *  entries are dropped individually; unexpected top-level shapes return `[]`.
+ *  Pure — unit-tested. */
+function parseDiscussions(json: unknown): GitHubDiscussion[] {
+  if (!json || typeof json !== "object") return [];
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return [];
+  const repository = (data as { repository?: unknown }).repository;
+  if (!repository || typeof repository !== "object") return [];
+  const discussions = (repository as { discussions?: unknown }).discussions;
+  if (!discussions || typeof discussions !== "object") return [];
+  const nodes = (discussions as { nodes?: unknown }).nodes;
+  if (!Array.isArray(nodes)) return [];
+
+  const result: GitHubDiscussion[] = [];
+  for (const raw of nodes) {
+    if (!raw || typeof raw !== "object") continue;
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj.id !== "string" || typeof obj.number !== "number" || typeof obj.title !== "string") continue;
+    const category = obj.category && typeof obj.category === "object" ? obj.category as Record<string, unknown> : null;
+    const author = obj.author && typeof obj.author === "object" ? obj.author as Record<string, unknown> : null;
+    result.push({
+      id: obj.id,
+      number: obj.number,
+      title: obj.title,
+      url: typeof obj.url === "string" ? obj.url : "",
+      category: category && typeof category.name === "string" ? category.name : "",
+      author: author && typeof author.login === "string" ? author.login : null,
+      createdAt: typeof obj.createdAt === "string" ? obj.createdAt : "",
+      answered: obj.isAnswered === true || obj.answerChosenAt != null,
+    });
+  }
+  return result;
+}
+
+/** Dig `data.repository.discussionCategories.nodes` out of the
+ *  `listGitHubDiscussions` GraphQL response (F22/G12) — powers the
+ *  create-discussion form's category picker only (scope A2: no category
+ *  management). Pure — unit-tested. */
+function parseDiscussionCategories(json: unknown): GitHubDiscussionCategory[] {
+  if (!json || typeof json !== "object") return [];
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return [];
+  const repository = (data as { repository?: unknown }).repository;
+  if (!repository || typeof repository !== "object") return [];
+  const categories = (repository as { discussionCategories?: unknown }).discussionCategories;
+  if (!categories || typeof categories !== "object") return [];
+  const nodes = (categories as { nodes?: unknown }).nodes;
+  if (!Array.isArray(nodes)) return [];
+
+  const result: GitHubDiscussionCategory[] = [];
+  for (const raw of nodes) {
+    if (!raw || typeof raw !== "object") continue;
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj.id !== "string" || typeof obj.name !== "string") continue;
+    result.push({ id: obj.id, name: obj.name });
+  }
+  return result;
+}
+
+/** Dig `data.repository.discussion` out of the `getGitHubDiscussion` GraphQL
+ *  response (F22/G12) — the thread's body plus its comments, and
+ *  `answerable` from `category.isAnswerable`. Returns `null` (never throws)
+ *  on any unexpected shape, including a missing discussion (deleted/no
+ *  access) or a malformed comment list. Individual malformed comments are
+ *  dropped rather than failing the whole detail. Pure — unit-tested. */
+function parseDiscussionDetail(json: unknown): GitHubDiscussionDetail | null {
+  if (!json || typeof json !== "object") return null;
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const repository = (data as { repository?: unknown }).repository;
+  if (!repository || typeof repository !== "object") return null;
+  const discussion = (repository as { discussion?: unknown }).discussion;
+  if (!discussion || typeof discussion !== "object") return null;
+  const obj = discussion as Record<string, unknown>;
+  if (typeof obj.id !== "string" || typeof obj.title !== "string") return null;
+
+  const comments: GitHubDiscussionComment[] = [];
+  const commentsField = obj.comments && typeof obj.comments === "object" ? obj.comments as Record<string, unknown> : null;
+  const commentNodes = commentsField ? commentsField.nodes : undefined;
+  if (Array.isArray(commentNodes)) {
+    for (const raw of commentNodes) {
+      if (!raw || typeof raw !== "object") continue;
+      const c = raw as Record<string, unknown>;
+      if (typeof c.id !== "string" || typeof c.body !== "string") continue;
+      const author = c.author && typeof c.author === "object" ? c.author as Record<string, unknown> : null;
+      comments.push({
+        id: c.id,
+        body: c.body,
+        author: author && typeof author.login === "string" ? author.login : null,
+        createdAt: typeof c.createdAt === "string" ? c.createdAt : "",
+        isAnswer: c.isAnswer === true,
+      });
+    }
+  }
+
+  const category = obj.category && typeof obj.category === "object" ? obj.category as Record<string, unknown> : null;
+  return {
+    id: obj.id,
+    title: obj.title,
+    body: typeof obj.body === "string" ? obj.body : "",
+    comments,
+    answerable: !!category && category.isAnswerable === true,
+  };
+}
+
+/** Dig `data.createDiscussion.discussion.{number,url}` out of the
+ *  `createDiscussion` mutation response (F22/G12). */
+function createdDiscussionFromGraphql(json: unknown): { number: number; url: string } | null {
+  if (!json || typeof json !== "object") return null;
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const payload = (data as { createDiscussion?: unknown }).createDiscussion;
+  if (!payload || typeof payload !== "object") return null;
+  const discussion = (payload as { discussion?: unknown }).discussion;
+  if (!discussion || typeof discussion !== "object") return null;
+  const obj = discussion as Record<string, unknown>;
+  if (typeof obj.number !== "number" || typeof obj.url !== "string") return null;
+  return { number: obj.number, url: obj.url };
+}
+
+/** Dig `data.addDiscussionComment.comment.id` out of the
+ *  `addDiscussionComment` mutation response (F22/G12). */
+function addedDiscussionCommentIdFromGraphql(json: unknown): string | null {
+  if (!json || typeof json !== "object") return null;
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const payload = (data as { addDiscussionComment?: unknown }).addDiscussionComment;
+  if (!payload || typeof payload !== "object") return null;
+  const comment = (payload as { comment?: unknown }).comment;
+  if (!comment || typeof comment !== "object") return null;
+  const id = (comment as { id?: unknown }).id;
+  return typeof id === "string" ? id : null;
+}
+
 /** Toggle a PR's draft state. REST has no endpoint for this, so it goes through
  *  the GraphQL `convertPullRequestToDraft` / `markPullRequestReadyForReview`
  *  mutations, keyed on the PR's global node id (read from the REST PR first). */
@@ -3043,6 +3244,226 @@ export async function setGitHubProjectItemStatus(input: SetGitHubProjectItemStat
   const gqlError = graphqlErrorMessage(json);
   if (gqlError) return { ok: false, error: projectsScopeErrorMessage(gqlError) };
   return { ok: true, message: "Status updated." };
+}
+
+/** List discussions + categories for the repo (F22/G12) — one GraphQL request
+ *  fetches both, same combined-fetch shape as `getGitHubProjectItems`.
+ *  Read-only and works without a token (`auth: "none"`), same as
+ *  `listGitHubItems` — the UI gates create/comment/answer on
+ *  `auth === "token"` rather than on repo push, since any authenticated user
+ *  can do those on Discussions (not just someone with push access). A repo
+ *  with Discussions turned off surfaces as a GraphQL error, mapped to a
+ *  friendly message by `discussionsDisabledErrorMessage`. */
+export async function listGitHubDiscussions(input: { dir: string }): Promise<GitHubDiscussionsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const token = await githubToken();
+
+  const query = `query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){`
+    + `discussions(first:25, orderBy:{field:UPDATED_AT, direction:DESC}){ nodes{ id number title url createdAt isAnswered category{ name } author{ login } } }`
+    + `discussionCategories(first:25){ nodes{ id name } }`
+    + `} }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: discussionsDisabledErrorMessage(gqlError) };
+  return {
+    ok: true,
+    discussions: parseDiscussions(json),
+    categories: parseDiscussionCategories(json),
+    auth: token ? "token" : "none",
+  };
+}
+
+/** A single discussion's body + comments, plus whether its category supports
+ *  marking an answer (F22/G12). Read-only, same no-token-required shape as
+ *  `listGitHubDiscussions`. */
+export async function getGitHubDiscussion(input: GetGitHubDiscussionInput): Promise<GitHubDiscussionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "discussion number must be positive" };
+  }
+  const token = await githubToken();
+
+  const query = `query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){`
+    + `discussion(number:$number){ id title body category{ isAnswerable } comments(first:50){ nodes{ id body createdAt isAnswer author{ login } } } }`
+    + `} }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name, number: input.number } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: discussionsDisabledErrorMessage(gqlError) };
+  const detail = parseDiscussionDetail(json);
+  if (!detail) return { ok: false, error: "GitHub returned an unexpected discussion response" };
+  return { ok: true, detail };
+}
+
+/** Create a discussion (F22/G12). GraphQL-only: resolve the repo's node id
+ *  (same `repository(owner,name){id}` lookup `transferGitHubIssue` uses for
+ *  its target repo), then POST `createDiscussion`. Requires a token — any
+ *  authenticated user can start a discussion, not just someone with push. */
+export async function createGitHubDiscussion(input: CreateGitHubDiscussionInput): Promise<GitHubDiscussionCreateResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.categoryId.trim()) return { ok: false, error: "category required" };
+  const title = input.title.trim();
+  if (!title) return { ok: false, error: "discussion title required" };
+  const body = input.body.trim();
+  if (!body) return { ok: false, error: "discussion body required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to create a discussion" };
+
+  const repoIdQuery = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id}}`;
+  const repoIdRes = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query: repoIdQuery, variables: { owner: repo.owner, name: repo.name } }) },
+  );
+  if (!("status" in repoIdRes)) return repoIdRes;
+  const repoIdJson = await repoIdRes.json().catch(() => null);
+  if (!repoIdRes.ok) return { ok: false, error: apiError(repoIdJson, repoIdRes.status, repoIdRes.statusText) };
+  const repoIdGqlError = graphqlErrorMessage(repoIdJson);
+  if (repoIdGqlError) return { ok: false, error: discussionsDisabledErrorMessage(repoIdGqlError) };
+  const repoId = targetRepoIdFromGraphql(repoIdJson);
+  if (!repoId) return { ok: false, error: "GitHub returned a repository without a node id" };
+
+  const query = `mutation($r:ID!,$c:ID!,$t:String!,$b:String!){ createDiscussion(input:{ repositoryId:$r, categoryId:$c, title:$t, body:$b }){ discussion{ number url } } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { r: repoId, c: input.categoryId, t: title, b: body } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: discussionsDisabledErrorMessage(gqlError) };
+  const created = createdDiscussionFromGraphql(json);
+  if (!created) return { ok: false, error: "GitHub returned an unexpected create-discussion response" };
+  return { ok: true, number: created.number, url: created.url };
+}
+
+/** Comment on a discussion (F22/G12). Requires only a token, not push — same
+ *  gating as `createGitHubDiscussion` (see the G12 gating note). */
+export async function addGitHubDiscussionComment(input: AddGitHubDiscussionCommentInput): Promise<GitHubDiscussionCommentResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.discussionId.trim()) return { ok: false, error: "discussion id required" };
+  const body = input.body.trim();
+  if (!body) return { ok: false, error: "comment body required" };
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to comment" };
+
+  const query = `mutation($d:ID!,$b:String!){ addDiscussionComment(input:{ discussionId:$d, body:$b }){ comment{ id } } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { d: input.discussionId, b: body } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: discussionsDisabledErrorMessage(gqlError) };
+  const commentId = addedDiscussionCommentIdFromGraphql(json);
+  if (!commentId) return { ok: false, error: "GitHub returned an unexpected add-comment response" };
+  return { ok: true, commentId };
+}
+
+/** Mark/unmark a comment as a discussion's accepted answer (F22/G12). GitHub
+ *  actually requires maintain/write access (or being the discussion author)
+ *  for this — narrower than "any token", but there's no cheap way to check
+ *  that up front, so this is allowed optimistically and any rejection
+ *  surfaces as the plain GraphQL error. */
+export async function setGitHubDiscussionAnswer(input: SetGitHubDiscussionAnswerInput): Promise<GitHubDiscussionAnswerResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.commentId.trim()) return { ok: false, error: "comment id required" };
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to mark an answer" };
+
+  const field = input.answer ? "markDiscussionCommentAsAnswer" : "unmarkDiscussionCommentAsAnswer";
+  const query = `mutation($id:ID!){ ${field}(input:{ id:$id }){ clientMutationId } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { id: input.commentId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: discussionsDisabledErrorMessage(gqlError) };
+  return { ok: true, isAnswer: input.answer };
+}
+
+/** Delete a discussion (F22/G12). GitHub permits this on the viewer's own
+ *  discussion, or with repo push/admin — the UI gates the delete control on
+ *  `author === viewerLogin || canPush` and lets any other rejection surface
+ *  as the plain GraphQL error. */
+export async function deleteGitHubDiscussion(input: DeleteGitHubDiscussionInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.discussionId.trim()) return { ok: false, error: "discussion id required" };
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to delete a discussion" };
+
+  const query = `mutation($id:ID!){ deleteDiscussion(input:{ id:$id }){ clientMutationId } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { id: input.discussionId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: discussionsDisabledErrorMessage(gqlError) };
+  return { ok: true, message: "Discussion deleted." };
+}
+
+/** Delete a discussion comment (F22/G12) — same own-content-or-push gating as
+ *  `deleteGitHubDiscussion`. */
+export async function deleteGitHubDiscussionComment(input: DeleteGitHubDiscussionCommentInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.commentId.trim()) return { ok: false, error: "comment id required" };
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to delete a comment" };
+
+  const query = `mutation($id:ID!){ deleteDiscussionComment(input:{ id:$id }){ clientMutationId } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { id: input.commentId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: discussionsDisabledErrorMessage(gqlError) };
+  return { ok: true, message: "Comment deleted." };
 }
 
 /** The authenticated user's login, so the UI can offer edit/delete only on the

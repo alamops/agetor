@@ -59,6 +59,7 @@ import {
 } from "./terminals.ts";
 import { listAgentCapabilities } from "./commands.ts";
 import {
+  addGitHubDiscussionComment,
   addGitHubProjectItem,
   addGitHubReaction,
   addGitHubSubIssue,
@@ -66,6 +67,7 @@ import {
   cancelGitHubWorkflowRun,
   closeGitHubPull,
   createGitHubComment,
+  createGitHubDiscussion,
   createGitHubIssue,
   createGitHubPull,
   createGitHubLabel,
@@ -73,11 +75,14 @@ import {
   createGitHubPullLineComment,
   createGitHubRelease,
   deleteGitHubComment,
+  deleteGitHubDiscussion,
+  deleteGitHubDiscussionComment,
   deleteGitHubLabel,
   deleteGitHubMilestone,
   deleteGitHubRelease,
   dispatchGitHubWorkflow,
   getGitHubCommitStatus,
+  getGitHubDiscussion,
   getGitHubIssuePinned,
   getGitHubProjectItems,
   getGitHubPullChecks,
@@ -91,6 +96,7 @@ import {
   getGitHubPullReviewThreads,
   listGitHubAssignees,
   listGitHubComments,
+  listGitHubDiscussions,
   listGitHubItems,
   listGitHubItemsAcrossRepos,
   listGitHubLabels,
@@ -116,6 +122,7 @@ import {
   requestGitHubPullReviewers,
   rerunGitHubWorkflowRun,
   reviewGitHubPull,
+  setGitHubDiscussionAnswer,
   setGitHubIssueLock,
   setGitHubIssuePinned,
   setGitHubProjectItemStatus,
@@ -1903,6 +1910,138 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             fieldId: body.fieldId,
             optionId: body.optionId,
           });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussions": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubDiscussions({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const rawNumber = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid discussion number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubDiscussion({ dir, number: rawNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-create": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            categoryId?: string;
+            title?: string;
+            body?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.categoryId !== "string" || !body.categoryId.trim()) {
+            return json({ error: "categoryId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.title !== "string" || !body.title.trim()) {
+            return json({ error: "title required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubDiscussion({
+            dir,
+            categoryId: body.categoryId,
+            title: body.title,
+            body: body.body,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-comment": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; discussionId?: string; body?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.discussionId !== "string" || !body.discussionId.trim()) {
+            return json({ error: "discussionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await addGitHubDiscussionComment({ dir, discussionId: body.discussionId, body: body.body });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-answer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; commentId?: string; answer?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.commentId !== "string" || !body.commentId.trim()) {
+            return json({ error: "commentId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.answer !== "boolean") {
+            return json({ error: "answer (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubDiscussionAnswer({ dir, commentId: body.commentId, answer: body.answer });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; discussionId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.discussionId !== "string" || !body.discussionId.trim()) {
+            return json({ error: "discussionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubDiscussion({ dir, discussionId: body.discussionId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-comment-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; commentId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.commentId !== "string" || !body.commentId.trim()) {
+            return json({ error: "commentId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubDiscussionComment({ dir, commentId: body.commentId });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

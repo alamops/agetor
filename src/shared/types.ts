@@ -1060,6 +1060,62 @@ export interface GitHubProjectItemsResult {
   statusField: GitHubProjectField | null;
 }
 
+/** A GitHub Discussions thread (GraphQL-only — F22/G12). `answered` is derived
+ *  from `isAnswered`/`answerChosenAt` — true once one of the thread's comments
+ *  has been marked the accepted answer. `author` is null for a deleted
+ *  account (GraphQL nulls the field rather than erroring). */
+export interface GitHubDiscussion {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  category: string;
+  author: string | null;
+  createdAt: string;
+  answered: boolean;
+}
+
+/** A Discussions category (e.g. "Q&A", "Announcements") — listed only to
+ *  populate the create-discussion form's category picker. Scope decision A2:
+ *  category *management* (create/edit/delete a category) is out of scope. */
+export interface GitHubDiscussionCategory {
+  id: string;
+  name: string;
+}
+
+/** `auth` mirrors `GitHubListResult.auth`: discussions are readable without a
+ *  token, but the UI gates create/comment/answer on `auth !== "none"` — any
+ *  authenticated user can do those, not just someone with push access (G12
+ *  gating note; distinct from every other manager panel, which gates writes
+ *  on push). */
+export interface GitHubDiscussionsResult {
+  discussions: GitHubDiscussion[];
+  categories: GitHubDiscussionCategory[];
+  auth: "token" | "none";
+}
+
+/** A single comment on a discussion thread. `isAnswer` reflects whether GitHub
+ *  currently has this comment marked as the discussion's accepted answer. */
+export interface GitHubDiscussionComment {
+  id: string;
+  body: string;
+  author: string | null;
+  createdAt: string;
+  isAnswer: boolean;
+}
+
+/** A discussion's full detail — body + comments. `answerable` reflects the
+ *  discussion's *category* (`category.isAnswerable`, e.g. "Q&A" is answerable,
+ *  "Announcements" isn't) — the UI hides the mark/unmark-answer control when
+ *  false regardless of who's viewing. */
+export interface GitHubDiscussionDetail {
+  id: string;
+  title: string;
+  body: string;
+  comments: GitHubDiscussionComment[];
+  answerable: boolean;
+}
+
 /** GitHub's mergeability verdict for a PR, from `GET /pulls/:n`.
  *  `mergeable` is null while GitHub computes it in the background (poll again).
  *  `mergeableState` is GitHub's coarse status: clean | dirty (conflicts) |
