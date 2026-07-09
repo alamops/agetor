@@ -246,9 +246,21 @@ Render a small pill (match the existing badge/pill idiom already in the file —
 
 **Rollback:** the gate is one `if` in `attachDoneHandler`. Reverting T4 restores today's behavior; T1/T2/T3/T5/T6 are additive and inert without it.
 
-## 8. Open questions / assumptions
+## 8. What actually shipped — deviations from this plan
+
+1. **§7 claimed "Stop still works" on a held task. It did not.** `attachDoneHandler` runs `active.delete(runId)` before parking the card, and `cancelRun` begins `if (!h) return false` — so Stop was a silent no-op on exactly the task it was meant to rescue. Fixed by giving `cancelRun` a held-task branch (interrupt by session name, orphan the rows, release to `review`) and adding `interruptTaskSession` to `claude-tmux.ts`, which addresses the session by its deterministic name and so works with no `SessionState` (as after a boot re-arm).
+2. **`disposeSessionState` was parameterized rather than unconditionally orphaning.** T3 verified all three call sites and found `reattachSession`'s defensive pre-dispose may refer to a *live* session that will keep writing. It takes `orphanSubagents = false`; only `spawnClaudeViaTmux` and `dropSession` — both provably preceded by a `killTaskSession` — pass `true`.
+3. **`dropSession` now also releases when there is no `SessionState`.** A task held across a restart has a boot-armed watcher but no session state, so delete/archive would have leaked its poll timer.
+4. **The boot pass releases (rather than skips) a held task whose run has a null `claudeSessionId`.** No watch path can be derived, so nothing would ever observe those agents finishing — treating it like a dead session is the only non-stranding option.
+5. **`setSubagentEmitter` / `setSubagentSettleHook` now return the previous value.** Not in the original plan. `bun test` shares one process; a test that reset them to `null` un-wired the orchestrator for every later file, and the task could never reach `review`. Tests save and restore.
+6. **`db.runningCountForTask`** added so the hold's status message doesn't scan every row via `runningCountsByTask()`.
+
+## 9. Open questions / assumptions
 
 - **Assumed** the `status` chunk emitted when holding (`background agents still running (N) …`) needs no new sentinel constant — it's informational, not pattern-matched by `makeChunkHandler`. If review disagrees, promote it to `shared/types.ts`.
 - **Assumed** `GET /tasks` is the only route the board reads task rows from. T5 must grep for other `tasks.list()` / `tasks.get()` route handlers and cover them.
 - **Deferred:** distinguishing async (`run_in_background`) from sync `Task` subagents. Not needed for this behavior; revisit if the sub-second hold on sync subagents ever proves visible.
 - **Deferred:** surfacing `failed` / `cancelled` subagent statuses (still dead states after this change; we only add `orphaned`).
+- **Deliberate:** the badge renders in *every* column, not just `running`. If a background agent resumes after the card reached `review`, its row flips back to `running` and the badge reappears on a Review card. The count is truthful and surfaces the anomaly rather than hiding it; nothing pulls the card back to `running`. Revisit if it reads as noise.
+- **Known cosmetic:** deleting a held task emits one transient `column → review` GlobalEvent (via `dropSession` → orphan → settle hook) microseconds before the row is deleted.
+- **Not done:** no real-app smoke test (`bun run dev`). Verified by 789 unit/integration tests only.
