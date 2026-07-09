@@ -61,12 +61,23 @@ export function intersection(a: Rect, b: Rect): Rect | null {
 }
 
 /**
- * True iff `frame` overlaps some display's `bounds` (not `workArea`) by at
- * least `MIN_VISIBLE_WIDTH` x `MIN_VISIBLE_HEIGHT`. `bounds` is used here
+ * True iff `frame` overlaps a *single* display's `bounds` (not `workArea`) by
+ * at least `MIN_VISIBLE_WIDTH` x `MIN_VISIBLE_HEIGHT`. `bounds` is used here
  * rather than `workArea` because a frame that pokes up under the menu bar
  * or down over the Dock is still visible and draggable — visibility only
  * cares about the physical screen, not the region an app window is polite
  * enough to avoid.
+ *
+ * The threshold is evaluated **per display, not against the union of them**.
+ * Adjacent displays form one contiguous desktop, so a window straddling the
+ * seam can present a usable strip to the user while clearing the threshold on
+ * neither screen alone — e.g. a 120pt-wide window centred on the boundary
+ * shows 60pt on each side and is reported here as not visible. That is a
+ * deliberate false negative. The alternative, summing coverage across
+ * displays, would accept a 10x600 sliver (6000px² > the 4800px² threshold
+ * area) as "visible" even though there's no grabbable title bar anywhere —
+ * trading a rare, harmless re-centering for a window the user genuinely
+ * cannot reach. Erring toward repair is the safer failure.
  *
  * Returns `true` when `displays` is empty. `Screen.getAllDisplays()`
  * returns `[]` when the native display-enumeration library isn't loaded
@@ -95,9 +106,11 @@ export function frameIsVisible(frame: Rect, displays: DisplayInfo[]): boolean {
  * purpose. Visibility checks (above) and repair placement (here) are
  * deliberately asymmetric for this reason.
  *
- * Repair only fires on *total* loss of visibility (delegated to
- * `frameIsVisible`), never on a partial mismatch or an unfamiliar-looking
- * position. A frame legitimately placed on a secondary display can have
+ * Repair fires only when `frameIsVisible` reports no display showing a usable
+ * part of the frame — never on a partial mismatch or an unfamiliar-looking
+ * position. (See `frameIsVisible` for the one deliberate false negative: a
+ * window straddling the seam between two adjacent displays.) A frame
+ * legitimately placed on a secondary display can have
  * wildly different-looking coordinates from the primary display (e.g. a
  * large negative x) without being wrong — display layouts are stored in
  * whatever coordinate space macOS handed back at placement time, and a

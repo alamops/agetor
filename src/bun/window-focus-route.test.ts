@@ -1,53 +1,48 @@
-import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { makeTestNative } from "./test-native.ts";
+import { focusWindow } from "./window-focus.ts";
 
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-window-focus-route-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
 // Distinct from other server-test ports so parallel test runs don't fight.
 process.env.AGETOR_API_PORT = "4402";
 
-// Stub electrobun's native bridge before server.ts imports it — same reason
-// as notifications.test.ts. Critically, this stub MUST export `Screen`:
-// server.ts's `/window/focus` handler reads `ElectrobunBun.Screen.getAllDisplays()`
-// lazily inside the handler and passes it straight through to `focusWindow`,
-// which calls it inside a guarded try/catch as part of frame repair. Without
-// a `Screen` export here, `getAllDisplays()` would throw, the guard would
-// swallow it, and `activate()` would still run — the test would pass for the
-// wrong reason (proving nothing about the frame-repair path actually running).
-mock.module("electrobun/bun", () => ({
-  Utils: {
-    showNotification: () => {},
-    openPath: () => true,
-    openFileDialog: async () => [],
-  },
-  BrowserWindow: class { /* unused in this test */ },
-  ApplicationMenu: { setApplicationMenu: () => { /* noop */ } },
-  Updater: { /* noop */ },
-  Screen: { getAllDisplays: () => [] },
-}));
-
-let server: { stop: () => void; port: number };
-let token: string;
+// No mock.module("electrobun/bun") here, deliberately: server.ts must never
+// import Electrobun (that would drag it, and `three`, into the headless CLI
+// daemon — see the ApiNative doc-comment). /window/focus reaches the native
+// host through the same injected `ApiNative` seam every other native route
+// uses, so this test injects one instead of stubbing a module.
+let server: { stop: () => void };
 let setMainWindow: (win: unknown) => void;
+let token: string;
 
 beforeAll(async () => {
   await import("./db.ts");
   const { startApiServer, API_TOKEN } = await import("./server.ts");
   const windowModule = await import("./window.ts");
   setMainWindow = windowModule.setMainWindow as unknown as (win: unknown) => void;
-  server = startApiServer() as unknown as { stop: () => void; port: number };
+  const { getMainWindow } = windowModule;
+
+  // Mirror index.ts's real wiring: the injected focusWindow() resolves the
+  // window through the same registry the app uses and delegates to the same
+  // routine. `getAllDisplays: () => []` is what Electrobun itself returns when
+  // the native display library isn't loaded, which is exactly this process.
+  const native = makeTestNative({
+    focusWindow: () => focusWindow(getMainWindow(), { getAllDisplays: () => [] }),
+  });
+
+  server = startApiServer({ native }) as unknown as { stop: () => void };
   token = API_TOKEN;
 });
 
-afterAll(() => {
-  server?.stop?.();
-});
+afterAll(() => server?.stop?.());
 
 afterEach(() => {
-  // A registered fake window must never leak into another test in this file
-  // (or a sibling test file, given mock.module's process-wide reach).
+  // A registered fake window must never leak into another test in this file,
+  // or into a sibling file sharing the module registry.
   setMainWindow(null);
 });
 

@@ -80,13 +80,20 @@ export function focusWindow(win: FocusableWindow | null | undefined, deps: Focus
   // `activateIgnoringOtherApps:` + `makeKeyAndOrderFront:` under the hood.
   //
   // Deliberately not doing the `setVisibleOnAllWorkspaces(true) → activate()
-  // → false` trick some Electron apps use to force a Space switch:
-  // Electrobun exposes no such API (no `NSApp.activate`, no
-  // `moveToActiveSpace`), and even if it did, forcing a Space switch is the
-  // app overriding a user-level macOS setting ("switch to a Space with open
-  // windows"). If the window lives on another Space, macOS decides whether
-  // to switch to it. This is a deliberate product choice, not a gap — don't
-  // "fix" it by reaching for cross-Space tricks later.
+  // → false` trick that would pull the window onto whichever Space the user
+  // is currently looking at. Electrobun *does* expose
+  // `setVisibleOnAllWorkspaces` (BrowserWindow.ts:342 — it's the one
+  // `collectionBehavior` bit the FFI surfaces), so this is buildable: leaving
+  // it out is a product decision, not a missing API. Forcing the window
+  // across Spaces overrides a user-level macOS setting ("switch to a Space
+  // with open windows"), the toggle-off half of the trick is timing-sensitive,
+  // and `canJoinAllSpaces` alone still can't enter another app's fullscreen
+  // Space. So if the window lives on another Space, macOS decides. Don't
+  // "fix" this later without re-litigating the product call.
+  //
+  // (`NSApp.activate` and `moveToActiveSpace` genuinely don't exist in the
+  // FFI table, and can't be added: the native wrapper ships as a prebuilt
+  // dylib with no source, and dlopen throws on an undeclared symbol.)
   try {
     win.activate();
   } catch (err) {

@@ -119,6 +119,24 @@ describe("frameIsVisible", () => {
   test("window entirely off every display is not visible", () => {
     expect(frameIsVisible({ x: 5000, y: 5000, width: 800, height: 600 }, DISPLAYS)).toBe(false);
   });
+
+  test("narrow window straddling the LEFT/PRIMARY seam is reported not visible (deliberate false negative)", () => {
+    // LEFT spans x:-1366..0 and PRIMARY spans x:0..1728, so this 120pt-wide
+    // frame is fully on-screen to the user: 60pt either side of the seam. The
+    // threshold is checked per display, so neither reaches MIN_VISIBLE_WIDTH
+    // and repair re-centres it. Pinned because the obvious "fix" — summing
+    // coverage across displays — would start accepting ungrabbable slivers.
+    const straddling: Rect = { x: -60, y: 100, width: 120, height: 600 };
+    expect(intersection(straddling, LEFT.bounds)).toEqual({ x: -60, y: 100, width: 60, height: 600 });
+    expect(intersection(straddling, PRIMARY.bounds)).toEqual({ x: 0, y: 100, width: 60, height: 600 });
+    expect(frameIsVisible(straddling, DISPLAYS)).toBe(false);
+  });
+
+  test("a wide window straddling the same seam is visible (one side clears the threshold)", () => {
+    // The false negative above is confined to windows narrower than
+    // 2 x MIN_VISIBLE_WIDTH. A normal-sized window on the seam is fine.
+    expect(frameIsVisible({ x: -200, y: 100, width: 800, height: 600 }, DISPLAYS)).toBe(true);
+  });
 });
 
 describe("repairFrame", () => {

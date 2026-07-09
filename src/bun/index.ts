@@ -238,6 +238,7 @@ const native: ApiNative = {
   openPath: (p) => Utils.openPath(p),
   openExternal: (url) => Utils.openExternal(url),
   showNotification: (n) => showTaskNotification(n),
+  focusWindow: () => focusMainWindow(),
   quit: () => Utils.quit(),
   updates: {
     snapshot: () => getUpdateSnapshot(),

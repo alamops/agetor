@@ -2,14 +2,6 @@ import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { WebSocketHandler } from "bun";
-// Namespace import, not `import { Screen } from "electrobun/bun"`: tests
-// mock.module("electrobun/bun", ...) with a stub that doesn't export
-// `Screen` (see notifications.test.ts), and Bun's ESM linker rejects a
-// named import of a binding the mock doesn't provide at *import* time,
-// before any test even runs. A namespace import always resolves; the
-// `/window/focus` handler below reads `.Screen` off it lazily, so a mocked
-// module missing that key only matters if the route is actually hit.
-import * as ElectrobunBun from "electrobun/bun";
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, getApiPort } from "./api-config.ts";
 import { removeCoreCreds } from "./core-creds.ts";
@@ -69,7 +61,6 @@ import {
 import { listAgentCapabilities } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
-import { focusWindow } from "./window-focus.ts";
 import {
   answerTmuxPrompt,
   findTmuxPromptById,
@@ -220,6 +211,14 @@ export interface ApiNative {
     /** Task to deep-link to on click, e.g. via terminal-notifier's -open. */
     taskId?: string;
   }): void;
+  /** Raise + focus the app window. Returns `false` when there is no window to
+   *  act on — never to report a failed native call, so callers can map `false`
+   *  to "no window" without conflating it with a platform hiccup. Lives behind
+   *  this interface (rather than calling `focusWindow` here) because resolving
+   *  the display layout needs `Screen` from `electrobun/bun`, and importing
+   *  that at module scope would drag Electrobun — and its transitive `three`
+   *  dependency — into the headless CLI daemon, which imports this file. */
+  focusWindow(): boolean;
   quit(): void;
   updates: {
     snapshot(): UpdaterSnapshot;
@@ -462,11 +461,18 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // Dock reopen). The webview needs this too: a clicked toast's `onOpen`
       // runs entirely in the renderer, and a WKWebView's own `window.focus()`
       // can't activate the host NSApplication, so it has to round-trip
-      // through here to reach the same `focusWindow` routine.
+      // through here.
+      //
+      // Native-gated rather than calling `focusWindow()` inline (the way
+      // `/window/toggle-zoom` above pokes `getMainWindow()` directly): raising
+      // a window means first checking the frame against the live display
+      // layout, which needs `Screen` from `electrobun/bun`. Importing that
+      // here would pull Electrobun into the headless CLI daemon, which imports
+      // this module — see the note on ApiNative.
       "/window/focus": {
         POST: authed((req) => {
-          const focused = focusWindow(getMainWindow(), { getAllDisplays: () => ElectrobunBun.Screen.getAllDisplays() });
-          if (!focused) {
+          if (!native) return notAvailableHeadless(req);
+          if (!native.focusWindow()) {
             return json(
               { error: "no main window" },
               { status: 503, headers: corsHeaders(req) },
