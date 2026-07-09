@@ -48,6 +48,7 @@ import {
   sessionLiveness,
   sessionNameFor,
   jsonlPathFor,
+  interruptTaskSession,
 } from "./claude-tmux.ts";
 import {
   dropCodexSession,
@@ -486,10 +487,14 @@ export function reconcileOrphans(): number {
     if (resolveHarness(task.agent)?.kind !== "claude-code") continue;
     if (sessionExistsByName(sessionNameFor(heldId))) {
       const run = task.runId ? runs.get(task.runId) : null;
-      // No JSONL session id means no watch directory to derive — the background
-      // agents can't be re-tailed, so leave the rows for a later settle rather
-      // than fabricating a path.
-      if (!run?.claudeSessionId) continue;
+      // No JSONL session id means no watch directory to derive, so nothing will
+      // ever observe these agents finishing. Treat it exactly like a dead
+      // session and release, rather than leaving the card held forever.
+      if (!run?.claudeSessionId) {
+        orphanRunningSubagents(heldId);
+        released++;
+        continue;
+      }
       const cwd = task.worktreePath ?? task.workdir;
       const harness = resolveHarness(task.agent);
       attachSubagentWatcher({
@@ -742,7 +747,7 @@ function attachDoneHandler(
           && !wasSessionDied
           && subagents.hasRunning(taskId);
         if (holdForSubagents) {
-          const runningCount = subagents.runningCountsByTask().get(taskId) ?? 0;
+          const runningCount = subagents.runningCountForTask(taskId);
           emit({
             runId,
             taskId,
@@ -956,7 +961,20 @@ function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult
 
 export function cancelRun(runId: string): boolean {
   const h = active.get(runId);
-  if (!h) return false;
+  if (!h) {
+    // A held task (turn succeeded, background agents still running) has no
+    // `active` handle — `attachDoneHandler` dropped it before parking the card
+    // in `running`. Its Stop button must still do something, or a background
+    // agent that wedges without dying leaves the user no way out short of a
+    // restart. Interrupt the live session and release the hold; the run itself
+    // already succeeded, so the card advances to `review`.
+    const taskId = runs.get(runId)?.taskId;
+    if (!taskId || !isHeldByBackgroundAgents(taskId)) return false;
+    cancelPendingForTask(taskId, "cancelled by user");
+    interruptTaskSession(taskId);
+    orphanRunningSubagents(taskId);
+    return true;
+  }
   // Stop targets the whole task, not just one run. `kill()` sends Ctrl+C
   // to the tmux session, which also clears claude's queued-input buffer,
   // so every queued run in this task is going down too. Mark each

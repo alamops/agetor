@@ -689,6 +689,14 @@ export const subagents = {
     ).get(taskId);
     return row !== null;
   },
+  /** How many of this task's subagents are `running`. Distinct from
+   *  `runningCountsByTask` so a single-task caller doesn't scan every row. */
+  runningCountForTask(taskId: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM subagents WHERE task_id = ? AND status = 'running'`,
+    ).get(taskId);
+    return row?.n ?? 0;
+  },
   /** Flip every `running` row for this task to `orphaned` (ended_at = now).
    *  Returns the affected rows (post-update shape) so the caller can emit a
    *  `finished` lifecycle event per row. Returns [] when nothing was running. */

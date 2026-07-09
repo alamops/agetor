@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { tasks } from "./db.ts";
-import { attachSubagentWatcher, orphanRunningSubagents, type SubagentWatcherHandle } from "./claude-subagents.ts";
+import { attachSubagentWatcher, detachWatcherFor, orphanRunningSubagents, type SubagentWatcherHandle } from "./claude-subagents.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
   activeTmuxPromptsForTask,
@@ -3578,8 +3578,29 @@ export function dropSession(taskId: string): void {
     // any `running` subagent rows are never getting another transcript line.
     disposeSessionState(state, true);
     sessions.delete(taskId);
+  } else {
+    // A task held in `running` across a restart has a watcher armed by the boot
+    // pass but no SessionState (its run already succeeded, so nothing
+    // reattached). Without this the boot-armed watcher outlives the task it
+    // belongs to, polling a directory that delete/archive is about to remove.
+    detachWatcherFor(taskId);
+    orphanRunningSubagents(taskId);
   }
   killTaskSession(taskId);
+}
+
+/**
+ * Send Ctrl+C to a task's tmux session addressed purely by its deterministic
+ * name — no in-memory `SessionState` required. Stop on a task whose turn has
+ * already resolved (held in `running` while its background agents finish) has
+ * no `active` run handle to route the interrupt through, and after a restart it
+ * has no `SessionState` either. Returns false when the session is already gone.
+ */
+export function interruptTaskSession(taskId: string): boolean {
+  const name = sessionNameFor(taskId);
+  if (!sessionExistsByName(name)) return false;
+  tmux(["send-keys", "-t", name, "C-c"]);
+  return true;
 }
 
 /** Close any watcher / interval timer held by a SessionState and reject any
