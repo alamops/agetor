@@ -49,6 +49,10 @@ function coerceTodoItem(raw: unknown): TodoItem | null {
   const r = raw as Record<string, unknown>;
   if (r.content == null) return null;
   const content = String(r.content);
+  // An empty/whitespace-only content would render as a lone checkbox glyph
+  // beside a blank line. Drop it, same as a missing `content` — consistent
+  // with this module's refusal to render a vacuous card at all.
+  if (content.trim() === "") return null;
   const status: TodoStatus =
     typeof r.status === "string" && VALID_STATUSES.has(r.status)
       ? (r.status as TodoStatus)
