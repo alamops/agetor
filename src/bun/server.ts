@@ -222,6 +222,14 @@ export interface ApiNative {
     /** Task to deep-link to on click, e.g. via terminal-notifier's -open. */
     taskId?: string;
   }): void;
+  /** Raise + focus the app window. Returns `false` when there is no window to
+   *  act on — never to report a failed native call, so callers can map `false`
+   *  to "no window" without conflating it with a platform hiccup. Lives behind
+   *  this interface (rather than calling `focusWindow` here) because resolving
+   *  the display layout needs `Screen` from `electrobun/bun`, and importing
+   *  that at module scope would drag Electrobun — and its transitive `three`
+   *  dependency — into the headless CLI daemon, which imports this file. */
+  focusWindow(): boolean;
   quit(): void;
   updates: {
     snapshot(): UpdaterSnapshot;
@@ -455,6 +463,32 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           if (win.isMaximized()) win.unmaximize();
           else win.maximize();
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Bring the main window to the front from the webview side — the
+      // counterpart to `focusMainWindow()` in index.ts (notification click,
+      // Dock reopen). The webview needs this too: a clicked toast's `onOpen`
+      // runs entirely in the renderer, and a WKWebView's own `window.focus()`
+      // can't activate the host NSApplication, so it has to round-trip
+      // through here.
+      //
+      // Native-gated rather than calling `focusWindow()` inline (the way
+      // `/window/toggle-zoom` above pokes `getMainWindow()` directly): raising
+      // a window means first checking the frame against the live display
+      // layout, which needs `Screen` from `electrobun/bun`. Importing that
+      // here would pull Electrobun into the headless CLI daemon, which imports
+      // this module — see the note on ApiNative.
+      "/window/focus": {
+        POST: authed((req) => {
+          if (!native) return notAvailableHeadless(req);
+          if (!native.focusWindow()) {
+            return json(
+              { error: "no main window" },
+              { status: 503, headers: corsHeaders(req) },
+            );
+          }
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },

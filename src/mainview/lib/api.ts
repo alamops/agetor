@@ -185,6 +185,15 @@ export const api = {
    *  implement the native title-bar double-click gesture. */
   toggleWindowZoom: () =>
     j<{ ok: boolean; skipped?: string }>("/window/toggle-zoom", { method: "POST" }),
+  /** Ask the main process to raise + focus the app window. A WKWebView's own
+   *  `window.focus()` can't activate the host NSApplication, so every "bring
+   *  agetor to front" affordance (toast clicks, etc.) has to round-trip
+   *  through here instead. Best-effort UI polish: swallows failures behind a
+   *  console.warn rather than throwing into a React event handler. */
+  focusWindow: (): Promise<void> =>
+    j<{ ok: true }>("/window/focus", { method: "POST" })
+      .then(() => undefined)
+      .catch((e) => { console.warn("[agetor] focusWindow failed", e); }),
   getUpdateStatus: () => j<UpdateSnapshot>("/updates/status"),
   checkForUpdate: () => j<UpdateSnapshot>("/updates/check", { method: "POST" }),
   applyUpdate: () => j<{ ok: true }>("/updates/apply", { method: "POST" }),
