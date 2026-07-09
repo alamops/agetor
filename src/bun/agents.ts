@@ -1,5 +1,5 @@
 import path from "node:path";
-import { MODEL_EFFORT_SUPPORT, type AgentKind, type Harness } from "../shared/types.ts";
+import { MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   spawnClaudeViaTmux,
@@ -64,6 +64,7 @@ const CLAUDE_MODEL_FLAG: Record<string, string> = {
   "opus-4.8": "claude-opus-4-8",
   "opus-4.7": "claude-opus-4-7",
   "opus-4.6": "claude-opus-4-6",
+  "sonnet-5": "claude-sonnet-5",
   "sonnet-4.6": "claude-sonnet-4-6",
   "haiku-4.5": "claude-haiku-4-5",
 };
@@ -461,6 +462,19 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
     setTimeout(() => {
       onChunk("assistant", "API Error: 529 Overloaded. This is a server-side issue, usually temporary.");
       onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}HTTP 529 — turn aborted; blocked for manual retry`);
+    }, 5);
+    setTimeout(() => { resolveDone(0); }, resolveDelayMs);
+  } else if (process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED === "1") {
+    // Test hook: simulate the tmux session dying mid-turn. Mirrors what the
+    // real drivers emit from their death watch — the `SESSION_DIED_STATUS_PREFIX`
+    // sentinel status chunk that makeChunkHandler pattern-matches to flip the
+    // column to `blocked`, then resolves the turn with code 0 (the handle
+    // `sessionDied` flag, not the exit code, drives the failed/blocked outcome).
+    // Optional resolve delay lets cancellation-precedence tests fire cancelRun
+    // between the column flip and the done resolution.
+    const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
+    setTimeout(() => {
+      onChunk("status", `${SESSION_DIED_STATUS_PREFIX}tmux session agetor-fake ended unexpectedly — task blocked`);
     }, 5);
     setTimeout(() => { resolveDone(0); }, resolveDelayMs);
   } else {

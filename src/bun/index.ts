@@ -1,14 +1,19 @@
-import { writeFileSync } from "node:fs";
-import Electrobun, { ApplicationMenu, BrowserWindow, Updater } from "electrobun/bun";
+import { writeFileSync, existsSync } from "node:fs";
+import Electrobun, { ApplicationMenu, BrowserWindow, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
-import { startApiServer, API_PORT, API_TOKEN } from "./server.ts";
-import { db, pidFilePath, tasks } from "./db.ts";
+import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
+import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans } from "./orchestrator.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
-import { startUpdaterLoop } from "./updater.ts";
+import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
+import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
+import { resolveNotifier, resolveNotifierApp, buildNotifierArgs } from "./notifier.ts";
+import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
+import { setPendingOpenTask } from "./pending-open.ts";
+import pkg from "../../package.json" with { type: "json" };
 
 /** Drop a pid file in the data dir so out-of-process tools (notably
  *  `bun run wipe:dev`) can tell whether an agetor instance is using this
@@ -119,19 +124,179 @@ installNativeMenu();
 // background — we don't await it so a slow CLI never delays the API/window.
 void refreshDiscoveredModels();
 
-try {
-  startApiServer();
-} catch (e) {
-  // The webview is created after this — if the API never came up, we'd
-  // leave an orphan window talking to whatever else happens to be on the
-  // port (e.g. a stale agetor, or OTLP gRPC which also defaults to 4317).
-  // Fail loudly instead so the user sees the real problem in the launcher
-  // logs rather than a wall of CORS errors in the renderer console.
-  const msg = (e as Error)?.message ?? String(e);
-  console.error(`[agetor] failed to bind API on 127.0.0.1:${API_PORT}: ${msg}`);
-  console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
-  process.exit(1);
+/**
+ * Posts a task notification, deep-linking it to the task when possible.
+ *
+ * Electrobun's own `Utils.showNotification` has no click callback — a click
+ * just dismisses the banner — so it can't carry the user back to the task that
+ * fired it. Our bundled native helper (AgetorNotifier.app, see notifier.ts)
+ * can: it posts via UNUserNotificationCenter with the deep link in userInfo,
+ * and on click opens `agetor://task/<id>`, which triggers Electrobun's
+ * "open-url" event (handled below) on the already-running app. So when a
+ * `taskId` is supplied and the helper resolves, we spawn it instead.
+ *
+ * Fallback discipline (a notifier problem must never mean NO notification):
+ *   - No taskId or no helper resolved → plain Utils.showNotification.
+ *   - A *synchronous* spawn throw → caught here → plain notification.
+ *   - The helper launches but exits non-zero (e.g. the user denied
+ *     notification permission — the helper exits 2 then) → we watch `.exited`
+ *     and fall back on failure. This async check is essential: a
+ *     launch/permission failure surfaces on the *child*, not as a synchronous
+ *     throw. The helper exits 0 once it has posted, so the happy path never
+ *     double-notifies.
+ */
+function showTaskNotification(n: {
+  title: string;
+  body?: string;
+  subtitle?: string;
+  silent?: boolean;
+  taskId?: string;
+}): void {
+  const plain = () =>
+    Utils.showNotification({ title: n.title, body: n.body, subtitle: n.subtitle, silent: n.silent });
+
+  if (n.taskId) {
+    const bin = resolveNotifier();
+    if (bin) {
+      try {
+        const child = Bun.spawn(
+          [
+            bin,
+            ...buildNotifierArgs({
+              title: n.title,
+              body: n.body,
+              subtitle: n.subtitle,
+              silent: n.silent,
+              url: buildTaskDeepLink(n.taskId),
+            }),
+          ],
+          { stdout: "ignore", stderr: "ignore" },
+        );
+        // Fall back if the helper failed to actually show anything.
+        child.exited
+          .then((code) => {
+            // 0 = posted. 2 = the user denied notification permission (or never
+            // answered the one-time prompt). On denial we deliberately do NOT
+            // fall back to Utils.showNotification: that posts under agetor's
+            // MAIN bundle id — a second "Agetor" identity — which would
+            // re-prompt for a permission the user just declined. Respect the
+            // choice (no notification). Any OTHER non-zero code is an
+            // unexpected helper failure, so fall back to a plain notification.
+            if (code === 0) return;
+            if (code === 2) {
+              console.error("[agetor] notifier helper: notification permission not granted; skipping fallback");
+              return;
+            }
+            console.error(`[agetor] notifier helper exited ${code}, falling back to plain notification`);
+            plain();
+          })
+          .catch((err) => {
+            console.error("[agetor] notifier helper failed, falling back:", err);
+            plain();
+          });
+        return;
+      } catch (err) {
+        console.error("[agetor] notifier helper spawn failed, falling back:", err);
+        // fall through to the plain notification below
+      }
+    }
+  }
+  plain();
 }
+
+// Best-effort: register the notifier helper bundle with LaunchServices at
+// startup. We spawn the helper's inner Mach-O directly (not via `open`), which
+// does not guarantee the bundle is in the LaunchServices database — and a
+// notification CLICK needs LS to be able to relaunch the bundle by identity to
+// deliver the response (which runs `open agetor://…`). Registering it here
+// maximizes the chance the cold-relaunch-on-click path works. Fully non-fatal:
+// posting notifications works regardless; only the click-relaunch depends on it
+// (and that is a manual-QA item on a notarized build either way).
+function registerNotifierBundle(): void {
+  try {
+    const app = resolveNotifierApp();
+    if (!app) return;
+    const lsregister =
+      "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister";
+    if (!existsSync(lsregister)) return;
+    // Fire-and-forget; lsregister is fast and idempotent.
+    Bun.spawn([lsregister, "-f", app], { stdout: "ignore", stderr: "ignore" });
+  } catch (err) {
+    console.error("[agetor] failed to register notifier bundle with LaunchServices:", err);
+  }
+}
+registerNotifierBundle();
+
+// Native-host capabilities the API server needs but that only exist inside
+// Electrobun (file dialogs, OS notifications, open-in-Finder/browser, the
+// self-updater, quit). The headless CLI daemon injects none of these — its
+// routes 501 — but the packaged app wires them up here.
+const native: ApiNative = {
+  openFileDialog: (opts) => Utils.openFileDialog(opts),
+  openPath: (p) => Utils.openPath(p),
+  openExternal: (url) => Utils.openExternal(url),
+  showNotification: (n) => showTaskNotification(n),
+  quit: () => Utils.quit(),
+  updates: {
+    snapshot: () => getUpdateSnapshot(),
+    check: () => checkForUpdate(),
+    apply: () => applyUpdate(),
+  },
+};
+
+let apiServer: ReturnType<typeof startApiServer>;
+try {
+  apiServer = startApiServer({ native });
+} catch (e) {
+  // Port busy. If our own cli-daemon owns it (the CLI started a background core
+  // while the app was closed), ask it to hand off, wait for the port to free,
+  // then bind and become the owner. Anything else — a foreign process (stale
+  // agetor, or OTLP gRPC which also defaults to 4317) or a wedged daemon that
+  // won't release — falls through to the loud message + exit so the user sees
+  // the real problem rather than a wall of CORS errors in the renderer.
+  const creds = readCoreCreds(dataDir);
+  let recovered: ReturnType<typeof startApiServer> | null = null;
+  if (creds && creds.kind === "cli-daemon" && (await probeLiveCore(creds))) {
+    console.log("[agetor] a CLI daemon owns the API port — requesting handoff…");
+    try {
+      await fetch(`http://127.0.0.1:${creds.port}/daemon/shutdown`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${creds.token}` },
+      });
+    } catch {
+      /* the daemon drops the connection as it exits — expected */
+    }
+    if (await waitForPortFree(creds.port, 10_000)) {
+      try {
+        recovered = startApiServer({ native });
+      } catch {
+        /* fall through to the loud message below */
+      }
+    }
+  }
+  if (!recovered) {
+    const msg = (e as Error)?.message ?? String(e);
+    console.error(`[agetor] failed to bind API on 127.0.0.1:${API_PORT}: ${msg}`);
+    console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
+    process.exit(1);
+  }
+  apiServer = recovered;
+}
+
+// Publish the per-launch API port + token so the CLI (and a second app launch)
+// can discover and authenticate to this core. `kind: "app"` tells a future
+// daemon spawn that the richer surface owns the port.
+writeCoreCreds(
+  {
+    port: apiServer.port!,
+    token: API_TOKEN,
+    pid: process.pid,
+    kind: "app",
+    version: pkg.version,
+    startedAt: Date.now(),
+  },
+  dataDir,
+);
 
 // Warn the user before quitting when runs are still active. Electrobun's
 // `before-quit` event fires synchronously from Utils.quit() and reads
@@ -148,6 +313,7 @@ try {
 // is in flight.
 Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
   if (consumeForceQuit()) {
+    removeCoreCreds(dataDir);
     event.response = { allow: true };
     return;
   }
@@ -167,6 +333,7 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
     // of a missed warning is small; the cost of trapping the user is high.
   }
   if (runningCount === 0) {
+    removeCoreCreds(dataDir);
     event.response = { allow: true };
     return;
   }
@@ -276,6 +443,46 @@ Electrobun.events.on("reopen", () => {
   windowLifecycle.createMainWindow().catch((err) => {
     console.error("[agetor] failed to recreate window on reopen:", err);
   });
+});
+
+// Deep-link entry point: macOS routes a click on our custom `agetor://`
+// scheme (e.g. from a terminal-notifier notification — see
+// showTaskNotification above) to `open <url>`, which Electrobun surfaces as
+// this "open-url" event. There's no notification-click callback in
+// Electrobun, so this is the only way a notification click gets back into
+// the app — see the design note at src/mainview/lib/api.ts:424.
+//
+// We ALWAYS stash the taskId in pending-open.ts (short-TTL) and, if a window
+// already exists, ALSO broadcast immediately:
+//   - Window exists: the webview is connected to /app/events, so the direct
+//     broadcast arrives instantly. The pending stash is belt-and-suspenders —
+//     if the broadcast happens to land while the webview is mid-reload or
+//     between EventSource reconnects, the next subscriber flushes the pending
+//     entry (within its TTL) so the click isn't silently lost.
+//   - No window (app was fully dismissed / cold start): there's no SSE
+//     subscriber yet, so we rely entirely on the pending flush — create the
+//     window and the freshly-booted webview picks it up when it subscribes
+//     (see the consumePendingOpenTask() flush in server.ts's SSE route).
+// The pending entry's TTL (pending-open.ts) prevents a much-later, unrelated
+// reconnect from resurrecting a stale click. Re-opening the same task is
+// idempotent (webview just re-selects it), so a rare double-delivery is
+// harmless. Wrapped so a malformed URL / window-creation failure never
+// crashes the event dispatcher.
+Electrobun.events.on("open-url", (e: { data: { url: string } }) => {
+  try {
+    const taskId = parseTaskDeepLink(e.data.url);
+    if (!taskId) return;
+    setPendingOpenTask(taskId);
+    if (getMainWindow()) {
+      broadcastAppEvent({ type: "open_task", taskId, ts: Date.now() });
+    } else {
+      windowLifecycle.createMainWindow().catch((err) => {
+        console.error("[agetor] failed to create window for open-url:", err);
+      });
+    }
+  } catch (err) {
+    console.error("[agetor] failed to handle open-url:", err);
+  }
 });
 
 await windowLifecycle.createMainWindow();

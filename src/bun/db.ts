@@ -2,9 +2,10 @@ import { Database } from "bun:sqlite";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskReference, TaskType, Run, RunEventStream } from "../shared/types.ts";
+import type { AgentKind, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
+import { coreCredsPath } from "./core-creds.ts";
 // Interactions live in-memory in `interactions.ts`. The import creates a
 // cycle: db.ts → interactions.ts → db.ts (for `tasks`). It is safe ONLY
 // because both modules access each other's exports exclusively from
@@ -47,6 +48,11 @@ export const dataDir = DATA_DIR;
  *  liveness checks. Single source of truth so a future rename doesn't
  *  leave silent stragglers. */
 export const pidFilePath = path.join(DATA_DIR, "agetor.pid");
+
+/** Core credentials file (port + per-launch API token + owner pid/kind),
+ *  written after the API server binds and read by the CLI/daemon to discover
+ *  and authenticate to the running core. See `core-creds.ts`. */
+export const credsFilePath = coreCredsPath(DATA_DIR);
 
 export const db = new Database(path.join(DATA_DIR, "agetor.sqlite"));
 db.exec("PRAGMA journal_mode = WAL;");
@@ -557,10 +563,10 @@ export const runs = {
    *  caller that just wants `{ runId, stream, data, ts }`. */
   events(runId: string) {
     return db.query<
-      { runId: string; stream: string; data: string; ts: number },
+      { runId: string; stream: string; data: string; ts: number; subagentId: string | null },
       [string]
     >(
-      `SELECT run_id as runId, stream, data, ts
+      `SELECT run_id as runId, stream, data, ts, subagent_id as subagentId
        FROM run_events
        WHERE run_id = ?
        ORDER BY id ASC`,
@@ -573,17 +579,23 @@ export const runs = {
    *  scrollback instead of per-run silos. */
   eventsForTask(taskId: string) {
     return db.query<
-      { runId: string; stream: string; data: string; ts: number },
+      { runId: string; stream: string; data: string; ts: number; subagentId: string | null },
       [string]
     >(
-      `SELECT run_events.run_id as runId, stream, data, ts
+      `SELECT run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
        FROM run_events
        JOIN runs ON runs.id = run_events.run_id
        WHERE runs.task_id = ?
        ORDER BY run_events.id ASC`,
     ).all(taskId);
   },
-  appendEvent(runId: string, stream: RunEventStream, data: string, lineUuid?: string | null) {
+  appendEvent(
+    runId: string,
+    stream: RunEventStream,
+    data: string,
+    lineUuid?: string | null,
+    subagentId?: string | null,
+  ) {
     // INSERT OR IGNORE only when a dedup key is provided. With NULL keys the
     // partial unique index (`WHERE line_uuid IS NOT NULL`) doesn't apply, so
     // non-JSONL events still insert unconditionally and we don't accidentally
@@ -591,13 +603,13 @@ export const runs = {
     // (runId, NULL).
     if (lineUuid) {
       db.run(
-        `INSERT OR IGNORE INTO run_events (run_id, stream, data, ts, line_uuid) VALUES (?, ?, ?, ?, ?)`,
-        [runId, stream, data, Date.now(), lineUuid],
+        `INSERT OR IGNORE INTO run_events (run_id, stream, data, ts, line_uuid, subagent_id) VALUES (?, ?, ?, ?, ?, ?)`,
+        [runId, stream, data, Date.now(), lineUuid, subagentId ?? null],
       );
     } else {
       db.run(
-        `INSERT INTO run_events (run_id, stream, data, ts) VALUES (?, ?, ?, ?)`,
-        [runId, stream, data, Date.now()],
+        `INSERT INTO run_events (run_id, stream, data, ts, subagent_id) VALUES (?, ?, ?, ?, ?)`,
+        [runId, stream, data, Date.now(), subagentId ?? null],
       );
     }
   },
@@ -613,14 +625,92 @@ export const runs = {
    *  re-emit them onto the reattached (still-`running`) run's chunk
    *  handler — corrupting its event history and, worse, firing
    *  `onEndOfTurn` on the wrong turn and prematurely resolving the
-   *  current run. */
+   *  current run.
+   *
+   *  `subagent_id IS NULL`: this seeds the MAIN session tailer's dedup set
+   *  only — subagent transcripts live in separate sidechain files and are
+   *  deduped independently via `seenLineUuidsForSubagent`, keyed by
+   *  `(run_id, subagent_id, line_uuid)`. Mixing subagent uuids into this set
+   *  is a no-op in practice (uuid namespaces don't collide) but is the wrong
+   *  scope conceptually, and matches the same filter applied elsewhere for
+   *  subagent-tagged rows. */
   seenLineUuidsForTask(taskId: string): Set<string> {
     const rows = db.query<{ line_uuid: string }, [string]>(
       `SELECT e.line_uuid
        FROM run_events e
        JOIN runs r ON r.id = e.run_id
-       WHERE r.task_id = ? AND e.line_uuid IS NOT NULL`,
+       WHERE r.task_id = ? AND e.line_uuid IS NOT NULL AND e.subagent_id IS NULL`,
     ).all(taskId);
     return new Set(rows.map((r) => r.line_uuid));
+  },
+  /** Line uuids already persisted for a single subagent's stream. Seeds the
+   *  subagent tailer's in-memory dedup set on reattach so re-reading
+   *  `agent-<id>.jsonl` from offset 0 doesn't double-insert/emit events the
+   *  previous process already streamed. Scoped by subagent_id (independent of
+   *  run_id), mirroring `seenLineUuidsForTask` for the main stream. */
+  seenLineUuidsForSubagent(subagentId: string): Set<string> {
+    const rows = db.query<{ line_uuid: string }, [string]>(
+      `SELECT line_uuid FROM run_events
+       WHERE subagent_id = ? AND line_uuid IS NOT NULL`,
+    ).all(subagentId);
+    return new Set(rows.map((r) => r.line_uuid));
+  },
+};
+
+interface SubagentRow {
+  id: string;
+  task_id: string;
+  run_id: string | null;
+  parent_kind: string;
+  agent_type: string | null;
+  description: string | null;
+  spawn_depth: number;
+  source_path: string;
+  status: string;
+  started_at: number;
+  ended_at: number | null;
+}
+
+function toSubagent(r: SubagentRow): Subagent {
+  return {
+    id: r.id,
+    taskId: r.task_id,
+    runId: r.run_id,
+    parentKind: r.parent_kind === "bg_session" ? "bg_session" : "subagent",
+    agentType: r.agent_type,
+    description: r.description,
+    spawnDepth: r.spawn_depth,
+    sourcePath: r.source_path,
+    status: r.status as SubagentStatus,
+    startedAt: r.started_at,
+    endedAt: r.ended_at,
+  };
+}
+
+export const subagents = {
+  /** Every tracked subagent for a task, oldest first (spawn order — that's how
+   *  the tab strip lays them out left-to-right after the pinned Main tab). */
+  listForTask(taskId: string): Subagent[] {
+    return db.query<SubagentRow, [string]>(
+      `SELECT * FROM subagents WHERE task_id = ? ORDER BY started_at ASC, id ASC`,
+    ).all(taskId).map(toSubagent);
+  },
+  get(id: string): Subagent | null {
+    const row = db.query<SubagentRow, [string]>(`SELECT * FROM subagents WHERE id = ?`).get(id);
+    return row ? toSubagent(row) : null;
+  },
+  /** Register a freshly-discovered subagent. Idempotent: re-discovering an
+   *  existing id (e.g. the watcher restarts) is a no-op rather than resetting
+   *  its status/timing. */
+  insertIfAbsent(s: Subagent): void {
+    db.run(
+      `INSERT OR IGNORE INTO subagents
+         (id, task_id, run_id, parent_kind, agent_type, description, spawn_depth, source_path, status, started_at, ended_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [s.id, s.taskId, s.runId, s.parentKind, s.agentType, s.description, s.spawnDepth, s.sourcePath, s.status, s.startedAt, s.endedAt],
+    );
+  },
+  setStatus(id: string, status: SubagentStatus, endedAt: number | null): void {
+    db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, endedAt, id]);
   },
 };

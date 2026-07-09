@@ -13,6 +13,7 @@ import type {
   Project,
   Run,
   RunEvent,
+  Subagent,
   Task,
   TaskDiff,
   TaskReference,
@@ -32,6 +33,7 @@ export interface UpdateSnapshot {
 // callers (BranchPicker) keep working while the single definition lives in
 // src/shared/types.ts (server + webview share one wire shape).
 export type { BranchInfo, BranchNamingConfig };
+export { commitPushPrompt } from "../../shared/types.ts";
 
 /** Where a command/extension comes from. `plugin` entries are contributed by an
  *  enabled Claude Code plugin and are namespaced `<plugin>:<name>`; `builtin`
@@ -334,6 +336,10 @@ export const api = {
   terminalSocketUrl: (id: string) =>
     `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?token=${encodeURIComponent(API_TOKEN)}`,
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
+  /** Background/sub agents tracked for a task — drives the run panel's
+   *  read-only per-subagent tab strip. Polled like `listRuns`; live deltas
+   *  also arrive on the task SSE as `stream: "subagent"` events. */
+  listSubagents: (taskId: string) => j<Subagent[]>(`/tasks/${taskId}/subagents`),
   /** Everything the task's worktree changed vs its pinned base. Empty `files`
    *  + a `note` when there's no worktree or no diff. */
   getTaskDiff: (taskId: string) => j<TaskDiff>(`/tasks/${taskId}/diff`),
@@ -429,10 +435,16 @@ export const api = {
     ),
 
   /** Fire a native macOS notification via the Bun process. Fire-and-forget
-   *  — the OS handles display; clicking the notification just focuses the
-   *  app (Electrobun's bridge doesn't expose a click callback). The
-   *  matching in-app toast carries the deep-link. */
-  notifyOS: (input: { title: string; body?: string; subtitle?: string; silent?: boolean }) =>
+   *  — the OS handles display. When `taskId` is provided, the Bun side
+   *  encodes it into an `agetor://task/<id>` deep-link so clicking the
+   *  notification opens straight to that task, not just app focus. */
+  notifyOS: (input: {
+    title: string;
+    body?: string;
+    subtitle?: string;
+    silent?: boolean;
+    taskId?: string;
+  }) =>
     j<{ ok: boolean }>("/notifications", {
       method: "POST",
       body: JSON.stringify(input),

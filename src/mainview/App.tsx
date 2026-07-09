@@ -18,8 +18,9 @@ import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSuccess } from "@/lib/toasts";
+import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
+import { findTaskById } from "@/lib/notification-open";
 import { cn } from "@/lib/utils";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
@@ -216,6 +217,37 @@ export default function App() {
   // anyway" the server arms a one-shot flag and re-issues Utils.quit().
   useEffect(() => {
     const cancel = api.subscribeAppEvents((ev) => {
+      if (ev.type === "open_task") {
+        // A native notification deep-link (`agetor://task/<id>`) was
+        // clicked. Open that task's RunPanel, fetching a fresh task list
+        // first if it isn't loaded yet (e.g. the task was just created and
+        // hasn't been picked up by the 2s poll). Mirrors the onOpen idiom
+        // in the GlobalEvent handler below, but this handler closes over
+        // its own scope, so the fresh list has to be fetched directly
+        // rather than relying on `tasksRef` updating synchronously after
+        // `setTasks`.
+        const fresh = findTaskById(tasksRef.current, ev.taskId);
+        if (fresh) {
+          setSelected(fresh);
+          window.focus();
+          return;
+        }
+        void (async () => {
+          try {
+            const list = await api.listTasks();
+            setTasks(list);
+            const found = findTaskById(list, ev.taskId);
+            if (found) {
+              setSelected(found);
+              window.focus();
+            }
+            // else: silently no-op — the task doesn't exist (deleted?).
+          } catch {
+            // Best-effort — no-op on fetch failure.
+          }
+        })();
+        return;
+      }
       if (ev.type !== "quit_request") return;
       const n = ev.runningRunCount;
       const noun = n === 1 ? "task is" : "tasks are";
@@ -339,6 +371,8 @@ export default function App() {
       if (ev.column === "blocked") {
         if (ev.reason === "api-error") {
           toastApiError({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.reason === "session-died") {
+          toastSessionEnded({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else {
           toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         }

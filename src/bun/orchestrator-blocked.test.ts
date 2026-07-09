@@ -136,3 +136,103 @@ test("orchestrator: cancellation wins over api-error in column resolution (cance
     delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
   }
 });
+
+test("orchestrator moves task to 'blocked' when a running tmux session dies mid-run", async () => {
+  const { createTask, startTask, subscribeGlobal } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  // The fake driver emits the same `SESSION_DIED_STATUS_PREFIX` sentinel the
+  // real claude/codex death watch emits when the tmux session vanishes, then
+  // resolves done(0). The orchestrator's chunk handler should flip the column
+  // to `blocked` (reason `session-died`), and the done handler should keep it
+  // there and record the run `failed` — the previous blind spot left it stuck
+  // in `running` until the next boot.
+  process.env.AGETOR_CLAUDE_DRIVER = "fake";
+  process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED = "1";
+
+  const globals: GlobalEvent[] = [];
+  const unsub = subscribeGlobal((e) => globals.push(e));
+
+  try {
+    const created = await createTask({
+      title: "session died",
+      prompt: "anything",
+      agent: "claude-code",
+      workdir: process.cwd(),
+      isolation: "none",
+    });
+    if ("error" in created) throw new Error(created.error);
+    const task = created.task;
+
+    const res = await startTask(task.id);
+    if ("error" in res) throw new Error(`startTask failed: ${res.error}`);
+    const runId = res.runId;
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    const after = tasks.get(task.id);
+    expect(after?.column).toBe("blocked");
+
+    const runRow = runs.get(runId);
+    expect(runRow?.status).toBe("failed");
+
+    // The `session-died` reason on the column event is what routes the UI to
+    // the "Session ended" toast (not the generic "Waiting on you"). Assert it
+    // explicitly so a dropped 4th arg to updateColumn is caught.
+    const diedCol = globals.find(
+      (e) => e.kind === "column" && e.taskId === task.id && e.column === "blocked",
+    );
+    expect(diedCol).toBeDefined();
+    if (diedCol?.kind !== "column") throw new Error("expected column event");
+    expect(diedCol.reason).toBe("session-died");
+  } finally {
+    unsub();
+    delete process.env.AGETOR_CLAUDE_DRIVER;
+    delete process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED;
+  }
+});
+
+test("orchestrator: cancellation wins over session-death (cancelled task → 'ready', not 'blocked')", async () => {
+  const { createTask, startTask, cancelRun } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  // Session-death flips the column to `blocked` immediately, but a user cancel
+  // arriving before the delayed done(0) must still win — a cancelled run lands
+  // in `ready`/`cancelled`, matching the api-error precedence above.
+  process.env.AGETOR_CLAUDE_DRIVER = "fake";
+  process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED = "1";
+  process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = "120";
+
+  try {
+    const created = await createTask({
+      title: "session died then cancel",
+      prompt: "anything",
+      agent: "claude-code",
+      workdir: process.cwd(),
+      isolation: "none",
+    });
+    if ("error" in created) throw new Error(created.error);
+    const task = created.task;
+
+    const res = await startTask(task.id);
+    if ("error" in res) throw new Error(`startTask failed: ${res.error}`);
+    const runId = res.runId;
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(tasks.get(task.id)?.column).toBe("blocked");
+
+    cancelRun(runId);
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    const after = tasks.get(task.id);
+    expect(after?.column).toBe("ready");
+
+    const runRow = runs.get(runId);
+    expect(runRow?.status).toBe("cancelled");
+  } finally {
+    delete process.env.AGETOR_CLAUDE_DRIVER;
+    delete process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED;
+    delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+  }
+});

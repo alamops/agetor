@@ -28,6 +28,15 @@ test("claude sonnet-4.6 supports max but not xhigh (per API docs)", () => {
   expect(ids).not.toContain("xhigh");
 });
 
+test("claude sonnet-5 supports xhigh + max (first Sonnet tier with xhigh)", () => {
+  const ids = supportedEfforts("claude-code", "sonnet-5").map((o) => o.id);
+  expect(ids).toContain("max");
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("high");
+  expect(ids).toContain("medium");
+  expect(ids).toContain("low");
+});
+
 test("claude haiku-4.5 exposes no effort options (CLI doesn't accept the flag)", () => {
   const ids = supportedEfforts("claude-code", "haiku-4.5").map((o) => o.id);
   expect(ids).toEqual([]);
