@@ -682,4 +682,32 @@ export const subagents = {
   setStatus(id: string, status: SubagentStatus, endedAt: number | null): void {
     db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, endedAt, id]);
   },
+  /** True when at least one subagent row for this task is still `running`. */
+  hasRunning(taskId: string): boolean {
+    const row = db.query<{ 1: number }, [string]>(
+      `SELECT 1 FROM subagents WHERE task_id = ? AND status = 'running' LIMIT 1`,
+    ).get(taskId);
+    return row !== null;
+  },
+  /** Flip every `running` row for this task to `orphaned` (ended_at = now).
+   *  Returns the affected rows (post-update shape) so the caller can emit a
+   *  `finished` lifecycle event per row. Returns [] when nothing was running. */
+  orphanRunning(taskId: string, now: number): Subagent[] {
+    const rows = db.query<SubagentRow, [string]>(
+      `SELECT * FROM subagents WHERE task_id = ? AND status = 'running'`,
+    ).all(taskId);
+    if (rows.length === 0) return [];
+    db.run(
+      `UPDATE subagents SET status = 'orphaned', ended_at = ? WHERE task_id = ? AND status = 'running'`,
+      [now, taskId],
+    );
+    return rows.map((r) => toSubagent({ ...r, status: "orphaned", ended_at: now }));
+  },
+  /** taskId -> count of `running` rows. One grouped query, for the board poll. */
+  runningCountsByTask(): Map<string, number> {
+    const rows = db.query<{ task_id: string; n: number }, []>(
+      `SELECT task_id, COUNT(*) AS n FROM subagents WHERE status = 'running' GROUP BY task_id`,
+    ).all();
+    return new Map(rows.map((r) => [r.task_id, r.n]));
+  },
 };

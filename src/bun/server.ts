@@ -103,6 +103,17 @@ const json = (data: unknown, init?: ResponseInit) =>
     status: init?.status,
   });
 
+// Derived, never-persisted count of this task's still-`running` subagent
+// rows — drives the kanban card's "N background agents" badge. Single-task
+// routes are called far less often than the 2s `/tasks` poll, so a one-off
+// filter over `listForTask` (already exported, already indexed by task_id)
+// is fine here; `/tasks` itself uses the grouped `runningCountsByTask()`
+// query instead of calling this per row.
+function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
+  const runningSubagents = subagents.listForTask(t.id).filter((s) => s.status === "running").length;
+  return { ...t, runningSubagents };
+}
+
 // Turn raw path strings into references: keep only existing absolute paths,
 // dedupe, and read directory-ness from the filesystem (authoritative — more
 // reliable than the webview's view). The stat filter also discards the bogus
@@ -862,7 +873,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       "/tasks": {
-        GET: authed((req) => json(tasks.list(), { headers: corsHeaders(req) })),
+        GET: authed((req) => {
+          const counts = subagents.runningCountsByTask();
+          return json(
+            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0 })),
+            { headers: corsHeaders(req) },
+          );
+        }),
         POST: authed(async (req) => {
           const body = (await req.json()) as Partial<Task> & {
             baseRef?: string;
@@ -901,7 +918,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if ("error" in result) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
-          return json(result.task, { headers: corsHeaders(req) });
+          return json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
@@ -909,7 +926,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => {
           const t = tasks.get(req.params.id);
           return t
-            ? json(t, { headers: corsHeaders(req) })
+            ? json(withRunningSubagents(t), { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PATCH: authed(async (req) => {
@@ -1006,7 +1023,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           reconcileTaskSession(req.params.id, before, updated).catch((err: unknown) => {
             console.error("reconcileTaskSession failed:", err);
           });
-          return json(updated, { headers: corsHeaders(req) });
+          return json(withRunningSubagents(updated), { headers: corsHeaders(req) });
         }),
         DELETE: authed(async (req) => {
           await deleteTask(req.params.id);
@@ -1028,7 +1045,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const result = archiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
-            : json(result.task, { headers: corsHeaders(req) });
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
@@ -1037,7 +1054,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const result = unarchiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
-            : json(result.task, { headers: corsHeaders(req) });
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
