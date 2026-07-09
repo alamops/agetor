@@ -5,6 +5,9 @@ import type {
   GitHubChecksResult,
   GitHubComment,
   GitHubCommentsResult,
+  GitHubCommitStatus,
+  GitHubCommitStatusContext,
+  GitHubCommitStatusResult,
   GitHubItemKind,
   GitHubItemState,
   GitHubLabel,
@@ -34,10 +37,14 @@ import type {
   GitHubReactionsResult,
   GitHubReactionSubject,
   GitHubReactionSummary,
+  GitHubRelease,
+  GitHubReleasesResult,
   GitHubRepoPermissions,
   GitHubReviewThread,
   GitHubSubIssue,
   GitHubSubIssuesResult,
+  GitHubTag,
+  GitHubTagsResult,
   GitHubUser,
   TaskDiff,
 } from "../shared/types.ts";
@@ -283,6 +290,36 @@ interface DeleteGitHubMilestoneInput {
   number: number;
 }
 
+interface CreateGitHubReleaseInput {
+  dir: string;
+  tagName: string;
+  name?: string;
+  body?: string;
+  draft?: boolean;
+  prerelease?: boolean;
+  targetCommitish?: string;
+}
+
+interface UpdateGitHubReleaseInput {
+  dir: string;
+  id: number;
+  name?: string;
+  body?: string;
+  draft?: boolean;
+  prerelease?: boolean;
+  tagName?: string;
+}
+
+interface DeleteGitHubReleaseInput {
+  dir: string;
+  id: number;
+}
+
+interface GetGitHubCommitStatusInput {
+  dir: string;
+  ref: string;
+}
+
 interface ListGitHubNotificationsInput {
   dir: string;
   /** `false` (default) = unread only; `true` = all notifications, matching
@@ -359,6 +396,10 @@ type GitHubIssueTransferResponse = ({ ok: true; url: string; message?: string })
 type GitHubNotificationsResponse = ({ ok: true } & GitHubNotificationsResult) | GitHubListError;
 type GitHubMarkAllReadResponse = ({ ok: true; message: string }) | GitHubListError;
 type GitHubThreadSubscriptionResponse = ({ ok: true; subscribed: boolean; ignored: boolean }) | GitHubListError;
+type GitHubReleasesResponse = ({ ok: true } & GitHubReleasesResult) | GitHubListError;
+type GitHubReleaseResponse = ({ ok: true; release: GitHubRelease }) | GitHubListError;
+type GitHubTagsResponse = ({ ok: true } & GitHubTagsResult) | GitHubListError;
+type GitHubCommitStatusResponse = ({ ok: true } & GitHubCommitStatusResult) | GitHubListError;
 
 const GITHUB_FETCH_TIMEOUT_MS = 30_000;
 const GITHUB_DIFF_BODY_CAP_BYTES = 8_000_000;
@@ -613,6 +654,9 @@ export const __githubInternals = {
   parseRateLimit,
   normalizeNotification,
   notificationHtmlUrl,
+  normalizeRelease,
+  normalizeTag,
+  normalizeCommitStatus,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -923,6 +967,73 @@ function parseLinkedIssues(json: unknown): GitHubLinkedIssue[] {
     });
   }
   return issues;
+}
+
+/** A single `GET /repos/:o/:r/releases` entry (F18). Requires `id` + `tag_name`
+ *  — the two fields every action (edit/delete) and the UI's row key need.
+ *  Pure — unit-tested. */
+function normalizeRelease(raw: unknown): GitHubRelease | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.id !== "number" || typeof obj.tag_name !== "string") return null;
+  return {
+    id: obj.id,
+    tagName: obj.tag_name,
+    name: typeof obj.name === "string" ? obj.name : "",
+    body: typeof obj.body === "string" ? obj.body : "",
+    draft: typeof obj.draft === "boolean" ? obj.draft : false,
+    prerelease: typeof obj.prerelease === "boolean" ? obj.prerelease : false,
+    publishedAt: typeof obj.published_at === "string" ? obj.published_at : null,
+    createdAt: typeof obj.created_at === "string" ? obj.created_at : "",
+    htmlUrl: typeof obj.html_url === "string" ? obj.html_url : "",
+    targetCommitish: typeof obj.target_commitish === "string" ? obj.target_commitish : "",
+  };
+}
+
+/** A single `GET /repos/:o/:r/tags` entry — `{ name, commit: { sha } }`.
+ *  Requires both a non-empty name and a resolvable commit sha. Pure —
+ *  unit-tested. */
+function normalizeTag(raw: unknown): GitHubTag | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.name !== "string" || !obj.name) return null;
+  const commit = obj.commit && typeof obj.commit === "object" ? obj.commit as Record<string, unknown> : null;
+  const sha = commit && typeof commit.sha === "string" ? commit.sha : "";
+  if (!sha) return null;
+  return { name: obj.name, commitSha: sha };
+}
+
+/** A single context entry within a combined status's `statuses` array.
+ *  Requires `context` (the CI provider's identifier string) — everything
+ *  else defaults defensively. Pure, but only reachable through
+ *  `normalizeCommitStatus` below (not independently unit-tested). */
+function normalizeCommitStatusContext(raw: unknown): GitHubCommitStatusContext | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.context !== "string") return null;
+  return {
+    context: obj.context,
+    state: typeof obj.state === "string" ? obj.state : "",
+    description: typeof obj.description === "string" ? obj.description : null,
+    targetUrl: typeof obj.target_url === "string" ? obj.target_url : null,
+  };
+}
+
+/** `GET /repos/:o/:r/commits/:ref/status` (F19, the legacy combined-status
+ *  API — distinct from the check-runs `normalizeCheckRun` above). An
+ *  unrecognized top-level `state` degrades to `""` rather than rejecting the
+ *  whole payload; malformed entries in `statuses` are dropped individually.
+ *  Pure — unit-tested. */
+function normalizeCommitStatus(raw: unknown): GitHubCommitStatus | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const state = obj.state === "success" || obj.state === "pending" || obj.state === "failure" || obj.state === "error"
+    ? obj.state
+    : "";
+  const rawStatuses = Array.isArray(obj.statuses) ? obj.statuses : [];
+  const statuses = rawStatuses.map(normalizeCommitStatusContext).filter((x): x is GitHubCommitStatusContext => !!x);
+  const total = typeof obj.total_count === "number" ? obj.total_count : statuses.length;
+  return { state, total, statuses };
 }
 
 function repoSlug(repo: GitHubRepo): string {
@@ -1675,6 +1786,28 @@ export async function getGitHubPullChecks(input: GitHubItemNumberInput): Promise
     sha,
     checkRuns: rawRuns.map(normalizeCheckRun).filter((x): x is GitHubCheckRun => !!x),
   };
+}
+
+/** `GET /repos/:o/:r/commits/:ref/status` (F19) — the combined status from
+ *  GitHub's legacy Status API, shown next to the check-runs above (some CI
+ *  providers still only post through this older API). Unlike
+ *  `getGitHubPullChecks`, `ref` is caller-supplied (typically a PR head sha
+ *  already resolved by the UI) rather than resolved from a PR number here. */
+export async function getGitHubCommitStatus(input: GetGitHubCommitStatusInput): Promise<GitHubCommitStatusResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const ref = input.ref.trim();
+  if (!ref) return { ok: false, error: "commit ref required" };
+
+  const token = await githubToken();
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/commits/${encodeURIComponent(ref)}/status`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const status = normalizeCommitStatus(json);
+  if (!status) return { ok: false, error: "GitHub returned an unexpected commit status response" };
+  return { ok: true, repo: repoSlug(repo), ref, ...status };
 }
 
 /** The PR's commits, oldest first — same pagination shape as `listGitHubLabels`
@@ -3137,6 +3270,137 @@ export async function deleteGitHubMilestone(input: DeleteGitHubMilestoneInput): 
     return { ok: false, error: apiError(json, res.status, res.statusText) };
   }
   return { ok: true, message: "Milestone deleted." };
+}
+
+/** `GET /repos/:o/:r/releases` (F18) — same 3-page pagination cap as
+ *  `listGitHubLabels`. Sorted newest first by `publishedAt` (falling back to
+ *  `createdAt` for a draft, which has no publish date yet). */
+export async function listGitHubReleases(input: { dir: string }): Promise<GitHubReleasesResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+
+  const token = await githubToken();
+  const releases: GitHubRelease[] = [];
+  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases?per_page=100`;
+  for (let page = 0; next && page < 3; page++) {
+    const res = await fetchGitHub(next, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: apiError(body, res.status, res.statusText) };
+    if (!Array.isArray(body)) return { ok: false, error: "GitHub returned an unexpected releases response" };
+    for (const raw of body) {
+      const release = normalizeRelease(raw);
+      if (release) releases.push(release);
+    }
+    next = pageLinks(res.headers.get("link"));
+  }
+  releases.sort((a, b) => (b.publishedAt ?? b.createdAt).localeCompare(a.publishedAt ?? a.createdAt));
+  return { ok: true, repo: repoSlug(repo), releases };
+}
+
+/** `GET /repos/:o/:r/tags` — powers the release manager's tag-name datalist
+ *  (F18). Same 3-page pagination cap as `listGitHubLabels`. */
+export async function listGitHubTags(input: { dir: string }): Promise<GitHubTagsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+
+  const token = await githubToken();
+  const tags: GitHubTag[] = [];
+  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/tags?per_page=100`;
+  for (let page = 0; next && page < 3; page++) {
+    const res = await fetchGitHub(next, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: apiError(body, res.status, res.statusText) };
+    if (!Array.isArray(body)) return { ok: false, error: "GitHub returned an unexpected tags response" };
+    for (const raw of body) {
+      const tag = normalizeTag(raw);
+      if (tag) tags.push(tag);
+    }
+    next = pageLinks(res.headers.get("link"));
+  }
+  return { ok: true, tags };
+}
+
+export async function createGitHubRelease(input: CreateGitHubReleaseInput): Promise<GitHubReleaseResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const tagName = input.tagName.trim();
+  if (!tagName) return { ok: false, error: "tag name required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to create a release" };
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases`;
+  const res = await fetchGitHub(
+    url,
+    token,
+    "application/vnd.github+json",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        tag_name: tagName,
+        ...(input.name?.trim() ? { name: input.name.trim() } : {}),
+        ...(input.body !== undefined ? { body: input.body } : {}),
+        ...(input.draft !== undefined ? { draft: input.draft } : {}),
+        ...(input.prerelease !== undefined ? { prerelease: input.prerelease } : {}),
+        ...(input.targetCommitish?.trim() ? { target_commitish: input.targetCommitish.trim() } : {}),
+      }),
+    },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const release = normalizeRelease(json);
+  if (!release) return { ok: false, error: "GitHub returned an unexpected release response" };
+  return { ok: true, release };
+}
+
+export async function updateGitHubRelease(input: UpdateGitHubReleaseInput): Promise<GitHubReleaseResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.id) || input.id <= 0) return { ok: false, error: "valid release id required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to edit a release" };
+  const patch: { tag_name?: string; name?: string; body?: string; draft?: boolean; prerelease?: boolean } = {};
+  if (input.tagName !== undefined) {
+    const tn = input.tagName.trim();
+    if (!tn) return { ok: false, error: "tag name cannot be empty" };
+    patch.tag_name = tn;
+  }
+  if (input.name !== undefined) patch.name = input.name;
+  if (input.body !== undefined) patch.body = input.body;
+  if (input.draft !== undefined) patch.draft = input.draft;
+  if (input.prerelease !== undefined) patch.prerelease = input.prerelease;
+  if (Object.keys(patch).length === 0) {
+    return { ok: false, error: "release update requires a tag, name, body, draft, or prerelease change" };
+  }
+
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases/${input.id}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "PATCH", body: JSON.stringify(patch) });
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const release = normalizeRelease(json);
+  if (!release) return { ok: false, error: "GitHub returned an unexpected release response" };
+  return { ok: true, release };
+}
+
+export async function deleteGitHubRelease(input: DeleteGitHubReleaseInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.id) || input.id <= 0) return { ok: false, error: "valid release id required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to delete a release" };
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases/${input.id}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "DELETE" });
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, message: "Release deleted." };
 }
 
 /** A single `GET /notifications` entry. Returns null when `id` or `subject`

@@ -861,6 +861,31 @@ export interface GitHubChecksResult {
   checkRuns: GitHubCheckRun[];
 }
 
+/** A single context entry in a commit's combined status (`GET
+ *  /commits/:ref/status`) — the legacy Status API, distinct from the
+ *  check-runs `GitHubChecksResult` above (some CI providers still only post
+ *  through this older API, so both are shown). */
+export interface GitHubCommitStatusContext {
+  context: string;
+  state: string;
+  description: string | null;
+  targetUrl: string | null;
+}
+
+/** Normalized combined-status payload — the shape `normalizeCommitStatus`
+ *  produces from the raw response, before the request-scoped `repo`/`ref`
+ *  are stitched on at the call site (see `GitHubCommitStatusResult`). */
+export interface GitHubCommitStatus {
+  state: "success" | "pending" | "failure" | "error" | "";
+  total: number;
+  statuses: GitHubCommitStatusContext[];
+}
+
+export interface GitHubCommitStatusResult extends GitHubCommitStatus {
+  repo: string;
+  ref: string;
+}
+
 /** A single commit on a pull request, from `GET /pulls/:n/commits`.
  *  `messageHeadline` is the first line of the commit message; `author` prefers
  *  the top-level GitHub-user `author` (has a `login`) over the raw git author,
@@ -877,6 +902,40 @@ export interface GitHubPullCommitsResult {
   repo: string;
   pullNumber: number;
   commits: GitHubPullCommit[];
+}
+
+/** A repository release, from `GET /repos/:o/:r/releases` (F18). `body` is
+ *  the release notes markdown; `targetCommitish` is the branch/sha the tag
+ *  was (or will be) cut from. */
+export interface GitHubRelease {
+  id: number;
+  tagName: string;
+  name: string;
+  body: string;
+  draft: boolean;
+  prerelease: boolean;
+  publishedAt: string | null;
+  createdAt: string;
+  htmlUrl: string;
+  targetCommitish: string;
+}
+
+export interface GitHubReleasesResult {
+  repo: string;
+  releases: GitHubRelease[];
+}
+
+/** A repository tag, from `GET /repos/:o/:r/tags` — powers the release
+ *  manager's tag-name datalist (F18). Tags aren't paginated per-repo scope in
+ *  the UI, so this result carries no `repo` field (unlike the other list
+ *  results here). */
+export interface GitHubTag {
+  name: string;
+  commitSha: string;
+}
+
+export interface GitHubTagsResult {
+  tags: GitHubTag[];
 }
 
 /** An issue a pull request will close on merge (GraphQL

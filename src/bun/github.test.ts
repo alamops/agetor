@@ -38,6 +38,9 @@ const {
   parseRateLimit,
   normalizeNotification,
   notificationHtmlUrl,
+  normalizeRelease,
+  normalizeTag,
+  normalizeCommitStatus,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -691,4 +694,102 @@ test("normalizeNotification defaults missing optional fields and drops entries w
   expect(normalizeNotification({ unread: true, subject: { title: "x" } })).toBeNull();
   expect(normalizeNotification({ id: "3" })).toBeNull();
   expect(normalizeNotification(null)).toBeNull();
+});
+
+test("normalizeRelease maps snake_case fields, defaults missing ones, and drops entries without id/tag_name", () => {
+  expect(
+    normalizeRelease({
+      id: 1,
+      tag_name: "v1.0.0",
+      name: "First release",
+      body: "Notes",
+      draft: false,
+      prerelease: false,
+      published_at: "2026-01-01T00:00:00Z",
+      created_at: "2025-12-31T00:00:00Z",
+      html_url: "https://github.com/o/r/releases/tag/v1.0.0",
+      target_commitish: "main",
+    }),
+  ).toEqual({
+    id: 1,
+    tagName: "v1.0.0",
+    name: "First release",
+    body: "Notes",
+    draft: false,
+    prerelease: false,
+    publishedAt: "2026-01-01T00:00:00Z",
+    createdAt: "2025-12-31T00:00:00Z",
+    htmlUrl: "https://github.com/o/r/releases/tag/v1.0.0",
+    targetCommitish: "main",
+  });
+  // missing optional fields default; unpublished draft → publishedAt null
+  expect(normalizeRelease({ id: 2, tag_name: "v0.1.0" })).toEqual({
+    id: 2,
+    tagName: "v0.1.0",
+    name: "",
+    body: "",
+    draft: false,
+    prerelease: false,
+    publishedAt: null,
+    createdAt: "",
+    htmlUrl: "",
+    targetCommitish: "",
+  });
+  // no id / no tag_name → null
+  expect(normalizeRelease({ tag_name: "v1" })).toBeNull();
+  expect(normalizeRelease({ id: 3 })).toBeNull();
+  expect(normalizeRelease(null)).toBeNull();
+});
+
+test("normalizeTag requires both a name and a resolvable commit sha", () => {
+  expect(normalizeTag({ name: "v1.0.0", commit: { sha: "abc123" } })).toEqual({
+    name: "v1.0.0",
+    commitSha: "abc123",
+  });
+  // no commit object, or commit without a sha → null
+  expect(normalizeTag({ name: "v1.0.0" })).toBeNull();
+  expect(normalizeTag({ name: "v1.0.0", commit: {} })).toBeNull();
+  // no name → null
+  expect(normalizeTag({ commit: { sha: "abc123" } })).toBeNull();
+  expect(normalizeTag(null)).toBeNull();
+});
+
+test("normalizeCommitStatus maps state/statuses, defaults total to the surviving count, and drops malformed contexts", () => {
+  expect(
+    normalizeCommitStatus({
+      state: "success",
+      total_count: 2,
+      statuses: [
+        { context: "ci/build", state: "success", description: "Build passed", target_url: "https://ci.example.com/1" },
+        { context: "ci/lint", state: "pending", description: null, target_url: null },
+      ],
+    }),
+  ).toEqual({
+    state: "success",
+    total: 2,
+    statuses: [
+      { context: "ci/build", state: "success", description: "Build passed", targetUrl: "https://ci.example.com/1" },
+      { context: "ci/lint", state: "pending", description: null, targetUrl: null },
+    ],
+  });
+  // no statuses at all → empty, total 0
+  expect(normalizeCommitStatus({ state: "pending", total_count: 0, statuses: [] })).toEqual({
+    state: "pending",
+    total: 0,
+    statuses: [],
+  });
+  // unrecognized top-level state degrades to "", not rejected outright
+  expect(normalizeCommitStatus({ state: "bogus", statuses: [] })).toEqual({ state: "", total: 0, statuses: [] });
+  // missing total_count falls back to the surviving (non-malformed) statuses count
+  expect(
+    normalizeCommitStatus({
+      state: "failure",
+      statuses: [{ context: "ci/build", state: "failure" }, { state: "success" }, null],
+    }),
+  ).toEqual({
+    state: "failure",
+    total: 1,
+    statuses: [{ context: "ci/build", state: "failure", description: null, targetUrl: null }],
+  });
+  expect(normalizeCommitStatus(null)).toBeNull();
 });

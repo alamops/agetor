@@ -11,6 +11,9 @@ import {
   addGitHubReaction,
   addGitHubSubIssue,
   applyGitHubSuggestion,
+  createGitHubRelease,
+  deleteGitHubRelease,
+  getGitHubCommitStatus,
   getGitHubIssuePinned,
   getGitHubPullLinkedIssues,
   getGitHubRepoPermissions,
@@ -24,7 +27,9 @@ import {
   listGitHubNotifications,
   listGitHubPullCommits,
   listGitHubReactions,
+  listGitHubReleases,
   listGitHubSubIssues,
+  listGitHubTags,
   markAllGitHubNotificationsRead,
   markGitHubNotificationRead,
   removeGitHubReaction,
@@ -36,6 +41,7 @@ import {
   setGitHubThreadSubscription,
   transferGitHubIssue,
   unsubscribeGitHubThread,
+  updateGitHubRelease,
 } from "./github.ts";
 
 let REPO_DIR = "";
@@ -126,6 +132,170 @@ test("listGitHubMilestones maps snake_case fields from the API response", async 
     if (!res.ok) throw new Error(res.error);
     expect(res.milestones).toHaveLength(1);
     expect(res.milestones[0]).toMatchObject({ number: 1, title: "v1", openIssues: 3, closedIssues: 1 });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubReleases resolves the repo from the git remote, follows pagination, and sorts newest first", async () => {
+  const page1 = [
+    { id: 1, tag_name: "v1.0.0", name: "v1.0.0", published_at: "2026-01-01T00:00:00Z", created_at: "2025-12-31T00:00:00Z", html_url: "u1", target_commitish: "main" },
+  ];
+  const page2 = [
+    { id: 2, tag_name: "v2.0.0", name: "v2.0.0", published_at: "2026-06-01T00:00:00Z", created_at: "2026-05-31T00:00:00Z", html_url: "u2", target_commitish: "main" },
+  ];
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/releases?per_page=100",
+      json: page1,
+      headers: { link: '<https://api.github.com/repos/acme/widgets/releases?page=2>; rel="next"' },
+    },
+    { match: "releases?page=2", json: page2 },
+  ]);
+  try {
+    const res = await listGitHubReleases({ dir: REPO_DIR });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.repo).toBe("acme/widgets");
+    // newest published first, regardless of API/page order
+    expect(res.releases.map((r) => r.tagName)).toEqual(["v2.0.0", "v1.0.0"]);
+    expect(mock.calls).toHaveLength(2); // followed the `next` link
+  } finally {
+    mock.restore();
+  }
+});
+
+test("createGitHubRelease POSTs tag_name/name/body/draft/prerelease and returns the normalized release", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "/repos/acme/widgets/releases",
+      json: { id: 5, tag_name: "v3.0.0", name: "v3.0.0", body: "Notes", draft: true, prerelease: false, html_url: "u", target_commitish: "main" },
+    },
+  ]);
+  try {
+    const res = await createGitHubRelease({ dir: REPO_DIR, tagName: "v3.0.0", name: "v3.0.0", body: "Notes", draft: true });
+    expect(res).toEqual({
+      ok: true,
+      release: {
+        id: 5,
+        tagName: "v3.0.0",
+        name: "v3.0.0",
+        body: "Notes",
+        draft: true,
+        prerelease: false,
+        publishedAt: null,
+        createdAt: "",
+        htmlUrl: "u",
+        targetCommitish: "main",
+      },
+    });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.method).toBe("POST");
+    expect(JSON.parse(mock.calls[0]!.body!)).toEqual({ tag_name: "v3.0.0", name: "v3.0.0", body: "Notes", draft: true });
+    expect(mock.calls[0]!.headers.authorization).toBe("Bearer test-token");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("updateGitHubRelease PATCHes only the provided fields to the release's id endpoint", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "PATCH",
+      match: "/repos/acme/widgets/releases/5",
+      json: { id: 5, tag_name: "v3.0.0", name: "v3.0.1", body: "Updated", draft: false, prerelease: false, html_url: "u", target_commitish: "main" },
+    },
+  ]);
+  try {
+    const res = await updateGitHubRelease({ dir: REPO_DIR, id: 5, name: "v3.0.1", body: "Updated", draft: false });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.release.name).toBe("v3.0.1");
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/releases/5");
+    expect(mock.calls[0]!.method).toBe("PATCH");
+    expect(JSON.parse(mock.calls[0]!.body!)).toEqual({ name: "v3.0.1", body: "Updated", draft: false });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("deleteGitHubRelease DELETEs the release's id endpoint", async () => {
+  const mock = mockGitHubFetch([
+    { method: "DELETE", match: "/repos/acme/widgets/releases/5" },
+  ]);
+  try {
+    const res = await deleteGitHubRelease({ dir: REPO_DIR, id: 5 });
+    expect(res).toEqual({ ok: true, message: "Release deleted." });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.method).toBe("DELETE");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubTags maps name/commit.sha from the API response", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/tags?per_page=100",
+      json: [
+        { name: "v1.0.0", commit: { sha: "abc123" } },
+        { name: "v2.0.0", commit: { sha: "def456" } },
+      ],
+    },
+  ]);
+  try {
+    const res = await listGitHubTags({ dir: REPO_DIR });
+    expect(res).toEqual({
+      ok: true,
+      tags: [
+        { name: "v1.0.0", commitSha: "abc123" },
+        { name: "v2.0.0", commitSha: "def456" },
+      ],
+    });
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubCommitStatus hits the commit status endpoint and returns the combined state", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/commits/abc123/status",
+      json: {
+        state: "success",
+        total_count: 1,
+        statuses: [{ context: "ci/build", state: "success", description: "Build passed", target_url: "https://ci.example.com/1" }],
+      },
+    },
+  ]);
+  try {
+    const res = await getGitHubCommitStatus({ dir: REPO_DIR, ref: "abc123" });
+    expect(res).toEqual({
+      ok: true,
+      repo: "acme/widgets",
+      ref: "abc123",
+      state: "success",
+      total: 1,
+      statuses: [{ context: "ci/build", state: "success", description: "Build passed", targetUrl: "https://ci.example.com/1" }],
+    });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/commits/abc123/status");
+    expect(mock.calls[0]!.method).toBe("GET");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubCommitStatus maps a non-2xx response to the friendly `message` error", async () => {
+  const mock = mockGitHubFetch([
+    { match: "/commits/deadbeef/status", status: 404, json: { message: "No commit found for SHA: deadbeef" } },
+  ]);
+  try {
+    const res = await getGitHubCommitStatus({ dir: REPO_DIR, ref: "deadbeef" });
+    expect(res).toEqual({ ok: false, error: "No commit found for SHA: deadbeef" });
   } finally {
     mock.restore();
   }

@@ -29,6 +29,7 @@ import {
   PinOff,
   Plus,
   RefreshCw,
+  Rocket,
   Search,
   Sparkles,
   Tag,
@@ -60,6 +61,7 @@ import type {
   GitHubCheckRun,
   GitHubChecksResult,
   GitHubComment,
+  GitHubCommitStatusResult,
   GitHubLinkedIssue,
   GitHubListItem,
   GitHubNotification,
@@ -67,10 +69,12 @@ import type {
   GitHubPullLineComment,
   GitHubPullMergeability,
   GitHubRateLimit,
+  GitHubRelease,
   GitHubRepoLabel,
   GitHubRepoMilestone,
   GitHubReviewThread,
   GitHubSubIssue,
+  GitHubTag,
   GitHubUser,
   Project,
   TaskDiff,
@@ -411,6 +415,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // All assignable repo users (powers the triage assignee picker). Convenience
   // data only — no manager UI, so failures are swallowed like labels/milestones.
   const [repoAssignees, setRepoAssignees] = useState<GitHubUser[]>([]);
+  // Repo releases (F18) — powers the releases manager. Repo-scoped like
+  // labels/milestones, so disabled in aggregate mode.
+  const [repoReleases, setRepoReleases] = useState<GitHubRelease[]>([]);
+  const [releaseManagerOpen, setReleaseManagerOpen] = useState(false);
+  // Repo tags — feeds the release manager's tag-name datalist. Lazy — only
+  // fetched while the manager is open, mirroring notifications below.
+  const [repoTags, setRepoTags] = useState<GitHubTag[]>([]);
   // Repo notifications inbox (F14) — private (token-gated), so nothing is
   // preloaded until the panel is opened; the fetch itself surfaces the
   // "sign in" error when unauthenticated.
@@ -443,6 +454,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const commentSeq = useRef(0);
   const reviewCommentSeq = useRef(0);
   const checksSeq = useRef(0);
+  const commitStatusSeq = useRef(0);
   const mergeabilitySeq = useRef(0);
   const commitsSeq = useRef(0);
   const linkedIssuesSeq = useRef(0);
@@ -456,6 +468,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [checks, setChecks] = useState<Record<string, GitHubChecksResult | undefined>>({});
   const [checksLoading, setChecksLoading] = useState<Record<string, boolean | undefined>>({});
   const [checksErrors, setChecksErrors] = useState<Record<string, string | undefined>>({});
+  // Combined commit status (F19, the legacy Status API) — keyed and lazy-fetched
+  // like `checks` above, but keyed off the PR head sha (resolved from `checks`
+  // once it lands) rather than the PR number.
+  const [commitStatus, setCommitStatus] = useState<Record<string, GitHubCommitStatusResult | undefined>>({});
+  const [commitStatusLoading, setCommitStatusLoading] = useState<Record<string, boolean | undefined>>({});
+  const [commitStatusErrors, setCommitStatusErrors] = useState<Record<string, string | undefined>>({});
   const [mergeability, setMergeability] = useState<Record<string, GitHubPullMergeability | undefined>>({});
   const [mergeabilityLoading, setMergeabilityLoading] = useState<Record<string, boolean | undefined>>({});
   const [mergeabilityErrors, setMergeabilityErrors] = useState<Record<string, string | undefined>>({});
@@ -650,6 +668,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   useEffect(() => {
     diffSeq.current += 1;
     checksSeq.current += 1;
+    commitStatusSeq.current += 1;
     mergeabilitySeq.current += 1;
     commitsSeq.current += 1;
     linkedIssuesSeq.current += 1;
@@ -661,6 +680,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setChecks({});
     setChecksLoading({});
     setChecksErrors({});
+    setCommitStatus({});
+    setCommitStatusLoading({});
+    setCommitStatusErrors({});
     setMergeability({});
     setMergeabilityLoading({});
     setMergeabilityErrors({});
@@ -971,6 +993,70 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     return () => { cancelled = true; };
   }, [open, projectPath, isAggregate]);
 
+  // Newest first (by publishedAt, falling back to createdAt for drafts) — the
+  // server already sorts this way, but re-sort after every mutation so the
+  // manager's own create/edit doesn't reshuffle the list out of order.
+  const sortReleases = (rs: GitHubRelease[]) =>
+    [...rs].sort((a, b) => (b.publishedAt ?? b.createdAt).localeCompare(a.publishedAt ?? a.createdAt));
+
+  const refreshRepoReleases = async () => {
+    if (!projectPath) return;
+    try {
+      const r = await api.listGitHubReleases({ path: projectPath });
+      setRepoReleases(sortReleases(r.releases));
+    } catch {
+      // Releases are manager-only convenience data; ignore fetch failures.
+    }
+  };
+
+  const createRelease = async (
+    tagName: string,
+    name: string,
+    body: string,
+    draft: boolean,
+    prerelease: boolean,
+  ) => {
+    if (!projectPath) throw new Error("no project selected");
+    const { release } = await api.createGitHubRelease({ path: projectPath, tagName, name, body, draft, prerelease });
+    setRepoReleases((cur) => sortReleases([...cur, release]));
+  };
+
+  const editRelease = async (
+    id: number,
+    patch: { name?: string; body?: string; draft?: boolean; prerelease?: boolean; tagName?: string },
+  ) => {
+    if (!projectPath) throw new Error("no project selected");
+    const { release } = await api.updateGitHubRelease({ path: projectPath, id, ...patch });
+    setRepoReleases((cur) => sortReleases(cur.map((r) => (r.id === id ? release : r))));
+  };
+
+  const removeRelease = async (id: number) => {
+    if (!projectPath) throw new Error("no project selected");
+    await api.deleteGitHubRelease({ path: projectPath, id });
+    setRepoReleases((cur) => cur.filter((r) => r.id !== id));
+  };
+
+  useEffect(() => {
+    if (!open || !projectPath || isAggregate) { setRepoReleases([]); return; }
+    let cancelled = false;
+    api.listGitHubReleases({ path: projectPath })
+      .then((r) => { if (!cancelled) setRepoReleases(sortReleases(r.releases)); })
+      .catch(() => { if (!cancelled) setRepoReleases([]); });
+    return () => { cancelled = true; };
+  }, [open, projectPath, isAggregate]);
+
+  // Tags are manager-only convenience data (the create-release tag datalist),
+  // so — like notifications — fetched lazily only while the panel is open
+  // rather than unconditionally on every project switch.
+  useEffect(() => {
+    if (!open || !releaseManagerOpen || !projectPath || isAggregate) { setRepoTags([]); return; }
+    let cancelled = false;
+    api.listGitHubTags({ path: projectPath })
+      .then((r) => { if (!cancelled) setRepoTags(r.tags); })
+      .catch(() => { if (!cancelled) setRepoTags([]); });
+    return () => { cancelled = true; };
+  }, [open, releaseManagerOpen, projectPath, isAggregate]);
+
   // Lazy — only fetches while the panel is open (notifications are private
   // and the fetch itself surfaces the sign-in error, so there's no point
   // preloading before the user opens the panel).
@@ -1141,6 +1227,36 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         setChecksLoading((cur) => ({ ...cur, [key]: false }));
       });
   }, [open, projectPath, expandedItem, checks, checksLoading, checksErrors]);
+
+  useEffect(() => {
+    // F19 — the combined status needs a commit sha, not a PR number. Reuse the
+    // sha `checks` already resolved via the server's pullHeadSha lookup (which
+    // covers open/closed/merged PRs alike); fall back to mergeability's
+    // headSha (only fetched for open PRs). Skip until one of them lands —
+    // there's nothing to fetch yet.
+    if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
+    const key = itemKey(expandedItem);
+    const sha = checks[key]?.sha ?? mergeability[key]?.headSha;
+    if (!sha) return;
+    if (commitStatus[key] || commitStatusLoading[key] || commitStatusErrors[key]) return;
+
+    const requestId = ++commitStatusSeq.current;
+    setCommitStatusLoading((cur) => ({ ...cur, [key]: true }));
+    setCommitStatusErrors((cur) => ({ ...cur, [key]: undefined }));
+    api.getGitHubCommitStatus({ path: expandedItemPath, ref: sha })
+      .then((payload) => {
+        if (requestId !== commitStatusSeq.current) return;
+        setCommitStatus((cur) => ({ ...cur, [key]: payload }));
+      })
+      .catch((e: unknown) => {
+        if (requestId !== commitStatusSeq.current) return;
+        setCommitStatusErrors((cur) => ({ ...cur, [key]: e instanceof Error ? e.message : String(e) }));
+      })
+      .finally(() => {
+        if (requestId !== commitStatusSeq.current) return;
+        setCommitStatusLoading((cur) => ({ ...cur, [key]: false }));
+      });
+  }, [open, projectPath, expandedItem, checks, mergeability, commitStatus, commitStatusLoading, commitStatusErrors]);
 
   useEffect(() => {
     // Only open PRs surface a mergeability verdict — skip closed/merged ones so
@@ -1560,14 +1676,17 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       // head in the background. Give it a moment before invalidating the caches,
       // otherwise the refetch races the merge and shows a stale "behind" verdict.
       await new Promise((r) => setTimeout(r, 2_000));
-      // The head moved, so the cached mergeability, checks, and diff are stale —
-      // clear them so their effects refetch against the new head. Reset the
-      // mergeability retry budget so it can self-heal on the fresh head.
+      // The head moved, so the cached mergeability, checks, commit status, and
+      // diff are stale — clear them so their effects refetch against the new
+      // head. Reset the mergeability retry budget so it can self-heal on the
+      // fresh head.
       mergeabilityRetries.current[itemKey(item)] = 0;
       setMergeability((cur) => ({ ...cur, [itemKey(item)]: undefined }));
       setMergeabilityErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
       setChecks((cur) => ({ ...cur, [itemKey(item)]: undefined }));
       setChecksErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+      setCommitStatus((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+      setCommitStatusErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
       setDiffs((cur) => ({ ...cur, [itemKey(item)]: undefined }));
       setDiffErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
       // The head moved — any queued review comments now reference stale lines.
@@ -1978,7 +2097,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage labels"}
             aria-label="Manage labels"
             disabled={!projectPath || isAggregate}
-            onClick={() => { setLabelManagerOpen((v) => !v); setMilestoneManagerOpen(false); setNotificationsOpen(false); }}
+            onClick={() => {
+              setLabelManagerOpen((v) => !v);
+              setMilestoneManagerOpen(false);
+              setReleaseManagerOpen(false);
+              setNotificationsOpen(false);
+            }}
           >
             <Tag className="size-4" />
           </Button>
@@ -1988,9 +2112,29 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage milestones"}
             aria-label="Manage milestones"
             disabled={!projectPath || isAggregate}
-            onClick={() => { setMilestoneManagerOpen((v) => !v); setLabelManagerOpen(false); setNotificationsOpen(false); }}
+            onClick={() => {
+              setMilestoneManagerOpen((v) => !v);
+              setLabelManagerOpen(false);
+              setReleaseManagerOpen(false);
+              setNotificationsOpen(false);
+            }}
           >
             <Milestone className="size-4" />
+          </Button>
+          <Button
+            size="icon"
+            variant={releaseManagerOpen ? "secondary" : "ghost"}
+            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage releases"}
+            aria-label="Manage releases"
+            disabled={!projectPath || isAggregate}
+            onClick={() => {
+              setReleaseManagerOpen((v) => !v);
+              setLabelManagerOpen(false);
+              setMilestoneManagerOpen(false);
+              setNotificationsOpen(false);
+            }}
+          >
+            <Rocket className="size-4" />
           </Button>
           <Button
             size="icon"
@@ -1998,7 +2142,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Notifications"}
             aria-label="Notifications"
             disabled={!projectPath || isAggregate}
-            onClick={() => { setNotificationsOpen((v) => !v); setLabelManagerOpen(false); setMilestoneManagerOpen(false); }}
+            onClick={() => {
+              setNotificationsOpen((v) => !v);
+              setLabelManagerOpen(false);
+              setMilestoneManagerOpen(false);
+              setReleaseManagerOpen(false);
+            }}
           >
             <Bell className="size-4" />
           </Button>
@@ -2211,6 +2360,18 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onClose={() => setMilestoneManagerOpen(false)}
           />
         )}
+        {releaseManagerOpen && (
+          <ReleasesManager
+            releases={repoReleases}
+            tags={repoTags}
+            authenticated={canPush}
+            onCreate={createRelease}
+            onEdit={editRelease}
+            onDelete={removeRelease}
+            onRefresh={() => { void refreshRepoReleases(); }}
+            onClose={() => setReleaseManagerOpen(false)}
+          />
+        )}
         {notificationsOpen && (
           <NotificationsPanel
             notifications={notifications}
@@ -2329,6 +2490,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 checks={item.kind === "pulls" ? checks[itemKey(item)] : undefined}
                 checksLoading={item.kind === "pulls" ? !!checksLoading[itemKey(item)] : false}
                 checksError={item.kind === "pulls" ? checksErrors[itemKey(item)] : undefined}
+                commitStatus={item.kind === "pulls" ? commitStatus[itemKey(item)] : undefined}
+                commitStatusLoading={item.kind === "pulls" ? !!commitStatusLoading[itemKey(item)] : false}
+                commitStatusError={item.kind === "pulls" ? commitStatusErrors[itemKey(item)] : undefined}
                 mergeability={item.kind === "pulls" ? mergeability[itemKey(item)] : undefined}
                 mergeabilityLoading={item.kind === "pulls" ? !!mergeabilityLoading[itemKey(item)] : false}
                 mergeabilityError={item.kind === "pulls" ? mergeabilityErrors[itemKey(item)] : undefined}
@@ -2442,6 +2606,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                   if (item.kind !== "pulls") return;
                   setChecksErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                 }}
+                onRetryCommitStatus={() => {
+                  if (item.kind !== "pulls") return;
+                  setCommitStatusErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+                }}
                 onRefreshDiff={() => {
                   if (item.kind !== "pulls") return;
                   setDiffs((cur) => ({ ...cur, [itemKey(item)]: undefined }));
@@ -2455,6 +2623,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                   if (item.kind !== "pulls") return;
                   setChecks((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                   setChecksErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+                }}
+                onRefreshCommitStatus={() => {
+                  if (item.kind !== "pulls") return;
+                  setCommitStatus((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+                  setCommitStatusErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                 }}
                 onRefreshMergeability={() => {
                   if (item.kind !== "pulls") return;
@@ -3246,6 +3419,289 @@ function MilestoneRow({
   );
 }
 
+/** A release's publish date for display — falls back to `createdAt` for a
+ *  draft, which has no `publishedAt` yet. */
+function releaseDateLabel(release: GitHubRelease): string {
+  const date = release.publishedAt ?? release.createdAt;
+  return date ? fmtDate(date) : "";
+}
+
+function ReleasesManager({
+  releases,
+  tags,
+  authenticated,
+  onCreate,
+  onEdit,
+  onDelete,
+  onRefresh,
+  onClose,
+}: {
+  releases: GitHubRelease[];
+  tags: GitHubTag[];
+  authenticated: boolean;
+  onCreate: (tagName: string, name: string, body: string, draft: boolean, prerelease: boolean) => Promise<void>;
+  onEdit: (
+    id: number,
+    patch: { name?: string; body?: string; draft?: boolean; prerelease?: boolean; tagName?: string },
+  ) => Promise<void>;
+  onDelete: (id: number) => Promise<void>;
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  const [tagName, setTagName] = useState("");
+  const [name, setName] = useState("");
+  const [body, setBody] = useState("");
+  const [draft, setDraft] = useState(false);
+  const [prerelease, setPrerelease] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const create = async () => {
+    const t = tagName.trim();
+    if (!t || creating) return;
+    setCreating(true);
+    setError(null);
+    try {
+      await onCreate(t, name, body, draft, prerelease);
+      setTagName("");
+      setName("");
+      setBody("");
+      setDraft(false);
+      setPrerelease(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  return (
+    <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <Rocket className="size-3.5" />
+          Releases ({releases.length})
+        </div>
+        <div className="flex items-center gap-1">
+          <Button size="icon" variant="ghost" className="size-6" title="Refresh releases" aria-label="Refresh releases" onClick={onRefresh}>
+            <RefreshCw className="size-3.5" />
+          </Button>
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      </div>
+      <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,0.8fr)_minmax(0,1fr)]">
+        <Input
+          value={tagName}
+          onChange={(e) => setTagName(e.target.value)}
+          placeholder="Tag name"
+          className="h-8 text-xs"
+          list="github-dialog-release-tags"
+          disabled={creating || !authenticated}
+        />
+        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Release title (optional)" className="h-8 text-xs" disabled={creating || !authenticated} />
+        <datalist id="github-dialog-release-tags">
+          {tags.map((t) => <option key={t.name} value={t.name} />)}
+        </datalist>
+      </div>
+      <Textarea
+        value={body}
+        onChange={(e) => setBody(e.target.value)}
+        placeholder="Release notes (optional, markdown)"
+        className="mb-2 min-h-16 resize-y text-xs"
+        disabled={creating || !authenticated}
+      />
+      <div className="mb-2 flex flex-wrap items-center gap-3">
+        <label className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+          <input type="checkbox" checked={draft} disabled={creating || !authenticated} onChange={(e) => setDraft(e.target.checked)} />
+          Draft
+        </label>
+        <label className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+          <input type="checkbox" checked={prerelease} disabled={creating || !authenticated} onChange={(e) => setPrerelease(e.target.checked)} />
+          Pre-release
+        </label>
+        <Button
+          size="sm"
+          className="ml-auto"
+          disabled={creating || !tagName.trim() || !authenticated}
+          title={authenticated ? undefined : PUSH_ONLY_TITLE}
+          onClick={() => { void create(); }}
+        >
+          {creating ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
+          Add
+        </Button>
+      </div>
+      {error && (
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+      <div className="max-h-56 space-y-1 overflow-y-auto">
+        {releases.length === 0 ? (
+          <div className="px-1 py-2 text-[11px] text-muted-foreground">No releases in this repository.</div>
+        ) : (
+          releases.map((r) => <ReleaseRow key={r.id} release={r} authenticated={authenticated} onEdit={onEdit} onDelete={onDelete} />)
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ReleaseRow({
+  release,
+  authenticated,
+  onEdit,
+  onDelete,
+}: {
+  release: GitHubRelease;
+  authenticated: boolean;
+  onEdit: (
+    id: number,
+    patch: { name?: string; body?: string; draft?: boolean; prerelease?: boolean; tagName?: string },
+  ) => Promise<void>;
+  onDelete: (id: number) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(release.name);
+  const [body, setBody] = useState(release.body);
+  const [draft, setDraft] = useState(release.draft);
+  const [prerelease, setPrerelease] = useState(release.prerelease);
+  const [busy, setBusy] = useState<null | "save" | "delete">(null);
+  const [confirm, setConfirm] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const reset = () => {
+    setName(release.name);
+    setBody(release.body);
+    setDraft(release.draft);
+    setPrerelease(release.prerelease);
+    setError(null);
+  };
+
+  const save = async () => {
+    if (busy) return;
+    setBusy("save");
+    setError(null);
+    try {
+      await onEdit(release.id, { name, body, draft, prerelease });
+      setEditing(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const del = async () => {
+    if (busy) return;
+    setBusy("delete");
+    setError(null);
+    try {
+      await onDelete(release.id); // success unmounts this row
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(null);
+      setConfirm(false);
+    }
+  };
+
+  if (editing) {
+    return (
+      <div className="rounded border border-border/60 p-2">
+        <div className="grid gap-2 md:grid-cols-[minmax(0,0.6fr)_minmax(0,1fr)]">
+          <span className="flex items-center truncate rounded border border-border/60 px-2 text-[11px] text-muted-foreground">{release.tagName}</span>
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Release title" className="h-7 text-xs" disabled={busy === "save"} />
+        </div>
+        <Textarea value={body} onChange={(e) => setBody(e.target.value)} placeholder="Release notes" className="mt-2 min-h-16 resize-y text-xs" disabled={busy === "save"} />
+        <div className="mt-2 flex flex-wrap items-center gap-3">
+          <label className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <input type="checkbox" checked={draft} disabled={busy === "save"} onChange={(e) => setDraft(e.target.checked)} />
+            Draft
+          </label>
+          <label className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <input type="checkbox" checked={prerelease} disabled={busy === "save"} onChange={(e) => setPrerelease(e.target.checked)} />
+            Pre-release
+          </label>
+        </div>
+        {error && (
+          <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
+            <AlertCircle className="size-3.5" />
+            {error}
+          </div>
+        )}
+        <div className="mt-1 flex justify-end gap-2">
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" disabled={busy === "save"} onClick={() => { setEditing(false); reset(); }}>
+            Cancel
+          </Button>
+          <Button size="sm" className="h-6 px-2 text-[11px]" disabled={busy === "save"} onClick={() => { void save(); }}>
+            {busy === "save" ? <Loader2 className="mr-1 size-3 animate-spin" /> : <FilePen className="mr-1 size-3" />}
+            Save
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2 rounded px-1 py-1 text-xs">
+      <Rocket className="size-3.5 shrink-0 text-emerald-400" />
+      <span className="shrink-0 rounded border border-border/60 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">{release.tagName}</span>
+      <span className="min-w-0 shrink truncate font-medium">{release.name || release.tagName}</span>
+      {release.draft && <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">Draft</span>}
+      {release.prerelease && <span className="shrink-0 rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-400">Pre-release</span>}
+      <span className="shrink-0 text-[11px] text-muted-foreground">{releaseDateLabel(release)}</span>
+      {error && <span className="truncate text-[11px] text-rose-400">{error}</span>}
+      <div className="ml-auto flex shrink-0 items-center gap-1">
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-6"
+          title="Open release on GitHub"
+          aria-label={`Open ${release.tagName} on GitHub`}
+          onClick={() => { void api.openExternal(release.htmlUrl); }}
+        >
+          <ExternalLink className="size-3.5" />
+        </Button>
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-6"
+          title={authenticated ? "Edit release" : PUSH_ONLY_TITLE}
+          aria-label={`Edit ${release.tagName}`}
+          disabled={!!busy || !authenticated}
+          onClick={() => { reset(); setEditing(true); }}
+        >
+          <FilePen className="size-3.5" />
+        </Button>
+        {confirm ? (
+          <>
+            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-rose-400" disabled={busy === "delete"} onClick={() => { void del(); }}>
+              {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : "Confirm"}
+            </Button>
+            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" disabled={busy === "delete"} onClick={() => setConfirm(false)}>
+              Cancel
+            </Button>
+          </>
+        ) : (
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-6 text-muted-foreground hover:text-rose-400"
+            title={authenticated ? "Delete release" : PUSH_ONLY_TITLE}
+            aria-label={`Delete ${release.tagName}`}
+            disabled={!!busy || !authenticated}
+            onClick={() => setConfirm(true)}
+          >
+            <XCircle className="size-3.5" />
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function NotificationsPanel({
   notifications,
   loading,
@@ -3456,6 +3912,9 @@ function GitHubItemRow({
   checks,
   checksLoading,
   checksError,
+  commitStatus,
+  commitStatusLoading,
+  commitStatusError,
   mergeability,
   mergeabilityLoading,
   mergeabilityError,
@@ -3544,8 +4003,10 @@ function GitHubItemRow({
   onRetryComments,
   onRetryDiff,
   onRetryChecks,
+  onRetryCommitStatus,
   onRefreshDiff,
   onRefreshChecks,
+  onRefreshCommitStatus,
   onRefreshMergeability,
   onRetryCommits,
   onToggle,
@@ -3561,6 +4022,9 @@ function GitHubItemRow({
   checks?: GitHubChecksResult;
   checksLoading: boolean;
   checksError?: string;
+  commitStatus?: GitHubCommitStatusResult;
+  commitStatusLoading: boolean;
+  commitStatusError?: string;
   mergeability?: GitHubPullMergeability;
   mergeabilityLoading: boolean;
   mergeabilityError?: string;
@@ -3649,8 +4113,10 @@ function GitHubItemRow({
   onRetryComments: () => void;
   onRetryDiff: () => void;
   onRetryChecks: () => void;
+  onRetryCommitStatus: () => void;
   onRefreshDiff: () => void;
   onRefreshChecks: () => void;
+  onRefreshCommitStatus: () => void;
   onRefreshMergeability: () => void;
   onRetryCommits: () => void;
   onToggle: () => void;
@@ -3860,6 +4326,7 @@ function GitHubItemRow({
                 canPush={canPush}
               />
               <CheckRuns checks={checks} loading={checksLoading} error={checksError} onRetry={onRetryChecks} onRefresh={onRefreshChecks} />
+              <CommitStatus status={commitStatus} loading={commitStatusLoading} error={commitStatusError} onRetry={onRetryCommitStatus} onRefresh={onRefreshCommitStatus} />
               <PullCommits commits={commits} loading={commitsLoading} error={commitsError} onRetry={onRetryCommits} />
               <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} />
               <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
@@ -3943,6 +4410,16 @@ function checkClass(run: GitHubCheckRun): string {
     return "text-emerald-400";
   }
   return "text-rose-400";
+}
+
+/** Combined-status (F19) state → color, shared by the summary line and each
+ *  per-context row. GitHub's states: success/pending/failure/error, plus the
+ *  empty string when a ref has no statuses at all. */
+function commitStatusClass(state: string): string {
+  if (state === "success") return "text-emerald-400";
+  if (state === "pending") return "text-sky-400";
+  if (state === "failure" || state === "error") return "text-rose-400";
+  return "text-muted-foreground";
 }
 
 const MERGE_TONE_CLASS: Record<MergeTone, string> = {
@@ -4969,6 +5446,102 @@ function CheckRuns({
                   title="Open check on GitHub"
                   aria-label={`Open ${run.name} check on GitHub`}
                   onClick={() => { void api.openExternal(run.htmlUrl!); }}
+                >
+                  <ExternalLink className="size-3.5" />
+                </Button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** F19 — the combined status from GitHub's legacy Status API, shown next to
+ *  the check-runs section above. Distinct data source (some CI providers
+ *  still only post through this older API), so it's possible for one to have
+ *  entries while the other doesn't. Hidden entirely when there's nothing to
+ *  show (`total === 0`) rather than rendering an empty section. */
+function CommitStatus({
+  status,
+  loading,
+  error,
+  onRetry,
+  onRefresh,
+}: {
+  status?: GitHubCommitStatusResult;
+  loading: boolean;
+  error?: string;
+  onRetry: () => void;
+  onRefresh: () => void;
+}) {
+  // The legacy combined-status API is rarely populated (most repos post via
+  // check-runs), so most PR expansions resolve to empty. Render nothing until we
+  // actually have contexts to show — otherwise every expand flashes a header +
+  // "Loading…" box that immediately unmounts. `total` can also diverge from the
+  // surviving `statuses` (defensive), so gate visibility on the array length.
+  const hasContent = !!status && status.statuses.length > 0;
+  if (loading && !status) return null;
+  if (!loading && !error && !hasContent) return null;
+
+  return (
+    <div className="mt-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <GitPullRequest className="size-3.5" />
+          Commit status
+        </div>
+        <div className="flex items-center gap-2">
+          {hasContent && (
+            <span className={cn("text-[11px] font-medium capitalize", commitStatusClass(status.state))}>
+              {status.state || "unknown"}
+            </span>
+          )}
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-6"
+            title="Refresh commit status"
+            aria-label="Refresh commit status"
+            disabled={loading}
+            onClick={onRefresh}
+          >
+            {loading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+          </Button>
+        </div>
+      </div>
+
+      {loading && (
+        <div className="flex items-center justify-center gap-2 rounded-md border border-border/60 py-6 text-sm text-muted-foreground">
+          <Loader2 className="size-4 animate-spin" /> Loading commit status...
+        </div>
+      )}
+      {!loading && error && (
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-rose-400">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="size-4" /> {error}
+          </div>
+          <Button size="sm" variant="outline" onClick={onRetry}>
+            Retry
+          </Button>
+        </div>
+      )}
+      {!loading && !error && hasContent && (
+        <div className="overflow-hidden rounded-md border border-border/60">
+          {status!.statuses.map((ctx) => (
+            <div key={ctx.context} className="flex items-center gap-2 border-b border-border/50 px-3 py-2 last:border-b-0">
+              <span className={cn("size-2 shrink-0 rounded-full bg-current", commitStatusClass(ctx.state))} />
+              <span className="min-w-0 flex-1 truncate text-sm">{ctx.context}</span>
+              {ctx.description && <span className="min-w-0 max-w-[40%] truncate text-xs text-muted-foreground">{ctx.description}</span>}
+              <span className={cn("shrink-0 text-xs capitalize", commitStatusClass(ctx.state))}>{ctx.state || "unknown"}</span>
+              {ctx.targetUrl && (
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  title="Open status target on GitHub"
+                  aria-label={`Open ${ctx.context} status on GitHub`}
+                  onClick={() => { void api.openExternal(ctx.targetUrl!); }}
                 >
                   <ExternalLink className="size-3.5" />
                 </Button>

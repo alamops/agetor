@@ -11,6 +11,8 @@ import type {
   GitHubComment,
   GitHubCommentsResult,
   GitHubChecksResult,
+  GitHubCommitStatus,
+  GitHubCommitStatusResult,
   GitHubAssigneesResult,
   GitHubLabelsResult,
   GitHubRepoLabel,
@@ -35,9 +37,13 @@ import type {
   GitHubReactionsResult,
   GitHubReactionSubject,
   GitHubReactionSummary,
+  GitHubRelease,
+  GitHubReleasesResult,
   GitHubRepoPermissions,
   GitHubSubIssue,
   GitHubSubIssuesResult,
+  GitHubTag,
+  GitHubTagsResult,
   Harness,
   HarnessStatus,
   HarnessUsage,
@@ -70,6 +76,8 @@ export type {
   GitHubChecksResult,
   GitHubComment,
   GitHubCommentsResult,
+  GitHubCommitStatus,
+  GitHubCommitStatusResult,
   GitHubItemKind,
   GitHubItemState,
   GitHubAssigneesResult,
@@ -96,9 +104,13 @@ export type {
   GitHubReactionsResult,
   GitHubReactionSubject,
   GitHubReactionSummary,
+  GitHubRelease,
+  GitHubReleasesResult,
   GitHubRepoPermissions,
   GitHubSubIssue,
   GitHubSubIssuesResult,
+  GitHubTag,
+  GitHubTagsResult,
 };
 export { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
 
@@ -529,6 +541,49 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  listGitHubReleases: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubReleasesResult>(`/github/releases?${q.toString()}`);
+  },
+  createGitHubRelease: (input: {
+    path: string;
+    tagName: string;
+    name?: string;
+    body?: string;
+    draft?: boolean;
+    prerelease?: boolean;
+    targetCommitish?: string;
+  }) =>
+    j<{ ok: true; release: GitHubRelease }>("/github/releases", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubRelease: (input: {
+    path: string;
+    id: number;
+    name?: string;
+    body?: string;
+    draft?: boolean;
+    prerelease?: boolean;
+    tagName?: string;
+  }) =>
+    j<{ ok: true; release: GitHubRelease }>("/github/release-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubRelease: (input: { path: string; id: number }) =>
+    j<{ ok: true; message?: string }>("/github/release-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubTags: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubTagsResult>(`/github/tags?${q.toString()}`);
+  },
+  getGitHubCommitStatus: (input: { path: string; ref: string }) => {
+    const q = new URLSearchParams({ path: input.path, ref: input.ref });
+    return j<GitHubCommitStatusResult>(`/github/commit-status?${q.toString()}`);
+  },
   updateGitHubComment: (input: { path: string; commentId: number; kind: "issue" | "review"; body: string }) =>
     j<{ ok: true; comment: GitHubComment }>("/github/comment-update", {
       method: "POST",
