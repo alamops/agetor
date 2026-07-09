@@ -668,7 +668,13 @@ function normalizeMilestone(raw: unknown): GitHubMilestone | null {
   };
 }
 
-function normalizeItem(kind: GitHubItemKind, raw: unknown): GitHubListItem | null {
+// `sourcePath` defaults to null (rather than being required at every call
+// site) so the many existing 2-arg call sites — and __githubInternals tests —
+// keep compiling unchanged; every *production* call site below threads its
+// own `input.dir` through so a list/action item always carries a usable path
+// (G8, multi-repo aggregation: the UI resolves `item.sourcePath ?? projectPath`
+// for every per-item action).
+function normalizeItem(kind: GitHubItemKind, raw: unknown, sourcePath: string | null = null): GitHubListItem | null {
   if (!raw || typeof raw !== "object") return null;
   const obj = raw as Record<string, unknown>;
   if (typeof obj.number !== "number" || typeof obj.title !== "string") return null;
@@ -698,6 +704,7 @@ function normalizeItem(kind: GitHubItemKind, raw: unknown): GitHubListItem | nul
     closedAt: typeof obj.closed_at === "string" ? obj.closed_at : null,
     mergedAt: typeof obj.merged_at === "string" ? obj.merged_at : null,
     locked: typeof obj.locked === "boolean" ? obj.locked : false,
+    sourcePath,
   };
 }
 
@@ -1085,7 +1092,7 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
     if (!raws) return { ok: false, error: "GitHub returned an unexpected response" };
     for (const raw of raws) {
       if (!useSearch && input.kind === "issues" && raw && typeof raw === "object" && "pull_request" in raw) continue;
-      const item = normalizeItem(input.kind, raw);
+      const item = normalizeItem(input.kind, raw, input.dir);
       if (item && matchesFilters(item, input.query ?? "", clientLabels, clientAssignee)) {
         items.push(item);
       }
@@ -1117,6 +1124,125 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
     page,
     hasMore,
     rateLimit: lastRes ? parseRateLimit(lastRes.headers) : null,
+  };
+}
+
+interface ListGitHubItemsAcrossReposInput {
+  dirs: string[];
+  kind: GitHubItemKind;
+  state: GitHubItemState;
+  query?: string;
+  labels?: string[];
+  assignee?: string;
+  createdByMe?: boolean;
+  assignedToMe?: boolean;
+  reviewRequested?: boolean;
+  searchQuery?: string;
+  sort?: "created" | "updated" | "comments";
+  direction?: "asc" | "desc";
+}
+
+/** Merges items across several repos into one `GitHubListResult`-shaped list
+ *  (G8, multi-repo aggregation / F15). For each `dir`, reuses the single-repo
+ *  `listGitHubItems` — same filters, always page 1 — and tags every returned
+ *  item with `sourcePath = dir` so the UI's per-item actions resolve
+ *  `item.sourcePath ?? projectPath` and land on the correct repo even though
+ *  the list itself is merged.
+ *
+ *  A dir without a GitHub remote (or that fails for any other reason —
+ *  unauthenticated search, rate limit, …) is skipped silently rather than
+ *  failing the whole aggregate: a handful of registered projects commonly
+ *  includes ones with no GitHub remote at all, and one flaky repo shouldn't
+ *  blank the rest. Only errors if EVERY dir failed.
+ *
+ *  Each repo contributes at most one page (its own `hasMore`, if true, sets
+ *  the aggregate result's `hasMore` — signaling "this merged list is
+ *  truncated" rather than "there's a page 2 to fetch"; the UI disables
+ *  "Load more" in aggregate mode rather than trying to page per-repo). */
+export async function listGitHubItemsAcrossRepos(input: ListGitHubItemsAcrossReposInput): Promise<GitHubListResponse> {
+  const dirs = Array.from(new Set(input.dirs.filter((d) => d.trim())));
+  if (dirs.length === 0) return { ok: false, error: "no projects to aggregate" };
+
+  const fetchOne = (dir: string) => listGitHubItems({
+    dir,
+    kind: input.kind,
+    state: input.state,
+    query: input.query,
+    labels: input.labels,
+    assignee: input.assignee,
+    createdByMe: input.createdByMe,
+    assignedToMe: input.assignedToMe,
+    reviewRequested: input.reviewRequested,
+    searchQuery: input.searchQuery,
+    sort: input.sort,
+    direction: input.direction,
+    page: 1,
+  });
+
+  // Bounded concurrency: each per-repo fetch spawns several `git`/`gh`
+  // sub-processes plus a GitHub HTTP call, so an unbounded `Promise.all` over
+  // every registered project can trip secondary rate limits (worse against the
+  // ~30/min Search API). A small pool keeps the burst in check while still
+  // overlapping the network latency. Results are collected by index so the
+  // per-repo order is preserved (the final sort re-orders anyway).
+  const CONCURRENCY = 5;
+  const perRepo: { dir: string; res: GitHubListResponse }[] = new Array(dirs.length);
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= dirs.length) return;
+      const dir = dirs[i]!;
+      perRepo[i] = { dir, res: await fetchOne(dir) };
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, dirs.length) }, worker));
+
+  const repos: string[] = [];
+  const items: GitHubListItem[] = [];
+  let truncated = false;
+  let auth: "token" | "none" = "none";
+  let rateLimit: GitHubRateLimit | null = null;
+
+  for (const { dir, res } of perRepo) {
+    if (!res.ok) continue; // no remote, unauthenticated search, etc. — skip silently
+    repos.push(res.repo);
+    for (const item of res.items) items.push({ ...item, sourcePath: dir });
+    if (res.hasMore) truncated = true;
+    if (res.auth === "token") auth = "token";
+    if (res.rateLimit && (!rateLimit || res.rateLimit.remaining < rateLimit.remaining)) rateLimit = res.rateLimit;
+  }
+
+  if (repos.length === 0) {
+    return { ok: false, error: "none of the selected projects have a usable GitHub remote" };
+  }
+
+  // Default sort mirrors the UI's "best-match" fallback for a single repo
+  // (created-desc); merging across repos has no relevance signal at all, so
+  // "updated desc" is the more useful cross-repo default.
+  const sortField = input.sort ?? "updated";
+  const direction = input.direction ?? "desc";
+  const sortValue = (item: GitHubListItem): number => {
+    if (sortField === "comments") return item.comments;
+    const raw = sortField === "created" ? item.createdAt : item.updatedAt;
+    const t = Date.parse(raw);
+    return Number.isNaN(t) ? 0 : t;
+  };
+  items.sort((a, b) => {
+    const diff = sortValue(a) - sortValue(b);
+    return direction === "asc" ? diff : -diff;
+  });
+
+  return {
+    ok: true,
+    repo: `${repos.length} ${repos.length === 1 ? "repository" : "repositories"}`,
+    repos,
+    webUrl: null,
+    auth,
+    items,
+    page: 1,
+    hasMore: truncated,
+    rateLimit,
   };
 }
 
@@ -1162,7 +1288,7 @@ export async function createGitHubPull(input: CreateGitHubPullInput): Promise<Gi
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
-  const item = normalizeItem("pulls", json);
+  const item = normalizeItem("pulls", json, input.dir);
   if (!item) return { ok: false, error: "GitHub returned an unexpected pull request response" };
 
   const reviewers = input.reviewers?.map((s) => s.trim()).filter(Boolean) ?? [];
@@ -1678,7 +1804,7 @@ export async function closeGitHubPull(input: CloseGitHubPullInput): Promise<GitH
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
-  const item = normalizeItem("pulls", json);
+  const item = normalizeItem("pulls", json, input.dir);
   if (comment) {
     const commentResult = await createGitHubComment({ dir: input.dir, number: input.number, body: comment });
     if (!commentResult.ok) {
@@ -1727,7 +1853,7 @@ export async function createGitHubIssue(input: CreateGitHubIssueInput): Promise<
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
-  const item = normalizeItem("issues", json);
+  const item = normalizeItem("issues", json, input.dir);
   if (!item) return { ok: false, error: "GitHub returned an unexpected issue response" };
   return { ok: true, item, message: "Issue created." };
 }
@@ -1759,7 +1885,7 @@ export async function updateGitHubIssue(input: UpdateGitHubIssueInput): Promise<
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
-  const item = normalizeItem(kind, json);
+  const item = normalizeItem(kind, json, input.dir);
   if (!item) return { ok: false, error: `GitHub returned an unexpected ${noun} response` };
   return { ok: true, item, message: `${kind === "pulls" ? "Pull request" : "Issue"} updated.` };
 }
@@ -1895,7 +2021,7 @@ export async function reopenGitHubPull(input: GitHubItemNumberInput): Promise<Gi
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
-  const item = normalizeItem("pulls", json);
+  const item = normalizeItem("pulls", json, input.dir);
   if (!item) return { ok: false, error: "GitHub returned an unexpected pull request response" };
   return { ok: true, item, message: "Pull request reopened." };
 }

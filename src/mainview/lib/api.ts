@@ -365,6 +365,42 @@ export const api = {
     if (input.direction) q.set("direction", input.direction);
     return j<GitHubListResult>(`/github/items?${q.toString()}`);
   },
+  /** Multi-repo aggregation (G8/F15) — "All repositories" in the GitHub
+   *  dialog. Same filters as `listGitHubItems`, fanned out server-side across
+   *  every path with a GitHub remote and merged into one list; each item
+   *  carries its own repo's path as `sourcePath`. `page`/"Load more" aren't
+   *  supported — the aggregate result always covers the first page per repo. */
+  listGitHubItemsAcrossRepos: (input: {
+    paths: string[];
+    kind: GitHubItemKind;
+    state: GitHubItemState;
+    query?: string;
+    labels?: string[];
+    assignee?: string;
+    createdByMe?: boolean;
+    assignedToMe?: boolean;
+    reviewRequested?: boolean;
+    searchQuery?: string;
+    sort?: "created" | "updated" | "comments";
+    direction?: "asc" | "desc";
+  }) =>
+    j<GitHubListResult>("/github/items-aggregate", {
+      method: "POST",
+      body: JSON.stringify({
+        paths: input.paths,
+        kind: input.kind,
+        state: input.state,
+        q: input.query,
+        labels: input.labels,
+        assignee: input.assignee,
+        createdByMe: input.createdByMe,
+        assignedToMe: input.assignedToMe,
+        reviewRequested: input.reviewRequested,
+        searchQuery: input.searchQuery,
+        sort: input.sort,
+        direction: input.direction,
+      }),
+    }),
   getGitHubRepoPermissions: (input: { path: string }) => {
     const q = new URLSearchParams({ path: input.path });
     return j<{ ok: true } & GitHubRepoPermissions>(`/github/repo-permissions?${q.toString()}`);

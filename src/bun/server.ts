@@ -85,6 +85,7 @@ import {
   listGitHubAssignees,
   listGitHubComments,
   listGitHubItems,
+  listGitHubItemsAcrossRepos,
   listGitHubLabels,
   listGitHubMilestones,
   listGitHubNotifications,
@@ -533,6 +534,69 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             page,
             sort: sort ?? undefined,
             direction: direction ?? undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Multi-repo aggregation (G8/F15) — "All repositories" in the GitHub
+      // dialog. POST (not GET) because `paths` is an array. Mirrors /github/items'
+      // filters; per-repo fetches are fanned out server-side and merged.
+      "/github/items-aggregate": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            paths?: unknown;
+            kind?: string;
+            state?: string;
+            q?: string;
+            labels?: unknown;
+            assignee?: string;
+            createdByMe?: boolean;
+            assignedToMe?: boolean;
+            reviewRequested?: boolean;
+            searchQuery?: string;
+            sort?: string;
+            direction?: string;
+          };
+          const paths = Array.isArray(body.paths)
+            ? body.paths.filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+            : [];
+          if (paths.length === 0) return json({ error: "paths required" }, { status: 400, headers: corsHeaders(req) });
+          const kind = body.kind;
+          if (kind !== "pulls" && kind !== "issues") {
+            return json({ error: "kind must be pulls or issues" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const state = body.state ?? "open";
+          if (state !== "open" && state !== "closed" && state !== "all") {
+            return json({ error: "state must be open, closed, or all" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const sort = body.sort;
+          if (sort !== undefined && sort !== "created" && sort !== "updated" && sort !== "comments") {
+            return json({ error: "sort must be created, updated, or comments" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const direction = body.direction;
+          if (direction !== undefined && direction !== "asc" && direction !== "desc") {
+            return json({ error: "direction must be asc or desc" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const labels = Array.isArray(body.labels)
+            ? body.labels.filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+            : [];
+          const result = await listGitHubItemsAcrossRepos({
+            dirs: paths,
+            kind: kind as GitHubItemKind,
+            state: state as GitHubItemState,
+            query: body.q ?? "",
+            labels,
+            assignee: body.assignee ?? "",
+            createdByMe: body.createdByMe === true,
+            assignedToMe: body.assignedToMe === true,
+            reviewRequested: body.reviewRequested === true,
+            searchQuery: body.searchQuery ?? "",
+            sort,
+            direction,
           });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });

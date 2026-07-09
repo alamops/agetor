@@ -2,6 +2,9 @@
 // (URL, method, headers, body, pagination, error mapping) via the fetch-mock
 // harness in github-test-util.ts. Complements github.test.ts, which unit-tests
 // the pure helpers in isolation.
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { test, expect, beforeAll } from "bun:test";
 import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
 import {
@@ -15,6 +18,7 @@ import {
   getGitHubViewer,
   listGitHubAssignees,
   listGitHubItems,
+  listGitHubItemsAcrossRepos,
   listGitHubLabels,
   listGitHubMilestones,
   listGitHubNotifications,
@@ -1211,6 +1215,75 @@ test("listGitHubItems (REST path, no client filter) fetches exactly one source p
   } finally {
     mock.restore();
   }
+});
+
+// ---------------------------------------------------------------------------
+// listGitHubItemsAcrossRepos (G8, multi-repo aggregation / F15) — reuses
+// listGitHubItems per dir, tags every item with sourcePath = dir, merges, and
+// sorts. See github-test-util.ts for makeGitHubRepo/mockGitHubFetch.
+// ---------------------------------------------------------------------------
+
+test("listGitHubItemsAcrossRepos fans out across repos, tags items with sourcePath, and sorts by updated desc by default", async () => {
+  const repoB = await makeGitHubRepo("acme", "gadgets");
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/pulls",
+      json: [
+        { number: 1, title: "widgets older", state: "open", html_url: "https://github.com/acme/widgets/pull/1", updated_at: "2026-01-01T00:00:00Z" },
+      ],
+    },
+    {
+      match: "/repos/acme/gadgets/pulls",
+      json: [
+        { number: 5, title: "gadgets newer", state: "open", html_url: "https://github.com/acme/gadgets/pull/5", updated_at: "2026-02-01T00:00:00Z" },
+      ],
+    },
+  ]);
+  try {
+    const res = await listGitHubItemsAcrossRepos({ dirs: [REPO_DIR, repoB], kind: "pulls", state: "open" });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(mock.calls).toHaveLength(2);
+    expect(res.repos?.sort()).toEqual(["acme/gadgets", "acme/widgets"]);
+    // updated desc default → the more-recently-updated gadgets item leads.
+    expect(res.items.map((i) => i.number)).toEqual([5, 1]);
+    expect(res.items.find((i) => i.number === 5)?.sourcePath).toBe(repoB);
+    expect(res.items.find((i) => i.number === 1)?.sourcePath).toBe(REPO_DIR);
+    expect(res.page).toBe(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubItemsAcrossRepos skips a dir without a GitHub remote silently", async () => {
+  const bareDir = mkdtempSync(path.join(tmpdir(), "agetor-gh-no-remote-"));
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/issues",
+      json: [
+        { number: 2, title: "only from the remote-having repo", state: "open", html_url: "https://github.com/acme/widgets/issues/2" },
+      ],
+    },
+  ]);
+  try {
+    const res = await listGitHubItemsAcrossRepos({ dirs: [REPO_DIR, bareDir], kind: "issues", state: "open" });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(mock.calls).toHaveLength(1); // the bare dir never hits the network
+    expect(res.repos).toEqual(["acme/widgets"]);
+    expect(res.items.map((i) => i.number)).toEqual([2]);
+    expect(res.items[0]!.sourcePath).toBe(REPO_DIR);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubItemsAcrossRepos errors when every dir has no usable GitHub remote", async () => {
+  const bareDir = mkdtempSync(path.join(tmpdir(), "agetor-gh-no-remote-"));
+  const res = await listGitHubItemsAcrossRepos({ dirs: [bareDir], kind: "issues", state: "open" });
+  expect(res.ok).toBe(false);
+  if (res.ok) throw new Error("expected failure");
+  expect(res.error).toMatch(/GitHub remote/i);
 });
 
 test("listGitHubNotifications hits the repo notifications endpoint with all=false by default and maps fields", async () => {

@@ -740,6 +740,13 @@ export interface GitHubListItem {
    *  `/issues/:number/lock` endpoint. Defaults to `false` when the source
    *  response omits the field (some list paths do). */
   locked: boolean;
+  /** Local filesystem path of the project this item came from (G8, multi-repo
+   *  aggregation). Single-repo listing sets this to that repo's dir; every
+   *  per-item action resolves `item.sourcePath ?? projectPath` so writes land
+   *  on the correct repo even when the list aggregates several. Null only for
+   *  items normalized without a known dir (shouldn't happen in practice —
+   *  every list/action call site threads one through). */
+  sourcePath: string | null;
 }
 
 /** Rate-limit snapshot parsed from a GitHub API response's `x-ratelimit-*`
@@ -764,20 +771,31 @@ export interface GitHubRepoPermissions {
 }
 
 export interface GitHubListResult {
+  /** Single-repo mode: "owner/name". Aggregate mode (G8): a display summary
+   *  like "3 repositories" — see `repos` for the actual slugs. */
   repo: string;
-  webUrl: string;
+  /** Null in aggregate mode (G8) — there's no single repo to open. */
+  webUrl: string | null;
   auth: "token" | "none";
   items: GitHubListItem[];
   /** Page number this result represents — mirrors the request's `page`
-   *  (defaults to 1). Used by the "Load more" flow to request `page + 1`. */
+   *  (defaults to 1). Used by the "Load more" flow to request `page + 1`.
+   *  Aggregate mode (G8) always reports page 1 — "Load more" is disabled. */
   page: number;
   /** True when another page is available beyond this one — derived from the
    *  REST `link: rel="next"` header, or from the Search API's `total_count`
-   *  (capped at GitHub's 1000-result search ceiling). */
+   *  (capped at GitHub's 1000-result search ceiling). In aggregate mode (G8)
+   *  this instead means "at least one aggregated repo had more than the
+   *  first page fetched" (the merged list is truncated to one page per repo). */
   hasMore: boolean;
   /** Rate-limit snapshot from the headers of the response that produced this
-   *  page, or null when the headers were absent. */
+   *  page, or null when the headers were absent. Aggregate mode (G8) reports
+   *  the tightest-remaining snapshot across the fanned-out per-repo calls. */
   rateLimit: GitHubRateLimit | null;
+  /** Aggregate mode only (G8): the resolved "owner/name" slug of every repo
+   *  whose fetch succeeded (dirs without a GitHub remote, or that otherwise
+   *  failed, are silently skipped). Undefined in single-repo mode. */
+  repos?: string[];
 }
 
 export interface GitHubComment {

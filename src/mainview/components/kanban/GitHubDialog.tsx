@@ -89,6 +89,30 @@ const basename = (p: string) => {
   return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;
 };
 
+/** Stable per-item identity (G8, multi-repo aggregation). Item numbers are
+ *  per-repo, so an aggregated list routinely holds two items with the same
+ *  kind+number (repo A PR #5 and repo B PR #5). Keying anything on number alone
+ *  collides — React row keys, `expandedKey`, and every per-item state map. The
+ *  composite key disambiguates by the item's own repo path. In single-repo mode
+ *  `sourcePath` is null, so the key is exactly the historical `${kind}-${number}`
+ *  — existing behavior (and tests) unchanged. */
+function itemKey(item: Pick<GitHubListItem, "kind" | "number" | "sourcePath">): string {
+  return item.sourcePath
+    ? `${item.sourcePath}::${item.kind}-${item.number}`
+    : `${item.kind}-${item.number}`;
+}
+
+/** Whether two list items are the same underlying GitHub item — kind + number
+ *  scoped to the same repo. Used by every in-place list mutation
+ *  (upsert/close/transfer/label reconcile) so a change to repo B's #5 can't
+ *  overwrite repo A's #5 in aggregate mode. */
+function sameItem(
+  a: Pick<GitHubListItem, "kind" | "number" | "sourcePath">,
+  b: Pick<GitHubListItem, "kind" | "number" | "sourcePath">,
+): boolean {
+  return a.kind === b.kind && a.number === b.number && (a.sourcePath ?? null) === (b.sourcePath ?? null);
+}
+
 const fmtDate = (value: string) => {
   if (!value) return "";
   const d = new Date(value);
@@ -304,6 +328,18 @@ function hasSuggestion(body: string): boolean {
 // Shared tooltip for every push-only control disabled by F13 gating.
 const PUSH_ONLY_TITLE = "Requires write access to this repository";
 
+// Sentinel `projectPath` value selecting "All repositories" (G8, multi-repo
+// aggregation / F15) — not a real filesystem path, so every effect that needs
+// a concrete repo (viewer login excepted, which falls back to the first
+// registered project) must special-case it. Chosen to be exceedingly unlikely
+// to collide with a real project path.
+const AGGREGATE_PROJECT_PATH = "__agetor_all_repositories__";
+
+// Shared tooltip for the repo-scoped toolbar buttons (labels/milestones/
+// notifications) and the new-PR/new-issue composers, all disabled in
+// aggregate mode since they need a single concrete repo.
+const AGGREGATE_DISABLED_TITLE = "Select a single project — not available across all repositories";
+
 /** Subtle "API: 4823/5000" (or "search: 27/30") indicator (F17). Muted by
  *  default; tints amber when remaining budget drops under 10% of the limit —
  *  the Search API's ~30/min ceiling is small enough that this can trip during
@@ -322,6 +358,8 @@ function RateLimitBadge({ rateLimit }: { rateLimit: GitHubRateLimit }) {
 
 export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Props) {
   const [projectPath, setProjectPath] = useState("");
+  // "All repositories" (G8/F15) — see AGGREGATE_PROJECT_PATH.
+  const isAggregate = projectPath === AGGREGATE_PROJECT_PATH;
   const [kind, setKind] = useState<GitHubItemKind>("pulls");
   const [state, setState] = useState<GitHubItemState>("open");
   const [query, setQuery] = useState("");
@@ -408,72 +446,75 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const mergeabilitySeq = useRef(0);
   const commitsSeq = useRef(0);
   const linkedIssuesSeq = useRef(0);
-  // Bounds the self-healing re-poll when GitHub returns mergeable=null.
-  const mergeabilityRetries = useRef<Record<number, number>>({});
+  // Bounds the self-healing re-poll when GitHub returns mergeable=null. Keyed by
+  // itemKey (G8) so two same-numbered PRs across repos don't share a retry budget.
+  const mergeabilityRetries = useRef<Record<string, number>>({});
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
-  const [diffs, setDiffs] = useState<Record<number, TaskDiff | undefined>>({});
-  const [diffLoading, setDiffLoading] = useState<Record<number, boolean | undefined>>({});
-  const [diffErrors, setDiffErrors] = useState<Record<number, string | undefined>>({});
-  const [checks, setChecks] = useState<Record<number, GitHubChecksResult | undefined>>({});
-  const [checksLoading, setChecksLoading] = useState<Record<number, boolean | undefined>>({});
-  const [checksErrors, setChecksErrors] = useState<Record<number, string | undefined>>({});
-  const [mergeability, setMergeability] = useState<Record<number, GitHubPullMergeability | undefined>>({});
-  const [mergeabilityLoading, setMergeabilityLoading] = useState<Record<number, boolean | undefined>>({});
-  const [mergeabilityErrors, setMergeabilityErrors] = useState<Record<number, string | undefined>>({});
-  const [commits, setCommits] = useState<Record<number, GitHubPullCommit[] | undefined>>({});
-  const [commitsLoading, setCommitsLoading] = useState<Record<number, boolean | undefined>>({});
-  const [commitsErrors, setCommitsErrors] = useState<Record<number, string | undefined>>({});
-  const [linkedIssues, setLinkedIssues] = useState<Record<number, GitHubLinkedIssue[] | undefined>>({});
-  const [linkedIssuesLoading, setLinkedIssuesLoading] = useState<Record<number, boolean | undefined>>({});
-  const [linkedIssuesErrors, setLinkedIssuesErrors] = useState<Record<number, string | undefined>>({});
-  const [comments, setComments] = useState<Record<number, GitHubComment[] | undefined>>({});
-  const [commentsLoading, setCommentsLoading] = useState<Record<number, boolean | undefined>>({});
-  const [commentErrors, setCommentErrors] = useState<Record<number, string | undefined>>({});
-  const [commentDrafts, setCommentDrafts] = useState<Record<number, string | undefined>>({});
-  const [commentSubmitting, setCommentSubmitting] = useState<Record<number, boolean | undefined>>({});
-  const [reviewComments, setReviewComments] = useState<Record<number, GitHubPullLineComment[] | undefined>>({});
+  const [diffs, setDiffs] = useState<Record<string, TaskDiff | undefined>>({});
+  const [diffLoading, setDiffLoading] = useState<Record<string, boolean | undefined>>({});
+  const [diffErrors, setDiffErrors] = useState<Record<string, string | undefined>>({});
+  const [checks, setChecks] = useState<Record<string, GitHubChecksResult | undefined>>({});
+  const [checksLoading, setChecksLoading] = useState<Record<string, boolean | undefined>>({});
+  const [checksErrors, setChecksErrors] = useState<Record<string, string | undefined>>({});
+  const [mergeability, setMergeability] = useState<Record<string, GitHubPullMergeability | undefined>>({});
+  const [mergeabilityLoading, setMergeabilityLoading] = useState<Record<string, boolean | undefined>>({});
+  const [mergeabilityErrors, setMergeabilityErrors] = useState<Record<string, string | undefined>>({});
+  const [commits, setCommits] = useState<Record<string, GitHubPullCommit[] | undefined>>({});
+  const [commitsLoading, setCommitsLoading] = useState<Record<string, boolean | undefined>>({});
+  const [commitsErrors, setCommitsErrors] = useState<Record<string, string | undefined>>({});
+  const [linkedIssues, setLinkedIssues] = useState<Record<string, GitHubLinkedIssue[] | undefined>>({});
+  const [linkedIssuesLoading, setLinkedIssuesLoading] = useState<Record<string, boolean | undefined>>({});
+  const [linkedIssuesErrors, setLinkedIssuesErrors] = useState<Record<string, string | undefined>>({});
+  const [comments, setComments] = useState<Record<string, GitHubComment[] | undefined>>({});
+  const [commentsLoading, setCommentsLoading] = useState<Record<string, boolean | undefined>>({});
+  const [commentErrors, setCommentErrors] = useState<Record<string, string | undefined>>({});
+  const [commentDrafts, setCommentDrafts] = useState<Record<string, string | undefined>>({});
+  const [commentSubmitting, setCommentSubmitting] = useState<Record<string, boolean | undefined>>({});
+  const [reviewComments, setReviewComments] = useState<Record<string, GitHubPullLineComment[] | undefined>>({});
   // Resolvable review-comment threads (GraphQL), keyed by PR number; matched to
   // the flat review-comments list via each thread's rootCommentId.
-  const [reviewThreads, setReviewThreads] = useState<Record<number, GitHubReviewThread[] | undefined>>({});
+  const [reviewThreads, setReviewThreads] = useState<Record<string, GitHubReviewThread[] | undefined>>({});
   // True when a PR has more than the first 100 review threads (resolve controls
   // then only cover the first page).
-  const [reviewThreadsTruncated, setReviewThreadsTruncated] = useState<Record<number, boolean | undefined>>({});
-  const [reviewCommentsLoading, setReviewCommentsLoading] = useState<Record<number, boolean | undefined>>({});
-  const [reviewCommentErrors, setReviewCommentErrors] = useState<Record<number, string | undefined>>({});
+  const [reviewThreadsTruncated, setReviewThreadsTruncated] = useState<Record<string, boolean | undefined>>({});
+  const [reviewCommentsLoading, setReviewCommentsLoading] = useState<Record<string, boolean | undefined>>({});
+  const [reviewCommentErrors, setReviewCommentErrors] = useState<Record<string, string | undefined>>({});
+  // Keyed by review-comment id (globally unique across repos), not item key —
+  // safe under aggregation without the composite-key treatment.
   const [reviewReplyDrafts, setReviewReplyDrafts] = useState<Record<number, string | undefined>>({});
   const [reviewReplySubmitting, setReviewReplySubmitting] = useState<Record<number, boolean | undefined>>({});
   // Keyed by review-comment id (not PR number) — apply-suggestion is a
   // per-comment action, mirroring reviewReplySubmitting's own keying.
   const [applySuggestionBusy, setApplySuggestionBusy] = useState<Record<number, boolean | undefined>>({});
-  const [reviewDrafts, setReviewDrafts] = useState<Record<number, string | undefined>>({});
+  const [reviewDrafts, setReviewDrafts] = useState<Record<string, string | undefined>>({});
   // Inline comments queued for the next review submission (the "pending review"
   // batched flow), keyed by PR number.
-  const [pendingReview, setPendingReview] = useState<Record<number, LineCommentTarget[] | undefined>>({});
+  const [pendingReview, setPendingReview] = useState<Record<string, LineCommentTarget[] | undefined>>({});
   // True when the diff was invalidated (refreshed / branch updated) after comments
   // were queued — their line numbers may no longer match, so warn before submit.
-  const [pendingStale, setPendingStale] = useState<Record<number, boolean | undefined>>({});
-  const [closeDrafts, setCloseDrafts] = useState<Record<number, string | undefined>>({});
-  const [mergeMethods, setMergeMethods] = useState<Record<number, GitHubPullMergeMethod | undefined>>({});
-  const [labelDrafts, setLabelDrafts] = useState<Record<number, string | undefined>>({});
-  const [assigneeDrafts, setAssigneeDrafts] = useState<Record<number, string | undefined>>({});
-  const [milestoneDrafts, setMilestoneDrafts] = useState<Record<number, string | undefined>>({});
-  const [reviewerDrafts, setReviewerDrafts] = useState<Record<number, string | undefined>>({});
-  const [teamReviewerDrafts, setTeamReviewerDrafts] = useState<Record<number, string | undefined>>({});
-  const [editorOpen, setEditorOpen] = useState<Record<number, boolean | undefined>>({});
-  const [titleDrafts, setTitleDrafts] = useState<Record<number, string | undefined>>({});
-  const [bodyDrafts, setBodyDrafts] = useState<Record<number, string | undefined>>({});
-  const [actionBusy, setActionBusy] = useState<Record<number, string | undefined>>({});
-  const [actionErrors, setActionErrors] = useState<Record<number, string | undefined>>({});
-  const [actionMessages, setActionMessages] = useState<Record<number, string | undefined>>({});
+  const [pendingStale, setPendingStale] = useState<Record<string, boolean | undefined>>({});
+  const [closeDrafts, setCloseDrafts] = useState<Record<string, string | undefined>>({});
+  const [mergeMethods, setMergeMethods] = useState<Record<string, GitHubPullMergeMethod | undefined>>({});
+  const [labelDrafts, setLabelDrafts] = useState<Record<string, string | undefined>>({});
+  const [assigneeDrafts, setAssigneeDrafts] = useState<Record<string, string | undefined>>({});
+  const [milestoneDrafts, setMilestoneDrafts] = useState<Record<string, string | undefined>>({});
+  const [reviewerDrafts, setReviewerDrafts] = useState<Record<string, string | undefined>>({});
+  const [teamReviewerDrafts, setTeamReviewerDrafts] = useState<Record<string, string | undefined>>({});
+  const [editorOpen, setEditorOpen] = useState<Record<string, boolean | undefined>>({});
+  const [titleDrafts, setTitleDrafts] = useState<Record<string, string | undefined>>({});
+  const [bodyDrafts, setBodyDrafts] = useState<Record<string, string | undefined>>({});
+  const [actionBusy, setActionBusy] = useState<Record<string, string | undefined>>({});
+  const [actionErrors, setActionErrors] = useState<Record<string, string | undefined>>({});
+  const [actionMessages, setActionMessages] = useState<Record<string, string | undefined>>({});
   // Which panel triggered the last action, so its error/message renders next to
   // the control the user used ("actions" | "triage" | "edit"), not in a sibling.
-  const [actionSource, setActionSource] = useState<Record<number, string | undefined>>({});
+  const [actionSource, setActionSource] = useState<Record<string, string | undefined>>({});
   // Optional `lock_reason` picked before locking an issue/PR conversation.
-  const [lockReasonDrafts, setLockReasonDrafts] = useState<Record<number, string | undefined>>({});
+  const [lockReasonDrafts, setLockReasonDrafts] = useState<Record<string, string | undefined>>({});
   // "owner/name" typed into the transfer-issue control, and whether the
   // disruptive two-step confirm has been armed for that row.
-  const [transferDrafts, setTransferDrafts] = useState<Record<number, string | undefined>>({});
-  const [transferConfirm, setTransferConfirm] = useState<Record<number, boolean | undefined>>({});
+  const [transferDrafts, setTransferDrafts] = useState<Record<string, string | undefined>>({});
+  const [transferConfirm, setTransferConfirm] = useState<Record<string, boolean | undefined>>({});
   // Success banner for a completed transfer — shown at the list level since the
   // transferred item is removed from `result.items` the moment it succeeds.
   const [transferNotice, setTransferNotice] = useState<{ message: string; url: string } | null>(null);
@@ -507,6 +548,16 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     });
   }, [open, initialProjectPath, projects]);
 
+  // Stable signal of the aggregate candidate set (G8): the joined project paths
+  // when "All repositories" is selected, "" otherwise. Threaded into the reload
+  // effect's deps so registering/removing a project while aggregating refreshes
+  // the list — without the every-render array identity of `projects` thrashing
+  // the single-repo path (where this stays a constant "").
+  const aggregatePathsKey = useMemo(
+    () => (isAggregate ? projects.map((p) => p.path).join("\n") : ""),
+    [isAggregate, projects],
+  );
+
   // `page`/`append` power the "Load more" flow (F16): a plain refresh or a
   // filter/sort change always fetches page 1 and replaces `result`; "Load
   // more" fetches `page + 1` and appends, deduped by kind+number in case a
@@ -518,35 +569,52 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     if (!projectPath) return;
     const requestId = opts?.requestId ?? ++requestSeq.current;
     if (requestId !== requestSeq.current) return;
-    const append = !!opts?.append;
+    // "Load more" is disabled in aggregate mode (G8) — each fetch always
+    // covers page 1 per repo, merged fresh.
+    const append = !!opts?.append && !isAggregate;
     const targetPage = opts?.page ?? 1;
     if (append) setLoadingMore(true); else setLoading(true);
     setError(null);
     try {
-      const next = await api.listGitHubItems({
-        path: projectPath,
-        kind,
-        state,
-        // The one search box is either a client-side substring filter or raw
-        // GitHub search qualifiers (committed on Enter), depending on the GH toggle.
-        query: searchSyntax ? "" : query,
-        searchQuery: searchSyntax ? searchSubmitted : "",
-        labels: splitLabels(labels),
-        assignee,
-        createdByMe,
-        assignedToMe,
-        reviewRequested: kind === "pulls" && reviewRequested,
-        page: targetPage,
-        // "best-match" → omit the sort param entirely (relevance on search,
-        // created-desc default on REST).
-        sort: sortField === "best-match" ? undefined : sortField,
-        direction: sortDirection,
-      });
+      const next = isAggregate
+        ? await api.listGitHubItemsAcrossRepos({
+            paths: projects.map((p) => p.path),
+            kind,
+            state,
+            query: searchSyntax ? "" : query,
+            searchQuery: searchSyntax ? searchSubmitted : "",
+            labels: splitLabels(labels),
+            assignee,
+            createdByMe,
+            assignedToMe,
+            reviewRequested: kind === "pulls" && reviewRequested,
+            sort: sortField === "best-match" ? undefined : sortField,
+            direction: sortDirection,
+          })
+        : await api.listGitHubItems({
+            path: projectPath,
+            kind,
+            state,
+            // The one search box is either a client-side substring filter or raw
+            // GitHub search qualifiers (committed on Enter), depending on the GH toggle.
+            query: searchSyntax ? "" : query,
+            searchQuery: searchSyntax ? searchSubmitted : "",
+            labels: splitLabels(labels),
+            assignee,
+            createdByMe,
+            assignedToMe,
+            reviewRequested: kind === "pulls" && reviewRequested,
+            page: targetPage,
+            // "best-match" → omit the sort param entirely (relevance on search,
+            // created-desc default on REST).
+            sort: sortField === "best-match" ? undefined : sortField,
+            direction: sortDirection,
+          });
       if (requestId !== requestSeq.current) return;
       setResult((cur) => {
         if (!append || !cur) return next;
-        const seen = new Set(cur.items.map((it) => `${it.kind}-${it.number}`));
-        const appended = next.items.filter((it) => !seen.has(`${it.kind}-${it.number}`));
+        const seen = new Set(cur.items.map((it) => itemKey(it)));
+        const appended = next.items.filter((it) => !seen.has(itemKey(it)));
         return { ...next, items: [...cur.items, ...appended] };
       });
     } catch (e) {
@@ -561,7 +629,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   };
 
   const loadMore = () => {
-    if (!result || !result.hasMore || loading || loadingMore || reloadPending) return;
+    if (isAggregate || !result || !result.hasMore || loading || loadingMore || reloadPending) return;
     const requestId = ++requestSeq.current;
     void load({ requestId, page: result.page + 1, append: true });
   };
@@ -577,7 +645,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     const t = setTimeout(() => { setReloadPending(false); void load({ requestId }); }, 250);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested, sortField, sortDirection]);
+  }, [open, projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested, sortField, sortDirection, aggregatePathsKey]);
 
   useEffect(() => {
     diffSeq.current += 1;
@@ -679,33 +747,79 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
 
   const projectOptions = useMemo(() => {
     const opts = projects.map((p) => ({ path: p.path, label: p.name || basename(p.path) || p.path }));
-    if (projectPath && !opts.some((p) => p.path === projectPath)) {
+    if (projectPath && projectPath !== AGGREGATE_PROJECT_PATH && !opts.some((p) => p.path === projectPath)) {
       opts.unshift({ path: projectPath, label: basename(projectPath) || projectPath });
     }
+    // "All repositories" (G8/F15) always leads the list — the backend filters
+    // the candidate paths down to the ones with a GitHub remote.
+    opts.unshift({ path: AGGREGATE_PROJECT_PATH, label: "All repositories" });
     return opts;
   }, [projects, projectPath]);
 
   const expandedItem = useMemo(() => {
     if (!expandedKey) return null;
-    return result?.items.find((item) => `${item.kind}-${item.number}` === expandedKey) ?? null;
+    return result?.items.find((item) => itemKey(item) === expandedKey) ?? null;
   }, [expandedKey, result]);
+  // Resolved path for the currently-expanded item's per-item data fetches
+  // (diff/checks/mergeability/commits/linkedIssues/comments/reviewComments) —
+  // falls back to `projectPath` in single-repo mode; in aggregate mode every
+  // item carries its own repo's `sourcePath` from the merge in
+  // `listGitHubItemsAcrossRepos`.
+  const expandedItemPath = expandedItem?.sourcePath ?? projectPath;
+
+  /** Small "owner/name"-ish badge shown on each row in aggregate mode (G8) —
+   *  the local project's display name for `item.sourcePath`, matching what the
+   *  project selector already shows for that project. */
+  const repoLabelFor = (item: GitHubListItem): string => {
+    if (!item.sourcePath) return "";
+    const proj = projects.find((p) => p.path === item.sourcePath);
+    return proj?.name || basename(item.sourcePath) || item.sourcePath;
+  };
 
   useEffect(() => {
-    if (!open || !projectPath || viewerResolved.current) return;
+    if (!open || viewerResolved.current) return;
+    // The viewer's login is token-scoped, not repo-scoped, so any repo with a
+    // GitHub remote can resolve it. In aggregate mode (G8) there's no single
+    // `projectPath` to ask, so try each registered project in order until one
+    // succeeds — falling back to just `projects[0]` would leave the login empty
+    // forever if that first project happens to have no GitHub remote (a
+    // no-remote lookup rejects, and the deps here don't retry per-project).
+    const candidates = isAggregate ? projects.map((p) => p.path) : (projectPath ? [projectPath] : []);
+    if (candidates.length === 0) return;
     let cancelled = false;
-    api.getGitHubViewer({ path: projectPath })
-      .then((r) => { if (!cancelled) { setViewerLogin(r.login); viewerResolved.current = true; } })
-      // Leave unresolved on failure (e.g. no remote) so a later project retries.
-      .catch(() => { /* keep the current (empty) login */ });
+    void (async () => {
+      for (const p of candidates) {
+        if (cancelled) return;
+        try {
+          const r = await api.getGitHubViewer({ path: p });
+          if (cancelled) return;
+          setViewerLogin(r.login);
+          viewerResolved.current = true;
+          return; // first project with a GitHub remote wins
+        } catch {
+          // No remote / lookup failed — try the next candidate.
+        }
+      }
+    })();
     return () => { cancelled = true; };
-  }, [open, projectPath]);
+  }, [open, projectPath, isAggregate, projects]);
 
   // Push access (F13) is per-repo, so re-resolve on every project switch —
   // unlike the viewer login above. Stays optimistic (canPush=true) while a
   // fresh project's check is in flight so controls aren't disabled during
   // that brief window; only flips to disabled once resolved false.
   useEffect(() => {
-    if (!open || !projectPath || canPushResolvedFor.current === projectPath) return;
+    if (!open) return;
+    if (isAggregate) {
+      // canPush varies per repo in aggregate mode (G8) — resolving it per item
+      // would mean one permissions round-trip per repo per row. Simpler and
+      // still correct: gate optimistically (assume push, let GitHub reject a
+      // write with a real error) rather than disabling every push-only control.
+      setCanPush(true);
+      canPushResolvedFor.current = null; // force re-resolve if the user switches back to a single repo
+      return;
+    }
+    if (!projectPath || canPushResolvedFor.current === projectPath) return;
     let cancelled = false;
     setCanPush(true);
     api.getGitHubRepoPermissions({ path: projectPath })
@@ -720,7 +834,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       // caching a wrongly-optimistic value permanently.
       .catch(() => { /* keep the current (optimistic) canPush */ });
     return () => { cancelled = true; };
-  }, [open, projectPath]);
+  }, [open, projectPath, isAggregate]);
 
   const refreshRepoLabels = async () => {
     if (!projectPath) return;
@@ -767,13 +881,16 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   };
 
   useEffect(() => {
-    if (!open || !projectPath) { setRepoLabels([]); return; }
+    // Repo labels are single-repo data (the datalist + LabelManager, both
+    // disabled in aggregate mode) — skip the fetch entirely rather than
+    // hitting the aggregate sentinel path.
+    if (!open || !projectPath || isAggregate) { setRepoLabels([]); return; }
     let cancelled = false;
     api.listGitHubLabels({ path: projectPath })
       .then((r) => { if (!cancelled) setRepoLabels(r.labels); })
       .catch(() => { if (!cancelled) setRepoLabels([]); });
     return () => { cancelled = true; };
-  }, [open, projectPath]);
+  }, [open, projectPath, isAggregate]);
 
   // Sort open milestones before closed, then by due date (undated last), then title.
   // Applied on every set (load, refresh, and optimistic mutation) so the order is
@@ -837,28 +954,30 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   };
 
   useEffect(() => {
-    if (!open || !projectPath) { setRepoMilestones([]); return; }
+    if (!open || !projectPath || isAggregate) { setRepoMilestones([]); return; }
     let cancelled = false;
     api.listGitHubMilestones({ path: projectPath })
       .then((r) => { if (!cancelled) setRepoMilestones(sortMilestones(r.milestones)); })
       .catch(() => { if (!cancelled) setRepoMilestones([]); });
     return () => { cancelled = true; };
-  }, [open, projectPath]);
+  }, [open, projectPath, isAggregate]);
 
   useEffect(() => {
-    if (!open || !projectPath) { setRepoAssignees([]); return; }
+    if (!open || !projectPath || isAggregate) { setRepoAssignees([]); return; }
     let cancelled = false;
     api.listGitHubAssignees({ path: projectPath })
       .then((r) => { if (!cancelled) setRepoAssignees(r.assignees); })
       .catch(() => { if (!cancelled) setRepoAssignees([]); });
     return () => { cancelled = true; };
-  }, [open, projectPath]);
+  }, [open, projectPath, isAggregate]);
 
   // Lazy — only fetches while the panel is open (notifications are private
   // and the fetch itself surfaces the sign-in error, so there's no point
   // preloading before the user opens the panel).
   useEffect(() => {
-    if (!open || !notificationsOpen || !projectPath) return;
+    // The toolbar button that opens this panel is disabled in aggregate mode
+    // (notifications are single-repo), so `isAggregate` is defense-in-depth.
+    if (!open || !notificationsOpen || !projectPath || isAggregate) return;
     const requestId = ++notificationsSeq.current;
     setNotificationsLoading(true);
     setNotificationsError(null);
@@ -866,7 +985,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       .then((r) => { if (requestId === notificationsSeq.current) setNotifications(r.notifications); })
       .catch((e) => { if (requestId === notificationsSeq.current) setNotificationsError(e instanceof Error ? e.message : String(e)); })
       .finally(() => { if (requestId === notificationsSeq.current) setNotificationsLoading(false); });
-  }, [open, notificationsOpen, projectPath, notificationsShowAll]);
+  }, [open, notificationsOpen, projectPath, notificationsShowAll, isAggregate]);
 
   const refreshNotifications = async () => {
     if (!projectPath) return;
@@ -960,7 +1079,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   };
 
   useEffect(() => {
-    if (!open || !projectPath || kind !== "pulls") return;
+    // The New PR composer is hidden in aggregate mode (needs a concrete repo).
+    if (!open || !projectPath || kind !== "pulls" || isAggregate) return;
     let cancelled = false;
     api.getGitHubPullDefaults({ path: projectPath })
       .then((defaults) => {
@@ -972,51 +1092,53 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         // Defaults are convenience only; creation will surface real errors.
       });
     return () => { cancelled = true; };
-  }, [open, projectPath, kind]);
+  }, [open, projectPath, kind, isAggregate]);
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
     const number = expandedItem.number;
-    if (diffs[number] || diffLoading[number] || diffErrors[number]) return;
+    const key = itemKey(expandedItem);
+    if (diffs[key] || diffLoading[key] || diffErrors[key]) return;
 
     const requestId = ++diffSeq.current;
-    setDiffLoading((cur) => ({ ...cur, [number]: true }));
-    setDiffErrors((cur) => ({ ...cur, [number]: undefined }));
-    api.getGitHubPullDiff({ path: projectPath, number })
+    setDiffLoading((cur) => ({ ...cur, [key]: true }));
+    setDiffErrors((cur) => ({ ...cur, [key]: undefined }));
+    api.getGitHubPullDiff({ path: expandedItemPath, number })
       .then((diff) => {
         if (requestId !== diffSeq.current) return;
-        setDiffs((cur) => ({ ...cur, [number]: diff }));
+        setDiffs((cur) => ({ ...cur, [key]: diff }));
       })
       .catch((e: unknown) => {
         if (requestId !== diffSeq.current) return;
-        setDiffErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+        setDiffErrors((cur) => ({ ...cur, [key]: e instanceof Error ? e.message : String(e) }));
       })
       .finally(() => {
         if (requestId !== diffSeq.current) return;
-        setDiffLoading((cur) => ({ ...cur, [number]: false }));
+        setDiffLoading((cur) => ({ ...cur, [key]: false }));
       });
   }, [open, projectPath, expandedItem, diffs, diffLoading, diffErrors]);
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
     const number = expandedItem.number;
-    if (checks[number] || checksLoading[number] || checksErrors[number]) return;
+    const key = itemKey(expandedItem);
+    if (checks[key] || checksLoading[key] || checksErrors[key]) return;
 
     const requestId = ++checksSeq.current;
-    setChecksLoading((cur) => ({ ...cur, [number]: true }));
-    setChecksErrors((cur) => ({ ...cur, [number]: undefined }));
-    api.getGitHubPullChecks({ path: projectPath, number })
+    setChecksLoading((cur) => ({ ...cur, [key]: true }));
+    setChecksErrors((cur) => ({ ...cur, [key]: undefined }));
+    api.getGitHubPullChecks({ path: expandedItemPath, number })
       .then((payload) => {
         if (requestId !== checksSeq.current) return;
-        setChecks((cur) => ({ ...cur, [number]: payload }));
+        setChecks((cur) => ({ ...cur, [key]: payload }));
       })
       .catch((e: unknown) => {
         if (requestId !== checksSeq.current) return;
-        setChecksErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+        setChecksErrors((cur) => ({ ...cur, [key]: e instanceof Error ? e.message : String(e) }));
       })
       .finally(() => {
         if (requestId !== checksSeq.current) return;
-        setChecksLoading((cur) => ({ ...cur, [number]: false }));
+        setChecksLoading((cur) => ({ ...cur, [key]: false }));
       });
   }, [open, projectPath, expandedItem, checks, checksLoading, checksErrors]);
 
@@ -1025,251 +1147,265 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     // we don't burn the server-side poll on data the UI never shows.
     if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls" || expandedItem.state !== "open") return;
     const number = expandedItem.number;
-    if (mergeability[number] || mergeabilityLoading[number] || mergeabilityErrors[number]) return;
+    const key = itemKey(expandedItem);
+    if (mergeability[key] || mergeabilityLoading[key] || mergeabilityErrors[key]) return;
 
     const requestId = ++mergeabilitySeq.current;
-    setMergeabilityLoading((cur) => ({ ...cur, [number]: true }));
-    setMergeabilityErrors((cur) => ({ ...cur, [number]: undefined }));
-    api.getGitHubPullMergeability({ path: projectPath, number })
+    setMergeabilityLoading((cur) => ({ ...cur, [key]: true }));
+    setMergeabilityErrors((cur) => ({ ...cur, [key]: undefined }));
+    api.getGitHubPullMergeability({ path: expandedItemPath, number })
       .then((payload) => {
         if (requestId !== mergeabilitySeq.current) return;
-        setMergeability((cur) => ({ ...cur, [number]: payload }));
+        setMergeability((cur) => ({ ...cur, [key]: payload }));
         // GitHub may still be computing (`mergeable === null`). Self-heal with a
         // single delayed re-poll rather than making the user hit refresh.
-        if (payload.mergeable === null && !payload.merged && (mergeabilityRetries.current[number] ?? 0) < 1) {
-          mergeabilityRetries.current[number] = (mergeabilityRetries.current[number] ?? 0) + 1;
+        if (payload.mergeable === null && !payload.merged && (mergeabilityRetries.current[key] ?? 0) < 1) {
+          mergeabilityRetries.current[key] = (mergeabilityRetries.current[key] ?? 0) + 1;
           setTimeout(() => {
             if (requestId !== mergeabilitySeq.current) return;
-            setMergeability((cur) => ({ ...cur, [number]: undefined }));
-            setMergeabilityErrors((cur) => ({ ...cur, [number]: undefined }));
+            setMergeability((cur) => ({ ...cur, [key]: undefined }));
+            setMergeabilityErrors((cur) => ({ ...cur, [key]: undefined }));
           }, 2_500);
         }
       })
       .catch((e: unknown) => {
         if (requestId !== mergeabilitySeq.current) return;
-        setMergeabilityErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+        setMergeabilityErrors((cur) => ({ ...cur, [key]: e instanceof Error ? e.message : String(e) }));
       })
       .finally(() => {
         if (requestId !== mergeabilitySeq.current) return;
-        setMergeabilityLoading((cur) => ({ ...cur, [number]: false }));
+        setMergeabilityLoading((cur) => ({ ...cur, [key]: false }));
       });
   }, [open, projectPath, expandedItem, mergeability, mergeabilityLoading, mergeabilityErrors]);
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
     const number = expandedItem.number;
-    if (commits[number] || commitsLoading[number] || commitsErrors[number]) return;
+    const key = itemKey(expandedItem);
+    if (commits[key] || commitsLoading[key] || commitsErrors[key]) return;
 
     const requestId = ++commitsSeq.current;
-    setCommitsLoading((cur) => ({ ...cur, [number]: true }));
-    setCommitsErrors((cur) => ({ ...cur, [number]: undefined }));
-    api.listGitHubPullCommits({ path: projectPath, number })
+    setCommitsLoading((cur) => ({ ...cur, [key]: true }));
+    setCommitsErrors((cur) => ({ ...cur, [key]: undefined }));
+    api.listGitHubPullCommits({ path: expandedItemPath, number })
       .then((payload) => {
         if (requestId !== commitsSeq.current) return;
-        setCommits((cur) => ({ ...cur, [number]: payload.commits }));
+        setCommits((cur) => ({ ...cur, [key]: payload.commits }));
       })
       .catch((e: unknown) => {
         if (requestId !== commitsSeq.current) return;
-        setCommitsErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+        setCommitsErrors((cur) => ({ ...cur, [key]: e instanceof Error ? e.message : String(e) }));
       })
       .finally(() => {
         if (requestId !== commitsSeq.current) return;
-        setCommitsLoading((cur) => ({ ...cur, [number]: false }));
+        setCommitsLoading((cur) => ({ ...cur, [key]: false }));
       });
   }, [open, projectPath, expandedItem, commits, commitsLoading, commitsErrors]);
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
     const number = expandedItem.number;
-    if (linkedIssues[number] || linkedIssuesLoading[number] || linkedIssuesErrors[number]) return;
+    const key = itemKey(expandedItem);
+    if (linkedIssues[key] || linkedIssuesLoading[key] || linkedIssuesErrors[key]) return;
 
     const requestId = ++linkedIssuesSeq.current;
-    setLinkedIssuesLoading((cur) => ({ ...cur, [number]: true }));
-    setLinkedIssuesErrors((cur) => ({ ...cur, [number]: undefined }));
-    api.getGitHubPullLinkedIssues({ path: projectPath, number })
+    setLinkedIssuesLoading((cur) => ({ ...cur, [key]: true }));
+    setLinkedIssuesErrors((cur) => ({ ...cur, [key]: undefined }));
+    api.getGitHubPullLinkedIssues({ path: expandedItemPath, number })
       .then((payload) => {
         if (requestId !== linkedIssuesSeq.current) return;
-        setLinkedIssues((cur) => ({ ...cur, [number]: payload.issues }));
+        setLinkedIssues((cur) => ({ ...cur, [key]: payload.issues }));
       })
       .catch((e: unknown) => {
         if (requestId !== linkedIssuesSeq.current) return;
-        setLinkedIssuesErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+        setLinkedIssuesErrors((cur) => ({ ...cur, [key]: e instanceof Error ? e.message : String(e) }));
       })
       .finally(() => {
         if (requestId !== linkedIssuesSeq.current) return;
-        setLinkedIssuesLoading((cur) => ({ ...cur, [number]: false }));
+        setLinkedIssuesLoading((cur) => ({ ...cur, [key]: false }));
       });
   }, [open, projectPath, expandedItem, linkedIssues, linkedIssuesLoading, linkedIssuesErrors]);
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem) return;
     const number = expandedItem.number;
-    if (comments[number] || commentsLoading[number] || commentErrors[number]) return;
+    const key = itemKey(expandedItem);
+    if (comments[key] || commentsLoading[key] || commentErrors[key]) return;
 
     const requestId = ++commentSeq.current;
-    setCommentsLoading((cur) => ({ ...cur, [number]: true }));
-    setCommentErrors((cur) => ({ ...cur, [number]: undefined }));
-    api.listGitHubComments({ path: projectPath, number })
+    setCommentsLoading((cur) => ({ ...cur, [key]: true }));
+    setCommentErrors((cur) => ({ ...cur, [key]: undefined }));
+    api.listGitHubComments({ path: expandedItemPath, number })
       .then((payload) => {
         if (requestId !== commentSeq.current) return;
-        setComments((cur) => ({ ...cur, [number]: payload.comments }));
+        setComments((cur) => ({ ...cur, [key]: payload.comments }));
       })
       .catch((e: unknown) => {
         if (requestId !== commentSeq.current) return;
-        setCommentErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+        setCommentErrors((cur) => ({ ...cur, [key]: e instanceof Error ? e.message : String(e) }));
       })
       .finally(() => {
         if (requestId !== commentSeq.current) return;
-        setCommentsLoading((cur) => ({ ...cur, [number]: false }));
+        setCommentsLoading((cur) => ({ ...cur, [key]: false }));
       });
   }, [open, projectPath, expandedItem, comments, commentsLoading, commentErrors]);
 
   useEffect(() => {
     if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
     const number = expandedItem.number;
-    if (reviewComments[number] || reviewCommentsLoading[number] || reviewCommentErrors[number]) return;
+    const key = itemKey(expandedItem);
+    if (reviewComments[key] || reviewCommentsLoading[key] || reviewCommentErrors[key]) return;
 
     const requestId = ++reviewCommentSeq.current;
-    setReviewCommentsLoading((cur) => ({ ...cur, [number]: true }));
-    setReviewCommentErrors((cur) => ({ ...cur, [number]: undefined }));
+    setReviewCommentsLoading((cur) => ({ ...cur, [key]: true }));
+    setReviewCommentErrors((cur) => ({ ...cur, [key]: undefined }));
     Promise.all([
-      api.listGitHubPullReviewComments({ path: projectPath, number }),
+      api.listGitHubPullReviewComments({ path: expandedItemPath, number }),
       // Threads are supplementary (resolve controls) — degrade to none on failure.
-      api.getGitHubPullReviewThreads({ path: projectPath, number })
+      api.getGitHubPullReviewThreads({ path: expandedItemPath, number })
         .catch(() => ({ threads: [] as GitHubReviewThread[], truncated: false })),
     ])
       .then(([commentsPayload, threadsPayload]) => {
         if (requestId !== reviewCommentSeq.current) return;
-        setReviewComments((cur) => ({ ...cur, [number]: commentsPayload.comments }));
-        setReviewThreads((cur) => ({ ...cur, [number]: threadsPayload.threads }));
-        setReviewThreadsTruncated((cur) => ({ ...cur, [number]: threadsPayload.truncated }));
+        setReviewComments((cur) => ({ ...cur, [key]: commentsPayload.comments }));
+        setReviewThreads((cur) => ({ ...cur, [key]: threadsPayload.threads }));
+        setReviewThreadsTruncated((cur) => ({ ...cur, [key]: threadsPayload.truncated }));
       })
       .catch((e: unknown) => {
         if (requestId !== reviewCommentSeq.current) return;
-        setReviewCommentErrors((cur) => ({ ...cur, [number]: e instanceof Error ? e.message : String(e) }));
+        setReviewCommentErrors((cur) => ({ ...cur, [key]: e instanceof Error ? e.message : String(e) }));
       })
       .finally(() => {
         if (requestId !== reviewCommentSeq.current) return;
-        setReviewCommentsLoading((cur) => ({ ...cur, [number]: false }));
+        setReviewCommentsLoading((cur) => ({ ...cur, [key]: false }));
       });
   }, [open, projectPath, expandedItem, reviewComments, reviewCommentsLoading, reviewCommentErrors]);
 
   const submitComment = async (item: GitHubListItem) => {
-    const body = (commentDrafts[item.number] ?? "").trim();
-    if (!projectPath || !body || commentSubmitting[item.number]) return;
-    setCommentSubmitting((cur) => ({ ...cur, [item.number]: true }));
-    setCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    const itemPath = item.sourcePath ?? projectPath;
+    const body = (commentDrafts[itemKey(item)] ?? "").trim();
+    if (!projectPath || !body || commentSubmitting[itemKey(item)]) return;
+    setCommentSubmitting((cur) => ({ ...cur, [itemKey(item)]: true }));
+    setCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const { comment } = await api.createGitHubComment({ path: projectPath, number: item.number, body });
-      setComments((cur) => ({ ...cur, [item.number]: [...(cur[item.number] ?? []), comment] }));
-      setCommentDrafts((cur) => ({ ...cur, [item.number]: "" }));
+      const { comment } = await api.createGitHubComment({ path: itemPath, number: item.number, body });
+      setComments((cur) => ({ ...cur, [itemKey(item)]: [...(cur[itemKey(item)] ?? []), comment] }));
+      setCommentDrafts((cur) => ({ ...cur, [itemKey(item)]: "" }));
     } catch (e) {
-      setCommentErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setCommentErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setCommentSubmitting((cur) => ({ ...cur, [item.number]: false }));
+      setCommentSubmitting((cur) => ({ ...cur, [itemKey(item)]: false }));
     }
   };
 
   const submitLineComment = async (item: GitHubListItem, target: LineCommentTarget) => {
+    const itemPath = item.sourcePath ?? projectPath;
     if (!projectPath || item.kind !== "pulls") return;
     const { comment } = await api.createGitHubPullLineComment({
-      path: projectPath,
+      path: itemPath,
       number: item.number,
       body: target.body,
       filePath: target.filePath,
       line: target.line,
       side: target.side,
     });
-    setReviewComments((cur) => ({ ...cur, [item.number]: [...(cur[item.number] ?? []), comment] }));
-    setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setReviewComments((cur) => ({ ...cur, [itemKey(item)]: [...(cur[itemKey(item)] ?? []), comment] }));
+    setReviewCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
   };
 
   const submitReviewReply = async (item: GitHubListItem, commentId: number) => {
+    const itemPath = item.sourcePath ?? projectPath;
     const body = (reviewReplyDrafts[commentId] ?? "").trim();
     if (!projectPath || item.kind !== "pulls" || !body || reviewReplySubmitting[commentId]) return;
     setReviewReplySubmitting((cur) => ({ ...cur, [commentId]: true }));
-    setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setReviewCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
       const { comment } = await api.replyGitHubPullLineComment({
-        path: projectPath,
+        path: itemPath,
         number: item.number,
         commentId,
         body,
       });
-      setReviewComments((cur) => ({ ...cur, [item.number]: [...(cur[item.number] ?? []), comment] }));
+      setReviewComments((cur) => ({ ...cur, [itemKey(item)]: [...(cur[itemKey(item)] ?? []), comment] }));
       setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: "" }));
     } catch (e) {
-      setReviewCommentErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setReviewCommentErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
       setReviewReplySubmitting((cur) => ({ ...cur, [commentId]: false }));
     }
   };
 
   const applySuggestion = async (item: GitHubListItem, commentId: number) => {
+    const itemPath = item.sourcePath ?? projectPath;
     if (!projectPath || applySuggestionBusy[commentId]) return;
     setApplySuggestionBusy((cur) => ({ ...cur, [commentId]: true }));
-    setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+    setReviewCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      await api.applyGitHubSuggestion({ path: projectPath, number: item.number, commentId });
+      await api.applyGitHubSuggestion({ path: itemPath, number: item.number, commentId });
       // Refetch — mirrors the "clear to undefined so the loader effect refires"
       // convention used elsewhere in this file (e.g. runPullReview above).
-      setReviewComments((cur) => ({ ...cur, [item.number]: undefined }));
+      setReviewComments((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     } catch (e) {
-      setReviewCommentErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setReviewCommentErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
       setApplySuggestionBusy((cur) => ({ ...cur, [commentId]: false }));
     }
   };
 
   const editConversationComment = async (item: GitHubListItem, commentId: number, body: string) => {
+    const itemPath = item.sourcePath ?? projectPath;
     if (!projectPath) throw new Error("no project selected");
-    const { comment } = await api.updateGitHubComment({ path: projectPath, commentId, kind: "issue", body });
+    const { comment } = await api.updateGitHubComment({ path: itemPath, commentId, kind: "issue", body });
     setComments((cur) => ({
       ...cur,
-      [item.number]: (cur[item.number] ?? []).map((c) => (c.id === commentId ? comment : c)),
+      [itemKey(item)]: (cur[itemKey(item)] ?? []).map((c) => (c.id === commentId ? comment : c)),
     }));
   };
 
   const deleteConversationComment = async (item: GitHubListItem, commentId: number) => {
+    const itemPath = item.sourcePath ?? projectPath;
     if (!projectPath) throw new Error("no project selected");
-    await api.deleteGitHubComment({ path: projectPath, commentId, kind: "issue" });
+    await api.deleteGitHubComment({ path: itemPath, commentId, kind: "issue" });
     setComments((cur) => ({
       ...cur,
-      [item.number]: (cur[item.number] ?? []).filter((c) => c.id !== commentId),
+      [itemKey(item)]: (cur[itemKey(item)] ?? []).filter((c) => c.id !== commentId),
     }));
   };
 
   const editReviewComment = async (item: GitHubListItem, commentId: number, body: string) => {
+    const itemPath = item.sourcePath ?? projectPath;
     if (!projectPath) throw new Error("no project selected");
-    const { comment } = await api.updateGitHubComment({ path: projectPath, commentId, kind: "review", body });
+    const { comment } = await api.updateGitHubComment({ path: itemPath, commentId, kind: "review", body });
     // Keep the line-comment's path/line/side; only body + updatedAt change.
     setReviewComments((cur) => ({
       ...cur,
-      [item.number]: (cur[item.number] ?? []).map((c) =>
+      [itemKey(item)]: (cur[itemKey(item)] ?? []).map((c) =>
         c.id === commentId ? { ...c, body: comment.body, updatedAt: comment.updatedAt } : c,
       ),
     }));
   };
 
   const deleteReviewComment = async (item: GitHubListItem, commentId: number) => {
+    const itemPath = item.sourcePath ?? projectPath;
     if (!projectPath) throw new Error("no project selected");
-    await api.deleteGitHubComment({ path: projectPath, commentId, kind: "review" });
+    await api.deleteGitHubComment({ path: itemPath, commentId, kind: "review" });
     setReviewComments((cur) => ({
       ...cur,
-      [item.number]: (cur[item.number] ?? []).filter((c) => c.id !== commentId),
+      [itemKey(item)]: (cur[itemKey(item)] ?? []).filter((c) => c.id !== commentId),
     }));
   };
 
   const toggleThreadResolved = async (item: GitHubListItem, thread: GitHubReviewThread) => {
+    const itemPath = item.sourcePath ?? projectPath;
     if (!projectPath) throw new Error("no project selected");
     const result = await api.setGitHubReviewThreadResolved({
-      path: projectPath,
+      path: itemPath,
       threadId: thread.threadId,
       resolved: !thread.isResolved,
     });
     setReviewThreads((cur) => ({
       ...cur,
-      [item.number]: (cur[item.number] ?? []).map((t) =>
+      [itemKey(item)]: (cur[itemKey(item)] ?? []).map((t) =>
         t.threadId === thread.threadId ? { ...t, isResolved: result.resolved } : t,
       ),
     }));
@@ -1311,12 +1447,15 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     return true;
   };
 
-  const markPullClosed = (number: number, replacement?: GitHubListItem) => {
+  // Identity is the closed PR itself (kind+number+sourcePath), not just the
+  // number — in aggregate mode (G8) two repos can each have a PR #5, and only
+  // the one that was actually closed should flip/drop.
+  const markPullClosed = (target: GitHubListItem, replacement?: GitHubListItem) => {
     setResult((cur) => {
       if (!cur) return cur;
       let found = false;
       const items = cur.items.flatMap((item) => {
-        if (item.kind !== "pulls" || item.number !== number) return [item];
+        if (item.kind !== "pulls" || !sameItem(item, target)) return [item];
         found = true;
         const next = replacement ?? { ...item, state: "closed" as const, closedAt: new Date().toISOString() };
         return itemMatchesActiveFilters(next) ? [next] : [];
@@ -1329,25 +1468,26 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   };
 
   const runPullReview = async (item: GitHubListItem, event: GitHubPullReviewEvent) => {
-    const body = (reviewDrafts[item.number] ?? "").trim();
-    const pending = pendingReview[item.number] ?? [];
-    if (!projectPath || actionBusy[item.number]) return;
+    const itemPath = item.sourcePath ?? projectPath;
+    const body = (reviewDrafts[itemKey(item)] ?? "").trim();
+    const pending = pendingReview[itemKey(item)] ?? [];
+    if (!projectPath || actionBusy[itemKey(item)]) return;
     // COMMENT/REQUEST_CHANGES need a summary note OR at least one pending inline
     // comment; APPROVE can be empty.
     if (event !== "APPROVE" && !body && pending.length === 0) {
       setActionErrors((cur) => ({
         ...cur,
-        [item.number]: event === "COMMENT" ? "A review comment requires a note." : "Request changes requires a comment.",
+        [itemKey(item)]: event === "COMMENT" ? "A review comment requires a note." : "Request changes requires a comment.",
       }));
       return;
     }
-    setActionBusy((cur) => ({ ...cur, [item.number]: event }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: event }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
       const result = await api.reviewGitHubPull({
-        path: projectPath,
+        path: itemPath,
         number: item.number,
         event,
         body,
@@ -1355,65 +1495,67 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       });
       setActionMessages((cur) => ({
         ...cur,
-        [item.number]: result.message ?? (event === "APPROVE"
+        [itemKey(item)]: result.message ?? (event === "APPROVE"
           ? "Pull request approved."
           : event === "COMMENT" ? "Review submitted." : "Changes requested."),
       }));
-      setReviewDrafts((cur) => ({ ...cur, [item.number]: "" }));
+      setReviewDrafts((cur) => ({ ...cur, [itemKey(item)]: "" }));
       // The pending inline comments were posted with the review — clear them and
       // refetch the review-comments list so they show up.
       if (pending.length > 0) {
-        setPendingReview((cur) => ({ ...cur, [item.number]: [] }));
-        setPendingStale((cur) => ({ ...cur, [item.number]: false }));
-        setReviewComments((cur) => ({ ...cur, [item.number]: undefined }));
-        setReviewThreads((cur) => ({ ...cur, [item.number]: undefined }));
-        setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+        setPendingReview((cur) => ({ ...cur, [itemKey(item)]: [] }));
+        setPendingStale((cur) => ({ ...cur, [itemKey(item)]: false }));
+        setReviewComments((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+        setReviewThreads((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+        setReviewCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
       }
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
   const addToReview = (item: GitHubListItem, target: LineCommentTarget) => {
     // A comment queued against the current diff starts a fresh (non-stale) queue.
-    const wasEmpty = (pendingReview[item.number] ?? []).length === 0;
-    setPendingReview((cur) => ({ ...cur, [item.number]: [...(cur[item.number] ?? []), target] }));
-    if (wasEmpty) setPendingStale((cur) => ({ ...cur, [item.number]: false }));
+    const wasEmpty = (pendingReview[itemKey(item)] ?? []).length === 0;
+    setPendingReview((cur) => ({ ...cur, [itemKey(item)]: [...(cur[itemKey(item)] ?? []), target] }));
+    if (wasEmpty) setPendingStale((cur) => ({ ...cur, [itemKey(item)]: false }));
   };
 
   const removePendingReview = (item: GitHubListItem, index: number) => {
-    setPendingReview((cur) => ({ ...cur, [item.number]: (cur[item.number] ?? []).filter((_, i) => i !== index) }));
+    setPendingReview((cur) => ({ ...cur, [itemKey(item)]: (cur[itemKey(item)] ?? []).filter((_, i) => i !== index) }));
   };
 
   const runPullMerge = async (item: GitHubListItem) => {
-    if (!projectPath || actionBusy[item.number]) return;
-    const method = mergeMethods[item.number] ?? "merge";
-    setActionBusy((cur) => ({ ...cur, [item.number]: "merge" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || actionBusy[itemKey(item)]) return;
+    const method = mergeMethods[itemKey(item)] ?? "merge";
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "merge" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const result = await api.mergeGitHubPull({ path: projectPath, number: item.number, method });
-      if (result.merged) markPullClosed(item.number);
-      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Pull request merged." }));
+      const result = await api.mergeGitHubPull({ path: itemPath, number: item.number, method });
+      if (result.merged) markPullClosed(item);
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Pull request merged." }));
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
   const runUpdateBranch = async (item: GitHubListItem) => {
-    if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
-    setActionBusy((cur) => ({ ...cur, [item.number]: "update-branch" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || item.kind !== "pulls" || actionBusy[itemKey(item)]) return;
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "update-branch" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const result = await api.updateGitHubPullBranch({ path: projectPath, number: item.number });
-      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Branch update started." }));
+      const result = await api.updateGitHubPullBranch({ path: itemPath, number: item.number });
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Branch update started." }));
       // update-branch is async (202 Accepted) — GitHub merges the base into the
       // head in the background. Give it a moment before invalidating the caches,
       // otherwise the refetch races the merge and shows a stale "behind" verdict.
@@ -1421,133 +1563,138 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       // The head moved, so the cached mergeability, checks, and diff are stale —
       // clear them so their effects refetch against the new head. Reset the
       // mergeability retry budget so it can self-heal on the fresh head.
-      mergeabilityRetries.current[item.number] = 0;
-      setMergeability((cur) => ({ ...cur, [item.number]: undefined }));
-      setMergeabilityErrors((cur) => ({ ...cur, [item.number]: undefined }));
-      setChecks((cur) => ({ ...cur, [item.number]: undefined }));
-      setChecksErrors((cur) => ({ ...cur, [item.number]: undefined }));
-      setDiffs((cur) => ({ ...cur, [item.number]: undefined }));
-      setDiffErrors((cur) => ({ ...cur, [item.number]: undefined }));
+      mergeabilityRetries.current[itemKey(item)] = 0;
+      setMergeability((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+      setMergeabilityErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+      setChecks((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+      setChecksErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+      setDiffs((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+      setDiffErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
       // The head moved — any queued review comments now reference stale lines.
-      setPendingStale((cur) => ({ ...cur, [item.number]: true }));
+      setPendingStale((cur) => ({ ...cur, [itemKey(item)]: true }));
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
   const runPullClose = async (item: GitHubListItem) => {
-    if (!projectPath || actionBusy[item.number]) return;
-    const comment = (closeDrafts[item.number] ?? "").trim();
-    setActionBusy((cur) => ({ ...cur, [item.number]: "close" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || actionBusy[itemKey(item)]) return;
+    const comment = (closeDrafts[itemKey(item)] ?? "").trim();
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "close" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const result = await api.closeGitHubPull({ path: projectPath, number: item.number, comment });
-      markPullClosed(item.number, result.item);
-      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Pull request closed." }));
-      setCloseDrafts((cur) => ({ ...cur, [item.number]: "" }));
+      const result = await api.closeGitHubPull({ path: itemPath, number: item.number, comment });
+      markPullClosed(item, result.item);
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Pull request closed." }));
+      setCloseDrafts((cur) => ({ ...cur, [itemKey(item)]: "" }));
       if (comment && result.commentPosted !== false) {
-        setComments((cur) => ({ ...cur, [item.number]: undefined }));
-        setCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+        setComments((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+        setCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
       }
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
   const runReopenPull = async (item: GitHubListItem) => {
-    if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
-    setActionBusy((cur) => ({ ...cur, [item.number]: "reopen" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || item.kind !== "pulls" || actionBusy[itemKey(item)]) return;
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "reopen" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const result = await api.reopenGitHubPull({ path: projectPath, number: item.number });
+      const result = await api.reopenGitHubPull({ path: itemPath, number: item.number });
       // Keep the row visible even under a "closed" filter so the reopen is
       // legible; it drops out on the next refresh.
       upsertListItem(result.item, false, true);
-      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Pull request reopened." }));
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Pull request reopened." }));
       // Now open again — let the mergeability effect fetch a fresh verdict.
-      mergeabilityRetries.current[item.number] = 0;
+      mergeabilityRetries.current[itemKey(item)] = 0;
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
   const runToggleDraft = async (item: GitHubListItem) => {
-    if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || item.kind !== "pulls" || actionBusy[itemKey(item)]) return;
     const nextDraft = !item.draft;
-    setActionBusy((cur) => ({ ...cur, [item.number]: "draft" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "draft" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const result = await api.setGitHubPullDraft({ path: projectPath, number: item.number, draft: nextDraft });
+      const result = await api.setGitHubPullDraft({ path: itemPath, number: item.number, draft: nextDraft });
       upsertListItem({ ...item, draft: result.draft });
-      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Draft state updated." }));
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Draft state updated." }));
       // Draft ↔ ready flips mergeable_state (draft PRs report "draft"), so refresh.
-      mergeabilityRetries.current[item.number] = 0;
-      setMergeability((cur) => ({ ...cur, [item.number]: undefined }));
-      setMergeabilityErrors((cur) => ({ ...cur, [item.number]: undefined }));
+      mergeabilityRetries.current[itemKey(item)] = 0;
+      setMergeability((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+      setMergeabilityErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
   const runToggleAutoMerge = async (item: GitHubListItem) => {
-    if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
-    const enable = !mergeability[item.number]?.autoMerge;
-    const mergeMethod = mergeMethods[item.number] ?? "merge";
-    setActionBusy((cur) => ({ ...cur, [item.number]: "auto-merge" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || item.kind !== "pulls" || actionBusy[itemKey(item)]) return;
+    const enable = !mergeability[itemKey(item)]?.autoMerge;
+    const mergeMethod = mergeMethods[itemKey(item)] ?? "merge";
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "auto-merge" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const result = await api.setGitHubPullAutoMerge({ path: projectPath, number: item.number, enable, mergeMethod });
-      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Auto-merge updated." }));
+      const result = await api.setGitHubPullAutoMerge({ path: itemPath, number: item.number, enable, mergeMethod });
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Auto-merge updated." }));
       // Optimistically flip the cached mergeability rather than refetching —
       // GitHub's mergeable computation isn't affected by this toggle.
       setMergeability((cur) => {
-        const existing = cur[item.number];
+        const existing = cur[itemKey(item)];
         if (!existing) return cur;
-        return { ...cur, [item.number]: { ...existing, autoMerge: result.autoMergeEnabled } };
+        return { ...cur, [itemKey(item)]: { ...existing, autoMerge: result.autoMergeEnabled } };
       });
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
   const runToggleLock = async (item: GitHubListItem) => {
-    if (!projectPath || actionBusy[item.number]) return;
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || actionBusy[itemKey(item)]) return;
     const nextLocked = !item.locked;
-    setActionBusy((cur) => ({ ...cur, [item.number]: "lock" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "lock" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
       const result = await api.setGitHubIssueLock({
-        path: projectPath,
+        path: itemPath,
         number: item.number,
         locked: nextLocked,
-        lockReason: nextLocked ? (lockReasonDrafts[item.number] || undefined) : undefined,
+        lockReason: nextLocked ? (lockReasonDrafts[itemKey(item)] || undefined) : undefined,
       });
       upsertListItem({ ...item, locked: result.locked }, false, true);
-      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Lock state updated." }));
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Lock state updated." }));
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
@@ -1555,30 +1702,31 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // second click actually fires the transfer. Changing the target repo re-arms
   // the confirm (handled by onTransferDraftChange below).
   const runTransferIssue = async (item: GitHubListItem) => {
-    if (!projectPath || item.kind !== "issues" || actionBusy[item.number]) return;
-    const targetRepo = (transferDrafts[item.number] ?? "").trim();
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || item.kind !== "issues" || actionBusy[itemKey(item)]) return;
+    const targetRepo = (transferDrafts[itemKey(item)] ?? "").trim();
     if (!targetRepo) return;
-    if (!transferConfirm[item.number]) {
-      setTransferConfirm((cur) => ({ ...cur, [item.number]: true }));
+    if (!transferConfirm[itemKey(item)]) {
+      setTransferConfirm((cur) => ({ ...cur, [itemKey(item)]: true }));
       return;
     }
-    setActionBusy((cur) => ({ ...cur, [item.number]: "transfer" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "transfer" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const result = await api.transferGitHubIssue({ path: projectPath, number: item.number, targetRepo });
+      const result = await api.transferGitHubIssue({ path: itemPath, number: item.number, targetRepo });
       setTransferNotice({ message: result.message ?? `Issue transferred to ${targetRepo}.`, url: result.url });
       // The issue no longer lives in this repo — drop it from the list rather
       // than reconciling it in place.
-      setResult((cur) => cur && { ...cur, items: cur.items.filter((it) => !(it.kind === item.kind && it.number === item.number)) });
-      setExpandedKey((cur) => (cur === `${item.kind}-${item.number}` ? null : cur));
-      setTransferDrafts((cur) => ({ ...cur, [item.number]: "" }));
-      setTransferConfirm((cur) => ({ ...cur, [item.number]: false }));
+      setResult((cur) => cur && { ...cur, items: cur.items.filter((it) => !sameItem(it, item)) });
+      setExpandedKey((cur) => (cur === itemKey(item) ? null : cur));
+      setTransferDrafts((cur) => ({ ...cur, [itemKey(item)]: "" }));
+      setTransferConfirm((cur) => ({ ...cur, [itemKey(item)]: false }));
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
@@ -1589,17 +1737,19 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const upsertListItem = (replacement: GitHubListItem, prepend = false, keepIfPresent = false) => {
     setResult((cur) => {
       if (!cur) return cur;
-      const exists = cur.items.some((item) => item.kind === replacement.kind && item.number === replacement.number);
+      // Match on kind+number+sourcePath (G8) so a write to repo B's #5 can't
+      // overwrite repo A's #5 in an aggregated list.
+      const exists = cur.items.some((item) => sameItem(item, replacement));
       if (!itemMatchesActiveFilters(replacement) && !(keepIfPresent && exists)) {
         return {
           ...cur,
-          items: cur.items.filter((item) => item.kind !== replacement.kind || item.number !== replacement.number),
+          items: cur.items.filter((item) => !sameItem(item, replacement)),
         };
       }
       return {
         ...cur,
         items: exists
-          ? cur.items.map((item) => item.kind === replacement.kind && item.number === replacement.number ? replacement : item)
+          ? cur.items.map((item) => sameItem(item, replacement) ? replacement : item)
           : prepend ? [replacement, ...cur.items] : [...cur.items, replacement],
       };
     });
@@ -1686,39 +1836,41 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   };
 
   const updateIssueState = async (item: GitHubListItem, nextState: "open" | "closed") => {
-    if (!projectPath || actionBusy[item.number]) return;
-    setActionBusy((cur) => ({ ...cur, [item.number]: nextState }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "actions" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || actionBusy[itemKey(item)]) return;
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: nextState }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "actions" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const result = await api.updateGitHubIssue({ path: projectPath, number: item.number, state: nextState });
+      const result = await api.updateGitHubIssue({ path: itemPath, number: item.number, state: nextState });
       upsertListItem(result.item);
-      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Issue updated." }));
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Issue updated." }));
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
   const updateIssueLabels = async (item: GitHubListItem) => {
-    if (!projectPath || actionBusy[item.number]) return;
-    const nextLabels = splitLabels(labelDrafts[item.number] ?? item.labels.map((label) => label.name).join(", "));
-    const nextAssignees = splitLabels(assigneeDrafts[item.number] ?? item.assignees.map((a) => a.login).join(", "));
-    const rawMilestone = milestoneDrafts[item.number] ?? (item.milestone ? String(item.milestone.number) : "");
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || actionBusy[itemKey(item)]) return;
+    const nextLabels = splitLabels(labelDrafts[itemKey(item)] ?? item.labels.map((label) => label.name).join(", "));
+    const nextAssignees = splitLabels(assigneeDrafts[itemKey(item)] ?? item.assignees.map((a) => a.login).join(", "));
+    const rawMilestone = milestoneDrafts[itemKey(item)] ?? (item.milestone ? String(item.milestone.number) : "");
     const nextMilestone = parseMilestone(rawMilestone);
     if (nextMilestone === null) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: "Milestone must be a positive number." }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: "Milestone must be a positive number." }));
       return;
     }
-    setActionBusy((cur) => ({ ...cur, [item.number]: "labels" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "triage" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "labels" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "triage" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
       const result = await api.updateGitHubIssue({
-        path: projectPath,
+        path: itemPath,
         number: item.number,
         kind: item.kind,
         labels: nextLabels,
@@ -1728,65 +1880,67 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       // The /issues/:n response drops PR-only fields (e.g. `draft`); keep them
       // from the item we already have so a triage save can't flip the badge.
       upsertListItem(item.kind === "pulls" ? { ...result.item, draft: item.draft } : result.item);
-      setLabelDrafts((cur) => ({ ...cur, [item.number]: result.item.labels.map((label) => label.name).join(", ") }));
-      setAssigneeDrafts((cur) => ({ ...cur, [item.number]: result.item.assignees.map((a) => a.login).join(", ") }));
-      setMilestoneDrafts((cur) => ({ ...cur, [item.number]: result.item.milestone ? String(result.item.milestone.number) : "" }));
-      setActionMessages((cur) => ({ ...cur, [item.number]: "Triage updated." }));
+      setLabelDrafts((cur) => ({ ...cur, [itemKey(item)]: result.item.labels.map((label) => label.name).join(", ") }));
+      setAssigneeDrafts((cur) => ({ ...cur, [itemKey(item)]: result.item.assignees.map((a) => a.login).join(", ") }));
+      setMilestoneDrafts((cur) => ({ ...cur, [itemKey(item)]: result.item.milestone ? String(result.item.milestone.number) : "" }));
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: "Triage updated." }));
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
   const saveEdit = async (item: GitHubListItem) => {
-    if (!projectPath || actionBusy[item.number]) return;
-    const title = (titleDrafts[item.number] ?? item.title).trim();
-    const body = bodyDrafts[item.number] ?? item.body;
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || actionBusy[itemKey(item)]) return;
+    const title = (titleDrafts[itemKey(item)] ?? item.title).trim();
+    const body = bodyDrafts[itemKey(item)] ?? item.body;
     if (!title) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: "Title cannot be empty." }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: "Title cannot be empty." }));
       return;
     }
-    setActionBusy((cur) => ({ ...cur, [item.number]: "edit" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "edit" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "edit" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "edit" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const result = await api.updateGitHubIssue({ path: projectPath, number: item.number, kind: item.kind, title, body });
+      const result = await api.updateGitHubIssue({ path: itemPath, number: item.number, kind: item.kind, title, body });
       upsertListItem(item.kind === "pulls" ? { ...result.item, draft: item.draft } : result.item);
       // Close and discard the drafts so reopening reflects the freshly-saved item.
-      setEditorOpen((cur) => ({ ...cur, [item.number]: false }));
-      setTitleDrafts((cur) => ({ ...cur, [item.number]: undefined }));
-      setBodyDrafts((cur) => ({ ...cur, [item.number]: undefined }));
-      setActionMessages((cur) => ({ ...cur, [item.number]: `${item.kind === "pulls" ? "Pull request" : "Issue"} updated.` }));
+      setEditorOpen((cur) => ({ ...cur, [itemKey(item)]: false }));
+      setTitleDrafts((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+      setBodyDrafts((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: `${item.kind === "pulls" ? "Pull request" : "Issue"} updated.` }));
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
   const requestReviewers = async (item: GitHubListItem) => {
-    if (!projectPath || item.kind !== "pulls" || actionBusy[item.number]) return;
-    const reviewers = splitLabels(reviewerDrafts[item.number] ?? "");
-    const teamReviewers = splitLabels(teamReviewerDrafts[item.number] ?? "");
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!projectPath || item.kind !== "pulls" || actionBusy[itemKey(item)]) return;
+    const reviewers = splitLabels(reviewerDrafts[itemKey(item)] ?? "");
+    const teamReviewers = splitLabels(teamReviewerDrafts[itemKey(item)] ?? "");
     if (reviewers.length === 0 && teamReviewers.length === 0) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: "Enter at least one reviewer or team." }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: "Enter at least one reviewer or team." }));
       return;
     }
-    setActionBusy((cur) => ({ ...cur, [item.number]: "reviewers" }));
-    setActionSource((cur) => ({ ...cur, [item.number]: "triage" }));
-    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
-    setActionMessages((cur) => ({ ...cur, [item.number]: undefined }));
+    setActionBusy((cur) => ({ ...cur, [itemKey(item)]: "reviewers" }));
+    setActionSource((cur) => ({ ...cur, [itemKey(item)]: "triage" }));
+    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+    setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const result = await api.requestGitHubPullReviewers({ path: projectPath, number: item.number, reviewers, teamReviewers });
-      setActionMessages((cur) => ({ ...cur, [item.number]: result.message ?? "Reviewers requested." }));
-      setReviewerDrafts((cur) => ({ ...cur, [item.number]: "" }));
-      setTeamReviewerDrafts((cur) => ({ ...cur, [item.number]: "" }));
+      const result = await api.requestGitHubPullReviewers({ path: itemPath, number: item.number, reviewers, teamReviewers });
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Reviewers requested." }));
+      setReviewerDrafts((cur) => ({ ...cur, [itemKey(item)]: "" }));
+      setTeamReviewerDrafts((cur) => ({ ...cur, [itemKey(item)]: "" }));
     } catch (e) {
-      setActionErrors((cur) => ({ ...cur, [item.number]: e instanceof Error ? e.message : String(e) }));
+      setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
-      setActionBusy((cur) => ({ ...cur, [item.number]: undefined }));
+      setActionBusy((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     }
   };
 
@@ -1821,9 +1975,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           <Button
             size="icon"
             variant={labelManagerOpen ? "secondary" : "ghost"}
-            title="Manage labels"
+            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage labels"}
             aria-label="Manage labels"
-            disabled={!projectPath}
+            disabled={!projectPath || isAggregate}
             onClick={() => { setLabelManagerOpen((v) => !v); setMilestoneManagerOpen(false); setNotificationsOpen(false); }}
           >
             <Tag className="size-4" />
@@ -1831,9 +1985,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           <Button
             size="icon"
             variant={milestoneManagerOpen ? "secondary" : "ghost"}
-            title="Manage milestones"
+            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage milestones"}
             aria-label="Manage milestones"
-            disabled={!projectPath}
+            disabled={!projectPath || isAggregate}
             onClick={() => { setMilestoneManagerOpen((v) => !v); setLabelManagerOpen(false); setNotificationsOpen(false); }}
           >
             <Milestone className="size-4" />
@@ -1841,20 +1995,20 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           <Button
             size="icon"
             variant={notificationsOpen ? "secondary" : "ghost"}
-            title="Notifications"
+            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Notifications"}
             aria-label="Notifications"
-            disabled={!projectPath}
+            disabled={!projectPath || isAggregate}
             onClick={() => { setNotificationsOpen((v) => !v); setLabelManagerOpen(false); setMilestoneManagerOpen(false); }}
           >
             <Bell className="size-4" />
           </Button>
-          {result && (
+          {result && result.webUrl && (
             <Button
               size="icon"
               variant="ghost"
               title="Open repository on GitHub"
               aria-label="Open repository on GitHub"
-              onClick={() => { void api.openExternal(result.webUrl); }}
+              onClick={() => { void api.openExternal(result.webUrl!); }}
             >
               <ExternalLink className="size-4" />
             </Button>
@@ -2075,7 +2229,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onClose={() => setNotificationsOpen(false)}
           />
         )}
-        {kind === "pulls" && (
+        {kind === "pulls" && !isAggregate && (
           <PullComposer
             open={pullComposerOpen}
             title={newPullTitle}
@@ -2101,7 +2255,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           />
         )}
 
-        {kind === "issues" && (
+        {kind === "issues" && !isAggregate && (
           <IssueComposer
             open={issueComposerOpen}
             title={newIssueTitle}
@@ -2164,73 +2318,74 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             </div>
             {result.items.map((item) => (
               <GitHubItemRow
-                key={`${item.kind}-${item.number}`}
+                key={itemKey(item)}
                 item={item}
                 projectPath={projectPath}
-                expanded={expandedKey === `${item.kind}-${item.number}`}
-                diff={item.kind === "pulls" ? diffs[item.number] : undefined}
-                diffLoading={item.kind === "pulls" ? !!diffLoading[item.number] : false}
-                diffError={item.kind === "pulls" ? diffErrors[item.number] : undefined}
-                checks={item.kind === "pulls" ? checks[item.number] : undefined}
-                checksLoading={item.kind === "pulls" ? !!checksLoading[item.number] : false}
-                checksError={item.kind === "pulls" ? checksErrors[item.number] : undefined}
-                mergeability={item.kind === "pulls" ? mergeability[item.number] : undefined}
-                mergeabilityLoading={item.kind === "pulls" ? !!mergeabilityLoading[item.number] : false}
-                mergeabilityError={item.kind === "pulls" ? mergeabilityErrors[item.number] : undefined}
-                commits={item.kind === "pulls" ? commits[item.number] : undefined}
-                commitsLoading={item.kind === "pulls" ? !!commitsLoading[item.number] : false}
-                commitsError={item.kind === "pulls" ? commitsErrors[item.number] : undefined}
-                linkedIssues={item.kind === "pulls" ? linkedIssues[item.number] : undefined}
-                reviewComments={item.kind === "pulls" ? reviewComments[item.number] : undefined}
-                reviewCommentsLoading={item.kind === "pulls" ? !!reviewCommentsLoading[item.number] : false}
-                reviewCommentError={item.kind === "pulls" ? reviewCommentErrors[item.number] : undefined}
+                repoBadge={isAggregate ? repoLabelFor(item) : undefined}
+                expanded={expandedKey === itemKey(item)}
+                diff={item.kind === "pulls" ? diffs[itemKey(item)] : undefined}
+                diffLoading={item.kind === "pulls" ? !!diffLoading[itemKey(item)] : false}
+                diffError={item.kind === "pulls" ? diffErrors[itemKey(item)] : undefined}
+                checks={item.kind === "pulls" ? checks[itemKey(item)] : undefined}
+                checksLoading={item.kind === "pulls" ? !!checksLoading[itemKey(item)] : false}
+                checksError={item.kind === "pulls" ? checksErrors[itemKey(item)] : undefined}
+                mergeability={item.kind === "pulls" ? mergeability[itemKey(item)] : undefined}
+                mergeabilityLoading={item.kind === "pulls" ? !!mergeabilityLoading[itemKey(item)] : false}
+                mergeabilityError={item.kind === "pulls" ? mergeabilityErrors[itemKey(item)] : undefined}
+                commits={item.kind === "pulls" ? commits[itemKey(item)] : undefined}
+                commitsLoading={item.kind === "pulls" ? !!commitsLoading[itemKey(item)] : false}
+                commitsError={item.kind === "pulls" ? commitsErrors[itemKey(item)] : undefined}
+                linkedIssues={item.kind === "pulls" ? linkedIssues[itemKey(item)] : undefined}
+                reviewComments={item.kind === "pulls" ? reviewComments[itemKey(item)] : undefined}
+                reviewCommentsLoading={item.kind === "pulls" ? !!reviewCommentsLoading[itemKey(item)] : false}
+                reviewCommentError={item.kind === "pulls" ? reviewCommentErrors[itemKey(item)] : undefined}
                 reviewReplyDrafts={reviewReplyDrafts}
                 reviewReplySubmitting={reviewReplySubmitting}
                 applySuggestionBusy={applySuggestionBusy}
-                comments={comments[item.number]}
-                commentsLoading={!!commentsLoading[item.number]}
-                commentError={commentErrors[item.number]}
-                commentDraft={commentDrafts[item.number] ?? ""}
-                commentSubmitting={!!commentSubmitting[item.number]}
-                reviewDraft={reviewDrafts[item.number] ?? ""}
-                closeDraft={closeDrafts[item.number] ?? ""}
-                mergeMethod={mergeMethods[item.number] ?? "merge"}
-                actionBusy={actionBusy[item.number]}
-                actionError={actionErrors[item.number]}
-                actionMessage={actionMessages[item.number]}
-                actionSource={actionSource[item.number]}
+                comments={comments[itemKey(item)]}
+                commentsLoading={!!commentsLoading[itemKey(item)]}
+                commentError={commentErrors[itemKey(item)]}
+                commentDraft={commentDrafts[itemKey(item)] ?? ""}
+                commentSubmitting={!!commentSubmitting[itemKey(item)]}
+                reviewDraft={reviewDrafts[itemKey(item)] ?? ""}
+                closeDraft={closeDrafts[itemKey(item)] ?? ""}
+                mergeMethod={mergeMethods[itemKey(item)] ?? "merge"}
+                actionBusy={actionBusy[itemKey(item)]}
+                actionError={actionErrors[itemKey(item)]}
+                actionMessage={actionMessages[itemKey(item)]}
+                actionSource={actionSource[itemKey(item)]}
                 repoLabels={repoLabels}
                 repoAssignees={repoAssignees}
                 repoMilestones={repoMilestones}
-                labelDraft={labelDrafts[item.number] ?? item.labels.map((label) => label.name).join(", ")}
-                assigneeDraft={assigneeDrafts[item.number] ?? item.assignees.map((a) => a.login).join(", ")}
-                milestoneDraft={milestoneDrafts[item.number] ?? (item.milestone ? String(item.milestone.number) : "")}
-                reviewerDraft={reviewerDrafts[item.number] ?? ""}
-                teamReviewerDraft={teamReviewerDrafts[item.number] ?? ""}
-                editorOpen={!!editorOpen[item.number]}
-                titleDraft={titleDrafts[item.number] ?? item.title}
-                bodyDraft={bodyDrafts[item.number] ?? item.body}
+                labelDraft={labelDrafts[itemKey(item)] ?? item.labels.map((label) => label.name).join(", ")}
+                assigneeDraft={assigneeDrafts[itemKey(item)] ?? item.assignees.map((a) => a.login).join(", ")}
+                milestoneDraft={milestoneDrafts[itemKey(item)] ?? (item.milestone ? String(item.milestone.number) : "")}
+                reviewerDraft={reviewerDrafts[itemKey(item)] ?? ""}
+                teamReviewerDraft={teamReviewerDrafts[itemKey(item)] ?? ""}
+                editorOpen={!!editorOpen[itemKey(item)]}
+                titleDraft={titleDrafts[itemKey(item)] ?? item.title}
+                bodyDraft={bodyDrafts[itemKey(item)] ?? item.body}
                 onEditToggle={(next) => {
-                  setEditorOpen((cur) => ({ ...cur, [item.number]: next }));
+                  setEditorOpen((cur) => ({ ...cur, [itemKey(item)]: next }));
                   if (next) {
-                    setTitleDrafts((cur) => ({ ...cur, [item.number]: cur[item.number] ?? item.title }));
-                    setBodyDrafts((cur) => ({ ...cur, [item.number]: cur[item.number] ?? item.body }));
+                    setTitleDrafts((cur) => ({ ...cur, [itemKey(item)]: cur[itemKey(item)] ?? item.title }));
+                    setBodyDrafts((cur) => ({ ...cur, [itemKey(item)]: cur[itemKey(item)] ?? item.body }));
                   } else {
                     // Cancel discards the draft so reopening reflects the live item.
-                    setTitleDrafts((cur) => ({ ...cur, [item.number]: undefined }));
-                    setBodyDrafts((cur) => ({ ...cur, [item.number]: undefined }));
-                    setActionErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                    setTitleDrafts((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+                    setBodyDrafts((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+                    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                   }
                 }}
-                onTitleDraftChange={(body) => setTitleDrafts((cur) => ({ ...cur, [item.number]: body }))}
-                onBodyDraftChange={(body) => setBodyDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onTitleDraftChange={(body) => setTitleDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
+                onBodyDraftChange={(body) => setBodyDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
                 onSaveEdit={() => { void saveEdit(item); }}
-                onReviewerDraftChange={(body) => setReviewerDrafts((cur) => ({ ...cur, [item.number]: body }))}
-                onTeamReviewerDraftChange={(body) => setTeamReviewerDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onReviewerDraftChange={(body) => setReviewerDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
+                onTeamReviewerDraftChange={(body) => setTeamReviewerDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
                 onRequestReviewers={() => { void requestReviewers(item); }}
-                onReviewDraftChange={(body) => setReviewDrafts((cur) => ({ ...cur, [item.number]: body }))}
-                onCloseDraftChange={(body) => setCloseDrafts((cur) => ({ ...cur, [item.number]: body }))}
-                onMergeMethodChange={(method) => setMergeMethods((cur) => ({ ...cur, [item.number]: method }))}
+                onReviewDraftChange={(body) => setReviewDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
+                onCloseDraftChange={(body) => setCloseDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
+                onMergeMethodChange={(method) => setMergeMethods((cur) => ({ ...cur, [itemKey(item)]: method }))}
                 onReview={(event) => { void runPullReview(item, event); }}
                 onMerge={() => { void runPullMerge(item); }}
                 onUpdateBranch={() => { void runUpdateBranch(item); }}
@@ -2238,16 +2393,16 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onToggleDraft={() => { void runToggleDraft(item); }}
                 onToggleAutoMerge={() => { void runToggleAutoMerge(item); }}
                 onClosePull={() => { void runPullClose(item); }}
-                pendingReview={item.kind === "pulls" ? (pendingReview[item.number] ?? []) : []}
-                pendingStale={item.kind === "pulls" ? !!pendingStale[item.number] : false}
+                pendingReview={item.kind === "pulls" ? (pendingReview[itemKey(item)] ?? []) : []}
+                pendingStale={item.kind === "pulls" ? !!pendingStale[itemKey(item)] : false}
                 onAddToReview={(target) => addToReview(item, target)}
                 onRemovePendingReview={(index) => removePendingReview(item, index)}
                 onLineComment={(target) => submitLineComment(item, target)}
                 onReviewReplyDraftChange={(commentId, body) => setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: body }))}
                 onSubmitReviewReply={(commentId) => { void submitReviewReply(item, commentId); }}
                 viewerLogin={viewerLogin}
-                reviewThreads={item.kind === "pulls" ? (reviewThreads[item.number] ?? []) : []}
-                reviewThreadsTruncated={item.kind === "pulls" ? !!reviewThreadsTruncated[item.number] : false}
+                reviewThreads={item.kind === "pulls" ? (reviewThreads[itemKey(item)] ?? []) : []}
+                reviewThreadsTruncated={item.kind === "pulls" ? !!reviewThreadsTruncated[itemKey(item)] : false}
                 onToggleThreadResolved={(thread) => toggleThreadResolved(item, thread)}
                 onEditReviewComment={(commentId, body) => editReviewComment(item, commentId, body)}
                 onDeleteReviewComment={(commentId) => deleteReviewComment(item, commentId)}
@@ -2256,74 +2411,83 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 onDeleteComment={(commentId) => deleteConversationComment(item, commentId)}
                 onRetryReviewComments={() => {
                   if (item.kind !== "pulls") return;
-                  setReviewCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                  setReviewCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                 }}
-                onLabelDraftChange={(body) => setLabelDrafts((cur) => ({ ...cur, [item.number]: body }))}
-                onAssigneeDraftChange={(body) => setAssigneeDrafts((cur) => ({ ...cur, [item.number]: body }))}
-                onMilestoneDraftChange={(body) => setMilestoneDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onLabelDraftChange={(body) => setLabelDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
+                onAssigneeDraftChange={(body) => setAssigneeDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
+                onMilestoneDraftChange={(body) => setMilestoneDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
                 onIssueState={(nextState) => { void updateIssueState(item, nextState); }}
                 onIssueLabels={() => { void updateIssueLabels(item); }}
-                lockReasonDraft={lockReasonDrafts[item.number] ?? ""}
-                onLockReasonDraftChange={(body) => setLockReasonDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                lockReasonDraft={lockReasonDrafts[itemKey(item)] ?? ""}
+                onLockReasonDraftChange={(body) => setLockReasonDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
                 onToggleLock={() => { void runToggleLock(item); }}
-                transferDraft={transferDrafts[item.number] ?? ""}
+                transferDraft={transferDrafts[itemKey(item)] ?? ""}
                 onTransferDraftChange={(body) => {
-                  setTransferDrafts((cur) => ({ ...cur, [item.number]: body }));
-                  setTransferConfirm((cur) => ({ ...cur, [item.number]: false }));
+                  setTransferDrafts((cur) => ({ ...cur, [itemKey(item)]: body }));
+                  setTransferConfirm((cur) => ({ ...cur, [itemKey(item)]: false }));
                 }}
-                transferConfirming={!!transferConfirm[item.number]}
+                transferConfirming={!!transferConfirm[itemKey(item)]}
                 onTransferIssue={() => { void runTransferIssue(item); }}
-                onCancelTransfer={() => setTransferConfirm((cur) => ({ ...cur, [item.number]: false }))}
-                onCommentDraftChange={(body) => setCommentDrafts((cur) => ({ ...cur, [item.number]: body }))}
+                onCancelTransfer={() => setTransferConfirm((cur) => ({ ...cur, [itemKey(item)]: false }))}
+                onCommentDraftChange={(body) => setCommentDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
                 onSubmitComment={() => { void submitComment(item); }}
                 onRetryComments={() => {
-                  setCommentErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                  setCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                 }}
                 onRetryDiff={() => {
                   if (item.kind !== "pulls") return;
-                  setDiffErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                  setDiffErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                 }}
                 onRetryChecks={() => {
                   if (item.kind !== "pulls") return;
-                  setChecksErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                  setChecksErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                 }}
                 onRefreshDiff={() => {
                   if (item.kind !== "pulls") return;
-                  setDiffs((cur) => ({ ...cur, [item.number]: undefined }));
-                  setDiffErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                  setDiffs((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+                  setDiffErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                   // A refreshed diff may renumber lines under any queued comments.
-                  if ((pendingReview[item.number] ?? []).length > 0) {
-                    setPendingStale((cur) => ({ ...cur, [item.number]: true }));
+                  if ((pendingReview[itemKey(item)] ?? []).length > 0) {
+                    setPendingStale((cur) => ({ ...cur, [itemKey(item)]: true }));
                   }
                 }}
                 onRefreshChecks={() => {
                   if (item.kind !== "pulls") return;
-                  setChecks((cur) => ({ ...cur, [item.number]: undefined }));
-                  setChecksErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                  setChecks((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+                  setChecksErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                 }}
                 onRefreshMergeability={() => {
                   if (item.kind !== "pulls") return;
-                  mergeabilityRetries.current[item.number] = 0;
-                  setMergeability((cur) => ({ ...cur, [item.number]: undefined }));
-                  setMergeabilityErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                  mergeabilityRetries.current[itemKey(item)] = 0;
+                  setMergeability((cur) => ({ ...cur, [itemKey(item)]: undefined }));
+                  setMergeabilityErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                 }}
                 onRetryCommits={() => {
                   if (item.kind !== "pulls") return;
-                  setCommitsErrors((cur) => ({ ...cur, [item.number]: undefined }));
+                  setCommitsErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
                 }}
                 onToggle={() => {
-                  const key = `${item.kind}-${item.number}`;
+                  const key = itemKey(item);
                   setExpandedKey((cur) => (cur === key ? null : key));
                 }}
                 canPush={canPush}
               />
             ))}
-            {result.hasMore && (
+            {/* "Load more" is disabled in aggregate mode (G8) — each aggregate
+                fetch already covers page 1 per repo; `result.hasMore` there
+                means "at least one repo's results were truncated to one page"
+                rather than "there's a page 2 to fetch". */}
+            {result.hasMore && !isAggregate && (
               <div className="flex justify-center py-1">
                 <Button size="sm" variant="outline" disabled={loadingMore || loading || reloadPending} onClick={loadMore}>
                   {loadingMore ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : null}
                   Load more
                 </Button>
+              </div>
+            )}
+            {result.hasMore && isAggregate && (
+              <div className="px-1 text-[11px] text-muted-foreground">
+                Some repositories have more results than shown here — switch to a single project to see them all.
               </div>
             )}
           </div>
@@ -3386,6 +3550,7 @@ function GitHubItemRow({
   onRetryCommits,
   onToggle,
   canPush,
+  repoBadge,
 }: {
   item: GitHubListItem;
   projectPath: string;
@@ -3493,6 +3658,10 @@ function GitHubItemRow({
   // every push-only control this row renders (merge, lock, pin, transfer,
   // sub-issues, reviewers, triage save, apply-suggestion, …).
   canPush: boolean;
+  // Aggregate mode (G8/F15): shows a small repo badge next to the title
+  // (redundant, and hidden, in single-repo mode) so items from different
+  // repos are distinguishable in the merged list.
+  repoBadge?: string;
 }) {
   const merged = item.kind === "pulls" && !!item.mergedAt;
   // The item's own author may close/reopen and edit the title/body of their own
@@ -3500,6 +3669,10 @@ function GitHubItemRow({
   // wider flag, while genuinely push-only actions (merge, lock, pin, transfer,
   // labels/milestones, reviewers, auto-merge) stay on `canPush` alone.
   const canModifyOwn = canPush || (!!viewerLogin && item.author?.login === viewerLogin);
+  // Per-item action path (G8, multi-repo aggregation): every api.* call this
+  // row (and everything it renders) makes resolves the item's own repo first,
+  // falling back to the dialog-level `projectPath` in single-repo mode.
+  const itemPath = item.sourcePath ?? projectPath;
   const stateClass = item.state === "open"
     ? "text-emerald-400"
     : merged
@@ -3522,6 +3695,14 @@ function GitHubItemRow({
             {item.draft && (
               <span className="rounded border border-border/60 px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
                 Draft
+              </span>
+            )}
+            {repoBadge && (
+              <span
+                className="rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                title="Repository this item belongs to"
+              >
+                {repoBadge}
               </span>
             )}
           </div>
@@ -3627,7 +3808,7 @@ function GitHubItemRow({
               )}
             </div>
           )}
-          <Reactions path={projectPath} subject={{ type: "issue", id: item.number }} viewer={viewerLogin} />
+          <Reactions path={itemPath} subject={{ type: "issue", id: item.number }} viewer={viewerLogin} />
           {item.kind === "pulls" && (
             <>
               <PullActions
@@ -3683,7 +3864,7 @@ function GitHubItemRow({
               <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} />
               <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
               <ReviewComments
-                path={projectPath}
+                path={itemPath}
                 comments={reviewComments}
                 loading={reviewCommentsLoading}
                 error={reviewCommentError}
@@ -3709,7 +3890,7 @@ function GitHubItemRow({
           {item.kind === "issues" && (
             <IssueActions
               item={item}
-              path={projectPath}
+              path={itemPath}
               repoLabels={repoLabels}
               repoAssignees={repoAssignees}
               repoMilestones={repoMilestones}
@@ -3737,7 +3918,7 @@ function GitHubItemRow({
             />
           )}
           <Conversation
-            path={projectPath}
+            path={itemPath}
             comments={comments}
             loading={commentsLoading}
             error={commentError}

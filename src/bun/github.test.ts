@@ -61,6 +61,7 @@ function makeItem(overrides: Partial<GitHubListItem> = {}): GitHubListItem {
     closedAt: null,
     mergedAt: null,
     locked: false,
+    sourcePath: null,
     ...overrides,
   };
 }
