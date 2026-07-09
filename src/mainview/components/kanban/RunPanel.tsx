@@ -567,7 +567,26 @@ function RunPanelBody({
   // instead of flapping.
   useEffect(() => {
     if (!latestRun) return;
-    if (latestRun.status === "running") return;
+    if (latestRun.status === "running") {
+      // The newest run just became "running" again — e.g. a background-agent
+      // continuation turn that shares `claudeSessionId` with the run the
+      // current `rebuilt` snapshot was captured from, whose first live events
+      // can land before the 2s runs-poll updates `runs`/`latestRun` (see
+      // `rebuiltRunIds` and the SSE batch-flush invalidation above). If a
+      // snapshot is still set at that point, `displayedEvents` will mask the
+      // new run's live events behind it — and because this effect only
+      // re-fires on `latestRun` id/status/claudeSessionId changes, the
+      // freeze would persist until the run resolves. Clear eagerly instead:
+      // "the newest run is live again ⇒ no snapshot should mask the stream."
+      // Functional updaters read the current value without adding
+      // `rebuilt`/`rebuildNote` to this effect's deps, so this can't loop —
+      // clearing them doesn't change `latestRun`, the only thing gating
+      // re-runs, and is a no-op (bails to the same reference) once already
+      // clear.
+      setRebuilt((prev) => (prev ? null : prev));
+      setRebuildNote((prev) => (prev ? null : prev));
+      return;
+    }
     if (!latestRun.claudeSessionId) return;
     const sessionId = latestRun.claudeSessionId;
     let cancelled = false;

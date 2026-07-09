@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 // same convention as claude-tmux-queue.test.ts / claude-tmux-death.test.ts.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-continuation-"));
 
-const { __forTest, setContinuationRunFactory } = await import("./claude-tmux.ts");
+const { __forTest, setContinuationRunFactory, setBackgroundTaskSettledHandler } = await import("./claude-tmux.ts");
 import type { ContinuationHooks, SpawnedAgent, ChunkHandler } from "./claude-tmux.ts";
 
 // ─── fixtures ───────────────────────────────────────────────────────────
@@ -324,6 +324,48 @@ test("factory returning null falls back to legacy lastChunk routing — no throw
       setContinuationRunFactory(prev);
     }
   } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+// ─── F1: __rebuild__ settle-block guard ────────────────────────────────
+//
+// `rebuildEventsFromJsonl` drives `dispatchLine` against a synthetic
+// SessionState keyed `taskId: "__rebuild__"` to re-emit a finished session's
+// JSONL for a UI replay — a read-only operation. The background-task/agent
+// settle block in `dispatchLine` (which calls
+// `setBackgroundTaskSettledHandler`'s installed hook) must not run for that
+// synthetic state: `markSettledById` keys on agentId alone with no taskId
+// scoping, so firing it from a rebuild would settle a REAL subagent row.
+
+test("dispatchLine's background-task settle block is skipped for the synthetic __rebuild__ state", () => {
+  const { jsonlPath } = freshSession();
+  const rebuildState = __forTest.installSession("__rebuild__", jsonlPath);
+  const calls: Array<{ taskId: string; agentId: string }> = [];
+  const prev = setBackgroundTaskSettledHandler((tid, agentId) => {
+    calls.push({ taskId: tid, agentId });
+  });
+  try {
+    __forTest.dispatchLine(rebuildState, taskNotificationLine("agent-rebuild"));
+    expect(calls).toEqual([]);
+  } finally {
+    setBackgroundTaskSettledHandler(prev);
+    __forTest.uninstallSession("__rebuild__");
+  }
+});
+
+test("dispatchLine's background-task settle block still fires for a normal (non-rebuild) session state", () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  const calls: Array<{ taskId: string; agentId: string }> = [];
+  const prev = setBackgroundTaskSettledHandler((tid, agentId) => {
+    calls.push({ taskId: tid, agentId });
+  });
+  try {
+    __forTest.dispatchLine(state, taskNotificationLine("agent-normal"));
+    expect(calls).toEqual([{ taskId, agentId: "agent-normal" }]);
+  } finally {
+    setBackgroundTaskSettledHandler(prev);
     __forTest.uninstallSession(taskId);
   }
 });

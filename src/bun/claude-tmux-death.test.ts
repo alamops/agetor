@@ -104,6 +104,27 @@ test("signalSessionDeath is a no-op when no turn is in flight (idle session deat
   }
 });
 
+test("F5: a throwing heldSessionProbe is treated as not-held (no crash, no emission)", async () => {
+  const { taskId, state } = freshSession();
+  const rec = recorder();
+  const prevProbe = setHeldSessionProbe(() => { throw new Error("boom: SQLite busy"); });
+  try {
+    // No slot pushed and no reattach onEndOfTurn → not in flight — the only
+    // way this call reaches the probe at all is the `!turnInFlight` guard.
+    expect(__forTest.turnInFlight(state)).toBe(false);
+
+    // Must not throw out of signalSessionDeath even though the probe does.
+    expect(() => __forTest.signalSessionDeath(state)).not.toThrow();
+
+    // Treated as "not held" (same as the probe returning false / being unset)
+    // → the no-op idle-death path, nothing emitted.
+    expect(rec.out.length).toBe(0);
+  } finally {
+    setHeldSessionProbe(prevProbe);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
 test("sessionLiveness: exit 0 is alive", () => {
   const restore = fakeTmux(0, "");
   try { expect(sessionLiveness("agetor-x")).toBe("alive"); } finally { restore(); }
@@ -384,10 +405,20 @@ test(
 
       await wait(DEATH_WINDOW_MS);
 
+      // Held-death case (no turn in flight, task held for background agents):
+      // the sentinel prefix would falsely imply the orchestrator flips the
+      // card to `blocked`, but a held task actually releases to `review` —
+      // so this path emits the honest, prefix-free held-death wording instead
+      // (see F3: `signalSessionDeath`'s `inFlight` branch).
       const sentinel = rec.out.find(
         (c) => c.stream === "status" && c.data.startsWith(SESSION_DIED_STATUS_PREFIX),
       );
-      expect(sentinel).toBeDefined();
+      expect(sentinel).toBeUndefined();
+      const heldDeath = rec.out.find(
+        (c) => c.stream === "status"
+          && c.data.includes("ended while background agents were running — releasing task"),
+      );
+      expect(heldDeath).toBeDefined();
 
       expect(subagents.get("agent-1")?.status).toBe("orphaned");
     } finally {
@@ -456,10 +487,16 @@ test(
       held = true;
       await wait(DEATH_WINDOW_MS);
 
+      // Held-death case — see the wording note in the "stays armed" test above.
       const sentinel = rec.out.find(
         (c) => c.stream === "status" && c.data.startsWith(SESSION_DIED_STATUS_PREFIX),
       );
-      expect(sentinel).toBeDefined();
+      expect(sentinel).toBeUndefined();
+      const heldDeath = rec.out.find(
+        (c) => c.stream === "status"
+          && c.data.includes("ended while background agents were running — releasing task"),
+      );
+      expect(heldDeath).toBeDefined();
     } finally {
       setHeldSessionProbe(prevProbe);
       ctrlTmux.restore();
@@ -496,6 +533,46 @@ test(
         (c) => c.stream === "status" && c.data.startsWith(SESSION_DIED_STATUS_PREFIX),
       );
       expect(sentinel).toBeUndefined();
+    } finally {
+      setHeldSessionProbe(prevProbe);
+      ctrlTmux.restore();
+      if (taskId) cleanupHeldReattach(taskId);
+    }
+  },
+);
+
+test(
+  "F5: a throwing heldSessionProbe on the real poll interval never crashes the tick and behaves as not-held",
+  async () => {
+    const ctrlTmux = controllableTmux();
+    let taskId = "";
+    const prevProbe = setHeldSessionProbe(() => { throw new Error("boom: SQLite busy"); });
+    try {
+      const setup = await setupHeldReattach();
+      taskId = setup.taskId;
+      const { rec } = setup;
+
+      // Session reports `gone` the whole window — with a healthy probe
+      // returning true this would fire (per the "stays armed" test above).
+      // With a throwing probe, `heldProbeSafe` swallows the throw and
+      // returns false, so the poll behaves exactly like the "probe returns
+      // false" case: `misses` resets every tick and nothing ever fires. The
+      // real assertion here is that the process is still alive to check —
+      // an unguarded probe would have thrown inside the `setInterval`
+      // callback and (depending on the runtime) could abort the tick chain
+      // or surface as an unhandled error.
+      ctrlTmux.setGone(true);
+      await wait(DEATH_WINDOW_MS);
+
+      const sentinel = rec.out.find(
+        (c) => c.stream === "status" && c.data.startsWith(SESSION_DIED_STATUS_PREFIX),
+      );
+      expect(sentinel).toBeUndefined();
+      const heldDeath = rec.out.find(
+        (c) => c.stream === "status"
+          && c.data.includes("ended while background agents were running — releasing task"),
+      );
+      expect(heldDeath).toBeUndefined();
     } finally {
       setHeldSessionProbe(prevProbe);
       ctrlTmux.restore();

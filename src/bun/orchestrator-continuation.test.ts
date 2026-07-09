@@ -349,37 +349,38 @@ test("a follow-up sent while the continuation run is in flight folds into it (bu
 
 // ── 5. Codex — is the factory actually agent-kind-guarded? ─────────────────
 
-test("codex task: startContinuationRun has NO explicit agent-kind guard (documents a real gap, not a fix)", async () => {
+test("codex task → factory returns null (agent-kind guard)", async () => {
   // In production this factory is only ever invoked from claude-tmux.ts's
   // `dispatchLine` — codex-tmux.ts never references
   // `continuationRunFactory`/`setContinuationRunFactory` at all (grepped;
   // zero hits), so a codex task's session never reaches this path today.
-  // But `startContinuationRun`'s own body (orchestrator.ts ~1365) only
-  // checks `taskId === "__rebuild__"` and `!task || task.archivedAt != null`
-  // — there is no `resolveHarness(task.agent)?.kind === "claude-code"` guard.
-  // Calling it directly (as this test does, standing in for a hypothetical
-  // future caller or refactor that wires it up for codex too) produces a
-  // real `origin: "continuation"` run row stamped with the codex task's own
-  // agent id. This test asserts the ACTUAL behavior, not the wished-for
-  // guard — see this file's final report for the flag.
+  // `startContinuationRun`'s own body (orchestrator.ts ~1365) now guards on
+  // `resolveHarness(task.agent)?.kind !== "claude-code"` in addition to the
+  // `"__rebuild__"` and unknown/archived-task checks — continuations are a
+  // claude-JSONL concept (a background-task auto-continuation observed via
+  // `dispatchLine`'s tail of the session's own JSONL); codex is one-shot per
+  // turn and has no equivalent notion of "kept talking after end_turn". This
+  // test asserts the factory declines a codex task outright — defense in
+  // depth for a path that's inert today but would otherwise mint a real
+  // `origin: "continuation"` run row stamped with codex's agent id if a
+  // future caller or refactor ever wired codex into this factory.
   const taskId = await createTaskWithAgent("continuation-codex-gap", "codex");
-  await seedPriorRun(taskId, {
+  const priorRunId = await seedPriorRun(taskId, {
     agent: "codex",
     codexSessionId: `codex-sess-${randomUUID()}`,
     column: "review",
   });
 
   const hooks = realFactory!(taskId);
-  expect(hooks).not.toBeNull();
+  expect(hooks).toBeNull();
 
   const { tasks, runs } = await import("./db.ts");
   const task = tasks.get(taskId);
-  expect(task?.column).toBe("running");
-  const newRun = runs.get(task!.runId!);
-  expect(newRun?.agent).toBe("codex");
-  expect(newRun?.origin).toBe("continuation");
-  // claudeSessionId inheritance is claude-specific (`findLastClaudeSessionId`
-  // filters on `claude_session_id IS NOT NULL`) — a codex-only run history
-  // has none, so it comes back null. Documented, not asserted as "correct".
-  expect(newRun?.claudeSessionId).toBeNull();
+  // No adoption happened: column and runId stay exactly as seeded.
+  expect(task?.column).toBe("review");
+  expect(task?.runId).toBe(priorRunId);
+  // No new run row was created — only the seeded prior run exists.
+  const rows = runs.listForTask(taskId);
+  expect(rows.length).toBe(1);
+  expect(rows[0]?.id).toBe(priorRunId);
 });

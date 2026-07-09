@@ -144,6 +144,20 @@ export function setHeldSessionProbe(
   return prev;
 }
 
+/** Call `heldSessionProbe`, never letting a throwing probe reach the death
+ *  watch — mirrors `fireBackgroundTaskSettled` just below: the probe runs
+ *  orchestrator DB reads we don't control (SQLite can transiently throw,
+ *  e.g. "database is busy"), and a bad read must not crash the poll tick.
+ *  Treats a throw as "not held", the same as the unset (`null`) case. */
+function heldProbeSafe(taskId: string): boolean {
+  try {
+    return heldSessionProbe?.(taskId) ?? false;
+  } catch (e) {
+    console.error(`[claude-tmux] heldSessionProbe threw for task ${taskId}:`, e);
+    return false;
+  }
+}
+
 /**
  * Handler the orchestrator installs to learn that a background task/agent
  * named in a task-notification JSONL line has settled, so it can flip the
@@ -2058,10 +2072,23 @@ function dispatchLine(state: SessionState, line: string): void {
   // background agent settled while the process was down, and the consumer
   // (`subagents.markSettledById`) is idempotent, so re-firing for an
   // already-seen line is harmless.
-  const notifContent = taskNotificationContent(evt);
-  if (notifContent) {
-    const agentId = extractTaskNotificationAgentId(notifContent);
-    if (agentId) fireBackgroundTaskSettled(state.taskId, agentId);
+  //
+  // Skipped for the synthetic `__rebuild__` state (see `rebuildEventsFromJsonl`):
+  // that helper's contract is a read-only re-emission of a finished session's
+  // JSONL for a UI replay, not a second live tailer. `markSettledById` keys
+  // on agentId alone with no taskId scoping, so firing here would settle a
+  // REAL subagent/background-task row from a request that never touched a
+  // live session — e.g. a rebuild racing a genuine resume could release a
+  // hold the live tailer still needs. Mirrors how the continuation-adoption
+  // check further down is naturally inert for `__rebuild__` (its factory
+  // looks the taskId up and finds no such task), just made explicit here
+  // since this block runs unconditionally rather than through a factory.
+  if (state.taskId !== "__rebuild__") {
+    const notifContent = taskNotificationContent(evt);
+    if (notifContent) {
+      const agentId = extractTaskNotificationAgentId(notifContent);
+      if (agentId) fireBackgroundTaskSettled(state.taskId, agentId);
+    }
   }
 
   // Already-seen lines (reattach replay-from-offset-0) skip chunk emission
@@ -2875,31 +2902,47 @@ export const DEATH_JSONL_QUIET_MS = 3_000;
  * Settle an in-flight turn (or a held task — see below) because its tmux
  * session died unexpectedly.
  *
- * Emits the shared `SESSION_DIED_STATUS_PREFIX` sentinel (which the
- * orchestrator's chunk handler pattern-matches to flip the card to `blocked`
- * and mark the run's handle), then resolves the active turn so the done
- * handler runs — exactly mirroring the claude API-error path, where the
- * outcome is driven by the handle flag, not the exit code.
+ * While a turn is genuinely in flight, emits the shared
+ * `SESSION_DIED_STATUS_PREFIX` sentinel (which the orchestrator's chunk
+ * handler pattern-matches to flip the card to `blocked` and mark the run's
+ * handle), then resolves the active turn so the done handler runs — exactly
+ * mirroring the claude API-error path, where the outcome is driven by the
+ * handle flag, not the exit code.
+ *
+ * When there's no turn in flight and death fired only because the task is
+ * held open for background agents, the sentinel would lie: there's no
+ * active handle for the orchestrator to flip to `blocked`, so a held task
+ * actually releases to `review` instead. That case emits a plain status
+ * chunk WITHOUT the sentinel prefix — see the held branch below.
  *
  * No-ops when no turn is in flight AND the task isn't held for background
- * agents (`heldSessionProbe`): if the final flush already popped the slot
+ * agents (`heldProbeSafe`): if the final flush already popped the slot
  * (the turn genuinely completed a beat before the session vanished) and
  * nothing is holding the card open, there's nothing to settle — an idle
  * session dying between turns is out of scope (the card isn't "running"; a
  * re-run self-heals via spawn's pre-kill). When the task IS held, the main
  * run already resolved so there's no slot/onEndOfTurn to settle below (both
- * branches are skipped harmlessly) — this call still emits the sentinel
- * (via `state.lastChunk`, the succeeded run's handler) and, unconditionally
- * at the bottom, orphans any still-`running` subagent rows, which is what
- * lets the orchestrator's settle hook release the hold.
+ * branches are skipped harmlessly) — this call still emits the held-death
+ * status (via `state.lastChunk`, the succeeded run's handler) and,
+ * unconditionally at the bottom, orphans any still-`running` subagent rows,
+ * which is what lets the orchestrator's settle hook release the hold.
  */
 function signalSessionDeath(state: SessionState): void {
-  if (!turnInFlight(state) && !heldSessionProbe?.(state.taskId)) return;
+  const inFlight = turnInFlight(state);
+  if (!inFlight && !heldProbeSafe(state.taskId)) return;
   const slot = state.turnQueue[0];
   const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
   onChunk(
     "status",
-    `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
+    inFlight
+      ? `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`
+      // Held-probe-driven death, no active turn: the main run already
+      // resolved, so there's no handle for the orchestrator to flip to
+      // `blocked` — the task actually releases to `review`. Say so honestly
+      // instead of reusing the sentinel, which the orchestrator would
+      // otherwise pattern-match into a "blocked" breadcrumb that never
+      // happens for this path.
+      : `tmux session ${state.sessionName} ended while background agents were running — releasing task`,
   );
   if (slot && slot.resolve) {
     state.turnQueue.shift();
@@ -2966,7 +3009,7 @@ function startDeathWatch(state: SessionState): void {
   // task isn't held open for background agents).
   let misses = 0;
   state.deathTimer = setInterval(() => {
-    if (!turnInFlight(state) && !heldSessionProbe?.(state.taskId)) { misses = 0; return; } // idle & not held — skip the tmux poll
+    if (!turnInFlight(state) && !heldProbeSafe(state.taskId)) { misses = 0; return; } // idle & not held — skip the tmux poll
     // Compute the log-recency veto lazily — it only matters for a `gone` probe,
     // and `gone` is the rare tick, so we skip a statSync on every `alive` poll.
     const liveness = sessionLiveness(state.sessionName);

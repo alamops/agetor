@@ -1361,11 +1361,18 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
  *     relying on that incidental fact alone;
  *   - an unknown task (deleted out from under a live session); or
  *   - an archived task (no new run should reopen the card).
+ *   - a non-claude-code task: continuations are a claude-JSONL concept (a
+ *     background-task auto-continuation observed via `dispatchLine`'s tail of
+ *     the session's own JSONL); codex is one-shot per turn and has no
+ *     equivalent notion of "kept talking after end_turn", so there's nothing
+ *     to adopt a run for. Only claude-tmux's `dispatchLine` calls this
+ *     factory today, so this is defense in depth rather than a live path.
  */
 function startContinuationRun(taskId: string): ContinuationHooks | null {
   if (taskId === "__rebuild__") return null;
   const task = tasks.get(taskId);
   if (!task || task.archivedAt != null) return null;
+  if (resolveHarness(task.agent)?.kind !== "claude-code") return null;
 
   const newRunId = randomUUID();
   const now = Date.now();
