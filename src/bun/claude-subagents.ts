@@ -69,8 +69,16 @@ const DONE_IDLE_MS = 1500;
  * (DB-only) when no emitter is registered.
  */
 let emitFn: ((e: RunEvent) => void) | null = null;
-export function setSubagentEmitter(fn: ((e: RunEvent) => void) | null): void {
+/** Returns the previously-registered sink. `bun test` shares one process across
+ *  every test file, so a test that installs a spy here must put the real one
+ *  back — otherwise it silently un-wires the orchestrator for every file that
+ *  runs after it. Production ignores the return value. */
+export function setSubagentEmitter(
+  fn: ((e: RunEvent) => void) | null,
+): ((e: RunEvent) => void) | null {
+  const prev = emitFn;
   emitFn = fn;
+  return prev;
 }
 
 /**
@@ -82,8 +90,15 @@ export function setSubagentEmitter(fn: ((e: RunEvent) => void) | null): void {
  * only signals "something changed for taskId," never decides what to do.
  */
 let settleFn: ((taskId: string) => void) | null = null;
-export function setSubagentSettleHook(fn: ((taskId: string) => void) | null): void {
+/** Returns the previously-registered hook, for the same save/restore reason as
+ *  `setSubagentEmitter`: nulling this in a test's `afterEach` strands every
+ *  later test file with no release path, so a held task never reaches `review`. */
+export function setSubagentSettleHook(
+  fn: ((taskId: string) => void) | null,
+): ((taskId: string) => void) | null {
+  const prev = settleFn;
   settleFn = fn;
+  return prev;
 }
 
 /** Call the settle hook, never letting a throwing hook reach the poll timer
