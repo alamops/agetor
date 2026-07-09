@@ -19,12 +19,11 @@ export async function cmdCommit(args: string[], flags: Flags): Promise<void> {
   if (task.archivedAt != null) {
     throw new Error("task is archived — unarchive it before committing");
   }
-  // Match the webview, which only offers Commit & push when the run is idle:
-  // committing mid-turn would fold the prompt into the in-flight work and could
-  // capture half-finished changes.
-  if (task.column === "running") {
-    throw new Error(`task is still working — commit after it finishes (watch it with 'agetor logs ${short}')`);
-  }
+  // Committing mid-turn is supported: the prompt folds into the in-flight run
+  // via the same paste-follow-up path as `agetor send`. Since #92, a task can
+  // also sit in column "running" long after the background agent's run has
+  // actually succeeded — column no longer implies a turn is in flight — so
+  // there's no column-based guard here.
   if (task.pendingInteractionCount > 0) {
     throw new Error(`task is waiting for an answer — respond first with 'agetor answer ${short}'`);
   }
@@ -55,9 +54,13 @@ export async function cmdCommit(args: string[], flags: Flags): Promise<void> {
 
 /** The best-effort heads-up appended to the success line. Empty in the normal
  *  case (uncommitted changes present); `ignored` (not a git repo) wins over a
- *  clean tree. Pure so the note contract can be unit-tested. */
-export function commitNote(git: { hasChanges: boolean; ignored?: boolean }): string {
+ *  clean tree. A clean tree with nothing ahead of upstream means there's
+ *  nothing for the prompt to do at all. Pure so the note contract can be
+ *  unit-tested. */
+export function commitNote(git: { hasChanges: boolean; ahead?: number; ignored?: boolean }): string {
   if (git.ignored) return " (not a git worktree)";
-  if (!git.hasChanges) return " (working tree clean — push only)";
+  if (!git.hasChanges) {
+    return (git.ahead ?? 0) > 0 ? " (working tree clean — push only)" : " (nothing to commit or push)";
+  }
   return "";
 }

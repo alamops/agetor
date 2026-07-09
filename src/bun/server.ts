@@ -46,7 +46,14 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { planAskAnswers } from "./claude-questions.ts";
-import { getTaskDiff, gitFetch, gitPull, hasUncommittedChanges, listBranches } from "./worktree.ts";
+import {
+  getAheadCount,
+  getTaskDiff,
+  gitFetch,
+  gitPull,
+  hasUncommittedChanges,
+  listBranches,
+} from "./worktree.ts";
 import {
   attachSocket,
   closeTerminal,
@@ -1198,11 +1205,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
-      // Whether the task's working tree has uncommitted changes. Drives the
-      // "Commit & push" action in the run panel, which only makes sense to
-      // show when there's actually something to commit. `ignored: true` means
-      // we couldn't tell (not a git repo, dir missing, git failed) — the UI
-      // treats that as "don't offer the action" rather than guessing.
+      // Whether the task's working tree has uncommitted changes, and how many
+      // commits on HEAD haven't been pushed yet. Drives the "Commit & push"
+      // chip in the run panel: `hasChanges` gates the "commit" half, `ahead`
+      // gates the "push" half, and the chip appears on git state alone —
+      // regardless of whether a run is active. `ignored: true` means we
+      // couldn't tell (not a git repo, dir missing, git failed) — the UI
+      // treats that as "don't offer the action" rather than guessing, and in
+      // that case we don't bother computing `ahead` either. An `ahead`
+      // lookup failure (no upstream, no baseRef, or a git error) degrades to
+      // `0` rather than flipping `ignored` — that flag stays keyed to
+      // `hasUncommittedChanges` alone.
       "/tasks/:id/git-status": {
         GET: authed(async (req) => {
           const t = tasks.get(req.params.id);
@@ -1210,11 +1223,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const dir = t.worktreePath ?? t.workdir;
-          const result = await hasUncommittedChanges(dir);
+          const [result, aheadResult] = await Promise.all([
+            hasUncommittedChanges(dir),
+            getAheadCount(dir, t.baseRef ?? null),
+          ]);
           if (result === null) {
-            return json({ hasChanges: false, ignored: true }, { headers: corsHeaders(req) });
+            return json(
+              { hasChanges: false, ahead: 0, ignored: true },
+              { headers: corsHeaders(req) },
+            );
           }
-          return json({ hasChanges: result, ignored: false }, { headers: corsHeaders(req) });
+          return json(
+            { hasChanges: result, ahead: aheadResult ?? 0, ignored: false },
+            { headers: corsHeaders(req) },
+          );
         }),
       },
 
