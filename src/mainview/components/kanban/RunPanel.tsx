@@ -18,6 +18,7 @@ import {
   AGENT_OPTIONS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  branchCommitType,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -653,10 +654,23 @@ function RunPanelBody({
   // resulting turn shows up as a normal run row with streamed events.
   const sendCommitPush = async () => {
     if (!resumableRunId || sending) return;
+    // Derive the commit-subject type from the task's actual branch prefix
+    // (e.g. "feature/…" → "feature:", "hotfix/…" → "hotfix:") so the commit
+    // matches the branch nomenclature; falls back to feat/fix/chore by task
+    // type when there's no prefix. Name the real branch in the push hint so the
+    // agent doesn't have to guess it.
+    const ccType = branchCommitType(task.branch, task.taskType);
+    // Shell-quote the branch: git ref names may legally contain shell
+    // metacharacters (backtick, $, !, parens, and even a single quote), and this
+    // lands inside a shell command. `'\''` is the POSIX escape for a quote.
+    const branchLabel = task.branch
+      ? `'${task.branch.replace(/'/g, "'\\''")}'`
+      : "<branch>";
     const message =
-      "Commit all changes with a clear, conventional commit message " +
-      "summarizing the work and push the current branch to origin. " +
-      "If the branch has no upstream yet, set it with `git push -u origin <branch>`.";
+      `Commit all changes with a clear commit message ` +
+      `(prefix the subject with "${ccType}:", e.g. "${ccType}: ...") summarizing the work, ` +
+      `then push the current branch to origin. ` +
+      `If the branch has no upstream yet, set it with \`git push -u origin ${branchLabel}\`.`;
     // Intentionally leaves `input` / `sendRefs` alone — Commit & push is a
     // side action that shouldn't discard text the user has typed for the
     // next turn. `send()` clears those because it consumed them.

@@ -21,6 +21,11 @@ import m018 from "./018_run_events_dedup.sql" with { type: "text" };
 import m019 from "./019_archived_at.sql" with { type: "text" };
 import m020 from "./020_task_type.sql" with { type: "text" };
 import m021 from "./021_codex_session_id.sql" with { type: "text" };
+// NOTE: 022 (022_subagents, already on main) and 023 (023_task_backlog, a
+// concurrent branch) are owned elsewhere — they arrive when this branch merges
+// main. This migration took 024 to append cleanly after both. Migration ids are
+// opaque, so the local numeric gap (021 → 024 on this branch) is harmless.
+import m024 from "./024_project_branch_config.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -46,4 +51,5 @@ export const migrations: Migration[] = [
   { id: "019_archived_at", sql: m019 },
   { id: "020_task_type", sql: m020 },
   { id: "021_codex_session_id", sql: m021 },
+  { id: "024_project_branch_config", sql: m024 },
 ];

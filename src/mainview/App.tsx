@@ -16,6 +16,7 @@ import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/componen
 import { UpdateBanner } from "@/components/updater/UpdateBanner";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
+import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSuccess } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
@@ -110,8 +111,15 @@ export default function App() {
     return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
   }, []);
 
-  const refresh = async () => {
-    try { setTasks(await api.listTasks()); } catch { /* keep last good snapshot; retry next tick */ }
+  /** Re-list tasks. Returns the fetched list so callers that need to inspect a
+   *  task right after a mutation don't have to issue a second GET. `null` on
+   *  failure — the last good snapshot stays rendered and the poll retries. */
+  const refresh = async (): Promise<Task[] | null> => {
+    try {
+      const list = await api.listTasks();
+      setTasks(list);
+      return list;
+    } catch { return null; /* keep last good snapshot; retry next tick */ }
   };
   const refreshAgents = async () => {
     try {
@@ -395,11 +403,25 @@ export default function App() {
     }
   };
 
+  // `startTask` materializes the worktree, which can re-pin the branch when a
+  // create-time uniqueness race is only detectable once the branch actually
+  // exists. Surface the change so the user isn't left believing the name they
+  // saw. Reads the new branch out of the refresh we already do — no extra GET.
+  // Best-effort: if the refresh failed, the 2s poll still shows the real branch.
+  const startAndNotifyBranch = async (taskId: string, branchBefore: string | null) => {
+    await api.startTask(taskId);
+    const list = await refresh();
+    if (!branchBefore || !list) return;
+    const after = list.find((t) => t.id === taskId);
+    if (after?.branch && after.branch !== branchBefore) {
+      toast(`Branch changed to “${after.branch}” — “${branchBefore}” was already taken.`);
+    }
+  };
+
   const start = async (t: Task) => {
     try {
       setError(null);
-      await api.startTask(t.id);
-      await refresh();
+      await startAndNotifyBranch(t.id, t.branch);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // tmux-missing errors get a guided fix dialog instead of a toast — the
@@ -569,10 +591,17 @@ export default function App() {
                 ...input,
                 column: start ? "ready" : "backlog",
               });
+              // The server makes the branch unique within the repo, so the
+              // pinned name can differ from what the sidebar showed (a
+              // same-name task already exists). Surface the final name rather
+              // than let the user assume the one they saw.
+              if (input.branch && created.branch && created.branch !== input.branch) {
+                toast(`Branch set to “${created.branch}” to keep it unique.`);
+              }
               await refresh();
               if (start) {
-                await api.startTask(created.id);
-                await refresh();
+                // Refreshes internally, so no second refresh here.
+                await startAndNotifyBranch(created.id, created.branch);
               }
             } catch (e) {
               setError(e instanceof Error ? e.message : String(e));
