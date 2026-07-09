@@ -742,11 +742,42 @@ export interface GitHubListItem {
   locked: boolean;
 }
 
+/** Rate-limit snapshot parsed from a GitHub API response's `x-ratelimit-*`
+ *  headers (see `parseRateLimit` in `src/bun/github.ts`). `resource` is
+ *  GitHub's own bucket name (e.g. "core" or "search" — the Search API has a
+ *  much tighter ~30/min budget than the ~5000/hr core budget). */
+export interface GitHubRateLimit {
+  remaining: number;
+  limit: number;
+  resource: string;
+}
+
+/** The viewer's permission level on a repo, from `GET /repos/:o/:r`'s
+ *  `permissions` object. Drives push-only-control gating (F13) — `push` is
+ *  the one the UI cares about; `admin`/`maintain` ride along for future use.
+ *  Unauthenticated (no token) resolves to all-false rather than erroring,
+ *  mirroring `getGitHubViewer`'s no-token behavior. */
+export interface GitHubRepoPermissions {
+  push: boolean;
+  admin: boolean;
+  maintain: boolean;
+}
+
 export interface GitHubListResult {
   repo: string;
   webUrl: string;
   auth: "token" | "none";
   items: GitHubListItem[];
+  /** Page number this result represents — mirrors the request's `page`
+   *  (defaults to 1). Used by the "Load more" flow to request `page + 1`. */
+  page: number;
+  /** True when another page is available beyond this one — derived from the
+   *  REST `link: rel="next"` header, or from the Search API's `total_count`
+   *  (capped at GitHub's 1000-result search ceiling). */
+  hasMore: boolean;
+  /** Rate-limit snapshot from the headers of the response that produced this
+   *  page, or null when the headers were absent. */
+  rateLimit: GitHubRateLimit | null;
 }
 
 export interface GitHubComment {

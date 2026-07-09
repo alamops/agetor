@@ -27,10 +27,12 @@ import type {
   GitHubPullMergeResult,
   GitHubPullReviewEvent,
   GitHubPullReviewThreadsResult,
+  GitHubRateLimit,
   GitHubReactionContent,
   GitHubReactionsResult,
   GitHubReactionSubject,
   GitHubReactionSummary,
+  GitHubRepoPermissions,
   GitHubReviewThread,
   GitHubSubIssue,
   GitHubSubIssuesResult,
@@ -74,6 +76,16 @@ interface ListGitHubItemsInput {
   // Raw GitHub search qualifiers typed by the user (e.g. `label:bug sort:updated`).
   // When present, forces the Search API and is appended to the composed query.
   searchQuery?: string;
+  /** 1-based page to fetch. Defaults to 1. Combined with `hasMore` on the
+   *  result, this is what drives the UI's "Load more" pagination (F16). */
+  page?: number;
+  /** Server-side sort field — passed to REST `/issues`|`/pulls` as `sort`, and
+   *  to `/search/issues` as `sort` too (search additionally supports
+   *  `reactions`, not exposed here). */
+  sort?: "created" | "updated" | "comments";
+  /** Sort direction — REST calls it `direction`, search calls it `order`;
+   *  `listGitHubItems` translates the single input field to each API's name. */
+  direction?: "asc" | "desc";
 }
 
 interface GetGitHubPullDiffInput {
@@ -305,6 +317,7 @@ type GitHubPullAutoMergeResponse = ({ ok: true; autoMergeEnabled: boolean; messa
 type GitHubPullCommitsResponse = ({ ok: true } & GitHubPullCommitsResult) | GitHubListError;
 type GitHubLinkedIssuesResponse = ({ ok: true } & GitHubLinkedIssuesResult) | GitHubListError;
 type GitHubViewerResponse = ({ ok: true; login: string }) | GitHubListError;
+type GitHubRepoPermissionsResponse = ({ ok: true } & GitHubRepoPermissions) | GitHubListError;
 type GitHubLabelsResponse = ({ ok: true } & GitHubLabelsResult) | GitHubListError;
 type GitHubLabelResponse = ({ ok: true; label: GitHubRepoLabel }) | GitHubListError;
 type GitHubAssigneesResponse = ({ ok: true } & GitHubAssigneesResult) | GitHubListError;
@@ -576,6 +589,7 @@ export const __githubInternals = {
   targetRepoIdFromGraphql,
   transferredIssueFromGraphql,
   subIssuesApiError,
+  parseRateLimit,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -727,6 +741,22 @@ function pageLinks(link: string | null): string | null {
     }
   }
   return null;
+}
+
+/** Parse GitHub's `x-ratelimit-*` response headers into a `GitHubRateLimit`,
+ *  or null when any of the three are absent (a mocked/error response, or a
+ *  non-GitHub-API response). `remaining`/`limit` are validated as finite
+ *  numbers so a malformed header value degrades to null rather than NaN
+ *  leaking into the UI. Pure — unit-tested. */
+function parseRateLimit(headers: Headers): GitHubRateLimit | null {
+  const remaining = headers.get("x-ratelimit-remaining");
+  const limit = headers.get("x-ratelimit-limit");
+  const resource = headers.get("x-ratelimit-resource");
+  if (remaining === null || limit === null || resource === null) return null;
+  const remainingNum = Number(remaining);
+  const limitNum = Number(limit);
+  if (!Number.isFinite(remainingNum) || !Number.isFinite(limitNum)) return null;
+  return { remaining: remainingNum, limit: limitNum, resource };
 }
 
 function fetchErrorMessage(e: unknown): string {
@@ -925,6 +955,11 @@ function buildSearchQuery(slug: string, input: ListGitHubItemsInput): string {
   return parts.join(" ");
 }
 
+/** GitHub's Search API never returns more than 1000 results total, regardless
+ *  of `total_count` — page*per_page hitting this ceiling means "no more",
+ *  even if `total_count` says otherwise. */
+const SEARCH_RESULT_CEILING = 1000;
+
 export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitHubListResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
@@ -940,28 +975,72 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
     return { ok: false, error: "GitHub authentication required for search / involvement filters" };
   }
 
-  let url: URL;
-  if (useSearch) {
-    // One page of 100 keeps the tighter Search rate limit (~30/min) from being
-    // hit by the 3× fan-out the list endpoints use.
-    url = new URL("https://api.github.com/search/issues");
-    url.searchParams.set("q", buildSearchQuery(slug, input));
-    url.searchParams.set("per_page", "100");
-  } else {
-    const endpoint = input.kind === "pulls" ? "pulls" : "issues";
-    url = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/${endpoint}`);
-    url.searchParams.set("state", input.state);
-    url.searchParams.set("per_page", "50");
-    if (input.kind === "issues" && labels.length > 0) url.searchParams.set("labels", labels.join(","));
-    if (input.kind === "issues" && assignee) url.searchParams.set("assignee", assignee);
-  }
+  const page = Number.isInteger(input.page) && (input.page as number) > 0 ? (input.page as number) : 1;
+  // One page of 100 keeps the tighter Search rate limit (~30/min) from being
+  // hit as hard as the higher-volume REST list endpoints.
+  const perPage = useSearch ? 100 : 50;
 
-  const maxPages = useSearch ? 1 : 3;
+  // What still has to be filtered client-side after the request comes back. In
+  // search mode the qualifiers already scoped labels/assignee/state server-side,
+  // so nothing is refined here. On the REST path, `labels`/`assignee` are only
+  // server-side for `kind:"issues"` — for pulls they're client-side — and the
+  // free-text `query` is ALWAYS client-side (matchesFilters).
+  const clientLabels = useSearch ? [] : (input.kind === "pulls" ? labels : []);
+  const clientAssignee = useSearch ? "" : (input.kind === "pulls" ? assignee : "");
+  const clientQuery = (input.query ?? "").trim();
+  const clientFiltering = !useSearch && (clientLabels.length > 0 || clientAssignee !== "" || clientQuery !== "");
+
+  // TWO FETCH MODES:
+  //  1. No client-side filtering (the Search API path always; the REST path
+  //     with no label/assignee/text filter) → fetch exactly ONE source page
+  //     that maps 1:1 to the UI `page`. `hasMore` comes straight from the
+  //     source (link header / total_count), and "Load more" advances one page.
+  //  2. Client-side filtering active (REST path only) → the raw source page is
+  //     refined by matchesFilters, so a single page can yield zero matches even
+  //     when hits live on later source pages. Fetch up to 3 source pages per UI
+  //     "page" and accumulate the post-filter matches (restoring the pre-
+  //     single-page recall). "Load more" then advances by 3-source-page blocks;
+  //     `hasMore` reflects whether the last source page fetched still had a
+  //     `next` link.
+  const sourcePagesPerBlock = clientFiltering ? 3 : 1;
+  const firstSourcePage = (page - 1) * sourcePagesPerBlock + 1;
+
+  const buildPageUrl = (sourcePage: number): string => {
+    let url: URL;
+    if (useSearch) {
+      url = new URL("https://api.github.com/search/issues");
+      url.searchParams.set("q", buildSearchQuery(slug, input));
+      url.searchParams.set("per_page", String(perPage));
+      url.searchParams.set("page", String(sourcePage));
+      // No `sort` → GitHub ranks by best-match relevance; `order` is meaningless
+      // (and ignored) without a sort, so omit it too rather than send a stray param.
+      if (input.sort) {
+        url.searchParams.set("sort", input.sort);
+        // The Search API calls direction "order"; REST calls it "direction".
+        if (input.direction) url.searchParams.set("order", input.direction);
+      }
+    } else {
+      const endpoint = input.kind === "pulls" ? "pulls" : "issues";
+      url = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/${endpoint}`);
+      url.searchParams.set("state", input.state);
+      url.searchParams.set("per_page", String(perPage));
+      url.searchParams.set("page", String(sourcePage));
+      if (input.sort) url.searchParams.set("sort", input.sort);
+      if (input.direction) url.searchParams.set("direction", input.direction);
+      if (input.kind === "issues" && labels.length > 0) url.searchParams.set("labels", labels.join(","));
+      if (input.kind === "issues" && assignee) url.searchParams.set("assignee", assignee);
+    }
+    return url.toString();
+  };
+
   const items: GitHubListItem[] = [];
-  let next: string | null = url.toString();
-  for (let page = 0; next && page < maxPages; page++) {
-    const res = await fetchGitHub(next, token, "application/vnd.github+json");
+  let hasMore = false;
+  let lastRes: Response | null = null;
+  for (let i = 0; i < sourcePagesPerBlock; i++) {
+    const sourcePage = firstSourcePage + i;
+    const res = await fetchGitHub(buildPageUrl(sourcePage), token, "application/vnd.github+json");
     if (!("status" in res)) return res;
+    lastRes = res;
     const body = await res.json().catch(() => null);
     if (!res.ok) {
       let msg = body && typeof body === "object" && "message" in body
@@ -981,10 +1060,6 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
       ? (body && typeof body === "object" && Array.isArray((body as { items?: unknown }).items) ? (body as { items: unknown[] }).items : null)
       : (Array.isArray(body) ? body : null);
     if (!raws) return { ok: false, error: "GitHub returned an unexpected response" };
-    // In search mode the qualifiers already scoped labels/assignee server-side,
-    // so only the free-text query is refined client-side.
-    const clientLabels = useSearch ? [] : (input.kind === "pulls" ? labels : []);
-    const clientAssignee = useSearch ? "" : (input.kind === "pulls" ? assignee : "");
     for (const raw of raws) {
       if (!useSearch && input.kind === "issues" && raw && typeof raw === "object" && "pull_request" in raw) continue;
       const item = normalizeItem(input.kind, raw);
@@ -992,7 +1067,22 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
         items.push(item);
       }
     }
-    next = pageLinks(res.headers.get("link"));
+
+    if (useSearch) {
+      // The Search API path is always single-page — derive hasMore from
+      // total_count (capped at GitHub's 1000-result search ceiling).
+      const totalCount = body && typeof body === "object" && typeof (body as { total_count?: unknown }).total_count === "number"
+        ? (body as { total_count: number }).total_count
+        : raws.length;
+      const seenThroughThisPage = page * perPage;
+      hasMore = seenThroughThisPage < totalCount && seenThroughThisPage < SEARCH_RESULT_CEILING;
+      break;
+    }
+    // REST: hasMore tracks whether the LAST source page we fetched still points
+    // at a next page. Stop early once the source is exhausted.
+    const nextLink = pageLinks(res.headers.get("link"));
+    hasMore = nextLink != null;
+    if (!nextLink) break;
   }
 
   return {
@@ -1001,6 +1091,9 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
     webUrl: `https://github.com/${slug}`,
     auth: token ? "token" : "none",
     items,
+    page,
+    hasMore,
+    rateLimit: lastRes ? parseRateLimit(lastRes.headers) : null,
   };
 }
 
@@ -2253,6 +2346,33 @@ export async function getGitHubViewer(input: { dir: string }): Promise<GitHubVie
     ? (json as { login: string }).login
     : "";
   return { ok: true, login };
+}
+
+/** The viewer's push/admin/maintain permission on the repo, from `GET
+ *  /repos/:o/:r`'s `permissions` object — drives push-only-control gating
+ *  (F13). Unauthenticated (no token) returns all-false rather than erroring,
+ *  mirroring `getGitHubViewer`'s no-token behavior; a public repo is still
+ *  readable without a token, but the viewer plainly can't push to it. */
+export async function getGitHubRepoPermissions(input: { dir: string }): Promise<GitHubRepoPermissionsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const token = await githubToken();
+  if (!token) return { ok: true, push: false, admin: false, maintain: false };
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const perms = json && typeof json === "object" && (json as { permissions?: unknown }).permissions
+    && typeof (json as { permissions?: unknown }).permissions === "object"
+    ? (json as { permissions: Record<string, unknown> }).permissions
+    : {};
+  return {
+    ok: true,
+    push: perms.push === true,
+    admin: perms.admin === true,
+    maintain: perms.maintain === true,
+  };
 }
 
 /** `/issues/comments/:id` for a conversation comment, `/pulls/comments/:id` for

@@ -10,8 +10,10 @@ import {
   applyGitHubSuggestion,
   getGitHubIssuePinned,
   getGitHubPullLinkedIssues,
+  getGitHubRepoPermissions,
   getGitHubViewer,
   listGitHubAssignees,
+  listGitHubItems,
   listGitHubLabels,
   listGitHubMilestones,
   listGitHubPullCommits,
@@ -909,6 +911,297 @@ test("transferGitHubIssue surfaces a friendly error when the target repo isn't f
       ok: false,
       error: 'Target repository "dest/missing" wasn\'t found or isn\'t accessible.',
     });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubRepoPermissions hits /repos/:o/:r and reads the permissions object (push:true)", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "https://api.github.com/repos/acme/widgets",
+      json: { permissions: { push: true, admin: false, maintain: true } },
+    },
+  ]);
+  try {
+    const res = await getGitHubRepoPermissions({ dir: REPO_DIR });
+    expect(res).toEqual({ ok: true, push: true, admin: false, maintain: true });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets");
+    expect(mock.calls[0]!.headers.authorization).toBe("Bearer test-token");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubRepoPermissions reads push:false for a read-only collaborator", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "https://api.github.com/repos/acme/widgets",
+      json: { permissions: { push: false, admin: false, maintain: false, pull: true } },
+    },
+  ]);
+  try {
+    const res = await getGitHubRepoPermissions({ dir: REPO_DIR });
+    expect(res).toEqual({ ok: true, push: false, admin: false, maintain: false });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubRepoPermissions returns all-false without a network call when unauthenticated", async () => {
+  const priorToken = process.env.GITHUB_TOKEN;
+  const priorGhToken = process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getGitHubRepoPermissions({ dir: REPO_DIR });
+    expect(res).toEqual({ ok: true, push: false, admin: false, maintain: false });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+    if (priorToken !== undefined) process.env.GITHUB_TOKEN = priorToken;
+    if (priorGhToken !== undefined) process.env.GH_TOKEN = priorGhToken;
+  }
+});
+
+test("listGitHubItems (REST path) puts sort/direction/page in the query string and derives hasMore from the link header", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/issues",
+      json: [
+        { number: 1, title: "First", state: "open", html_url: "https://github.com/acme/widgets/issues/1" },
+      ],
+      headers: {
+        link: '<https://api.github.com/repos/acme/widgets/issues?page=3>; rel="next"',
+        "x-ratelimit-remaining": "4990",
+        "x-ratelimit-limit": "5000",
+        "x-ratelimit-resource": "core",
+      },
+    },
+  ]);
+  try {
+    const res = await listGitHubItems({
+      dir: REPO_DIR,
+      kind: "issues",
+      state: "open",
+      page: 2,
+      sort: "updated",
+      direction: "asc",
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.page).toBe(2);
+    expect(res.hasMore).toBe(true);
+    expect(res.rateLimit).toEqual({ remaining: 4990, limit: 5000, resource: "core" });
+    const call = mock.calls[0]!;
+    const q = new URL(call.url).searchParams;
+    expect(q.get("sort")).toBe("updated");
+    expect(q.get("direction")).toBe("asc");
+    expect(q.get("page")).toBe("2");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubItems (REST path) hasMore is false when the response has no next link", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/pulls",
+      json: [{ number: 1, title: "First", state: "open", html_url: "https://github.com/acme/widgets/pull/1" }],
+    },
+  ]);
+  try {
+    const res = await listGitHubItems({ dir: REPO_DIR, kind: "pulls", state: "open" });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.hasMore).toBe(false);
+    expect(res.page).toBe(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubItems (search path) puts sort/order/page in the query string and derives hasMore from total_count", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "https://api.github.com/search/issues",
+      json: {
+        total_count: 250,
+        items: [{ number: 1, title: "First", state: "open", html_url: "https://github.com/acme/widgets/issues/1" }],
+      },
+      headers: {
+        "x-ratelimit-remaining": "27",
+        "x-ratelimit-limit": "30",
+        "x-ratelimit-resource": "search",
+      },
+    },
+  ]);
+  try {
+    const res = await listGitHubItems({
+      dir: REPO_DIR,
+      kind: "issues",
+      state: "open",
+      createdByMe: true,
+      page: 1,
+      sort: "comments",
+      direction: "desc",
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.hasMore).toBe(true); // 1*100 = 100 < 250
+    expect(res.rateLimit).toEqual({ remaining: 27, limit: 30, resource: "search" });
+    const call = mock.calls[0]!;
+    const q = new URL(call.url).searchParams;
+    expect(q.get("sort")).toBe("comments");
+    expect(q.get("order")).toBe("desc");
+    expect(q.get("page")).toBe("1");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubItems (search path) hasMore is false once total_count is exhausted", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "https://api.github.com/search/issues",
+      json: {
+        total_count: 5,
+        items: [{ number: 1, title: "First", state: "open", html_url: "https://github.com/acme/widgets/issues/1" }],
+      },
+    },
+  ]);
+  try {
+    const res = await listGitHubItems({ dir: REPO_DIR, kind: "issues", state: "open", createdByMe: true, page: 1 });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.hasMore).toBe(false); // 1*100 = 100 >= 5
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubItems returns rateLimit: null when the response has no rate-limit headers", async () => {
+  const mock = mockGitHubFetch([
+    { match: "/repos/acme/widgets/pulls", json: [] },
+  ]);
+  try {
+    const res = await listGitHubItems({ dir: REPO_DIR, kind: "pulls", state: "open" });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.rateLimit).toBeNull();
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubItems (REST path, client-side text filter) fans out up to 3 source pages and accumulates matches", async () => {
+  // A free-text `query` is refined client-side via matchesFilters, so a match
+  // that lives on a later source page must still surface — the single page-1
+  // fetch would otherwise show zero. Three source pages are fetched for one UI
+  // page; hasMore comes from the LAST source page's link header.
+  const mock = mockGitHubFetch([
+    {
+      match: "&page=1",
+      json: [{ number: 1, title: "unrelated", state: "open", html_url: "https://github.com/acme/widgets/pull/1" }],
+      headers: { link: '<https://api.github.com/repos/acme/widgets/pulls?page=2>; rel="next"' },
+    },
+    {
+      match: "&page=2",
+      json: [{ number: 2, title: "foo two", state: "open", html_url: "https://github.com/acme/widgets/pull/2" }],
+      headers: { link: '<https://api.github.com/repos/acme/widgets/pulls?page=3>; rel="next"' },
+    },
+    {
+      match: "&page=3",
+      json: [{ number: 3, title: "foo three", state: "open", html_url: "https://github.com/acme/widgets/pull/3" }],
+      headers: { link: '<https://api.github.com/repos/acme/widgets/pulls?page=4>; rel="next"' },
+    },
+  ]);
+  try {
+    const res = await listGitHubItems({ dir: REPO_DIR, kind: "pulls", state: "open", query: "foo" });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(mock.calls).toHaveLength(3); // fanned out across 3 source pages
+    expect(res.items.map((i) => i.number)).toEqual([2, 3]); // page-1 item filtered out
+    expect(res.hasMore).toBe(true); // 3rd source page still had a next link
+    expect(res.page).toBe(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubItems (REST path, client filter) stops early and reports hasMore:false when a source page has no next link", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "&page=1",
+      json: [{ number: 1, title: "foo one", state: "open", html_url: "https://github.com/acme/widgets/pull/1" }],
+      headers: { link: '<https://api.github.com/repos/acme/widgets/pulls?page=2>; rel="next"' },
+    },
+    {
+      // No link header → the source is exhausted; the 3rd fetch never happens.
+      match: "&page=2",
+      json: [{ number: 2, title: "foo two", state: "open", html_url: "https://github.com/acme/widgets/pull/2" }],
+    },
+  ]);
+  try {
+    const res = await listGitHubItems({ dir: REPO_DIR, kind: "pulls", state: "open", query: "foo" });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(mock.calls).toHaveLength(2); // stopped at the page with no next link
+    expect(res.items.map((i) => i.number)).toEqual([1, 2]);
+    expect(res.hasMore).toBe(false);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubItems (REST path, client filter) load-more advances by 3-source-page blocks", async () => {
+  // UI page 2 with client filtering active → source pages 4, 5, 6.
+  const mock = mockGitHubFetch([
+    {
+      match: "&page=4",
+      json: [{ number: 4, title: "foo four", state: "open", html_url: "https://github.com/acme/widgets/pull/4" }],
+      headers: { link: '<https://api.github.com/repos/acme/widgets/pulls?page=5>; rel="next"' },
+    },
+    {
+      match: "&page=5",
+      json: [{ number: 5, title: "nope", state: "open", html_url: "https://github.com/acme/widgets/pull/5" }],
+      headers: { link: '<https://api.github.com/repos/acme/widgets/pulls?page=6>; rel="next"' },
+    },
+    {
+      match: "&page=6",
+      json: [{ number: 6, title: "foo six", state: "open", html_url: "https://github.com/acme/widgets/pull/6" }],
+    },
+  ]);
+  try {
+    const res = await listGitHubItems({ dir: REPO_DIR, kind: "pulls", state: "open", query: "foo", page: 2 });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(mock.calls).toHaveLength(3);
+    expect(res.items.map((i) => i.number)).toEqual([4, 6]);
+    expect(res.hasMore).toBe(false);
+    expect(res.page).toBe(2);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubItems (REST path, no client filter) fetches exactly one source page", async () => {
+  // No labels/assignee/text filter → clean single-page + load-more mode.
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/pulls",
+      json: [{ number: 1, title: "anything", state: "open", html_url: "https://github.com/acme/widgets/pull/1" }],
+      headers: { link: '<https://api.github.com/repos/acme/widgets/pulls?page=2>; rel="next"' },
+    },
+  ]);
+  try {
+    const res = await listGitHubItems({ dir: REPO_DIR, kind: "pulls", state: "open" });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(mock.calls).toHaveLength(1); // single page despite the next link
+    expect(res.hasMore).toBe(true);
   } finally {
     mock.restore();
   }

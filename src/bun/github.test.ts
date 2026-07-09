@@ -35,6 +35,7 @@ const {
   targetRepoIdFromGraphql,
   transferredIssueFromGraphql,
   subIssuesApiError,
+  parseRateLimit,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -604,4 +605,31 @@ test("subIssuesApiError maps 404/410 to a feature-gated friendly message, else f
     .toBe("Sub-issues aren't available here — the feature may not be enabled for this repository, or the issue doesn't exist.");
   expect(subIssuesApiError({ message: "Validation Failed" }, 422, "Unprocessable Entity")).toBe("Validation Failed");
   expect(subIssuesApiError(null, 500, "Internal Server Error")).toBe("500 Internal Server Error");
+});
+
+test("parseRateLimit reads remaining/limit/resource when all three headers are present", () => {
+  const headers = new Headers({
+    "x-ratelimit-remaining": "27",
+    "x-ratelimit-limit": "30",
+    "x-ratelimit-resource": "search",
+  });
+  expect(parseRateLimit(headers)).toEqual({ remaining: 27, limit: 30, resource: "search" });
+});
+
+test("parseRateLimit returns null when the headers are absent", () => {
+  expect(parseRateLimit(new Headers())).toBeNull();
+});
+
+test("parseRateLimit returns null when only some of the three headers are present", () => {
+  expect(parseRateLimit(new Headers({ "x-ratelimit-remaining": "27" }))).toBeNull();
+  expect(parseRateLimit(new Headers({ "x-ratelimit-remaining": "27", "x-ratelimit-limit": "30" }))).toBeNull();
+});
+
+test("parseRateLimit returns null on a non-numeric remaining/limit value", () => {
+  const headers = new Headers({
+    "x-ratelimit-remaining": "not-a-number",
+    "x-ratelimit-limit": "30",
+    "x-ratelimit-resource": "core",
+  });
+  expect(parseRateLimit(headers)).toBeNull();
 });

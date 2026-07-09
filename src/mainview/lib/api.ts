@@ -33,6 +33,7 @@ import type {
   GitHubReactionsResult,
   GitHubReactionSubject,
   GitHubReactionSummary,
+  GitHubRepoPermissions,
   GitHubSubIssue,
   GitHubSubIssuesResult,
   Harness,
@@ -91,6 +92,7 @@ export type {
   GitHubReactionsResult,
   GitHubReactionSubject,
   GitHubReactionSummary,
+  GitHubRepoPermissions,
   GitHubSubIssue,
   GitHubSubIssuesResult,
 };
@@ -338,6 +340,9 @@ export const api = {
     assignedToMe?: boolean;
     reviewRequested?: boolean;
     searchQuery?: string;
+    page?: number;
+    sort?: "created" | "updated" | "comments";
+    direction?: "asc" | "desc";
   }) => {
     const q = new URLSearchParams({
       path: input.path,
@@ -351,7 +356,14 @@ export const api = {
     if (input.assignedToMe) q.set("assignedToMe", "1");
     if (input.reviewRequested) q.set("reviewRequested", "1");
     if (input.searchQuery) q.set("searchQuery", input.searchQuery);
+    if (input.page) q.set("page", String(input.page));
+    if (input.sort) q.set("sort", input.sort);
+    if (input.direction) q.set("direction", input.direction);
     return j<GitHubListResult>(`/github/items?${q.toString()}`);
+  },
+  getGitHubRepoPermissions: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<{ ok: true } & GitHubRepoPermissions>(`/github/repo-permissions?${q.toString()}`);
   },
   getGitHubPullDiff: (input: { path: string; number: number }) => {
     const q = new URLSearchParams({

@@ -3,8 +3,10 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   AlertCircle,
+  ArrowDownWideNarrow,
   ArrowRightLeft,
   ArrowUpFromLine,
+  ArrowUpWideNarrow,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -60,6 +62,7 @@ import type {
   GitHubPullCommit,
   GitHubPullLineComment,
   GitHubPullMergeability,
+  GitHubRateLimit,
   GitHubRepoLabel,
   GitHubRepoMilestone,
   GitHubReviewThread,
@@ -294,6 +297,25 @@ function hasSuggestion(body: string): boolean {
   return /```suggestion\r?\n/.test(body);
 }
 
+// Shared tooltip for every push-only control disabled by F13 gating.
+const PUSH_ONLY_TITLE = "Requires write access to this repository";
+
+/** Subtle "API: 4823/5000" (or "search: 27/30") indicator (F17). Muted by
+ *  default; tints amber when remaining budget drops under 10% of the limit —
+ *  the Search API's ~30/min ceiling is small enough that this can trip during
+ *  normal use, which is the point of surfacing it at all. */
+function RateLimitBadge({ rateLimit }: { rateLimit: GitHubRateLimit }) {
+  const low = rateLimit.limit > 0 && rateLimit.remaining / rateLimit.limit < 0.1;
+  return (
+    <span
+      className={cn("shrink-0 text-[11px]", low ? "font-medium text-amber-400" : "text-muted-foreground")}
+      title={`GitHub API rate limit (${rateLimit.resource}): ${rateLimit.remaining} of ${rateLimit.limit} requests remaining`}
+    >
+      {rateLimit.resource}: {rateLimit.remaining}/{rateLimit.limit}
+    </span>
+  );
+}
+
 export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Props) {
   const [projectPath, setProjectPath] = useState("");
   const [kind, setKind] = useState<GitHubItemKind>("pulls");
@@ -318,6 +340,26 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // Authenticated user's login, so edit/delete controls appear only on the
   // viewer's own comments. Empty when unauthenticated.
   const [viewerLogin, setViewerLogin] = useState("");
+  // Whether the viewer has push access to the current repo (F13). Optimistic
+  // (true) while unresolved so controls aren't disabled during the brief
+  // window before the permissions check lands — only flips to `false` once
+  // resolved, never hides a control (see `canPushResolvedFor` below).
+  const [canPush, setCanPush] = useState(true);
+  // Sort field + direction (F16) — re-fetches page 1 on change, like the other
+  // filters below. "best-match" is the default: it omits sort/order entirely so
+  // the Search API returns relevance-ranked results for free-text queries (and
+  // the REST path falls back to its own created-desc default). The api client
+  // maps "best-match" to "no sort param".
+  const [sortField, setSortField] = useState<"best-match" | "created" | "updated" | "comments">("best-match");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
+  // Tracks in-flight/finished "Load more" fetches, separate from the initial
+  // `loading` flag so the existing list stays visible while more loads.
+  const [loadingMore, setLoadingMore] = useState(false);
+  // True during the 250ms filter/sort debounce window, before the reload fetch
+  // actually starts. "Load more" is gated on this: the debounce effect bumps
+  // requestSeq up front, so a load-more click in the window would otherwise
+  // out-race (and silently drop) the pending reload for the new filters.
+  const [reloadPending, setReloadPending] = useState(false);
   // All repo labels (powers the label datalist + the label manager).
   const [repoLabels, setRepoLabels] = useState<GitHubRepoLabel[]>([]);
   const [labelManagerOpen, setLabelManagerOpen] = useState(false);
@@ -332,6 +374,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // (e.g. the first project has no GitHub remote) leaves it unresolved so a later
   // project with a remote can still fill it in.
   const viewerResolved = useRef(false);
+  // Push access is per-repo (unlike the viewer's login), so this caches the
+  // project path it was last resolved for rather than a plain boolean —
+  // switching projects re-resolves. A failed lookup leaves it unresolved so
+  // the effect retries on the next render for that same project.
+  const canPushResolvedFor = useRef<string | null>(null);
   const requestSeq = useRef(0);
   const diffSeq = useRef(0);
   const commentSeq = useRef(0);
@@ -439,10 +486,20 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     });
   }, [open, initialProjectPath, projects]);
 
-  const load = async (requestId = ++requestSeq.current) => {
+  // `page`/`append` power the "Load more" flow (F16): a plain refresh or a
+  // filter/sort change always fetches page 1 and replaces `result`; "Load
+  // more" fetches `page + 1` and appends, deduped by kind+number in case a
+  // page boundary shifted between requests. `requestId` reuses the existing
+  // request-seq guard so a stale in-flight page (e.g. the user changed a
+  // filter while "Load more" was still loading) can't land after a newer
+  // fetch has already replaced the list.
+  const load = async (opts?: { requestId?: number; page?: number; append?: boolean }) => {
     if (!projectPath) return;
+    const requestId = opts?.requestId ?? ++requestSeq.current;
     if (requestId !== requestSeq.current) return;
-    setLoading(true);
+    const append = !!opts?.append;
+    const targetPage = opts?.page ?? 1;
+    if (append) setLoadingMore(true); else setLoading(true);
     setError(null);
     try {
       const next = await api.listGitHubItems({
@@ -458,28 +515,48 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         createdByMe,
         assignedToMe,
         reviewRequested: kind === "pulls" && reviewRequested,
+        page: targetPage,
+        // "best-match" → omit the sort param entirely (relevance on search,
+        // created-desc default on REST).
+        sort: sortField === "best-match" ? undefined : sortField,
+        direction: sortDirection,
       });
       if (requestId !== requestSeq.current) return;
-      setResult(next);
+      setResult((cur) => {
+        if (!append || !cur) return next;
+        const seen = new Set(cur.items.map((it) => `${it.kind}-${it.number}`));
+        const appended = next.items.filter((it) => !seen.has(`${it.kind}-${it.number}`));
+        return { ...next, items: [...cur.items, ...appended] };
+      });
     } catch (e) {
       if (requestId !== requestSeq.current) return;
-      setResult(null);
+      if (!append) setResult(null);
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      if (requestId === requestSeq.current) setLoading(false);
+      if (requestId === requestSeq.current) {
+        if (append) setLoadingMore(false); else setLoading(false);
+      }
     }
+  };
+
+  const loadMore = () => {
+    if (!result || !result.hasMore || loading || loadingMore || reloadPending) return;
+    const requestId = ++requestSeq.current;
+    void load({ requestId, page: result.page + 1, append: true });
   };
 
   useEffect(() => {
     const requestId = ++requestSeq.current;
     if (!open || !projectPath) {
       setLoading(false);
+      setReloadPending(false);
       return;
     }
-    const t = setTimeout(() => { void load(requestId); }, 250);
+    setReloadPending(true);
+    const t = setTimeout(() => { setReloadPending(false); void load({ requestId }); }, 250);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested]);
+  }, [open, projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested, sortField, sortDirection]);
 
   useEffect(() => {
     diffSeq.current += 1;
@@ -539,7 +616,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setTransferDrafts({});
     setTransferConfirm({});
     setTransferNotice(null);
-  }, [projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested]);
+  }, [projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested, sortField, sortDirection]);
 
   // "Review requested" is a PR-only qualifier — drop it when viewing issues.
   useEffect(() => {
@@ -599,6 +676,28 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       .then((r) => { if (!cancelled) { setViewerLogin(r.login); viewerResolved.current = true; } })
       // Leave unresolved on failure (e.g. no remote) so a later project retries.
       .catch(() => { /* keep the current (empty) login */ });
+    return () => { cancelled = true; };
+  }, [open, projectPath]);
+
+  // Push access (F13) is per-repo, so re-resolve on every project switch —
+  // unlike the viewer login above. Stays optimistic (canPush=true) while a
+  // fresh project's check is in flight so controls aren't disabled during
+  // that brief window; only flips to disabled once resolved false.
+  useEffect(() => {
+    if (!open || !projectPath || canPushResolvedFor.current === projectPath) return;
+    let cancelled = false;
+    setCanPush(true);
+    api.getGitHubRepoPermissions({ path: projectPath })
+      .then((r) => {
+        if (cancelled) return;
+        setCanPush(r.push);
+        canPushResolvedFor.current = projectPath;
+      })
+      // Leave unresolved on failure (e.g. no remote): `canPushResolvedFor` isn't
+      // set, so this project re-resolves the next time the effect's deps change
+      // (a project switch back to it, or the dialog reopening) rather than
+      // caching a wrongly-optimistic value permanently.
+      .catch(() => { /* keep the current (optimistic) canPush */ });
     return () => { cancelled = true; };
   }, [open, projectPath]);
 
@@ -1578,11 +1677,14 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             <GitPullRequest className="size-4 shrink-0 text-muted-foreground" />
             GitHub
           </div>
-          <div className="mt-0.5 truncate text-xs text-muted-foreground">
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 truncate text-xs text-muted-foreground">
             {result ? (
               <>
-                {result.repo}
-                {result.auth === "none" && " · unauthenticated"}
+                <span className="truncate">
+                  {result.repo}
+                  {result.auth === "none" && " · unauthenticated"}
+                </span>
+                {result.rateLimit && <RateLimitBadge rateLimit={result.rateLimit} />}
               </>
             ) : (
               "Pull requests and issues"
@@ -1723,6 +1825,31 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           placeholder="Assignee"
           className="h-8 text-xs"
         />
+        <div className="flex items-center gap-1.5 md:col-span-2">
+          <span className="text-[11px] text-muted-foreground">Sort:</span>
+          <Select
+            value={sortField}
+            onChange={(e) => setSortField(e.target.value as "best-match" | "created" | "updated" | "comments")}
+            title="Sort by"
+            aria-label="Sort by"
+            className="h-8 w-32 text-xs"
+          >
+            <option value="best-match">Best match</option>
+            <option value="created">Created</option>
+            <option value="updated">Updated</option>
+            <option value="comments">Comments</option>
+          </Select>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-8"
+            title={sortDirection === "desc" ? "Descending — click for ascending" : "Ascending — click for descending"}
+            aria-label="Toggle sort direction"
+            onClick={() => setSortDirection((d) => (d === "desc" ? "asc" : "desc"))}
+          >
+            {sortDirection === "desc" ? <ArrowDownWideNarrow className="size-3.5" /> : <ArrowUpWideNarrow className="size-3.5" />}
+          </Button>
+        </div>
         <datalist id="github-dialog-labels">
           {availableLabels.map((label) => <option key={label} value={label} />)}
         </datalist>
@@ -1775,7 +1902,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         {labelManagerOpen && (
           <LabelManager
             labels={repoLabels}
-            authenticated={result?.auth !== "none"}
+            authenticated={canPush}
             onCreate={createLabel}
             onEdit={editLabel}
             onDelete={removeLabel}
@@ -1786,7 +1913,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         {milestoneManagerOpen && (
           <MilestoneManager
             milestones={repoMilestones}
-            authenticated={result?.auth !== "none"}
+            authenticated={canPush}
             onCreate={createMilestone}
             onEdit={editMilestone}
             onDelete={removeMilestone}
@@ -2034,8 +2161,17 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                   const key = `${item.kind}-${item.number}`;
                   setExpandedKey((cur) => (cur === key ? null : key));
                 }}
+                canPush={canPush}
               />
             ))}
+            {result.hasMore && (
+              <div className="flex justify-center py-1">
+                <Button size="sm" variant="outline" disabled={loadingMore || loading || reloadPending} onClick={loadMore}>
+                  {loadingMore ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : null}
+                  Load more
+                </Button>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -2327,8 +2463,9 @@ function LabelManager({
   onClose,
 }: {
   labels: GitHubRepoLabel[];
-  // A token is present. Note: GitHub still enforces push access — a read-only
-  // collaborator sees the controls but the mutations 403.
+  // The viewer has push access to this repo (F13). Controls stay visible but
+  // disabled (with a tooltip) when false, rather than hidden, so the UI still
+  // communicates the capability exists.
   authenticated: boolean;
   onCreate: (name: string, color: string, description: string) => Promise<void>;
   onEdit: (name: string, patch: { newName?: string; color?: string; description?: string }) => Promise<void>;
@@ -2375,20 +2512,23 @@ function LabelManager({
           </Button>
         </div>
       </div>
-      {authenticated && (
-        <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)_auto]">
-          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" className="h-8 text-xs" disabled={creating} />
-          <div className="flex items-center gap-1">
-            <span className="size-4 shrink-0 rounded-full border border-border/60" style={{ backgroundColor: labelSwatch(color) }} />
-            <Input value={color} onChange={(e) => setColor(e.target.value)} placeholder="hex" className="h-8 w-20 text-xs" disabled={creating} />
-          </div>
-          <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description (optional)" className="h-8 text-xs" disabled={creating} />
-          <Button size="sm" disabled={creating || !name.trim()} onClick={() => { void create(); }}>
-            {creating ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
-            Add
-          </Button>
+      <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)_auto]">
+        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" className="h-8 text-xs" disabled={creating || !authenticated} />
+        <div className="flex items-center gap-1">
+          <span className="size-4 shrink-0 rounded-full border border-border/60" style={{ backgroundColor: labelSwatch(color) }} />
+          <Input value={color} onChange={(e) => setColor(e.target.value)} placeholder="hex" className="h-8 w-20 text-xs" disabled={creating || !authenticated} />
         </div>
-      )}
+        <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description (optional)" className="h-8 text-xs" disabled={creating || !authenticated} />
+        <Button
+          size="sm"
+          disabled={creating || !name.trim() || !authenticated}
+          title={authenticated ? undefined : PUSH_ONLY_TITLE}
+          onClick={() => { void create(); }}
+        >
+          {creating ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
+          Add
+        </Button>
+      </div>
       {error && (
         <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
           <AlertCircle className="size-3.5" />
@@ -2494,27 +2634,41 @@ function LabelRow({
       </span>
       {label.description && <span className="min-w-0 flex-1 truncate text-muted-foreground">{label.description}</span>}
       {error && <span className="truncate text-[11px] text-rose-400">{error}</span>}
-      {authenticated && (
-        <div className="ml-auto flex shrink-0 items-center gap-1">
-          <Button size="icon" variant="ghost" className="size-6" title="Edit label" aria-label={`Edit ${label.name}`} disabled={!!busy} onClick={() => { reset(); setEditing(true); }}>
-            <FilePen className="size-3.5" />
-          </Button>
-          {confirm ? (
-            <>
-              <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-rose-400" disabled={busy === "delete"} onClick={() => { void del(); }}>
-                {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : "Confirm"}
-              </Button>
-              <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" disabled={busy === "delete"} onClick={() => setConfirm(false)}>
-                Cancel
-              </Button>
-            </>
-          ) : (
-            <Button size="icon" variant="ghost" className="size-6 text-muted-foreground hover:text-rose-400" title="Delete label" aria-label={`Delete ${label.name}`} disabled={!!busy} onClick={() => setConfirm(true)}>
-              <XCircle className="size-3.5" />
+      <div className="ml-auto flex shrink-0 items-center gap-1">
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-6"
+          title={authenticated ? "Edit label" : PUSH_ONLY_TITLE}
+          aria-label={`Edit ${label.name}`}
+          disabled={!!busy || !authenticated}
+          onClick={() => { reset(); setEditing(true); }}
+        >
+          <FilePen className="size-3.5" />
+        </Button>
+        {confirm ? (
+          <>
+            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-rose-400" disabled={busy === "delete"} onClick={() => { void del(); }}>
+              {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : "Confirm"}
             </Button>
-          )}
-        </div>
-      )}
+            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" disabled={busy === "delete"} onClick={() => setConfirm(false)}>
+              Cancel
+            </Button>
+          </>
+        ) : (
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-6 text-muted-foreground hover:text-rose-400"
+            title={authenticated ? "Delete label" : PUSH_ONLY_TITLE}
+            aria-label={`Delete ${label.name}`}
+            disabled={!!busy || !authenticated}
+            onClick={() => setConfirm(true)}
+          >
+            <XCircle className="size-3.5" />
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
@@ -2585,17 +2739,20 @@ function MilestoneManager({
           </Button>
         </div>
       </div>
-      {authenticated && (
-        <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)_auto]">
-          <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" className="h-8 text-xs" disabled={creating} />
-          <Input type="date" value={dueOn} onChange={(e) => setDueOn(e.target.value)} title="Due date (optional)" className="h-8 w-36 text-xs" disabled={creating} />
-          <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description (optional)" className="h-8 text-xs" disabled={creating} />
-          <Button size="sm" disabled={creating || !title.trim()} onClick={() => { void create(); }}>
-            {creating ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
-            Add
-          </Button>
-        </div>
-      )}
+      <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1.4fr)_auto]">
+        <Input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" className="h-8 text-xs" disabled={creating || !authenticated} />
+        <Input type="date" value={dueOn} onChange={(e) => setDueOn(e.target.value)} title="Due date (optional)" className="h-8 w-36 text-xs" disabled={creating || !authenticated} />
+        <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description (optional)" className="h-8 text-xs" disabled={creating || !authenticated} />
+        <Button
+          size="sm"
+          disabled={creating || !title.trim() || !authenticated}
+          title={authenticated ? undefined : PUSH_ONLY_TITLE}
+          onClick={() => { void create(); }}
+        >
+          {creating ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
+          Add
+        </Button>
+      </div>
       {error && (
         <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
           <AlertCircle className="size-3.5" />
@@ -2722,37 +2879,51 @@ function MilestoneRow({
         {milestone.dueOn && ` · due ${dueDateInput(milestone.dueOn)}`}
       </span>
       {error && <span className="truncate text-[11px] text-rose-400">{error}</span>}
-      {authenticated && (
-        <div className="ml-auto flex shrink-0 items-center gap-1">
-          <Button size="icon" variant="ghost" className="size-6" title="Edit milestone" aria-label={`Edit ${milestone.title}`} disabled={!!busy} onClick={() => { reset(); setEditing(true); }}>
-            <FilePen className="size-3.5" />
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-6 px-1.5 text-[11px]"
-            title={milestone.state === "open" ? "Close milestone" : "Reopen milestone"}
-            disabled={!!busy}
-            onClick={() => { void toggleState(); }}
-          >
-            {busy === "state" ? <Loader2 className="size-3 animate-spin" /> : milestone.state === "open" ? "Close" : "Reopen"}
-          </Button>
-          {confirm ? (
-            <>
-              <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-rose-400" disabled={busy === "delete"} onClick={() => { void del(); }}>
-                {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : "Confirm"}
-              </Button>
-              <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" disabled={busy === "delete"} onClick={() => setConfirm(false)}>
-                Cancel
-              </Button>
-            </>
-          ) : (
-            <Button size="icon" variant="ghost" className="size-6 text-muted-foreground hover:text-rose-400" title="Delete milestone" aria-label={`Delete ${milestone.title}`} disabled={!!busy} onClick={() => setConfirm(true)}>
-              <XCircle className="size-3.5" />
+      <div className="ml-auto flex shrink-0 items-center gap-1">
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-6"
+          title={authenticated ? "Edit milestone" : PUSH_ONLY_TITLE}
+          aria-label={`Edit ${milestone.title}`}
+          disabled={!!busy || !authenticated}
+          onClick={() => { reset(); setEditing(true); }}
+        >
+          <FilePen className="size-3.5" />
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 px-1.5 text-[11px]"
+          title={authenticated ? (milestone.state === "open" ? "Close milestone" : "Reopen milestone") : PUSH_ONLY_TITLE}
+          disabled={!!busy || !authenticated}
+          onClick={() => { void toggleState(); }}
+        >
+          {busy === "state" ? <Loader2 className="size-3 animate-spin" /> : milestone.state === "open" ? "Close" : "Reopen"}
+        </Button>
+        {confirm ? (
+          <>
+            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-rose-400" disabled={busy === "delete"} onClick={() => { void del(); }}>
+              {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : "Confirm"}
             </Button>
-          )}
-        </div>
-      )}
+            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" disabled={busy === "delete"} onClick={() => setConfirm(false)}>
+              Cancel
+            </Button>
+          </>
+        ) : (
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-6 text-muted-foreground hover:text-rose-400"
+            title={authenticated ? "Delete milestone" : PUSH_ONLY_TITLE}
+            aria-label={`Delete ${milestone.title}`}
+            disabled={!!busy || !authenticated}
+            onClick={() => setConfirm(true)}
+          >
+            <XCircle className="size-3.5" />
+          </Button>
+        )}
+      </div>
     </div>
   );
 }
@@ -2860,6 +3031,7 @@ function GitHubItemRow({
   onRefreshMergeability,
   onRetryCommits,
   onToggle,
+  canPush,
 }: {
   item: GitHubListItem;
   projectPath: string;
@@ -2963,8 +3135,17 @@ function GitHubItemRow({
   onRefreshMergeability: () => void;
   onRetryCommits: () => void;
   onToggle: () => void;
+  // Whether the viewer has push access to this repo (F13). Threaded down to
+  // every push-only control this row renders (merge, lock, pin, transfer,
+  // sub-issues, reviewers, triage save, apply-suggestion, …).
+  canPush: boolean;
 }) {
   const merged = item.kind === "pulls" && !!item.mergedAt;
+  // The item's own author may close/reopen and edit the title/body of their own
+  // issue/PR without repo push access — so those specific controls gate on this
+  // wider flag, while genuinely push-only actions (merge, lock, pin, transfer,
+  // labels/milestones, reviewers, auto-merge) stay on `canPush` alone.
+  const canModifyOwn = canPush || (!!viewerLogin && item.author?.login === viewerLogin);
   const stateClass = item.state === "open"
     ? "text-emerald-400"
     : merged
@@ -3053,7 +3234,14 @@ function GitHubItemRow({
               {item.kind === "pulls" ? "Pull request" : "Issue"} #{item.number}
             </div>
             {!editorOpen && (
-              <Button size="sm" variant="ghost" className="h-7" onClick={() => onEditToggle(true)}>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7"
+                disabled={!canModifyOwn}
+                title={canModifyOwn ? undefined : PUSH_ONLY_TITLE}
+                onClick={() => onEditToggle(true)}
+              >
                 <FilePen className="mr-2 size-3.5" />
                 Edit
               </Button>
@@ -3068,6 +3256,7 @@ function GitHubItemRow({
               body={bodyDraft}
               busy={actionBusy === "edit"}
               error={actionSource === "edit" ? actionError : undefined}
+              canSave={canModifyOwn}
               onTitleChange={onTitleDraftChange}
               onBodyChange={onBodyDraftChange}
               onCancel={() => onEditToggle(false)}
@@ -3110,6 +3299,8 @@ function GitHubItemRow({
                 onToggleAutoMerge={onToggleAutoMerge}
                 onClosePull={onClosePull}
                 onRefreshMergeability={onRefreshMergeability}
+                canPush={canPush}
+                canModifyOwn={canModifyOwn}
               />
               <PullTriage
                 repoLabels={repoLabels}
@@ -3131,6 +3322,7 @@ function GitHubItemRow({
                 onTeamReviewerDraftChange={onTeamReviewerDraftChange}
                 onSaveTriage={onIssueLabels}
                 onRequestReviewers={onRequestReviewers}
+                canPush={canPush}
               />
               <CheckRuns checks={checks} loading={checksLoading} error={checksError} onRetry={onRetryChecks} onRefresh={onRefreshChecks} />
               <PullCommits commits={commits} loading={commitsLoading} error={commitsError} onRetry={onRetryCommits} />
@@ -3155,6 +3347,8 @@ function GitHubItemRow({
                 onDraftChange={onReviewReplyDraftChange}
                 onSubmitReply={onSubmitReviewReply}
                 onRetry={onRetryReviewComments}
+                canPush={canPush}
+                canResolveThreads={canModifyOwn}
               />
             </>
           )}
@@ -3169,6 +3363,8 @@ function GitHubItemRow({
               assigneeDraft={assigneeDraft}
               milestoneDraft={milestoneDraft}
               busy={actionBusy}
+              canPush={canPush}
+              canModifyOwn={canModifyOwn}
               error={actionSource === "actions" || actionSource === "triage" ? actionError : undefined}
               message={actionSource === "actions" || actionSource === "triage" ? actionMessage : undefined}
               onLabelDraftChange={onLabelDraftChange}
@@ -3246,6 +3442,8 @@ function IssueActions({
   transferConfirming,
   onTransferIssue,
   onCancelTransfer,
+  canPush,
+  canModifyOwn,
 }: {
   item: GitHubListItem;
   path: string;
@@ -3271,8 +3469,16 @@ function IssueActions({
   transferConfirming: boolean;
   onTransferIssue: () => void;
   onCancelTransfer: () => void;
+  canPush: boolean;
+  // Push access OR being the issue's own author — gates close/reopen only.
+  // Everything else here (triage save, lock, pin, transfer) stays push-only.
+  canModifyOwn: boolean;
 }) {
   const isBusy = !!busy;
+  const pushDisabled = isBusy || !canPush;
+  const pushTitle = canPush ? undefined : PUSH_ONLY_TITLE;
+  const ownDisabled = isBusy || !canModifyOwn;
+  const ownTitle = canModifyOwn ? undefined : PUSH_ONLY_TITLE;
   const nextState = item.state === "open" ? "closed" : "open";
   return (
     <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
@@ -3307,7 +3513,7 @@ function IssueActions({
           onAssigneeDraftChange={onAssigneeDraftChange}
           onMilestoneDraftChange={onMilestoneDraftChange}
         />
-        <Button size="sm" variant="outline" disabled={isBusy} onClick={onIssueLabels}>
+        <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onIssueLabels}>
           {busy === "labels" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Tag className="mr-2 size-3.5" />}
           Save triage
         </Button>
@@ -3316,13 +3522,14 @@ function IssueActions({
         <Button
           size="sm"
           variant="outline"
-          disabled={isBusy}
+          disabled={ownDisabled}
+          title={ownTitle}
           onClick={() => onIssueState(nextState)}
         >
           {busy === nextState ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
           {item.state === "open" ? "Close issue" : "Reopen issue"}
         </Button>
-        <IssuePinToggle path={path} number={item.number} />
+        <IssuePinToggle path={path} number={item.number} canPush={canPush} />
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/40 pt-3">
@@ -3330,7 +3537,7 @@ function IssueActions({
           value={lockReasonDraft}
           onChange={(e) => onLockReasonDraftChange(e.target.value)}
           className="h-8 w-40 text-xs"
-          disabled={isBusy || item.locked}
+          disabled={isBusy || item.locked || !canPush}
           title="Lock reason (optional)"
           aria-label="Lock reason"
         >
@@ -3340,7 +3547,7 @@ function IssueActions({
           <option value="resolved">Resolved</option>
           <option value="spam">Spam</option>
         </Select>
-        <Button size="sm" variant="outline" disabled={isBusy} onClick={onToggleLock}>
+        <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onToggleLock}>
           {busy === "lock" ? (
             <Loader2 className="mr-2 size-3.5 animate-spin" />
           ) : item.locked ? (
@@ -3352,7 +3559,7 @@ function IssueActions({
         </Button>
       </div>
 
-      <SubIssues path={path} issueNumber={item.number} />
+      <SubIssues path={path} issueNumber={item.number} canPush={canPush} />
 
       <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/40 pt-3">
         <Input
@@ -3360,14 +3567,14 @@ function IssueActions({
           onChange={(e) => onTransferDraftChange(e.target.value)}
           placeholder="Transfer to owner/repo"
           className="h-8 w-48 text-xs"
-          disabled={isBusy}
+          disabled={isBusy || !canPush}
         />
         {transferConfirming ? (
           <>
             <span className="text-[11px] text-amber-400">
               Transfer #{item.number} to {transferDraft.trim() || "…"}? This can't be undone.
             </span>
-            <Button size="sm" variant="destructive" disabled={isBusy || !transferDraft.trim()} onClick={onTransferIssue}>
+            <Button size="sm" variant="destructive" disabled={pushDisabled || !transferDraft.trim()} title={pushTitle} onClick={onTransferIssue}>
               {busy === "transfer" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <ArrowRightLeft className="mr-2 size-3.5" />}
               Confirm transfer
             </Button>
@@ -3376,7 +3583,7 @@ function IssueActions({
             </Button>
           </>
         ) : (
-          <Button size="sm" variant="outline" disabled={isBusy || !transferDraft.trim()} onClick={onTransferIssue}>
+          <Button size="sm" variant="outline" disabled={pushDisabled || !transferDraft.trim()} title={pushTitle} onClick={onTransferIssue}>
             <ArrowRightLeft className="mr-2 size-3.5" />
             Transfer issue
           </Button>
@@ -3390,7 +3597,7 @@ function IssueActions({
  *  carry pin state (GraphQL-only), so this lazily reads it via
  *  `getGitHubIssuePinned` on mount rather than threading yet another field
  *  through the parent's already-large per-item state. */
-function IssuePinToggle({ path, number }: { path: string; number: number }) {
+function IssuePinToggle({ path, number, canPush }: { path: string; number: number; canPush: boolean }) {
   const [pinned, setPinned] = useState<boolean | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -3424,7 +3631,13 @@ function IssuePinToggle({ path, number }: { path: string; number: number }) {
 
   return (
     <div className="flex items-center gap-2">
-      <Button size="sm" variant="outline" disabled={busy || loading || pinned === undefined} onClick={() => void toggle()}>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={busy || loading || pinned === undefined || !canPush}
+        title={canPush ? undefined : PUSH_ONLY_TITLE}
+        onClick={() => void toggle()}
+      >
         {busy || loading ? (
           <Loader2 className="mr-2 size-3.5 animate-spin" />
         ) : pinned ? (
@@ -3443,7 +3656,7 @@ function IssuePinToggle({ path, number }: { path: string; number: number }) {
  *  time it's expanded, and owns its own add/remove busy state. Kept separate
  *  from the parent's per-item state (like `IssuePinToggle`) since both `path`
  *  and `issueNumber` fully determine its data. */
-function SubIssues({ path, issueNumber }: { path: string; issueNumber: number }) {
+function SubIssues({ path, issueNumber, canPush }: { path: string; issueNumber: number; canPush: boolean }) {
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<GitHubSubIssue[] | undefined>(undefined);
   const [loading, setLoading] = useState(false);
@@ -3550,8 +3763,8 @@ function SubIssues({ path, issueNumber }: { path: string; issueNumber: number })
                       size="icon"
                       variant="ghost"
                       className="size-6"
-                      disabled={busy === `remove:${child.id}`}
-                      title={`Remove #${child.number}`}
+                      disabled={busy === `remove:${child.id}` || !canPush}
+                      title={canPush ? `Remove #${child.number}` : PUSH_ONLY_TITLE}
                       aria-label={`Remove #${child.number}`}
                       onClick={() => void remove(child)}
                     >
@@ -3568,9 +3781,15 @@ function SubIssues({ path, issueNumber }: { path: string; issueNumber: number })
               onChange={(e) => setAddDraft(e.target.value)}
               placeholder="Add by #number"
               className="h-8 w-32 text-xs"
-              disabled={busy === "add"}
+              disabled={busy === "add" || !canPush}
             />
-            <Button size="sm" variant="outline" disabled={busy === "add" || !addDraft.trim()} onClick={() => void add()}>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy === "add" || !addDraft.trim() || !canPush}
+              title={canPush ? undefined : PUSH_ONLY_TITLE}
+              onClick={() => void add()}
+            >
               {busy === "add" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
               Add
             </Button>
@@ -3586,6 +3805,7 @@ function ItemEditor({
   body,
   busy,
   error,
+  canSave,
   onTitleChange,
   onBodyChange,
   onCancel,
@@ -3595,6 +3815,9 @@ function ItemEditor({
   body: string;
   busy: boolean;
   error?: string;
+  // Whether the viewer may save this edit — repo push access OR being the
+  // item's own author (title/body edits are allowed to the author).
+  canSave: boolean;
   onTitleChange: (title: string) => void;
   onBodyChange: (body: string) => void;
   onCancel: () => void;
@@ -3628,7 +3851,7 @@ function ItemEditor({
         <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>
           Cancel
         </Button>
-        <Button size="sm" disabled={busy || !title.trim()} onClick={onSave}>
+        <Button size="sm" disabled={busy || !title.trim() || !canSave} title={canSave ? undefined : PUSH_ONLY_TITLE} onClick={onSave}>
           {busy ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <FilePen className="mr-2 size-3.5" />}
           Save
         </Button>
@@ -3657,6 +3880,7 @@ function PullTriage({
   onTeamReviewerDraftChange,
   onSaveTriage,
   onRequestReviewers,
+  canPush,
 }: {
   repoLabels: GitHubRepoLabel[];
   repoAssignees: GitHubUser[];
@@ -3677,8 +3901,14 @@ function PullTriage({
   onTeamReviewerDraftChange: (body: string) => void;
   onSaveTriage: () => void;
   onRequestReviewers: () => void;
+  canPush: boolean;
 }) {
   const isBusy = !!busy;
+  const pushDisabled = isBusy || !canPush;
+  const pushTitle = canPush ? undefined : PUSH_ONLY_TITLE;
+  const reviewersTitle = !prOpen
+    ? "Reviewers can only be requested on open pull requests"
+    : pushTitle;
   return (
     <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -3712,7 +3942,7 @@ function PullTriage({
           onAssigneeDraftChange={onAssigneeDraftChange}
           onMilestoneDraftChange={onMilestoneDraftChange}
         />
-        <Button size="sm" variant="outline" disabled={isBusy} onClick={onSaveTriage}>
+        <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onSaveTriage}>
           {busy === "labels" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Tag className="mr-2 size-3.5" />}
           Save triage
         </Button>
@@ -3723,20 +3953,20 @@ function PullTriage({
           onChange={(e) => onReviewerDraftChange(e.target.value)}
           placeholder={prOpen ? "Reviewers, comma separated" : "Reviewers can only be requested on open PRs"}
           className="h-8 text-xs"
-          disabled={isBusy || !prOpen}
+          disabled={isBusy || !prOpen || !canPush}
         />
         <Input
           value={teamReviewerDraft}
           onChange={(e) => onTeamReviewerDraftChange(e.target.value)}
           placeholder={prOpen ? "Teams, comma separated (org slugs)" : "Teams can only be requested on open PRs"}
           className="h-8 text-xs"
-          disabled={isBusy || !prOpen}
+          disabled={isBusy || !prOpen || !canPush}
         />
         <Button
           size="sm"
           variant="outline"
-          disabled={isBusy || !prOpen || (!reviewerDraft.trim() && !teamReviewerDraft.trim())}
-          title={prOpen ? undefined : "Reviewers can only be requested on open pull requests"}
+          disabled={pushDisabled || !prOpen || (!reviewerDraft.trim() && !teamReviewerDraft.trim())}
+          title={reviewersTitle}
           onClick={onRequestReviewers}
         >
           {busy === "reviewers" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitPullRequest className="mr-2 size-3.5" />}
@@ -3770,6 +4000,8 @@ function PullActions({
   onToggleAutoMerge,
   onClosePull,
   onRefreshMergeability,
+  canPush,
+  canModifyOwn,
 }: {
   item: GitHubListItem;
   reviewDraft: string;
@@ -3793,10 +4025,23 @@ function PullActions({
   onToggleAutoMerge: () => void;
   onClosePull: () => void;
   onRefreshMergeability: () => void;
+  canPush: boolean;
+  // Push access OR being the PR's own author — gates close/reopen only.
+  // Merge, auto-merge, update-branch and draft-toggle stay push-only.
+  canModifyOwn: boolean;
 }) {
   const disabled = item.state !== "open" || !!busy;
   const view = item.state === "open" && mergeability ? mergeabilityView(mergeability) : null;
-  const mergeDisabled = disabled || (view ? !view.canMerge : false);
+  const mergeDisabled = disabled || !canPush || (view ? !view.canMerge : false);
+  const mergeTitle = !canPush ? PUSH_ONLY_TITLE : view && !view.canMerge ? view.label : undefined;
+  const pushDisabled = disabled || !canPush;
+  const pushTitle = canPush ? undefined : PUSH_ONLY_TITLE;
+  const ownTitle = canModifyOwn ? undefined : PUSH_ONLY_TITLE;
+  // Reopen shows only on a closed PR, so it can't reuse `disabled`
+  // (which is always true off the open state) — gate it on busy + own-modify.
+  const reopenDisabled = !!busy || !canModifyOwn;
+  // Close needs an open PR (via `disabled`) plus push-or-author.
+  const closeDisabled = disabled || !canModifyOwn;
   return (
     <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -3805,7 +4050,7 @@ function PullActions({
           Actions
         </div>
         {item.state === "open" && (
-          <Button size="sm" variant="ghost" className="h-7" disabled={!!busy} onClick={onToggleDraft}>
+          <Button size="sm" variant="ghost" className="h-7" disabled={!!busy || !canPush} title={pushTitle} onClick={onToggleDraft}>
             {busy === "draft" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <FilePen className="mr-2 size-3.5" />}
             {item.draft ? "Mark ready for review" : "Convert to draft"}
           </Button>
@@ -3817,7 +4062,7 @@ function PullActions({
           </span>
         )}
         {item.state !== "open" && !item.mergedAt && (
-          <Button size="sm" variant="outline" className="h-7" disabled={!!busy} onClick={onReopenPull}>
+          <Button size="sm" variant="outline" className="h-7" disabled={reopenDisabled} title={ownTitle} onClick={onReopenPull}>
             {busy === "reopen" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitPullRequest className="mr-2 size-3.5" />}
             Reopen
           </Button>
@@ -3856,7 +4101,7 @@ function PullActions({
           )}
           <div className="ml-auto flex items-center gap-2">
             {view?.showUpdateBranch && (
-              <Button size="sm" variant="outline" disabled={disabled} onClick={onUpdateBranch}>
+              <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onUpdateBranch}>
                 {busy === "update-branch" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <ArrowUpFromLine className="mr-2 size-3.5" />}
                 Update branch
               </Button>
@@ -3943,7 +4188,7 @@ function PullActions({
             size="sm"
             className="mt-2"
             disabled={mergeDisabled}
-            title={view && !view.canMerge ? view.label : undefined}
+            title={mergeTitle}
             onClick={onMerge}
           >
             {busy === "merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
@@ -3956,7 +4201,7 @@ function PullActions({
                   <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
                     <CheckCircle2 className="size-3.5" /> Auto-merge enabled
                   </span>
-                  <Button size="sm" variant="outline" disabled={disabled} onClick={onToggleAutoMerge}>
+                  <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onToggleAutoMerge}>
                     {busy === "auto-merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : null}
                     Disable
                   </Button>
@@ -3965,8 +4210,8 @@ function PullActions({
                 <Button
                   size="sm"
                   variant="outline"
-                  disabled={disabled || !mergeability}
-                  title={!mergeability ? "Waiting for mergeability…" : undefined}
+                  disabled={pushDisabled || !mergeability}
+                  title={!canPush ? PUSH_ONLY_TITLE : !mergeability ? "Waiting for mergeability…" : undefined}
                   onClick={onToggleAutoMerge}
                 >
                   {busy === "auto-merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
@@ -3990,7 +4235,8 @@ function PullActions({
             size="sm"
             variant="outline"
             className="mt-2"
-            disabled={disabled}
+            disabled={closeDisabled}
+            title={ownTitle}
             onClick={onClosePull}
           >
             {busy === "close" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
@@ -4368,6 +4614,8 @@ function ReviewComments({
   onDraftChange,
   onSubmitReply,
   onRetry,
+  canPush,
+  canResolveThreads,
 }: {
   path: string;
   comments?: GitHubPullLineComment[];
@@ -4389,6 +4637,12 @@ function ReviewComments({
   onDraftChange: (commentId: number, body: string) => void;
   onSubmitReply: (commentId: number) => void;
   onRetry: () => void;
+  // Gates the Apply-suggestion button (a push-only write to the head branch).
+  canPush: boolean;
+  // Resolving/reopening a thread needs write access OR being the PR author, so
+  // this is the wider `canPush || prAuthorIsViewer` flag — distinct from
+  // `canPush`, which the apply-suggestion write still needs on its own.
+  canResolveThreads: boolean;
 }) {
   const [busyThread, setBusyThread] = useState<string | null>(null);
   const [threadError, setThreadError] = useState<{ id: string; msg: string } | null>(null);
@@ -4475,7 +4729,8 @@ function ReviewComments({
                       size="sm"
                       variant="ghost"
                       className="ml-auto h-6 px-2 text-[11px]"
-                      disabled={busyThread === thread.threadId}
+                      disabled={busyThread === thread.threadId || !canResolveThreads}
+                      title={canResolveThreads ? undefined : PUSH_ONLY_TITLE}
                       onClick={() => { void toggle(thread); }}
                     >
                       {busyThread === thread.threadId
@@ -4498,6 +4753,7 @@ function ReviewComments({
                   onDelete={() => onDelete(comment.id)}
                   suggestion={hasSuggestion(comment.body) ? {
                     canApply: !!viewerLogin && prOpen,
+                    canPush,
                     applying: !!applyBusy[comment.id],
                     onApply: () => onApply(comment.id),
                   } : undefined}
@@ -4679,8 +4935,11 @@ function EditableCommentBody({
   /** When set, `body` contains at least one ```suggestion fence — renders it as
    *  a distinct "Suggested change" block instead of a plain code block, with an
    *  Apply button when `canApply`. Undefined when the comment has no suggestion,
-   *  or the caller doesn't support applying one (e.g. conversation comments). */
-  suggestion?: { canApply: boolean; applying: boolean; onApply: () => void };
+   *  or the caller doesn't support applying one (e.g. conversation comments).
+   *  `canApply` gates whether the control renders at all (unauthenticated / PR
+   *  closed — structural, not push-related); `canPush` (F13) only disables the
+   *  visible button with a tooltip, per the show-but-disable gating rule. */
+  suggestion?: { canApply: boolean; canPush: boolean; applying: boolean; onApply: () => void };
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(body);
@@ -4765,7 +5024,8 @@ function EditableCommentBody({
                           size="sm"
                           variant="outline"
                           className="h-6 px-2 text-[11px]"
-                          disabled={suggestion.applying}
+                          disabled={suggestion.applying || !suggestion.canPush}
+                          title={suggestion.canPush ? undefined : PUSH_ONLY_TITLE}
                           onClick={() => suggestion.onApply()}
                         >
                           {suggestion.applying

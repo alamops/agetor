@@ -75,6 +75,7 @@ import {
   getGitHubIssuePinned,
   getGitHubPullChecks,
   getGitHubPullLinkedIssues,
+  getGitHubRepoPermissions,
   getGitHubViewer,
   getGitHubPullDefaults,
   getGitHubPullDiff,
@@ -502,6 +503,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             .map((s) => s.trim())
             .filter(Boolean);
           const assignee = url.searchParams.get("assignee") ?? "";
+          const rawPage = Number(url.searchParams.get("page"));
+          const page = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : undefined;
+          const sort = url.searchParams.get("sort");
+          const direction = url.searchParams.get("direction");
+          if (sort !== null && sort !== "created" && sort !== "updated" && sort !== "comments") {
+            return json({ error: "sort must be created, updated, or comments" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (direction !== null && direction !== "asc" && direction !== "desc") {
+            return json({ error: "direction must be asc or desc" }, { status: 400, headers: corsHeaders(req) });
+          }
           const result = await listGitHubItems({
             dir,
             kind: kind as GitHubItemKind,
@@ -513,7 +524,23 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             assignedToMe: url.searchParams.get("assignedToMe") === "1",
             reviewRequested: url.searchParams.get("reviewRequested") === "1",
             searchQuery: url.searchParams.get("searchQuery") ?? "",
+            page,
+            sort: sort ?? undefined,
+            direction: direction ?? undefined,
           });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/repo-permissions": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await getGitHubRepoPermissions({ dir });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
