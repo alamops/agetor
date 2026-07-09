@@ -32,6 +32,7 @@ import {
   getTmuxSource,
   resolveTmuxBin,
   setTmuxSource,
+  tmuxSocketArgs,
   type TmuxSource,
 } from "./tmux-resolution.ts";
 import {
@@ -70,6 +71,7 @@ import {
 import { MODEL_EFFORT_SUPPORT, TASK_TYPES } from "../shared/types.ts";
 import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
+import { consumePendingOpenTask } from "./pending-open.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -206,6 +208,8 @@ export interface ApiNative {
     body?: string;
     subtitle?: string;
     silent?: boolean;
+    /** Task to deep-link to on click, e.g. via terminal-notifier's -open. */
+    taskId?: string;
   }): void;
   quit(): void;
   updates: {
@@ -1115,8 +1119,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // contain `agetor-<hex>` so they don't strictly need escaping, but
           // we apply the same helper for symmetry.
           const shellEscape = (s: string) => s.replace(/(["\\$`])/g, "\\$1");
+          // Honor an active non-default socket (test isolation / a future
+          // dedicated production socket) so "Open in Terminal" attaches to
+          // the same server the session actually lives on, not whatever the
+          // default socket happens to be. Empty in production today.
+          const socketArgsStr = tmuxSocketArgs()
+            .map((a) => `\\"${shellEscape(a)}\\"`)
+            .join(" ");
           const script =
-            `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\" attach -t \\"${shellEscape(sessionName)}\\""\n` +
+            `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\"${socketArgsStr ? " " + socketArgsStr : ""} attach -t \\"${shellEscape(sessionName)}\\""\n` +
             `activate application "Terminal"`;
           const proc = Bun.spawn(["osascript", "-e", script], {
             stdout: "ignore",
@@ -1666,6 +1677,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             body?: unknown;
             subtitle?: unknown;
             silent?: unknown;
+            taskId?: unknown;
           };
           const MAX_LEN = 256;
           const trunc = (v: unknown): string | undefined =>
@@ -1677,11 +1689,23 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 400, headers: corsHeaders(req) },
             );
           }
+          // taskId is an identifier, not display text — not truncated (a
+          // truncated id wouldn't match any task), but bounded: real ids are
+          // short, so an over-length value is treated as absent (falls back to
+          // a plain, non-deep-linking notification) rather than flowed into an
+          // argv unbounded.
+          const taskId =
+            typeof body.taskId === "string" &&
+            body.taskId.length > 0 &&
+            body.taskId.length <= 512
+              ? body.taskId
+              : undefined;
           native.showNotification({
             title,
             body: trunc(body.body),
             subtitle: trunc(body.subtitle),
             silent: Boolean(body.silent),
+            taskId,
           });
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
@@ -1710,6 +1734,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             };
             const unsubscribe = subscribeAppEvents((e) => send(e));
             const ping = setInterval(() => send({ type: "ping" }), 15_000);
+            // Flush a deep-link open that arrived before this client
+            // connected (e.g. a notification click while the app had no
+            // window and the webview was still booting) — see
+            // pending-open.ts and index.ts's "open-url" handler.
+            const pendingTaskId = consumePendingOpenTask();
+            if (pendingTaskId) {
+              send({ type: "open_task", taskId: pendingTaskId, ts: Date.now() });
+            }
             req.signal.addEventListener("abort", () => {
               clearInterval(ping);
               unsubscribe();

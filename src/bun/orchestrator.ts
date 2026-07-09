@@ -8,6 +8,7 @@ import {
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
   MODEL_EFFORT_SUPPORT,
+  SESSION_DIED_STATUS_PREFIX,
   TASK_TYPES,
   type AgentKind,
   type Harness,
@@ -36,14 +37,15 @@ import {
   cycleToMode,
   type CycleResult,
   dropSession,
-  listAgetorSessions,
   killSessionByName,
   reattachSession,
   pasteFollowUp,
   sendSlashCommand,
   sendTurn,
+  hasSessionState,
   sessionExists,
   sessionExistsByName,
+  sessionLiveness,
   sessionNameFor,
 } from "./claude-tmux.ts";
 import {
@@ -87,6 +89,12 @@ interface ActiveRun {
    *  keep the column at `blocked` (instead of bouncing to `ready`) and
    *  record the run as `failed`. */
   apiError: boolean;
+  /** Set when the run's tmux session died unexpectedly mid-turn (the driver
+   *  emitted the `SESSION_DIED_STATUS_PREFIX` sentinel). Like `apiError`, the
+   *  chunk handler flips the column to `blocked` immediately and the done
+   *  handler reads this on resolution to keep it there (record the run as
+   *  `failed`, not bounce to `ready`). */
+  sessionDied: boolean;
 }
 const active = new Map<string, ActiveRun>(); // runId -> handle
 
@@ -151,7 +159,7 @@ function updateColumn(
   taskId: string,
   runId: string | null,
   next: ColumnId,
-  reason?: "api-error" | "approval",
+  reason?: "api-error" | "approval" | "session-died",
 ): void {
   const before = tasks.get(taskId);
   const prev: ColumnId | null = before?.column ?? null;
@@ -260,9 +268,15 @@ setResolvedBroadcaster((res: InteractionResolved) => {
  * where they left off. Anything else (tmux gone, JSONL missing, codex run
  * whose child process died with us) is flipped to `orphaned`.
  *
- * Any leftover `agetor-*` tmux sessions that don't correspond to a still-
- * running DB row are killed at the end — stragglers from a crash or from
- * tasks that were deleted while detached.
+ * We never enumerate-and-kill `agetor-*` sessions here. Agetor runs on the
+ * user's *shared* default tmux socket, so a blind sweep would reap sessions
+ * belonging to a different agetor instance (dev vs release DB) or to a
+ * `bun test` run — the bug this deliberately avoids. Every kill agetor issues
+ * is keyed to a specific task id from *this* instance's own DB (see the
+ * per-row `killSessionByName` below, `killTaskSession` on delete/archive, and
+ * codex's own teardown), so it can never touch a foreign instance's sessions.
+ * A genuinely-leaked session (crash artifact, or a task deleted while agetor
+ * was offline) is simply left alive rather than risk killing a live one.
  *
  * Called once at boot from `src/bun/index.ts`.
  */
@@ -337,10 +351,12 @@ export function reconcileOrphans(): number {
         // (correctly-persisted) `blocked` back to `review` on the first
         // pending-end-turn fire. `EXISTS` short-circuits on first match
         // and reads more clearly than `COUNT(*) > 0`.
+        // subagent_id IS NULL: a subagent tailer's own transient api-error
+        // status row (since #81) must not seed the main run's apiError.
         const priorApiError = db.query<{ found: 0 | 1 }, [string, string]>(
           `SELECT EXISTS(
              SELECT 1 FROM run_events
-             WHERE run_id = ? AND stream = 'status' AND data LIKE ?
+             WHERE run_id = ? AND stream = 'status' AND data LIKE ? AND subagent_id IS NULL
            ) AS found`,
         ).get(row.id, `${CLAUDE_API_ERROR_STATUS_PREFIX}%`)?.found ?? 0;
         if (priorApiError === 1) {
@@ -394,30 +410,16 @@ export function reconcileOrphans(): number {
     }
   }
 
-  // Kill any leftover `agetor-*` tmux sessions whose task didn't reattach.
-  // These are real stragglers — crash artifacts or sessions whose task was
-  // deleted while agetor was down. Sessions matched to a reattached run
-  // are spared (they're now driven by the new process's session state).
-  let killedStragglers = 0;
-  for (const name of listAgetorSessions()) {
-    // Session names are `agetor-<taskId-prefix>` (first 12 chars). Spare
-    // any session whose prefix matches a reattached taskId.
-    const matchesReattached = [...reattachedTaskIds].some(
-      (id) => name === sessionNameFor(id),
-    );
-    if (matchesReattached) continue;
-    killSessionByName(name);
-    killedStragglers++;
-  }
-
+  // Deliberately NO straggler sweep here. Sessions live on the shared default
+  // tmux socket, so enumerating + killing every un-reattached `agetor-*`
+  // session would reap a sibling instance's (dev vs release DB) or a test
+  // run's live sessions. We reattach what we can, orphan the rest in the DB,
+  // and leave any unaccounted-for session alive.
   if (reattachedTaskIds.size > 0) {
     console.log(`[agetor] reattached to ${reattachedTaskIds.size} live tmux session(s)`);
   }
   if (orphaned.length > 0) {
     console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
-  }
-  if (killedStragglers > 0) {
-    console.log(`[agetor] killed ${killedStragglers} stale tmux session(s) with no matching run`);
   }
   return orphaned.length;
 }
@@ -567,6 +569,20 @@ function makeChunkHandler(
         }
       }
     }
+    // Session-died path (both agents): the driver emits this sentinel when a
+    // running turn's tmux session vanished. Flip to `blocked` so the card
+    // stops sitting in `running`, and mark the handle so `attachDoneHandler`
+    // keeps it there (and records `failed`) when the run settles a beat later.
+    if (stream === "status" && data.startsWith(SESSION_DIED_STATUS_PREFIX)) {
+      const handle = active.get(runId);
+      if (handle && !handle.sessionDied) {
+        handle.sessionDied = true;
+        const task = tasks.get(taskId);
+        if (task && task.runId === runId) {
+          updateColumn(taskId, runId, "blocked", "session-died");
+        }
+      }
+    }
   };
 }
 
@@ -582,6 +598,7 @@ function registerActiveRun(
     kill: () => agent.kill(),
     cancelled: false,
     apiError: false,
+    sessionDied: false,
     writeInput: (line) => agent.writeInput(line),
   });
 }
@@ -601,15 +618,16 @@ function attachDoneHandler(
       const handle = active.get(runId);
       const wasCancelled = handle?.cancelled ?? false;
       const wasApiError = handle?.apiError ?? false;
+      const wasSessionDied = handle?.sessionDied ?? false;
       active.delete(runId);
 
-      // API error overrides the exit-code mapping: claude resolves the turn
-      // with code 0 (the synthetic message stages a clean end_turn), but the
+      // API error / session-death override the exit-code mapping: the driver
+      // resolves the turn with code 0 (a clean end_turn was staged), but the
       // run really failed — record it as such so the badge and history are
       // honest.
       const newStatus: RunStatus = wasCancelled
         ? "cancelled"
-        : wasApiError ? "failed"
+        : (wasApiError || wasSessionDied) ? "failed"
         : code === 0 ? "succeeded" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: code });
       // Only flip the task's column when the run that just resolved is
@@ -628,7 +646,7 @@ function attachDoneHandler(
         // `blocked` just because it had previously hit an API error.
         const nextColumn: ColumnId = wasCancelled
           ? "ready"
-          : wasApiError ? "blocked"
+          : (wasApiError || wasSessionDied) ? "blocked"
           : newStatus === "succeeded" ? "review" : "ready";
         updateColumn(taskId, runId, nextColumn);
       }
@@ -648,13 +666,17 @@ function attachDoneHandler(
     .catch((err) => {
       const handle = active.get(runId);
       const wasCancelled = handle?.cancelled ?? false;
+      const wasSessionDied = handle?.sessionDied ?? false;
       active.delete(runId);
       const newStatus: RunStatus = wasCancelled ? "cancelled" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: -1 });
       const task = tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
-        updateColumn(taskId, runId, "ready");
+        // A session-death that reaches the reject path (not the case today —
+        // both drivers resolve on death — but keep the column consistent with
+        // the resolve path if a future refactor ever rejects instead).
+        updateColumn(taskId, runId, wasSessionDied ? "blocked" : "ready");
       }
       emit({
         runId,
@@ -1027,12 +1049,13 @@ function findLastCodexSessionId(taskId: string): string | null {
  * Send a follow-up prompt to a claude task. Always creates a new run row so
  * the run history shows each user message as its own entry.
  *
- *   • If the task's tmux session is still alive, we paste the prompt into it
- *     as a fresh turn (`sendTurn`).
- *   • If the session is gone (app restart killed it, the previous run ended
- *     and tmux was torn down, etc.), we spawn a brand-new session and use a
- *     combined "previous context + new user message" prompt so claude has
- *     enough continuity to keep going.
+ *   • If we hold live in-memory session state AND the tmux session is not
+ *     unambiguously gone, we paste the prompt into it as a fresh turn
+ *     (`sendTurn`).
+ *   • Otherwise (session gone, or a tmux session that outlived our process
+ *     after a restart with no in-memory state) we spawn a brand-new session
+ *     resuming via `claude --resume <sessionId>` so claude reloads the prior
+ *     conversation from its JSONL and keeps going.
  *
  * Returns false only on internal lookup failure (missing task row). Sessions
  * are always recoverable as long as the task itself still exists.
@@ -1041,7 +1064,22 @@ function sendClaudeTurn(taskId: string, line: string): string | null {
   const task = tasks.get(taskId);
   if (!task) return null;
 
-  if (sessionExists(taskId)) {
+  // Route to the live-session paste path unless we're SURE the session is
+  // dead. `sessionLiveness` (not the raw `sessionExists` boolean it replaces
+  // here) distinguishes an unambiguous `gone` from an `unreachable` probe —
+  // the same tri-state #88 introduced for the death watch, because a bare
+  // `.ok` boolean conflates "session absent" with "tmux hiccuped" (busy-server
+  // EAGAIN under load). Boot reconciliation no longer sweeps idle sessions, so
+  // a tmux session can outlive our process with no SessionState — in which
+  // case `sendTurn` would reject with "no live session" — so we also require
+  // in-memory state. `unreachable` (inconclusive) deliberately still takes the
+  // non-destructive paste path: if the session really is dead the paste fails
+  // gracefully and the death-watch/boot-reconcile recovers it later; routing
+  // it to `spawnResumedSession` instead would risk its unconditional
+  // pre-kill (`spawnClaudeViaTmux`) tearing down a live, possibly mid-turn
+  // session over a transient probe failure. Only an unambiguous `gone` (or no
+  // in-memory state at all) reaches the destructive respawn path.
+  if (hasSessionState(taskId) && sessionLiveness(sessionNameFor(taskId)) !== "gone") {
     return sendTurnInExistingSession(task, taskId, line);
   }
   return spawnResumedSession(task, taskId, line);
