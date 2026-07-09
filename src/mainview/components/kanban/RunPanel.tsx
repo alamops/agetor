@@ -45,6 +45,8 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
 import { TerminalView } from "./TerminalView";
+import { deriveTodoProgress } from "@/lib/todo-progress";
+import { TodoProgressCard } from "./TodoProgressCard";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -543,6 +545,12 @@ function RunPanelBody({
     return [...others, ...rebuilt.events];
   }, [activeStream, subagentEventsById, mainEvents, rebuilt, rebuiltRunIds]);
 
+  /** The current to-do list for whichever stream is selected. Claude re-emits
+   *  the whole TodoWrite list on every change, so this is a latest-wins scan
+   *  (see lib/todo-progress.ts). Memoized on `displayedEvents` alone — it is
+   *  recomputed on every SSE frame, so it must stay a single O(n) pass. */
+  const todoProgress = useMemo(() => deriveTodoProgress(displayedEvents), [displayedEvents]);
+
   /** Indicator mode for the bottom-pinned heartbeat. A follow-up sent while
    *  the agent is working is folded into the active run (the backend pastes it
    *  into the live session — no new run row), so there's only ever one
@@ -946,6 +954,15 @@ function RunPanelBody({
             setActiveStream(id);
           }}
         />
+      )}
+
+      {/* Full-bleed section with inner padding, matching RunsList /
+          TerminalsSection above — the card itself is rounded, so it needs the
+          px-3 inset to avoid sitting flush against the panel edges. */}
+      {todoProgress && (
+        <div className="border-b border-border/60 px-3 py-2">
+          <TodoProgressCard progress={todoProgress} />
+        </div>
       )}
 
       <div
