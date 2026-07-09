@@ -7,6 +7,9 @@ import {
   ArrowRightLeft,
   ArrowUpFromLine,
   ArrowUpWideNarrow,
+  Bell,
+  BellOff,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -59,6 +62,7 @@ import type {
   GitHubComment,
   GitHubLinkedIssue,
   GitHubListItem,
+  GitHubNotification,
   GitHubPullCommit,
   GitHubPullLineComment,
   GitHubPullMergeability,
@@ -369,6 +373,23 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // All assignable repo users (powers the triage assignee picker). Convenience
   // data only — no manager UI, so failures are swallowed like labels/milestones.
   const [repoAssignees, setRepoAssignees] = useState<GitHubUser[]>([]);
+  // Repo notifications inbox (F14) — private (token-gated), so nothing is
+  // preloaded until the panel is opened; the fetch itself surfaces the
+  // "sign in" error when unauthenticated.
+  const [notifications, setNotifications] = useState<GitHubNotification[]>([]);
+  // Guards both the lazy-load effect and the manual refresh so a slower fetch
+  // (e.g. unread→all toggled mid-request) can't clobber a newer result.
+  const notificationsSeq = useRef(0);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [notificationsLoading, setNotificationsLoading] = useState(false);
+  const [notificationsError, setNotificationsError] = useState<string | null>(null);
+  // false = unread only (GitHub's own default); true = all recent notifications.
+  const [notificationsShowAll, setNotificationsShowAll] = useState(false);
+  const [notificationsMarkAllBusy, setNotificationsMarkAllBusy] = useState(false);
+  // Per-thread in-flight action ("read" | "ignore" | "unsubscribe") and the
+  // last error for that thread, both keyed by notification id.
+  const [notificationBusy, setNotificationBusy] = useState<Record<string, string | undefined>>({});
+  const [notificationRowErrors, setNotificationRowErrors] = useState<Record<string, string | undefined>>({});
   // The viewer login is token-scoped (identical across projects), so resolve it
   // once per session rather than on every open / project switch. A failed lookup
   // (e.g. the first project has no GitHub remote) leaves it unresolved so a later
@@ -832,6 +853,111 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       .catch(() => { if (!cancelled) setRepoAssignees([]); });
     return () => { cancelled = true; };
   }, [open, projectPath]);
+
+  // Lazy — only fetches while the panel is open (notifications are private
+  // and the fetch itself surfaces the sign-in error, so there's no point
+  // preloading before the user opens the panel).
+  useEffect(() => {
+    if (!open || !notificationsOpen || !projectPath) return;
+    const requestId = ++notificationsSeq.current;
+    setNotificationsLoading(true);
+    setNotificationsError(null);
+    api.listGitHubNotifications({ path: projectPath, all: notificationsShowAll })
+      .then((r) => { if (requestId === notificationsSeq.current) setNotifications(r.notifications); })
+      .catch((e) => { if (requestId === notificationsSeq.current) setNotificationsError(e instanceof Error ? e.message : String(e)); })
+      .finally(() => { if (requestId === notificationsSeq.current) setNotificationsLoading(false); });
+  }, [open, notificationsOpen, projectPath, notificationsShowAll]);
+
+  const refreshNotifications = async () => {
+    if (!projectPath) return;
+    const requestId = ++notificationsSeq.current;
+    setNotificationsLoading(true);
+    setNotificationsError(null);
+    try {
+      const r = await api.listGitHubNotifications({ path: projectPath, all: notificationsShowAll });
+      if (requestId === notificationsSeq.current) setNotifications(r.notifications);
+    } catch (e) {
+      if (requestId === notificationsSeq.current) setNotificationsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (requestId === notificationsSeq.current) setNotificationsLoading(false);
+    }
+  };
+
+  const markNotificationRead = async (id: string) => {
+    if (!projectPath) return;
+    setNotificationBusy((cur) => ({ ...cur, [id]: "read" }));
+    setNotificationRowErrors((cur) => ({ ...cur, [id]: undefined }));
+    try {
+      await api.markGitHubNotificationRead({ path: projectPath, threadId: id });
+      // Unread-only view: the read thread no longer matches the filter, drop
+      // it. "All" view: keep the row but clear its unread dot.
+      setNotifications((cur) => (
+        notificationsShowAll
+          ? cur.map((n) => (n.id === id ? { ...n, unread: false } : n))
+          : cur.filter((n) => n.id !== id)
+      ));
+    } catch (e) {
+      setNotificationRowErrors((cur) => ({ ...cur, [id]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setNotificationBusy((cur) => ({ ...cur, [id]: undefined }));
+    }
+  };
+
+  const markAllNotificationsRead = async () => {
+    if (!projectPath || notificationsMarkAllBusy) return;
+    setNotificationsMarkAllBusy(true);
+    setNotificationsError(null);
+    try {
+      await api.markAllGitHubNotificationsRead({ path: projectPath });
+      setNotifications((cur) => (
+        notificationsShowAll ? cur.map((n) => ({ ...n, unread: false })) : []
+      ));
+    } catch (e) {
+      setNotificationsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setNotificationsMarkAllBusy(false);
+    }
+  };
+
+  const ignoreNotificationThread = async (id: string) => {
+    if (!projectPath) return;
+    setNotificationBusy((cur) => ({ ...cur, [id]: "ignore" }));
+    setNotificationRowErrors((cur) => ({ ...cur, [id]: undefined }));
+    try {
+      await api.setGitHubThreadSubscription({ path: projectPath, threadId: id, ignored: true });
+      // Ignoring a thread also marks it read on GitHub — mirror mark-read so the
+      // user sees the action land (drop in unread view, clear the dot in "all").
+      setNotifications((cur) => (
+        notificationsShowAll
+          ? cur.map((n) => (n.id === id ? { ...n, unread: false } : n))
+          : cur.filter((n) => n.id !== id)
+      ));
+    } catch (e) {
+      setNotificationRowErrors((cur) => ({ ...cur, [id]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setNotificationBusy((cur) => ({ ...cur, [id]: undefined }));
+    }
+  };
+
+  const unsubscribeNotificationThread = async (id: string) => {
+    if (!projectPath) return;
+    setNotificationBusy((cur) => ({ ...cur, [id]: "unsubscribe" }));
+    setNotificationRowErrors((cur) => ({ ...cur, [id]: undefined }));
+    try {
+      await api.unsubscribeGitHubThread({ path: projectPath, threadId: id });
+      // Unsubscribed — the user won't get further updates, so drop it from the
+      // unread view (clear the dot in "all") to acknowledge the action.
+      setNotifications((cur) => (
+        notificationsShowAll
+          ? cur.map((n) => (n.id === id ? { ...n, unread: false } : n))
+          : cur.filter((n) => n.id !== id)
+      ));
+    } catch (e) {
+      setNotificationRowErrors((cur) => ({ ...cur, [id]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setNotificationBusy((cur) => ({ ...cur, [id]: undefined }));
+    }
+  };
 
   useEffect(() => {
     if (!open || !projectPath || kind !== "pulls") return;
@@ -1698,7 +1824,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title="Manage labels"
             aria-label="Manage labels"
             disabled={!projectPath}
-            onClick={() => { setLabelManagerOpen((v) => !v); setMilestoneManagerOpen(false); }}
+            onClick={() => { setLabelManagerOpen((v) => !v); setMilestoneManagerOpen(false); setNotificationsOpen(false); }}
           >
             <Tag className="size-4" />
           </Button>
@@ -1708,9 +1834,19 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title="Manage milestones"
             aria-label="Manage milestones"
             disabled={!projectPath}
-            onClick={() => { setMilestoneManagerOpen((v) => !v); setLabelManagerOpen(false); }}
+            onClick={() => { setMilestoneManagerOpen((v) => !v); setLabelManagerOpen(false); setNotificationsOpen(false); }}
           >
             <Milestone className="size-4" />
+          </Button>
+          <Button
+            size="icon"
+            variant={notificationsOpen ? "secondary" : "ghost"}
+            title="Notifications"
+            aria-label="Notifications"
+            disabled={!projectPath}
+            onClick={() => { setNotificationsOpen((v) => !v); setLabelManagerOpen(false); setMilestoneManagerOpen(false); }}
+          >
+            <Bell className="size-4" />
           </Button>
           {result && (
             <Button
@@ -1919,6 +2055,24 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onDelete={removeMilestone}
             onRefresh={() => { void refreshRepoMilestones(); }}
             onClose={() => setMilestoneManagerOpen(false)}
+          />
+        )}
+        {notificationsOpen && (
+          <NotificationsPanel
+            notifications={notifications}
+            loading={notificationsLoading}
+            error={notificationsError}
+            showAll={notificationsShowAll}
+            onToggleShowAll={() => setNotificationsShowAll((v) => !v)}
+            onRefresh={() => { void refreshNotifications(); }}
+            onMarkAllRead={() => { void markAllNotificationsRead(); }}
+            markAllBusy={notificationsMarkAllBusy}
+            onMarkRead={(id) => { void markNotificationRead(id); }}
+            onIgnore={(id) => { void ignoreNotificationThread(id); }}
+            onUnsubscribe={(id) => { void unsubscribeNotificationThread(id); }}
+            busy={notificationBusy}
+            rowErrors={notificationRowErrors}
+            onClose={() => setNotificationsOpen(false)}
           />
         )}
         {kind === "pulls" && (
@@ -2924,6 +3078,206 @@ function MilestoneRow({
           </Button>
         )}
       </div>
+    </div>
+  );
+}
+
+function NotificationsPanel({
+  notifications,
+  loading,
+  error,
+  showAll,
+  onToggleShowAll,
+  onRefresh,
+  onMarkAllRead,
+  markAllBusy,
+  onMarkRead,
+  onIgnore,
+  onUnsubscribe,
+  busy,
+  rowErrors,
+  onClose,
+}: {
+  notifications: GitHubNotification[];
+  loading: boolean;
+  error: string | null;
+  showAll: boolean;
+  onToggleShowAll: () => void;
+  onRefresh: () => void;
+  onMarkAllRead: () => void;
+  markAllBusy: boolean;
+  onMarkRead: (id: string) => void;
+  onIgnore: (id: string) => void;
+  onUnsubscribe: (id: string) => void;
+  busy: Record<string, string | undefined>;
+  rowErrors: Record<string, string | undefined>;
+  onClose: () => void;
+}) {
+  const unreadCount = notifications.filter((n) => n.unread).length;
+  return (
+    <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <Bell className="size-3.5" />
+          Notifications ({showAll ? notifications.length : unreadCount})
+        </div>
+        <div className="flex items-center gap-1">
+          <div className="flex rounded-md border border-input p-0.5">
+            <Button
+              size="sm"
+              variant={!showAll ? "secondary" : "ghost"}
+              className="h-6 px-2 text-[11px]"
+              onClick={() => { if (showAll) onToggleShowAll(); }}
+            >
+              Unread
+            </Button>
+            <Button
+              size="sm"
+              variant={showAll ? "secondary" : "ghost"}
+              className="h-6 px-2 text-[11px]"
+              onClick={() => { if (!showAll) onToggleShowAll(); }}
+            >
+              All
+            </Button>
+          </div>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2 text-[11px]"
+            disabled={loading || notifications.length === 0 || markAllBusy}
+            onClick={onMarkAllRead}
+          >
+            {markAllBusy ? <Loader2 className="mr-1 size-3 animate-spin" /> : <Check className="mr-1 size-3" />}
+            Mark all read
+          </Button>
+          <Button size="icon" variant="ghost" className="size-6" title="Refresh notifications" aria-label="Refresh notifications" disabled={loading} onClick={onRefresh}>
+            {loading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+          </Button>
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      </div>
+      {error && (
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+      <div className="max-h-72 space-y-1 overflow-y-auto">
+        {!error && notifications.length === 0 ? (
+          <div className="px-1 py-2 text-[11px] text-muted-foreground">
+            {loading ? "Loading…" : "No notifications."}
+          </div>
+        ) : (
+          notifications.map((n) => (
+            <NotificationRow
+              key={n.id}
+              notification={n}
+              busy={busy[n.id]}
+              error={rowErrors[n.id]}
+              onMarkRead={() => onMarkRead(n.id)}
+              onIgnore={() => onIgnore(n.id)}
+              onUnsubscribe={() => onUnsubscribe(n.id)}
+            />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function NotificationRow({
+  notification,
+  busy,
+  error,
+  onMarkRead,
+  onIgnore,
+  onUnsubscribe,
+}: {
+  notification: GitHubNotification;
+  busy: string | undefined;
+  error: string | undefined;
+  onMarkRead: () => void;
+  onIgnore: () => void;
+  onUnsubscribe: () => void;
+}) {
+  // Prefer the browsable HTML URL; the api.github.com subject/comment URLs
+  // would open raw JSON in the browser.
+  const openUrl = notification.htmlUrl ?? notification.subjectUrl;
+  return (
+    <div className="rounded px-1 py-1.5 text-xs">
+      <div className="flex items-center gap-2">
+        <span
+          className={cn(
+            "size-1.5 shrink-0 rounded-full",
+            notification.unread ? "bg-sky-400" : "bg-transparent",
+          )}
+          aria-hidden
+        />
+        {openUrl ? (
+          <button
+            type="button"
+            className="min-w-0 flex-1 truncate text-left hover:underline"
+            title={notification.title}
+            onClick={() => { void api.openExternal(openUrl); }}
+          >
+            {notification.title}
+          </button>
+        ) : (
+          <span className="min-w-0 flex-1 truncate">{notification.title}</span>
+        )}
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-6"
+            title="Mark as read"
+            aria-label={`Mark ${notification.title} as read`}
+            disabled={!!busy}
+            onClick={onMarkRead}
+          >
+            {busy === "read" ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-1.5 text-[11px]"
+            title="Ignore this conversation"
+            disabled={!!busy}
+            onClick={onIgnore}
+          >
+            {busy === "ignore" ? <Loader2 className="size-3 animate-spin" /> : <BellOff className="mr-1 size-3" />}
+            Ignore
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-1.5 text-[11px]"
+            title="Unsubscribe from this thread"
+            disabled={!!busy}
+            onClick={onUnsubscribe}
+          >
+            {busy === "unsubscribe" ? <Loader2 className="size-3 animate-spin" /> : <X className="mr-1 size-3" />}
+            Unsubscribe
+          </Button>
+        </div>
+      </div>
+      <div className="mt-0.5 flex items-center gap-1.5 pl-3.5 text-[11px] text-muted-foreground">
+        <span className="truncate">{notification.reason.replace(/_/g, " ")}</span>
+        {notification.updatedAt && (
+          <>
+            <span>·</span>
+            <span>{fmtRelativeDate(notification.updatedAt)}</span>
+          </>
+        )}
+      </div>
+      {error && (
+        <div className="mt-0.5 flex items-center gap-1 pl-3.5 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
     </div>
   );
 }

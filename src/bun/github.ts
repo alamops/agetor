@@ -16,6 +16,8 @@ import type {
   GitHubRepoLabel,
   GitHubMilestone,
   GitHubMilestonesResult,
+  GitHubNotification,
+  GitHubNotificationsResult,
   GitHubRepoMilestone,
   GitHubPullCommit,
   GitHubPullCommitsResult,
@@ -281,6 +283,22 @@ interface DeleteGitHubMilestoneInput {
   number: number;
 }
 
+interface ListGitHubNotificationsInput {
+  dir: string;
+  /** `false` (default) = unread only; `true` = all notifications, matching
+   *  GitHub's own `all` query param semantics. */
+  all?: boolean;
+}
+
+interface GitHubThreadInput {
+  dir: string;
+  threadId: string;
+}
+
+interface SetGitHubThreadSubscriptionInput extends GitHubThreadInput {
+  ignored: boolean;
+}
+
 interface ListGitHubReactionsInput {
   dir: string;
   subject: GitHubReactionSubject;
@@ -338,6 +356,9 @@ type GitHubIssuePinnedResponse = ({ ok: true; pinned: boolean; message?: string 
 type GitHubSubIssuesResponse = ({ ok: true } & GitHubSubIssuesResult) | GitHubListError;
 type GitHubSubIssueAddResponse = ({ ok: true; subIssue: GitHubSubIssue; message?: string }) | GitHubListError;
 type GitHubIssueTransferResponse = ({ ok: true; url: string; message?: string }) | GitHubListError;
+type GitHubNotificationsResponse = ({ ok: true } & GitHubNotificationsResult) | GitHubListError;
+type GitHubMarkAllReadResponse = ({ ok: true; message: string }) | GitHubListError;
+type GitHubThreadSubscriptionResponse = ({ ok: true; subscribed: boolean; ignored: boolean }) | GitHubListError;
 
 const GITHUB_FETCH_TIMEOUT_MS = 30_000;
 const GITHUB_DIFF_BODY_CAP_BYTES = 8_000_000;
@@ -590,6 +611,8 @@ export const __githubInternals = {
   transferredIssueFromGraphql,
   subIssuesApiError,
   parseRateLimit,
+  normalizeNotification,
+  notificationHtmlUrl,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -2988,4 +3011,195 @@ export async function deleteGitHubMilestone(input: DeleteGitHubMilestoneInput): 
     return { ok: false, error: apiError(json, res.status, res.statusText) };
   }
   return { ok: true, message: "Milestone deleted." };
+}
+
+/** A single `GET /notifications` entry. Returns null when `id` or `subject`
+ *  is missing — those are the two fields every other field is meaningless
+ *  without (a notification the UI can't identify or describe). Pure —
+ *  unit-tested. */
+/** A GitHub notification `subject.url` is a REST API URL
+ *  (`https://api.github.com/repos/o/r/issues/9`). Convert it to the browsable
+ *  HTML URL so opening a notification lands on the page, not raw JSON. Returns
+ *  null when the shape isn't a recognizable repo subject URL. */
+function notificationHtmlUrl(subjectUrl: string | null): string | null {
+  if (!subjectUrl) return null;
+  const m = /^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/(.+)$/.exec(subjectUrl);
+  if (!m) return null;
+  const [, owner, name, rest] = m;
+  // pulls → pull, commits → commit; issues/releases map straight through.
+  const path = rest!.replace(/^pulls\//, "pull/").replace(/^commits\//, "commit/");
+  return `https://github.com/${owner}/${name}/${path}`;
+}
+
+function normalizeNotification(raw: unknown): GitHubNotification | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.id !== "string" || !obj.id) return null;
+  const subject = obj.subject && typeof obj.subject === "object" ? obj.subject as Record<string, unknown> : null;
+  if (!subject) return null;
+  const repository = obj.repository && typeof obj.repository === "object" ? obj.repository as Record<string, unknown> : null;
+  const subjectUrl = typeof subject.url === "string" ? subject.url : null;
+  return {
+    id: obj.id,
+    unread: obj.unread === true,
+    reason: typeof obj.reason === "string" ? obj.reason : "",
+    updatedAt: typeof obj.updated_at === "string" ? obj.updated_at : "",
+    title: typeof subject.title === "string" ? subject.title : "",
+    subjectType: typeof subject.type === "string" ? subject.type : "",
+    subjectUrl,
+    htmlUrl: notificationHtmlUrl(subjectUrl),
+    latestCommentUrl: typeof subject.latest_comment_url === "string" ? subject.latest_comment_url : null,
+    repo: repository && typeof repository.full_name === "string" ? repository.full_name : "",
+  };
+}
+
+/** `GET /repos/:o/:r/notifications` — this repo's inbox (F14). Notifications
+ *  are always private, so (unlike most list endpoints here) there is no
+ *  unauthenticated fallback: no token is a hard error rather than an
+ *  empty/degraded result. `all: false` (GitHub's default) returns unread
+ *  only; `all: true` returns the full recent history for the repo. */
+export async function listGitHubNotifications(input: ListGitHubNotificationsInput): Promise<GitHubNotificationsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to view notifications" };
+
+  const notifications: GitHubNotification[] = [];
+  const all = input.all === true ? "true" : "false";
+  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/notifications?all=${all}&per_page=50`;
+  for (let page = 0; next && page < 3; page++) {
+    const res = await fetchGitHub(next, token, "application/vnd.github+json");
+    if (!("status" in res)) return res;
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: apiError(body, res.status, res.statusText) };
+    if (!Array.isArray(body)) return { ok: false, error: "GitHub returned an unexpected notifications response" };
+    for (const raw of body) {
+      const notification = normalizeNotification(raw);
+      if (notification) notifications.push(notification);
+    }
+    next = pageLinks(res.headers.get("link"));
+  }
+  return { ok: true, repo: repoSlug(repo), notifications };
+}
+
+/** `PATCH /notifications/threads/:id` — marks a single thread as read.
+ *  Responds 205 with no body; success is `res.ok` alone. */
+export async function markGitHubNotificationRead(input: GitHubThreadInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const threadId = input.threadId.trim();
+  if (!threadId) return { ok: false, error: "thread id required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to mark a notification read" };
+  const res = await fetchGitHub(
+    `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}`,
+    token,
+    "application/vnd.github+json",
+    { method: "PATCH" },
+  );
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true };
+}
+
+/** `PUT /repos/:o/:r/notifications` — marks every notification in this repo
+ *  as read. Responds 202 (Accepted, async) or 205 (already up to date) with
+ *  no body; success is `res.ok` alone. */
+export async function markAllGitHubNotificationsRead(input: { dir: string }): Promise<GitHubMarkAllReadResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to mark notifications read" };
+  const res = await fetchGitHub(
+    `https://api.github.com/repos/${repo.owner}/${repo.name}/notifications`,
+    token,
+    "application/vnd.github+json",
+    { method: "PUT" },
+  );
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, message: "Marked all as read." };
+}
+
+/** `GET /notifications/threads/:id/subscription` — a 404 means the viewer has
+ *  no explicit subscription record for the thread (the common case: they're
+ *  simply subscribed by default participation), which is not an error —
+ *  it's reported as `{ subscribed: false, ignored: false }`. */
+export async function getGitHubThreadSubscription(input: GitHubThreadInput): Promise<GitHubThreadSubscriptionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const threadId = input.threadId.trim();
+  if (!threadId) return { ok: false, error: "thread id required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to view thread subscription" };
+  const res = await fetchGitHub(
+    `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
+    token,
+    "application/vnd.github+json",
+  );
+  if (!("status" in res)) return res;
+  if (res.status === 404) return { ok: true, subscribed: false, ignored: false };
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const obj = json && typeof json === "object" ? json as Record<string, unknown> : {};
+  return { ok: true, subscribed: obj.subscribed === true, ignored: obj.ignored === true };
+}
+
+/** `PUT /notifications/threads/:id/subscription` — (re)subscribes to a
+ *  thread, optionally muting it (`ignored: true`, GitHub's "ignore this
+ *  conversation"). */
+export async function setGitHubThreadSubscription(input: SetGitHubThreadSubscriptionInput): Promise<GitHubThreadSubscriptionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const threadId = input.threadId.trim();
+  if (!threadId) return { ok: false, error: "thread id required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to update thread subscription" };
+  const res = await fetchGitHub(
+    `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
+    token,
+    "application/vnd.github+json",
+    { method: "PUT", body: JSON.stringify({ ignored: input.ignored === true }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const obj = json && typeof json === "object" ? json as Record<string, unknown> : {};
+  return { ok: true, subscribed: obj.subscribed === true, ignored: obj.ignored === true };
+}
+
+/** `DELETE /notifications/threads/:id/subscription` — removes the viewer's
+ *  subscription entirely (distinct from `ignored: true`, which keeps a
+ *  subscription but mutes it). Responds 204 with no body. */
+export async function unsubscribeGitHubThread(input: GitHubThreadInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const threadId = input.threadId.trim();
+  if (!threadId) return { ok: false, error: "thread id required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to unsubscribe from a thread" };
+  const res = await fetchGitHub(
+    `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
+    token,
+    "application/vnd.github+json",
+    { method: "DELETE" },
+  );
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true };
 }

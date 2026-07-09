@@ -11,21 +11,27 @@ import {
   getGitHubIssuePinned,
   getGitHubPullLinkedIssues,
   getGitHubRepoPermissions,
+  getGitHubThreadSubscription,
   getGitHubViewer,
   listGitHubAssignees,
   listGitHubItems,
   listGitHubLabels,
   listGitHubMilestones,
+  listGitHubNotifications,
   listGitHubPullCommits,
   listGitHubReactions,
   listGitHubSubIssues,
+  markAllGitHubNotificationsRead,
+  markGitHubNotificationRead,
   removeGitHubReaction,
   removeGitHubSubIssue,
   requestGitHubPullReviewers,
   setGitHubIssueLock,
   setGitHubIssuePinned,
   setGitHubPullAutoMerge,
+  setGitHubThreadSubscription,
   transferGitHubIssue,
+  unsubscribeGitHubThread,
 } from "./github.ts";
 
 let REPO_DIR = "";
@@ -1202,6 +1208,173 @@ test("listGitHubItems (REST path, no client filter) fetches exactly one source p
     if (!res.ok) throw new Error(res.error);
     expect(mock.calls).toHaveLength(1); // single page despite the next link
     expect(res.hasMore).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubNotifications hits the repo notifications endpoint with all=false by default and maps fields", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/notifications",
+      json: [
+        {
+          id: "1",
+          unread: true,
+          reason: "mention",
+          updated_at: "2026-07-01T00:00:00Z",
+          subject: {
+            title: "Fix it",
+            url: "https://api.github.com/repos/acme/widgets/issues/9",
+            type: "Issue",
+            latest_comment_url: null,
+          },
+          repository: { full_name: "acme/widgets" },
+        },
+      ],
+    },
+  ]);
+  try {
+    const res = await listGitHubNotifications({ dir: REPO_DIR });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.repo).toBe("acme/widgets");
+    expect(res.notifications).toEqual([
+      {
+        id: "1",
+        unread: true,
+        reason: "mention",
+        updatedAt: "2026-07-01T00:00:00Z",
+        title: "Fix it",
+        subjectType: "Issue",
+        subjectUrl: "https://api.github.com/repos/acme/widgets/issues/9",
+        htmlUrl: "https://github.com/acme/widgets/issues/9",
+        latestCommentUrl: null,
+        repo: "acme/widgets",
+      },
+    ]);
+    expect(mock.calls).toHaveLength(1);
+    const url = new URL(mock.calls[0]!.url);
+    expect(url.pathname).toBe("/repos/acme/widgets/notifications");
+    expect(url.searchParams.get("all")).toBe("false");
+    expect(url.searchParams.get("per_page")).toBe("50");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubNotifications passes all=true through to the request when requested", async () => {
+  const mock = mockGitHubFetch([{ match: "/repos/acme/widgets/notifications", json: [] }]);
+  try {
+    const res = await listGitHubNotifications({ dir: REPO_DIR, all: true });
+    expect(res.ok).toBe(true);
+    const url = new URL(mock.calls[0]!.url);
+    expect(url.searchParams.get("all")).toBe("true");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubNotifications requires a token — errors without a network call when unauthenticated", async () => {
+  const priorToken = process.env.GITHUB_TOKEN;
+  const priorGhToken = process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await listGitHubNotifications({ dir: REPO_DIR });
+    expect(res).toEqual({ ok: false, error: "GitHub authentication required to view notifications" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+    if (priorToken !== undefined) process.env.GITHUB_TOKEN = priorToken;
+    if (priorGhToken !== undefined) process.env.GH_TOKEN = priorGhToken;
+  }
+});
+
+test("markGitHubNotificationRead PATCHes the thread endpoint and succeeds on a 205 with no body", async () => {
+  const mock = mockGitHubFetch([
+    { method: "PATCH", match: "https://api.github.com/notifications/threads/42", status: 205 },
+  ]);
+  try {
+    const res = await markGitHubNotificationRead({ dir: REPO_DIR, threadId: "42" });
+    expect(res).toEqual({ ok: true });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/notifications/threads/42");
+    expect(mock.calls[0]!.method).toBe("PATCH");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("markAllGitHubNotificationsRead PUTs the repo notifications endpoint and succeeds on a 202 with no body", async () => {
+  const mock = mockGitHubFetch([
+    { method: "PUT", match: "https://api.github.com/repos/acme/widgets/notifications", status: 202 },
+  ]);
+  try {
+    const res = await markAllGitHubNotificationsRead({ dir: REPO_DIR });
+    expect(res).toEqual({ ok: true, message: "Marked all as read." });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/notifications");
+    expect(mock.calls[0]!.method).toBe("PUT");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubThreadSubscription maps subscribed/ignored from the response", async () => {
+  const mock = mockGitHubFetch([
+    { match: "https://api.github.com/notifications/threads/42/subscription", json: { subscribed: true, ignored: false } },
+  ]);
+  try {
+    const res = await getGitHubThreadSubscription({ dir: REPO_DIR, threadId: "42" });
+    expect(res).toEqual({ ok: true, subscribed: true, ignored: false });
+    expect(mock.calls[0]!.method).toBe("GET");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubThreadSubscription treats a 404 as unsubscribed/unignored, not an error", async () => {
+  const mock = mockGitHubFetch([
+    { match: "https://api.github.com/notifications/threads/42/subscription", status: 404 },
+  ]);
+  try {
+    const res = await getGitHubThreadSubscription({ dir: REPO_DIR, threadId: "42" });
+    expect(res).toEqual({ ok: true, subscribed: false, ignored: false });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubThreadSubscription PUTs {ignored} to the subscription endpoint", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "PUT",
+      match: "https://api.github.com/notifications/threads/42/subscription",
+      json: { subscribed: true, ignored: true },
+    },
+  ]);
+  try {
+    const res = await setGitHubThreadSubscription({ dir: REPO_DIR, threadId: "42", ignored: true });
+    expect(res).toEqual({ ok: true, subscribed: true, ignored: true });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.method).toBe("PUT");
+    expect(JSON.parse(mock.calls[0]!.body ?? "{}")).toEqual({ ignored: true });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("unsubscribeGitHubThread DELETEs the subscription endpoint and succeeds on a 204 with no body", async () => {
+  const mock = mockGitHubFetch([
+    { method: "DELETE", match: "https://api.github.com/notifications/threads/42/subscription", status: 204 },
+  ]);
+  try {
+    const res = await unsubscribeGitHubThread({ dir: REPO_DIR, threadId: "42" });
+    expect(res).toEqual({ ok: true });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.method).toBe("DELETE");
   } finally {
     mock.restore();
   }

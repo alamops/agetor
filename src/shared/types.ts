@@ -959,6 +959,32 @@ export interface GitHubReactionsResult {
   reactions: GitHubReactionSummary[];
 }
 
+/** A GitHub notification thread (`GET /notifications`), scoped to the current
+ *  repo (F14). `subjectType` is GitHub's own subject kind ("PullRequest",
+ *  "Issue", "Commit", "Discussion", …) — not narrowed to `GitHubItemKind`
+ *  since notifications cover subjects the rest of the UI doesn't model.
+ *  `subjectUrl`/`latestCommentUrl` are api.github.com URLs (or null); the UI
+ *  opens whichever is present via `api.openExternal`. */
+export interface GitHubNotification {
+  id: string;
+  unread: boolean;
+  reason: string;
+  updatedAt: string;
+  title: string;
+  subjectType: string;
+  subjectUrl: string | null;
+  /** Browsable HTML URL derived from `subjectUrl` (api.github.com → github.com),
+   *  so the UI opens the page rather than the raw JSON. Null when not derivable. */
+  htmlUrl: string | null;
+  latestCommentUrl: string | null;
+  repo: string;
+}
+
+export interface GitHubNotificationsResult {
+  repo: string;
+  notifications: GitHubNotification[];
+}
+
 /**
  * Streams the run panel listens on. Codex (and any unstructured agent)
  * uses the flat trio: stdout / stderr / status. Claude's JSONL is parsed

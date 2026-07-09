@@ -36,6 +36,8 @@ const {
   transferredIssueFromGraphql,
   subIssuesApiError,
   parseRateLimit,
+  normalizeNotification,
+  notificationHtmlUrl,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -632,4 +634,60 @@ test("parseRateLimit returns null on a non-numeric remaining/limit value", () =>
     "x-ratelimit-resource": "core",
   });
   expect(parseRateLimit(headers)).toBeNull();
+});
+
+test("normalizeNotification maps id/unread/reason/subject/repository fields", () => {
+  expect(
+    normalizeNotification({
+      id: "1",
+      unread: true,
+      reason: "mention",
+      updated_at: "2026-07-01T00:00:00Z",
+      subject: {
+        title: "Fix the thing",
+        url: "https://api.github.com/repos/o/r/issues/9",
+        type: "Issue",
+        latest_comment_url: "https://api.github.com/repos/o/r/issues/comments/5",
+      },
+      repository: { full_name: "o/r" },
+    }),
+  ).toEqual({
+    id: "1",
+    unread: true,
+    reason: "mention",
+    updatedAt: "2026-07-01T00:00:00Z",
+    title: "Fix the thing",
+    subjectType: "Issue",
+    subjectUrl: "https://api.github.com/repos/o/r/issues/9",
+    htmlUrl: "https://github.com/o/r/issues/9",
+    latestCommentUrl: "https://api.github.com/repos/o/r/issues/comments/5",
+    repo: "o/r",
+  });
+});
+
+test("notificationHtmlUrl converts REST subject URLs to browsable HTML URLs", () => {
+  expect(notificationHtmlUrl("https://api.github.com/repos/o/r/issues/9")).toBe("https://github.com/o/r/issues/9");
+  expect(notificationHtmlUrl("https://api.github.com/repos/o/r/pulls/12")).toBe("https://github.com/o/r/pull/12");
+  expect(notificationHtmlUrl("https://api.github.com/repos/o/r/commits/abc123")).toBe("https://github.com/o/r/commit/abc123");
+  // unrecognized / null → null
+  expect(notificationHtmlUrl(null)).toBeNull();
+  expect(notificationHtmlUrl("https://example.com/x")).toBeNull();
+});
+
+test("normalizeNotification defaults missing optional fields and drops entries without id/subject", () => {
+  expect(normalizeNotification({ id: "2", subject: {} })).toEqual({
+    id: "2",
+    unread: false,
+    reason: "",
+    updatedAt: "",
+    title: "",
+    subjectType: "",
+    subjectUrl: null,
+    htmlUrl: null,
+    latestCommentUrl: null,
+    repo: "",
+  });
+  expect(normalizeNotification({ unread: true, subject: { title: "x" } })).toBeNull();
+  expect(normalizeNotification({ id: "3" })).toBeNull();
+  expect(normalizeNotification(null)).toBeNull();
 });

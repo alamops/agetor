@@ -19,6 +19,8 @@ import type {
   GitHubLinkedIssue,
   GitHubLinkedIssuesResult,
   GitHubListResult,
+  GitHubNotification,
+  GitHubNotificationsResult,
   GitHubPullCommit,
   GitHubPullCommitsResult,
   GitHubPullDefaultsResult,
@@ -78,6 +80,8 @@ export type {
   GitHubLinkedIssue,
   GitHubLinkedIssuesResult,
   GitHubListResult,
+  GitHubNotification,
+  GitHubNotificationsResult,
   GitHubPullCommit,
   GitHubPullCommitsResult,
   GitHubPullDefaultsResult,
@@ -673,6 +677,34 @@ export const api = {
         subjectId: input.subject.id,
         reactionId: input.reactionId,
       }),
+    }),
+  listGitHubNotifications: (input: { path: string; all?: boolean }) => {
+    const q = new URLSearchParams({ path: input.path, all: input.all ? "true" : "false" });
+    return j<GitHubNotificationsResult>(`/github/notifications?${q.toString()}`);
+  },
+  markGitHubNotificationRead: (input: { path: string; threadId: string }) =>
+    j<{ ok: true }>("/github/notification-read", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  markAllGitHubNotificationsRead: (input: { path: string }) =>
+    j<{ ok: true; message: string }>("/github/notifications-read-all", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getGitHubThreadSubscription: (input: { path: string; threadId: string }) => {
+    const q = new URLSearchParams({ path: input.path, threadId: input.threadId });
+    return j<{ ok: true; subscribed: boolean; ignored: boolean }>(`/github/thread-subscription?${q.toString()}`);
+  },
+  setGitHubThreadSubscription: (input: { path: string; threadId: string; ignored: boolean }) =>
+    j<{ ok: true; subscribed: boolean; ignored: boolean }>("/github/thread-subscription", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  unsubscribeGitHubThread: (input: { path: string; threadId: string }) =>
+    j<{ ok: true }>("/github/thread-unsubscribe", {
+      method: "POST",
+      body: JSON.stringify(input),
     }),
   getTmuxSource: () =>
     j<{

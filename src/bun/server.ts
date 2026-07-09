@@ -76,6 +76,7 @@ import {
   getGitHubPullChecks,
   getGitHubPullLinkedIssues,
   getGitHubRepoPermissions,
+  getGitHubThreadSubscription,
   getGitHubViewer,
   getGitHubPullDefaults,
   getGitHubPullDiff,
@@ -86,10 +87,13 @@ import {
   listGitHubItems,
   listGitHubLabels,
   listGitHubMilestones,
+  listGitHubNotifications,
   listGitHubPullCommits,
   listGitHubPullReviewComments,
   listGitHubReactions,
   listGitHubSubIssues,
+  markAllGitHubNotificationsRead,
+  markGitHubNotificationRead,
   mergeGitHubPull,
   removeGitHubReaction,
   removeGitHubSubIssue,
@@ -102,7 +106,9 @@ import {
   setGitHubPullAutoMerge,
   setGitHubPullDraft,
   setGitHubReviewThreadResolved,
+  setGitHubThreadSubscription,
   transferGitHubIssue,
+  unsubscribeGitHubThread,
   updateGitHubComment,
   updateGitHubIssue,
   updateGitHubLabel,
@@ -1635,6 +1641,95 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           const subject: GitHubReactionSubject = { type: body.subjectType, id: body.subjectId };
           const result = await removeGitHubReaction({ dir, subject, reactionId: body.reactionId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/notifications": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const all = url.searchParams.get("all") === "true";
+          const result = await listGitHubNotifications({ dir, all });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/notification-read": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await markGitHubNotificationRead({ dir, threadId: body.threadId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/notifications-read-all": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await markAllGitHubNotificationsRead({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/thread-subscription": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const threadId = url.searchParams.get("threadId");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!threadId || !threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubThreadSubscription({ dir, threadId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string; ignored?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubThreadSubscription({ dir, threadId: body.threadId, ignored: body.ignored === true });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/thread-unsubscribe": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await unsubscribeGitHubThread({ dir, threadId: body.threadId });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
