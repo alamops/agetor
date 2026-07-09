@@ -1452,6 +1452,15 @@ function RunsList({ runs }: { runs: Run[] }) {
           <Badge variant={STATUS_VARIANT[latest.status]} className="shrink-0">
             {latest.status}
           </Badge>
+          {latest.origin === "continuation" && (
+            <Badge
+              variant="secondary"
+              className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+              title="auto-continued after a background task"
+            >
+              auto
+            </Badge>
+          )}
           <span className="truncate">
             Run #{ordinalFor(latest.id)} · {formatTime(latest.startedAt)}
           </span>
@@ -1482,6 +1491,15 @@ function RunsList({ runs }: { runs: Run[] }) {
                 <Badge variant={STATUS_VARIANT[r.status]} className="shrink-0">
                   {r.status}
                 </Badge>
+                {r.origin === "continuation" && (
+                  <Badge
+                    variant="secondary"
+                    className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+                    title="auto-continued after a background task"
+                  >
+                    auto
+                  </Badge>
+                )}
                 <span className="truncate text-muted-foreground">
                   #{ordinalFor(r.id)} · {formatTime(r.startedAt)}
                 </span>
