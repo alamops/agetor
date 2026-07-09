@@ -720,6 +720,13 @@ function RunPanelBody({
     const line = input.trim();
     if (!line && !sendRefs.length) return;
     if (!resumableRunId) return;
+    // Never deliver while a native modal is up: claude is blocked on it inside
+    // the tmux REPL, so the keystrokes would paste into the modal instead of
+    // reaching the agent (and the run would hang "working"). The Send button is
+    // already disabled here, but the textarea now stays typable while a prompt
+    // is pending — so you can stash a draft — which means Enter can reach this
+    // function. Guard it at the source rather than relying on the field.
+    if (modalPending) return;
     // Don't fire a send while a backlog op (e.g. Save-for-later stashing this
     // same text) is mid-flight — otherwise a fast Enter could both send and
     // save the same message.
@@ -775,8 +782,10 @@ function RunPanelBody({
   // Park the current composer content on the backlog instead of sending it —
   // "a message that came to mind but isn't ready to send yet." Consumes the
   // composer (text + refs) exactly like `send()` does, so the two actions feel
-  // symmetric. Works even while a prompt is pending (the send box is gated but
-  // stashing a thought for later is always safe).
+  // symmetric. Available in every state the composer renders — including before
+  // the task's first run and while a prompt is pending. Those are exactly the
+  // moments you can't send but most want to jot something down, so the textarea
+  // stays typable there and only *sending* is gated (see `send()`).
   const saveForLater = async () => {
     const text = input.trim();
     if (!text && !sendRefs.length) return;
@@ -1263,27 +1272,42 @@ function RunPanelBody({
                   if (e.defaultPrevented) return;
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
+                    // The field is typable in states we can't send from (before
+                    // the first run, or while a prompt is pending). Swallowing
+                    // Enter there would be a dead key, so it does the thing the
+                    // user means: stash the draft. `send()` guards both states
+                    // too, so this is the only place that decides.
+                    if (!canSend || modalPending) {
+                      void saveForLater();
+                      return;
+                    }
                     void send();
                   }
                 }}
                 placeholder={
                   modalPending
-                    ? "Answer the prompt above — or press Stop to cancel, then send a new message."
+                    ? "Answer the prompt above — or type a message and Save it for later."
                     : canSend
                     ? task.column === "running"
                       ? "Agent is working — your message will be added to the current turn. Type / for commands."
                       : task.column === "blocked"
                         ? "Answer the question, or send any follow-up. Type / for commands."
                         : "Send a message — resumes the conversation in a fresh session. Type / for commands."
-                    : "Not running yet — type a message and Save it for later, ready to send once the task runs."
+                    // `!canSend` covers two states: never run, and "ran but has
+                    // no resumable session" (a codex task whose run_id was
+                    // cleared — claude falls back to its newest run). Don't
+                    // claim "not running yet" in the latter.
+                    : runs.length > 0
+                      ? "No live session to send to — save this message for later, or re-run the task."
+                      : "Not running yet — type a message and Save it for later, ready to send once the task runs."
                 }
                 rows={2}
-                // Typing is allowed even when the task can't be sent to yet:
-                // that's the whole point of "Save for later" — you stash the
-                // draft now and send it once the task is running. Sending stays
-                // gated on `canSend` (button below + the guard in `send()`),
-                // so Enter is a harmless no-op pre-run.
-                disabled={sending || backlogBusy || modalPending}
+                // Typing is allowed in every state the composer renders, even
+                // when we can't send: that's the point of "Save for later".
+                // Sending is gated separately — the Send button below plus the
+                // `canSend` / `modalPending` guards inside `send()` — so a
+                // keystroke can never leak into a live tmux modal.
+                disabled={sending || backlogBusy}
                 className="h-16 min-h-0 w-full resize-none text-xs"
               />
               <SlashAutocomplete
@@ -1551,7 +1575,14 @@ function BacklogItemRow({
             className={BACKLOG_ICON_BTN}
             disabled={!canSend || busy}
             onClick={onSend}
-            title={canSend ? "Send now" : "Run the task first, then you can send this"}
+            // `canSend` here is the parent's `canSend && !modalPending`, so it
+            // goes false for two different reasons — no live/resumable session,
+            // or a prompt is waiting. Keep the copy true for both.
+            title={
+              canSend
+                ? "Send now"
+                : "Can't send right now — run the task, or answer the pending prompt first"
+            }
           >
             <Send className="size-3.5" />
           </button>
