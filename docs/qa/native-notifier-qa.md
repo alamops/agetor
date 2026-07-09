@@ -59,3 +59,39 @@ bun run build     # runs vendor:notifier (builds+signs AgetorNotifier.app), then
   `bun run vendor:notifier`; the `agetor://` scheme only routes once the built
   `.app` is registered with LaunchServices, so the full click loop is a
   built-app test, not a dev-server test.
+
+## Focus behavior on click (macOS 14+ cooperative activation)
+
+macOS 14 made `activate` a *request* the currently-active app can deny —
+`NSApplication.activate` / `NSRunningApplication.activate(options:
+.activateIgnoringOtherApps)` are deprecated no-ops. Clicking a notification
+briefly makes the helper the active app with a real, yieldable activation
+right, which it now explicitly yields to Agetor (`sh.alamops.agetor`) before
+opening the deep link, so the request is honored instead of just bouncing the
+Dock icon. Verify each scenario below on a real, signed, packaged build (per
+the steps above) — this cannot be verified from `bun run dev`.
+
+- [ ] **Buried behind other apps.** With several other apps' windows layered
+      on top of Agetor's, click the notification → Agetor's window is raised
+      above them and gets keyboard focus (not just a Dock bounce).
+- [ ] **Minimized to the Dock.** Minimize the Agetor window, then click the
+      notification → the window un-minimizes and comes to the front.
+- [ ] **On a secondary display.** With Agetor's window on a second monitor and
+      focus on the primary, click the notification → the secondary display's
+      window is raised and focused; the OS switches your active display/cursor
+      context to it as normal for cross-display activation.
+- [ ] **On another Space.** With Agetor's window on a different Space than the
+      one you're on, click the notification:
+      - If **Desktop & Dock → Mission Control → "When switching to an
+        application, switch to a Space with open windows for the
+        application"** is **on** (the default): macOS switches you to
+        Agetor's Space and focuses its window.
+      - If that setting is **off**: the Space does *not* switch — only the
+        menu bar changes to Agetor's and the window stays on its own Space.
+        This is expected OS behavior, not a bug in the helper; don't file it
+        as a regression.
+- [ ] **Window fully closed** (not just minimized — actually closed, process
+      still running). Click the notification → Agetor recreates/opens a
+      window and it comes to the foreground with the right task open (same as
+      the "window closed" case in the core loop above, verified here
+      specifically for focus/activation rather than task routing).
