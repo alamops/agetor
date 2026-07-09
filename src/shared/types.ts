@@ -1080,19 +1080,6 @@ export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): strin
   );
 }
 
-/** A branch in a project repo, as returned by `GET /projects/branches`.
- *  Single source of truth shared by the server, webview, and CLI. */
-export interface BranchInfo {
-  /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */
-  name: string;
-  /** Unix-ms timestamp of the tip commit, used to sort recents first. */
-  committedAt: number;
-  /** True for the branch currently checked out at the queried dir. */
-  current: boolean;
-  /** True for remote-tracking refs (`refs/remotes/<remote>/<name>`). */
-  remote: boolean;
-}
-
 /**
  * A working directory the user has registered as a "project". Surfaced in the
  * workdir picker on the New Task form so common paths don't need to be typed
@@ -1111,10 +1098,13 @@ export interface Project {
 }
 
 /**
- * A branch surfaced by the new-task base-ref picker. Shared so the server
- * (`listBranches` in src/bun/worktree.ts) and the webview (`api.ts` /
- * `BranchPicker`) agree on a single wire shape — the previous per-side copies
- * had already silently drifted (the client one omitted `remote`).
+ * A branch in a project repo, as returned by `GET /projects/branches` and
+ * surfaced by the new-task base-ref picker. The single source of truth shared
+ * by the server (`listBranches` in src/bun/worktree.ts), the webview (`api.ts` /
+ * `BranchPicker`), and the CLI — the previous per-side copies had already
+ * silently drifted (the client one omitted `remote`). Keep it that way: do not
+ * re-declare this interface, since TypeScript would silently merge the two
+ * declarations rather than flag the duplicate.
  */
 export interface BranchInfo {
   /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */
