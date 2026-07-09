@@ -2,6 +2,14 @@ import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { WebSocketHandler } from "bun";
+// Namespace import, not `import { Screen } from "electrobun/bun"`: tests
+// mock.module("electrobun/bun", ...) with a stub that doesn't export
+// `Screen` (see notifications.test.ts), and Bun's ESM linker rejects a
+// named import of a binding the mock doesn't provide at *import* time,
+// before any test even runs. A namespace import always resolves; the
+// `/window/focus` handler below reads `.Screen` off it lazily, so a mocked
+// module missing that key only matters if the route is actually hit.
+import * as ElectrobunBun from "electrobun/bun";
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, getApiPort } from "./api-config.ts";
 import { removeCoreCreds } from "./core-creds.ts";
@@ -61,6 +69,7 @@ import {
 import { listAgentCapabilities } from "./commands.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
+import { focusWindow } from "./window-focus.ts";
 import {
   answerTmuxPrompt,
   findTmuxPromptById,
@@ -444,6 +453,25 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           if (win.isMaximized()) win.unmaximize();
           else win.maximize();
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Bring the main window to the front from the webview side — the
+      // counterpart to `focusMainWindow()` in index.ts (notification click,
+      // Dock reopen). The webview needs this too: a clicked toast's `onOpen`
+      // runs entirely in the renderer, and a WKWebView's own `window.focus()`
+      // can't activate the host NSApplication, so it has to round-trip
+      // through here to reach the same `focusWindow` routine.
+      "/window/focus": {
+        POST: authed((req) => {
+          const focused = focusWindow(getMainWindow(), { getAllDisplays: () => ElectrobunBun.Screen.getAllDisplays() });
+          if (!focused) {
+            return json(
+              { error: "no main window" },
+              { status: 503, headers: corsHeaders(req) },
+            );
+          }
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },

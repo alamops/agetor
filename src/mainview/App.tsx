@@ -217,11 +217,12 @@ export default function App() {
         // in the GlobalEvent handler below, but this handler closes over
         // its own scope, so the fresh list has to be fetched directly
         // rather than relying on `tasksRef` updating synchronously after
-        // `setTasks`.
+        // `setTasks`. No focusWindow() call here: this handler only fires
+        // after the main process has already handled `open-url` and focused
+        // the window itself, so a second call would be redundant.
         const fresh = findTaskById(tasksRef.current, ev.taskId);
         if (fresh) {
           setSelected(fresh);
-          window.focus();
           return;
         }
         void (async () => {
@@ -231,7 +232,6 @@ export default function App() {
             const found = findTaskById(list, ev.taskId);
             if (found) {
               setSelected(found);
-              window.focus();
             }
             // else: silently no-op — the task doesn't exist (deleted?).
           } catch {
@@ -294,9 +294,11 @@ export default function App() {
         const fresh = tasksRef.current.find((t) => t.id === ev.taskId);
         if (fresh) setSelected(fresh);
         // Best-effort: bring the agetor window forward when the user clicks
-        // through from a native notification. window.focus() is a no-op in
-        // many browsers but works inside WKWebView.
-        window.focus();
+        // through from a toast. Unlike the open_task handler above, nothing
+        // else focuses the window on this path — a WKWebView's own
+        // `window.focus()` can't activate the host NSApplication, so it has
+        // to round-trip through the main process.
+        void api.focusWindow();
       };
       if (ev.kind === "interaction") {
         // A question / permission prompt opened or closed. The tracker raises
