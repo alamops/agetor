@@ -35,6 +35,7 @@ import {
 import { appendReferences } from "../../../shared/refs.ts";
 import { createEventDeduper } from "@/lib/event-dedup";
 import { createEventBuffer } from "@/lib/event-buffer";
+import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { AgentIcon } from "./AgentIcon";
 import {
   ReferencesPicker,
@@ -56,6 +57,17 @@ import { TerminalView } from "./TerminalView";
 function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
   return harnesses.find((h) => h.id === harnessId)?.kind ?? "claude-code";
 }
+
+/**
+ * `RunEvent` as held in the panel's local `events` state, tagged with a
+ * client-assigned monotonic id. The server doesn't expose a stable event id
+ * over SSE (`run_events.id` never leaves the DB layer) — `id` here is
+ * assigned by `nextEventIdRef` the moment an event is accepted into the
+ * unified stream, purely so `rebuilt-mask.ts` can tell a genuinely NEW live
+ * event apart from one the server re-delivers on SSE reconnect (full-history
+ * replay) when deciding whether the JSONL rebuild snapshot has gone stale.
+ */
+type StreamEvent = RunEvent & { id: number };
 
 interface Props {
   /** When null, the panel slides off-screen and unmounts after the exit animation. */
@@ -233,16 +245,25 @@ function RunPanelBody({
    *  codex stdout/stderr chunk. The renderer dispatches on `stream` to
    *  pick a component (assistant text, thinking, tool call, tool result,
    *  status divider, error). Events from EVERY run of the task are
-   *  merged here so the user sees one unified scrollback. */
-  const [events, setEvents] = useState<RunEvent[]>([]);
+   *  merged here so the user sees one unified scrollback. Each event is
+   *  tagged with a client-assigned `id` (see `StreamEvent`) as it's
+   *  accepted, in arrival order. */
+  const [events, setEvents] = useState<StreamEvent[]>([]);
   /** When the user clicks "Rebuild from session JSONL" (or the auto-
    *  rebuild fires after a run finishes), we patch the latest claude
    *  session's events with the freshly-parsed on-disk version.
    *  `sessionId` is the `claudeSessionId` the rebuild covers — used at
    *  render time to splice the rebuilt events into the unified stream
    *  in place of the live ones for runs that share that session id.
-   *  Null means "use the live streamed events as normal". */
-  const [rebuilt, setRebuilt] = useState<{ sessionId: string; events: RunEvent[] } | null>(null);
+   *  `maxLiveEventIdAtSnapshot` is the highest `StreamEvent.id` observed
+   *  at capture time — the SSE delivery path (below) uses it, together
+   *  with `rebuiltRunIds`, to detect a genuinely NEW live event landing
+   *  for a masked run and clear the snapshot so live events render again
+   *  (see `rebuilt-mask.ts`). Null means "use the live streamed events
+   *  as normal". */
+  const [rebuilt, setRebuilt] = useState<
+    { sessionId: string; events: RunEvent[]; maxLiveEventIdAtSnapshot: number } | null
+  >(null);
   const [rebuildBusy, setRebuildBusy] = useState(false);
   const [rebuildNote, setRebuildNote] = useState<string | null>(null);
   const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
@@ -260,6 +281,14 @@ function RunPanelBody({
   // true, so a user who scrolls up to read history isn't yanked back down on
   // every streamed chunk.
   const nearBottomRef = useRef(true);
+  // Monotonic id source for `StreamEvent.id`, incremented once per event as
+  // it's accepted into the unified stream (see the SSE subscription effect
+  // below). Assigning synchronously at push time — rather than deriving from
+  // `events.length` inside a render — means it's always current even while a
+  // batch is buffered and hasn't flushed into React state yet, which is what
+  // the rebuild-snapshot-invalidation check needs to be race-free. Reset to
+  // 0 on task switch alongside the rest of the stream state.
+  const nextEventIdRef = useRef(0);
 
   // Reset on task switch (no remount because we no longer key on task.id).
   // Re-arm the auto-scroll heuristic so opening a different task pins the
@@ -289,7 +318,12 @@ function RunPanelBody({
         setRebuildNote(res.reason ?? "no events found in JSONL");
         return;
       }
-      setRebuilt({ sessionId: latestRun.claudeSessionId, events: res.events });
+      setRebuilt({
+        sessionId: latestRun.claudeSessionId,
+        events: res.events,
+        // "Everything observed so far" — see `nextEventIdRef`.
+        maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
+      });
       setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
     } catch (e) {
       setRebuildNote(`rebuild failed: ${(e as Error).message}`);
@@ -363,6 +397,7 @@ function RunPanelBody({
   // panel shows the whole conversation as a single scrollback.
   useEffect(() => {
     setEvents([]);
+    nextEventIdRef.current = 0;
     // Collapse the dual-emit + replay duplicates the server stream carries
     // (live echo + JSONL twin per user message; full-history replay on every
     // reconnect). The deduper keeps `user` keys in a never-trimmed set so a
@@ -389,8 +424,38 @@ function RunPanelBody({
     // arm/flush bookkeeping (and the re-arm-after-flush invariant that fixes
     // the freeze) lives in `createEventBuffer` so it can be unit-tested.
     const FLUSH_FALLBACK_MS = 250;
-    const buffer = createEventBuffer<RunEvent>(
-      (batch) => setEvents((cur) => [...cur, ...batch]),
+    const buffer = createEventBuffer<StreamEvent>(
+      (batch) => {
+        setEvents((cur) => [...cur, ...batch]);
+        // A newer live MAIN-stream event landing for a run the rebuilt-from-
+        // JSONL snapshot is currently masking means the snapshot is stale —
+        // clear it so `displayedEvents` falls back to the live stream. This
+        // is what un-freezes the panel when a post-`end_turn` background-
+        // agent continuation keeps emitting into a run the panel already
+        // considers finished (the snapshot only ever covers events observed
+        // up to the moment it was captured). `rebuiltMaskRef` (defined below,
+        // synced from `rebuilt`/`rebuiltRunIds`) is read fresh on every batch
+        // rather than closed over at effect-setup time, since this callback
+        // is created once per SSE subscription and would otherwise see a
+        // stale snapshot. Clearing here does NOT touch `latestRun`, so the
+        // auto-rebuild effect (deps: latestRun id/status/claudeSessionId)
+        // does not immediately re-fire and re-mask — it only fires again
+        // when the newest run itself next resolves.
+        const mask = rebuiltMaskRef.current;
+        if (mask) {
+          const invalidated = batch.some((e) =>
+            invalidatesRebuiltSnapshot(
+              { maxLiveEventIdAtSnapshot: mask.maxLiveEventIdAtSnapshot },
+              e,
+              mask.runIds,
+            ),
+          );
+          if (invalidated) {
+            setRebuilt(null);
+            setRebuildNote(null);
+          }
+        }
+      },
       (flush) => {
         const raf = requestAnimationFrame(flush);
         const timer = setTimeout(flush, FLUSH_FALLBACK_MS);
@@ -441,7 +506,11 @@ function RunPanelBody({
         } catch { /* ignore malformed */ }
         return;
       }
-      buffer.push(e);
+      // Tag with the next client-assigned id (see `StreamEvent`) — the
+      // server doesn't send one over SSE, and the invalidation check above
+      // needs a monotonic ordering to distinguish a genuinely new event from
+      // one the replay burst re-delivers on reconnect.
+      buffer.push({ ...e, id: nextEventIdRef.current++ });
     });
     return () => {
       buffer.dispose();
@@ -485,16 +554,52 @@ function RunPanelBody({
   // at 500 chars), so the JSONL is the canonical source. Skips while
   // a run is in flight (live tailing is still appending) and codex
   // (no JSONL transcript).
+  //
+  // This effect's deps are ONLY `latestRun` id/status/claudeSessionId, which
+  // is deliberate and load-bearing: when the SSE batch-flush callback above
+  // detects a newer live event for a masked run and calls
+  // `setRebuilt(null)`/`setRebuildNote(null)`, none of those three fields
+  // change (the run itself hasn't — its status is still whatever it was),
+  // so this effect does NOT re-run and immediately re-mask the stream it
+  // was just un-frozen from. It only fires again — legitimately re-snapshot-
+  // ting — when the newest run's own id/status/sessionId next changes, i.e.
+  // when a later run resolves. This is what makes clearing the snapshot on a
+  // background-agent continuation's post-`end_turn` activity actually stick
+  // instead of flapping.
   useEffect(() => {
     if (!latestRun) return;
-    if (latestRun.status === "running") return;
+    if (latestRun.status === "running") {
+      // The newest run just became "running" again — e.g. a background-agent
+      // continuation turn that shares `claudeSessionId` with the run the
+      // current `rebuilt` snapshot was captured from, whose first live events
+      // can land before the 2s runs-poll updates `runs`/`latestRun` (see
+      // `rebuiltRunIds` and the SSE batch-flush invalidation above). If a
+      // snapshot is still set at that point, `displayedEvents` will mask the
+      // new run's live events behind it — and because this effect only
+      // re-fires on `latestRun` id/status/claudeSessionId changes, the
+      // freeze would persist until the run resolves. Clear eagerly instead:
+      // "the newest run is live again ⇒ no snapshot should mask the stream."
+      // Functional updaters read the current value without adding
+      // `rebuilt`/`rebuildNote` to this effect's deps, so this can't loop —
+      // clearing them doesn't change `latestRun`, the only thing gating
+      // re-runs, and is a no-op (bails to the same reference) once already
+      // clear.
+      setRebuilt((prev) => (prev ? null : prev));
+      setRebuildNote((prev) => (prev ? null : prev));
+      return;
+    }
     if (!latestRun.claudeSessionId) return;
     const sessionId = latestRun.claudeSessionId;
     let cancelled = false;
     void api.rebuildRunEvents(latestRun.id).then((res) => {
       if (cancelled) return;
       if (res.events.length > 0) {
-        setRebuilt({ sessionId, events: res.events });
+        setRebuilt({
+          sessionId,
+          events: res.events,
+          // "Everything observed so far" — see `nextEventIdRef`.
+          maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
+        });
         setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
       } else if (res.reason) {
         setRebuildNote(res.reason);
@@ -515,6 +620,20 @@ function RunPanelBody({
     }
     return ids;
   }, [rebuilt, runs]);
+
+  /** Live mirror of `{ maxLiveEventIdAtSnapshot, runIds }` derived from
+   *  `rebuilt`/`rebuiltRunIds`, read by the SSE batch-flush callback in the
+   *  subscription effect above. That callback is created once per task
+   *  subscription and closes over whatever `rebuilt`/`rebuiltRunIds` were at
+   *  effect-setup time — without this ref it would keep checking against a
+   *  stale (or even already-cleared) snapshot instead of the current one.
+   *  `null` (no active snapshot) short-circuits the check entirely. */
+  const rebuiltMaskRef = useRef<{ maxLiveEventIdAtSnapshot: number; runIds: Set<string> } | null>(null);
+  useEffect(() => {
+    rebuiltMaskRef.current = rebuilt && rebuiltRunIds
+      ? { maxLiveEventIdAtSnapshot: rebuilt.maxLiveEventIdAtSnapshot, runIds: rebuiltRunIds }
+      : null;
+  }, [rebuilt, rebuiltRunIds]);
 
   /** The task's own (main) agent events — everything not tagged to a subagent.
    *  The rebuild-from-JSONL path only ever covers the main session transcript,
@@ -1347,6 +1466,15 @@ function RunsList({ runs }: { runs: Run[] }) {
           <Badge variant={STATUS_VARIANT[latest.status]} className="shrink-0">
             {latest.status}
           </Badge>
+          {latest.origin === "continuation" && (
+            <Badge
+              variant="secondary"
+              className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+              title="auto-continued after a background task"
+            >
+              auto
+            </Badge>
+          )}
           <span className="truncate">
             Run #{ordinalFor(latest.id)} · {formatTime(latest.startedAt)}
           </span>
@@ -1377,6 +1505,15 @@ function RunsList({ runs }: { runs: Run[] }) {
                 <Badge variant={STATUS_VARIANT[r.status]} className="shrink-0">
                   {r.status}
                 </Badge>
+                {r.origin === "continuation" && (
+                  <Badge
+                    variant="secondary"
+                    className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+                    title="auto-continued after a background task"
+                  >
+                    auto
+                  </Badge>
+                )}
                 <span className="truncate text-muted-foreground">
                   #{ordinalFor(r.id)} · {formatTime(r.startedAt)}
                 </span>

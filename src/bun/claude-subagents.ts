@@ -112,6 +112,41 @@ function fireSettle(taskId: string): void {
   }
 }
 
+/**
+ * Parked-discovery hook, injected once by the orchestrator at startup. Fired
+ * whenever this module notices a subagent that is (newly, or once again)
+ * `running` — a fresh `discover()` insert, or an existing row flipping back
+ * to running after a resumed background agent starts writing again. This is
+ * the *opposite* direction from `settleFn`: that one says "something finished,
+ * maybe release the hold"; this one says "something just started/resumed,
+ * maybe pull the card back". Same cycle-avoidance rationale as `emitFn` /
+ * `settleFn` — the pull-back policy (only from `review`, never from
+ * `done`/`blocked`/`ready`) lives on the orchestrator side. This module only
+ * signals "a subagent is running for taskId," never decides what to do.
+ */
+let parkedDiscoveryFn: ((taskId: string) => void) | null = null;
+/** Returns the previously-registered hook, for the same save/restore reason as
+ *  `setSubagentEmitter`/`setSubagentSettleHook`: a test that installs a spy
+ *  here must put the real one back in `afterEach`, or every later test file
+ *  loses the pull-back wiring. */
+export function setParkedDiscoveryHandler(
+  fn: ((taskId: string) => void) | null,
+): ((taskId: string) => void) | null {
+  const prev = parkedDiscoveryFn;
+  parkedDiscoveryFn = fn;
+  return prev;
+}
+
+/** Call the parked-discovery hook, never letting a throwing hook reach the
+ *  poll timer / dir watcher callback — mirrors `fireSettle`'s posture. */
+function fireParkedDiscovery(taskId: string): void {
+  try {
+    parkedDiscoveryFn?.(taskId);
+  } catch (e) {
+    console.error(`[claude-subagents] parked-discovery hook threw for task ${taskId}:`, e);
+  }
+}
+
 interface SubagentMeta {
   agentType: string | null;
   description: string | null;
@@ -180,6 +215,14 @@ export interface SubagentWatcherHandle {
    *  it); tests use it with an injected `now` to exercise the watcher
    *  deterministically instead of waiting on real timers. */
   pump(now?: number): void;
+  /** Reflect an externally-driven settle (see `settleSubagentById`) into this
+   *  watcher's in-memory `FileState`, if it's tracking `id` — a no-op
+   *  otherwise. The DB write already happened before this is called; this
+   *  just keeps the tailer's resume-detection (`tailFile`'s
+   *  `fs.status !== "running"` check) and `checkDone`'s idle-detection from
+   *  re-deriving a status the external settle already decided, which would
+   *  otherwise re-fire a duplicate lifecycle/settle signal on the next tick. */
+  syncSettled(id: string, status: SubagentStatus, endedAt: number): void;
 }
 
 /** One live watcher per task, tops — a second `attachSubagentWatcher` for the
@@ -285,7 +328,7 @@ export function attachSubagentWatcher(opts: {
   // spawn) gets torn down before we build the new one.
   detachWatcherFor(taskId);
 
-  if (!ENABLED) return { detach() { /* disabled */ }, pump() { /* disabled */ } };
+  if (!ENABLED) return { detach() { /* disabled */ }, pump() { /* disabled */ }, syncSettled() { /* disabled */ } };
 
   const sessionId = path.basename(opts.jsonlPath, ".jsonl");
   const subagentsDir = path.join(path.dirname(opts.jsonlPath), sessionId, "subagents");
@@ -378,6 +421,7 @@ export function attachSubagentWatcher(opts: {
       files.set(id, fs);
       subagentsDb.insertIfAbsent(toSubagentShape(fs, taskId));
       emitLifecycle(fs, "started");
+      fireParkedDiscovery(taskId);
     }
   }
 
@@ -417,6 +461,7 @@ export function attachSubagentWatcher(opts: {
         fs.sawEndOfTurn = false;
         subagentsDb.setStatus(fs.subagentId, "running", null);
         emitLifecycle(fs, "started");
+        fireParkedDiscovery(taskId);
       }
       const { endOfTurn } = mapJsonlEventToChunks(line, (stream, data, lineUuid) => {
         runs.appendEvent(fs.runId, stream, data, lineUuid ?? null, fs.subagentId);
@@ -502,7 +547,50 @@ export function attachSubagentWatcher(opts: {
     pump(now?: number): void {
       cycle(now ?? Date.now());
     },
+    syncSettled(id: string, status: SubagentStatus, endedAt: number): void {
+      const fs = files.get(id);
+      if (!fs) return;
+      fs.status = status;
+      fs.endedAt = endedAt;
+    },
   };
   watchers.set(taskId, handle);
   return handle;
+}
+
+/**
+ * Settle a single subagent from OUTSIDE the watcher's own idle-detection —
+ * the entry point for an externally-detected completion: a parent
+ * task-notification naming the finishing agent (`setBackgroundTaskSettledHandler`
+ * on the claude-tmux side), or boot reconciliation finding its session gone.
+ * Runs the exact same bookkeeping a naturally-detected completion runs in
+ * `checkDone` (DB write → lifecycle emit → in-memory sync → settle hook), so a
+ * held task releases identically regardless of which path noticed the
+ * completion first. Idempotent via `subagentsDb.markSettledById` — a
+ * duplicate/late signal (e.g. this races the watcher's own `checkDone`) is a
+ * harmless no-op that returns `false` without emitting a second lifecycle
+ * event or firing the settle hook again.
+ */
+export function settleSubagentById(id: string, status: "completed" | "orphaned"): boolean {
+  let result: { changed: boolean; taskId: string | null };
+  try {
+    result = subagentsDb.markSettledById(id, status);
+  } catch (e) {
+    console.error(`[claude-subagents] markSettledById failed for subagent ${id}:`, e);
+    return false;
+  }
+  if (!result.changed || !result.taskId) return false;
+  const taskId = result.taskId;
+  const now = Date.now();
+  const row = subagentsDb.get(id);
+  if (row) {
+    try {
+      emitLifecycleForRow(row);
+    } catch (e) {
+      console.error(`[claude-subagents] settle lifecycle emit failed for subagent ${id}:`, e);
+    }
+  }
+  watchers.get(taskId)?.syncSettled(id, status, row?.endedAt ?? now);
+  fireSettle(taskId);
+  return true;
 }

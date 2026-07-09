@@ -71,6 +71,123 @@ export interface SpawnedAgent {
   done: Promise<number>;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Orchestrator injection seams.
+ *
+ * The orchestrator (server-side, imports this module) needs to reach INTO a
+ * live tmux-driven session at a few points this module can't decide on its
+ * own: which task a stray content line belongs to, whether a task is being
+ * held open for background agents, and when a background task/agent settles.
+ * Rather than import orchestrator.ts here (a cycle — orchestrator already
+ * imports claude-tmux for spawn/sendTurn/etc.), each seam is a module-level
+ * setter the orchestrator calls once at startup, mirroring the `emitFn` /
+ * `settleFn` pattern in claude-subagents.ts. All three default to null
+ * (no-op), so this file's behavior is byte-for-byte unchanged until
+ * something wires them up.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Everything `dispatchLine` needs to adopt a stray content line into a fresh
+ * run — see `setContinuationRunFactory` below. `onChunk` matches
+ * `ChunkHandler` exactly (the same sink shape every turn slot already uses);
+ * `onAdopted` hands back a live control handle shaped exactly like
+ * `SpawnedAgent` (kill / writeInput / done) so the caller can Stop or fold a
+ * follow-up into the continuation run the same way it already does for a
+ * normal turn.
+ */
+export type ContinuationHooks = {
+  onChunk: ChunkHandler;
+  onAdopted: (handle: SpawnedAgent) => void;
+};
+
+/**
+ * Factory the orchestrator installs to adopt a "stray" content line — one
+ * that arrives on a session with no turn in flight and nothing queued to
+ * receive it. This is exactly what happens after claude auto-resumes
+ * following a background-task notification (see the call site in
+ * `dispatchLine`): the prior run already resolved on its own `end_turn`, so
+ * without this seam the resumed conversation would silently dispatch
+ * through the stale `state.lastChunk` under the already-succeeded run.
+ * Returns `null` for a task the orchestrator doesn't want to (or can't)
+ * open a new run for — e.g. the task row is gone or archived — in which
+ * case `dispatchLine` falls back to today's `lastChunk` routing.
+ *
+ * Save/restore this like `claude-subagents.ts`'s `setSubagentEmitter`: a
+ * test that installs a fake here and doesn't put the real one back strands
+ * every later test file that dispatches a JSONL line while idle.
+ */
+let continuationRunFactory: ((taskId: string) => ContinuationHooks | null) | null = null;
+export function setContinuationRunFactory(
+  fn: ((taskId: string) => ContinuationHooks | null) | null,
+): ((taskId: string) => ContinuationHooks | null) | null {
+  const prev = continuationRunFactory;
+  continuationRunFactory = fn;
+  return prev;
+}
+
+/**
+ * Predicate the orchestrator installs to answer "is this task being held
+ * open for background agents right now?" (the #92 hold: the main run
+ * already resolved but the kanban card stays in `running` while subagents
+ * finish). `startDeathWatch` keeps polling `tmux has-session` while this is
+ * true even though `turnInFlight` is false — otherwise a session dying
+ * mid-hold would never be detected until the next boot's reconciliation.
+ * Returns `false` (via the `?.` at call sites) when unset, so death-watch
+ * gating is byte-for-byte unchanged until this is wired.
+ */
+let heldSessionProbe: ((taskId: string) => boolean) | null = null;
+export function setHeldSessionProbe(
+  fn: ((taskId: string) => boolean) | null,
+): ((taskId: string) => boolean) | null {
+  const prev = heldSessionProbe;
+  heldSessionProbe = fn;
+  return prev;
+}
+
+/** Call `heldSessionProbe`, never letting a throwing probe reach the death
+ *  watch — mirrors `fireBackgroundTaskSettled` just below: the probe runs
+ *  orchestrator DB reads we don't control (SQLite can transiently throw,
+ *  e.g. "database is busy"), and a bad read must not crash the poll tick.
+ *  Treats a throw as "not held", the same as the unset (`null`) case. */
+function heldProbeSafe(taskId: string): boolean {
+  try {
+    return heldSessionProbe?.(taskId) ?? false;
+  } catch (e) {
+    console.error(`[claude-tmux] heldSessionProbe threw for task ${taskId}:`, e);
+    return false;
+  }
+}
+
+/**
+ * Handler the orchestrator installs to learn that a background task/agent
+ * named in a task-notification JSONL line has settled, so it can flip the
+ * matching `subagents` row and re-check the hold predicate above. Fired
+ * from `dispatchLine` whenever a task-notification's `<task-id>` can be
+ * parsed out of the line — tolerant by design: when no id is found the call
+ * is simply skipped, since session death and boot reconciliation are
+ * independent settle signals that don't depend on this one firing.
+ */
+let backgroundTaskSettledFn: ((taskId: string, agentId: string) => void) | null = null;
+export function setBackgroundTaskSettledHandler(
+  fn: ((taskId: string, agentId: string) => void) | null,
+): ((taskId: string, agentId: string) => void) | null {
+  const prev = backgroundTaskSettledFn;
+  backgroundTaskSettledFn = fn;
+  return prev;
+}
+
+/** Call the background-task-settled hook, never letting a throwing hook
+ *  reach the tailer — mirrors `fireSettle` in claude-subagents.ts; the hook
+ *  runs orchestrator logic we don't control, and a bad handler must not
+ *  take the JSONL tail down. */
+function fireBackgroundTaskSettled(taskId: string, agentId: string): void {
+  try {
+    backgroundTaskSettledFn?.(taskId, agentId);
+  } catch (e) {
+    console.error(`[claude-tmux] background-task-settled hook threw for task ${taskId}:`, e);
+  }
+}
+
 export interface ClaudeLaunchOptions {
   taskId: string;
   /**
@@ -390,6 +507,69 @@ function isEndTurnContinuation(
   if (next.type === "user") {
     const content = next.message?.content;
     if (Array.isArray(content) && content.some((b) => b?.type === "tool_result")) return true;
+  }
+  return false;
+}
+
+/**
+ * Extract the raw `<task-notification>…</task-notification>` XML payload from
+ * `evt`, or `null` when `evt` isn't one of the two shapes claude uses to
+ * report a background command/agent's completion. Mirrors the detection in
+ * `mapParsedEventToChunks`'s `user` and `queue-operation` cases exactly, so
+ * the settle signal (`fireBackgroundTaskSettled`) and the status breadcrumb
+ * the user sees always agree on what counts as a notification. A third shape
+ * (`type: "attachment"`, `attachment.commandMode: "task-notification"`) has
+ * been observed carrying the same payload as a `queue-operation`/`user`
+ * companion line for the same event — deliberately not handled here since
+ * the other two already fire the settle signal for it and a duplicate would
+ * just be a harmless extra (idempotent) call.
+ */
+function taskNotificationContent(evt: ParsedJsonlEvent): string | null {
+  if (evt.type === "user" && evt.origin?.kind === "task-notification") {
+    const content = evt.message?.content;
+    return typeof content === "string" ? content : null;
+  }
+  if (evt.type === "queue-operation" && evt.operation === "enqueue" && typeof evt.content === "string") {
+    return evt.content;
+  }
+  return null;
+}
+
+/**
+ * Pull the `<task-id>` out of a task-notification payload. This id is
+ * identical to the finishing subagent's on-disk id — claude-subagents.ts
+ * tails `<sessionId>/subagents/agent-<agentId>.jsonl`, and empirically (see
+ * real transcripts under `~/.claude/projects/`) `<task-id>` in the
+ * notification and `<agentId>` in that filename are the same token for a
+ * background AGENT (Task-tool) completion. For a background *shell command*
+ * notification there's no matching subagent row; `setBackgroundTaskSettledHandler`'s
+ * callee is expected to no-op on an id it doesn't recognise. Returns `null`
+ * when no `<task-id>` tag is present so callers degrade gracefully.
+ */
+function extractTaskNotificationAgentId(content: string): string | null {
+  const m = /<task-id>([^<]+)<\/task-id>/.exec(content);
+  return m ? m[1]!.trim() : null;
+}
+
+/**
+ * True when `evt`, once mapped, would emit genuine conversational content —
+ * a `user` / `assistant` / `thinking` / `tool_use` / `tool_result` chunk —
+ * rather than a bare status/heartbeat breadcrumb. Used by `dispatchLine` to
+ * decide whether an unattributed line (no turn in flight, nothing queued) is
+ * significant enough to adopt via `continuationRunFactory`: a status-only
+ * line (a mode banner, a turn-duration footer, a task-notification
+ * breadcrumb) must NOT open a new run on its own — only the human/agent
+ * content that follows should.
+ */
+function isContinuationContentEvent(evt: ParsedJsonlEvent): boolean {
+  if (evt.type === "assistant") return true;
+  if (evt.type === "user") {
+    // Same filter mapParsedEventToChunks applies before emitting a `user`
+    // chunk — synthetic entries claude injects itself never count as new
+    // content on their own.
+    if (evt.origin?.kind === "task-notification") return false;
+    if (evt.isMeta === true) return false;
+    return true;
   }
   return false;
 }
@@ -1885,6 +2065,32 @@ function dispatchLine(state: SessionState, line: string): void {
     }
   }
 
+  // Background-task/agent settle signal. Deliberately runs BEFORE the dedup
+  // early-return below (unlike the continuation-adoption check further down,
+  // which must NOT fire on replayed lines): a reattach replay (offset-0
+  // re-read after an agetor restart) may be the only chance to learn that a
+  // background agent settled while the process was down, and the consumer
+  // (`subagents.markSettledById`) is idempotent, so re-firing for an
+  // already-seen line is harmless.
+  //
+  // Skipped for the synthetic `__rebuild__` state (see `rebuildEventsFromJsonl`):
+  // that helper's contract is a read-only re-emission of a finished session's
+  // JSONL for a UI replay, not a second live tailer. `markSettledById` keys
+  // on agentId alone with no taskId scoping, so firing here would settle a
+  // REAL subagent/background-task row from a request that never touched a
+  // live session — e.g. a rebuild racing a genuine resume could release a
+  // hold the live tailer still needs. Mirrors how the continuation-adoption
+  // check further down is naturally inert for `__rebuild__` (its factory
+  // looks the taskId up and finds no such task), just made explicit here
+  // since this block runs unconditionally rather than through a factory.
+  if (state.taskId !== "__rebuild__") {
+    const notifContent = taskNotificationContent(evt);
+    if (notifContent) {
+      const agentId = extractTaskNotificationAgentId(notifContent);
+      if (agentId) fireBackgroundTaskSettled(state.taskId, agentId);
+    }
+  }
+
   // Already-seen lines (reattach replay-from-offset-0) skip chunk emission
   // but still stage an end_turn so the run-row status transition can fire
   // when the next line confirms it. The banner is suppressed (emitBanner:
@@ -1899,6 +2105,39 @@ function dispatchLine(state: SessionState, line: string): void {
       };
     }
     return;
+  }
+
+  // Continuation adoption: this line is provably NEW (it passed the dedup
+  // return above). If no turn is in flight and nothing is queued to receive
+  // it, yet it carries genuine content, claude has resumed talking with no
+  // run listening — the case a post-end_turn background-task auto-resume
+  // produces (the notification breadcrumb itself never reaches here; it's a
+  // status-only line filtered out by `isContinuationContentEvent`, and it
+  // already returned above via the dedup path on any replay). Ask the
+  // orchestrator to adopt a fresh run before this line is dispatched, so the
+  // run exists before its first chunk lands.
+  if (
+    continuationRunFactory
+    && !turnInFlight(state)
+    && state.turnQueue.length === 0
+    && !state.onEndOfTurn
+    && isContinuationContentEvent(evt)
+  ) {
+    const hooks = continuationRunFactory(state.taskId);
+    if (hooks) {
+      const adopted: TurnSlot = { onChunk: hooks.onChunk, resolve: null, reject: null };
+      const done = new Promise<number>((resolve, reject) => {
+        adopted.resolve = resolve;
+        adopted.reject = reject;
+      });
+      state.turnQueue.push(adopted);
+      // Register the run with the orchestrator BEFORE the triggering line
+      // dispatches below — the caller must be able to observe "running"
+      // before the first chunk arrives, not after.
+      hooks.onAdopted(makeAgent(state.taskId, done));
+    }
+    // A null factory result (unknown/archived task) intentionally falls
+    // through to the pre-existing `lastChunk` routing below — unchanged.
   }
 
   const slot = state.turnQueue[0];
@@ -2660,26 +2899,50 @@ export const DEATH_MISS_THRESHOLD = 4;
 export const DEATH_JSONL_QUIET_MS = 3_000;
 
 /**
- * Settle an in-flight turn because its tmux session died unexpectedly.
+ * Settle an in-flight turn (or a held task — see below) because its tmux
+ * session died unexpectedly.
  *
- * Emits the shared `SESSION_DIED_STATUS_PREFIX` sentinel (which the
- * orchestrator's chunk handler pattern-matches to flip the card to `blocked`
- * and mark the run's handle), then resolves the active turn so the done
- * handler runs — exactly mirroring the claude API-error path, where the
- * outcome is driven by the handle flag, not the exit code.
+ * While a turn is genuinely in flight, emits the shared
+ * `SESSION_DIED_STATUS_PREFIX` sentinel (which the orchestrator's chunk
+ * handler pattern-matches to flip the card to `blocked` and mark the run's
+ * handle), then resolves the active turn so the done handler runs — exactly
+ * mirroring the claude API-error path, where the outcome is driven by the
+ * handle flag, not the exit code.
  *
- * No-ops when no turn is in flight: if the final flush already popped the slot
- * (the turn genuinely completed a beat before the session vanished) there's
- * nothing to settle, and an idle session dying between turns is out of scope
- * (the card isn't "running"; a re-run self-heals via spawn's pre-kill).
+ * When there's no turn in flight and death fired only because the task is
+ * held open for background agents, the sentinel would lie: there's no
+ * active handle for the orchestrator to flip to `blocked`, so a held task
+ * actually releases to `review` instead. That case emits a plain status
+ * chunk WITHOUT the sentinel prefix — see the held branch below.
+ *
+ * No-ops when no turn is in flight AND the task isn't held for background
+ * agents (`heldProbeSafe`): if the final flush already popped the slot
+ * (the turn genuinely completed a beat before the session vanished) and
+ * nothing is holding the card open, there's nothing to settle — an idle
+ * session dying between turns is out of scope (the card isn't "running"; a
+ * re-run self-heals via spawn's pre-kill). When the task IS held, the main
+ * run already resolved so there's no slot/onEndOfTurn to settle below (both
+ * branches are skipped harmlessly) — this call still emits the held-death
+ * status (via `state.lastChunk`, the succeeded run's handler) and,
+ * unconditionally at the bottom, orphans any still-`running` subagent rows,
+ * which is what lets the orchestrator's settle hook release the hold.
  */
 function signalSessionDeath(state: SessionState): void {
-  if (!turnInFlight(state)) return;
+  const inFlight = turnInFlight(state);
+  if (!inFlight && !heldProbeSafe(state.taskId)) return;
   const slot = state.turnQueue[0];
   const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
   onChunk(
     "status",
-    `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`,
+    inFlight
+      ? `${SESSION_DIED_STATUS_PREFIX}tmux session ${state.sessionName} ended unexpectedly — task blocked`
+      // Held-probe-driven death, no active turn: the main run already
+      // resolved, so there's no handle for the orchestrator to flip to
+      // `blocked` — the task actually releases to `review`. Say so honestly
+      // instead of reusing the sentinel, which the orchestrator would
+      // otherwise pattern-match into a "blocked" breadcrumb that never
+      // happens for this path.
+      : `tmux session ${state.sessionName} ended while background agents were running — releasing task`,
   );
   if (slot && slot.resolve) {
     state.turnQueue.shift();
@@ -2724,11 +2987,17 @@ function turnInFlight(state: SessionState): boolean {
  *  session is long-lived and idle between turns, so we gate the actual
  *  `tmux has-session` subprocess on a turn being in flight — an idle session
  *  dying isn't a "running task" problem (and `signalSessionDeath` would no-op
- *  anyway). While a turn IS in flight, when the session vanishes we one-shot
- *  stop the poll, give the FS a grace beat to surface any final bytes, flush,
- *  then settle the run via `signalSessionDeath`. Torn down by
- *  `disposeSessionState` (intentional teardown clears it before the kill, so a
- *  Stop/delete can't be mistaken for an unexpected death). */
+ *  anyway) UNLESS the task is being held open for background agents
+ *  (`heldSessionProbe`, the #92 hold: the main run already resolved but the
+ *  kanban card stays `running` while subagents finish). Without probing
+ *  during a hold, a session dying mid-hold would go undetected until the
+ *  next boot's reconciliation — the poll would hit `!turnInFlight` on every
+ *  tick and reset `misses` to 0 forever. While a turn IS in flight (or the
+ *  task is held), when the session vanishes we one-shot stop the poll, give
+ *  the FS a grace beat to surface any final bytes, flush, then settle via
+ *  `signalSessionDeath`. Torn down by `disposeSessionState` (intentional
+ *  teardown clears it before the kill, so a Stop/delete can't be mistaken
+ *  for an unexpected death). */
 function startDeathWatch(state: SessionState): void {
   if (state.deathTimer) return;
   // Only a definitive `gone` probe (tmux server answered, this session absent)
@@ -2736,10 +3005,11 @@ function startDeathWatch(state: SessionState): void {
   // resets the counter (see `sessionLiveness`). Require DEATH_MISS_THRESHOLD
   // consecutive `gone` probes, and veto on recent JSONL writes, so a live task
   // is never wrongly blocked. Reset on any tick where the session is alive/
-  // unreachable, the JSONL was just written, or no turn is running.
+  // unreachable, the JSONL was just written, or no turn is running (and the
+  // task isn't held open for background agents).
   let misses = 0;
   state.deathTimer = setInterval(() => {
-    if (!turnInFlight(state)) { misses = 0; return; } // idle — no running turn; skip the tmux poll
+    if (!turnInFlight(state) && !heldProbeSafe(state.taskId)) { misses = 0; return; } // idle & not held — skip the tmux poll
     // Compute the log-recency veto lazily — it only matters for a `gone` probe,
     // and `gone` is the rare tick, so we skip a statSync on every `alive` poll.
     const liveness = sessionLiveness(state.sessionName);

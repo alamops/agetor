@@ -482,6 +482,7 @@ type RunRow = {
   tmux_session: string | null;
   claude_session_id: string | null;
   codex_session_id: string | null;
+  origin: string | null;
 };
 
 const toRun = (r: RunRow): Run => ({
@@ -495,6 +496,7 @@ const toRun = (r: RunRow): Run => ({
   tmuxSession: r.tmux_session,
   claudeSessionId: r.claude_session_id,
   codexSessionId: r.codex_session_id,
+  origin: (r.origin as Run["origin"]) ?? null,
 });
 
 export const runs = {
@@ -507,13 +509,17 @@ export const runs = {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
     return row ? toRun(row) : null;
   },
+  /** `r.origin` is optional on the `Run` type (most callers don't set it —
+   *  only the continuation-run factory does) so `?? null` keeps a
+   *  user-initiated run's row explicitly NULL rather than the JS `undefined`
+   *  bun:sqlite would otherwise bind. */
   insert(r: Run): Run {
     db.run(
-      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId],
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.origin ?? null],
     );
-    return r;
+    return { ...r, origin: r.origin ?? null };
   },
   update(id: string, patch: Partial<Run>): Run | null {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
@@ -681,6 +687,25 @@ export const subagents = {
   },
   setStatus(id: string, status: SubagentStatus, endedAt: number | null): void {
     db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, endedAt, id]);
+  },
+  /** Settle a single subagent by id — the DB half of an *externally*-detected
+   *  completion (a parent task-notification naming the finishing agent, or
+   *  boot reconciliation finding its session gone), as opposed to the
+   *  watcher's own `checkDone` idle-detection. Idempotent: only flips a row
+   *  whose status is currently `running`, so a duplicate/late signal (e.g.
+   *  the watcher's own idle-detection racing the same completion) is a
+   *  harmless no-op rather than double-firing `ended_at`. Returns whether a
+   *  row actually changed, plus its `taskId` (cheap — same SELECT) so the
+   *  caller can trigger the settle/release-hold bookkeeping without a second
+   *  query. */
+  markSettledById(id: string, status: "completed" | "orphaned"): { changed: boolean; taskId: string | null } {
+    const row = db.query<SubagentRow, [string]>(
+      `SELECT * FROM subagents WHERE id = ? AND status = 'running'`,
+    ).get(id);
+    if (!row) return { changed: false, taskId: null };
+    const now = Date.now();
+    db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, now, id]);
+    return { changed: true, taskId: row.task_id };
   },
   /** True when at least one subagent row for this task is still `running`. */
   hasRunning(taskId: string): boolean {
