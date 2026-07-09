@@ -8,6 +8,7 @@ import path from "node:path";
 import { test, expect, beforeAll } from "bun:test";
 import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
 import {
+  addGitHubProjectItem,
   addGitHubReaction,
   addGitHubSubIssue,
   applyGitHubSuggestion,
@@ -17,6 +18,7 @@ import {
   dispatchGitHubWorkflow,
   getGitHubCommitStatus,
   getGitHubIssuePinned,
+  getGitHubProjectItems,
   getGitHubPullLinkedIssues,
   getGitHubRepoPermissions,
   getGitHubThreadSubscription,
@@ -27,6 +29,7 @@ import {
   listGitHubLabels,
   listGitHubMilestones,
   listGitHubNotifications,
+  listGitHubProjectsV2,
   listGitHubPullCommits,
   listGitHubReactions,
   listGitHubReleases,
@@ -36,12 +39,14 @@ import {
   listGitHubWorkflows,
   markAllGitHubNotificationsRead,
   markGitHubNotificationRead,
+  removeGitHubProjectItem,
   removeGitHubReaction,
   removeGitHubSubIssue,
   requestGitHubPullReviewers,
   rerunGitHubWorkflowRun,
   setGitHubIssueLock,
   setGitHubIssuePinned,
+  setGitHubProjectItemStatus,
   setGitHubPullAutoMerge,
   setGitHubThreadSubscription,
   transferGitHubIssue,
@@ -1822,6 +1827,322 @@ test("dispatchGitHubWorkflow rejects a blank ref without a network call", async 
   try {
     const res = await dispatchGitHubWorkflow({ dir: REPO_DIR, workflowId: 7, ref: "   " });
     expect(res).toEqual({ ok: false, error: "ref required" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Projects v2 (F21/G11)
+// ---------------------------------------------------------------------------
+
+test("listGitHubProjectsV2 POSTs the projectsV2 query and parses the boards", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: {
+        data: {
+          repository: {
+            projectsV2: {
+              nodes: [
+                { id: "PVT_kw1", number: 3, title: "Roadmap", url: "https://github.com/orgs/acme/projects/3" },
+                { id: "PVT_kw2", number: 5, title: "Bugs", url: "https://github.com/orgs/acme/projects/5" },
+              ],
+            },
+          },
+        },
+      },
+    },
+  ]);
+  try {
+    const res = await listGitHubProjectsV2({ dir: REPO_DIR });
+    expect(res).toEqual({
+      ok: true,
+      projects: [
+        { id: "PVT_kw1", number: 3, title: "Roadmap", url: "https://github.com/orgs/acme/projects/3" },
+        { id: "PVT_kw2", number: 5, title: "Bugs", url: "https://github.com/orgs/acme/projects/5" },
+      ],
+    });
+    expect(mock.calls).toHaveLength(1);
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.query).toContain("projectsV2");
+    expect(body.variables).toEqual({ owner: "acme", name: "widgets" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubProjectsV2 maps a missing-scope GraphQL error to a friendly message", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { errors: [{ message: "Your token has not been granted the required scopes to execute this query." }] },
+    },
+  ]);
+  try {
+    const res = await listGitHubProjectsV2({ dir: REPO_DIR });
+    expect(res.ok).toBe(false);
+    expect((res as { error: string }).error).toContain("`project` scope");
+    expect((res as { error: string }).error).toContain("required scopes");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubProjectItems resolves the Status field and parses items keyed to it", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: {
+        data: {
+          node: {
+            fields: {
+              nodes: [
+                {
+                  __typename: "ProjectV2SingleSelectField",
+                  id: "PVTSSF_status",
+                  name: "Status",
+                  options: [{ id: "opt_todo", name: "Todo" }, { id: "opt_done", name: "Done" }],
+                },
+                { __typename: "ProjectV2Field", id: "PVTF_other", name: "Priority" },
+              ],
+            },
+            items: {
+              nodes: [
+                {
+                  id: "PVTI_1",
+                  content: { __typename: "Issue", number: 12, title: "Fix bug" },
+                  fieldValues: {
+                    nodes: [
+                      { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "opt_todo", name: "Todo", field: { id: "PVTSSF_status" } },
+                    ],
+                  },
+                },
+                {
+                  id: "PVTI_2",
+                  content: { __typename: "PullRequest", number: 7, title: "Add feature" },
+                  fieldValues: { nodes: [] },
+                },
+                {
+                  id: "PVTI_3",
+                  content: { __typename: "DraftIssue", title: "Investigate flake" },
+                  fieldValues: { nodes: [] },
+                },
+              ],
+            },
+          },
+        },
+      },
+    },
+  ]);
+  try {
+    const res = await getGitHubProjectItems({ dir: REPO_DIR, projectId: "PVT_kw1" });
+    expect(res).toEqual({
+      ok: true,
+      statusField: { id: "PVTSSF_status", name: "Status", options: [{ id: "opt_todo", name: "Todo" }, { id: "opt_done", name: "Done" }] },
+      items: [
+        { itemId: "PVTI_1", contentType: "Issue", number: 12, title: "Fix bug", statusOptionId: "opt_todo", statusOptionName: "Todo" },
+        { itemId: "PVTI_2", contentType: "PullRequest", number: 7, title: "Add feature", statusOptionId: null, statusOptionName: null },
+        { itemId: "PVTI_3", contentType: "DraftIssue", number: null, title: "Investigate flake", statusOptionId: null, statusOptionName: null },
+      ],
+    });
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.variables).toEqual({ id: "PVT_kw1" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubProjectItems returns a null statusField when the project has no Status field", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { node: { fields: { nodes: [] }, items: { nodes: [] } } } },
+    },
+  ]);
+  try {
+    const res = await getGitHubProjectItems({ dir: REPO_DIR, projectId: "PVT_kw1" });
+    expect(res).toEqual({ ok: true, items: [], statusField: null });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubProjectItems rejects a blank projectId without a network call", async () => {
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getGitHubProjectItems({ dir: REPO_DIR, projectId: "  " });
+    expect(res).toEqual({ ok: false, error: "project id required" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubProjectItem resolves the issue's node id via /issues/:number, then POSTs addProjectV2ItemById", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/issues/12", json: { node_id: "I_kw12" } },
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { addProjectV2ItemById: { item: { id: "PVTI_new" } } } },
+    },
+  ]);
+  try {
+    const res = await addGitHubProjectItem({ dir: REPO_DIR, projectId: "PVT_kw1", contentNumber: 12, contentKind: "issue" });
+    expect(res).toEqual({ ok: true, itemId: "PVTI_new" });
+    const gqlCall = mock.calls.find((c) => c.url === "https://api.github.com/graphql");
+    const body = JSON.parse(gqlCall!.body!);
+    expect(body.query).toContain("addProjectV2ItemById");
+    expect(body.variables).toEqual({ p: "PVT_kw1", c: "I_kw12" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubProjectItem resolves a PR's node id via /pulls/:number when contentKind is pr", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/pulls/7", json: { node_id: "PR_kw7" } },
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { addProjectV2ItemById: { item: { id: "PVTI_new2" } } } },
+    },
+  ]);
+  try {
+    const res = await addGitHubProjectItem({ dir: REPO_DIR, projectId: "PVT_kw1", contentNumber: 7, contentKind: "pr" });
+    expect(res).toEqual({ ok: true, itemId: "PVTI_new2" });
+    const restCall = mock.calls.find((c) => c.method === "GET");
+    expect(restCall!.url).toBe("https://api.github.com/repos/acme/widgets/pulls/7");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubProjectItem rejects a non-positive contentNumber without a network call", async () => {
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await addGitHubProjectItem({ dir: REPO_DIR, projectId: "PVT_kw1", contentNumber: 0, contentKind: "issue" });
+    expect(res).toEqual({ ok: false, error: "issue/PR number must be positive" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("addGitHubProjectItem maps a missing-scope GraphQL error on the add mutation to a friendly message", async () => {
+  const mock = mockGitHubFetch([
+    { method: "GET", match: "/repos/acme/widgets/issues/12", json: { node_id: "I_kw12" } },
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { errors: [{ message: "Resource not accessible — token scope insufficient" }] },
+    },
+  ]);
+  try {
+    const res = await addGitHubProjectItem({ dir: REPO_DIR, projectId: "PVT_kw1", contentNumber: 12, contentKind: "issue" });
+    expect(res.ok).toBe(false);
+    expect((res as { error: string }).error).toContain("`project` scope");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("removeGitHubProjectItem POSTs deleteProjectV2Item with the project + item ids", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { deleteProjectV2Item: { deletedItemId: "PVTI_1" } } },
+    },
+  ]);
+  try {
+    const res = await removeGitHubProjectItem({ dir: REPO_DIR, projectId: "PVT_kw1", itemId: "PVTI_1" });
+    expect(res).toEqual({ ok: true, message: "Item removed from project." });
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.query).toContain("deleteProjectV2Item");
+    expect(body.variables).toEqual({ p: "PVT_kw1", i: "PVTI_1" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("removeGitHubProjectItem rejects a blank itemId without a network call", async () => {
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await removeGitHubProjectItem({ dir: REPO_DIR, projectId: "PVT_kw1", itemId: "" });
+    expect(res).toEqual({ ok: false, error: "item id required" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubProjectItemStatus POSTs updateProjectV2ItemFieldValue with singleSelectOptionId in the mutation variables", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { data: { updateProjectV2ItemFieldValue: { projectV2Item: { id: "PVTI_1" } } } },
+    },
+  ]);
+  try {
+    const res = await setGitHubProjectItemStatus({
+      dir: REPO_DIR,
+      projectId: "PVT_kw1",
+      itemId: "PVTI_1",
+      fieldId: "PVTSSF_status",
+      optionId: "opt_done",
+    });
+    expect(res).toEqual({ ok: true, message: "Status updated." });
+    const body = JSON.parse(mock.calls[0]!.body!);
+    expect(body.query).toContain("updateProjectV2ItemFieldValue");
+    expect(body.query).toContain("singleSelectOptionId");
+    expect(body.variables).toEqual({ p: "PVT_kw1", i: "PVTI_1", f: "PVTSSF_status", o: "opt_done" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubProjectItemStatus maps a missing-scope GraphQL error to a friendly message", async () => {
+  const mock = mockGitHubFetch([
+    {
+      method: "POST",
+      match: "https://api.github.com/graphql",
+      json: { errors: [{ message: "Your token has not been granted the required scopes to execute this query." }] },
+    },
+  ]);
+  try {
+    const res = await setGitHubProjectItemStatus({
+      dir: REPO_DIR,
+      projectId: "PVT_kw1",
+      itemId: "PVTI_1",
+      fieldId: "PVTSSF_status",
+      optionId: "opt_done",
+    });
+    expect(res.ok).toBe(false);
+    expect((res as { error: string }).error).toContain("`project` scope");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("setGitHubProjectItemStatus rejects a blank optionId without a network call", async () => {
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await setGitHubProjectItemStatus({
+      dir: REPO_DIR,
+      projectId: "PVT_kw1",
+      itemId: "PVTI_1",
+      fieldId: "PVTSSF_status",
+      optionId: "",
+    });
+    expect(res).toEqual({ ok: false, error: "option id required" });
     expect(mock.calls).toHaveLength(0);
   } finally {
     mock.restore();

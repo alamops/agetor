@@ -43,6 +43,11 @@ const {
   normalizeCommitStatus,
   normalizeWorkflowRun,
   normalizeWorkflow,
+  parseProjectsV2,
+  parseProjectFields,
+  parseProjectItems,
+  projectsScopeErrorMessage,
+  addedProjectItemIdFromGraphql,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -858,4 +863,167 @@ test("normalizeWorkflow requires id/path/name and defaults an unrecognized state
   expect(normalizeWorkflow({ id: 1, name: "CI" })).toBeNull();
   expect(normalizeWorkflow({ id: 1, path: "x.yml" })).toBeNull();
   expect(normalizeWorkflow(null)).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Projects v2 (F21/G11)
+// ---------------------------------------------------------------------------
+
+test("parseProjectsV2 digs repository.projectsV2.nodes out of a GraphQL response, [] on anything unexpected", () => {
+  const happy = {
+    data: {
+      repository: {
+        projectsV2: {
+          nodes: [
+            { id: "PVT_1", number: 1, title: "Roadmap", url: "https://github.com/orgs/acme/projects/1" },
+            { id: "PVT_2", number: 2, title: "Bugs", url: "https://github.com/orgs/acme/projects/2" },
+          ],
+        },
+      },
+    },
+  };
+  expect(parseProjectsV2(happy)).toEqual([
+    { id: "PVT_1", number: 1, title: "Roadmap", url: "https://github.com/orgs/acme/projects/1" },
+    { id: "PVT_2", number: 2, title: "Bugs", url: "https://github.com/orgs/acme/projects/2" },
+  ]);
+
+  // A malformed node (missing fields) is dropped, valid siblings survive.
+  const partiallyMalformed = {
+    data: { repository: { projectsV2: { nodes: [{ id: "PVT_1" }, { id: "PVT_2", number: 2, title: "Bugs", url: "https://x/2" }] } } },
+  };
+  expect(parseProjectsV2(partiallyMalformed)).toEqual([{ id: "PVT_2", number: 2, title: "Bugs", url: "https://x/2" }]);
+
+  expect(parseProjectsV2(null)).toEqual([]);
+  expect(parseProjectsV2({})).toEqual([]);
+  expect(parseProjectsV2({ data: {} })).toEqual([]);
+  expect(parseProjectsV2({ data: { repository: null } })).toEqual([]);
+  expect(parseProjectsV2({ data: { repository: { projectsV2: { nodes: "not an array" } } } })).toEqual([]);
+});
+
+test("parseProjectFields keeps only ProjectV2SingleSelectField nodes, with their options", () => {
+  const happy = {
+    data: {
+      node: {
+        fields: {
+          nodes: [
+            {
+              __typename: "ProjectV2SingleSelectField",
+              id: "PVTSSF_status",
+              name: "Status",
+              options: [{ id: "opt_todo", name: "Todo" }, { id: "opt_done", name: "Done" }],
+            },
+            // A non-select field only carries the ProjectV2FieldCommon fragment
+            // (id/name, no options) — dropped, not mapped with empty options.
+            { __typename: "ProjectV2Field", id: "PVTF_priority", name: "Priority" },
+            { __typename: "ProjectV2IterationField", id: "PVTIF_sprint", name: "Sprint" },
+          ],
+        },
+      },
+    },
+  };
+  expect(parseProjectFields(happy)).toEqual([
+    { id: "PVTSSF_status", name: "Status", options: [{ id: "opt_todo", name: "Todo" }, { id: "opt_done", name: "Done" }] },
+  ]);
+
+  // A single-select field with no configured options → included, options: [].
+  const noOptions = {
+    data: { node: { fields: { nodes: [{ __typename: "ProjectV2SingleSelectField", id: "PVTSSF_empty", name: "Empty", options: [] }] } } },
+  };
+  expect(parseProjectFields(noOptions)).toEqual([{ id: "PVTSSF_empty", name: "Empty", options: [] }]);
+
+  expect(parseProjectFields(null)).toEqual([]);
+  expect(parseProjectFields({})).toEqual([]);
+  expect(parseProjectFields({ data: { node: null } })).toEqual([]);
+  expect(parseProjectFields({ data: { node: { fields: { nodes: "not an array" } } } })).toEqual([]);
+});
+
+test("parseProjectItems discriminates content by __typename and resolves the matching status field value", () => {
+  const statusFieldId = "PVTSSF_status";
+  const happy = {
+    data: {
+      node: {
+        items: {
+          nodes: [
+            {
+              id: "PVTI_1",
+              content: { __typename: "Issue", number: 12, title: "Fix bug" },
+              fieldValues: {
+                nodes: [
+                  { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "opt_todo", name: "Todo", field: { id: statusFieldId } },
+                ],
+              },
+            },
+            {
+              id: "PVTI_2",
+              content: { __typename: "PullRequest", number: 7, title: "Add feature" },
+              fieldValues: { nodes: [] },
+            },
+            {
+              id: "PVTI_3",
+              content: { __typename: "DraftIssue", title: "Investigate flake" },
+              fieldValues: { nodes: [] },
+            },
+            {
+              id: "PVTI_4",
+              content: { __typename: "SomethingFutureContentKind" },
+              fieldValues: { nodes: [] },
+            },
+            {
+              // A field value for a DIFFERENT field shouldn't be mistaken for Status.
+              id: "PVTI_5",
+              content: { __typename: "Issue", number: 20, title: "Other field set" },
+              fieldValues: {
+                nodes: [
+                  { __typename: "ProjectV2ItemFieldSingleSelectValue", optionId: "opt_x", name: "X", field: { id: "PVTSSF_other" } },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    },
+  };
+  expect(parseProjectItems(happy, statusFieldId)).toEqual([
+    { itemId: "PVTI_1", contentType: "Issue", number: 12, title: "Fix bug", statusOptionId: "opt_todo", statusOptionName: "Todo" },
+    { itemId: "PVTI_2", contentType: "PullRequest", number: 7, title: "Add feature", statusOptionId: null, statusOptionName: null },
+    { itemId: "PVTI_3", contentType: "DraftIssue", number: null, title: "Investigate flake", statusOptionId: null, statusOptionName: null },
+    { itemId: "PVTI_4", contentType: "other", number: null, title: "", statusOptionId: null, statusOptionName: null },
+    { itemId: "PVTI_5", contentType: "Issue", number: 20, title: "Other field set", statusOptionId: null, statusOptionName: null },
+  ]);
+
+  // null statusFieldId (project has no Status field) → every item's status is null.
+  expect(parseProjectItems(happy, null)[0]).toEqual({
+    itemId: "PVTI_1",
+    contentType: "Issue",
+    number: 12,
+    title: "Fix bug",
+    statusOptionId: null,
+    statusOptionName: null,
+  });
+
+  expect(parseProjectItems(null, statusFieldId)).toEqual([]);
+  expect(parseProjectItems({}, statusFieldId)).toEqual([]);
+  expect(parseProjectItems({ data: { node: null } }, statusFieldId)).toEqual([]);
+  expect(parseProjectItems({ data: { node: { items: { nodes: "not an array" } } } }, statusFieldId)).toEqual([]);
+  // A node missing `id` is dropped rather than crashing the whole parse.
+  expect(parseProjectItems({ data: { node: { items: { nodes: [{ content: { __typename: "Issue", number: 1, title: "x" } }] } } } }, null)).toEqual([]);
+});
+
+test("projectsScopeErrorMessage prepends the required-scope hint only when the error mentions scope", () => {
+  expect(projectsScopeErrorMessage("Your token has not been granted the required scopes to execute this query."))
+    .toContain("`project` scope");
+  expect(projectsScopeErrorMessage("Resource not accessible — token scope insufficient"))
+    .toContain("`project` scope");
+  // Unrelated errors pass through untouched.
+  expect(projectsScopeErrorMessage("Could not resolve to a ProjectV2 with the id.")).toBe(
+    "Could not resolve to a ProjectV2 with the id.",
+  );
+});
+
+test("addedProjectItemIdFromGraphql digs data.addProjectV2ItemById.item.id out of the mutation response", () => {
+  expect(addedProjectItemIdFromGraphql({ data: { addProjectV2ItemById: { item: { id: "PVTI_new" } } } })).toBe("PVTI_new");
+  expect(addedProjectItemIdFromGraphql(null)).toBeNull();
+  expect(addedProjectItemIdFromGraphql({})).toBeNull();
+  expect(addedProjectItemIdFromGraphql({ data: { addProjectV2ItemById: null } })).toBeNull();
+  expect(addedProjectItemIdFromGraphql({ data: { addProjectV2ItemById: { item: {} } } })).toBeNull();
 });

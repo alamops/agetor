@@ -32,6 +32,11 @@ import type {
   GitHubPullMergeResult,
   GitHubPullReviewEvent,
   GitHubPullReviewThreadsResult,
+  GitHubProjectField,
+  GitHubProjectItem,
+  GitHubProjectItemsResult,
+  GitHubProjectV2,
+  GitHubProjectsV2Result,
   GitHubRateLimit,
   GitHubReactionContent,
   GitHubReactionsResult,
@@ -227,6 +232,36 @@ interface RemoveGitHubSubIssueInput extends GitHubItemNumberInput {
 interface TransferGitHubIssueInput extends GitHubItemNumberInput {
   /** "owner/name" of the destination repository. */
   targetRepo: string;
+}
+
+interface GetGitHubProjectItemsInput {
+  dir: string;
+  projectId: string;
+}
+
+interface AddGitHubProjectItemInput {
+  dir: string;
+  projectId: string;
+  contentNumber: number;
+  /** Which REST endpoint resolves the content's node id — `/issues/:number`
+   *  vs `/pulls/:number`. Both return `node_id` for the same underlying
+   *  object (a PR is an issue under the hood), so this only picks which
+   *  endpoint to hit, not whether the add succeeds. */
+  contentKind: "issue" | "pr";
+}
+
+interface RemoveGitHubProjectItemInput {
+  dir: string;
+  projectId: string;
+  itemId: string;
+}
+
+interface SetGitHubProjectItemStatusInput {
+  dir: string;
+  projectId: string;
+  itemId: string;
+  fieldId: string;
+  optionId: string;
 }
 
 // A "conversation" comment (issue/PR body thread) lives under /issues/comments;
@@ -430,6 +465,9 @@ type GitHubCommitStatusResponse = ({ ok: true } & GitHubCommitStatusResult) | Gi
 type GitHubWorkflowRunsResponse = ({ ok: true } & GitHubWorkflowRunsResult) | GitHubListError;
 type GitHubWorkflowsResponse = ({ ok: true } & GitHubWorkflowsResult) | GitHubListError;
 type GitHubWorkflowActionResponse = ({ ok: true; message: string }) | GitHubListError;
+type GitHubProjectsV2Response = ({ ok: true } & GitHubProjectsV2Result) | GitHubListError;
+type GitHubProjectItemsResponse = ({ ok: true } & GitHubProjectItemsResult) | GitHubListError;
+type GitHubProjectItemAddResponse = ({ ok: true; itemId: string }) | GitHubListError;
 
 const GITHUB_FETCH_TIMEOUT_MS = 30_000;
 const GITHUB_DIFF_BODY_CAP_BYTES = 8_000_000;
@@ -689,6 +727,11 @@ export const __githubInternals = {
   normalizeCommitStatus,
   normalizeWorkflowRun,
   normalizeWorkflow,
+  parseProjectsV2,
+  parseProjectFields,
+  parseProjectItems,
+  projectsScopeErrorMessage,
+  addedProjectItemIdFromGraphql,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -2245,6 +2288,21 @@ function graphqlErrorMessage(json: unknown): string | null {
     : "GitHub rejected the request";
 }
 
+/** Map a GraphQL error touching the token's OAuth scope to a friendly message
+ *  for Projects v2 endpoints (F21/G11). GitHub Projects v2 requires the
+ *  `project` (classic PAT) or `read:project` (fine-grained) scope, which most
+ *  tokens don't carry by default — the raw GraphQL error is opaque ("Your
+ *  token has not been granted the required scopes...", "Resource not
+ *  accessible by personal access token", …), so this matches loosely on the
+ *  word "scope" rather than one exact string and prepends actionable
+ *  guidance. Leaves any other error message untouched. Pure — unit-tested. */
+function projectsScopeErrorMessage(raw: string): string {
+  if (/scope/i.test(raw)) {
+    return `your GitHub token needs the \`project\` scope (or \`read:project\` for fine-grained tokens) to manage Projects — ${raw}`;
+  }
+  return raw;
+}
+
 /** Dig `data.<field>.pullRequest.isDraft` out of a GraphQL response. */
 function draftFromGraphql(json: unknown, field: string): boolean | null {
   if (!json || typeof json !== "object") return null;
@@ -2309,6 +2367,149 @@ function transferredIssueFromGraphql(json: unknown): { number: number; url: stri
   const obj = issue as Record<string, unknown>;
   if (typeof obj.number !== "number" || typeof obj.url !== "string") return null;
   return { number: obj.number, url: obj.url };
+}
+
+/** Dig `data.repository.projectsV2.nodes` out of a GraphQL response (F21/G11)
+ *  — the repo-linked Projects v2 boards. Defensive: `[]` on any unexpected
+ *  shape, and malformed entries are dropped individually rather than failing
+ *  the whole list. Pure — unit-tested. */
+function parseProjectsV2(json: unknown): GitHubProjectV2[] {
+  if (!json || typeof json !== "object") return [];
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return [];
+  const repository = (data as { repository?: unknown }).repository;
+  if (!repository || typeof repository !== "object") return [];
+  const projectsV2 = (repository as { projectsV2?: unknown }).projectsV2;
+  if (!projectsV2 || typeof projectsV2 !== "object") return [];
+  const nodes = (projectsV2 as { nodes?: unknown }).nodes;
+  if (!Array.isArray(nodes)) return [];
+
+  const projects: GitHubProjectV2[] = [];
+  for (const node of nodes) {
+    if (!node || typeof node !== "object") continue;
+    const obj = node as Record<string, unknown>;
+    if (typeof obj.id !== "string" || typeof obj.number !== "number" || typeof obj.title !== "string" || typeof obj.url !== "string") {
+      continue;
+    }
+    projects.push({ id: obj.id, number: obj.number, title: obj.title, url: obj.url });
+  }
+  return projects;
+}
+
+/** Dig `data.node.fields.nodes` out of the project-items query response
+ *  (F21/G11), keeping only `ProjectV2SingleSelectField` nodes (discriminated
+ *  by `__typename` — the query's other inline fragment,
+ *  `... on ProjectV2FieldCommon`, exists only so non-select field types don't
+ *  break the query; those nodes carry no `options` and aren't useful here, so
+ *  they're dropped). Each returned field's `options` reflects whatever that
+ *  particular single-select field has configured (rarely empty, but not
+ *  guaranteed non-empty). Pure — unit-tested. */
+function parseProjectFields(json: unknown): GitHubProjectField[] {
+  if (!json || typeof json !== "object") return [];
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return [];
+  const node = (data as { node?: unknown }).node;
+  if (!node || typeof node !== "object") return [];
+  const fields = (node as { fields?: unknown }).fields;
+  if (!fields || typeof fields !== "object") return [];
+  const nodes = (fields as { nodes?: unknown }).nodes;
+  if (!Array.isArray(nodes)) return [];
+
+  const result: GitHubProjectField[] = [];
+  for (const raw of nodes) {
+    if (!raw || typeof raw !== "object") continue;
+    const obj = raw as Record<string, unknown>;
+    if (obj.__typename !== "ProjectV2SingleSelectField") continue;
+    if (typeof obj.id !== "string" || typeof obj.name !== "string") continue;
+    const rawOptions = Array.isArray(obj.options) ? obj.options : [];
+    const options: { id: string; name: string }[] = [];
+    for (const rawOption of rawOptions) {
+      if (!rawOption || typeof rawOption !== "object") continue;
+      const optionObj = rawOption as Record<string, unknown>;
+      if (typeof optionObj.id !== "string" || typeof optionObj.name !== "string") continue;
+      options.push({ id: optionObj.id, name: optionObj.name });
+    }
+    result.push({ id: obj.id, name: obj.name, options });
+  }
+  return result;
+}
+
+/** Dig `data.node.items.nodes` out of the project-items query response
+ *  (F21/G11) into our flat item shape. `content.__typename` discriminates
+ *  Issue/PullRequest (number+title) vs DraftIssue (title only, `number:
+ *  null`) vs anything else (`contentType: "other"`, defensive against future
+ *  GraphQL content types). `statusFieldId` (the resolved "Status" field's id,
+ *  or null when the project has no such field) picks the matching
+ *  `ProjectV2ItemFieldSingleSelectValue` out of each item's `fieldValues` —
+ *  an item with no value for that field (or when `statusFieldId` is null)
+ *  gets `statusOptionId`/`statusOptionName: null`. Pure — unit-tested. */
+function parseProjectItems(json: unknown, statusFieldId: string | null): GitHubProjectItem[] {
+  if (!json || typeof json !== "object") return [];
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return [];
+  const node = (data as { node?: unknown }).node;
+  if (!node || typeof node !== "object") return [];
+  const items = (node as { items?: unknown }).items;
+  if (!items || typeof items !== "object") return [];
+  const nodes = (items as { nodes?: unknown }).nodes;
+  if (!Array.isArray(nodes)) return [];
+
+  const result: GitHubProjectItem[] = [];
+  for (const raw of nodes) {
+    if (!raw || typeof raw !== "object") continue;
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj.id !== "string") continue;
+
+    const content = obj.content && typeof obj.content === "object" ? obj.content as Record<string, unknown> : null;
+    const typename = content && typeof content.__typename === "string" ? content.__typename : null;
+    let contentType: GitHubProjectItem["contentType"] = "other";
+    let number: number | null = null;
+    let title = "";
+    if (typename === "Issue" || typename === "PullRequest") {
+      contentType = typename;
+      number = content && typeof content.number === "number" ? content.number : null;
+      title = content && typeof content.title === "string" ? content.title : "";
+    } else if (typename === "DraftIssue") {
+      contentType = "DraftIssue";
+      title = content && typeof content.title === "string" ? content.title : "";
+    }
+
+    let statusOptionId: string | null = null;
+    let statusOptionName: string | null = null;
+    const fieldValuesConnection = obj.fieldValues && typeof obj.fieldValues === "object"
+      ? (obj.fieldValues as { nodes?: unknown }).nodes
+      : undefined;
+    if (statusFieldId && Array.isArray(fieldValuesConnection)) {
+      for (const rawValue of fieldValuesConnection) {
+        if (!rawValue || typeof rawValue !== "object") continue;
+        const valueObj = rawValue as Record<string, unknown>;
+        if (valueObj.__typename !== "ProjectV2ItemFieldSingleSelectValue") continue;
+        const field = valueObj.field && typeof valueObj.field === "object" ? valueObj.field as Record<string, unknown> : null;
+        const fieldId = field && typeof field.id === "string" ? field.id : null;
+        if (fieldId !== statusFieldId) continue;
+        statusOptionId = typeof valueObj.optionId === "string" ? valueObj.optionId : null;
+        statusOptionName = typeof valueObj.name === "string" ? valueObj.name : null;
+        break;
+      }
+    }
+
+    result.push({ itemId: obj.id, contentType, number, title, statusOptionId, statusOptionName });
+  }
+  return result;
+}
+
+/** Dig `data.addProjectV2ItemById.item.id` out of the `addProjectV2ItemById`
+ *  mutation response (F21/G11). */
+function addedProjectItemIdFromGraphql(json: unknown): string | null {
+  if (!json || typeof json !== "object") return null;
+  const data = (json as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return null;
+  const payload = (data as { addProjectV2ItemById?: unknown }).addProjectV2ItemById;
+  if (!payload || typeof payload !== "object") return null;
+  const item = (payload as { item?: unknown }).item;
+  if (!item || typeof item !== "object") return null;
+  const id = (item as { id?: unknown }).id;
+  return typeof id === "string" ? id : null;
 }
 
 /** Toggle a PR's draft state. REST has no endpoint for this, so it goes through
@@ -2683,6 +2884,165 @@ export async function transferGitHubIssue(input: TransferGitHubIssueInput): Prom
   const transferred = transferredIssueFromGraphql(json);
   if (!transferred) return { ok: false, error: "GitHub returned an unexpected transfer response" };
   return { ok: true, url: transferred.url, message: `Issue transferred to ${input.targetRepo} as #${transferred.number}.` };
+}
+
+/** List the Projects v2 boards linked to this repo (F21/G11) — read-only.
+ *  GraphQL-only (Projects v2 has no REST surface). Requires the token to
+ *  carry the `project`/`read:project` scope; GitHub's own error for a
+ *  missing scope is opaque, so it's routed through `projectsScopeErrorMessage`
+ *  for a friendlier message. */
+export async function listGitHubProjectsV2(input: { dir: string }): Promise<GitHubProjectsV2Response> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to view projects" };
+
+  const query = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){projectsV2(first:20){nodes{id number title url}}}}`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: projectsScopeErrorMessage(gqlError) };
+  return { ok: true, projects: parseProjectsV2(json) };
+}
+
+/** List a project's items plus its "Status" single-select field (if any),
+ *  so the UI can populate each row's status dropdown from `statusField`
+ *  (F21/G11). One GraphQL request fetches both `fields` and `items` off the
+ *  same `node(id:$projectId)` — `fields` first(30), `items` first(50); this
+ *  UI manages existing projects, not their schema, so no pagination beyond
+ *  those single pages. */
+export async function getGitHubProjectItems(input: GetGitHubProjectItemsInput): Promise<GitHubProjectItemsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.projectId.trim()) return { ok: false, error: "project id required" };
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to view project items" };
+
+  const query = `query($id:ID!){ node(id:$id){ ... on ProjectV2 {`
+    + `fields(first:30){ nodes{ __typename ... on ProjectV2SingleSelectField { id name options{ id name } } ... on ProjectV2FieldCommon { id name } } }`
+    + `items(first:50){ nodes{ id content{ __typename ... on Issue{ number title } ... on PullRequest{ number title } ... on DraftIssue{ title } }`
+    + `fieldValues(first:20){ nodes{ __typename ... on ProjectV2ItemFieldSingleSelectValue{ optionId name field{ ... on ProjectV2FieldCommon{ id } } } } } } }`
+    + `} } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { id: input.projectId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: projectsScopeErrorMessage(gqlError) };
+  const statusField = parseProjectFields(json).find((f) => f.name === "Status") ?? null;
+  const items = parseProjectItems(json, statusField?.id ?? null);
+  return { ok: true, items, statusField };
+}
+
+/** Add an existing issue/PR to a project by number (F21/G11) — scope decision
+ *  A1 manages items on existing projects, not project schema/creation. Two
+ *  steps: resolve the content's global node id via REST (`contentKind`
+ *  picks `/issues/:number` vs `/pulls/:number` — both return `node_id`), then
+ *  `addProjectV2ItemById`. Draft issues aren't addressable by number, so this
+ *  only covers Issue/PullRequest content. */
+export async function addGitHubProjectItem(input: AddGitHubProjectItemInput): Promise<GitHubProjectItemAddResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.projectId.trim()) return { ok: false, error: "project id required" };
+  if (!Number.isInteger(input.contentNumber) || input.contentNumber <= 0) {
+    return { ok: false, error: "issue/PR number must be positive" };
+  }
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to add a project item" };
+
+  const segment = input.contentKind === "pr" ? "pulls" : "issues";
+  const contentUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/${segment}/${input.contentNumber}`;
+  const contentRes = await fetchGitHub(contentUrl, token, "application/vnd.github+json");
+  if (!("status" in contentRes)) return contentRes;
+  const contentJson = await contentRes.json().catch(() => null);
+  if (!contentRes.ok) return { ok: false, error: apiError(contentJson, contentRes.status, contentRes.statusText) };
+  const nodeId = contentJson && typeof contentJson === "object" && typeof (contentJson as { node_id?: unknown }).node_id === "string"
+    ? (contentJson as { node_id: string }).node_id
+    : null;
+  if (!nodeId) return { ok: false, error: "GitHub returned an item without a node id" };
+
+  const query = `mutation($p:ID!,$c:ID!){ addProjectV2ItemById(input:{ projectId:$p, contentId:$c }){ item{ id } } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { p: input.projectId, c: nodeId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: projectsScopeErrorMessage(gqlError) };
+  const itemId = addedProjectItemIdFromGraphql(json);
+  if (!itemId) return { ok: false, error: "GitHub returned an unexpected add-item response" };
+  return { ok: true, itemId };
+}
+
+/** Remove an item from a project (F21/G11) — does not close/delete the
+ *  underlying issue/PR, only unlinks it from the board. */
+export async function removeGitHubProjectItem(input: RemoveGitHubProjectItemInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.projectId.trim()) return { ok: false, error: "project id required" };
+  if (!input.itemId.trim()) return { ok: false, error: "item id required" };
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to remove a project item" };
+
+  const query = `mutation($p:ID!,$i:ID!){ deleteProjectV2Item(input:{ projectId:$p, itemId:$i }){ deletedItemId } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { p: input.projectId, i: input.itemId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: projectsScopeErrorMessage(gqlError) };
+  return { ok: true, message: "Item removed from project." };
+}
+
+/** Set an item's value for a single-select field — in practice always the
+ *  "Status" field surfaced by `getGitHubProjectItems` (F21/G11). Scope
+ *  decision A1 doesn't include clearing a field back to unset (no
+ *  `clearProjectV2ItemFieldValue` mutation wired here), only setting one of
+ *  the field's existing options. */
+export async function setGitHubProjectItemStatus(input: SetGitHubProjectItemStatusInput): Promise<GitHubActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!input.projectId.trim()) return { ok: false, error: "project id required" };
+  if (!input.itemId.trim()) return { ok: false, error: "item id required" };
+  if (!input.fieldId.trim()) return { ok: false, error: "field id required" };
+  if (!input.optionId.trim()) return { ok: false, error: "option id required" };
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to update a project item" };
+
+  const query = `mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){ updateProjectV2ItemFieldValue(input:{ projectId:$p, itemId:$i, fieldId:$f, value:{ singleSelectOptionId:$o } }){ projectV2Item { id } } }`;
+  const res = await fetchGitHub(
+    "https://api.github.com/graphql",
+    token,
+    "application/vnd.github+json",
+    { method: "POST", body: JSON.stringify({ query, variables: { p: input.projectId, i: input.itemId, f: input.fieldId, o: input.optionId } }) },
+  );
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const gqlError = graphqlErrorMessage(json);
+  if (gqlError) return { ok: false, error: projectsScopeErrorMessage(gqlError) };
+  return { ok: true, message: "Status updated." };
 }
 
 /** The authenticated user's login, so the UI can offer edit/delete only on the

@@ -14,13 +14,16 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  CircleDot,
   ExternalLink,
   FileMinus,
   FilePen,
   FilePlus,
   FileSymlink,
+  FileText,
   GitMerge,
   GitPullRequest,
+  Kanban,
   ListTree,
   Loader2,
   Lock,
@@ -72,6 +75,9 @@ import type {
   GitHubPullCommit,
   GitHubPullLineComment,
   GitHubPullMergeability,
+  GitHubProjectField,
+  GitHubProjectItem,
+  GitHubProjectV2,
   GitHubRateLimit,
   GitHubRelease,
   GitHubRepoLabel,
@@ -1302,6 +1308,179 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     }
   };
 
+  // Projects v2 (F21/G11) — repo-linked project boards. Lazy — like
+  // notifications/actions, only fetched while the manager is open. Scope
+  // decision A1: manage items + status on EXISTING projects, not creation or
+  // field-schema edits.
+  const [projectsV2, setProjectsV2] = useState<GitHubProjectV2[]>([]);
+  const [projectsManagerOpen, setProjectsManagerOpen] = useState(false);
+  const [projectsLoading, setProjectsLoading] = useState(false);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
+  const projectsSeq = useRef(0);
+  // The selected board's own items, fetched once a project is picked from the
+  // panel's project <Select>. Cleared whenever the selection or project path
+  // changes so a stale board's items can't linger under a new selection.
+  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const [projectItems, setProjectItems] = useState<GitHubProjectItem[]>([]);
+  const [projectStatusField, setProjectStatusField] = useState<GitHubProjectField | null>(null);
+  const [projectItemsLoading, setProjectItemsLoading] = useState(false);
+  const [projectItemsError, setProjectItemsError] = useState<string | null>(null);
+  const projectItemsSeq = useRef(0);
+  // Per-item in-flight action ("status" | "remove") and the last error for
+  // that item, both keyed by itemId — mirrors the workflow-run busy/error maps.
+  const [projectItemBusy, setProjectItemBusy] = useState<Record<string, string | undefined>>({});
+  const [projectItemErrors, setProjectItemErrors] = useState<Record<string, string | undefined>>({});
+  // "Add issue/PR by #number" form state.
+  const [projectAddNumber, setProjectAddNumber] = useState("");
+  const [projectAddKind, setProjectAddKind] = useState<"issue" | "pr">("issue");
+  const [projectAddBusy, setProjectAddBusy] = useState(false);
+  const [projectAddError, setProjectAddError] = useState<string | null>(null);
+
+  useEffect(() => {
+    // The toolbar button that opens this panel is disabled in aggregate mode
+    // (Projects v2 is single-repo), so `isAggregate` is defense-in-depth.
+    if (!open || !projectsManagerOpen || !projectPath || isAggregate) return;
+    const requestId = ++projectsSeq.current;
+    setProjectsLoading(true);
+    setProjectsError(null);
+    api.listGitHubProjectsV2({ path: projectPath })
+      .then((r) => { if (requestId === projectsSeq.current) setProjectsV2(r.projects); })
+      .catch((e) => { if (requestId === projectsSeq.current) setProjectsError(e instanceof Error ? e.message : String(e)); })
+      .finally(() => { if (requestId === projectsSeq.current) setProjectsLoading(false); });
+  }, [open, projectsManagerOpen, projectPath, isAggregate]);
+
+  const refreshProjects = async () => {
+    if (!projectPath || !projectsManagerOpen) return;
+    const requestId = ++projectsSeq.current;
+    setProjectsLoading(true);
+    setProjectsError(null);
+    try {
+      const r = await api.listGitHubProjectsV2({ path: projectPath });
+      if (requestId === projectsSeq.current) setProjectsV2(r.projects);
+    } catch (e) {
+      if (requestId === projectsSeq.current) setProjectsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (requestId === projectsSeq.current) setProjectsLoading(false);
+    }
+  };
+
+  // A project switch (or the panel/project changing under it) drops the
+  // previously selected board — its items belong to a project that may no
+  // longer even be in `projectsV2`.
+  useEffect(() => {
+    setSelectedProjectId("");
+    setProjectItems([]);
+    setProjectStatusField(null);
+    setProjectItemsError(null);
+  }, [projectPath, isAggregate, projectsManagerOpen]);
+
+  // Switching the selected board also clears the add-form + per-item feedback so
+  // a stale "add #5 failed" banner from board A doesn't linger under board B.
+  useEffect(() => {
+    setProjectAddNumber("");
+    setProjectAddError(null);
+    setProjectItemErrors({});
+    setProjectItemBusy({});
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!open || !projectsManagerOpen || !projectPath || isAggregate || !selectedProjectId) return;
+    const requestId = ++projectItemsSeq.current;
+    setProjectItemsLoading(true);
+    setProjectItemsError(null);
+    api.getGitHubProjectItems({ path: projectPath, projectId: selectedProjectId })
+      .then((r) => {
+        if (requestId !== projectItemsSeq.current) return;
+        setProjectItems(r.items);
+        setProjectStatusField(r.statusField);
+      })
+      .catch((e) => { if (requestId === projectItemsSeq.current) setProjectItemsError(e instanceof Error ? e.message : String(e)); })
+      .finally(() => { if (requestId === projectItemsSeq.current) setProjectItemsLoading(false); });
+  }, [open, projectsManagerOpen, projectPath, isAggregate, selectedProjectId]);
+
+  const refreshProjectItems = async () => {
+    if (!projectPath || !selectedProjectId) return;
+    const requestId = ++projectItemsSeq.current;
+    setProjectItemsLoading(true);
+    setProjectItemsError(null);
+    try {
+      const r = await api.getGitHubProjectItems({ path: projectPath, projectId: selectedProjectId });
+      if (requestId === projectItemsSeq.current) {
+        setProjectItems(r.items);
+        setProjectStatusField(r.statusField);
+      }
+    } catch (e) {
+      if (requestId === projectItemsSeq.current) setProjectItemsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (requestId === projectItemsSeq.current) setProjectItemsLoading(false);
+    }
+  };
+
+  const setProjectItemStatus = async (itemId: string, optionId: string, optionName: string) => {
+    if (!projectPath || !selectedProjectId || !projectStatusField) return;
+    setProjectItemBusy((cur) => ({ ...cur, [itemId]: "status" }));
+    setProjectItemErrors((cur) => ({ ...cur, [itemId]: undefined }));
+    // Optimistic — reflect the new status immediately rather than waiting on
+    // a refetch; reverted (implicitly, by the row's own error text) if the
+    // mutation below fails.
+    const previous = projectItems.find((it) => it.itemId === itemId);
+    setProjectItems((cur) => cur.map((it) => (it.itemId === itemId ? { ...it, statusOptionId: optionId, statusOptionName: optionName } : it)));
+    try {
+      await api.setGitHubProjectItemStatus({
+        path: projectPath,
+        projectId: selectedProjectId,
+        itemId,
+        fieldId: projectStatusField.id,
+        optionId,
+      });
+    } catch (e) {
+      setProjectItemErrors((cur) => ({ ...cur, [itemId]: e instanceof Error ? e.message : String(e) }));
+      if (previous) {
+        setProjectItems((cur) => cur.map((it) => (it.itemId === itemId ? previous : it)));
+      }
+    } finally {
+      setProjectItemBusy((cur) => ({ ...cur, [itemId]: undefined }));
+    }
+  };
+
+  const removeProjectItem = async (itemId: string) => {
+    if (!projectPath || !selectedProjectId) return;
+    setProjectItemBusy((cur) => ({ ...cur, [itemId]: "remove" }));
+    setProjectItemErrors((cur) => ({ ...cur, [itemId]: undefined }));
+    try {
+      await api.removeGitHubProjectItem({ path: projectPath, projectId: selectedProjectId, itemId });
+      setProjectItems((cur) => cur.filter((it) => it.itemId !== itemId)); // success unmounts this row
+    } catch (e) {
+      setProjectItemErrors((cur) => ({ ...cur, [itemId]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setProjectItemBusy((cur) => ({ ...cur, [itemId]: undefined }));
+    }
+  };
+
+  const addProjectItem = async () => {
+    if (!projectPath || !selectedProjectId || projectAddBusy) return;
+    const num = Number(projectAddNumber);
+    if (!Number.isInteger(num) || num <= 0) return;
+    setProjectAddBusy(true);
+    setProjectAddError(null);
+    try {
+      await api.addGitHubProjectItem({
+        path: projectPath,
+        projectId: selectedProjectId,
+        contentNumber: num,
+        contentKind: projectAddKind,
+      });
+      setProjectAddNumber("");
+      // The add mutation only returns the new item's id, not its title/number/
+      // content type — refetch to pick those up (explicitly allowed by spec).
+      await refreshProjectItems();
+    } catch (e) {
+      setProjectAddError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectAddBusy(false);
+    }
+  };
+
   useEffect(() => {
     // The New PR composer is hidden in aggregate mode (needs a concrete repo).
     if (!open || !projectPath || kind !== "pulls" || isAggregate) return;
@@ -2241,6 +2420,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setReleaseManagerOpen(false);
               setNotificationsOpen(false);
               setActionsManagerOpen(false);
+              setProjectsManagerOpen(false);
             }}
           >
             <Tag className="size-4" />
@@ -2257,6 +2437,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setReleaseManagerOpen(false);
               setNotificationsOpen(false);
               setActionsManagerOpen(false);
+              setProjectsManagerOpen(false);
             }}
           >
             <Milestone className="size-4" />
@@ -2273,6 +2454,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setMilestoneManagerOpen(false);
               setNotificationsOpen(false);
               setActionsManagerOpen(false);
+              setProjectsManagerOpen(false);
             }}
           >
             <Rocket className="size-4" />
@@ -2289,6 +2471,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setMilestoneManagerOpen(false);
               setReleaseManagerOpen(false);
               setActionsManagerOpen(false);
+              setProjectsManagerOpen(false);
             }}
           >
             <Bell className="size-4" />
@@ -2305,9 +2488,27 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setMilestoneManagerOpen(false);
               setReleaseManagerOpen(false);
               setNotificationsOpen(false);
+              setProjectsManagerOpen(false);
             }}
           >
             <Workflow className="size-4" />
+          </Button>
+          <Button
+            size="icon"
+            variant={projectsManagerOpen ? "secondary" : "ghost"}
+            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Projects"}
+            aria-label="Projects"
+            disabled={!projectPath || isAggregate}
+            onClick={() => {
+              setProjectsManagerOpen((v) => !v);
+              setLabelManagerOpen(false);
+              setMilestoneManagerOpen(false);
+              setReleaseManagerOpen(false);
+              setNotificationsOpen(false);
+              setActionsManagerOpen(false);
+            }}
+          >
+            <Kanban className="size-4" />
           </Button>
           {result && result.webUrl && (
             <Button
@@ -2574,6 +2775,34 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onDispatch={() => { void dispatchWorkflow(); }}
             onRefresh={() => { void refreshActions(); }}
             onClose={() => setActionsManagerOpen(false)}
+          />
+        )}
+        {projectsManagerOpen && (
+          <ProjectsPanel
+            projects={projectsV2}
+            loading={projectsLoading}
+            error={projectsError}
+            authenticated={canPush}
+            selectedProjectId={selectedProjectId}
+            onSelectProject={setSelectedProjectId}
+            items={projectItems}
+            statusField={projectStatusField}
+            itemsLoading={projectItemsLoading}
+            itemsError={projectItemsError}
+            itemBusy={projectItemBusy}
+            itemErrors={projectItemErrors}
+            onSetStatus={(itemId, optionId, optionName) => { void setProjectItemStatus(itemId, optionId, optionName); }}
+            onRemoveItem={(itemId) => { void removeProjectItem(itemId); }}
+            addNumber={projectAddNumber}
+            onAddNumberChange={setProjectAddNumber}
+            addKind={projectAddKind}
+            onAddKindChange={setProjectAddKind}
+            addBusy={projectAddBusy}
+            addError={projectAddError}
+            onAddItem={() => { void addProjectItem(); }}
+            onRefresh={() => { void refreshProjects(); }}
+            onRefreshItems={() => { void refreshProjectItems(); }}
+            onClose={() => setProjectsManagerOpen(false)}
           />
         )}
         {kind === "pulls" && !isAggregate && (
@@ -4389,6 +4618,276 @@ function WorkflowRunRow({
             <span>{fmtRelativeDate(run.createdAt)}</span>
           </>
         )}
+      </div>
+      {error && (
+        <div className="mt-0.5 flex items-center gap-1 pl-0.5 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProjectsPanel({
+  projects,
+  loading,
+  error,
+  authenticated,
+  selectedProjectId,
+  onSelectProject,
+  items,
+  statusField,
+  itemsLoading,
+  itemsError,
+  itemBusy,
+  itemErrors,
+  onSetStatus,
+  onRemoveItem,
+  addNumber,
+  onAddNumberChange,
+  addKind,
+  onAddKindChange,
+  addBusy,
+  addError,
+  onAddItem,
+  onRefresh,
+  onRefreshItems,
+  onClose,
+}: {
+  projects: GitHubProjectV2[];
+  loading: boolean;
+  error: string | null;
+  authenticated: boolean;
+  selectedProjectId: string;
+  onSelectProject: (id: string) => void;
+  items: GitHubProjectItem[];
+  statusField: GitHubProjectField | null;
+  itemsLoading: boolean;
+  itemsError: string | null;
+  itemBusy: Record<string, string | undefined>;
+  itemErrors: Record<string, string | undefined>;
+  onSetStatus: (itemId: string, optionId: string, optionName: string) => void;
+  onRemoveItem: (itemId: string) => void;
+  addNumber: string;
+  onAddNumberChange: (v: string) => void;
+  addKind: "issue" | "pr";
+  onAddKindChange: (k: "issue" | "pr") => void;
+  addBusy: boolean;
+  addError: string | null;
+  onAddItem: () => void;
+  onRefresh: () => void;
+  onRefreshItems: () => void;
+  onClose: () => void;
+}) {
+  const selectedProject = projects.find((p) => p.id === selectedProjectId) ?? null;
+  const addDisabled = addBusy || !authenticated || !selectedProjectId || !addNumber.trim();
+  return (
+    <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <Kanban className="size-3.5" />
+          Projects{projects.length > 0 && ` (${projects.length})`}
+        </div>
+        <div className="flex items-center gap-1">
+          <Button size="icon" variant="ghost" className="size-6" title="Refresh projects" aria-label="Refresh projects" disabled={loading} onClick={onRefresh}>
+            {loading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+          </Button>
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      </div>
+      {error && (
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+      <div className="mb-2">
+        <Select
+          value={selectedProjectId}
+          onChange={(e) => onSelectProject(e.target.value)}
+          title="Project"
+          aria-label="Project"
+          className="h-8 text-xs"
+          disabled={loading || projects.length === 0}
+        >
+          <option value="">
+            {loading ? "Loading projects…" : projects.length === 0 ? "No projects linked to this repository" : "Select a project…"}
+          </option>
+          {projects.map((p) => (
+            <option key={p.id} value={p.id}>#{p.number} {p.title}</option>
+          ))}
+        </Select>
+      </div>
+
+      {selectedProjectId && (
+        <>
+          <div className="mb-2 flex items-center justify-between gap-2 border-t border-border/60 pt-2">
+            <div className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
+              <span>Items{!itemsLoading && ` (${items.length})`}</span>
+              {selectedProject && (
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="size-6"
+                  title="Open project on GitHub"
+                  aria-label="Open project on GitHub"
+                  onClick={() => { void api.openExternal(selectedProject.url); }}
+                >
+                  <ExternalLink className="size-3.5" />
+                </Button>
+              )}
+            </div>
+            <Button size="icon" variant="ghost" className="size-6" title="Refresh items" aria-label="Refresh items" disabled={itemsLoading} onClick={onRefreshItems}>
+              {itemsLoading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+            </Button>
+          </div>
+          {itemsError && (
+            <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+              <AlertCircle className="size-3.5" />
+              {itemsError}
+            </div>
+          )}
+          <div className="mb-3 max-h-56 space-y-1 overflow-y-auto">
+            {!itemsError && items.length === 0 ? (
+              <div className="px-1 py-2 text-[11px] text-muted-foreground">
+                {itemsLoading ? "Loading…" : "No items on this project board."}
+              </div>
+            ) : (
+              items.map((it) => (
+                <ProjectItemRow
+                  key={it.itemId}
+                  item={it}
+                  statusField={statusField}
+                  authenticated={authenticated}
+                  busy={itemBusy[it.itemId]}
+                  error={itemErrors[it.itemId]}
+                  onSetStatus={(optionId, optionName) => onSetStatus(it.itemId, optionId, optionName)}
+                  onRemove={() => onRemoveItem(it.itemId)}
+                />
+              ))
+            )}
+          </div>
+
+          <div className="border-t border-border/60 pt-2">
+            <div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground">
+              <Plus className="size-3.5" />
+              Add issue/PR by number
+            </div>
+            <div className="mb-1 flex items-center gap-1.5">
+              <Select
+                value={addKind}
+                onChange={(e) => onAddKindChange(e.target.value === "pr" ? "pr" : "issue")}
+                title="Content kind"
+                aria-label="Content kind"
+                className="h-8 w-20 shrink-0 text-xs"
+                disabled={addBusy || !authenticated}
+              >
+                <option value="issue">Issue</option>
+                <option value="pr">PR</option>
+              </Select>
+              <Input
+                value={addNumber}
+                onChange={(e) => onAddNumberChange(e.target.value.replace(/[^0-9]/g, ""))}
+                placeholder="#number"
+                className="h-8 flex-1 text-xs"
+                disabled={addBusy || !authenticated}
+                onKeyDown={(e) => { if (e.key === "Enter" && !addDisabled) onAddItem(); }}
+              />
+              <Button
+                size="sm"
+                disabled={addDisabled}
+                title={authenticated ? undefined : PUSH_ONLY_TITLE}
+                onClick={onAddItem}
+              >
+                {addBusy ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
+                Add
+              </Button>
+            </div>
+            {addError && (
+              <div className="flex items-center gap-1 text-[11px] text-rose-400">
+                <AlertCircle className="size-3.5" />
+                {addError}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ProjectItemRow({
+  item,
+  statusField,
+  authenticated,
+  busy,
+  error,
+  onSetStatus,
+  onRemove,
+}: {
+  item: GitHubProjectItem;
+  statusField: GitHubProjectField | null;
+  authenticated: boolean;
+  busy: string | undefined;
+  error: string | undefined;
+  onSetStatus: (optionId: string, optionName: string) => void;
+  onRemove: () => void;
+}) {
+  const isBusy = !!busy;
+  const Icon = item.contentType === "PullRequest" ? GitPullRequest : item.contentType === "DraftIssue" ? FileText : CircleDot;
+  const iconClass = item.contentType === "PullRequest"
+    ? "text-emerald-400"
+    : item.contentType === "DraftIssue"
+      ? "text-muted-foreground"
+      : "text-sky-400";
+  const label = item.contentType === "DraftIssue"
+    ? item.title || "(untitled draft)"
+    : item.number != null
+      ? `#${item.number} ${item.title || "(untitled)"}`
+      : item.title || "(untitled)";
+  return (
+    <div className="rounded px-1 py-1.5 text-xs">
+      <div className="flex items-center gap-2">
+        <Icon className={cn("size-3.5 shrink-0", iconClass)} />
+        <span className="min-w-0 flex-1 truncate font-medium" title={label}>{label}</span>
+        {statusField && (
+          <Select
+            value={item.statusOptionId ?? ""}
+            onChange={(e) => {
+              const optionId = e.target.value;
+              // "— no status —" (empty value) is display-only — there's no
+              // clear-field mutation wired up (scope decision A1), so picking
+              // it is a no-op; the controlled value snaps back to the item's
+              // actual current status.
+              if (!optionId) return;
+              const option = statusField.options.find((o) => o.id === optionId);
+              if (option) onSetStatus(option.id, option.name);
+            }}
+            title="Status"
+            aria-label={`Status for ${label}`}
+            className="h-6 w-28 shrink-0 text-[11px]"
+            disabled={isBusy || !authenticated}
+          >
+            <option value="">— no status —</option>
+            {statusField.options.map((o) => (
+              <option key={o.id} value={o.id}>{o.name}</option>
+            ))}
+          </Select>
+        )}
+        <Button
+          size="icon"
+          variant="ghost"
+          className="size-6 shrink-0 text-muted-foreground hover:text-rose-400"
+          title={authenticated ? "Remove from project" : PUSH_ONLY_TITLE}
+          aria-label={`Remove ${label} from project`}
+          disabled={isBusy || !authenticated}
+          onClick={onRemove}
+        >
+          {busy === "remove" ? <Loader2 className="size-3.5 animate-spin" /> : <X className="size-3.5" />}
+        </Button>
       </div>
       {error && (
         <div className="mt-0.5 flex items-center gap-1 pl-0.5 text-[11px] text-rose-400">

@@ -59,6 +59,7 @@ import {
 } from "./terminals.ts";
 import { listAgentCapabilities } from "./commands.ts";
 import {
+  addGitHubProjectItem,
   addGitHubReaction,
   addGitHubSubIssue,
   applyGitHubSuggestion,
@@ -78,6 +79,7 @@ import {
   dispatchGitHubWorkflow,
   getGitHubCommitStatus,
   getGitHubIssuePinned,
+  getGitHubProjectItems,
   getGitHubPullChecks,
   getGitHubPullLinkedIssues,
   getGitHubRepoPermissions,
@@ -94,6 +96,7 @@ import {
   listGitHubLabels,
   listGitHubMilestones,
   listGitHubNotifications,
+  listGitHubProjectsV2,
   listGitHubPullCommits,
   listGitHubPullReviewComments,
   listGitHubReactions,
@@ -105,6 +108,7 @@ import {
   markAllGitHubNotificationsRead,
   markGitHubNotificationRead,
   mergeGitHubPull,
+  removeGitHubProjectItem,
   removeGitHubReaction,
   removeGitHubSubIssue,
   reopenGitHubPull,
@@ -114,6 +118,7 @@ import {
   reviewGitHubPull,
   setGitHubIssueLock,
   setGitHubIssuePinned,
+  setGitHubProjectItemStatus,
   setGitHubPullAutoMerge,
   setGitHubPullDraft,
   setGitHubReviewThreadResolved,
@@ -1784,6 +1789,120 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "target repo required" }, { status: 400, headers: corsHeaders(req) });
           }
           const result = await transferGitHubIssue({ dir, number: rawNumber, targetRepo: body.targetRepo });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/projects": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubProjectsV2({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-items": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const projectId = url.searchParams.get("projectId");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!projectId) return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await getGitHubProjectItems({ dir, projectId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-item-add": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            projectId?: string;
+            contentNumber?: number;
+            contentKind?: "issue" | "pr";
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+            return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.contentNumber !== "number" || !Number.isInteger(body.contentNumber) || body.contentNumber <= 0) {
+            return json({ error: "valid contentNumber required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const contentKind = body.contentKind === "pr" ? "pr" : "issue";
+          const result = await addGitHubProjectItem({
+            dir,
+            projectId: body.projectId,
+            contentNumber: body.contentNumber,
+            contentKind,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-item-remove": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; projectId?: string; itemId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+            return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.itemId !== "string" || !body.itemId.trim()) {
+            return json({ error: "itemId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await removeGitHubProjectItem({ dir, projectId: body.projectId, itemId: body.itemId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-item-status": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            projectId?: string;
+            itemId?: string;
+            fieldId?: string;
+            optionId?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+            return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.itemId !== "string" || !body.itemId.trim()) {
+            return json({ error: "itemId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.fieldId !== "string" || !body.fieldId.trim()) {
+            return json({ error: "fieldId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.optionId !== "string" || !body.optionId.trim()) {
+            return json({ error: "optionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubProjectItemStatus({
+            dir,
+            projectId: body.projectId,
+            itemId: body.itemId,
+            fieldId: body.fieldId,
+            optionId: body.optionId,
+          });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

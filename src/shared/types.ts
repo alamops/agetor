@@ -1011,6 +1011,55 @@ export interface GitHubSubIssuesResult {
   subIssues: GitHubSubIssue[];
 }
 
+/** A repo-linked GitHub Projects v2 board, from GraphQL
+ *  `repository.projectsV2.nodes` (F21/G11). Projects v2 is GraphQL-only —
+ *  there's no REST equivalent. `number` is the project's board number (used
+ *  in its URL), distinct from the opaque GraphQL `id` every mutation keys on. */
+export interface GitHubProjectV2 {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+}
+
+export interface GitHubProjectsV2Result {
+  projects: GitHubProjectV2[];
+}
+
+/** A single-select field on a project (e.g. "Status"), with its selectable
+ *  options. Non-select fields (text, number, date, iteration…) are not
+ *  represented here — `options` is empty for any field this UI doesn't drive
+ *  a dropdown for. */
+export interface GitHubProjectField {
+  id: string;
+  name: string;
+  options: { id: string; name: string }[];
+}
+
+/** A single item on a project board — an Issue, PullRequest, or DraftIssue
+ *  (GraphQL `content.__typename`), plus its current value for the project's
+ *  "Status" single-select field (if any). `number`/`title` come from the
+ *  underlying content for Issue/PullRequest; a DraftIssue has no `number`
+ *  (null) and its own `title`. `contentType: "other"` covers any future
+ *  content type GraphQL might add that this UI doesn't special-case. */
+export interface GitHubProjectItem {
+  itemId: string;
+  contentType: "Issue" | "PullRequest" | "DraftIssue" | "other";
+  number: number | null;
+  title: string;
+  statusOptionId: string | null;
+  statusOptionName: string | null;
+}
+
+/** `statusField` is the project's field named "Status" (if it's a
+ *  single-select field) — the UI uses its `options` to populate each row's
+ *  status dropdown. Null when the project has no such field, in which case
+ *  the UI hides the status column entirely. */
+export interface GitHubProjectItemsResult {
+  items: GitHubProjectItem[];
+  statusField: GitHubProjectField | null;
+}
+
 /** GitHub's mergeability verdict for a PR, from `GET /pulls/:n`.
  *  `mergeable` is null while GitHub computes it in the background (poll again).
  *  `mergeableState` is GitHub's coarse status: clean | dirty (conflicts) |

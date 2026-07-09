@@ -33,6 +33,11 @@ import type {
   GitHubPullReviewThreadsResult,
   GitHubPullMergeResult,
   GitHubPullReviewEvent,
+  GitHubProjectField,
+  GitHubProjectItem,
+  GitHubProjectItemsResult,
+  GitHubProjectV2,
+  GitHubProjectsV2Result,
   GitHubReactionContent,
   GitHubReactionsResult,
   GitHubReactionSubject,
@@ -104,6 +109,11 @@ export type {
   GitHubPullReviewThreadsResult,
   GitHubPullMergeResult,
   GitHubPullReviewEvent,
+  GitHubProjectField,
+  GitHubProjectItem,
+  GitHubProjectItemsResult,
+  GitHubProjectV2,
+  GitHubProjectsV2Result,
   GitHubReactionContent,
   GitHubReactionsResult,
   GitHubReactionSubject,
@@ -758,6 +768,29 @@ export const api = {
     }),
   transferGitHubIssue: (input: { path: string; number: number; targetRepo: string }) =>
     j<{ ok: true; url: string; message?: string }>("/github/issue-transfer", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubProjectsV2: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubProjectsV2Result>(`/github/projects?${q.toString()}`);
+  },
+  getGitHubProjectItems: (input: { path: string; projectId: string }) => {
+    const q = new URLSearchParams({ path: input.path, projectId: input.projectId });
+    return j<GitHubProjectItemsResult>(`/github/project-items?${q.toString()}`);
+  },
+  addGitHubProjectItem: (input: { path: string; projectId: string; contentNumber: number; contentKind: "issue" | "pr" }) =>
+    j<{ ok: true; itemId: string }>("/github/project-item-add", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  removeGitHubProjectItem: (input: { path: string; projectId: string; itemId: string }) =>
+    j<{ ok: true; message?: string }>("/github/project-item-remove", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubProjectItemStatus: (input: { path: string; projectId: string; itemId: string; fieldId: string; optionId: string }) =>
+    j<{ ok: true; message?: string }>("/github/project-item-status", {
       method: "POST",
       body: JSON.stringify(input),
     }),
