@@ -340,7 +340,7 @@ export const api = {
    *  + a `note` when there's no worktree or no diff. */
   getTaskDiff: (taskId: string) => j<TaskDiff>(`/tasks/${taskId}/diff`),
   getTaskGitStatus: (taskId: string) =>
-    j<{ hasChanges: boolean; ignored: boolean }>(`/tasks/${taskId}/git-status`),
+    j<{ hasChanges: boolean; ahead: number; ignored: boolean }>(`/tasks/${taskId}/git-status`),
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
   sendRunInput: (runId: string, line: string) =>

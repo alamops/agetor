@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { api, COMMIT_PUSH_PROMPT, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow } from "@/lib/subagent-tabs";
+import { shouldOfferCommitPush, type TaskGitStatus } from "@/lib/commit-push";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/select";
@@ -636,14 +637,16 @@ function RunPanelBody({
   const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
-  // Whether the task's working tree has uncommitted changes. Drives the
-  // "Commit & push" action chip above the textarea. Reset to `false`
-  // whenever the latest run is not in a succeeded state so the chip
-  // disappears the moment a new turn starts (`send()` refreshes the runs
-  // list immediately, so `latestRun.status` flips to "running" within
-  // ~200ms of the click). A polling effect keeps the flag in sync with
-  // the actual git state while the run sits idle on success.
-  const [hasChanges, setHasChanges] = useState(false);
+  // The task's live git status (uncommitted changes / unpushed commits).
+  // Drives the "Commit & push" action chip above the textarea via
+  // `shouldOfferCommitPush`. Deliberately independent of run status —
+  // background agents can dirty the worktree (or add unpushed commits)
+  // while the latest run is still `running`, so the chip must be able to
+  // surface then too, not just after a run succeeds. `null` means unknown
+  // (not yet polled, or the last poll failed) and hides the chip. A
+  // polling effect keeps this in sync with the actual git state for as
+  // long as the panel is mounted.
+  const [gitStatus, setGitStatus] = useState<TaskGitStatus | null>(null);
   const [sendDragging, setSendDragging] = useState(false);
   // `/`-command and skill autocomplete for the send field. Same list the
   // New Task form uses — depends on (agent, workdir, branch) so a slash
@@ -674,37 +677,37 @@ function RunPanelBody({
     return () => { cancelled = true; };
   }, [task.agent, task.workdir, task.branch]);
 
-  // Keep `hasChanges` aligned with the latest run's terminal state. We only
-  // ever offer "Commit & push" when the latest run succeeded — any other
-  // status (running / failed / cancelled / orphaned / no runs yet) hides
-  // the chip. While in the succeeded state, poll every 5s so the chip
-  // disappears if the agent (or the user, from a separate terminal)
-  // commits the changes through another path. The loop is sequential
-  // (each tick waits for the previous git status to resolve before
-  // sleeping) so a slow `git status` can't produce out-of-order
-  // setHasChanges calls.
+  // Poll the task's git status every 5s for as long as the panel is
+  // mounted, regardless of run status — with background agents, most of a
+  // task's life is spent `running`, and the worktree can get dirty (or
+  // gain unpushed commits) during that window, not just after a run
+  // succeeds. The 5s cadence also lets the chip disappear if the agent (or
+  // the user, from a separate terminal) commits the changes through
+  // another path. The loop is sequential (each tick waits for the
+  // previous git status to resolve before sleeping) so a slow `git
+  // status` can't produce out-of-order setGitStatus calls.
+  //
+  // Deps are `[task.id]` ONLY — App.tsx polls /tasks every 2s and rebuilds
+  // the task object each tick, so depending on `latestRun`/`task` fields
+  // here would restart this effect (and its poll cadence) every 2s.
   useEffect(() => {
-    if (latestRun?.status !== "succeeded") {
-      setHasChanges(false);
-      return;
-    }
     let cancelled = false;
     const tick = async () => {
       while (!cancelled) {
         try {
           const res = await api.getTaskGitStatus(task.id);
           if (cancelled) return;
-          setHasChanges(res.hasChanges && !res.ignored);
+          setGitStatus(res);
         } catch {
           if (cancelled) return;
-          setHasChanges(false);
+          setGitStatus(null);
         }
         await new Promise((r) => setTimeout(r, 5000));
       }
     };
     void tick();
     return () => { cancelled = true; };
-  }, [task.id, latestRun?.id, latestRun?.status]);
+  }, [task.id]);
 
   const send = async () => {
     const line = input.trim();
@@ -727,11 +730,6 @@ function RunPanelBody({
         // message never appears.
         setRebuilt(null);
         setRebuildNote(null);
-        // Hide the "Commit & push" chip optimistically — a new turn is
-        // about to land. Without this there's a brief window between this
-        // finally and the listRuns response where `latestRun.status` is
-        // still "succeeded" and the chip flickers back into view.
-        setHasChanges(false);
         // Refresh the runs list right away so the new run row appears
         // immediately, rather than waiting up to 2s for the next poll.
         void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
@@ -777,9 +775,6 @@ function RunPanelBody({
         setRebuilt(null);
         setRebuildNote(null);
         void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
-        // Optimistically hide the chip — the new turn is in flight so we
-        // won't render it again until the next succeeded state.
-        setHasChanges(false);
         nearBottomRef.current = true;
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -1059,7 +1054,7 @@ function RunPanelBody({
                 // in-flight send needs to disable the trigger here.
                 disabled={sending}
               />
-              {latestRun?.status === "succeeded" && hasChanges && !sending && (
+              {shouldOfferCommitPush(gitStatus) && !sending && (
                 <Button
                   size="sm"
                   variant="secondary"

@@ -65,6 +65,49 @@ export async function hasUncommittedChanges(dir: string): Promise<boolean | null
   return res.stdout.trim().length > 0;
 }
 
+/**
+ * How many commits on `dir`'s HEAD would be pushed — i.e. haven't reached
+ * the branch's remote yet. Three tiers, from most to least authoritative:
+ *
+ * 1. `@{u}..HEAD` — the branch has a configured upstream, so this is the
+ *    literal "what would `git push` send" count. Success here is definitive.
+ * 2. No upstream (the common case for a fresh `agetor/<id>-<slug>` branch
+ *    that's never been pushed): fall back to `baseRef..HEAD` when a baseRef
+ *    is known. A branch with no upstream has never been pushed, so every
+ *    commit ahead of the base it was cut from is, by construction, unpushed.
+ * 3. No upstream and no baseRef to compare against: return `0` rather than
+ *    `null`. This is "unknown but not blocking" — we can't compute a real
+ *    ahead count, but callers already have `hasChanges` to decide whether
+ *    there's anything actionable, so a silent `0` is preferable to `null`
+ *    forcing every caller to special-case "ahead is unknown."
+ *
+ * `null` is reserved for cases where we can't even attempt the comparison —
+ * missing dir or not a git repo — mirroring `hasUncommittedChanges`'s
+ * null-means-"couldn't inspect" contract.
+ */
+export async function getAheadCount(dir: string, baseRef: string | null): Promise<number | null> {
+  if (!existsSync(dir)) return null;
+  if (!(await isGitRepo(dir))) return null;
+
+  const upstream = await git(["rev-list", "--count", "@{u}..HEAD"], dir);
+  if (upstream.ok) {
+    const count = Number.parseInt(upstream.stdout, 10);
+    if (!Number.isNaN(count)) return count;
+    return null;
+  }
+
+  if (baseRef) {
+    const base = await git(["rev-list", "--count", `${baseRef}..HEAD`], dir);
+    if (base.ok) {
+      const count = Number.parseInt(base.stdout, 10);
+      if (!Number.isNaN(count)) return count;
+    }
+    return null;
+  }
+
+  return 0;
+}
+
 // A directory's git top-level is stable for the lifetime of the process, so
 // resolved roots are memoized — discovery (/agent-discovery) resolves the same
 // workdir on every refresh and would otherwise spawn a `git rev-parse` for
