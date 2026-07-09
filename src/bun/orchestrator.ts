@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { db, tasks, runs, harnesses } from "./db.ts";
+import { db, tasks, runs, harnesses, subagents } from "./db.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import {
@@ -47,12 +47,19 @@ import {
   sessionExistsByName,
   sessionLiveness,
   sessionNameFor,
+  jsonlPathFor,
+  interruptTaskSession,
 } from "./claude-tmux.ts";
 import {
   dropCodexSession,
   reattachCodexSession,
 } from "./codex-tmux.ts";
-import { setSubagentEmitter } from "./claude-subagents.ts";
+import {
+  setSubagentEmitter,
+  setSubagentSettleHook,
+  orphanRunningSubagents,
+  attachSubagentWatcher,
+} from "./claude-subagents.ts";
 import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName } from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -114,6 +121,12 @@ function emit(e: RunEvent) {
 // channel the UI already subscribes to.
 setSubagentEmitter(emit);
 
+// A held task's terminal run is already `succeeded`, so nothing in the run
+// lifecycle will ever move it out of `running` — the release has to be driven
+// by the background agents themselves. Register the release as the subagent
+// settle hook so the last-agent-finishing edge lands the card in `review`.
+setSubagentSettleHook(maybeReleaseHeldTask);
+
 /**
  * Subscribe to the app-wide lifecycle stream — terminal run-status
  * transitions and column changes. Live-only: subscribers see events from the
@@ -167,6 +180,36 @@ function updateColumn(
   if (prev !== next) {
     emitGlobal({ kind: "column", taskId, runId, column: next, prev, ts: Date.now(), reason });
   }
+}
+
+/**
+ * A task is "held" when its terminal run already succeeded but background
+ * agents are still running. Derived purely from the DB (not the in-memory
+ * `active` map) so the answer survives a restart and doesn't depend on
+ * whether the subagent's settle fired before or after the run's completion
+ * landed — either interleaving reads the same committed rows.
+ */
+function isHeldByBackgroundAgents(taskId: string): boolean {
+  const task = tasks.get(taskId);
+  if (!task || task.column !== "running" || task.runId == null) return false;
+  if (runs.get(task.runId)?.status !== "succeeded") return false;
+  return subagents.hasRunning(taskId);
+}
+
+/**
+ * Flip a held task to `review` once its last subagent finishes. Called on
+ * every subagent completion (via the settle hook), so it must be cheap and
+ * safe to call repeatedly — it no-ops unless the task is still held-and-clear:
+ * the user hasn't moved the card, the terminal run still succeeded, and no
+ * subagent is left running. A newer in-flight run (status !== succeeded) also
+ * bails, so a held release can't stomp a follow-up turn's `running` state.
+ */
+function maybeReleaseHeldTask(taskId: string): void {
+  const task = tasks.get(taskId);
+  if (!task || task.column !== "running" || task.runId == null) return;
+  if (runs.get(task.runId)?.status !== "succeeded") return;
+  if (subagents.hasRunning(taskId)) return;
+  updateColumn(taskId, task.runId, "review");
 }
 
 /** Test hook: drive the event bus directly to verify SSE routing without
@@ -421,6 +464,56 @@ export function reconcileOrphans(): number {
   if (orphaned.length > 0) {
     console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
   }
+
+  // Held tasks are invisible to the pass above: their terminal run is already
+  // `succeeded`, so it never appears in the `status='running'` scan and nothing
+  // re-arms the subagent watcher that would eventually release the card. Left
+  // alone, a restart strands a held task in `running` forever. Walk the
+  // `column='running'` tasks whose terminal run isn't running but that still
+  // have live subagent rows, and either re-arm the watcher (session still up,
+  // the background agent can finish and settle) or orphan the rows (session
+  // gone → settle hook lands the card in `review`).
+  let reArmed = 0;
+  let released = 0;
+  const heldTaskIds = db.query<{ id: string }, []>(
+    `SELECT id FROM tasks WHERE "column" = 'running'`,
+  ).all();
+  for (const { id: heldId } of heldTaskIds) {
+    if (!isHeldByBackgroundAgents(heldId)) continue;
+    const task = tasks.get(heldId);
+    if (!task) continue;
+    // Only claude-code writes subagent rows; a codex task can never be held, so
+    // it never reaches here. Guard the session probe on kind for clarity.
+    if (resolveHarness(task.agent)?.kind !== "claude-code") continue;
+    if (sessionExistsByName(sessionNameFor(heldId))) {
+      const run = task.runId ? runs.get(task.runId) : null;
+      // No JSONL session id means no watch directory to derive, so nothing will
+      // ever observe these agents finishing. Treat it exactly like a dead
+      // session and release, rather than leaving the card held forever.
+      if (!run?.claudeSessionId) {
+        orphanRunningSubagents(heldId);
+        released++;
+        continue;
+      }
+      const cwd = task.worktreePath ?? task.workdir;
+      const harness = resolveHarness(task.agent);
+      attachSubagentWatcher({
+        taskId: heldId,
+        jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null),
+      });
+      reArmed++;
+    } else {
+      // Session gone: no watcher could ever observe these agents finishing, so
+      // flip the rows now. `orphanRunningSubagents` fires the settle hook →
+      // `maybeReleaseHeldTask` → the card advances to `review`.
+      orphanRunningSubagents(heldId);
+      released++;
+    }
+  }
+  if (reArmed > 0 || released > 0) {
+    console.log(`[agetor] held tasks: re-armed ${reArmed} watcher(s), released ${released} to review`);
+  }
+
   return orphaned.length;
 }
 
@@ -641,14 +734,37 @@ function attachDoneHandler(
       const task = tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
-        // Cancellation wins over api-error here, matching the newStatus
-        // resolution above — a user-cancelled run shouldn't land in
-        // `blocked` just because it had previously hit an API error.
-        const nextColumn: ColumnId = wasCancelled
-          ? "ready"
-          : (wasApiError || wasSessionDied) ? "blocked"
-          : newStatus === "succeeded" ? "review" : "ready";
-        updateColumn(taskId, runId, nextColumn);
+        // A clean success with background agents still in flight is HELD in
+        // `running` rather than advanced to `review` — the run finished but the
+        // task's work hasn't. `runs.update(..., "succeeded")` already landed
+        // above, so the concurrent-settle path (`maybeReleaseHeldTask`) reads
+        // the correct terminal status; whichever of the two fires last wins and
+        // both interleavings converge on the right column, so no lock is needed.
+        const holdForSubagents =
+          newStatus === "succeeded"
+          && !wasCancelled
+          && !wasApiError
+          && !wasSessionDied
+          && subagents.hasRunning(taskId);
+        if (holdForSubagents) {
+          const runningCount = subagents.runningCountForTask(taskId);
+          emit({
+            runId,
+            taskId,
+            stream: "status",
+            data: `background agents still running (${runningCount}) — holding in running`,
+            ts: Date.now(),
+          });
+        } else {
+          // Cancellation wins over api-error here, matching the newStatus
+          // resolution above — a user-cancelled run shouldn't land in
+          // `blocked` just because it had previously hit an API error.
+          const nextColumn: ColumnId = wasCancelled
+            ? "ready"
+            : (wasApiError || wasSessionDied) ? "blocked"
+            : newStatus === "succeeded" ? "review" : "ready";
+          updateColumn(taskId, runId, nextColumn);
+        }
       }
       emit({
         runId,
@@ -845,7 +961,20 @@ function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult
 
 export function cancelRun(runId: string): boolean {
   const h = active.get(runId);
-  if (!h) return false;
+  if (!h) {
+    // A held task (turn succeeded, background agents still running) has no
+    // `active` handle — `attachDoneHandler` dropped it before parking the card
+    // in `running`. Its Stop button must still do something, or a background
+    // agent that wedges without dying leaves the user no way out short of a
+    // restart. Interrupt the live session and release the hold; the run itself
+    // already succeeded, so the card advances to `review`.
+    const taskId = runs.get(runId)?.taskId;
+    if (!taskId || !isHeldByBackgroundAgents(taskId)) return false;
+    cancelPendingForTask(taskId, "cancelled by user");
+    interruptTaskSession(taskId);
+    orphanRunningSubagents(taskId);
+    return true;
+  }
   // Stop targets the whole task, not just one run. `kill()` sends Ctrl+C
   // to the tmux session, which also clears claude's queued-input buffer,
   // so every queued run in this task is going down too. Mark each

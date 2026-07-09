@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { tasks } from "./db.ts";
-import { attachSubagentWatcher, type SubagentWatcherHandle } from "./claude-subagents.ts";
+import { attachSubagentWatcher, detachWatcherFor, orphanRunningSubagents, type SubagentWatcherHandle } from "./claude-subagents.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
   activeTmuxPromptsForTask,
@@ -2704,6 +2704,12 @@ function signalSessionDeath(state: SessionState): void {
   if (state.scrapeTimer) { clearInterval(state.scrapeTimer); state.scrapeTimer = null; }
   state.subagentWatcher?.detach();
   state.subagentWatcher = null;
+  // The tmux session is provably gone, so nothing will ever write another
+  // subagent transcript line for this task — a still-`running` subagent row
+  // would otherwise hold the task in `running` forever waiting on an agent
+  // that no longer exists. Release it the same way the run itself is
+  // released above.
+  orphanRunningSubagents(state.taskId);
 }
 
 /** Whether a turn is currently in flight on this session — a live head slot
@@ -2873,8 +2879,10 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // doesn't leak the old state's watcher + poll/scrape/death timers. Mirrors
   // reattachSession's defensive pre-dispose. Safe on a fresh task (no-op on
   // undefined); on a re-run the old turn is already terminal so no queued slot
-  // is rejected.
-  disposeSessionState(sessions.get(opts.taskId));
+  // is rejected. `orphanSubagents: true` — `killTaskSession` above already
+  // killed the prior session, so any of its rows still `status='running'`
+  // are provably never going to hear from their agent again.
+  disposeSessionState(sessions.get(opts.taskId), true);
   sessions.set(opts.taskId, state);
 
   const done = new Promise<number>((resolve, reject) => {
@@ -3565,18 +3573,52 @@ export function cycleToMode(taskId: string, targetAgetorMode: string): Promise<C
 export function dropSession(taskId: string): void {
   const state = sessions.get(taskId);
   if (state) {
-    disposeSessionState(state);
+    // `orphanSubagents: true` — this task's session is being torn down for
+    // good (delete/archive/agent-switch, `killTaskSession` right below), so
+    // any `running` subagent rows are never getting another transcript line.
+    disposeSessionState(state, true);
     sessions.delete(taskId);
+  } else {
+    // A task held in `running` across a restart has a watcher armed by the boot
+    // pass but no SessionState (its run already succeeded, so nothing
+    // reattached). Without this the boot-armed watcher outlives the task it
+    // belongs to, polling a directory that delete/archive is about to remove.
+    detachWatcherFor(taskId);
+    orphanRunningSubagents(taskId);
   }
   killTaskSession(taskId);
+}
+
+/**
+ * Send Ctrl+C to a task's tmux session addressed purely by its deterministic
+ * name — no in-memory `SessionState` required. Stop on a task whose turn has
+ * already resolved (held in `running` while its background agents finish) has
+ * no `active` run handle to route the interrupt through, and after a restart it
+ * has no `SessionState` either. Returns false when the session is already gone.
+ */
+export function interruptTaskSession(taskId: string): boolean {
+  const name = sessionNameFor(taskId);
+  if (!sessionExistsByName(name)) return false;
+  tmux(["send-keys", "-t", name, "C-c"]);
+  return true;
 }
 
 /** Close any watcher / interval timer held by a SessionState and reject any
  *  queued turn slots so dependent promises settle. Used both by
  *  `dropSession` (intentional teardown) and by `reattachSession` (defensive
  *  cleanup before overwriting an entry in the sessions map). Safe to call
- *  with `undefined` so the caller can pass `sessions.get(taskId)` directly. */
-function disposeSessionState(state: SessionState | undefined): void {
+ *  with `undefined` so the caller can pass `sessions.get(taskId)` directly.
+ *
+ *  `orphanSubagents` gates whether this dispose also flips the task's
+ *  `running` subagent rows to `orphaned`. Only pass `true` when the
+ *  underlying tmux session is provably dead by this point — `dropSession`
+ *  (kills the session right after) and `spawnClaudeViaTmux`'s pre-kill
+ *  (already killed the session before disposing the old state). Leave it
+ *  `false` for `reattachSession`'s defensive re-dispose: a non-null prior
+ *  state there means the SAME tmux session is about to be reattached again,
+ *  which may still be alive and still writing subagent transcripts —
+ *  orphaning there would drop tracking for an agent that's still running. */
+function disposeSessionState(state: SessionState | undefined, orphanSubagents = false): void {
   if (!state) return;
   state.watcher?.close();
   state.watcher = null;
@@ -3591,6 +3633,7 @@ function disposeSessionState(state: SessionState | undefined): void {
   // this stops us TAILING the subagent files, never the agent itself.
   state.subagentWatcher?.detach();
   state.subagentWatcher = null;
+  if (orphanSubagents) orphanRunningSubagents(state.taskId);
   state.onEndOfTurn = null;
   state.pendingEndTurn = null;
   const err = new Error("session killed");

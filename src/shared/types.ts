@@ -329,6 +329,10 @@ export interface Task {
    * default kanban filter and rendered read-only in the run panel.
    */
   archivedAt: number | null;
+  /** Count of this task's subagents currently `status:"running"`. Derived per
+   *  request by the server (never persisted, never patchable). Absent on payloads
+   *  that don't join the subagents table. */
+  runningSubagents?: number;
 }
 
 /** A live terminal tab for a task. Returned by the terminal REST endpoints;
