@@ -112,8 +112,18 @@ export function frameIsVisible(frame: Rect, displays: DisplayInfo[]): boolean {
  * unchanged — there's no usable target to repair onto, and returning
  * something is worse than returning the (already known to be off-screen,
  * but at least not garbage) original.
+ *
+ * A degenerate *input* frame is likewise returned untouched. Electrobun's
+ * `getWindowFrame` reports `{0,0,0,0}` rather than throwing when the native
+ * window pointer is already gone, and a zero-area rect overlaps nothing, so
+ * it would otherwise be diagnosed as "off-screen" and re-centered — turning
+ * a dead handle into a live, zero-sized window. There is no width or height
+ * here to preserve, so there is nothing to repair: a caller that hands us a
+ * degenerate frame has a problem this function cannot fix, and inventing an
+ * origin for it only hides that.
  */
 export function repairFrame(frame: Rect, displays: DisplayInfo[]): Rect {
+  if (frame.width <= 0 || frame.height <= 0) return frame;
   if (frameIsVisible(frame, displays)) return frame;
 
   const usable = displays.filter((d) => d.workArea.width > 0 && d.workArea.height > 0);

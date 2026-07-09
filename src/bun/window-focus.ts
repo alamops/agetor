@@ -1,4 +1,4 @@
-import { repairFrame, type DisplayInfo, type Rect } from "./screen-frame";
+import { repairFrame, type DisplayInfo, type Rect } from "./screen-frame.ts";
 
 /**
  * Structural subset of Electrobun's `BrowserWindow` — only the members this
