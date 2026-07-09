@@ -938,6 +938,45 @@ export interface GitHubTagsResult {
   tags: GitHubTag[];
 }
 
+/** A single GitHub Actions workflow run, from `GET
+ *  /repos/:o/:r/actions/runs` (F20). `status` is GitHub's coarse run state
+ *  (`queued` | `in_progress` | `completed` | …); `conclusion` is only set
+ *  once `status === "completed"` (`success` | `failure` | `cancelled` |
+ *  `skipped` | `neutral` | `timed_out` | `action_required` | …), null while
+ *  still running. */
+export interface GitHubWorkflowRun {
+  id: number;
+  name: string;
+  displayTitle: string;
+  status: string;
+  conclusion: string | null;
+  event: string;
+  headBranch: string;
+  runNumber: number;
+  htmlUrl: string;
+  createdAt: string;
+  workflowId: number;
+}
+
+export interface GitHubWorkflowRunsResult {
+  repo: string;
+  runs: GitHubWorkflowRun[];
+}
+
+/** A single workflow definition, from `GET /repos/:o/:r/actions/workflows`
+ *  (F20) — powers the "run a workflow" dispatch picker. `state` is
+ *  `active` | `disabled_manually` | … ; only `active` ones are dispatchable. */
+export interface GitHubWorkflow {
+  id: number;
+  name: string;
+  path: string;
+  state: string;
+}
+
+export interface GitHubWorkflowsResult {
+  workflows: GitHubWorkflow[];
+}
+
 /** An issue a pull request will close on merge (GraphQL
  *  `closingIssuesReferences`), read-only — surfaced as a "Closes: #N" line. */
 export interface GitHubLinkedIssue {

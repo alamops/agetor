@@ -62,6 +62,7 @@ import {
   addGitHubReaction,
   addGitHubSubIssue,
   applyGitHubSuggestion,
+  cancelGitHubWorkflowRun,
   closeGitHubPull,
   createGitHubComment,
   createGitHubIssue,
@@ -74,6 +75,7 @@ import {
   deleteGitHubLabel,
   deleteGitHubMilestone,
   deleteGitHubRelease,
+  dispatchGitHubWorkflow,
   getGitHubCommitStatus,
   getGitHubIssuePinned,
   getGitHubPullChecks,
@@ -98,6 +100,8 @@ import {
   listGitHubReleases,
   listGitHubSubIssues,
   listGitHubTags,
+  listGitHubWorkflowRuns,
+  listGitHubWorkflows,
   markAllGitHubNotificationsRead,
   markGitHubNotificationRead,
   mergeGitHubPull,
@@ -106,6 +110,7 @@ import {
   reopenGitHubPull,
   replyGitHubPullLineComment,
   requestGitHubPullReviewers,
+  rerunGitHubWorkflowRun,
   reviewGitHubPull,
   setGitHubIssueLock,
   setGitHubIssuePinned,
@@ -926,6 +931,97 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const dir = url.searchParams.get("path");
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
           const result = await listGitHubTags({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-runs": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubWorkflowRuns({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflows": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubWorkflows({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-rerun": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; runId?: number; failedOnly?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.runId !== "number" || !Number.isInteger(body.runId) || body.runId <= 0) {
+            return json({ error: "valid run id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await rerunGitHubWorkflowRun({
+            dir,
+            runId: body.runId,
+            failedOnly: typeof body.failedOnly === "boolean" ? body.failedOnly : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-cancel": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; runId?: number };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.runId !== "number" || !Number.isInteger(body.runId) || body.runId <= 0) {
+            return json({ error: "valid run id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await cancelGitHubWorkflowRun({ dir, runId: body.runId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-dispatch": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            workflowId?: number;
+            ref?: string;
+            inputs?: Record<string, string>;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.workflowId !== "number" || !Number.isInteger(body.workflowId) || body.workflowId <= 0) {
+            return json({ error: "valid workflow id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.ref !== "string" || !body.ref.trim()) {
+            return json({ error: "ref required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await dispatchGitHubWorkflow({
+            dir,
+            workflowId: body.workflowId,
+            ref: body.ref,
+            inputs: body.inputs && typeof body.inputs === "object" ? body.inputs : undefined,
+          });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

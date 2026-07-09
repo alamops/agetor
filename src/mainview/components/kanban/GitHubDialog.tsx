@@ -7,6 +7,7 @@ import {
   ArrowRightLeft,
   ArrowUpFromLine,
   ArrowUpWideNarrow,
+  Ban,
   Bell,
   BellOff,
   Check,
@@ -27,13 +28,16 @@ import {
   Milestone,
   Pin,
   PinOff,
+  Play,
   Plus,
   RefreshCw,
   Rocket,
+  RotateCcw,
   Search,
   Sparkles,
   Tag,
   Unlock,
+  Workflow,
   X,
   XCircle,
 } from "lucide-react";
@@ -76,6 +80,8 @@ import type {
   GitHubSubIssue,
   GitHubTag,
   GitHubUser,
+  GitHubWorkflow,
+  GitHubWorkflowRun,
   Project,
   TaskDiff,
 } from "../../../shared/types.ts";
@@ -422,6 +428,26 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // Repo tags — feeds the release manager's tag-name datalist. Lazy — only
   // fetched while the manager is open, mirroring notifications below.
   const [repoTags, setRepoTags] = useState<GitHubTag[]>([]);
+  // Actions (F20) — recent workflow runs + dispatchable workflows. Both are
+  // lazy — like notifications/tags, only fetched while the manager is open.
+  const [workflowRuns, setWorkflowRuns] = useState<GitHubWorkflowRun[]>([]);
+  const [workflows, setWorkflows] = useState<GitHubWorkflow[]>([]);
+  const [actionsManagerOpen, setActionsManagerOpen] = useState(false);
+  const [actionsLoading, setActionsLoading] = useState(false);
+  const [actionsError, setActionsError] = useState<string | null>(null);
+  const actionsSeq = useRef(0);
+  // Per-run in-flight action ("rerun" | "rerun-failed" | "cancel") and the
+  // last error for that run, both keyed by run id — mirrors the notification
+  // per-thread busy/error maps.
+  const [workflowRunBusy, setWorkflowRunBusy] = useState<Record<number, string | undefined>>({});
+  const [workflowRunErrors, setWorkflowRunErrors] = useState<Record<number, string | undefined>>({});
+  // "Run a workflow" dispatch form state.
+  const [dispatchWorkflowId, setDispatchWorkflowId] = useState("");
+  const [dispatchRef, setDispatchRef] = useState("");
+  const [dispatchInputs, setDispatchInputs] = useState<{ key: string; value: string }[]>([]);
+  const [dispatchBusy, setDispatchBusy] = useState(false);
+  const [dispatchError, setDispatchError] = useState<string | null>(null);
+  const [dispatchMessage, setDispatchMessage] = useState<string | null>(null);
   // Repo notifications inbox (F14) — private (token-gated), so nothing is
   // preloaded until the panel is opened; the fetch itself surfaces the
   // "sign in" error when unauthenticated.
@@ -1161,6 +1187,118 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       setNotificationRowErrors((cur) => ({ ...cur, [id]: e instanceof Error ? e.message : String(e) }));
     } finally {
       setNotificationBusy((cur) => ({ ...cur, [id]: undefined }));
+    }
+  };
+
+  // Lazy — like notifications/tags, only fetched while the Actions panel is
+  // open. Fetches runs + workflows together since both power the same panel.
+  useEffect(() => {
+    // The toolbar button that opens this panel is disabled in aggregate mode
+    // (Actions is single-repo), so `isAggregate` is defense-in-depth.
+    if (!open || !actionsManagerOpen || !projectPath || isAggregate) return;
+    const requestId = ++actionsSeq.current;
+    setActionsLoading(true);
+    setActionsError(null);
+    Promise.all([
+      api.listGitHubWorkflowRuns({ path: projectPath }),
+      api.listGitHubWorkflows({ path: projectPath }),
+    ])
+      .then(([runsRes, workflowsRes]) => {
+        if (requestId !== actionsSeq.current) return;
+        setWorkflowRuns(runsRes.runs);
+        setWorkflows(workflowsRes.workflows);
+      })
+      .catch((e) => { if (requestId === actionsSeq.current) setActionsError(e instanceof Error ? e.message : String(e)); })
+      .finally(() => { if (requestId === actionsSeq.current) setActionsLoading(false); });
+  }, [open, actionsManagerOpen, projectPath, isAggregate]);
+
+  const refreshActions = async () => {
+    // Guard the deferred post-dispatch refresh (a 1.5s timer): if the panel was
+    // closed in the meantime, skip the fetch + state writes for a dead panel.
+    if (!projectPath || !actionsManagerOpen) return;
+    const requestId = ++actionsSeq.current;
+    setActionsLoading(true);
+    setActionsError(null);
+    try {
+      const [runsRes, workflowsRes] = await Promise.all([
+        api.listGitHubWorkflowRuns({ path: projectPath }),
+        api.listGitHubWorkflows({ path: projectPath }),
+      ]);
+      if (requestId === actionsSeq.current) {
+        setWorkflowRuns(runsRes.runs);
+        setWorkflows(workflowsRes.workflows);
+      }
+    } catch (e) {
+      if (requestId === actionsSeq.current) setActionsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (requestId === actionsSeq.current) setActionsLoading(false);
+    }
+  };
+
+  const rerunWorkflowRun = async (runId: number, failedOnly: boolean) => {
+    if (!projectPath) return;
+    const action = failedOnly ? "rerun-failed" : "rerun";
+    setWorkflowRunBusy((cur) => ({ ...cur, [runId]: action }));
+    setWorkflowRunErrors((cur) => ({ ...cur, [runId]: undefined }));
+    try {
+      await api.rerunGitHubWorkflowRun({ path: projectPath, runId, failedOnly });
+      // Optimistic: reflect the queued re-run immediately rather than waiting
+      // for a manual refresh — GitHub takes a moment to actually restart it.
+      setWorkflowRuns((cur) => cur.map((r) => (r.id === runId ? { ...r, status: "queued", conclusion: null } : r)));
+    } catch (e) {
+      setWorkflowRunErrors((cur) => ({ ...cur, [runId]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setWorkflowRunBusy((cur) => ({ ...cur, [runId]: undefined }));
+    }
+  };
+
+  const cancelWorkflowRun = async (runId: number) => {
+    if (!projectPath) return;
+    setWorkflowRunBusy((cur) => ({ ...cur, [runId]: "cancel" }));
+    setWorkflowRunErrors((cur) => ({ ...cur, [runId]: undefined }));
+    try {
+      await api.cancelGitHubWorkflowRun({ path: projectPath, runId });
+      setWorkflowRuns((cur) => cur.map((r) => (r.id === runId ? { ...r, status: "completed", conclusion: "cancelled" } : r)));
+    } catch (e) {
+      setWorkflowRunErrors((cur) => ({ ...cur, [runId]: e instanceof Error ? e.message : String(e) }));
+    } finally {
+      setWorkflowRunBusy((cur) => ({ ...cur, [runId]: undefined }));
+    }
+  };
+
+  const addDispatchInputRow = () => setDispatchInputs((cur) => [...cur, { key: "", value: "" }]);
+  const removeDispatchInputRow = (index: number) => setDispatchInputs((cur) => cur.filter((_, i) => i !== index));
+  const updateDispatchInputRow = (index: number, patch: Partial<{ key: string; value: string }>) =>
+    setDispatchInputs((cur) => cur.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+
+  const dispatchWorkflow = async () => {
+    if (!projectPath || dispatchBusy) return;
+    const workflowId = Number(dispatchWorkflowId);
+    const ref = dispatchRef.trim();
+    if (!Number.isInteger(workflowId) || workflowId <= 0 || !ref) return;
+    setDispatchBusy(true);
+    setDispatchError(null);
+    setDispatchMessage(null);
+    try {
+      const inputs: Record<string, string> = {};
+      for (const row of dispatchInputs) {
+        const key = row.key.trim();
+        if (key) inputs[key] = row.value;
+      }
+      const res = await api.dispatchGitHubWorkflow({
+        path: projectPath,
+        workflowId,
+        ref,
+        inputs: Object.keys(inputs).length > 0 ? inputs : undefined,
+      });
+      setDispatchMessage(res.message);
+      // Give GitHub a beat to register the run, then refresh the list so the
+      // new dispatch shows up without a manual click.
+      setTimeout(() => { void refreshActions(); }, 1500);
+    } catch (e) {
+      setDispatchError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDispatchBusy(false);
     }
   };
 
@@ -2102,6 +2240,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setMilestoneManagerOpen(false);
               setReleaseManagerOpen(false);
               setNotificationsOpen(false);
+              setActionsManagerOpen(false);
             }}
           >
             <Tag className="size-4" />
@@ -2117,6 +2256,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setLabelManagerOpen(false);
               setReleaseManagerOpen(false);
               setNotificationsOpen(false);
+              setActionsManagerOpen(false);
             }}
           >
             <Milestone className="size-4" />
@@ -2132,6 +2272,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setLabelManagerOpen(false);
               setMilestoneManagerOpen(false);
               setNotificationsOpen(false);
+              setActionsManagerOpen(false);
             }}
           >
             <Rocket className="size-4" />
@@ -2147,9 +2288,26 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               setLabelManagerOpen(false);
               setMilestoneManagerOpen(false);
               setReleaseManagerOpen(false);
+              setActionsManagerOpen(false);
             }}
           >
             <Bell className="size-4" />
+          </Button>
+          <Button
+            size="icon"
+            variant={actionsManagerOpen ? "secondary" : "ghost"}
+            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Actions"}
+            aria-label="Actions"
+            disabled={!projectPath || isAggregate}
+            onClick={() => {
+              setActionsManagerOpen((v) => !v);
+              setLabelManagerOpen(false);
+              setMilestoneManagerOpen(false);
+              setReleaseManagerOpen(false);
+              setNotificationsOpen(false);
+            }}
+          >
+            <Workflow className="size-4" />
           </Button>
           {result && result.webUrl && (
             <Button
@@ -2388,6 +2546,34 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             busy={notificationBusy}
             rowErrors={notificationRowErrors}
             onClose={() => setNotificationsOpen(false)}
+          />
+        )}
+        {actionsManagerOpen && (
+          <ActionsPanel
+            runs={workflowRuns}
+            workflows={workflows}
+            loading={actionsLoading}
+            error={actionsError}
+            authenticated={canPush}
+            runBusy={workflowRunBusy}
+            runErrors={workflowRunErrors}
+            onRerun={(runId) => { void rerunWorkflowRun(runId, false); }}
+            onRerunFailed={(runId) => { void rerunWorkflowRun(runId, true); }}
+            onCancel={(runId) => { void cancelWorkflowRun(runId); }}
+            dispatchWorkflowId={dispatchWorkflowId}
+            onDispatchWorkflowIdChange={setDispatchWorkflowId}
+            dispatchRef={dispatchRef}
+            onDispatchRefChange={setDispatchRef}
+            dispatchInputs={dispatchInputs}
+            onAddDispatchInputRow={addDispatchInputRow}
+            onRemoveDispatchInputRow={removeDispatchInputRow}
+            onUpdateDispatchInputRow={updateDispatchInputRow}
+            dispatchBusy={dispatchBusy}
+            dispatchError={dispatchError}
+            dispatchMessage={dispatchMessage}
+            onDispatch={() => { void dispatchWorkflow(); }}
+            onRefresh={() => { void refreshActions(); }}
+            onClose={() => setActionsManagerOpen(false)}
           />
         )}
         {kind === "pulls" && !isAggregate && (
@@ -3894,6 +4080,318 @@ function NotificationRow({
       </div>
       {error && (
         <div className="mt-0.5 flex items-center gap-1 pl-3.5 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Workflow run status/conclusion → color, mirroring `checkClass` (check-runs)
+ *  and `commitStatusClass` (combined status). Not-yet-completed runs
+ *  (queued/in_progress/waiting) read as "in flight" (sky); a completed run is
+ *  emerald for a clean conclusion, rose otherwise (failure/cancelled/
+ *  timed_out/action_required/…). */
+function workflowRunClass(run: GitHubWorkflowRun): string {
+  if (run.status !== "completed") return "text-sky-400";
+  if (run.conclusion === "success" || run.conclusion === "neutral" || run.conclusion === "skipped") {
+    return "text-emerald-400";
+  }
+  return "text-rose-400";
+}
+
+/** Label shown on the run's status pill — the conclusion once completed
+ *  (e.g. "success", "cancelled"), otherwise the coarse status (e.g.
+ *  "in_progress", "queued"). */
+function workflowRunLabel(run: GitHubWorkflowRun): string {
+  return (run.status === "completed" ? run.conclusion : run.status) ?? run.status;
+}
+
+function ActionsPanel({
+  runs,
+  workflows,
+  loading,
+  error,
+  authenticated,
+  runBusy,
+  runErrors,
+  onRerun,
+  onRerunFailed,
+  onCancel,
+  dispatchWorkflowId,
+  onDispatchWorkflowIdChange,
+  dispatchRef,
+  onDispatchRefChange,
+  dispatchInputs,
+  onAddDispatchInputRow,
+  onRemoveDispatchInputRow,
+  onUpdateDispatchInputRow,
+  dispatchBusy,
+  dispatchError,
+  dispatchMessage,
+  onDispatch,
+  onRefresh,
+  onClose,
+}: {
+  runs: GitHubWorkflowRun[];
+  workflows: GitHubWorkflow[];
+  loading: boolean;
+  error: string | null;
+  authenticated: boolean;
+  runBusy: Record<number, string | undefined>;
+  runErrors: Record<number, string | undefined>;
+  onRerun: (runId: number) => void;
+  onRerunFailed: (runId: number) => void;
+  onCancel: (runId: number) => void;
+  dispatchWorkflowId: string;
+  onDispatchWorkflowIdChange: (id: string) => void;
+  dispatchRef: string;
+  onDispatchRefChange: (ref: string) => void;
+  dispatchInputs: { key: string; value: string }[];
+  onAddDispatchInputRow: () => void;
+  onRemoveDispatchInputRow: (index: number) => void;
+  onUpdateDispatchInputRow: (index: number, patch: Partial<{ key: string; value: string }>) => void;
+  dispatchBusy: boolean;
+  dispatchError: string | null;
+  dispatchMessage: string | null;
+  onDispatch: () => void;
+  onRefresh: () => void;
+  onClose: () => void;
+}) {
+  const activeWorkflows = workflows.filter((w) => w.state === "active");
+  const dispatchDisabled = dispatchBusy || !authenticated || !dispatchWorkflowId || !dispatchRef.trim();
+  return (
+    <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <Workflow className="size-3.5" />
+          Actions ({runs.length})
+        </div>
+        <div className="flex items-center gap-1">
+          <Button size="icon" variant="ghost" className="size-6" title="Refresh Actions" aria-label="Refresh Actions" disabled={loading} onClick={onRefresh}>
+            {loading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+          </Button>
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-[11px]" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+      </div>
+      {error && (
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+          <AlertCircle className="size-3.5" />
+          {error}
+        </div>
+      )}
+      <div className="mb-3 max-h-56 space-y-1 overflow-y-auto">
+        {!error && runs.length === 0 ? (
+          <div className="px-1 py-2 text-[11px] text-muted-foreground">
+            {loading ? "Loading…" : "No recent workflow runs."}
+          </div>
+        ) : (
+          runs.map((r) => (
+            <WorkflowRunRow
+              key={r.id}
+              run={r}
+              authenticated={authenticated}
+              busy={runBusy[r.id]}
+              error={runErrors[r.id]}
+              onRerun={() => onRerun(r.id)}
+              onRerunFailed={() => onRerunFailed(r.id)}
+              onCancel={() => onCancel(r.id)}
+            />
+          ))
+        )}
+      </div>
+
+      <div className="border-t border-border/60 pt-2">
+        <div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground">
+          <Play className="size-3.5" />
+          Run a workflow
+        </div>
+        <div className="mb-2 grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,0.6fr)]">
+          <Select
+            value={dispatchWorkflowId}
+            onChange={(e) => onDispatchWorkflowIdChange(e.target.value)}
+            title="Workflow"
+            aria-label="Workflow"
+            className="h-8 text-xs"
+            disabled={dispatchBusy || !authenticated}
+          >
+            <option value="">Select a workflow…</option>
+            {activeWorkflows.map((w) => (
+              <option key={w.id} value={String(w.id)}>{w.name}</option>
+            ))}
+          </Select>
+          <Input
+            value={dispatchRef}
+            onChange={(e) => onDispatchRefChange(e.target.value)}
+            placeholder="Ref (branch, tag, or sha) — e.g. main"
+            className="h-8 text-xs"
+            disabled={dispatchBusy || !authenticated}
+          />
+        </div>
+        <div className="mb-2 space-y-1.5">
+          {dispatchInputs.map((row, i) => (
+            <div key={i} className="flex items-center gap-1.5">
+              <Input
+                value={row.key}
+                onChange={(e) => onUpdateDispatchInputRow(i, { key: e.target.value })}
+                placeholder="Input name"
+                className="h-7 flex-1 text-xs"
+                disabled={dispatchBusy || !authenticated}
+              />
+              <Input
+                value={row.value}
+                onChange={(e) => onUpdateDispatchInputRow(i, { value: e.target.value })}
+                placeholder="Value"
+                className="h-7 flex-1 text-xs"
+                disabled={dispatchBusy || !authenticated}
+              />
+              <Button
+                size="icon"
+                variant="ghost"
+                className="size-6 shrink-0"
+                title="Remove input"
+                aria-label={`Remove input ${i + 1}`}
+                disabled={dispatchBusy || !authenticated}
+                onClick={() => onRemoveDispatchInputRow(i)}
+              >
+                <X className="size-3.5" />
+              </Button>
+            </div>
+          ))}
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2 text-[11px]"
+            disabled={dispatchBusy || !authenticated}
+            onClick={onAddDispatchInputRow}
+          >
+            <Plus className="mr-1 size-3" />
+            Add input
+          </Button>
+        </div>
+        {dispatchError && (
+          <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+            <AlertCircle className="size-3.5" />
+            {dispatchError}
+          </div>
+        )}
+        {dispatchMessage && !dispatchError && (
+          <div className="mb-2 flex items-center gap-1 text-[11px] text-emerald-400">
+            <Check className="size-3.5" />
+            {dispatchMessage}
+          </div>
+        )}
+        <div className="flex justify-end">
+          <Button
+            size="sm"
+            disabled={dispatchDisabled}
+            title={authenticated ? undefined : PUSH_ONLY_TITLE}
+            onClick={onDispatch}
+          >
+            {dispatchBusy ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Play className="mr-2 size-3.5" />}
+            Run
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WorkflowRunRow({
+  run,
+  authenticated,
+  busy,
+  error,
+  onRerun,
+  onRerunFailed,
+  onCancel,
+}: {
+  run: GitHubWorkflowRun;
+  authenticated: boolean;
+  busy: string | undefined;
+  error: string | undefined;
+  onRerun: () => void;
+  onRerunFailed: () => void;
+  onCancel: () => void;
+}) {
+  const isBusy = !!busy;
+  // Anything not yet completed is cancellable — includes queued, in_progress,
+  // and the approval-gate states (waiting, pending, requested).
+  const cancellable = run.status !== "completed";
+  return (
+    <div className="rounded px-1 py-1.5 text-xs">
+      <div className="flex items-center gap-2">
+        <span className={cn("shrink-0 text-[10px] font-medium uppercase tracking-wide", workflowRunClass(run))}>
+          {workflowRunLabel(run)}
+        </span>
+        <span className="min-w-0 flex-1 truncate font-medium" title={run.displayTitle || run.name}>
+          {run.displayTitle || run.name}
+        </span>
+        <span className="shrink-0 text-[11px] text-muted-foreground">#{run.runNumber}</span>
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-6"
+            title="Open run on GitHub"
+            aria-label={`Open run #${run.runNumber} on GitHub`}
+            onClick={() => { void api.openExternal(run.htmlUrl); }}
+          >
+            <ExternalLink className="size-3.5" />
+          </Button>
+          {cancellable && (
+            <Button
+              size="icon"
+              variant="ghost"
+              className="size-6 text-muted-foreground hover:text-rose-400"
+              title={authenticated ? "Cancel run" : PUSH_ONLY_TITLE}
+              aria-label={`Cancel run #${run.runNumber}`}
+              disabled={isBusy || !authenticated}
+              onClick={onCancel}
+            >
+              {busy === "cancel" ? <Loader2 className="size-3.5 animate-spin" /> : <Ban className="size-3.5" />}
+            </Button>
+          )}
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-6"
+            title={authenticated ? "Re-run" : PUSH_ONLY_TITLE}
+            aria-label={`Re-run #${run.runNumber}`}
+            disabled={isBusy || !authenticated}
+            onClick={onRerun}
+          >
+            {busy === "rerun" ? <Loader2 className="size-3.5 animate-spin" /> : <RotateCcw className="size-3.5" />}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-1.5 text-[11px]"
+            title={authenticated ? "Re-run failed jobs only" : PUSH_ONLY_TITLE}
+            disabled={isBusy || !authenticated}
+            onClick={onRerunFailed}
+          >
+            {busy === "rerun-failed" ? <Loader2 className="size-3 animate-spin" /> : null}
+            Failed only
+          </Button>
+        </div>
+      </div>
+      <div className="mt-0.5 flex items-center gap-1.5 pl-0.5 text-[11px] text-muted-foreground">
+        <span className="truncate">{run.event}</span>
+        <span>·</span>
+        <span className="truncate">{run.headBranch}</span>
+        {run.createdAt && (
+          <>
+            <span>·</span>
+            <span>{fmtRelativeDate(run.createdAt)}</span>
+          </>
+        )}
+      </div>
+      {error && (
+        <div className="mt-0.5 flex items-center gap-1 pl-0.5 text-[11px] text-rose-400">
           <AlertCircle className="size-3.5" />
           {error}
         </div>

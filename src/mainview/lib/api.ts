@@ -44,6 +44,10 @@ import type {
   GitHubSubIssuesResult,
   GitHubTag,
   GitHubTagsResult,
+  GitHubWorkflow,
+  GitHubWorkflowRun,
+  GitHubWorkflowRunsResult,
+  GitHubWorkflowsResult,
   Harness,
   HarnessStatus,
   HarnessUsage,
@@ -111,6 +115,10 @@ export type {
   GitHubSubIssuesResult,
   GitHubTag,
   GitHubTagsResult,
+  GitHubWorkflow,
+  GitHubWorkflowRun,
+  GitHubWorkflowRunsResult,
+  GitHubWorkflowsResult,
 };
 export { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
 
@@ -580,6 +588,29 @@ export const api = {
     const q = new URLSearchParams({ path: input.path });
     return j<GitHubTagsResult>(`/github/tags?${q.toString()}`);
   },
+  listGitHubWorkflowRuns: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubWorkflowRunsResult>(`/github/workflow-runs?${q.toString()}`);
+  },
+  listGitHubWorkflows: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubWorkflowsResult>(`/github/workflows?${q.toString()}`);
+  },
+  rerunGitHubWorkflowRun: (input: { path: string; runId: number; failedOnly?: boolean }) =>
+    j<{ ok: true; message: string }>("/github/workflow-rerun", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  cancelGitHubWorkflowRun: (input: { path: string; runId: number }) =>
+    j<{ ok: true; message: string }>("/github/workflow-cancel", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  dispatchGitHubWorkflow: (input: { path: string; workflowId: number; ref: string; inputs?: Record<string, string> }) =>
+    j<{ ok: true; message: string }>("/github/workflow-dispatch", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   getGitHubCommitStatus: (input: { path: string; ref: string }) => {
     const q = new URLSearchParams({ path: input.path, ref: input.ref });
     return j<GitHubCommitStatusResult>(`/github/commit-status?${q.toString()}`);

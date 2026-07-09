@@ -46,6 +46,10 @@ import type {
   GitHubTag,
   GitHubTagsResult,
   GitHubUser,
+  GitHubWorkflow,
+  GitHubWorkflowRun,
+  GitHubWorkflowRunsResult,
+  GitHubWorkflowsResult,
   TaskDiff,
 } from "../shared/types.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
@@ -320,6 +324,29 @@ interface GetGitHubCommitStatusInput {
   ref: string;
 }
 
+interface RerunGitHubWorkflowRunInput {
+  dir: string;
+  runId: number;
+  /** When true, hits `rerun-failed-jobs` instead of the plain `rerun`
+   *  endpoint — only re-executes jobs that failed (and their dependents). */
+  failedOnly?: boolean;
+}
+
+interface CancelGitHubWorkflowRunInput {
+  dir: string;
+  runId: number;
+}
+
+interface DispatchGitHubWorkflowInput {
+  dir: string;
+  workflowId: number;
+  ref: string;
+  /** Free-form key/value pairs (F20 assumption: no YAML parser is available
+   *  to read the workflow file's declared `workflow_dispatch.inputs` schema,
+   *  so the user supplies whatever keys the workflow expects verbatim). */
+  inputs?: Record<string, string>;
+}
+
 interface ListGitHubNotificationsInput {
   dir: string;
   /** `false` (default) = unread only; `true` = all notifications, matching
@@ -400,6 +427,9 @@ type GitHubReleasesResponse = ({ ok: true } & GitHubReleasesResult) | GitHubList
 type GitHubReleaseResponse = ({ ok: true; release: GitHubRelease }) | GitHubListError;
 type GitHubTagsResponse = ({ ok: true } & GitHubTagsResult) | GitHubListError;
 type GitHubCommitStatusResponse = ({ ok: true } & GitHubCommitStatusResult) | GitHubListError;
+type GitHubWorkflowRunsResponse = ({ ok: true } & GitHubWorkflowRunsResult) | GitHubListError;
+type GitHubWorkflowsResponse = ({ ok: true } & GitHubWorkflowsResult) | GitHubListError;
+type GitHubWorkflowActionResponse = ({ ok: true; message: string }) | GitHubListError;
 
 const GITHUB_FETCH_TIMEOUT_MS = 30_000;
 const GITHUB_DIFF_BODY_CAP_BYTES = 8_000_000;
@@ -657,6 +687,8 @@ export const __githubInternals = {
   normalizeRelease,
   normalizeTag,
   normalizeCommitStatus,
+  normalizeWorkflowRun,
+  normalizeWorkflow,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -1034,6 +1066,47 @@ function normalizeCommitStatus(raw: unknown): GitHubCommitStatus | null {
   const statuses = rawStatuses.map(normalizeCommitStatusContext).filter((x): x is GitHubCommitStatusContext => !!x);
   const total = typeof obj.total_count === "number" ? obj.total_count : statuses.length;
   return { state, total, statuses };
+}
+
+/** A single `GET /repos/:o/:r/actions/runs` entry (F20). Requires `id` — the
+ *  field every per-row action (re-run/cancel) and the row key need. `name`
+ *  falls back to `display_title` when the workflow itself has no name (rare,
+ *  but the raw response can omit it); `displayTitle` always prefers GitHub's
+ *  own generated title (commit message headline by default). Pure —
+ *  unit-tested. */
+function normalizeWorkflowRun(raw: unknown): GitHubWorkflowRun | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.id !== "number") return null;
+  const displayTitle = typeof obj.display_title === "string" ? obj.display_title : "";
+  return {
+    id: obj.id,
+    name: typeof obj.name === "string" ? obj.name : displayTitle,
+    displayTitle,
+    status: typeof obj.status === "string" ? obj.status : "unknown",
+    conclusion: typeof obj.conclusion === "string" ? obj.conclusion : null,
+    event: typeof obj.event === "string" ? obj.event : "",
+    headBranch: typeof obj.head_branch === "string" ? obj.head_branch : "",
+    runNumber: typeof obj.run_number === "number" ? obj.run_number : 0,
+    htmlUrl: typeof obj.html_url === "string" ? obj.html_url : "",
+    createdAt: typeof obj.created_at === "string" ? obj.created_at : "",
+    workflowId: typeof obj.workflow_id === "number" ? obj.workflow_id : 0,
+  };
+}
+
+/** A single `GET /repos/:o/:r/actions/workflows` entry (F20) — powers the
+ *  "run a workflow" dispatch picker. Requires `id`, `path`, and `name`.
+ *  Pure — unit-tested. */
+function normalizeWorkflow(raw: unknown): GitHubWorkflow | null {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.id !== "number" || typeof obj.path !== "string" || typeof obj.name !== "string") return null;
+  return {
+    id: obj.id,
+    name: obj.name,
+    path: obj.path,
+    state: typeof obj.state === "string" ? obj.state : "",
+  };
 }
 
 function repoSlug(repo: GitHubRepo): string {
@@ -3592,4 +3665,119 @@ export async function unsubscribeGitHubThread(input: GitHubThreadInput): Promise
     return { ok: false, error: apiError(json, res.status, res.statusText) };
   }
   return { ok: true };
+}
+
+/** `GET /repos/:o/:r/actions/runs` (F20). Unlike the paginated list-with-
+ *  `link`-header endpoints elsewhere in this file, the response here is an
+ *  OBJECT with a nested `workflow_runs` array (not a bare array) — the API
+ *  already returns them newest-first, so a single page of 30 is enough for
+ *  the "recent runs" panel and no client-side sort/pagination is needed. */
+export async function listGitHubWorkflowRuns(input: { dir: string }): Promise<GitHubWorkflowRunsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+
+  const token = await githubToken();
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/runs?per_page=30`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const body = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(body, res.status, res.statusText) };
+  const rawRuns = body && typeof body === "object" && Array.isArray((body as Record<string, unknown>).workflow_runs)
+    ? (body as Record<string, unknown>).workflow_runs as unknown[]
+    : null;
+  if (!rawRuns) return { ok: false, error: "GitHub returned an unexpected workflow runs response" };
+  const runs = rawRuns.map(normalizeWorkflowRun).filter((x): x is GitHubWorkflowRun => !!x);
+  return { ok: true, repo: repoSlug(repo), runs };
+}
+
+/** `GET /repos/:o/:r/actions/workflows` (F20) — powers the "run a workflow"
+ *  dispatch picker. Same nested-object shape as `listGitHubWorkflowRuns`
+ *  (`.workflows[]`, not a bare array). */
+export async function listGitHubWorkflows(input: { dir: string }): Promise<GitHubWorkflowsResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+
+  const token = await githubToken();
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/workflows?per_page=100`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const body = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(body, res.status, res.statusText) };
+  const rawWorkflows = body && typeof body === "object" && Array.isArray((body as Record<string, unknown>).workflows)
+    ? (body as Record<string, unknown>).workflows as unknown[]
+    : null;
+  if (!rawWorkflows) return { ok: false, error: "GitHub returned an unexpected workflows response" };
+  const workflows = rawWorkflows.map(normalizeWorkflow).filter((x): x is GitHubWorkflow => !!x);
+  return { ok: true, workflows };
+}
+
+/** `POST /repos/:o/:r/actions/runs/:run_id/rerun` (or `rerun-failed-jobs`
+ *  when `failedOnly`) — F20. Responds 201 with no body; success is `res.ok`
+ *  alone, like the notification mark-read endpoints. */
+export async function rerunGitHubWorkflowRun(input: RerunGitHubWorkflowRunInput): Promise<GitHubWorkflowActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.runId) || input.runId <= 0) return { ok: false, error: "valid run id required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to re-run a workflow" };
+  const segment = input.failedOnly ? "rerun-failed-jobs" : "rerun";
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/runs/${input.runId}/${segment}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "POST" });
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, message: "Re-run queued." };
+}
+
+/** `POST /repos/:o/:r/actions/runs/:run_id/cancel` — F20. Responds 202 with
+ *  no body; success is `res.ok` alone. */
+export async function cancelGitHubWorkflowRun(input: CancelGitHubWorkflowRunInput): Promise<GitHubWorkflowActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.runId) || input.runId <= 0) return { ok: false, error: "valid run id required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to cancel a workflow run" };
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/runs/${input.runId}/cancel`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "POST" });
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, message: "Cancellation requested." };
+}
+
+/** `POST /repos/:o/:r/actions/workflows/:workflow_id/dispatches` (F20) —
+ *  triggers a `workflow_dispatch` run. `inputs` is omitted from the body
+ *  entirely when empty (GitHub rejects an empty `inputs: {}` for workflows
+ *  that declare no inputs). Responds 204 with no body; success is `res.ok`
+ *  alone. Inputs are free-form key/value strings supplied by the user — no
+ *  YAML parser is available to read the workflow file's declared
+ *  `workflow_dispatch.inputs` schema, so we don't attempt to validate them
+ *  against it (see input interface doc comment). */
+export async function dispatchGitHubWorkflow(input: DispatchGitHubWorkflowInput): Promise<GitHubWorkflowActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.workflowId) || input.workflowId <= 0) return { ok: false, error: "valid workflow id required" };
+  const ref = input.ref.trim();
+  if (!ref) return { ok: false, error: "ref required" };
+
+  const token = await githubToken();
+  if (!token) return { ok: false, error: "GitHub authentication required to dispatch a workflow" };
+  const inputs = input.inputs && Object.keys(input.inputs).length > 0 ? input.inputs : undefined;
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/workflows/${input.workflowId}/dispatches`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json", {
+    method: "POST",
+    body: JSON.stringify({ ref, ...(inputs ? { inputs } : {}) }),
+  });
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, message: "Workflow dispatched." };
 }

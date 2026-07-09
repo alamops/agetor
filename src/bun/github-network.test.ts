@@ -11,8 +11,10 @@ import {
   addGitHubReaction,
   addGitHubSubIssue,
   applyGitHubSuggestion,
+  cancelGitHubWorkflowRun,
   createGitHubRelease,
   deleteGitHubRelease,
+  dispatchGitHubWorkflow,
   getGitHubCommitStatus,
   getGitHubIssuePinned,
   getGitHubPullLinkedIssues,
@@ -30,11 +32,14 @@ import {
   listGitHubReleases,
   listGitHubSubIssues,
   listGitHubTags,
+  listGitHubWorkflowRuns,
+  listGitHubWorkflows,
   markAllGitHubNotificationsRead,
   markGitHubNotificationRead,
   removeGitHubReaction,
   removeGitHubSubIssue,
   requestGitHubPullReviewers,
+  rerunGitHubWorkflowRun,
   setGitHubIssueLock,
   setGitHubIssuePinned,
   setGitHubPullAutoMerge,
@@ -1618,6 +1623,206 @@ test("unsubscribeGitHubThread DELETEs the subscription endpoint and succeeds on 
     expect(res).toEqual({ ok: true });
     expect(mock.calls).toHaveLength(1);
     expect(mock.calls[0]!.method).toBe("DELETE");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubWorkflowRuns reads the nested workflow_runs array (not a bare array)", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/actions/runs?per_page=30",
+      json: {
+        total_count: 2,
+        workflow_runs: [
+          {
+            id: 101,
+            name: "CI",
+            display_title: "Fix the thing",
+            status: "completed",
+            conclusion: "success",
+            event: "push",
+            head_branch: "main",
+            run_number: 5,
+            html_url: "https://github.com/acme/widgets/actions/runs/101",
+            created_at: "2026-01-02T00:00:00Z",
+            workflow_id: 1,
+          },
+          {
+            id: 100,
+            name: "CI",
+            display_title: "Earlier run",
+            status: "in_progress",
+            conclusion: null,
+            event: "pull_request",
+            head_branch: "feature",
+            run_number: 4,
+            html_url: "https://github.com/acme/widgets/actions/runs/100",
+            created_at: "2026-01-01T00:00:00Z",
+            workflow_id: 1,
+          },
+        ],
+      },
+    },
+  ]);
+  try {
+    const res = await listGitHubWorkflowRuns({ dir: REPO_DIR });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.repo).toBe("acme/widgets");
+    // API already returns newest-first — no client-side re-sort.
+    expect(res.runs.map((r) => r.id)).toEqual([101, 100]);
+    expect(res.runs[0]).toEqual({
+      id: 101,
+      name: "CI",
+      displayTitle: "Fix the thing",
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      headBranch: "main",
+      runNumber: 5,
+      htmlUrl: "https://github.com/acme/widgets/actions/runs/101",
+      createdAt: "2026-01-02T00:00:00Z",
+      workflowId: 1,
+    });
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubWorkflowRuns errors on a malformed (non-object / bare-array) response", async () => {
+  const mock = mockGitHubFetch([
+    { match: "/repos/acme/widgets/actions/runs?per_page=30", json: [] },
+  ]);
+  try {
+    const res = await listGitHubWorkflowRuns({ dir: REPO_DIR });
+    expect(res).toEqual({ ok: false, error: "GitHub returned an unexpected workflow runs response" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitHubWorkflows reads the nested workflows array and only active state is dispatchable info-wise", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: "/repos/acme/widgets/actions/workflows?per_page=100",
+      json: {
+        total_count: 2,
+        workflows: [
+          { id: 1, name: "CI", path: ".github/workflows/ci.yml", state: "active" },
+          { id: 2, name: "Old", path: ".github/workflows/old.yml", state: "disabled_manually" },
+        ],
+      },
+    },
+  ]);
+  try {
+    const res = await listGitHubWorkflows({ dir: REPO_DIR });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.workflows).toEqual([
+      { id: 1, name: "CI", path: ".github/workflows/ci.yml", state: "active" },
+      { id: 2, name: "Old", path: ".github/workflows/old.yml", state: "disabled_manually" },
+    ]);
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("rerunGitHubWorkflowRun POSTs the plain rerun endpoint and succeeds on a 201 with no body", async () => {
+  const mock = mockGitHubFetch([
+    { method: "POST", match: "https://api.github.com/repos/acme/widgets/actions/runs/101/rerun", status: 201 },
+  ]);
+  try {
+    const res = await rerunGitHubWorkflowRun({ dir: REPO_DIR, runId: 101 });
+    expect(res).toEqual({ ok: true, message: "Re-run queued." });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/actions/runs/101/rerun");
+    expect(mock.calls[0]!.method).toBe("POST");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("rerunGitHubWorkflowRun hits rerun-failed-jobs when failedOnly is set", async () => {
+  const mock = mockGitHubFetch([
+    { method: "POST", match: "https://api.github.com/repos/acme/widgets/actions/runs/101/rerun-failed-jobs", status: 201 },
+  ]);
+  try {
+    const res = await rerunGitHubWorkflowRun({ dir: REPO_DIR, runId: 101, failedOnly: true });
+    expect(res).toEqual({ ok: true, message: "Re-run queued." });
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/actions/runs/101/rerun-failed-jobs");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("rerunGitHubWorkflowRun requires a token — errors without a network call when unauthenticated", async () => {
+  const priorToken = process.env.GITHUB_TOKEN;
+  const priorGhToken = process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await rerunGitHubWorkflowRun({ dir: REPO_DIR, runId: 101 });
+    expect(res).toEqual({ ok: false, error: "GitHub authentication required to re-run a workflow" });
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+    if (priorToken !== undefined) process.env.GITHUB_TOKEN = priorToken;
+    if (priorGhToken !== undefined) process.env.GH_TOKEN = priorGhToken;
+  }
+});
+
+test("cancelGitHubWorkflowRun POSTs the cancel endpoint and succeeds on a 202 with no body", async () => {
+  const mock = mockGitHubFetch([
+    { method: "POST", match: "https://api.github.com/repos/acme/widgets/actions/runs/101/cancel", status: 202 },
+  ]);
+  try {
+    const res = await cancelGitHubWorkflowRun({ dir: REPO_DIR, runId: 101 });
+    expect(res).toEqual({ ok: true, message: "Cancellation requested." });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.method).toBe("POST");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("dispatchGitHubWorkflow POSTs {ref, inputs} to the dispatches endpoint and succeeds on a 204 with no body", async () => {
+  const mock = mockGitHubFetch([
+    { method: "POST", match: "https://api.github.com/repos/acme/widgets/actions/workflows/7/dispatches", status: 204 },
+  ]);
+  try {
+    const res = await dispatchGitHubWorkflow({ dir: REPO_DIR, workflowId: 7, ref: "main", inputs: { environment: "staging" } });
+    expect(res).toEqual({ ok: true, message: "Workflow dispatched." });
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toBe("https://api.github.com/repos/acme/widgets/actions/workflows/7/dispatches");
+    expect(JSON.parse(mock.calls[0]!.body ?? "{}")).toEqual({ ref: "main", inputs: { environment: "staging" } });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("dispatchGitHubWorkflow omits inputs from the body entirely when empty", async () => {
+  const mock = mockGitHubFetch([
+    { method: "POST", match: "https://api.github.com/repos/acme/widgets/actions/workflows/7/dispatches", status: 204 },
+  ]);
+  try {
+    const res = await dispatchGitHubWorkflow({ dir: REPO_DIR, workflowId: 7, ref: "main" });
+    expect(res).toEqual({ ok: true, message: "Workflow dispatched." });
+    expect(JSON.parse(mock.calls[0]!.body ?? "{}")).toEqual({ ref: "main" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("dispatchGitHubWorkflow rejects a blank ref without a network call", async () => {
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await dispatchGitHubWorkflow({ dir: REPO_DIR, workflowId: 7, ref: "   " });
+    expect(res).toEqual({ ok: false, error: "ref required" });
+    expect(mock.calls).toHaveLength(0);
   } finally {
     mock.restore();
   }

@@ -41,6 +41,8 @@ const {
   normalizeRelease,
   normalizeTag,
   normalizeCommitStatus,
+  normalizeWorkflowRun,
+  normalizeWorkflow,
 } = __githubInternals;
 
 const REPO = { owner: "o", name: "r" };
@@ -792,4 +794,68 @@ test("normalizeCommitStatus maps state/statuses, defaults total to the surviving
     statuses: [{ context: "ci/build", state: "failure", description: null, targetUrl: null }],
   });
   expect(normalizeCommitStatus(null)).toBeNull();
+});
+
+test("normalizeWorkflowRun maps snake_case fields, defaults missing ones, and requires a numeric id", () => {
+  expect(
+    normalizeWorkflowRun({
+      id: 101,
+      name: "CI",
+      display_title: "Fix the thing",
+      status: "completed",
+      conclusion: "success",
+      event: "push",
+      head_branch: "main",
+      run_number: 42,
+      html_url: "https://github.com/o/r/actions/runs/101",
+      created_at: "2026-01-01T00:00:00Z",
+      workflow_id: 7,
+    }),
+  ).toEqual({
+    id: 101,
+    name: "CI",
+    displayTitle: "Fix the thing",
+    status: "completed",
+    conclusion: "success",
+    event: "push",
+    headBranch: "main",
+    runNumber: 42,
+    htmlUrl: "https://github.com/o/r/actions/runs/101",
+    createdAt: "2026-01-01T00:00:00Z",
+    workflowId: 7,
+  });
+  // missing `name` falls back to display_title; other optional fields default
+  expect(normalizeWorkflowRun({ id: 2, display_title: "Untitled run" })).toEqual({
+    id: 2,
+    name: "Untitled run",
+    displayTitle: "Untitled run",
+    status: "unknown",
+    conclusion: null,
+    event: "",
+    headBranch: "",
+    runNumber: 0,
+    htmlUrl: "",
+    createdAt: "",
+    workflowId: 0,
+  });
+  // no id → null
+  expect(normalizeWorkflowRun({ name: "CI" })).toBeNull();
+  expect(normalizeWorkflowRun(null)).toBeNull();
+});
+
+test("normalizeWorkflow requires id/path/name and defaults an unrecognized state to empty", () => {
+  expect(
+    normalizeWorkflow({ id: 9, name: "CI", path: ".github/workflows/ci.yml", state: "active" }),
+  ).toEqual({ id: 9, name: "CI", path: ".github/workflows/ci.yml", state: "active" });
+  expect(normalizeWorkflow({ id: 9, name: "CI", path: ".github/workflows/ci.yml" })).toEqual({
+    id: 9,
+    name: "CI",
+    path: ".github/workflows/ci.yml",
+    state: "",
+  });
+  // missing id / path / name → null
+  expect(normalizeWorkflow({ name: "CI", path: "x.yml" })).toBeNull();
+  expect(normalizeWorkflow({ id: 1, name: "CI" })).toBeNull();
+  expect(normalizeWorkflow({ id: 1, path: "x.yml" })).toBeNull();
+  expect(normalizeWorkflow(null)).toBeNull();
 });
