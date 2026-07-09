@@ -96,7 +96,10 @@ export async function getAheadCount(dir: string, baseRef: string | null): Promis
     return null;
   }
 
-  if (baseRef) {
+  // A "-"-leading ref would parse as a rev-list flag; skip the comparison
+  // rather than trust upstream validation (mirrors gitPull's guard), falling
+  // through to the unknown-but-not-blocking 0 below.
+  if (baseRef && !baseRef.startsWith("-")) {
     const base = await git(["rev-list", "--count", `${baseRef}..HEAD`], dir);
     if (base.ok) {
       const count = Number.parseInt(base.stdout, 10);
