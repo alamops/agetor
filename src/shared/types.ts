@@ -52,11 +52,11 @@ export function isApprovalPrompt(text: string): boolean {
   return APPROVAL_PROMPT_PATTERNS.some((re) => re.test(text));
 }
 
-export type AgentKind = "claude-code" | "codex";
+export type AgentKind = "claude-code" | "codex" | "grok";
 
 /**
  * A "harness" is the user-facing name for an agent configuration. Built-in
- * harnesses (`claude-code`, `codex`) wrap each CLI directly; user-created
+ * harnesses (`claude-code`, `codex`, `grok`) wrap each CLI directly; user-created
  * harnesses are *aliases* that wrap the same underlying `kind` with extra
  * env, an alternate `bin` path, or a per-account `home` override so the
  * CLI's login/config writes to a separate dir (multi-account support).
@@ -78,6 +78,8 @@ export interface Harness {
    *    "Not logged in" even with valid tokens.
    *  - codex: emitted as HOME=<home> + CODEX_HOME=<home>/.codex (codex doesn't
    *    use the macOS keychain, so re-homing it is safe).
+   *  - grok: emitted as GROK_HOME=<home> (grok doesn't use the macOS
+   *    keychain either, so re-homing it is safe; mirrors CODEX_HOME).
    *  NULL means "inherit the agetor process env". */
   home: string | null;
   /** Optional binary path override. NULL falls back to the AGETOR_*_BIN
@@ -168,6 +170,17 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
     kind: "codex",
     suggestedHarnessId: "codex-2",
     home: "{dataDir}/harnesses/codex-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "grok-additional",
+    label: "Additional Grok Build",
+    description:
+      "Another Grok Build harness with its own GROK_HOME so login and history are isolated from the built-in.",
+    kind: "grok",
+    suggestedHarnessId: "grok-2",
+    home: "{dataDir}/harnesses/grok-2",
     bin: null,
     env: {},
   },
@@ -392,10 +405,16 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // usage, so the default stays on the most-capable non-premium tier.
   "claude-code": "opus-4.8",
   "codex": "gpt-5.5",
+  "grok": "grok-build",
 };
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
   "codex": "high",
+  // grok has no confirmed CLI reasoning-effort flag — every curated model's
+  // MODEL_EFFORT_SUPPORT entry is `[]`, so this value is never dereferenced
+  // (supportedEfforts/the orchestrator short-circuit on the empty support
+  // list before reading DEFAULT_EFFORT). "none" documents the intent.
+  "grok": "none",
 };
 
 /**
@@ -421,6 +440,7 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
 export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> = {
   "claude-code": { code: "auto", plan: "plan" },
   "codex": { code: "auto", plan: "ask" },
+  "grok": { code: "auto", plan: "ask" },
 };
 
 /**
@@ -458,10 +478,14 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  *       https://developers.openai.com/codex/config-advanced
  *     gpt-5.5 / gpt-5 / gpt-5-codex → low/medium/high/xhigh
  *     (minimal kept out of UI)
+ *   - Grok Build (xAI): no first-class CLI reasoning-effort flag is
+ *     confirmed as of this integration (docs.x.ai/build, verified
+ *     2026-07-10) — every curated model maps to `[]`, same treatment as
+ *     Haiku 4.5.
  *
  * An empty list means "this model does not accept the effort flag at all"
- * (e.g. Haiku 4.5) — the UI collapses the dropdown and `buildCommand` emits
- * no env var / `-c` flag for that case.
+ * (e.g. Haiku 4.5, every grok model) — the UI collapses the dropdown and
+ * `buildCommand` emits no env var / `-c` flag for that case.
  */
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
@@ -488,6 +512,13 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gpt-5.5": ["xhigh", "high", "medium", "low"],
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
+  },
+  grok: {
+    // No confirmed reasoning-effort CLI flag for any grok model — picker
+    // collapses for all three (Haiku-4.5 precedent).
+    "grok-build": [],
+    "grok-4.5": [],
+    "grok-4-fast-reasoning": [],
   },
 };
 
@@ -529,6 +560,11 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
     "haiku-4.5": [],
   },
   codex: {},
+  grok: {
+    "grok-build": [],
+    "grok-4.5": [],
+    "grok-4-fast-reasoning": [],
+  },
 };
 
 export function supportedModes(agent: AgentKind, model: string | null): AgentOption[] {
@@ -577,6 +613,18 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     ],
     efforts: EFFORT_OPTIONS,
   },
+  grok: {
+    models: [
+      { id: "grok-build", label: "Grok Build", hint: "xAI's coding model — recommended default." },
+      { id: "grok-4.5", label: "Grok 4.5", hint: "General-purpose flagship model." },
+      { id: "grok-4-fast-reasoning", label: "Grok 4 Fast Reasoning", hint: "Faster, reasoning-tuned variant." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto", hint: "Full auto — bypassPermissions, no sandbox." },
+      { id: "ask", label: "Read-only", hint: "Inspect only — read-only sandbox, prompts silently denied." },
+    ],
+    efforts: EFFORT_OPTIONS,
+  },
 };
 
 export type RunStatus =
@@ -598,10 +646,10 @@ export interface Run {
   exitCode: number | null;
   /**
    * Name of the tmux session that hosted this run's REPL (claude-code) or
-   * one-shot `codex exec` turn (codex). For claude it's the same value across
-   * every run for a task (one persistent session); for codex each turn spawns
-   * a fresh session that shares the per-task name. NULL for pre-migration
-   * legacy rows.
+   * one-shot exec turn (codex, grok). For claude it's the same value across
+   * every run for a task (one persistent session); for codex and grok each
+   * turn spawns a fresh session that shares the per-task name. NULL for
+   * pre-migration legacy rows.
    */
   tmuxSession: string | null;
   /**
@@ -620,6 +668,15 @@ export interface Run {
    * for claude-code and legacy rows.
    */
   codexSessionId: string | null;
+  /**
+   * Grok Build's own headless session id (surfaced as `sessionId` in its
+   * `--output-format streaming-json` event stream). Captured when the grok
+   * tmux driver tails the run's NDJSON log. Drives `grok --resume <id>` for
+   * follow-up turns and is the reattach key for a mid-turn grok run. Distinct
+   * namespace from claude's and codex's session ids — never cross-compare.
+   * NULL for claude-code, codex, and legacy rows.
+   */
+  grokSessionId: string | null;
   /**
    * How this run came to exist. `null`/undefined = user-initiated (Run
    * button, a follow-up message typed into the panel — every run before

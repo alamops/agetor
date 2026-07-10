@@ -321,7 +321,7 @@ test("maybeReleaseHeldTask does not misfire when a newer run is already in fligh
     exitCode: null,
     tmuxSession: null,
     claudeSessionId: null,
-    codexSessionId: null,
+    codexSessionId: null, grokSessionId: null,
   });
   tasks.update(taskId, { runId: runId2 });
 

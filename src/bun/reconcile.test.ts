@@ -102,7 +102,7 @@ function succeededRun(id: string, taskId: string, overrides: Partial<Run> = {}):
     exitCode: 0,
     tmuxSession: null,
     claudeSessionId: `sess-${randomUUID()}`,
-    codexSessionId: null,
+    codexSessionId: null, grokSessionId: null,
     ...overrides,
   };
 }
@@ -196,7 +196,7 @@ test("reconcileOrphans marks running rows as orphaned and returns tasks to ready
     endedAt: null,
     exitCode: null,
     tmuxSession: null,
-    claudeSessionId: null, codexSessionId: null,
+    claudeSessionId: null, codexSessionId: null, grokSessionId: null,
   });
 
   const reconciled = reconcileOrphans();
@@ -262,7 +262,7 @@ test("reattach pre-seed SQL: detects a prior api-error status row scoped to the 
     runs.insert({
       id, taskId, agent: "claude-code", status: "failed",
       startedAt: now, endedAt: now, exitCode: 1,
-      tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+      tmuxSession: null, claudeSessionId: null, codexSessionId: null, grokSessionId: null,
     });
   }
   // The real api-error status on the target run — must match.
@@ -288,7 +288,7 @@ test("reattach pre-seed SQL: detects a prior api-error status row scoped to the 
   runs.insert({
     id: cleanRunId, taskId, agent: "claude-code", status: "failed",
     startedAt: now, endedAt: now, exitCode: 1,
-    tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, grokSessionId: null,
   });
   expect(ask(cleanRunId)).toBe(0);
 });
@@ -501,7 +501,7 @@ test("held-task boot pass: a codex task can never be held — the kind !== 'clau
 
   tasks.insert(heldTaskRow({ id: taskId, runId, agent: "codex" }));
   runs.insert(succeededRun(runId, taskId, {
-    agent: "codex", claudeSessionId: null, codexSessionId: `thread-${randomUUID()}`,
+    agent: "codex", claudeSessionId: null, codexSessionId: `thread-${randomUUID()}`, grokSessionId: null,
   }));
   subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 
@@ -681,7 +681,7 @@ test("boot pass (blind spot): a codex task's stray running subagent row is skipp
 
     tasks.insert(heldTaskRow({ id: taskId, runId, column: "review", agent: "codex" }));
     runs.insert(succeededRun(runId, taskId, {
-      agent: "codex", claudeSessionId: null, codexSessionId: `thread-${randomUUID()}`,
+      agent: "codex", claudeSessionId: null, codexSessionId: `thread-${randomUUID()}`, grokSessionId: null,
     }));
     subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
 

@@ -88,7 +88,7 @@ test("priorApiError query ignores a subagent-tagged api-error row (subagent_id s
     exitCode: 1,
     tmuxSession: null,
     claudeSessionId: null,
-    codexSessionId: null,
+    codexSessionId: null, grokSessionId: null,
   });
 
   // A subagent tailer's own api-error status row, persisted under the
@@ -146,7 +146,7 @@ test("priorApiError query matches a main-tailer api-error row (subagent_id NULL)
     exitCode: 1,
     tmuxSession: null,
     claudeSessionId: null,
-    codexSessionId: null,
+    codexSessionId: null, grokSessionId: null,
   });
 
   // The main tailer's own api-error status row — subagent_id explicitly
