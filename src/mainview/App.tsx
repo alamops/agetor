@@ -73,7 +73,7 @@ export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
-  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [] });
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], grok: [] });
   const [selected, setSelected] = useState<Task | null>(null);
   const [diffTask, setDiffTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);

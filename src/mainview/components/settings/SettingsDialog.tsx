@@ -535,7 +535,7 @@ function ListView({
                         disabled
                       </span>
                     )}
-                    {h.kind === "codex" && (
+                    {(h.kind === "codex" || h.kind === "grok") && (
                       <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
                         experimental
                       </span>
@@ -600,7 +600,7 @@ function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
       </p>
       <div className="space-y-1.5">
         {HARNESS_TEMPLATES.map((t) => {
-          const experimental = t.kind === "codex";
+          const experimental = t.kind === "codex" || t.kind === "grok";
           return (
             <button
               key={t.id}
@@ -743,9 +743,9 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
-        <div className="grid grid-cols-2 gap-1">
-          {(["claude-code", "codex"] as AgentKind[]).map((k) => {
-            const experimental = k === "codex";
+        <div className="grid grid-cols-3 gap-1">
+          {(["claude-code", "codex", "grok"] as AgentKind[]).map((k) => {
+            const experimental = k === "codex" || k === "grok";
             return (
               <Button
                 key={k}
@@ -771,21 +771,28 @@ function Editor({
         <label className="text-xs text-muted-foreground">
           {kind === "claude-code"
             ? "CLAUDE_CONFIG_DIR override (absolute path; optional)"
-            : "HOME override (absolute path; optional)"}
+            : kind === "grok"
+              ? "GROK_HOME override (absolute path; optional)"
+              : "HOME override (absolute path; optional)"}
         </label>
         <Input
           value={home}
           onChange={(e) => setHome(e.target.value)}
           placeholder={
             dataDir
-              ? abbreviateHome(`${dataDir}/harnesses/${kind === "codex" ? "codex-2" : "claude-2"}`, homeDir)
+              ? abbreviateHome(
+                  `${dataDir}/harnesses/${kind === "codex" ? "codex-2" : kind === "grok" ? "grok-2" : "claude-2"}`,
+                  homeDir,
+                )
               : "~/.agetor/harnesses/claude-2"
           }
         />
         <p className="text-[11px] leading-snug text-muted-foreground">
           {kind === "claude-code"
             ? "Sets CLAUDE_CONFIG_DIR on spawn — claude stores config, sessions, and login under this path, so a separate path gives this harness its own account. Authenticate by running: CLAUDE_CONFIG_DIR=<path> claude /login."
-            : "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account."}
+            : kind === "grok"
+              ? "Sets GROK_HOME on spawn — grok stores its login and session logs under $GROK_HOME (default ~/.grok), so a separate path gives this harness its own account."
+              : "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account."}
           {" "}Leave empty to share the default account.
         </p>
       </div>
