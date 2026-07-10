@@ -511,6 +511,13 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
   const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
   const done = new Promise<number>((res) => { resolveDone = res; });
+  // Every setTimeout this fake schedules is tracked here so `kill()` can
+  // clear them all — otherwise a chunk fires after the run/task row it
+  // targets has been deleted (e.g. a test that deletes a task immediately
+  // after starting it), and `runs.appendEvent` throws an unhandled
+  // `SQLITE_CONSTRAINT_FOREIGNKEY` against the cascade-deleted row.
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
   // Test hook: simulate a claude code API error mid-turn so orchestrator
   // tests can exercise the api-error → `blocked` column flip without having
   // to plumb a real synthetic-message JSONL through the driver. Mirrors what
@@ -527,11 +534,11 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
     // both events would land within the same tick and there'd be nowhere
     // to insert the cancel.
     const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
-    setTimeout(() => {
+    after(5, () => {
       onChunk("assistant", "API Error: 529 Overloaded. This is a server-side issue, usually temporary.");
       onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}HTTP 529 — turn aborted; blocked for manual retry`);
-    }, 5);
-    setTimeout(() => { resolveDone(0); }, resolveDelayMs);
+    });
+    after(resolveDelayMs, () => { resolveDone(0); });
   } else if (process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED === "1") {
     // Test hook: simulate the tmux session dying mid-turn. Mirrors what the
     // real drivers emit from their death watch — the `SESSION_DIED_STATUS_PREFIX`
@@ -541,17 +548,27 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
     // Optional resolve delay lets cancellation-precedence tests fire cancelRun
     // between the column flip and the done resolution.
     const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
-    setTimeout(() => {
+    after(5, () => {
       onChunk("status", `${SESSION_DIED_STATUS_PREFIX}tmux session agetor-fake ended unexpectedly — task blocked`);
-    }, 5);
-    setTimeout(() => { resolveDone(0); }, resolveDelayMs);
+    });
+    after(resolveDelayMs, () => { resolveDone(0); });
   } else {
-    setTimeout(() => onChunk("stdout", `fake response to: ${prompt}`), 5);
-    setTimeout(() => { onChunk("status", "turn complete"); resolveDone(0); }, 20);
+    after(5, () => onChunk("stdout", `fake response to: ${prompt}`));
+    after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });
   }
   const inst: FakeDriverInstance = {
     _record: record,
-    kill: () => { record.push("kill"); },
+    kill: () => {
+      record.push("kill");
+      // Clear every pending timer so no further chunks/resolutions fire from
+      // them, but still settle `done` immediately (with the same code the
+      // timer chain would have used) so a kill never leaves a caller awaiting
+      // `done` forever. If the timers already fired, both of these are no-ops
+      // (clearTimeout on an elapsed timer, resolveDone on an already-settled
+      // promise).
+      for (const t of timers) clearTimeout(t);
+      resolveDone(0);
+    },
     writeInput: (line) => { record.push(`write:${line}`); return true; },
     done,
   };

@@ -9,6 +9,7 @@ import {
   statSync as fsStatSync,
   writeFileSync,
   unlinkSync,
+  readFileSync,
 } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
@@ -63,8 +64,34 @@ export function cursorLogPath(runId: string): string {
 function cursorPromptPath(runId: string): string {
   return path.join(CURSOR_LOG_DIR, `${runId}.prompt.txt`);
 }
+/** Exit-code sidecar written by the hosting shell's trailing `echo $? >
+ *  <exitfile>` (see `spawnCursorViaTmux`). Its presence is what lets the
+ *  death-watch tell an ordinary process exit (no `result` event, e.g. a
+ *  turn that errored out before printing one) apart from a genuine session
+ *  death (crash, external kill, tmux server gone) — only the latter should
+ *  ever surface the `SESSION_DIED_STATUS_PREFIX` sentinel. */
+function cursorExitPath(runId: string): string {
+  return path.join(CURSOR_LOG_DIR, `${runId}.exit`);
+}
 function ensureLogDir(): void {
   if (!existsSync(CURSOR_LOG_DIR)) mkdirSync(CURSOR_LOG_DIR, { recursive: true });
+}
+
+/** Parse the exit-code sidecar for a run. Returns `null` when the file
+ *  doesn't exist yet (turn still in flight) or its contents aren't a valid
+ *  integer — both cases the caller must treat as "no verdict available",
+ *  not as exit code 0. Exported so the parse logic is unit-testable without
+ *  a real tmux session. */
+export function readCursorExitCode(runId: string): number | null {
+  let raw: string;
+  try {
+    raw = readFileSync(cursorExitPath(runId), "utf8").trim();
+  } catch {
+    return null;
+  }
+  if (!/^-?\d+$/.test(raw)) return null;
+  const code = Number.parseInt(raw, 10);
+  return Number.isFinite(code) ? code : null;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -91,18 +118,33 @@ interface CursorEvent {
 /** Result of mapping one event line. `done` is set when the event terminates
  *  the turn (`result` → 0 on success, 1 on `is_error`). `sessionId` is set on
  *  the first event that carries one (typically `system/init`, but cursor
- *  stamps `session_id` on every event, so any line can supply it). */
+ *  stamps `session_id` on every event, so any line can supply it).
+ *  `assistantTextEmitted` is set (to `true`) only by the `assistant` case
+ *  when it actually streamed non-empty text — callers fold this into their
+ *  per-run "did we already narrate this turn" state and pass it back in on
+ *  the next call as `priorAssistantText` (see `mapCursorEvent`'s `result`
+ *  case). */
 export interface CursorMapResult {
   done?: number;
   sessionId?: string;
+  assistantTextEmitted?: true;
 }
 
 /** Best-effort tool name for generic rendering — the `tool_call` envelope's
- *  inner `tool_call` payload shape is explicitly unstable (plan §2), so we
- *  never destructure past "first key of the object". */
+ *  inner `tool_call` payload shape is explicitly unstable (plan §2). We
+ *  first look for a known string-valued name field (`name` / `tool` /
+ *  `tool_name`, the shapes cursor-agent is documented to use), and only
+ *  fall back to "first key of the object" when none is present — otherwise
+ *  a payload shaped `{name: "shellToolCall", args: {...}}` would render the
+ *  literal string "name" rather than the tool's actual name. */
 function bestEffortToolName(toolCall: unknown): string {
   if (toolCall && typeof toolCall === "object" && !Array.isArray(toolCall)) {
-    const keys = Object.keys(toolCall as Record<string, unknown>);
+    const obj = toolCall as Record<string, unknown>;
+    for (const field of ["name", "tool", "tool_name"]) {
+      const value = obj[field];
+      if (typeof value === "string" && value.length > 0) return value;
+    }
+    const keys = Object.keys(obj);
     if (keys.length > 0) return keys[0]!;
   }
   return "tool_call";
@@ -127,6 +169,16 @@ function assistantText(message: CursorEvent["message"]): string {
  * `line_uuid` is stable across a reattach replay that re-reads the log from
  * offset 0 (plan §3.6/§4 T3 point 4).
  *
+ * `priorAssistantText` is whether an earlier line in THIS turn already
+ * streamed assistant text (threaded in by the caller the same way
+ * `lineIndex` is — `mapCursorEvent` itself is stateless/pure, so it can't
+ * remember prior calls on its own). It's only consulted by the `result`
+ * case: cursor's `assistant` event and `result` event both carry the same
+ * final answer on a normal turn, so the `result` text is suppressed when
+ * `priorAssistantText` is true, and only rendered as a fallback for the
+ * pure-tool-call turns whose narration shows up nowhere else. Defaults to
+ * `false` so callers that don't care (most tests) don't have to pass it.
+ *
  * line_uuid scheme:
  *   - `tool_call:<call_id>:<subtype>` for `tool_call` events — the subtype
  *     suffix keeps `started` and `completed` (same call_id) from colliding
@@ -137,6 +189,7 @@ export function mapCursorEvent(
   evt: CursorEvent,
   onChunk: ChunkHandler,
   lineIndex: number,
+  priorAssistantText: boolean = false,
 ): CursorMapResult {
   const type = evt.type ?? "";
   const sessionId = typeof evt.session_id === "string" ? evt.session_id : undefined;
@@ -156,7 +209,10 @@ export function mapCursorEvent(
 
     case "assistant": {
       const text = assistantText(evt.message);
-      if (text) onChunk("assistant", text, `cursor:${lineIndex}`);
+      if (text) {
+        onChunk("assistant", text, `cursor:${lineIndex}`);
+        return { sessionId, assistantTextEmitted: true };
+      }
       return { sessionId };
     }
 
@@ -196,8 +252,10 @@ export function mapCursorEvent(
       // `result` is the authoritative final text — only emit it as an
       // assistant chunk when the turn produced no assistant text of its own
       // (some turns are pure tool-call sequences whose narration only shows
-      // up here).
-      if (typeof evt.result === "string" && evt.result.length > 0) {
+      // up here). Guarded by `priorAssistantText` — cursor's `assistant`
+      // event and `result` event carry the SAME final answer on a normal
+      // turn, so emitting both would double-render it.
+      if (!priorAssistantText && typeof evt.result === "string" && evt.result.length > 0) {
         onChunk("assistant", evt.result, `cursor:${lineIndex}`);
       }
       return { sessionId, done: isError ? 1 : 0 };
@@ -228,6 +286,13 @@ interface CursorSessionState {
    *  threaded into `mapCursorEvent` so `line_uuid` is stable across a
    *  reattach replay from offset 0 (same physical line → same index). */
   nextLineIndex: number;
+  /** Whether an `assistant` event has already streamed non-empty text this
+   *  turn — threaded into `mapCursorEvent`'s `priorAssistantText` param so
+   *  the `result` case can suppress the duplicate final-answer text (Fix 1).
+   *  Per-run/one-shot state: a new run gets a fresh `CursorSessionState`, so
+   *  there's no mid-run reset to worry about — even a reattach replay from
+   *  offset 0 recomputes this correctly as it re-walks the log in order. */
+  assistantTextEmitted: boolean;
   watcher: FSWatcher | null;
   pollTimer: ReturnType<typeof setInterval> | null;
   deathTimer: ReturnType<typeof setInterval> | null;
@@ -314,7 +379,8 @@ function dispatchCursorEvent(state: CursorSessionState, evt: CursorEvent): void 
     }
     state.onChunk(stream, data, lineUuid);
   };
-  const result = mapCursorEvent(evt, onChunk, state.nextLineIndex);
+  const result = mapCursorEvent(evt, onChunk, state.nextLineIndex, state.assistantTextEmitted);
+  if (result.assistantTextEmitted) state.assistantTextEmitted = true;
   if (result.sessionId && !state.sessionIdSent) {
     state.sessionIdSent = true;
     state.onSessionId?.(result.sessionId);
@@ -336,6 +402,7 @@ function resolveCursorDone(state: CursorSessionState, code: number): void {
   // them best-effort so dataDir/cursor-logs/ doesn't grow unbounded. Timers
   // are already cleared above, so nothing will try to read them after this.
   try { unlinkSync(cursorPromptPath(state.runId)); } catch { /* already gone */ }
+  try { unlinkSync(cursorExitPath(state.runId)); } catch { /* already gone */ }
   try { unlinkSync(state.logPath); } catch { /* already gone */ }
   state.resolveDone(code);
 }
@@ -384,16 +451,32 @@ function startCursorTailer(state: CursorSessionState): Promise<number> {
     if (outcome === "reset") { misses = 0; return; }
     if (outcome === "wait") { misses++; return; }
     // Session gone. Give the FS a beat to surface the final bytes, flush, then
-    // resolve with whatever terminal code we saw (default: failed — a
-    // cursor-agent run that vanished without a `result` event did not
-    // succeed).
+    // decide clean-exit vs death before resolving.
     setTimeout(() => {
       flushCursorLog(state);
       // If the final flush surfaced a terminal event (`result`),
       // resolveCursorDone already fired — this was an orderly finish, not a
       // death, so don't emit the "session ended" sentinel.
       if (!state.resolved) {
-        // Emit the shared sentinel so the orchestrator flips the card to
+        // Check the exit-code sidecar FIRST: its presence means the hosting
+        // shell ran to completion and wrote `echo $?` before the tmux
+        // session went away — a clean process exit, just one that happened
+        // not to end in a `result` event (e.g. cursor-agent errored out
+        // before printing one). That's an ordinary failed/succeeded run,
+        // not a death, so it must NOT get the session-died sentinel (which
+        // the orchestrator maps to `blocked`, not the normal
+        // running->ready/review flow).
+        const exitCode = readCursorExitCode(state.runId);
+        if (exitCode !== null) {
+          if (exitCode !== 0) {
+            state.onChunk("stderr", `cursor-agent exited with code ${exitCode}`);
+          }
+          resolveCursorDone(state, exitCode);
+          return;
+        }
+        // No exitfile: the session vanished before the shell could write
+        // one — a genuine crash / external kill / tmux server death. Emit
+        // the shared sentinel so the orchestrator flips the card to
         // `blocked` (via makeChunkHandler) and the user sees WHY the run
         // stopped in the stream, instead of a silent drop to `ready`.
         state.onChunk(
@@ -454,22 +537,36 @@ export interface CursorLaunchOptions {
  * The cursor-agent argv elements are passed as `sh`'s positional parameters
  * (`"$@"`) so their content never goes through shell parsing either:
  *
- *   sh -c 'exec "$@" "$(cat <promptfile>)" > <logfile> 2>&1' sh <argv...>
+ *   sh -c '"$@" "$(cat <promptfile>)" > <logfile> 2>&1; echo $? > <exitfile>' sh <argv...>
+ *
+ * No `exec`: dropping it is what lets the trailing `echo $? > <exitfile>`
+ * run in the same shell AFTER cursor-agent exits, recording its exit code to
+ * a sidecar file (Fix 2 / plan §5 TT2). The death-watch (`startCursorTailer`)
+ * checks that sidecar before deciding a vanished tmux session is a genuine
+ * death — its presence means the process ran to completion (even if it
+ * didn't emit a `result` event), so the run settles as an ordinary
+ * succeeded/failed run instead of tripping the `SESSION_DIED_STATUS_PREFIX`
+ * sentinel. Removing `exec` does not change the prompt/argv quoting
+ * properties below — `"$@"` and `"$(cat …)"` are unaffected either way.
  *
  * `$(cat file)` strips a trailing newline from the prompt — acceptable (see
  * plan). Every path substituted directly into the script string
- * (`<promptfile>`, `<logfile>`) is single-quote-escaped via `sq` the same
- * way codex-tmux escapes its paths; those paths are agetor-generated
- * (derived from `runId`), never user text.
+ * (`<promptfile>`, `<logfile>`, `<exitfile>`) is single-quote-escaped via
+ * `sq` the same way codex-tmux escapes its paths; those paths are
+ * agetor-generated (derived from `runId`), never user text.
  */
 export function spawnCursorViaTmux(opts: CursorLaunchOptions): SpawnedAgent {
   ensureLogDir();
   const logPath = cursorLogPath(opts.runId);
   const promptPath = cursorPromptPath(opts.runId);
+  const exitPath = cursorExitPath(opts.runId);
   writeFileSync(promptPath, opts.promptText);
   // Truncate/create the log up front so the tailer's first stat succeeds and
   // offsets start at 0 cleanly even if a stale file from a reused id lingers.
   writeFileSync(logPath, "");
+  // Clear any stale exit-code sidecar from a reused runId so a leftover file
+  // can't be mistaken for this run's verdict before the shell writes its own.
+  try { unlinkSync(exitPath); } catch { /* already gone */ }
 
   const sessionName = sessionNameFor(opts.taskId);
   // Defensive: a zombie session under this name would make new-session fail.
@@ -481,8 +578,10 @@ export function spawnCursorViaTmux(opts: CursorLaunchOptions): SpawnedAgent {
   // element arrives via `"$@"` (positional params), bypassing shell parsing
   // entirely. A prompt containing single quotes, double quotes, `$()`,
   // backticks, or newlines is therefore delivered byte-for-byte (module the
-  // trailing-newline strip `$(cat)` always performs).
-  const inner = `exec "$@" "$(cat ${sq(promptPath)})" > ${sq(logPath)} 2>&1`;
+  // trailing-newline strip `$(cat)` always performs). No `exec`: the shell
+  // must stay alive after cursor-agent exits so it can record `$?` to the
+  // exit-code sidecar (Fix 2) — see the hosting-command doc comment above.
+  const inner = `"$@" "$(cat ${sq(promptPath)})" > ${sq(logPath)} 2>&1; echo $? > ${sq(exitPath)}`;
   const envArgs: string[] = [];
   // Forward PATH so cursor-agent's own tool invocations resolve dev binaries,
   // plus the harness env (HOME override) that controls cursor-agent's
@@ -509,6 +608,7 @@ export function spawnCursorViaTmux(opts: CursorLaunchOptions): SpawnedAgent {
     decoder: new StringDecoder("utf8"),
     partial: "",
     nextLineIndex: 0,
+    assistantTextEmitted: false,
     watcher: null,
     pollTimer: null,
     deathTimer: null,
@@ -583,6 +683,7 @@ export function reattachCursorSession(opts: CursorReattachOptions): SpawnedAgent
     decoder: new StringDecoder("utf8"),
     partial: "",
     nextLineIndex: 0,
+    assistantTextEmitted: false, // recomputed correctly as the replay from offset 0 re-walks the log in order
     watcher: null,
     pollTimer: null,
     deathTimer: null,

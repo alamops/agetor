@@ -15,8 +15,10 @@ beforeEach(() => {
   // absolute path in argv[0] and the equality checks would drift per host.
   process.env.AGETOR_CLAUDE_BIN = "claude";
   process.env.AGETOR_CODEX_BIN = "codex";
+  process.env.AGETOR_CURSOR_BIN = "cursor-agent";
   delete process.env.AGETOR_CLAUDE_ARGS;
   delete process.env.AGETOR_CODEX_ARGS;
+  delete process.env.AGETOR_CURSOR_ARGS;
 });
 
 /** Build a built-in harness for tests — kind doubles as id, no overrides. */
@@ -52,6 +54,10 @@ function alias(kind: AgentKind, opts: { home?: string; bin?: string; env?: Recor
 // will now always pass at runtime.
 const claudeDefaults = { mode: "auto", model: "opus-4.7", effort: "high" } as const;
 const codexDefaults = { mode: "auto", model: "gpt-5-codex", effort: "high" } as const;
+// Cursor has no effort knob — omitted from the defaults object entirely
+// (unlike claude/codex, `buildCommand`'s cursor branch never inspects
+// `opts.effort`, so leaving it unset is the realistic runtime shape).
+const cursorDefaults = { mode: "auto", model: "auto" } as const;
 
 test("aliased claude-code with a config-dir override emits CLAUDE_CONFIG_DIR (not HOME)", () => {
   // HOME is deliberately not overridden — see harnessEnv: re-homing breaks
@@ -105,6 +111,24 @@ test("aliased codex env CODEX_HOME overrides the home-derived default", () => {
   );
   expect(result.env?.HOME).toBe("/tmp/agetor-test");
   expect(result.env?.CODEX_HOME).toBe("/custom/path/.codex");
+});
+
+test("aliased cursor with HOME override emits HOME only (no CODEX_HOME)", () => {
+  // cursor-agent has no dedicated config-dir env var, so isolating an
+  // additional account means a plain HOME override — unlike codex, which
+  // also sets CODEX_HOME.
+  const result = buildCommand(
+    alias("cursor", { home: "/tmp/agetor-test/cursor-2" }),
+    "p",
+    { ...cursorDefaults },
+  );
+  expect(result.env?.HOME).toBe("/tmp/agetor-test/cursor-2");
+  expect(result.env?.CODEX_HOME).toBeUndefined();
+});
+
+test("cursor harness without a home override sets neither HOME nor CODEX_HOME (env undefined)", () => {
+  const result = buildCommand(builtin("cursor"), "p", { ...cursorDefaults });
+  expect(result.env).toBeUndefined();
 });
 
 // Claude-code launches the *interactive* REPL — `--print` is gone. The
@@ -423,6 +447,97 @@ test("codex throws when effort is missing for a model that supports it", () => {
   expect(() =>
     buildCommand(builtin("codex"), "hi", { mode: "auto", model: "gpt-5" }),
   ).toThrow(/effort is required/);
+});
+
+// Cursor is hosted in tmux exactly like codex (one-shot turn per invocation),
+// but the prompt is NOT an argv element here — cursor-tmux.ts appends it at
+// spawn time via its own injection-safe quoting. `buildCommand`'s job is just
+// the flags: -p stream-json, --model, the auto/ask force+sandbox posture, and
+// --resume. There is no effort flag at all (cursor-agent has none).
+test("cursor with defaults emits -p --output-format stream-json --model auto --force --sandbox disabled", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults });
+  expect(cmd).toEqual([
+    "cursor-agent",
+    "-p", "--output-format", "stream-json",
+    "--model", "auto",
+    "--force", "--sandbox", "disabled",
+  ]);
+});
+
+test("cursor 'ask' mode emits no --force / --sandbox flags (propose-only — cursor can't execute headlessly)", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, mode: "ask" });
+  expect(cmd).toEqual([
+    "cursor-agent",
+    "-p", "--output-format", "stream-json",
+    "--model", "auto",
+  ]);
+  expect(cmd).not.toContain("--force");
+  expect(cmd).not.toContain("--sandbox");
+});
+
+test("cursor null mode defaults to auto (--force --sandbox disabled), house convention", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { model: "auto", mode: null });
+  expect(cmd).toContain("--force");
+  expect(cmd).toContain("--sandbox");
+  expect(cmd[cmd.indexOf("--sandbox") + 1]).toBe("disabled");
+});
+
+test("cursor explicit model 'claude-opus-4.8' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, model: "claude-opus-4.8" });
+  expect(cmd).toEqual([
+    "cursor-agent",
+    "-p", "--output-format", "stream-json",
+    "--model", "claude-opus-4.8",
+    "--force", "--sandbox", "disabled",
+  ]);
+});
+
+test("cursor unknown model id passes through verbatim (house convention: unknown ids just work)", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, model: "cursor-mystery-9000" });
+  const i = cmd.indexOf("--model");
+  expect(i).toBeGreaterThan(-1);
+  expect(cmd[i + 1]).toBe("cursor-mystery-9000");
+});
+
+test("cursor resumeSessionId adds --resume <id> as the final argv elements (--resume is a flag, no subcommand ordering constraint)", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, resumeSessionId: "sess-99" });
+  expect(cmd.slice(-2)).toEqual(["--resume", "sess-99"]);
+});
+
+test("cursor ignores effort entirely — argv and env are identical with or without an effort id", () => {
+  const withEffort = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, effort: "high" });
+  const withoutEffort = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults });
+  expect(withEffort.cmd).toEqual(withoutEffort.cmd);
+  expect(withEffort.env).toEqual(withoutEffort.env);
+});
+
+test("cursor throws when model is missing", () => {
+  expect(() =>
+    buildCommand(builtin("cursor"), "hi", { mode: "auto" }),
+  ).toThrow(/model is required/);
+});
+
+test("AGETOR_CURSOR_BIN override is respected for the built-in cursor harness", () => {
+  process.env.AGETOR_CURSOR_BIN = "/env-fallback/cursor-agent";
+  expect(buildCommand(builtin("cursor"), "hi", { ...cursorDefaults }).cmd[0]).toBe(
+    "/env-fallback/cursor-agent",
+  );
+});
+
+test("AGETOR_CURSOR_ARGS extra args land after the mode flags and before --resume", () => {
+  process.env.AGETOR_CURSOR_ARGS = "--verbose --foo";
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    resumeSessionId: "sess-1",
+  });
+  expect(cmd).toEqual([
+    "cursor-agent",
+    "-p", "--output-format", "stream-json",
+    "--model", "auto",
+    "--force", "--sandbox", "disabled",
+    "--verbose", "--foo",
+    "--resume", "sess-1",
+  ]);
 });
 
 test("claude-code 'max' effort sets CLAUDE_CODE_EFFORT_LEVEL=max env", () => {
