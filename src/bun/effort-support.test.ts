@@ -87,3 +87,32 @@ test("ordered highest → lowest (no placeholder at the top)", () => {
   const filteredExpected = expectedOrder.filter((id) => ids.includes(id));
   expect(ids).toEqual(filteredExpected);
 });
+
+test("grok DEFAULT_MODEL is grok-build", () => {
+  expect(DEFAULT_MODEL.grok).toBe("grok-build");
+});
+
+test("grok grok-build supports no effort levels (no confirmed CLI reasoning-effort flag)", () => {
+  const ids = supportedEfforts("grok", "grok-build").map((o) => o.id);
+  expect(ids).toEqual([]);
+});
+
+test("grok grok-4.5 supports no effort levels", () => {
+  const ids = supportedEfforts("grok", "grok-4.5").map((o) => o.id);
+  expect(ids).toEqual([]);
+});
+
+test("grok grok-4-fast-reasoning supports no effort levels", () => {
+  const ids = supportedEfforts("grok", "grok-4-fast-reasoning").map((o) => o.id);
+  expect(ids).toEqual([]);
+});
+
+test("grok null model falls back to DEFAULT_MODEL support set (still empty — every grok model declines effort)", () => {
+  const ids = supportedEfforts("grok", null).map((o) => o.id);
+  expect(ids).toEqual([]);
+});
+
+test("grok unknown model falls back to the agent's DEFAULT_MODEL support set (empty)", () => {
+  const ids = supportedEfforts("grok", "grok-future-9000").map((o) => o.id);
+  expect(ids).toEqual([]);
+});

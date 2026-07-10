@@ -15,8 +15,10 @@ beforeEach(() => {
   // absolute path in argv[0] and the equality checks would drift per host.
   process.env.AGETOR_CLAUDE_BIN = "claude";
   process.env.AGETOR_CODEX_BIN = "codex";
+  process.env.AGETOR_GROK_BIN = "grok";
   delete process.env.AGETOR_CLAUDE_ARGS;
   delete process.env.AGETOR_CODEX_ARGS;
+  delete process.env.AGETOR_GROK_ARGS;
 });
 
 /** Build a built-in harness for tests — kind doubles as id, no overrides. */
@@ -455,6 +457,114 @@ test("AGETOR_CODEX_ARGS extra args land before the stdin sentinel", () => {
   process.env.AGETOR_CODEX_ARGS = "--verbose --foo";
   const { cmd } = buildCommand(builtin("codex"), "p", { ...codexDefaults });
   expect(cmd.slice(-3)).toEqual(["--verbose", "--foo", "-"]);
+});
+
+// --- grok ----------------------------------------------------------------
+// Grok Build is hosted via grok-tmux.ts (mirrors codex's one-shot-per-turn
+// pattern), but per D8 the prompt is NOT an argv element the way codex's
+// stdin sentinel is either: `-p` takes an argument, and embedding raw prompt
+// text into shell-quoted argv is quoting hell, so `spawnGrokViaTmux` splices
+// `-p "$(cat <promptfile>)"` in itself. buildCommand's returned argv must
+// never contain `-p` or the prompt text — every test below asserts that
+// explicitly rather than just checking the happy-path shape.
+const grokDefaults = { mode: "auto", model: "grok-build" } as const;
+
+test("grok with defaults emits --output-format streaming-json + -m + bypassPermissions/no-sandbox, no -p/prompt in argv", () => {
+  const { cmd } = buildCommand(builtin("grok"), "the prompt", { ...grokDefaults });
+  expect(cmd).toEqual([
+    "grok",
+    "--output-format", "streaming-json",
+    "-m", "grok-build",
+    "--permission-mode", "bypassPermissions",
+    "--sandbox", "off",
+  ]);
+  expect(cmd).not.toContain("-p");
+  expect(cmd).not.toContain("the prompt");
+});
+
+test("grok 'ask' mode + grok-4.5 + resume emits dontAsk/read-only + --resume, still no -p/prompt", () => {
+  const { cmd } = buildCommand(builtin("grok"), "some prompt text", {
+    mode: "ask",
+    model: "grok-4.5",
+    resumeSessionId: "abc",
+  });
+  expect(cmd).toEqual([
+    "grok",
+    "--output-format", "streaming-json",
+    "-m", "grok-4.5",
+    "--permission-mode", "dontAsk",
+    "--sandbox", "read-only",
+    "--resume", "abc",
+  ]);
+  expect(cmd).not.toContain("-p");
+  expect(cmd).not.toContain("some prompt text");
+});
+
+test("grok unknown model id passes through verbatim to -m", () => {
+  const { cmd } = buildCommand(builtin("grok"), "p", { ...grokDefaults, model: "grok-mystery-9" });
+  const i = cmd.indexOf("-m");
+  expect(cmd[i + 1]).toBe("grok-mystery-9");
+});
+
+test("grok unrecognized mode id falls back to the auto (bypassPermissions/no-sandbox) branch", () => {
+  // Unlike claude-code's verbatim --permission-mode passthrough, grok's D4
+  // mapping is binary: only "ask" is special-cased to the restrictive
+  // read-only posture. Any other id — including a future/unknown one —
+  // gets the hands-off default, mirroring the `mode ?? "auto"` convention
+  // used by claude-code and codex.
+  const { cmd } = buildCommand(builtin("grok"), "p", { ...grokDefaults, mode: "future-mode" });
+  expect(cmd).toContain("bypassPermissions");
+  expect(cmd).toContain("off");
+  expect(cmd).not.toContain("dontAsk");
+  expect(cmd).not.toContain("read-only");
+});
+
+test("grok throws when model is missing", () => {
+  expect(() =>
+    buildCommand(builtin("grok"), "p", { mode: "auto" }),
+  ).toThrow(/model is required/);
+});
+
+test.each(["grok-build", "grok-4.5", "grok-4-fast-reasoning"])(
+  "grok model '%s' emits no effort flag or env, even when an effort id is explicitly passed",
+  (model) => {
+    // D5/A2: no confirmed CLI reasoning-effort flag for any grok model —
+    // unlike claude-code/codex, buildCommand's grok branch never reads
+    // opts.effort at all, so passing one is silently ignored rather than
+    // required or validated.
+    const result = buildCommand(builtin("grok"), "p", { mode: "auto", model, effort: "high" });
+    expect(result.cmd).not.toContain("-c");
+    expect(result.env).toBeUndefined();
+  },
+);
+
+test("aliased grok with a home override emits GROK_HOME (not HOME)", () => {
+  const result = buildCommand(
+    alias("grok", { home: "/tmp/agetor-test/grok-2" }),
+    "p",
+    { ...grokDefaults },
+  );
+  expect(result.env?.GROK_HOME).toBe("/tmp/agetor-test/grok-2");
+  expect(result.env?.HOME).toBeUndefined();
+});
+
+test("aliased grok bin override beats the AGETOR_GROK_BIN env fallback", () => {
+  process.env.AGETOR_GROK_BIN = "/env-fallback/grok";
+  expect(buildCommand(builtin("grok"), "p", { ...grokDefaults }).cmd[0]).toBe("/env-fallback/grok");
+  expect(
+    buildCommand(alias("grok", { bin: "/alias/grok" }), "p", { ...grokDefaults }).cmd[0],
+  ).toBe("/alias/grok");
+});
+
+test("AGETOR_GROK_ARGS extra args land after the sandbox flags and before --resume", () => {
+  process.env.AGETOR_GROK_ARGS = "--verbose --foo";
+  const { cmd } = buildCommand(builtin("grok"), "p", { ...grokDefaults, resumeSessionId: "abc" });
+  const sandboxIdx = cmd.indexOf("--sandbox");
+  const extraIdx = cmd.indexOf("--verbose");
+  const resumeIdx = cmd.indexOf("--resume");
+  expect(extraIdx).toBeGreaterThan(sandboxIdx);
+  expect(resumeIdx).toBeGreaterThan(extraIdx);
+  expect(cmd.slice(extraIdx, extraIdx + 2)).toEqual(["--verbose", "--foo"]);
 });
 
 // Invariant test for AGENT_OPTIONS — guards against re-introducing the
