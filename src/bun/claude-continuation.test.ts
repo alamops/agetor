@@ -741,6 +741,118 @@ test("dispatchLine's background-task settle block still fires for a normal (non-
   }
 });
 
+// ─── Phase 8: uuid-less queue-operation notifications (verified latent bug) ──
+//
+// `queue-operation` lines carry `uuid: null` by design — the PRIMARY shape
+// current claude uses for background-task completion. Before this fix,
+// `maybeAdoptContinuation`'s replay guard (`if (uuid && state.seenLineUuids
+// .has(uuid)) return;`) never blocked a falsy uuid, so a REPLAYED
+// queue-operation line (boot reattach re-reads the JSONL from offset 0)
+// dispatched onto an idle queue re-triggered the continuation factory —
+// spawning a phantom continuation run for activity that already happened.
+// `syntheticNotificationUuid` closes the hole by deriving a deterministic
+// key from the notification's own content.
+
+test("a replayed queue-operation notification line (uuid: null) adopts a continuation exactly once, not twice", () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    let calls = 0;
+    const prev = setContinuationRunFactory((tid) => {
+      calls++;
+      expect(tid).toBe(taskId);
+      return { onChunk: () => {}, onAdopted: () => {} };
+    });
+    try {
+      // No uuid arg — reproduces the real claude 2.1.x shape (`uuid: null`),
+      // not the earlier tests' explicit "uuid-qop" fixture uuid.
+      const line = queueOperationLine(
+        "<task-notification><task-id>agent-replay-dup</task-id></task-notification>",
+      );
+
+      __forTest.dispatchLine(state, line);
+      expect(calls).toBe(1);
+      expect(state.turnQueue.length).toBe(1);
+
+      // Boot reattach re-reads the JSONL from offset 0 — the exact same
+      // bytes are dispatched a second time. Without a synthetic uuid
+      // standing in for the null real uuid, this looked like a brand-new
+      // line and adopted a second, phantom continuation run.
+      __forTest.dispatchLine(state, line);
+
+      expect(calls).toBe(1); // still exactly one — the replay is a no-op
+      expect(state.turnQueue.length).toBe(1);
+    } finally {
+      setContinuationRunFactory(prev);
+      clearArmedWatchdog(state);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("reattach-style: pre-seeding seenLineUuids with a queue-operation line's synthetic uuid suppresses adoption but the settle signal still fires", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+
+    const content = "<task-notification><task-id>agent-reattach-seed</task-id></task-notification>";
+    // Mirrors how reattach seeds seenLineUuids from run_events.line_uuid —
+    // the synthetic key computed the same way `dispatchLine` derives it.
+    state.seenLineUuids.add(__forTest.syntheticNotificationUuid(content));
+
+    let calls = 0;
+    const prevFactory = setContinuationRunFactory(() => {
+      calls++;
+      return { onChunk: () => {}, onAdopted: () => {} };
+    });
+    const settleCalls: string[] = [];
+    const prevSettle = setBackgroundTaskSettledHandler((_tid, agentId) => {
+      settleCalls.push(agentId);
+    });
+    try {
+      __forTest.dispatchLine(state, queueOperationLine(content));
+
+      expect(calls).toBe(0); // adoption suppressed — this key is already "seen"
+      expect(state.turnQueue.length).toBe(0);
+      // The settle block runs BEFORE the dedup early-return by design (see
+      // dispatchLine's comment) — a reattach replay may be the only chance
+      // to learn a background agent settled while the process was down, and
+      // markSettledById is idempotent — so it must still fire here.
+      expect(settleCalls).toEqual(["agent-reattach-seed"]);
+    } finally {
+      setContinuationRunFactory(prevFactory);
+      setBackgroundTaskSettledHandler(prevSettle);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("the status breadcrumb for a uuid-less queue-operation notification carries the synthetic uuid as its lineUuid", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    // No factory installed → falls back to lastChunk routing (the first
+    // turn's own recorder), same convention as the "factory returning null"
+    // / "no factory installed" tests above.
+    const firstOut = await resolveFirstTurn(state, jsonlPath);
+
+    const content = "<task-notification><task-id>agent-breadcrumb</task-id></task-notification>";
+    const expectedUuid = __forTest.syntheticNotificationUuid(content);
+
+    appendFileSync(jsonlPath, queueOperationLine(content));
+    __forTest.flushSync(state);
+
+    const breadcrumb = firstOut.find((r) => r.stream === "status" && r.data === "background task completed");
+    expect(breadcrumb).toBeDefined();
+    expect(breadcrumb!.uuid).toBe(expectedUuid);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
 test("with no factory installed at all, behavior is identical to pre-change: no calls, routes via lastChunk", async () => {
   const { taskId, jsonlPath } = freshSession();
   const state = __forTest.installSession(taskId, jsonlPath);

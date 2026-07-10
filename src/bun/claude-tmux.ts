@@ -553,6 +553,43 @@ function extractTaskNotificationAgentId(content: string): string | null {
 }
 
 /**
+ * Deterministic stand-in uuid for a JSONL line that carries `uuid: null` —
+ * today this is only `queue-operation` notification lines (claude 2.1.x's
+ * PRIMARY shape for reporting a background command/agent's completion; see
+ * `taskNotificationContent`'s doc comment). A falsy real uuid never satisfies
+ * `dispatchLine`'s `uuid && state.seenLineUuids.has(uuid)` replay guard (nor
+ * `maybeAdoptContinuation`'s copy of it), so without a synthetic key a
+ * reattach replay (boot re-reads the JSONL from offset 0) looks exactly like
+ * a brand-new line: `maybeAdoptContinuation` re-adopts a phantom continuation
+ * run, and the status breadcrumb double-persists into `run_events` (its
+ * `uuid: undefined` third `onChunk` arg defeats both the in-memory dedup and
+ * the DB's `(run_id, line_uuid)` partial unique index).
+ *
+ * Hashing `content` (the notification's own XML payload, which is stable
+ * across re-reads of the same physical line) gives every caller — the
+ * seenLineUuids dedup check, `maybeAdoptContinuation`'s replay guard, and the
+ * breadcrumb chunk's persisted `line_uuid` — the identical key for the
+ * identical line, including across process restarts. MUST stay a pure
+ * function of `content` — no `Date.now()`/`Math.random()` — or reattach's
+ * offset-0 replay would mint a different key than the first pass and the
+ * whole point of this helper falls apart.
+ *
+ * Hand-rolled FNV-1a (32-bit) rather than `Bun.hash` — FNV-1a's algorithm is
+ * a tiny, permanently-fixed public spec, so a synthetic uuid computed by one
+ * agetor version matches one computed by the next; `Bun.hash`'s algorithm
+ * carries no such stability guarantee across Bun releases. Prefixed for
+ * greppability in `run_events.line_uuid`.
+ */
+function syntheticNotificationUuid(content: string): string {
+  let hash = 0x811c9dc5; // FNV-1a 32-bit offset basis
+  for (let i = 0; i < content.length; i++) {
+    hash ^= content.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193); // FNV-1a 32-bit prime
+  }
+  return `qnotif:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+/**
  * True when `evt`, once mapped, would emit genuine conversational content —
  * a `user` / `assistant` / `thinking` / `tool_use` / `tool_result` chunk —
  * rather than a bare status/heartbeat breadcrumb. One of two adoption
@@ -856,10 +893,14 @@ function mapParsedEventToChunks(
       // Older versions used a synthetic `user` event with
       // `origin.kind: "task-notification"` (the user branch above still
       // handles that for forward/backward compat). queue-operation lines
-      // carry `uuid: null` so they bypass the seenLineUuids dedup
-      // entirely — that's fine, each enqueue is broadcast once per
-      // process and reattach hits a different file offset.
+      // carry `uuid: null` by design — reattach re-reads the JSONL from
+      // offset 0, so a real uuid-less broadcast WOULD be re-dispatched on
+      // restart. Stand in a deterministic hash of the content
+      // (`syntheticNotificationUuid`) so the breadcrumb's persisted
+      // `line_uuid` still dedups a replay, mirroring the same substitution
+      // `dispatchLine` makes for `seenLineUuids`/`maybeAdoptContinuation`.
       if (evt.operation === "enqueue" && typeof evt.content === "string") {
+        const notifUuid = uuid ?? syntheticNotificationUuid(evt.content);
         const summary = /<summary>([\s\S]*?)<\/summary>/.exec(evt.content)?.[1]?.trim();
         // Mirror the existing user/origin.kind handler's fallback: when a
         // task-notification payload arrives without a `<summary>` (older
@@ -868,10 +909,11 @@ function mapParsedEventToChunks(
         // silently — something measurable happened, and the run panel
         // shouldn't go dark on it.
         if (summary) {
-          onChunk("status", `background task: ${summary}`, uuid);
+          onChunk("status", `background task: ${summary}`, notifUuid);
         } else if (evt.content.startsWith("<task-notification>")) {
-          onChunk("status", "background task completed", uuid);
+          onChunk("status", "background task completed", notifUuid);
         }
+        return { endOfTurn: false, lineUuid: notifUuid };
       }
       return { endOfTurn: false, lineUuid: uuid };
     }
@@ -2142,15 +2184,24 @@ function fireContinuationWatchdog(state: SessionState): void {
  *
  * Because this now runs ABOVE the `seenLineUuids` dedup return, it carries
  * its own replay guard reproducing that exact condition: a line only
- * reaches adoption when NOT (`uuid && state.seenLineUuids.has(uuid)`).
- * Uuid-less lines (e.g. `queue-operation` notifications, which carry
- * `uuid: null`) are never excluded by this guard — only a line whose uuid we
- * HAVE already seen is.
+ * reaches adoption when NOT (`uuid && state.seenLineUuids.has(uuid)`). This
+ * guard is what makes queue-operation notification replay-safe: `uuid` here
+ * is `dispatchLine`'s already-resolved key — the JSONL line's real uuid when
+ * it has one, else `syntheticNotificationUuid(notifContent)` — never the raw
+ * (possibly-null) `evt.uuid`, so a replayed uuid-less notification IS
+ * excluded by this guard just like any other already-seen line.
+ *
+ * `notifContent` is passed in by the caller (`dispatchLine` computes
+ * `taskNotificationContent(evt)` once and reuses it for the settle block and
+ * the synthetic-uuid derivation too) rather than recomputed here.
  */
-function maybeAdoptContinuation(state: SessionState, evt: ParsedJsonlEvent, uuid: string | undefined): void {
+function maybeAdoptContinuation(
+  state: SessionState,
+  evt: ParsedJsonlEvent,
+  uuid: string | undefined,
+  notifContent: string | null,
+): void {
   if (uuid && state.seenLineUuids.has(uuid)) return;
-
-  const notifContent = taskNotificationContent(evt);
 
   // A second (or later) task-notification while a notification-adopted turn
   // is still waiting for real content is itself a fresh "claude noticed
@@ -2208,7 +2259,23 @@ function dispatchLine(state: SessionState, line: string): void {
     handler?.("stderr", `jsonl parse error: ${(e as Error).message}`);
     return;
   }
-  const uuid = typeof evt.uuid === "string" ? evt.uuid : undefined;
+  const rawUuid = typeof evt.uuid === "string" ? evt.uuid : undefined;
+  // queue-operation notification lines carry `uuid: null` by design (claude
+  // 2.1.x's PRIMARY shape for a background command/agent completion — see
+  // `taskNotificationContent`). A falsy uuid never satisfies the
+  // seenLineUuids replay guard below (nor `maybeAdoptContinuation`'s copy of
+  // it), so a boot reattach replaying the JSONL from offset 0 would
+  // re-dispatch the SAME notification as if it were brand new: a second,
+  // phantom continuation run gets adopted, and the breadcrumb double-persists
+  // into run_events (its uuid:undefined third onChunk arg defeats both the
+  // in-memory dedup and the DB's `(run_id, line_uuid)` partial unique index).
+  // Deriving a deterministic stand-in from the notification's own content
+  // closes both holes with one key, computed once here and threaded through:
+  // this dedup check, `maybeAdoptContinuation`'s replay guard, and (via
+  // `mapParsedEventToChunks`, which independently derives the identical value
+  // from `evt.content`) the persisted `run_events.line_uuid`.
+  const notifContent = taskNotificationContent(evt);
+  const uuid = rawUuid ?? (notifContent ? syntheticNotificationUuid(notifContent) : undefined);
 
   // Mirror the latest mode-bearing JSONL event into SessionState.
   // IMPORTANT: this update MUST stay above the seenLineUuids early-return.
@@ -2254,7 +2321,7 @@ function dispatchLine(state: SessionState, line: string): void {
   // card snaps back to `running`. See `maybeAdoptContinuation` for the full
   // eligibility rules (content OR task-notification, plus the watchdog it
   // arms for the notification case).
-  maybeAdoptContinuation(state, evt, uuid);
+  maybeAdoptContinuation(state, evt, uuid, notifContent);
 
   // Background-task/agent settle signal. Deliberately runs BEFORE the dedup
   // early-return below (unlike `maybeAdoptContinuation` just above, which
@@ -2277,7 +2344,6 @@ function dispatchLine(state: SessionState, line: string): void {
   // eligibility check on its own), just made explicit here since this block
   // runs unconditionally rather than through a factory.
   if (state.taskId !== "__rebuild__") {
-    const notifContent = taskNotificationContent(evt);
     if (notifContent) {
       const agentId = extractTaskNotificationAgentId(notifContent);
       if (agentId) fireBackgroundTaskSettled(state.taskId, agentId);
@@ -4258,6 +4324,10 @@ export const __forTest = {
    *  null when not armed. Exposed so a test can assert arm/reset/clear
    *  transitions without reaching into module-private state another way. */
   getContinuationWatchdog(state: SessionState) { return state.continuationWatchdog; },
+  /** Deterministic stand-in uuid for a uuid-less notification line (see its
+   *  doc comment above). Exposed so tests can compute the expected key for a
+   *  given payload rather than hardcoding a hash literal. */
+  syntheticNotificationUuid,
 };
 
 /**
