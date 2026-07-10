@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test, expect, afterAll } from "bun:test";
 import { mkdtempSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -8,8 +8,22 @@ import { randomUUID } from "node:crypto";
 // same convention as claude-tmux-queue.test.ts / claude-tmux-death.test.ts.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-continuation-"));
 
-const { __forTest, setContinuationRunFactory, setBackgroundTaskSettledHandler } = await import("./claude-tmux.ts");
+const { __forTest, setContinuationRunFactory, setBackgroundTaskSettledHandler, setContinuationWatchdogMs } =
+  await import("./claude-tmux.ts");
 import type { ContinuationHooks, SpawnedAgent, ChunkHandler } from "./claude-tmux.ts";
+
+// Safety net for the whole file: several tests below arm a REAL
+// notification-triggered watchdog (a real `setTimeout`, per
+// `armContinuationWatchdog` — see claude-tmux.ts). Every such test cancels
+// its own timer explicitly (see `clearArmedWatchdog` below), but shrinking
+// the default window here too means a test that forgets can't leave a real
+// ~10-minute timer pending past this file's run — which would otherwise
+// block `bun test`'s process exit rather than just failing an assertion.
+// Restored in `afterAll` so it can't leak into a sibling test file.
+const prevWatchdogMs = setContinuationWatchdogMs(50);
+afterAll(() => {
+  setContinuationWatchdogMs(prevWatchdogMs);
+});
 
 // ─── fixtures ───────────────────────────────────────────────────────────
 
@@ -104,6 +118,18 @@ async function withContinuationFactory<T>(
   }
 }
 
+/** Cancel any real (armed) watchdog timer on `state` directly, bypassing the
+ *  normal SUT clear path. A per-test cleanup companion to the module-level
+ *  `setContinuationWatchdogMs` shrink above — call this in a `finally` for
+ *  any test that arms a notification-triggered watchdog and doesn't already
+ *  let it resolve/clear itself (via content arriving, a real end_turn, or an
+ *  explicit `__forTest.fireContinuationWatchdog` call), so no real timer
+ *  outlives the test. */
+function clearArmedWatchdog(state: ReturnType<typeof __forTest.installSession>): void {
+  const wd = __forTest.getContinuationWatchdog(state);
+  if (wd) clearTimeout(wd.timer);
+}
+
 // ─── tests ──────────────────────────────────────────────────────────────
 
 test("a genuinely-new assistant content line after a resolved turn adopts a continuation exactly once, onAdopted before the first chunk", async () => {
@@ -145,6 +171,10 @@ test("a genuinely-new assistant content line after a resolved turn adopts a cont
     expect(adoptedHandle).not.toBeNull();
     // The adopted slot is now the live turn.
     expect(state.turnQueue.length).toBe(1);
+    // Content-triggered adoption needs no watchdog — real content already
+    // arrived, so there's nothing to wait for (contrast with the
+    // notification-triggered adoption tests below, which DO arm one).
+    expect(__forTest.getContinuationWatchdog(state)).toBeNull();
   } finally {
     __forTest.uninstallSession(taskId);
   }
@@ -217,41 +247,91 @@ test("replayed (deduped) lines do not trigger the factory even when they'd other
   }
 });
 
-test("a task-notification breadcrumb (user, origin.kind=task-notification) does not trigger the factory", async () => {
+// ─── notification-triggered adoption (docs/plans/adopt-continuation-on-task-notification.md §3) ──
+//
+// `maybeAdoptContinuation`'s eligibility is now `isContinuationContentEvent(evt)
+// || taskNotificationContent(evt) !== null` — a task-notification line is
+// itself an adoption trigger (not just a precursor the model must "confirm"
+// with real content), specifically so the card snaps to `running` for the
+// whole extended-thinking window that can precede the first content line.
+// Adoption on a notification also arms `CONTINUATION_WATCHDOG_MS` — see the
+// watchdog section further below.
+
+test("a provably-new task-notification line with no turn in flight adopts a continuation, arms the watchdog, and routes both the breadcrumb and subsequent content through the adopted slot", async () => {
   const { taskId, jsonlPath } = freshSession();
   const state = __forTest.installSession(taskId, jsonlPath);
   try {
     await resolveFirstTurn(state, jsonlPath);
 
     let calls = 0;
-    const prev = setContinuationRunFactory(() => {
+    const cont = recorder();
+    let adoptedHandle: SpawnedAgent | null = null;
+    const prev = setContinuationRunFactory((tid) => {
       calls++;
-      return { onChunk: () => {}, onAdopted: () => {} };
+      expect(tid).toBe(taskId);
+      return { onChunk: cont.onChunk, onAdopted: (h) => { adoptedHandle = h; } };
     });
     try {
       appendFileSync(jsonlPath, taskNotificationLine("agent-123", "uuid-notif"));
       __forTest.flushSync(state);
 
-      expect(calls).toBe(0);
-      expect(state.turnQueue.length).toBe(0);
+      expect(calls).toBe(1);
+      expect(adoptedHandle).not.toBeNull();
+      expect(state.turnQueue.length).toBe(1); // adopted slot pushed, no turn resolved yet
+
+      // The notification line itself is not silent — it routes through the
+      // now-adopted slot as a status breadcrumb (mapParsedEventToChunks'
+      // `user`/`origin.kind=task-notification` case: no `<summary>` tag in
+      // this fixture, so it falls back to the generic message).
+      expect(cont.out.some((r) => r.stream === "status" && r.data === "background task completed")).toBe(true);
+
+      // Notification-triggered adoption is a bet that claude will keep
+      // talking — unlike content-triggered adoption, it arms a watchdog.
+      const armed = __forTest.getContinuationWatchdog(state);
+      expect(armed).not.toBeNull();
+      expect(armed!.slot).toBe(state.turnQueue[0]!);
+
+      // Genuine content then arrives on the adopted slot...
+      appendFileSync(jsonlPath, assistantLineId("continuing after background task", "msg-2", "uuid-2"));
+      __forTest.flushSync(state);
+
+      expect(calls).toBe(1); // still exactly one adoption — no re-adopt on content
+      expect(cont.out.some((r) => r.data === "continuing after background task")).toBe(true);
+      // ...which proves the continuation is real and clears the watchdog.
+      expect(__forTest.getContinuationWatchdog(state)).toBeNull();
     } finally {
       setContinuationRunFactory(prev);
+      clearArmedWatchdog(state);
     }
   } finally {
     __forTest.uninstallSession(taskId);
   }
 });
 
-test("a queue-operation breadcrumb does not trigger the factory", async () => {
+test("a queue-operation breadcrumb — the other task-notification shape — also adopts a continuation with a watchdog armed, exactly like the user/origin shape", async () => {
+  // `taskNotificationContent` treats `queue-operation`/`enqueue` and
+  // `user`/`origin.kind=task-notification` as the SAME signal (see its
+  // doc comment: "one of the two shapes claude uses to report a background
+  // command/agent's completion") — both are meant to arm the watchdog and
+  // pull the card to `running` for the extended-thinking window. This
+  // supersedes an earlier assumption (encoded in this file's previous
+  // version) that queue-operation breadcrumbs never adopt; empirically,
+  // `maybeAdoptContinuation`'s eligibility check
+  // (`isContinuationContentEvent(evt) || taskNotificationContent(evt) !== null`)
+  // is satisfied by a queue-operation/enqueue line with string `content`,
+  // and this test pins that down against the real implementation rather
+  // than the earlier assumption.
   const { taskId, jsonlPath } = freshSession();
   const state = __forTest.installSession(taskId, jsonlPath);
   try {
     await resolveFirstTurn(state, jsonlPath);
 
     let calls = 0;
-    const prev = setContinuationRunFactory(() => {
+    let adoptedHandle: SpawnedAgent | null = null;
+    const prev = setContinuationRunFactory((tid) => {
       calls++;
-      return { onChunk: () => {}, onAdopted: () => {} };
+      expect(tid).toBe(taskId);
+      return { onChunk: () => {}, onAdopted: (h) => { adoptedHandle = h; } };
     });
     try {
       appendFileSync(
@@ -260,8 +340,42 @@ test("a queue-operation breadcrumb does not trigger the factory", async () => {
       );
       __forTest.flushSync(state);
 
+      expect(calls).toBe(1);
+      expect(adoptedHandle).not.toBeNull();
+      expect(state.turnQueue.length).toBe(1);
+      expect(__forTest.getContinuationWatchdog(state)).not.toBeNull();
+    } finally {
+      setContinuationRunFactory(prev);
+      clearArmedWatchdog(state);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("a task-notification line whose uuid was already seen (reattach replay) does not trigger the factory", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+
+    // Simulate this notification line having already been dispatched in a
+    // prior process — pre-seed the dedup set the way reattach does (same
+    // technique the existing content-line replay test above uses).
+    state.seenLineUuids.add("uuid-replayed-notif");
+
+    let calls = 0;
+    const prev = setContinuationRunFactory(() => {
+      calls++;
+      return { onChunk: () => {}, onAdopted: () => {} };
+    });
+    try {
+      appendFileSync(jsonlPath, taskNotificationLine("agent-replayed", "uuid-replayed-notif"));
+      __forTest.flushSync(state);
+
       expect(calls).toBe(0);
       expect(state.turnQueue.length).toBe(0);
+      expect(__forTest.getContinuationWatchdog(state)).toBeNull();
     } finally {
       setContinuationRunFactory(prev);
     }
@@ -270,7 +384,259 @@ test("a queue-operation breadcrumb does not trigger the factory", async () => {
   }
 });
 
-test("a status-only breadcrumb followed by genuine content still adopts on the content line, not the breadcrumb", async () => {
+test("a second task-notification line while the watchdog is already armed resets it (same slot, fresh timer) instead of re-adopting", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+
+    let calls = 0;
+    const prev = setContinuationRunFactory(() => {
+      calls++;
+      return { onChunk: () => {}, onAdopted: () => {} };
+    });
+    try {
+      appendFileSync(jsonlPath, taskNotificationLine("agent-first", "uuid-notif-a"));
+      __forTest.flushSync(state);
+      expect(calls).toBe(1);
+      const wd1 = __forTest.getContinuationWatchdog(state);
+      expect(wd1).not.toBeNull();
+
+      appendFileSync(jsonlPath, taskNotificationLine("agent-second", "uuid-notif-b"));
+      __forTest.flushSync(state);
+
+      expect(calls).toBe(1); // no re-adoption — the eligibility guard rejects
+      // it anyway (turnQueue is non-empty), so maybeAdoptContinuation's
+      // early "reset, don't re-adopt" branch is what actually runs.
+      const wd2 = __forTest.getContinuationWatchdog(state);
+      expect(wd2).not.toBeNull();
+      expect(wd2!.slot).toBe(wd1!.slot); // still guarding the SAME continuation
+      expect(wd2!.timer).not.toBe(wd1!.timer); // but a fresh timer — the window restarted
+      expect(state.turnQueue.length).toBe(1);
+    } finally {
+      setContinuationRunFactory(prev);
+      clearArmedWatchdog(state);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+// ─── continuation watchdog: fire + stale-fire guards ───────────────────────
+
+test("the continuation watchdog firing settles the adopted turn as succeeded, emitting the settle-status chunk through the normal end-turn path", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+
+    const cont = recorder();
+    let handle: SpawnedAgent | null = null;
+    const prev = setContinuationRunFactory(() => ({
+      onChunk: cont.onChunk,
+      onAdopted: (h) => { handle = h; },
+    }));
+    try {
+      appendFileSync(jsonlPath, taskNotificationLine("agent-watchdog", "uuid-notif-wd"));
+      __forTest.flushSync(state);
+      expect(handle).not.toBeNull();
+      expect(__forTest.getContinuationWatchdog(state)).not.toBeNull();
+
+      // Drive the destructive branch directly instead of waiting out
+      // CONTINUATION_WATCHDOG_MS (real minutes, even at this file's shrunk
+      // override) — __forTest exposes fireContinuationWatchdog exactly for
+      // deterministic tests like this one.
+      __forTest.fireContinuationWatchdog(state);
+
+      expect(cont.out.some((r) =>
+        r.stream === "status" && r.data === "no continuation followed the background task; settling",
+      )).toBe(true);
+      // Resolves through the normal end-turn path (firePendingEndTurn ->
+      // popEndOfTurn), same as any other turn completion.
+      await expect(handle!.done).resolves.toBe(0);
+      expect(state.turnQueue.length).toBe(0);
+      expect(__forTest.getContinuationWatchdog(state)).toBeNull();
+    } finally {
+      setContinuationRunFactory(prev);
+      clearArmedWatchdog(state);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("firing the watchdog again after it already settled the turn is a clean no-op (no double resolution)", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+
+    let handle: SpawnedAgent | null = null;
+    const prev = setContinuationRunFactory(() => ({
+      onChunk: () => {},
+      onAdopted: (h) => { handle = h; },
+    }));
+    try {
+      appendFileSync(jsonlPath, taskNotificationLine("agent-refire", "uuid-notif-refire"));
+      __forTest.flushSync(state);
+      expect(handle).not.toBeNull();
+
+      __forTest.fireContinuationWatchdog(state);
+      await expect(handle!.done).resolves.toBe(0);
+      expect(state.turnQueue.length).toBe(0);
+      expect(__forTest.getContinuationWatchdog(state)).toBeNull();
+
+      // Re-fire: `state.continuationWatchdog` is already null (one-shot),
+      // so this must be inert — no throw, no further queue mutation.
+      expect(() => __forTest.fireContinuationWatchdog(state)).not.toThrow();
+      expect(state.turnQueue.length).toBe(0);
+    } finally {
+      setContinuationRunFactory(prev);
+      clearArmedWatchdog(state);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("firing a watchdog whose armed slot is no longer the active turn is a no-op that leaves the new turn untouched", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    await resolveFirstTurn(state, jsonlPath);
+
+    const prev = setContinuationRunFactory(() => ({ onChunk: () => {}, onAdopted: () => {} }));
+    try {
+      appendFileSync(jsonlPath, taskNotificationLine("agent-stale-slot", "uuid-notif-stale"));
+      __forTest.flushSync(state);
+      const armed = __forTest.getContinuationWatchdog(state);
+      expect(armed).not.toBeNull();
+      expect(state.turnQueue[0]).toBe(armed!.slot);
+
+      // Reproduce the race `fireContinuationWatchdog`'s own doc comment
+      // calls out: a timer callback already queued on the event loop when
+      // something else advanced the turn queue past the guarded slot, a
+      // beat before the timer's own clear could run. Displace the adopted
+      // slot and put a DIFFERENT slot at the head WITHOUT going through the
+      // normal clear path (which would have nulled `continuationWatchdog`),
+      // so the stale reference survives to be fired against a slot that's
+      // no longer current.
+      const displaced = state.turnQueue.shift();
+      expect(displaced).toBe(armed!.slot);
+      let bResolved = false;
+      const bSlot = { onChunk: () => {}, resolve: () => { bResolved = true; }, reject: () => {} };
+      state.turnQueue.push(bSlot as unknown as (typeof state.turnQueue)[number]);
+
+      __forTest.fireContinuationWatchdog(state);
+
+      // Guard tripped on slot identity (`state.turnQueue[0] !== armed.slot`):
+      // bSlot is untouched, no double resolution of anything.
+      expect(bResolved).toBe(false);
+      expect(state.turnQueue.length).toBe(1);
+      expect(state.turnQueue[0]).toBe(bSlot);
+      // One-shot regardless of outcome: the stale reference is gone either way.
+      expect(__forTest.getContinuationWatchdog(state)).toBeNull();
+    } finally {
+      setContinuationRunFactory(prev);
+      clearArmedWatchdog(state);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+// ─── old-run vs adoption interleaving (docs/plans §3 "must verify, not assume") ──
+//
+// A task-notification line can, in the same dispatch, both (a) confirm a
+// staged `pendingEndTurn` from the turn that just ended — the OLD run's
+// slot.resolve() runs synchronously, but anything chained on that `done`
+// promise via `.then()` only runs as a queued MICROTASK — and (b) itself be
+// the adoption trigger for the continuation, whose `onAdopted` hook fires
+// synchronously inside the very same `dispatchLine` call. This test pins
+// down that ordering guarantee at the claude-tmux level: `onAdopted` (and
+// the background-task settle handler) provably complete before the OLD
+// run's `.then()` ever gets a turn, which is exactly the property
+// `dispatchLine`'s own comment relies on ("adopting first means the
+// orchestrator's release check sees task.runId already pointing at a
+// running continuation run and bails — no `review` flicker").
+//
+// NOTE: the deeper orchestrator-level assertion — that `attachDoneHandler`'s
+// `.then()` on the OLD run actually reads `task.runId` and bails because it
+// already points at the new continuation run — needs the real orchestrator
+// (DB-backed task.runId, attachDoneHandler), not this file's synthetic
+// SessionState harness. Checked `src/bun/orchestrator-continuation.test.ts`
+// for overlap: it covers the factory's DB effects (new run row, column
+// pull-back, the #92 hold, fold-while-busy) but has no test that races an
+// OLD run's done-resolution microtask against a notification-triggered
+// adoption on the same line. That combination is NOT covered anywhere
+// today — flagged in this file's owning task's summary as a gap for a
+// follow-up in orchestrator-continuation.test.ts (out of this file's
+// boundary).
+test("notification-triggered adoption (onAdopted, settle handler) runs synchronously ahead of the OLD run's done-promise microtask", async () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    // Stage (but do not fire) an OLD turn's end_turn — driving dispatchLine
+    // directly (not flushSync, which unconditionally fires any staged
+    // pendingEndTurn after its batch on the assumption a new prompt is about
+    // to be queued) reproduces the state a background-task auto-resume
+    // finds: the previous line ended the turn, but nothing has confirmed
+    // that yet, so the OLD slot is still the turnQueue head.
+    const old = recorder();
+    const oldDone = __forTest.pushTurnSlot(state, old.onChunk);
+    const order: string[] = [];
+    oldDone.then(() => order.push("old-run-then"));
+
+    __forTest.dispatchLine(state, endTurnLineId("old run's last line", "msg-old", "uuid-old"));
+    expect(state.turnQueue.length).toBe(1); // staged, not fired
+
+    const settleCalls: string[] = [];
+    const prevSettle = setBackgroundTaskSettledHandler((_tid, agentId) => {
+      settleCalls.push(agentId);
+      order.push("settle-handler");
+    });
+    const prevFactory = setContinuationRunFactory(() => ({
+      onChunk: () => {},
+      onAdopted: () => { order.push("adopted"); },
+    }));
+    try {
+      // ONE line both confirms the staged end_turn (staging block, fires
+      // synchronously, popping the OLD slot and scheduling its resolve as a
+      // microtask) AND is itself a fresh task-notification (adoption
+      // trigger, which dispatchLine runs BEFORE the settle block). All of
+      // that happens synchronously inside this single call.
+      __forTest.dispatchLine(state, taskNotificationLine("agent-interleave", "uuid-notif-interleave"));
+
+      // Synchronous work is done; the OLD run's .then() has NOT run yet —
+      // it's still sitting in the microtask queue behind this call.
+      expect(order).toEqual(["adopted", "settle-handler"]);
+      expect(settleCalls).toEqual(["agent-interleave"]);
+
+      // Now let microtasks drain.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(order).toEqual(["adopted", "settle-handler", "old-run-then"]);
+      await expect(oldDone).resolves.toBe(0);
+    } finally {
+      setContinuationRunFactory(prevFactory);
+      setBackgroundTaskSettledHandler(prevSettle);
+      clearArmedWatchdog(state);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("a task-notification breadcrumb immediately followed by genuine content in the same batch: adoption happens on the breadcrumb, the content line does not re-adopt", async () => {
+  // Previously (pre adopt-on-notification) this scenario adopted on the
+  // content line, since the breadcrumb alone wasn't eligible. Now the
+  // breadcrumb itself adopts — this test pins down that a content line
+  // arriving in the SAME flushSync batch right behind it is a no-op for the
+  // factory (maybeAdoptContinuation's `state.turnQueue.length !== 0` guard
+  // rejects it — the queue is already non-empty from the breadcrumb's
+  // adoption) while still delivering the content to the adopted slot and
+  // clearing its watchdog.
   const { taskId, jsonlPath } = freshSession();
   const state = __forTest.installSession(taskId, jsonlPath);
   try {
@@ -288,10 +654,15 @@ test("a status-only breadcrumb followed by genuine content still adopts on the c
       appendFileSync(jsonlPath, assistantLineId("resuming after the background task", "msg-3", "uuid-4"));
       __forTest.flushSync(state);
 
-      expect(calls).toEqual([taskId]); // adopted exactly once, on the content line
+      expect(calls).toEqual([taskId]); // adopted exactly once, not twice
+      expect(cont.out.some((r) => r.stream === "status" && r.data === "background task completed")).toBe(true);
       expect(cont.out.some((r) => r.data === "resuming after the background task")).toBe(true);
+      // The content line (dispatched to the same, already-adopted slot in
+      // this same batch) clears the watchdog the breadcrumb armed.
+      expect(__forTest.getContinuationWatchdog(state)).toBeNull();
     } finally {
       setContinuationRunFactory(prev);
+      clearArmedWatchdog(state);
     }
   } finally {
     __forTest.uninstallSession(taskId);
