@@ -38,8 +38,11 @@ export const PROMPT_NOISE_RE = [
   // and/or "esc to interrupt". That combination doesn't occur in legitimate
   // modal body/choice text (e.g. "Do you want to proceed?", "1. Yes, run
   // it") or in a plain "please wait…" status line with no parenthesized
-  // tail, so it can't be tripped by those.
-  /(?:…|\.\.\.)\s*\([^)]*(?:\d+\s*[hms]\b|\btokens?\b|\besc to interrupt\b)[^)]*\)\s*$/i,
+  // tail, so it can't be tripped by those. The token branch requires the
+  // numeric count the real footer always carries ("3.7k tokens") — a bare
+  // "tokens" must NOT strip, or a permission excerpt like "Read secrets…
+  // (rotates auth tokens)" would silently lose approval context.
+  /(?:…|\.\.\.)\s*\([^)]*(?:\d+\s*[hms]\b|\d[\d.,]*\s*[km]?\s*tokens?\b|\besc to interrupt\b)[^)]*\)\s*$/i,
 ];
 
 /** Does `line` match one of the noise patterns above? */
