@@ -131,6 +131,7 @@ async function seedPriorRun(
     tmuxSession: `agetor-test-${taskId}`,
     claudeSessionId: opts.claudeSessionId ?? null,
     codexSessionId: opts.codexSessionId ?? null,
+    cursorSessionId: null,
   });
   tasks.update(taskId, { column: opts.column ?? "review", runId });
   return runId;

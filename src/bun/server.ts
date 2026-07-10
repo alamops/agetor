@@ -603,9 +603,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof body.id !== "string" || !body.id.trim()) {
             return json({ error: "id required" }, { status: 400, headers: corsHeaders(req) });
           }
-          if (body.kind !== "claude-code" && body.kind !== "codex") {
+          if (body.kind !== "claude-code" && body.kind !== "codex" && body.kind !== "cursor") {
             return json(
-              { error: "kind must be 'claude-code' or 'codex'" },
+              { error: "kind must be 'claude-code', 'codex', or 'cursor'" },
               { status: 400, headers: corsHeaders(req) },
             );
           }
@@ -860,6 +860,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             {
               "claude-code": getDiscoveredModels("claude-code"),
               "codex": getDiscoveredModels("codex"),
+              "cursor": getDiscoveredModels("cursor"),
             },
             { headers: corsHeaders(req) },
           )),
@@ -869,6 +870,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             {
               "claude-code": getDiscoveredModels("claude-code"),
               "codex": getDiscoveredModels("codex"),
+              "cursor": getDiscoveredModels("cursor"),
             },
             { headers: corsHeaders(req) },
           );

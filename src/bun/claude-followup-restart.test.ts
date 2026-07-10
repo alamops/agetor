@@ -115,6 +115,7 @@ test("follow-up to a task whose session outlived the process resumes instead of 
       tmuxSession: sessionName,
       claudeSessionId: "prior-claude-session-id",
       codexSessionId: null,
+      cursorSessionId: null,
     });
 
     const result = sendInput(priorRunId, "please continue");

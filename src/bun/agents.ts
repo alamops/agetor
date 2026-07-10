@@ -8,6 +8,7 @@ import {
   type SpawnedAgent,
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
+import { spawnCursorViaTmux } from "./cursor-tmux.ts";
 import { gitWritableRootsSync } from "./worktree.ts";
 
 export type { SpawnedAgent };
@@ -119,10 +120,22 @@ function modelDeclinesEffort(kind: AgentKind, model: string): boolean {
  */
 export function resolveBin(harness: Harness): string {
   if (harness.bin) return harness.bin;
-  const fallback = harness.kind === "claude-code" ? "claude" : "codex";
-  const override = harness.kind === "claude-code"
-    ? process.env.AGETOR_CLAUDE_BIN
-    : process.env.AGETOR_CODEX_BIN;
+  let fallback: string;
+  let override: string | undefined;
+  switch (harness.kind) {
+    case "claude-code":
+      fallback = "claude";
+      override = process.env.AGETOR_CLAUDE_BIN;
+      break;
+    case "codex":
+      fallback = "codex";
+      override = process.env.AGETOR_CODEX_BIN;
+      break;
+    case "cursor":
+      fallback = "cursor-agent";
+      override = process.env.AGETOR_CURSOR_BIN;
+      break;
+  }
   if (override) return override;
   return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
 }
@@ -148,11 +161,18 @@ export function harnessEnv(harness: Harness): Record<string, string> {
     // macOS keychain, so re-homing it is harmless — but CODEX_HOME is what
     // actually controls its login & history, so we set both as a belt-and-
     // braces measure.
+    //
+    // Cursor has no documented dedicated config-dir env var, so isolating an
+    // additional account means a true HOME override (like codex's HOME half,
+    // but with no CODEX_HOME-equivalent to also set — cursor-agent reads its
+    // login/config straight out of $HOME).
     if (harness.kind === "claude-code") {
       env.CLAUDE_CONFIG_DIR = harness.home;
-    } else {
+    } else if (harness.kind === "codex") {
       env.HOME = harness.home;
       env.CODEX_HOME = path.join(harness.home, ".codex");
+    } else {
+      env.HOME = harness.home;
     }
   }
   // User-provided env wins over the home-derived defaults.
@@ -335,6 +355,54 @@ export function buildCommand(
     } else if (!modelDeclinesEffort("claude-code", opts.model)) {
       throw new Error(`effort is required for claude-code model ${opts.model}`);
     }
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
+  if (harness.kind === "cursor") {
+    // cursor — hosted in tmux via cursor-tmux.ts, one-shot turn per
+    // invocation exactly like codex. The prompt is NOT an argv element here:
+    // cursor-tmux.ts's spawnCursorViaTmux appends it as the final positional
+    // argv element at spawn time via its own injection-safe quoting pattern
+    // (stdin-prompt support is unverified for cursor-agent, unlike codex).
+    const extra = (process.env.AGETOR_CURSOR_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    const args: string[] = [bin, "-p", "--output-format", "stream-json"];
+
+    if (!opts.model) {
+      throw new Error("model is required for cursor");
+    }
+    // Passed through verbatim, including the default "auto" id — mirrors
+    // codex, which always emits --model rather than omitting the flag for
+    // its own default.
+    args.push("--model", opts.model);
+
+    // Mode → auto-execute posture. `auto` (also the null default, per house
+    // convention) runs with --force --sandbox disabled so cursor executes
+    // edits/commands without approval prompts — same "no sandbox"
+    // philosophy as claude's --dangerously-skip-permissions and codex's
+    // danger-full-access escalation. `ask` emits neither flag: cursor-agent
+    // -p cannot execute unapproved actions headlessly, so this is a
+    // propose-only run. No gitWritableRootsSync escalation is needed here
+    // (plan §3.4) — auto never runs sandboxed for cursor in the first place.
+    const mode = opts.mode ?? "auto";
+    if (mode === "auto") {
+      args.push("--force", "--sandbox", "disabled");
+    }
+
+    args.push(...extra);
+
+    // Multi-turn continuity: cursor's --resume is a FLAG (unlike codex's
+    // `resume <thread_id>` subcommand), so there's no subcommand-ordering
+    // constraint — it can sit anywhere in the argv. Kept here, after the
+    // mode flags, for visual parity with codex's flags-then-resume shape.
+    if (opts.resumeSessionId) {
+      args.push("--resume", opts.resumeSessionId);
+    }
+
+    // No effort flag: cursor-agent has none. opts.effort is ignored entirely
+    // (MODEL_EFFORT_SUPPORT.cursor keeps every model's supported-effort list
+    // empty, so the picker never even sends one).
 
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
@@ -548,6 +616,32 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       sessionId,
       configDir: harness.home,
       mode: opts.mode ?? null,
+    });
+  }
+
+  if (harness.kind === "cursor") {
+    // cursor — hosted in a per-task tmux session via cursor-tmux.ts (so a
+    // mid-turn run survives an agetor restart and is reattachable), streaming
+    // structured events by tailing cursor-agent's `--output-format
+    // stream-json` NDJSON log. Same one-shot-turn-in-tmux shape as codex.
+    if (process.env.AGETOR_CURSOR_DRIVER === "fake") {
+      buildCommand(harness, prompt, opts);
+      // Hand the orchestrator a session id so it persists `cursor_session_id`
+      // and can route follow-ups through `--resume` — mirrors what a real
+      // `system/init` event would deliver.
+      onSessionId?.(`fake-cursor-session-${taskId}`);
+      return makeFakeAgent(taskId, prompt, onChunk);
+    }
+    const built = buildCommand(harness, prompt, opts);
+    return spawnCursorViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      onSessionId,
     });
   }
 

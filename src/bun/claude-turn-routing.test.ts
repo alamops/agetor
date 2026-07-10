@@ -142,6 +142,7 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
       tmuxSession: state.sessionName,
       claudeSessionId: null,
       codexSessionId: null,
+      cursorSessionId: null,
     });
 
     const result = sendInput(priorRunId, "still there?");
@@ -246,6 +247,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
       tmuxSession: state.sessionName,
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
+      cursorSessionId: null,
     });
 
     const result = sendInput(priorRunId, "please continue");

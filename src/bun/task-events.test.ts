@@ -77,14 +77,14 @@ test("runs.eventsForTask merges events across runs in event-id (chronological) o
   runs.insert({
     id: runA, taskId, agent: "claude-code", status: "succeeded",
     startedAt: now, endedAt: now + 10, exitCode: 0,
-    tmuxSession: "agetor-test-a", claudeSessionId: null, codexSessionId: null,
+    tmuxSession: "agetor-test-a", claudeSessionId: null, codexSessionId: null, cursorSessionId: null,
   });
   runs.appendEvent(runA, "user", "first prompt");
   runs.appendEvent(runA, "assistant", "A reply 1");
   runs.insert({
     id: runB, taskId, agent: "claude-code", status: "running",
     startedAt: now + 20, endedAt: null, exitCode: null,
-    tmuxSession: "agetor-test-b", claudeSessionId: null, codexSessionId: null,
+    tmuxSession: "agetor-test-b", claudeSessionId: null, codexSessionId: null, cursorSessionId: null,
   });
   // Interleave so id-order ≠ grouped-by-run.
   runs.appendEvent(runB, "user", "second prompt");
@@ -120,12 +120,12 @@ test("runs.eventsForTask does not leak events from other tasks", async () => {
   runs.insert({
     id: runA, taskId: taskA, agent: "claude-code", status: "succeeded",
     startedAt: now, endedAt: now + 5, exitCode: 0,
-    tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null,
   });
   runs.insert({
     id: runB, taskId: taskB, agent: "claude-code", status: "succeeded",
     startedAt: now, endedAt: now + 5, exitCode: 0,
-    tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null,
   });
   runs.appendEvent(runA, "user", "A's message");
   runs.appendEvent(runB, "user", "B's message");
@@ -177,7 +177,7 @@ test("sendInput on a finished claude-code task inserts a NEW run row with status
   runs.insert({
     id: firstRunId, taskId, agent: "claude-code", status: "succeeded",
     startedAt: now, endedAt: now + 100, exitCode: 0,
-    tmuxSession: null, claudeSessionId: "fake-session-id", codexSessionId: null,
+    tmuxSession: null, claudeSessionId: "fake-session-id", codexSessionId: null, cursorSessionId: null,
   });
 
   const countRows = () => db.query<{ n: number }, [string]>(

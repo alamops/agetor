@@ -103,6 +103,7 @@ function succeededRun(id: string, taskId: string, overrides: Partial<Run> = {}):
     tmuxSession: null,
     claudeSessionId: `sess-${randomUUID()}`,
     codexSessionId: null,
+    cursorSessionId: null,
     ...overrides,
   };
 }
@@ -196,7 +197,7 @@ test("reconcileOrphans marks running rows as orphaned and returns tasks to ready
     endedAt: null,
     exitCode: null,
     tmuxSession: null,
-    claudeSessionId: null, codexSessionId: null,
+    claudeSessionId: null, codexSessionId: null, cursorSessionId: null,
   });
 
   const reconciled = reconcileOrphans();
@@ -262,7 +263,7 @@ test("reattach pre-seed SQL: detects a prior api-error status row scoped to the 
     runs.insert({
       id, taskId, agent: "claude-code", status: "failed",
       startedAt: now, endedAt: now, exitCode: 1,
-      tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+      tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null,
     });
   }
   // The real api-error status on the target run — must match.
@@ -288,7 +289,7 @@ test("reattach pre-seed SQL: detects a prior api-error status row scoped to the 
   runs.insert({
     id: cleanRunId, taskId, agent: "claude-code", status: "failed",
     startedAt: now, endedAt: now, exitCode: 1,
-    tmuxSession: null, claudeSessionId: null, codexSessionId: null,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null,
   });
   expect(ask(cleanRunId)).toBe(0);
 });
