@@ -8,7 +8,7 @@ import {
   Sparkles, Square, Terminal, Wrench, X,
 } from "lucide-react";
 import { api, COMMIT_PUSH_PROMPT, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
-import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow } from "@/lib/subagent-tabs";
+import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
 import { shouldOfferCommitPush, type TaskGitStatus } from "@/lib/commit-push";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -1329,7 +1329,8 @@ function basename(p: string): string {
  * agent stream and each background/sub agent it has spawned. Shown only while
  * background agents are active (see `showSubagentTabs`). The Main tab is always
  * first and visually emphasised — it's the one stream you can actually talk to;
- * the background tabs are watch-only. A running agent shows a pulsing green dot,
+ * the background tabs are watch-only, and the running ones sort directly after
+ * Main (see `sortSubagentTabs`). A running agent shows a pulsing green dot,
  * a finished one a check.
  */
 function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean; onSelect: (id: string) => void }) {
@@ -1376,12 +1377,17 @@ function SubagentTabs({
   active: string;
   onSelect: (id: string) => void;
 }) {
-  // Collapse a large fan-out behind a "+N" pill; expanding wraps the strip onto
-  // multiple rows rather than forcing a long horizontal scroll. A running or
-  // currently-active tab is never hidden (see `splitTabsForOverflow`).
+  // Running agents sort first, right after Main, so what's live is always the
+  // closest thing to hand (see `sortSubagentTabs`). Then collapse a large
+  // fan-out behind a "+N" pill; expanding wraps the strip onto multiple rows
+  // rather than forcing a long horizontal scroll. A running or currently-active
+  // tab is never hidden (see `splitTabsForOverflow`).
   const [expanded, setExpanded] = useState(false);
-  const { visible, overflow } = splitTabsForOverflow(subagents, active);
-  const shown = expanded ? subagents : visible;
+  // No useMemo: the 2s poll rebuilds `subagents` into a fresh array every tick,
+  // so memoising on it would never hit. The partition is O(n) on a handful.
+  const sorted = sortSubagentTabs(subagents);
+  const { visible, overflow } = splitTabsForOverflow(sorted, active);
+  const shown = expanded ? sorted : visible;
 
   return (
     <div
