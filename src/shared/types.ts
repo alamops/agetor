@@ -52,14 +52,14 @@ export function isApprovalPrompt(text: string): boolean {
   return APPROVAL_PROMPT_PATTERNS.some((re) => re.test(text));
 }
 
-export type AgentKind = "claude-code" | "codex";
+export type AgentKind = "claude-code" | "codex" | "cursor";
 
 /**
  * A "harness" is the user-facing name for an agent configuration. Built-in
- * harnesses (`claude-code`, `codex`) wrap each CLI directly; user-created
- * harnesses are *aliases* that wrap the same underlying `kind` with extra
- * env, an alternate `bin` path, or a per-account `home` override so the
- * CLI's login/config writes to a separate dir (multi-account support).
+ * harnesses (`claude-code`, `codex`, `cursor`) wrap each CLI directly;
+ * user-created harnesses are *aliases* that wrap the same underlying `kind`
+ * with extra env, an alternate `bin` path, or a per-account `home` override
+ * so the CLI's login/config writes to a separate dir (multi-account support).
  *
  * `tasks.agent` (free-form TEXT) stores the harness id — for built-ins the
  * id equals the kind, so legacy rows resolve without any backfill.
@@ -78,6 +78,10 @@ export interface Harness {
    *    "Not logged in" even with valid tokens.
    *  - codex: emitted as HOME=<home> + CODEX_HOME=<home>/.codex (codex doesn't
    *    use the macOS keychain, so re-homing it is safe).
+   *  - cursor: emitted as a plain HOME=<home> override — `cursor-agent` has
+   *    no documented dedicated config-dir env var, so isolating an
+   *    additional account's login/config means re-homing the whole process
+   *    (cursor doesn't touch the macOS keychain either, so this is safe).
    *  NULL means "inherit the agetor process env". */
   home: string | null;
   /** Optional binary path override. NULL falls back to the AGETOR_*_BIN
@@ -168,6 +172,17 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
     kind: "codex",
     suggestedHarnessId: "codex-2",
     home: "{dataDir}/harnesses/codex-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "cursor-additional",
+    label: "Additional Cursor",
+    description:
+      "Another cursor-agent harness with its own HOME override so login and config are isolated from the built-in — cursor-agent has no dedicated config-dir env var, so a full HOME override is how accounts are separated.",
+    kind: "cursor",
+    suggestedHarnessId: "cursor-2",
+    home: "{dataDir}/harnesses/cursor-2",
     bin: null,
     env: {},
   },
@@ -392,10 +407,19 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // usage, so the default stays on the most-capable non-premium tier.
   "claude-code": "opus-4.8",
   "codex": "gpt-5.5",
+  // Cursor's own "let cursor-agent pick" model — matches its CLI default.
+  "cursor": "auto",
 };
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
   "codex": "high",
+  // Cursor has no effort/reasoning knob at all — "none" is the canonical
+  // sentinel for "this model doesn't accept an effort flag" (see the "none"
+  // entry in EFFORT_OPTIONS below). MODEL_EFFORT_SUPPORT.cursor keeps every
+  // model's supported-effort list empty, so this value never actually
+  // surfaces in the picker; it's just a well-formed placeholder for legacy
+  // row backfills / createTask defaults.
+  "cursor": "none",
 };
 
 /**
@@ -421,6 +445,10 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
 export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> = {
   "claude-code": { code: "auto", plan: "plan" },
   "codex": { code: "auto", plan: "ask" },
+  // Cursor has no first-class plan mode either — same posture as codex:
+  // Plan routes to "ask" (propose-only; cursor cannot execute unapproved
+  // actions headlessly).
+  "cursor": { code: "auto", plan: "ask" },
 };
 
 /**
@@ -489,6 +517,15 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
   },
+  // cursor-agent has no effort/reasoning flag at all — every model it
+  // exposes gets an empty list, same representation as Haiku 4.5 above.
+  cursor: {
+    "auto": [],
+    "composer-2.5": [],
+    "claude-sonnet-5": [],
+    "claude-opus-4.8": [],
+    "gpt-5.5": [],
+  },
 };
 
 /**
@@ -529,6 +566,9 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
     "haiku-4.5": [],
   },
   codex: {},
+  // No per-model mode carve-outs for cursor either — both modes it exposes
+  // (auto/ask) are universally available across its model list.
+  cursor: {},
 };
 
 export function supportedModes(agent: AgentKind, model: string | null): AgentOption[] {
@@ -577,6 +617,20 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     ],
     efforts: EFFORT_OPTIONS,
   },
+  cursor: {
+    models: [
+      { id: "auto", label: "Auto", hint: "Cursor picks the model." },
+      { id: "composer-2.5", label: "Composer 2.5", hint: "Cursor's own fast agentic model." },
+      { id: "claude-sonnet-5", label: "Claude Sonnet 5", hint: "Anthropic's Sonnet 5, via Cursor." },
+      { id: "claude-opus-4.8", label: "Claude Opus 4.8", hint: "Anthropic's Opus 4.8, via Cursor." },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "OpenAI's GPT-5.5, via Cursor." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto (force)", hint: "Hands-off — runs with --force, executing edits and commands without approval prompts." },
+      { id: "ask", label: "Read-only", hint: "Propose-only — cursor cannot execute unapproved actions headlessly." },
+    ],
+    efforts: EFFORT_OPTIONS,
+  },
 };
 
 export type RunStatus =
@@ -620,6 +674,15 @@ export interface Run {
    * for claude-code and legacy rows.
    */
   codexSessionId: string | null;
+  /**
+   * Cursor's own conversation/session id (the `session_id` carried on every
+   * event in its `--output-format stream-json` NDJSON stream, first seen on
+   * `system/init`). Captured when the cursor tmux driver tails the run's
+   * NDJSON log. Drives `cursor-agent --resume <session_id>` for follow-up
+   * turns and is the reattach key for a mid-turn cursor run. NULL for
+   * claude-code/codex and legacy rows.
+   */
+  cursorSessionId: string | null;
   /**
    * How this run came to exist. `null`/undefined = user-initiated (Run
    * button, a follow-up message typed into the panel — every run before

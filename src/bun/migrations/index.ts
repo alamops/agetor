@@ -23,6 +23,8 @@ import m020 from "./020_task_type.sql" with { type: "text" };
 import m021 from "./021_codex_session_id.sql" with { type: "text" };
 import m022 from "./022_subagents.sql" with { type: "text" };
 import m023 from "./023_run_origin.sql" with { type: "text" };
+import m024 from "./024_cursor_harness.sql" with { type: "text" };
+import m025 from "./025_cursor_session_id.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -50,4 +52,6 @@ export const migrations: Migration[] = [
   { id: "021_codex_session_id", sql: m021 },
   { id: "022_subagents", sql: m022 },
   { id: "023_run_origin", sql: m023 },
+  { id: "024_cursor_harness", sql: m024 },
+  { id: "025_cursor_session_id", sql: m025 },
 ];
