@@ -23,8 +23,11 @@ import m020 from "./020_task_type.sql" with { type: "text" };
 import m021 from "./021_codex_session_id.sql" with { type: "text" };
 import m022 from "./022_subagents.sql" with { type: "text" };
 import m023 from "./023_run_origin.sql" with { type: "text" };
-import m024 from "./024_grok_harness.sql" with { type: "text" };
-import m025 from "./025_grok_session_id.sql" with { type: "text" };
+// 024/025 are reserved by the cursor-agent branch (merges before this one);
+// grok's migrations take 026/027 so the ids stay unique and append-ordered
+// across both branches.
+import m026 from "./026_grok_harness.sql" with { type: "text" };
+import m027 from "./027_grok_session_id.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -52,6 +55,6 @@ export const migrations: Migration[] = [
   { id: "021_codex_session_id", sql: m021 },
   { id: "022_subagents", sql: m022 },
   { id: "023_run_origin", sql: m023 },
-  { id: "024_grok_harness", sql: m024 },
-  { id: "025_grok_session_id", sql: m025 },
+  { id: "026_grok_harness", sql: m026 },
+  { id: "027_grok_session_id", sql: m027 },
 ];
