@@ -743,4 +743,16 @@ export const subagents = {
     ).all();
     return new Map(rows.map((r) => [r.task_id, r.n]));
   },
+  /** Distinct ids of every task with at least one `running` subagents row,
+   *  regardless of the task's own `column`. Boot reconciliation's held-task
+   *  pass used to source from `tasks WHERE column = 'running'`, which misses
+   *  a task whose terminal run already resolved and moved the card to
+   *  `review`/`done`/etc. before the crash — this is the wider source set
+   *  that also catches that case. */
+  taskIdsWithRunning(): string[] {
+    const rows = db.query<{ task_id: string }, []>(
+      `SELECT DISTINCT task_id FROM subagents WHERE status = 'running'`,
+    ).all();
+    return rows.map((r) => r.task_id);
+  },
 };

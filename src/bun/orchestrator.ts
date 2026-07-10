@@ -527,31 +527,73 @@ export function reconcileOrphans(): number {
     console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
   }
 
-  // Held tasks are invisible to the pass above: their terminal run is already
-  // `succeeded`, so it never appears in the `status='running'` scan and nothing
-  // re-arms the subagent watcher that would eventually release the card. Left
-  // alone, a restart strands a held task in `running` forever. Walk the
-  // `column='running'` tasks whose terminal run isn't running but that still
-  // have live subagent rows, and either re-arm the watcher (session still up,
-  // the background agent can finish and settle) or orphan the rows (session
-  // gone → settle hook lands the card in `review`).
+  // Held tasks — and, more generally, ANY task with a stuck `running`
+  // subagents row — are invisible to the pass above: their terminal run is
+  // already `succeeded`, so it never appears in the `status='running'` scan
+  // and nothing re-arms the subagent watcher that would eventually release
+  // the card. Left alone, a restart strands them forever. This used to only
+  // scan `tasks WHERE column = 'running'`, which covers the classic
+  // held-in-running case but has a blind spot: a `review`/`done`-column task
+  // whose subagents row is still `running` after a restart (the terminal run
+  // resolved and moved the card out of `running` *before* the crash, so the
+  // old scan skipped it entirely) was invisible here too — nothing ever
+  // re-armed its watcher or orphaned its rows, and the badge/tab dot stayed
+  // stuck forever. Source the wider set instead: every task with at least
+  // one `running` subagents row, regardless of column.
   let reArmed = 0;
   let released = 0;
-  const heldTaskIds = db.query<{ id: string }, []>(
-    `SELECT id FROM tasks WHERE "column" = 'running'`,
-  ).all();
-  for (const { id: heldId } of heldTaskIds) {
-    if (!isHeldByBackgroundAgents(heldId)) continue;
+  const heldTaskIds = subagents.taskIdsWithRunning();
+  for (const heldId of heldTaskIds) {
     const task = tasks.get(heldId);
     if (!task) continue;
     // Only claude-code writes subagent rows; a codex task can never be held, so
     // it never reaches here. Guard the session probe on kind for clarity.
     if (resolveHarness(task.agent)?.kind !== "claude-code") continue;
+
+    if (task.column === "running") {
+      // Classic held-task path, unchanged: only proceed when the terminal run
+      // has actually succeeded (i.e. this is a genuinely stuck "held for
+      // background agents" task, not an ordinary run still legitimately in
+      // progress that just happens to also have live subagent rows).
+      if (!isHeldByBackgroundAgents(heldId)) continue;
+      if (sessionExistsByName(sessionNameFor(heldId))) {
+        const run = task.runId ? runs.get(task.runId) : null;
+        // No JSONL session id means no watch directory to derive, so nothing will
+        // ever observe these agents finishing. Treat it exactly like a dead
+        // session and release, rather than leaving the card held forever.
+        if (!run?.claudeSessionId) {
+          orphanRunningSubagents(heldId);
+          released++;
+          continue;
+        }
+        const cwd = task.worktreePath ?? task.workdir;
+        const harness = resolveHarness(task.agent);
+        attachSubagentWatcher({
+          taskId: heldId,
+          jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null),
+        });
+        reArmed++;
+      } else {
+        // Session gone: no watcher could ever observe these agents finishing, so
+        // flip the rows now. `orphanRunningSubagents` fires the settle hook →
+        // `maybeReleaseHeldTask` → the card advances to `review`.
+        orphanRunningSubagents(heldId);
+        released++;
+      }
+      continue;
+    }
+
+    // Blind-spot path: any column other than `running` (review, done, ready,
+    // blocked, archived or not). `isHeldByBackgroundAgents` doesn't apply
+    // here — it only ever looks at `column === 'running'` rows — but the
+    // task's terminal run resolved normally (that's how the card got out of
+    // `running` before the crash), so `task.runId` still reliably points at
+    // that succeeded run and its `claudeSessionId`. Mirror the exact same
+    // session-alive / session-id-recoverable branch structure as above.
+    // HARD INVARIANT: never kill or create tmux sessions here — only re-arm
+    // watchers and flip DB rows.
     if (sessionExistsByName(sessionNameFor(heldId))) {
       const run = task.runId ? runs.get(task.runId) : null;
-      // No JSONL session id means no watch directory to derive, so nothing will
-      // ever observe these agents finishing. Treat it exactly like a dead
-      // session and release, rather than leaving the card held forever.
       if (!run?.claudeSessionId) {
         orphanRunningSubagents(heldId);
         released++;
@@ -565,15 +607,17 @@ export function reconcileOrphans(): number {
       });
       reArmed++;
     } else {
-      // Session gone: no watcher could ever observe these agents finishing, so
-      // flip the rows now. `orphanRunningSubagents` fires the settle hook →
-      // `maybeReleaseHeldTask` → the card advances to `review`.
+      // Session gone: orphan the rows. Unlike the held-in-running case, the
+      // settle hook's `maybeReleaseHeldTask` safely bails here (task.column
+      // isn't `running`), so this only clears the stale subagent rows — it
+      // does not move the card, which is already sitting wherever the user
+      // (or the earlier normal completion) left it.
       orphanRunningSubagents(heldId);
       released++;
     }
   }
   if (reArmed > 0 || released > 0) {
-    console.log(`[agetor] held tasks: re-armed ${reArmed} watcher(s), released ${released} to review`);
+    console.log(`[agetor] held tasks: re-armed ${reArmed} watcher(s), released ${released} background-agent row(s)`);
   }
 
   return orphaned.length;
