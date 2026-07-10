@@ -101,11 +101,12 @@ export type ContinuationHooks = {
 };
 
 /**
- * Factory the orchestrator installs to adopt a "stray" content line — one
- * that arrives on a session with no turn in flight and nothing queued to
- * receive it. This is exactly what happens after claude auto-resumes
- * following a background-task notification (see the call site in
- * `dispatchLine`): the prior run already resolved on its own `end_turn`, so
+ * Factory the orchestrator installs to adopt a "stray" line — one that
+ * arrives on a session with no turn in flight and nothing queued to receive
+ * it, either genuine content OR the task-notification line itself (see
+ * `maybeAdoptContinuation`, called from `dispatchLine`). This is exactly
+ * what happens after claude auto-resumes following a background-task
+ * notification: the prior run already resolved on its own `end_turn`, so
  * without this seam the resumed conversation would silently dispatch
  * through the stale `state.lastChunk` under the already-succeeded run.
  * Returns `null` for a task the orchestrator doesn't want to (or can't)
@@ -554,12 +555,14 @@ function extractTaskNotificationAgentId(content: string): string | null {
 /**
  * True when `evt`, once mapped, would emit genuine conversational content —
  * a `user` / `assistant` / `thinking` / `tool_use` / `tool_result` chunk —
- * rather than a bare status/heartbeat breadcrumb. Used by `dispatchLine` to
- * decide whether an unattributed line (no turn in flight, nothing queued) is
- * significant enough to adopt via `continuationRunFactory`: a status-only
- * line (a mode banner, a turn-duration footer, a task-notification
- * breadcrumb) must NOT open a new run on its own — only the human/agent
- * content that follows should.
+ * rather than a bare status/heartbeat breadcrumb. One of two adoption
+ * triggers `maybeAdoptContinuation` checks (the other is
+ * `taskNotificationContent`, handled separately since a task-notification is
+ * itself eligible to adopt — just with a watchdog attached, since it's only
+ * proof claude noticed the background work, not proof it will keep
+ * talking). A plain status-only line that is NEITHER of those two shapes (a
+ * mode banner, a turn-duration footer, an unrelated `isMeta` breadcrumb)
+ * must NOT open a new run on its own.
  */
 function isContinuationContentEvent(evt: ParsedJsonlEvent): boolean {
   if (evt.type === "assistant") return true;
@@ -1373,6 +1376,24 @@ interface SessionState {
    *  (and when AGETOR_TRACK_SUBAGENTS=0, `attachSubagentWatcher` returns a
    *  no-op handle). */
   subagentWatcher: SubagentWatcherHandle | null;
+  /**
+   * Armed by `maybeAdoptContinuation` ONLY when a continuation run was
+   * adopted off a task-notification line rather than genuine content — i.e.
+   * we don't yet know claude will actually keep talking after the
+   * background task settles, just that it noticed. `slot` is the adopted
+   * turn this watchdog is guarding, checked by identity at fire time so a
+   * stale timer callback (the turn already resolved a beat earlier through
+   * some other path) can't double-settle it. Reset (timer replaced, same
+   * slot) when another task-notification line arrives while still armed —
+   * a fresh wake signal earns a fresh window. Cleared — timer cancelled,
+   * field nulled — the moment real content reaches the adopted turn
+   * (`dispatchLine`), when that turn resolves through the normal end-turn
+   * machinery (`popEndOfTurn`), on an unexpected session death
+   * (`signalSessionDeath`), and on teardown (`disposeSessionState`), mirroring
+   * how `deathTimer` / `scrapeTimer` / `pollTimer` are handled in those same
+   * places. Content-triggered adoption arms nothing — real content already
+   * arrived, so there's nothing to wait for. Null when not armed. */
+  continuationWatchdog: { timer: ReturnType<typeof setTimeout>; slot: TurnSlot } | null;
 }
 
 interface TurnSlot {
@@ -1469,6 +1490,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     pendingEndTurn: null,
     holdUntilIdle: false,
     subagentWatcher: null,
+    continuationWatchdog: null,
   };
 }
 
@@ -1576,6 +1598,12 @@ function popEndOfTurn(state: SessionState): void {
   // The busy period (the active turn plus any folded follow-ups) is ending —
   // clear the hold so the next genuinely-sequential turn resolves normally.
   state.holdUntilIdle = false;
+  // A turn resolving through the normal end-turn machinery means any
+  // notification-triggered continuation watchdog has nothing left to guard
+  // against — cancel it. Safe unconditionally: the watchdog is only ever
+  // armed for the current queue head (see `maybeAdoptContinuation`), which
+  // is exactly the slot this call is about to pop below.
+  clearContinuationWatchdog(state);
   const slot = state.turnQueue[0];
   if (slot) {
     state.turnQueue.shift();
@@ -2021,6 +2049,156 @@ export function resolveAskCard(cardId: string, taskId: string): void {
   if (state && state.askCardId === cardId) state.askCardId = null;
 }
 
+/**
+ * Default wait after a notification-triggered continuation adoption (see
+ * `maybeAdoptContinuation`) before the watchdog gives up on ever seeing real
+ * content and settles the run as succeeded (`fireContinuationWatchdog`).
+ * Unlike `END_TURN_IDLE_FIRE_MS` — short enough that the 400ms `pollTimer`
+ * can just check elapsed time opportunistically on every tick — ten minutes
+ * is too long to poll for cheaply and too long for a unit test to wait out,
+ * so this is a real `setTimeout` (armed in `armContinuationWatchdog`) with a
+ * dedicated override seam, mirroring `setContinuationRunFactory` above
+ * rather than a bare unexported constant.
+ */
+export const CONTINUATION_WATCHDOG_MS = 10 * 60_000;
+let continuationWatchdogMs: number = CONTINUATION_WATCHDOG_MS;
+/** Test seam for `CONTINUATION_WATCHDOG_MS`. Pass `null` to restore the
+ *  default. Returns the previous value — save/restore like
+ *  `setContinuationRunFactory` so one test's override can't leak into the
+ *  next file's run. */
+export function setContinuationWatchdogMs(ms: number | null): number {
+  const prev = continuationWatchdogMs;
+  continuationWatchdogMs = ms ?? CONTINUATION_WATCHDOG_MS;
+  return prev;
+}
+
+/** Arm (or re-arm) the continuation watchdog for `slot` — the turn slot a
+ *  notification-triggered adoption just pushed. Cancels any existing timer
+ *  first so a re-arm (a second task-notification line while the first
+ *  window is still ticking — see `maybeAdoptContinuation`) restarts the full
+ *  window instead of stacking timers. */
+function armContinuationWatchdog(state: SessionState, slot: TurnSlot): void {
+  if (state.continuationWatchdog) clearTimeout(state.continuationWatchdog.timer);
+  const timer = setTimeout(() => fireContinuationWatchdog(state), continuationWatchdogMs);
+  state.continuationWatchdog = { timer, slot };
+}
+
+/** Cancel the continuation watchdog, if armed. Idempotent — safe to call
+ *  from every path that might settle the adopted turn, whether or not a
+ *  watchdog actually happens to be ticking. */
+function clearContinuationWatchdog(state: SessionState): void {
+  if (!state.continuationWatchdog) return;
+  clearTimeout(state.continuationWatchdog.timer);
+  state.continuationWatchdog = null;
+}
+
+/**
+ * Fires `continuationWatchdogMs` after a notification-triggered adoption
+ * with no real content ever landing on the adopted turn. Settles the run as
+ * succeeded through the exact same machinery the `flush` idle-fire uses for
+ * a genuine end_turn (`firePendingEndTurn` → `popEndOfTurn`) rather than a
+ * parallel resolve path, so the slot pops and `done` resolves with 0 just
+ * like a normal turn completion. If background subagents are still running,
+ * the orchestrator's hold gate (unrelated to this file) keeps the card in
+ * `running` regardless — this only resolves the RUN, not the task/column.
+ *
+ * `state.continuationWatchdog` is cleared everywhere content could prove the
+ * watch unnecessary (content dispatch, normal end-turn, session death,
+ * teardown), so by the time this timer callback actually runs, a non-null
+ * `armed` here means content genuinely never arrived. The `turnQueue[0]`
+ * identity check below is an extra belt-and-suspenders guard against a
+ * timer callback that was already queued on the event loop when one of
+ * those clears ran a beat too late to cancel it.
+ */
+function fireContinuationWatchdog(state: SessionState): void {
+  const armed = state.continuationWatchdog;
+  state.continuationWatchdog = null; // one-shot regardless of outcome below
+  if (!armed) return;
+  if (state.turnQueue[0] !== armed.slot) return;
+  armed.slot.onChunk("status", "no continuation followed the background task; settling");
+  state.pendingEndTurn = { messageId: null, uuid: undefined, emitBanner: false, stagedAt: Date.now() };
+  firePendingEndTurn(state);
+}
+
+/**
+ * Adopt a fresh continuation run for `evt` when it's the first provably-NEW
+ * line to arrive on a session with no turn in flight and nothing queued —
+ * the shape a post-end_turn background-task auto-resume produces. Two
+ * triggers:
+ *
+ *   - genuine content (`isContinuationContentEvent`) — claude is already
+ *     talking again; adopt immediately, no watchdog needed.
+ *   - a task-notification line (`taskNotificationContent`) — claude merely
+ *     NOTICED the background work finished, not proof it will keep talking.
+ *     Adopt anyway (so Stop/heartbeat/`running` are live for the whole
+ *     extended-thinking window that can precede the first content line) but
+ *     arm `CONTINUATION_WATCHDOG_MS` in case it never actually continues.
+ *
+ * Called from `dispatchLine` BEFORE the background-task settle block (which
+ * can release a task-notification's hold via `maybeReleaseHeldTask`) so a
+ * settle can never flip the card to `review` a beat before adoption pulls
+ * it back to `running` — see the settle block's comment for the ordering
+ * rationale.
+ *
+ * Because this now runs ABOVE the `seenLineUuids` dedup return, it carries
+ * its own replay guard reproducing that exact condition: a line only
+ * reaches adoption when NOT (`uuid && state.seenLineUuids.has(uuid)`).
+ * Uuid-less lines (e.g. `queue-operation` notifications, which carry
+ * `uuid: null`) are never excluded by this guard — only a line whose uuid we
+ * HAVE already seen is.
+ */
+function maybeAdoptContinuation(state: SessionState, evt: ParsedJsonlEvent, uuid: string | undefined): void {
+  if (uuid && state.seenLineUuids.has(uuid)) return;
+
+  const notifContent = taskNotificationContent(evt);
+
+  // A second (or later) task-notification while a notification-adopted turn
+  // is still waiting for real content is itself a fresh "claude noticed
+  // something" signal — reset the watchdog's clock instead of letting the
+  // window from the FIRST notification run out underneath a session that's
+  // still clearly alive. Does not re-adopt (the turn is already in flight —
+  // the eligibility guard below would reject it anyway).
+  if (notifContent && state.continuationWatchdog) {
+    armContinuationWatchdog(state, state.continuationWatchdog.slot);
+    return;
+  }
+
+  if (
+    !continuationRunFactory
+    || turnInFlight(state)
+    || state.turnQueue.length !== 0
+    || state.onEndOfTurn
+  ) {
+    return;
+  }
+  const isNotification = notifContent !== null;
+  if (!isContinuationContentEvent(evt) && !isNotification) return;
+
+  const hooks = continuationRunFactory(state.taskId);
+  // A null factory result (unknown/archived task) intentionally falls
+  // through to the pre-existing `lastChunk` routing in `dispatchLine` —
+  // unchanged.
+  if (!hooks) return;
+
+  const adopted: TurnSlot = { onChunk: hooks.onChunk, resolve: null, reject: null };
+  const done = new Promise<number>((resolve, reject) => {
+    adopted.resolve = resolve;
+    adopted.reject = reject;
+  });
+  state.turnQueue.push(adopted);
+  // Register the run with the orchestrator BEFORE the triggering line
+  // dispatches below — the caller must be able to observe "running" before
+  // the first chunk arrives, not after.
+  hooks.onAdopted(makeAgent(state.taskId, done));
+
+  // Content-triggered adoption needs no watchdog — real content already
+  // arrived, so there's nothing to wait for. Notification-triggered
+  // adoption is a bet that claude will keep talking; arm the watchdog so a
+  // continuation that never actually happens still settles instead of
+  // holding the card in `running` forever.
+  if (isNotification) armContinuationWatchdog(state, adopted);
+}
+
 function dispatchLine(state: SessionState, line: string): void {
   let evt: ParsedJsonlEvent;
   try {
@@ -2065,10 +2243,23 @@ function dispatchLine(state: SessionState, line: string): void {
     }
   }
 
+  // Continuation adoption: this line is provably NEW (`maybeAdoptContinuation`
+  // reproduces the dedup guard itself, since it runs above the early-return
+  // below). Runs BEFORE the background-task settle block on purpose: the
+  // settle block can release a held task via `maybeReleaseHeldTask`, and if
+  // this is a task-notification line that both settles the last background
+  // agent AND is itself the continuation trigger, adopting first means the
+  // orchestrator's release check sees `task.runId` already pointing at a
+  // running continuation run and bails — no `review` flicker before the
+  // card snaps back to `running`. See `maybeAdoptContinuation` for the full
+  // eligibility rules (content OR task-notification, plus the watchdog it
+  // arms for the notification case).
+  maybeAdoptContinuation(state, evt, uuid);
+
   // Background-task/agent settle signal. Deliberately runs BEFORE the dedup
-  // early-return below (unlike the continuation-adoption check further down,
-  // which must NOT fire on replayed lines): a reattach replay (offset-0
-  // re-read after an agetor restart) may be the only chance to learn that a
+  // early-return below (unlike `maybeAdoptContinuation` just above, which
+  // must NOT fire on replayed lines): a reattach replay (offset-0 re-read
+  // after an agetor restart) may be the only chance to learn that a
   // background agent settled while the process was down, and the consumer
   // (`subagents.markSettledById`) is idempotent, so re-firing for an
   // already-seen line is harmless.
@@ -2079,10 +2270,12 @@ function dispatchLine(state: SessionState, line: string): void {
   // on agentId alone with no taskId scoping, so firing here would settle a
   // REAL subagent/background-task row from a request that never touched a
   // live session — e.g. a rebuild racing a genuine resume could release a
-  // hold the live tailer still needs. Mirrors how the continuation-adoption
-  // check further down is naturally inert for `__rebuild__` (its factory
-  // looks the taskId up and finds no such task), just made explicit here
-  // since this block runs unconditionally rather than through a factory.
+  // hold the live tailer still needs. Mirrors how `maybeAdoptContinuation`
+  // just above is naturally inert for `__rebuild__` (its factory looks the
+  // taskId up and finds no such task; and `rebuildEventsFromJsonl` seeds a
+  // permanently non-empty `turnQueue`, which fails the empty-queue
+  // eligibility check on its own), just made explicit here since this block
+  // runs unconditionally rather than through a factory.
   if (state.taskId !== "__rebuild__") {
     const notifContent = taskNotificationContent(evt);
     if (notifContent) {
@@ -2107,40 +2300,16 @@ function dispatchLine(state: SessionState, line: string): void {
     return;
   }
 
-  // Continuation adoption: this line is provably NEW (it passed the dedup
-  // return above). If no turn is in flight and nothing is queued to receive
-  // it, yet it carries genuine content, claude has resumed talking with no
-  // run listening — the case a post-end_turn background-task auto-resume
-  // produces (the notification breadcrumb itself never reaches here; it's a
-  // status-only line filtered out by `isContinuationContentEvent`, and it
-  // already returned above via the dedup path on any replay). Ask the
-  // orchestrator to adopt a fresh run before this line is dispatched, so the
-  // run exists before its first chunk lands.
-  if (
-    continuationRunFactory
-    && !turnInFlight(state)
-    && state.turnQueue.length === 0
-    && !state.onEndOfTurn
-    && isContinuationContentEvent(evt)
-  ) {
-    const hooks = continuationRunFactory(state.taskId);
-    if (hooks) {
-      const adopted: TurnSlot = { onChunk: hooks.onChunk, resolve: null, reject: null };
-      const done = new Promise<number>((resolve, reject) => {
-        adopted.resolve = resolve;
-        adopted.reject = reject;
-      });
-      state.turnQueue.push(adopted);
-      // Register the run with the orchestrator BEFORE the triggering line
-      // dispatches below — the caller must be able to observe "running"
-      // before the first chunk arrives, not after.
-      hooks.onAdopted(makeAgent(state.taskId, done));
-    }
-    // A null factory result (unknown/archived task) intentionally falls
-    // through to the pre-existing `lastChunk` routing below — unchanged.
-  }
-
   const slot = state.turnQueue[0];
+  // A real content line reaching the adopted (still-active) turn means
+  // claude genuinely continued — the notification-triggered watchdog, if
+  // any, no longer needs to fire. Gated on slot identity: the watchdog is
+  // only ever armed for the current queue head (adoption always pushes to
+  // an empty queue), so this is really just "is a watchdog armed at all",
+  // spelled out defensively rather than assumed.
+  if (state.continuationWatchdog && state.continuationWatchdog.slot === slot && isContinuationContentEvent(evt)) {
+    clearContinuationWatchdog(state);
+  }
   // Active turn → its handler. No active turn → fall back to the most
   // recently popped slot's handler so trailing metadata still reaches the
   // correct run. If neither exists it's safe to drop.
@@ -2965,6 +3134,12 @@ function signalSessionDeath(state: SessionState): void {
   state.watcher = null;
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
   if (state.scrapeTimer) { clearInterval(state.scrapeTimer); state.scrapeTimer = null; }
+  // The session is gone, so a notification-triggered watchdog waiting on it
+  // will never see content or a normal end-turn either way — cancel rather
+  // than let it fire redundantly (harmlessly, since `fireContinuationWatchdog`
+  // would just find an empty/mismatched queue head — but there's nothing to
+  // gain by leaving it ticking on a dead session).
+  clearContinuationWatchdog(state);
   state.subagentWatcher?.detach();
   state.subagentWatcher = null;
   // The tmux session is provably gone, so nothing will ever write another
@@ -3898,6 +4073,7 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   state.scrapeTimer = null;
   if (state.deathTimer) clearInterval(state.deathTimer);
   state.deathTimer = null;
+  clearContinuationWatchdog(state);
   state.scrapeLastFingerprint = null;
   // Release the subagent watcher's fs.watch + poll timer. Read-only teardown:
   // this stops us TAILING the subagent files, never the agent itself.
@@ -4072,6 +4248,16 @@ export const __forTest = {
   pasteChains,
   queuePaste,
   queueTmuxOp,
+  /** Fire the continuation watchdog's settle logic directly — mirrors
+   *  `signalSessionDeath` above: real-timer tests would need to wait out
+   *  `CONTINUATION_WATCHDOG_MS` (or the `setContinuationWatchdogMs`
+   *  override), so exposing the destructive branch itself lets a test
+   *  drive "watchdog fires" deterministically without touching the timer. */
+  fireContinuationWatchdog,
+  /** Read-only accessor for the armed watchdog (timer + guarded slot), or
+   *  null when not armed. Exposed so a test can assert arm/reset/clear
+   *  transitions without reaching into module-private state another way. */
+  getContinuationWatchdog(state: SessionState) { return state.continuationWatchdog; },
 };
 
 /**
