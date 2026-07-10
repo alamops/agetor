@@ -7,6 +7,7 @@ import {
   readSync as fsReadSync,
   closeSync as fsCloseSync,
   statSync as fsStatSync,
+  readFileSync,
   writeFileSync,
   unlinkSync,
 } from "node:fs";
@@ -56,10 +57,14 @@ import {
  *
  * 2. **Event schema is unpublished** (A1 in the plan). `mapGrokEvent` is
  *    intentionally defensive — see its docstring. Because the terminal event
- *    (success/failure) may not be recognized, the death-watch's fail-safe
- *    default (SESSION_DIED_STATUS_PREFIX + `blocked`, lastCode defaulting to
- *    1) mirrors codex's exactly: a false "blocked" is recoverable from the run
- *    panel, whereas a false "succeeded" would silently mask a failed turn.
+ *    (success/failure) may not be recognized, the shell wrapper writes an
+ *    exit-code sidecar (`; echo $? > exitfile` — no `exec`, the shell must
+ *    outlive grok) that the death-watch consults before declaring death: a
+ *    present sidecar means the process exited cleanly (settle with its code,
+ *    no sentinel — a plain failure returns the card to `ready`); an absent
+ *    one plus a vanished session is a genuine death (sentinel → `blocked`,
+ *    lastCode defaulting to 1 — a false "blocked" is recoverable from the run
+ *    panel, whereas a false "succeeded" would silently mask a failed turn).
  *    Ship Experimental; refine once a real `streaming-json` log is captured.
  */
 
@@ -74,6 +79,25 @@ export function grokLogPath(runId: string): string {
 }
 function grokPromptPath(runId: string): string {
   return path.join(GROK_LOG_DIR, `${runId}.prompt.txt`);
+}
+/** Exit-code sidecar written by the shell wrapper (`; echo $? > exitfile`).
+ *  Its EXISTENCE means the grok process ran to completion and exited — the
+ *  death-watch reads it to distinguish an unrecognized-but-clean exit (grok's
+ *  event schema is unpublished, so the mapper may miss the terminal event)
+ *  from a genuine mid-turn session death. Derivable from runId for reattach. */
+function grokExitPath(runId: string): string {
+  return path.join(GROK_LOG_DIR, `${runId}.exit`);
+}
+/** Parse the sidecar. `null` = not written (process never reached its exit
+ *  line). A present-but-garbled file reads as 1 (exited, code unknown). */
+function readExitCode(runId: string): number | null {
+  try {
+    const raw = readFileSync(grokExitPath(runId), "utf8");
+    const n = Number.parseInt(raw.trim(), 10);
+    return Number.isFinite(n) ? n : 1;
+  } catch {
+    return null;
+  }
 }
 function ensureLogDir(): void {
   if (!existsSync(GROK_LOG_DIR)) mkdirSync(GROK_LOG_DIR, { recursive: true });
@@ -380,6 +404,7 @@ function resolveGrokDone(state: GrokSessionState, code: number): void {
   // already cleared above, so nothing will try to read them after this.
   try { unlinkSync(grokPromptPath(state.runId)); } catch { /* already gone */ }
   try { unlinkSync(state.logPath); } catch { /* already gone */ }
+  try { unlinkSync(grokExitPath(state.runId)); } catch { /* already gone */ }
   state.resolveDone(code);
 }
 
@@ -436,6 +461,21 @@ function startGrokTailer(state: GrokSessionState): Promise<number> {
       // fired — this was an orderly finish, not a death, so don't emit the
       // "session ended" sentinel.
       if (!state.resolved) {
+        // Exit-code sidecar (see the wrapper in spawnGrokViaTmux): grok's
+        // event schema is unpublished (D2), so an ordinary turn — success OR
+        // failure — may end without a terminal event the mapper recognizes.
+        // The sidecar file distinguishes "process exited cleanly with code N"
+        // (settle with N, no sentinel — a non-zero N returns the card to
+        // `ready`, not `blocked`) from "session vanished without the process
+        // reaching its exit line" (genuine death → sentinel → blocked).
+        const exitCode = readExitCode(state.runId);
+        if (exitCode !== null) {
+          if (exitCode !== 0) {
+            state.onChunk("stderr", `grok exited with code ${exitCode}`);
+          }
+          resolveGrokDone(state, exitCode);
+          return;
+        }
         // Emit the shared sentinel so the orchestrator flips the card to
         // `blocked` (via makeChunkHandler) and the user sees WHY the run
         // stopped in the stream, instead of a silent drop to `ready`.
@@ -501,11 +541,25 @@ export function spawnGrokViaTmux(opts: GrokLaunchOptions): SpawnedAgent {
   const tmux = resolveTmuxBin();
   const [bin, ...rest] = opts.argv;
   if (!bin) throw new Error("spawnGrokViaTmux requires a non-empty argv");
+  // A stale sidecar from a reused run id would make the death-watch read a
+  // previous turn's exit code — clear it before launch (log is truncated
+  // above for the same reason).
+  try { unlinkSync(grokExitPath(opts.runId)); } catch { /* none */ }
   // `-p "$(cat …)"`: the outer double quotes preserve the substituted file
   // content (whitespace/newlines included) as a single argv entry to grok;
   // the promptPath itself is single-quoted via sq() since it's our own
   // runId-derived path, never user content.
-  const inner = `exec ${sq(bin)} -p "$(cat ${sq(promptPath)})" ${rest.map(sq).join(" ")} > ${sq(logPath)} 2>&1`;
+  //
+  // No `exec` — the shell must outlive grok to write the exit-code sidecar
+  // (`; echo $? > exitfile`). Grok's event schema is unpublished (D2), so a
+  // turn may end without a terminal event the mapper recognizes; the sidecar
+  // lets the death-watch tell "process exited cleanly with code N" (settle
+  // with N — a plain failure returns the card to `ready`) apart from a
+  // genuine mid-turn session death (sentinel → `blocked`). Costs one extra
+  // sh process per turn; prompt-injection safety is unchanged (the prompt
+  // still arrives via command substitution as a single argument, never
+  // shell-parsed).
+  const inner = `${sq(bin)} -p "$(cat ${sq(promptPath)})" ${rest.map(sq).join(" ")} > ${sq(logPath)} 2>&1; echo $? > ${sq(grokExitPath(opts.runId))}`;
   const envArgs: string[] = [];
   // Forward PATH so grok's own tool invocations resolve dev binaries, plus
   // the harness env (GROK_HOME/HOME) that controls grok's login/history.
@@ -552,6 +606,7 @@ export function spawnGrokViaTmux(opts: GrokLaunchOptions): SpawnedAgent {
     // launch failure doesn't leave the prompt text on disk indefinitely.
     try { unlinkSync(promptPath); } catch { /* best-effort */ }
     try { unlinkSync(logPath); } catch { /* best-effort */ }
+    try { unlinkSync(grokExitPath(opts.runId)); } catch { /* best-effort */ }
     const done = Promise.resolve(1);
     return { kill: () => { /* nothing to kill */ }, writeInput: () => false, done };
   }

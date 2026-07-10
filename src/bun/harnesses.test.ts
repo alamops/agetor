@@ -203,4 +203,12 @@ test("getByIdOrKind synthesises a grok built-in row when the seeded row is missi
   const synth = harnesses.getByIdOrKind("grok");
   expect(synth?.kind).toBe("grok");
   expect(synth?.isBuiltin).toBe(true);
+  // Restore the seeded row: bun test shares ONE SQLite DB across all files,
+  // and later files (orchestrator-grok.test.ts) call setEnabled("grok", …),
+  // which needs the real row — leaving it deleted makes them flake on order.
+  db.run(
+    `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+     VALUES ('grok', 'grok', 'Grok Build', 1, NULL, NULL, '{}', ?, ?, 0)`,
+    [Date.now(), Date.now()],
+  );
 });

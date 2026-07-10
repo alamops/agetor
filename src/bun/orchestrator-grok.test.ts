@@ -15,7 +15,17 @@ process.env.AGETOR_GROK_DRIVER = "fake";
 process.env.AGETOR_GROK_BIN = "/bin/echo";
 
 beforeAll(async () => {
-  await import("./db.ts");
+  const { db } = await import("./db.ts");
+  // bun test runs every file in one process, so db.ts's first import wins and
+  // the DB is SHARED across files — the mkdtemp above only isolates us when
+  // this file happens to load first. An earlier file may have deleted the
+  // seeded grok builtin (harnesses.test.ts exercises exactly that), and
+  // setEnabled below needs the real row — re-seed idempotently.
+  db.run(
+    `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+     VALUES ('grok', 'grok', 'Grok Build', 1, NULL, NULL, '{}', ?, ?, 0)`,
+    [Date.now(), Date.now()],
+  );
 });
 
 async function settle(ms = 80) {
