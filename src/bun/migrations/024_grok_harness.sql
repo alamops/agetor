@@ -7,10 +7,17 @@
 -- No indexes or triggers exist on `harnesses` as of this migration, so none
 -- need to be recreated. Nothing else has a foreign key on this table —
 -- `tasks.agent` stores the harness id/kind as a plain string, not a FK.
+--
+-- The CHECK also permits 'cursor', which this branch does not ship: a sibling
+-- branch adds that kind with its own harnesses rebuild, and if each rebuild's
+-- CHECK excluded the other's kind, whichever migration ran second would fail
+-- copying the other's seeded row. Listing both makes the rebuilds
+-- order-independent; the app-layer whitelist in db.ts still governs which
+-- kinds can actually be inserted.
 
 CREATE TABLE harnesses_new (
   id         TEXT PRIMARY KEY,
-  kind       TEXT NOT NULL CHECK (kind IN ('claude-code', 'codex', 'grok')),
+  kind       TEXT NOT NULL CHECK (kind IN ('claude-code', 'codex', 'cursor', 'grok')),
   label      TEXT NOT NULL,
   is_builtin INTEGER NOT NULL DEFAULT 0,
   home       TEXT,

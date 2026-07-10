@@ -411,9 +411,11 @@ export function reconcileOrphans(): number {
     // claude-code, codex, and grok runs can all be reattached when their
     // detached tmux session is still alive. The reattach key differs by kind:
     // claude needs its JSONL session uuid (`claude_session_id`), codex needs
-    // its thread id (`codex_session_id`), grok needs its session id
-    // (`grok_session_id`) — the per-run log path is derived from the run id
-    // for both codex and grok. Note codex's and grok's sessions only live
+    // its thread id (`codex_session_id`). grok's key (`grok_session_id`) is
+    // NOT required to reattach — its log path derives from the run id and the
+    // id is sniffed heuristically (D2), so it may not have been captured yet
+    // mid-turn; the id only matters for follow-up `--resume` turns, and the
+    // reattached tail will sniff it again. Note codex's and grok's sessions only live
     // WHILE their turn is in flight, so a reattachable codex/grok run is by
     // definition one that was still running when agetor restarted. Also: if
     // we already reattached a newer sibling for this task, orphan the older
@@ -427,7 +429,7 @@ export function reconcileOrphans(): number {
       (kind === "claude-code" || kind === "codex" || kind === "grok")
       && task !== null
       && row.tmux_session !== null
-      && reattachKey !== null
+      && (kind === "grok" || reattachKey !== null)
       && !reattachedTaskIds.has(row.task_id)
       && sessionExistsByName(row.tmux_session);
 

@@ -173,6 +173,14 @@ export function mapGrokEvent(
   const typeRaw = evt.type ?? evt.event ?? evt.method ?? "";
   const type = typeRaw.toLowerCase();
   const key = typeof evt.id === "string" ? `${typeRaw}:${evt.id}` : `line:${lineIndex}`;
+  // Text-bearing chunks fold the line index into the key: streaming formats
+  // typically reuse one message id across delta events, and a bare
+  // `${type}:${id}` key would collapse every delta after the first — the
+  // seenLineUuids dedup runs on live runs too, not just reattach replays.
+  // Still deterministic across reattach (log re-read from offset 0 restarts
+  // lineIndex). Tool events keep the bare key: a repeated type+id there is
+  // more likely a state update than a delta, and duplicates render noisily.
+  const textKey = typeof evt.id === "string" ? `${key}:${lineIndex}` : key;
 
   // Error / failed events → stderr, terminal.
   if (type.includes("error") || type.includes("fail")) {
@@ -185,7 +193,7 @@ export function mapGrokEvent(
   // Reasoning / thinking events.
   if (type.includes("reason") || type.includes("think")) {
     const text = extractText(evt.text) ?? extractText(evt.content) ?? extractText(evt.message);
-    if (text) onChunk("thinking", text, key);
+    if (text) onChunk("thinking", text, textKey);
     return { sessionId };
   }
 
@@ -195,7 +203,7 @@ export function mapGrokEvent(
     const su = update.sessionUpdate.toLowerCase();
     if (su.includes("message") || su.includes("text")) {
       const text = extractText(update.content) ?? extractText(update.text);
-      if (text) onChunk("assistant", text, key);
+      if (text) onChunk("assistant", text, textKey);
       return { sessionId };
     }
     if (su.includes("tool") || su.includes("command") || su.includes("plan")) {
@@ -207,7 +215,7 @@ export function mapGrokEvent(
   // Plain assistant text / message events.
   if (type.includes("message") || type.includes("text") || type.includes("assistant")) {
     const text = extractText(evt.text) ?? extractText(evt.content) ?? extractText(evt.message);
-    if (text) onChunk("assistant", text, key);
+    if (text) onChunk("assistant", text, textKey);
     return { sessionId };
   }
 
@@ -357,6 +365,14 @@ function resolveGrokDone(state: GrokSessionState, code: number): void {
   state.resolved = true;
   disposeGrokState(state);
   grokSessions.delete(state.taskId);
+  // Kill the tmux session on resolve. On the normal path the one-shot grok
+  // process is already exiting (no-op), but the speculative mapper (D2) can
+  // recognize a terminal event early — without this, the run would be marked
+  // terminal while the real grok process kept working detached, and since
+  // reconcileOrphans only reattaches status='running' rows, that session
+  // would leak with no cleanup path. Own-scoped (this task's session name),
+  // so it can't touch a sibling instance's sessions.
+  killSessionByName(state.sessionName);
   // The run is terminal now: its events are persisted in run_events (the panel
   // replays from the DB, not the log) and reattach only applies to running
   // turns, so the per-run log + prompt files are dead weight. Prune them
@@ -532,6 +548,10 @@ export function spawnGrokViaTmux(opts: GrokLaunchOptions): SpawnedAgent {
     // synchronously so the run doesn't hang in `running`.
     const detail = (res.stderr || res.error?.message || "tmux new-session failed").trim();
     opts.onChunk("stderr", `failed to start grok session: ${detail}`, undefined);
+    // Nothing will ever tail these — prune the files written above so a
+    // launch failure doesn't leave the prompt text on disk indefinitely.
+    try { unlinkSync(promptPath); } catch { /* best-effort */ }
+    try { unlinkSync(logPath); } catch { /* best-effort */ }
     const done = Promise.resolve(1);
     return { kill: () => { /* nothing to kill */ }, writeInput: () => false, done };
   }

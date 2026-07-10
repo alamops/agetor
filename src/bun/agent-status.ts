@@ -84,7 +84,12 @@ export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
     };
   }
 
-  if (harness.kind === "claude-code") {
+  // claude hosts its REPL in tmux; grok hosts each one-shot turn in tmux
+  // (spawnGrokViaTmux) — both are unusable without it, so surface the friendly
+  // pre-flight hint instead of a raw spawn failure. codex also runs via tmux
+  // but predates this gate; widening it for codex is a separate decision (its
+  // absence there is a latent gap, not a grok regression).
+  if (harness.kind === "claude-code" || harness.kind === "grok") {
     const tmuxPath = resolveBinPath(resolveTmuxBin());
     if (!tmuxPath) {
       return {
