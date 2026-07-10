@@ -148,9 +148,34 @@ const CODEX_BUILTINS: ReadonlyArray<{ name: string; description: string; kind: "
   { name: "/review", description: "Review current changes and find issues", kind: "command" },
 ];
 
+/**
+ * Grok Build's documented slash commands (docs.x.ai/build, verified
+ * 2026-07-10). Unlike CLAUDE_BUILTINS/CODEX_BUILTINS, this list intentionally
+ * includes session/context-management commands (`/clear`, `/compact`,
+ * `/sessions`, …) alongside workflow ones — Grok Build's docs don't draw the
+ * same "actionable task vs interactive TUI meta" line the other two CLIs let
+ * us curate against, so the full documented set is surfaced as-is rather than
+ * guessing which ones a task prompt would plausibly use.
+ */
+const GROK_BUILTINS: ReadonlyArray<{ name: string; description: string; kind: "command" | "skill" }> = [
+  { name: "/plan", description: "Enter plan mode to draft an approach before Grok executes it", kind: "command" },
+  { name: "/view-plan", description: "Show the current plan", kind: "command" },
+  { name: "/new", description: "Start a new session", kind: "command" },
+  { name: "/clear", description: "Clear the current conversation context", kind: "command" },
+  { name: "/context", description: "Show current context/token usage", kind: "command" },
+  { name: "/compact", description: "Compact the conversation history to free up context", kind: "command" },
+  { name: "/sessions", description: "List and switch between saved sessions", kind: "command" },
+  { name: "/fork", description: "Fork the current session into a new one", kind: "command" },
+  { name: "/memory", description: "View or edit Grok's stored memory", kind: "command" },
+  { name: "/rewind", description: "Rewind the conversation to a previous point", kind: "command" },
+];
+
 /** The harness's built-in commands/skills as AvailableCommand rows. */
 function builtinCommands(agent: AgentKind): AvailableCommand[] {
-  const builtins = agent === "claude-code" ? CLAUDE_BUILTINS : CODEX_BUILTINS;
+  const builtins =
+    agent === "claude-code" ? CLAUDE_BUILTINS
+    : agent === "codex" ? CODEX_BUILTINS
+    : GROK_BUILTINS;
   return builtins.map((b) => ({ name: b.name, description: b.description, source: "builtin", kind: b.kind }));
 }
 
@@ -235,6 +260,18 @@ export async function listAvailableCommands(
     }
     all.push(...builtinCommands(opts.agent));
     all.push(...codexSystemSkills(userCmdRoot));
+  } else if (opts.agent === "grok") {
+    // Grok Build has a `~/.grok` home (config.toml + skills/plugins-style
+    // conventions per xAI's docs) but the exact on-disk layout — command
+    // directory name, skill manifest shape, project-level override path —
+    // isn't reliably documented as of 2026-07-10 (see plan A5). Rather than
+    // guess a directory shape that might silently be wrong (the historical
+    // trap: codex's picker returned [] because builtins were claude-only —
+    // see docs/plans/grok-build-agent-support.md §"Historical traps" #1),
+    // this is an explicit, documented degrade: builtins only for v1. Add
+    // user/project filesystem discovery once the layout is confirmed
+    // against a real `grok` install.
+    all.push(...builtinCommands(opts.agent));
   }
 
   // Project overrides user on collision so users can shadow a global command
@@ -545,6 +582,10 @@ function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null
       all.push(...codexTomlMcpServers(path.join(root, ".codex", "config.toml"), "project"));
     }
   }
+  // grok: no MCP/plugin discovery in v1 — same undocumented-layout rationale
+  // as listAvailableCommands' grok branch above. Explicit no-op rather than
+  // an implicit fallthrough so a future reader doesn't mistake the gap for
+  // an oversight.
   return all;
 }
 

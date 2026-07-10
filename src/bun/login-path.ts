@@ -67,7 +67,7 @@ function readLoginShellPath(): string | null {
  *  shell-injection if a future caller wires `probeCommandDir` to a DB- or
  *  user-supplied value (a harness alias `bin`, say). The hardcoded list is
  *  cheaper than runtime validation and self-documents intent. */
-const PROBEABLE_COMMANDS = ["claude", "codex", "tmux"] as const;
+const PROBEABLE_COMMANDS = ["claude", "codex", "grok", "tmux"] as const;
 type ProbeableCommand = (typeof PROBEABLE_COMMANDS)[number];
 
 /**

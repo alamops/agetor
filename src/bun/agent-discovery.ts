@@ -85,6 +85,19 @@ async function discoverClaude(): Promise<DiscoveredModel[]> {
   return [];
 }
 
+/**
+ * grok (xAI's Grok Build CLI) has no documented model-listing command as of
+ * writing (A3 in the grok-build-agent-support plan) — unlike codex's
+ * best-effort `codex prompt --models` probe, there's nothing to shell out to.
+ * Returning an empty list is the same graceful-degrade `discoverClaude` uses:
+ * the UI falls back to the curated `AGENT_OPTIONS.grok` list, and the cache
+ * still gets a `"grok"` entry so `Record<AgentKind, DiscoveredModel[]>`
+ * lookups never come back `undefined` for this kind.
+ */
+async function discoverGrok(): Promise<DiscoveredModel[]> {
+  return [];
+}
+
 const cache = new Map<AgentKind, DiscoveredModel[]>();
 let inflight: Promise<void> | null = null;
 
@@ -101,9 +114,14 @@ export function getDiscoveredModels(agent: AgentKind): DiscoveredModel[] {
 export async function refreshDiscoveredModels(): Promise<void> {
   if (inflight) return inflight;
   inflight = (async () => {
-    const [codex, claude] = await Promise.all([discoverCodex(), discoverClaude()]);
+    const [codex, claude, grok] = await Promise.all([
+      discoverCodex(),
+      discoverClaude(),
+      discoverGrok(),
+    ]);
     cache.set("codex", codex);
     cache.set("claude-code", claude);
+    cache.set("grok", grok);
   })().finally(() => { inflight = null; });
   return inflight;
 }
