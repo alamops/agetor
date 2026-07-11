@@ -21,21 +21,59 @@ import path from "node:path";
  * the merge dedupes, so a no-op turns into a no-op.
  */
 
-const MARKER_START = "__AGETOR_PATH_START__";
-const MARKER_END = "__AGETOR_PATH_END__";
+// Sentinels wrapping each value the probe prints, so MOTDs / version-manager
+// banners / anything else the rc files echo can't be mistaken for it. Exported
+// for the probe-parser unit tests. */
+export const MARKER_START = "__AGETOR_PATH_START__";
+export const MARKER_END = "__AGETOR_PATH_END__";
+export const FNM_START = "__AGETOR_FNM_START__";
+export const FNM_END = "__AGETOR_FNM_END__";
 
-function readLoginShellPath(): string | null {
+export interface LoginShellProbe {
+  /** The login shell's `$PATH`, or null if the markers didn't survive. */
+  path: string | null;
+  /** The login shell's `$FNM_DIR`, or null when unset (non-fnm user). */
+  fnmDir: string | null;
+}
+
+/** Pull one sentinel-delimited value out of the probe's stdout. Empty or
+ *  missing → null. */
+function extractMarked(stdout: string, start: string, end: string): string | null {
+  const s = stdout.indexOf(start);
+  const e = stdout.indexOf(end);
+  if (s === -1 || e === -1 || e <= s) return null;
+  const value = stdout.slice(s + start.length, e).trim();
+  return value || null;
+}
+
+/** Parse the login-shell probe's stdout into its captured values. Pure —
+ *  exported so the parsing can be unit-tested without spawning a shell. */
+export function parseLoginShellProbe(stdout: string): LoginShellProbe {
+  return {
+    path: extractMarked(stdout, MARKER_START, MARKER_END),
+    fnmDir: extractMarked(stdout, FNM_START, FNM_END),
+  };
+}
+
+function readLoginShellPath(): LoginShellProbe {
+  const empty: LoginShellProbe = { path: null, fnmDir: null };
   const shell = process.env.SHELL;
-  if (!shell) return null;
+  if (!shell) return empty;
 
   // -i (interactive) + -l (login) so both ~/.zprofile and ~/.zshrc style files
-  // run — zsh and bash both honor this combo. We mark the PATH with sentinels
-  // so MOTDs, version-manager init banners, or anything else the rc files
-  // print to stdout doesn't get mistaken for it.
+  // run — zsh and bash both honor this combo.
+  //
+  // We also capture $FNM_DIR: launched from Finder the process env is minimal
+  // and FNM_DIR is absent, but the user's rc exports it. Reading it here lets
+  // defaultDevPaths() enumerate fnm's node versions without agetor ever
+  // blind-statting ~/Library/Application Support/fnm at boot (see the TCC note
+  // in defaultDevPaths). $FNM_DIR expands to empty for non-fnm users → null.
   //
   // AGETOR_PATH_PROBE is a re-entrancy guard: if a user's rc file calls back
   // into agetor (unusual but possible), it can read this var and skip work.
-  const script = `printf '%s' '${MARKER_START}'; printf '%s' "$PATH"; printf '%s' '${MARKER_END}'`;
+  const script =
+    `printf '%s' '${MARKER_START}'; printf '%s' "$PATH"; printf '%s' '${MARKER_END}'; ` +
+    `printf '%s' '${FNM_START}'; printf '%s' "$FNM_DIR"; printf '%s' '${FNM_END}'`;
 
   let result;
   try {
@@ -46,21 +84,15 @@ function readLoginShellPath(): string | null {
       timeout: 2000,
     });
   } catch {
-    return null;
+    return empty;
   }
 
   // Don't gate on `result.status` — interactive shells routinely exit nonzero
   // when stdin isn't a TTY (zsh -i complains, nvm.sh's `complete` builtin
   // bails, oh-my-zsh's update check ENOENTs, etc). As long as the markers
-  // made it to stdout, the PATH between them is what we want.
-  if (!result || typeof result.stdout !== "string") return null;
-
-  const start = result.stdout.indexOf(MARKER_START);
-  const end = result.stdout.indexOf(MARKER_END);
-  if (start === -1 || end === -1 || end <= start) return null;
-
-  const value = result.stdout.slice(start + MARKER_START.length, end).trim();
-  return value || null;
+  // made it to stdout, the values between them are what we want.
+  if (!result || typeof result.stdout !== "string") return empty;
+  return parseLoginShellProbe(result.stdout);
 }
 
 /** Strict command-name allowlist: only the CLIs we ship support for. Prevents
@@ -154,17 +186,36 @@ export function defaultDevPaths(): string[] {
   const versionRoots = [
     // NVM: ~/.nvm/versions/node/<v>/bin
     { root: `${home}/.nvm/versions/node`, suffix: "bin" },
-    // fnm (macOS): ~/Library/Application Support/fnm/node-versions/<v>/installation/bin
-    {
-      root: `${home}/Library/Application Support/fnm/node-versions`,
-      suffix: path.join("installation", "bin"),
-    },
     // fnm (Linux/XDG): ~/.local/share/fnm/node-versions/<v>/installation/bin
     {
       root: `${home}/.local/share/fnm/node-versions`,
       suffix: path.join("installation", "bin"),
     },
   ];
+
+  // fnm's default macOS store is ~/Library/Application Support/fnm — and
+  // macOS Sequoia gates *any* access to another app's Application Support
+  // subdir behind the "Agetor would like to access data from other apps"
+  // (kTCCServiceSystemPolicyAppData) prompt. Statting/readdir-ing it
+  // unconditionally at boot pops that dialog for *every* user, including the
+  // majority who don't use fnm at all, and re-pops it on dev builds whose
+  // signature can't persist the decision. So we only scan fnm's store when
+  // fnm is actually configured — signalled by FNM_DIR, which fnm's shell init
+  // (`eval "$(fnm env)"`) exports — and we honor FNM_DIR's own value so a
+  // non-default location works too. When agetor is launched from Finder with
+  // a minimal env, FNM_DIR is absent; the login-shell PATH probe and the
+  // `type -p claude` fallback still resolve fnm-installed binaries via the
+  // user's own rc, so the only thing given up is enumerating *inactive* node
+  // versions — a fair trade for never tripping the TCC prompt.
+  const fnmDir = process.env.FNM_DIR;
+  if (fnmDir) {
+    // FNM_DIR frequently points at the XDG store already listed above; skip the
+    // duplicate so defaultDevPaths() never returns the same bin dir twice.
+    const derived = path.join(fnmDir, "node-versions");
+    if (!versionRoots.some((r) => r.root === derived)) {
+      versionRoots.push({ root: derived, suffix: path.join("installation", "bin") });
+    }
+  }
   for (const { root, suffix } of versionRoots) {
     try {
       if (!existsSync(root)) continue;
@@ -185,9 +236,17 @@ export function defaultDevPaths(): string[] {
  */
 export function rehydratePath(): string {
   const current = (process.env.PATH ?? "").split(":").filter(Boolean);
-  const loginPath = readLoginShellPath();
+  const login = readLoginShellPath();
+  // Adopt the login shell's FNM_DIR when our (possibly Finder-minimal) env
+  // lacks it, so defaultDevPaths() can enumerate fnm's node versions. Only fnm
+  // users reach this — non-fnm shells report an empty FNM_DIR — so it never
+  // reintroduces the TCC prompt for users who don't use fnm. Set before
+  // defaultDevPaths() reads it below.
+  if (login.fnmDir && !process.env.FNM_DIR) {
+    process.env.FNM_DIR = login.fnmDir;
+  }
   const extras = [
-    ...(loginPath ? loginPath.split(":").filter(Boolean) : []),
+    ...(login.path ? login.path.split(":").filter(Boolean) : []),
     ...defaultDevPaths(),
   ];
 
@@ -239,7 +298,7 @@ export function rehydratePath(): string {
     tmux: Bun.which("tmux", { PATH: next }) ?? "not found",
   };
   console.log(
-    `[agetor] PATH rehydrated (login-probe=${loginPath ? "ok" : "miss"}): ` +
+    `[agetor] PATH rehydrated (login-probe=${login.path ? "ok" : "miss"}): ` +
       `claude=${resolved.claude} codex=${resolved.codex} tmux=${resolved.tmux}`,
   );
   if (aliasHint) {
