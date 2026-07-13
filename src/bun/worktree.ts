@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { dataDir } from "./db.ts";
-import type { BranchInfo, DiffFile, Task, TaskDiff } from "../shared/types.ts";
+import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
+import type { BranchInfo, Task, TaskDiff } from "../shared/types.ts";
 
 export type { BranchInfo };
 
@@ -391,6 +392,48 @@ export async function gitPull(dir: string, branch: string): Promise<{ ok: boolea
   return { ok: true };
 }
 
+/**
+ * Push a local `branch` to the repo's remote and set its upstream, so a branch
+ * that only exists locally (e.g. an agetor worktree branch) can be turned into a
+ * pull request. The target remote is the branch's existing upstream remote if it
+ * has one, else `origin`, else the first configured remote.
+ *
+ * Network-bound, so it gets the same longer budget as `gitFetch`/`gitPull`.
+ * Returns `{ ok: false, error }` when `dir` isn't a git repo, has no remote, or
+ * the push failed (rejected, auth, network) — the git stderr is surfaced for the
+ * UI. On success, `remote` names the remote the branch was pushed to.
+ */
+export async function gitPush(
+  dir: string,
+  branch: string,
+): Promise<{ ok: boolean; error?: string; remote?: string }> {
+  // Defense-in-depth against a "-"-leading value being read as a git flag,
+  // mirroring gitPull's guard.
+  if (branch.startsWith("-")) return { ok: false, error: `invalid branch name: ${branch}` };
+  const root = await repoRoot(dir);
+  if (!root) return { ok: false, error: "not a git repository" };
+
+  // Prefer the branch's existing upstream remote; fall back to `origin`, then the
+  // first configured remote. No remotes → nothing to push to.
+  let remote: string;
+  const up = await git(["rev-parse", "--abbrev-ref", `${branch}@{upstream}`], root, 5_000);
+  if (up.ok && up.stdout.includes("/")) {
+    remote = up.stdout.slice(0, up.stdout.indexOf("/"));
+  } else {
+    const remotes = await git(["remote"], root, 5_000);
+    const list = remotes.ok ? remotes.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+    if (list.length === 0) return { ok: false, error: "no git remote configured to push to" };
+    remote = list.includes("origin") ? "origin" : list[0]!;
+  }
+
+  // `--set-upstream` so subsequent PR creation and the behind indicator have a
+  // tracking ref to work against. The leading-dash guard above is what keeps the
+  // branch arg from being read as a flag (git push has no `--end-of-options`).
+  const res = await git(["push", "--set-upstream", remote, branch], root, 120_000);
+  if (!res.ok) return { ok: false, error: res.stderr || res.stdout || `git push failed (exit ${res.exitCode})` };
+  return { ok: true, remote };
+}
+
 function slugify(s: string): string {
   return s
     .toLowerCase()
@@ -506,103 +549,9 @@ export async function prepareWorkdir(task: Task): Promise<PrepareResult> {
   };
 }
 
-// Hunks larger than this (per file) are truncated before crossing the API so
-// a generated lockfile or vendored blob can't bloat the payload / freeze the
-// renderer. The viewer surfaces the truncation.
-const PER_FILE_HUNK_CAP = 200_000;
 // Process at most this many newly-created (untracked) files. Each costs a
 // `git diff --no-index` spawn, so cap to keep a runaway scratch dir cheap.
 const MAX_UNTRACKED = 200;
-// Cap the total number of changed files crossing the API. A reformat-the-world
-// or accidentally-committed build dir shouldn't ship a multi-MB payload the
-// renderer then has to mount. The viewer surfaces the omission via `note`.
-const MAX_FILES = 500;
-
-/** Strip a leading `a/` or `b/` prefix and un-quote git's C-style path. */
-function cleanPath(raw: string): string | null {
-  let p = raw.trim();
-  if (p === "/dev/null") return null;
-  if (p.startsWith('"') && p.endsWith('"')) {
-    // git quotes paths containing unusual bytes; the escaping overlaps with
-    // JSON for the common cases (spaces, unicode). Best-effort un-quote.
-    try { p = JSON.parse(p) as string; } catch { /* keep quoted form */ }
-  }
-  if (p.startsWith("a/") || p.startsWith("b/")) p = p.slice(2);
-  return p;
-}
-
-/**
- * Parse `git diff` (unified, --no-color) output into one entry per file.
- * Sections start at each `diff --git …` line; the body keeps the extended
- * header (`new file mode`, `rename to`, `Binary files …`) plus the `@@` hunks.
- */
-function parseGitDiff(raw: string): DiffFile[] {
-  const files: DiffFile[] = [];
-  const headerRe = /^diff --git .*$/gm;
-  const starts: number[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = headerRe.exec(raw))) starts.push(m.index);
-
-  for (let i = 0; i < starts.length; i++) {
-    const section = raw.slice(starts[i], starts[i + 1] ?? raw.length);
-    const lines = section.split("\n");
-    let status: DiffFile["status"] = "modified";
-    let binary = false;
-    let oldPath: string | null = null;
-    let newPath: string | null = null;
-    let renameFrom: string | null = null;
-    let renameTo: string | null = null;
-    let hunkStart = -1;
-
-    for (let j = 1; j < lines.length; j++) {
-      const l = lines[j]!;
-      if (l.startsWith("new file mode")) status = "added";
-      else if (l.startsWith("deleted file mode")) status = "deleted";
-      else if (l.startsWith("rename from ")) { renameFrom = cleanPath(l.slice(12)); status = "renamed"; }
-      else if (l.startsWith("rename to ")) { renameTo = cleanPath(l.slice(10)); status = "renamed"; }
-      else if (l.startsWith("Binary files") || l.startsWith("GIT binary patch")) binary = true;
-      else if (l.startsWith("--- ")) oldPath = cleanPath(l.slice(4));
-      else if (l.startsWith("+++ ")) newPath = cleanPath(l.slice(4));
-      else if (l.startsWith("@@")) { hunkStart = j; break; }
-    }
-
-    const fullHunks = hunkStart >= 0 ? lines.slice(hunkStart).join("\n") : "";
-
-    // Count from the full hunks before any truncation so the summary line
-    // stays honest even when the rendered body is cut. (`+++`/`---` headers
-    // sit before the first `@@`, so they're never in `fullHunks` — the guards
-    // are belt-and-suspenders.)
-    let additions = 0;
-    let deletions = 0;
-    for (const l of fullHunks.split("\n")) {
-      if (l.startsWith("+") && !l.startsWith("+++")) additions++;
-      else if (l.startsWith("-") && !l.startsWith("---")) deletions++;
-    }
-
-    // Cap the rendered body, slicing at a line boundary so the last visible
-    // row isn't a partial line.
-    let hunks = fullHunks;
-    let truncated = false;
-    if (fullHunks.length > PER_FILE_HUNK_CAP) {
-      const cut = fullHunks.lastIndexOf("\n", PER_FILE_HUNK_CAP);
-      hunks = fullHunks.slice(0, cut > 0 ? cut : PER_FILE_HUNK_CAP);
-      truncated = true;
-    }
-
-    files.push({
-      path: renameTo ?? newPath ?? oldPath ?? "(unknown)",
-      oldPath: status === "renamed" ? renameFrom ?? oldPath : null,
-      status,
-      additions,
-      deletions,
-      binary,
-      hunks: binary ? "" : hunks,
-      truncated,
-    });
-  }
-  return files;
-}
-
 /**
  * Compute everything a task changed in its working directory — committed AND
  * uncommitted changes to tracked files, plus newly created (untracked) files
@@ -675,12 +624,12 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
     return { base: shortBase, files: [], note: emptyNote };
   }
   files.sort((a, b) => a.path.localeCompare(b.path));
-  if (files.length > MAX_FILES) {
+  if (files.length > MAX_DIFF_FILES) {
     const total = files.length;
     return {
       base: shortBase,
-      files: files.slice(0, MAX_FILES),
-      note: `Showing the first ${MAX_FILES} of ${total} changed files — the rest are omitted to keep the viewer responsive.`,
+      files: files.slice(0, MAX_DIFF_FILES),
+      note: `Showing the first ${MAX_DIFF_FILES} of ${total} changed files — the rest are omitted to keep the viewer responsive.`,
     };
   }
   return { base: shortBase, files };
