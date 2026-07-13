@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
-import { AlertTriangle, Settings, X } from "lucide-react";
+import { AlertTriangle, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
+import { GitHubDialog } from "@/components/kanban/GitHubDialog";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -86,6 +87,7 @@ export default function App() {
   const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [githubOpen, setGithubOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -225,11 +227,12 @@ export default function App() {
         // in the GlobalEvent handler below, but this handler closes over
         // its own scope, so the fresh list has to be fetched directly
         // rather than relying on `tasksRef` updating synchronously after
-        // `setTasks`.
+        // `setTasks`. No focusWindow() call here: this handler only fires
+        // after the main process has already handled `open-url` and focused
+        // the window itself, so a second call would be redundant.
         const fresh = findTaskById(tasksRef.current, ev.taskId);
         if (fresh) {
           setSelected(fresh);
-          window.focus();
           return;
         }
         void (async () => {
@@ -239,7 +242,6 @@ export default function App() {
             const found = findTaskById(list, ev.taskId);
             if (found) {
               setSelected(found);
-              window.focus();
             }
             // else: silently no-op — the task doesn't exist (deleted?).
           } catch {
@@ -302,9 +304,11 @@ export default function App() {
         const fresh = tasksRef.current.find((t) => t.id === ev.taskId);
         if (fresh) setSelected(fresh);
         // Best-effort: bring the agetor window forward when the user clicks
-        // through from a native notification. window.focus() is a no-op in
-        // many browsers but works inside WKWebView.
-        window.focus();
+        // through from a toast. Unlike the open_task handler above, nothing
+        // else focuses the window on this path — a WKWebView's own
+        // `window.focus()` can't activate the host NSApplication, so it has
+        // to round-trip through the main process.
+        void api.focusWindow();
       };
       if (ev.kind === "interaction") {
         // A question / permission prompt opened or closed. The tracker raises
@@ -601,6 +605,15 @@ export default function App() {
           <Button
             variant="ghost"
             size="icon"
+            onClick={() => setGithubOpen(true)}
+            aria-label="GitHub"
+            title="GitHub pull requests and issues"
+          >
+            <GitPullRequest className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={() => setSettingsOpen(true)}
             aria-label="Settings"
             title="Settings"
@@ -714,6 +727,12 @@ export default function App() {
         taskId={diffTask?.id ?? null}
         taskTitle={diffTask?.title}
         onClose={() => setDiffTask(null)}
+      />
+      <GitHubDialog
+        open={githubOpen}
+        projects={projects}
+        initialProjectPath={repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        onClose={() => setGithubOpen(false)}
       />
       <SettingsDialog
         open={settingsOpen}

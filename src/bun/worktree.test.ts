@@ -1,4 +1,4 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll, describe } from "bun:test";
 import { mkdtempSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -13,6 +13,14 @@ process.env.AGETOR_DATA_DIR = DATA_DIR;
 async function git(args: string[], cwd: string) {
   const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   await proc.exited;
+}
+
+// Standalone helper: run `git rev-parse` and capture the resolved sha/ref.
+async function revParse(cwd: string, ref: string): Promise<string> {
+  const proc = Bun.spawn(["git", "rev-parse", ref], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const out = (await new Response(proc.stdout).text()).trim();
+  await proc.exited;
+  return out;
 }
 
 async function makeRepo(): Promise<string> {
@@ -41,7 +49,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     mode: null,
     model: null,
     effort: null,
-    references: [],
+    references: [],    backlog: [],
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,
@@ -449,6 +457,20 @@ test("getTaskDiff truncates a huge file's body but keeps honest line counts", as
   expect(huge!.additions).toBe(lineCount);
 });
 
+test("parseGitDiff keeps the path for binary-only file sections", async () => {
+  const { parseGitDiff } = await import("./git-diff.ts");
+  const files = parseGitDiff([
+    "diff --git a/assets/logo.png b/assets/logo.png",
+    "index 1234567..89abcde 100644",
+    "Binary files a/assets/logo.png and b/assets/logo.png differ",
+    "",
+  ].join("\n"));
+
+  expect(files).toHaveLength(1);
+  expect(files[0]?.path).toBe("assets/logo.png");
+  expect(files[0]?.binary).toBe(true);
+});
+
 test("removeWorktree tears down both the worktree and the branch", async () => {
   const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
   const repo = await makeRepo();
@@ -733,4 +755,127 @@ test("gitPull rejects a branch name that could be read as a git flag", async () 
   const r = await gitPull(repo, "--upload-pack=evil");
   expect(r.ok).toBe(false);
   expect(r.error).toContain("invalid branch name");
+});
+
+test("gitPush pushes a local-only branch to origin and sets its upstream", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  // origin stays checked out on main; pushing a *different* new branch to a
+  // non-bare repo is allowed (only a push to the checked-out branch is denied).
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-push-clone-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  await git(["checkout", "-b", "feature/pushme"], clone);
+  writeFileSync(path.join(clone, "work.txt"), "local work\n");
+  await git(["add", "."], clone);
+  await git(["commit", "-m", "local work"], clone);
+
+  const r = await gitPush(clone, "feature/pushme");
+  expect(r.ok).toBe(true);
+  expect(r.remote).toBe("origin");
+
+  // origin now has the branch, and the clone tracks it.
+  const onOrigin = Bun.spawnSync(["git", "rev-parse", "--verify", "feature/pushme"], { cwd: origin });
+  expect(onOrigin.exitCode).toBe(0);
+  const upstream = Bun.spawnSync(
+    ["git", "rev-parse", "--abbrev-ref", "feature/pushme@{upstream}"],
+    { cwd: clone },
+  );
+  expect(new TextDecoder().decode(upstream.stdout).trim()).toBe("origin/feature/pushme");
+});
+
+test("gitPush errors when the repo has no remote configured", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  await git(["checkout", "-b", "feature/local"], repo);
+  const r = await gitPush(repo, "feature/local");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("no git remote");
+});
+
+test("gitPush rejects a branch name that could be read as a git flag", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const r = await gitPush(repo, "--upload-pack=evil");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("invalid branch name");
+});
+
+test("gitPush returns an error when the dir isn't a git repo", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-push-nongit-"));
+  const r = await gitPush(dir, "main");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("not a git repository");
+});
+
+describe("getAheadCount", () => {
+  test("returns null when the dir doesn't exist", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const missing = path.join(tmpdir(), `agetor-wt-missing-${randomUUID()}`);
+    expect(await getAheadCount(missing, null)).toBeNull();
+  });
+
+  test("returns null for a non-git directory", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-ahead-"));
+    expect(await getAheadCount(dir, null)).toBeNull();
+  });
+
+  test("counts commits ahead of a given baseRef when there's no upstream", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const baseSha = await revParse(repo, "HEAD");
+
+    writeFileSync(path.join(repo, "a.txt"), "a\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "second"], repo);
+
+    writeFileSync(path.join(repo, "b.txt"), "b\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "third"], repo);
+
+    expect(await getAheadCount(repo, baseSha)).toBe(2);
+
+    const headSha = await revParse(repo, "HEAD");
+    expect(await getAheadCount(repo, headSha)).toBe(0);
+  });
+
+  test("returns 0 (unknown-but-not-blocking) when there's no upstream and no baseRef", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await getAheadCount(repo, null)).toBe(0);
+  });
+
+  test("prefers the upstream count over baseRef, including a stale/misleading baseRef", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    // A bare repo stands in for the remote: `push -u` gives `repo` a real
+    // `@{u}` so getAheadCount should use tier 1 (upstream), not baseRef.
+    const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-ahead-bare-"));
+    await git(["init", "--bare", "-b", "main"], bare);
+
+    const repo = await makeRepo();
+    await git(["remote", "add", "origin", bare], repo);
+    await git(["push", "-u", "origin", "main"], repo);
+
+    expect(await getAheadCount(repo, null)).toBe(0);
+
+    writeFileSync(path.join(repo, "c.txt"), "c\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "after-push"], repo);
+
+    expect(await getAheadCount(repo, null)).toBe(1);
+
+    // A stale baseRef pointing at the current HEAD would give a
+    // baseRef..HEAD count of 0 if the baseRef tier were (incorrectly) used —
+    // but the upstream tier must win, so the answer stays 1.
+    const headSha = await revParse(repo, "HEAD");
+    expect(await getAheadCount(repo, headSha)).toBe(1);
+  });
+
+  test("returns null for an invalid baseRef when there's no upstream", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await getAheadCount(repo, "no-such-ref")).toBeNull();
+  });
 });

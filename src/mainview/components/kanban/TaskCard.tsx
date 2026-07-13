@@ -1,6 +1,6 @@
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -62,6 +62,7 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, o
 
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
+  const runningSubagents = task.runningSubagents ?? 0;
 
   return (
     <Card
@@ -105,6 +106,16 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, o
               >
                 <Terminal className="size-3" />
                 {task.openTerminalCount}
+              </Badge>
+            )}
+            {runningSubagents > 0 && (
+              <Badge
+                variant="outline"
+                className="gap-1 text-[10px]"
+                title={`${runningSubagents} background agent${runningSubagents > 1 ? "s" : ""} running`}
+              >
+                <Bot className="size-3" />
+                {runningSubagents}
               </Badge>
             )}
           </div>

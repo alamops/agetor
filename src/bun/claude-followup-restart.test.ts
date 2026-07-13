@@ -96,6 +96,7 @@ test("follow-up to a task whose session outlived the process resumes instead of 
       model: "claude-opus-4-7",
       effort: "medium",
       references: [],
+      backlog: [],
       runId: priorRunId,
       hasOpenableRun: false,
       pendingInteractionCount: 0,

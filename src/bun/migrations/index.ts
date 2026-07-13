@@ -22,10 +22,12 @@ import m019 from "./019_archived_at.sql" with { type: "text" };
 import m020 from "./020_task_type.sql" with { type: "text" };
 import m021 from "./021_codex_session_id.sql" with { type: "text" };
 import m022 from "./022_subagents.sql" with { type: "text" };
-// NOTE: 023 (023_task_backlog) is owned by a concurrent branch and lands when
-// that branch merges. This migration took 024 to append cleanly after it.
-// Migration ids are opaque, so the numeric gap (022 → 024) is harmless.
-import m024 from "./024_project_branch_config.sql" with { type: "text" };
+import m023 from "./023_run_origin.sql" with { type: "text" };
+import m024 from "./024_reseed_harness_builtins.sql" with { type: "text" };
+import m025 from "./025_task_backlog.sql" with { type: "text" };
+// Appends after main's 022–025 (this branch originally used 024, renumbered on
+// merge to avoid the clash with 024_reseed_harness_builtins).
+import m026 from "./026_project_branch_config.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -52,5 +54,8 @@ export const migrations: Migration[] = [
   { id: "020_task_type", sql: m020 },
   { id: "021_codex_session_id", sql: m021 },
   { id: "022_subagents", sql: m022 },
-  { id: "024_project_branch_config", sql: m024 },
+  { id: "023_run_origin", sql: m023 },
+  { id: "024_reseed_harness_builtins", sql: m024 },
+  { id: "025_task_backlog", sql: m025 },
+  { id: "026_project_branch_config", sql: m026 },
 ];

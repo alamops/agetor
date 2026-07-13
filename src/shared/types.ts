@@ -472,6 +472,14 @@ export interface Task {
    * launch prompt as text — agetor never copies or uploads these.
    */
   references: TaskReference[];
+  /**
+   * Saved, not-yet-sent draft messages for this task — a per-task memory of
+   * things the user wants to send later but isn't ready to send now. Ordered
+   * newest-intent-first by array position (the UI lets the user reorder).
+   * Persisted as a JSON column, mirroring `references`. Empty list when none.
+   * Sending a backlog item consumes it (removes it from this list).
+   */
+  backlog: BacklogMessage[];
   runId: string | null;
   /**
    * True when this task has at least one run whose status is
@@ -514,6 +522,10 @@ export interface Task {
    * default kanban filter and rendered read-only in the run panel.
    */
   archivedAt: number | null;
+  /** Count of this task's subagents currently `status:"running"`. Derived per
+   *  request by the server (never persisted, never patchable). Absent on payloads
+   *  that don't join the subagents table. */
+  runningSubagents?: number;
 }
 
 /** A live terminal tab for a task. Returned by the terminal REST endpoints;
@@ -540,6 +552,24 @@ export interface TaskReference {
   path: string;
   /** True for directories — affects icon + trailing slash in prompts. */
   isDirectory: boolean;
+}
+
+/**
+ * A saved, not-yet-sent draft message parked on a task's backlog. Carries the
+ * same shape a follow-up message assembles from the composer: free-text plus
+ * any attached file/folder references. When the user sends it, the text and
+ * references are inlined (via `appendReferences`) exactly like a normal
+ * follow-up, then the item is removed from the backlog.
+ */
+export interface BacklogMessage {
+  /** Stable id, assigned server-side, used to target edit/delete/reorder/send. */
+  id: string;
+  /** The draft message text. May be empty when the item is references-only. */
+  text: string;
+  /** File/folder references to inline when this draft is eventually sent. */
+  references: TaskReference[];
+  /** Unix ms timestamp when the draft was saved. */
+  createdAt: number;
 }
 
 export interface AgentOption {
@@ -801,6 +831,17 @@ export interface Run {
    * for claude-code and legacy rows.
    */
   codexSessionId: string | null;
+  /**
+   * How this run came to exist. `null`/undefined = user-initiated (Run
+   * button, a follow-up message typed into the panel — every run before
+   * this field existed). `"continuation"` = opened automatically by the
+   * orchestrator after the same claude session auto-resumed post `end_turn`
+   * (e.g. it delegated to a background task and later kept talking once
+   * that task finished). Optional so callers that don't pass it (most of
+   * them — only the continuation-run factory sets it) keep compiling
+   * unchanged; DB rows predating migration 023 read back as null.
+   */
+  origin?: "continuation" | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */
@@ -841,6 +882,554 @@ export interface TaskDiff {
    * `files` is non-empty.
    */
   note?: string;
+}
+
+export type GitHubItemKind = "pulls" | "issues";
+export type GitHubItemState = "open" | "closed" | "all";
+
+export interface GitHubLabel {
+  name: string;
+  color: string | null;
+}
+
+/** A repository label as returned by the labels-management endpoints (carries a
+ *  description, unlike the lighter GitHubLabel embedded in an item). `color` is
+ *  6-hex without a leading `#`. */
+export interface GitHubRepoLabel {
+  name: string;
+  color: string;
+  description: string;
+}
+
+export interface GitHubLabelsResult {
+  repo: string;
+  labels: GitHubRepoLabel[];
+}
+
+export interface GitHubUser {
+  login: string;
+  avatarUrl: string | null;
+  htmlUrl: string | null;
+}
+
+export interface GitHubAssigneesResult {
+  repo: string;
+  assignees: GitHubUser[];
+}
+
+export interface GitHubMilestone {
+  number: number;
+  title: string;
+}
+
+/** A repository milestone as returned by the milestone-management endpoints
+ *  (carries state, description, due date and issue counts, unlike the lighter
+ *  GitHubMilestone embedded in an item). `dueOn` is an ISO8601 string or null. */
+export interface GitHubRepoMilestone {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  description: string;
+  dueOn: string | null;
+  openIssues: number;
+  closedIssues: number;
+  htmlUrl: string;
+}
+
+export interface GitHubMilestonesResult {
+  repo: string;
+  milestones: GitHubRepoMilestone[];
+}
+
+export interface GitHubListItem {
+  kind: GitHubItemKind;
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  draft: boolean;
+  htmlUrl: string;
+  author: GitHubUser | null;
+  assignees: GitHubUser[];
+  milestone: GitHubMilestone | null;
+  body: string;
+  labels: GitHubLabel[];
+  comments: number;
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
+  /** Set (to a timestamp) only for a merged pull request; null otherwise —
+   *  lets the UI distinguish a merged PR from a closed-unmerged one, which the
+   *  `state: "closed"` value alone conflates. Always null for issues. */
+  mergedAt: string | null;
+  /** Whether the conversation is locked (REST `locked` field). Applies to both
+   *  issues and pull requests — GitHub locks both through the same
+   *  `/issues/:number/lock` endpoint. Defaults to `false` when the source
+   *  response omits the field (some list paths do). */
+  locked: boolean;
+  /** Local filesystem path of the project this item came from (G8, multi-repo
+   *  aggregation). Single-repo listing sets this to that repo's dir; every
+   *  per-item action resolves `item.sourcePath ?? projectPath` so writes land
+   *  on the correct repo even when the list aggregates several. Null only for
+   *  items normalized without a known dir (shouldn't happen in practice —
+   *  every list/action call site threads one through). */
+  sourcePath: string | null;
+}
+
+/** Rate-limit snapshot parsed from a GitHub API response's `x-ratelimit-*`
+ *  headers (see `parseRateLimit` in `src/bun/github.ts`). `resource` is
+ *  GitHub's own bucket name (e.g. "core" or "search" — the Search API has a
+ *  much tighter ~30/min budget than the ~5000/hr core budget). */
+export interface GitHubRateLimit {
+  remaining: number;
+  limit: number;
+  resource: string;
+}
+
+/** The viewer's permission level on a repo, from `GET /repos/:o/:r`'s
+ *  `permissions` object. Drives push-only-control gating (F13) — `push` is
+ *  the one the UI cares about; `admin`/`maintain` ride along for future use.
+ *  Unauthenticated (no token) resolves to all-false rather than erroring,
+ *  mirroring `getGitHubViewer`'s no-token behavior. */
+export interface GitHubRepoPermissions {
+  push: boolean;
+  admin: boolean;
+  maintain: boolean;
+}
+
+export interface GitHubListResult {
+  /** Single-repo mode: "owner/name". Aggregate mode (G8): a display summary
+   *  like "3 repositories" — see `repos` for the actual slugs. */
+  repo: string;
+  /** Null in aggregate mode (G8) — there's no single repo to open. */
+  webUrl: string | null;
+  auth: "token" | "none";
+  items: GitHubListItem[];
+  /** Page number this result represents — mirrors the request's `page`
+   *  (defaults to 1). Used by the "Load more" flow to request `page + 1`.
+   *  Aggregate mode (G8) always reports page 1 — "Load more" is disabled. */
+  page: number;
+  /** True when another page is available beyond this one — derived from the
+   *  REST `link: rel="next"` header, or from the Search API's `total_count`
+   *  (capped at GitHub's 1000-result search ceiling). In aggregate mode (G8)
+   *  this instead means "at least one aggregated repo had more than the
+   *  first page fetched" (the merged list is truncated to one page per repo). */
+  hasMore: boolean;
+  /** Rate-limit snapshot from the headers of the response that produced this
+   *  page, or null when the headers were absent. Aggregate mode (G8) reports
+   *  the tightest-remaining snapshot across the fanned-out per-repo calls. */
+  rateLimit: GitHubRateLimit | null;
+  /** Aggregate mode only (G8): the resolved "owner/name" slug of every repo
+   *  whose fetch succeeded (dirs without a GitHub remote, or that otherwise
+   *  failed, are silently skipped). Undefined in single-repo mode. */
+  repos?: string[];
+}
+
+export interface GitHubComment {
+  id: number;
+  body: string;
+  htmlUrl: string;
+  author: GitHubUser | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GitHubPullLineComment extends GitHubComment {
+  path: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+}
+
+export interface GitHubCommentsResult {
+  repo: string;
+  itemNumber: number;
+  comments: GitHubComment[];
+}
+
+export interface GitHubPullReviewCommentsResult {
+  repo: string;
+  pullNumber: number;
+  comments: GitHubPullLineComment[];
+}
+
+/** A resolvable review-comment thread (from GraphQL). `rootCommentId` is the
+ *  REST databaseId of the thread's first comment, so the UI can match a thread
+ *  to a comment in the flat review-comments list. */
+export interface GitHubReviewThread {
+  threadId: string;
+  rootCommentId: number;
+  isResolved: boolean;
+  isOutdated: boolean;
+}
+
+export interface GitHubPullReviewThreadsResult {
+  repo: string;
+  pullNumber: number;
+  threads: GitHubReviewThread[];
+  /** True when GitHub reported more than the first page of review threads, so
+   *  the resolve controls only cover the first 100. */
+  truncated: boolean;
+}
+
+export interface GitHubCheckRun {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  htmlUrl: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export interface GitHubChecksResult {
+  repo: string;
+  pullNumber: number;
+  sha: string;
+  checkRuns: GitHubCheckRun[];
+}
+
+/** A single context entry in a commit's combined status (`GET
+ *  /commits/:ref/status`) — the legacy Status API, distinct from the
+ *  check-runs `GitHubChecksResult` above (some CI providers still only post
+ *  through this older API, so both are shown). */
+export interface GitHubCommitStatusContext {
+  context: string;
+  state: string;
+  description: string | null;
+  targetUrl: string | null;
+}
+
+/** Normalized combined-status payload — the shape `normalizeCommitStatus`
+ *  produces from the raw response, before the request-scoped `repo`/`ref`
+ *  are stitched on at the call site (see `GitHubCommitStatusResult`). */
+export interface GitHubCommitStatus {
+  state: "success" | "pending" | "failure" | "error" | "";
+  total: number;
+  statuses: GitHubCommitStatusContext[];
+}
+
+export interface GitHubCommitStatusResult extends GitHubCommitStatus {
+  repo: string;
+  ref: string;
+}
+
+/** A single commit on a pull request, from `GET /pulls/:n/commits`.
+ *  `messageHeadline` is the first line of the commit message; `author` prefers
+ *  the top-level GitHub-user `author` (has a `login`) over the raw git author,
+ *  falling back to null when the commit's author isn't a known GitHub user. */
+export interface GitHubPullCommit {
+  sha: string;
+  messageHeadline: string;
+  author: GitHubUser | null;
+  authoredDate: string;
+  htmlUrl: string;
+}
+
+export interface GitHubPullCommitsResult {
+  repo: string;
+  pullNumber: number;
+  commits: GitHubPullCommit[];
+}
+
+/** A repository release, from `GET /repos/:o/:r/releases` (F18). `body` is
+ *  the release notes markdown; `targetCommitish` is the branch/sha the tag
+ *  was (or will be) cut from. */
+export interface GitHubRelease {
+  id: number;
+  tagName: string;
+  name: string;
+  body: string;
+  draft: boolean;
+  prerelease: boolean;
+  publishedAt: string | null;
+  createdAt: string;
+  htmlUrl: string;
+  targetCommitish: string;
+}
+
+export interface GitHubReleasesResult {
+  repo: string;
+  releases: GitHubRelease[];
+}
+
+/** A repository tag, from `GET /repos/:o/:r/tags` — powers the release
+ *  manager's tag-name datalist (F18). Tags aren't paginated per-repo scope in
+ *  the UI, so this result carries no `repo` field (unlike the other list
+ *  results here). */
+export interface GitHubTag {
+  name: string;
+  commitSha: string;
+}
+
+export interface GitHubTagsResult {
+  tags: GitHubTag[];
+}
+
+/** A single GitHub Actions workflow run, from `GET
+ *  /repos/:o/:r/actions/runs` (F20). `status` is GitHub's coarse run state
+ *  (`queued` | `in_progress` | `completed` | …); `conclusion` is only set
+ *  once `status === "completed"` (`success` | `failure` | `cancelled` |
+ *  `skipped` | `neutral` | `timed_out` | `action_required` | …), null while
+ *  still running. */
+export interface GitHubWorkflowRun {
+  id: number;
+  name: string;
+  displayTitle: string;
+  status: string;
+  conclusion: string | null;
+  event: string;
+  headBranch: string;
+  runNumber: number;
+  htmlUrl: string;
+  createdAt: string;
+  workflowId: number;
+}
+
+export interface GitHubWorkflowRunsResult {
+  repo: string;
+  runs: GitHubWorkflowRun[];
+}
+
+/** A single workflow definition, from `GET /repos/:o/:r/actions/workflows`
+ *  (F20) — powers the "run a workflow" dispatch picker. `state` is
+ *  `active` | `disabled_manually` | … ; only `active` ones are dispatchable. */
+export interface GitHubWorkflow {
+  id: number;
+  name: string;
+  path: string;
+  state: string;
+}
+
+export interface GitHubWorkflowsResult {
+  workflows: GitHubWorkflow[];
+}
+
+/** An issue a pull request will close on merge (GraphQL
+ *  `closingIssuesReferences`), read-only — surfaced as a "Closes: #N" line. */
+export interface GitHubLinkedIssue {
+  number: number;
+  title: string;
+  url: string;
+  state: "OPEN" | "CLOSED";
+}
+
+export interface GitHubLinkedIssuesResult {
+  repo: string;
+  pullNumber: number;
+  issues: GitHubLinkedIssue[];
+}
+
+/** A child issue tracked under a parent via GitHub's sub-issues REST API
+ *  (`/issues/:number/sub_issues`). `id` is the child's REST database id —
+ *  distinct from its display `number` — because removing a sub-issue
+ *  (`DELETE /issues/:number/sub_issue`) addresses the child by id, not
+ *  number, so the UI needs it without a second round trip. */
+export interface GitHubSubIssue {
+  id: number;
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  htmlUrl: string;
+}
+
+export interface GitHubSubIssuesResult {
+  repo: string;
+  issueNumber: number;
+  subIssues: GitHubSubIssue[];
+}
+
+/** A repo-linked GitHub Projects v2 board, from GraphQL
+ *  `repository.projectsV2.nodes` (F21/G11). Projects v2 is GraphQL-only —
+ *  there's no REST equivalent. `number` is the project's board number (used
+ *  in its URL), distinct from the opaque GraphQL `id` every mutation keys on. */
+export interface GitHubProjectV2 {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+}
+
+export interface GitHubProjectsV2Result {
+  projects: GitHubProjectV2[];
+}
+
+/** A single-select field on a project (e.g. "Status"), with its selectable
+ *  options. Non-select fields (text, number, date, iteration…) are not
+ *  represented here — `options` is empty for any field this UI doesn't drive
+ *  a dropdown for. */
+export interface GitHubProjectField {
+  id: string;
+  name: string;
+  options: { id: string; name: string }[];
+}
+
+/** A single item on a project board — an Issue, PullRequest, or DraftIssue
+ *  (GraphQL `content.__typename`), plus its current value for the project's
+ *  "Status" single-select field (if any). `number`/`title` come from the
+ *  underlying content for Issue/PullRequest; a DraftIssue has no `number`
+ *  (null) and its own `title`. `contentType: "other"` covers any future
+ *  content type GraphQL might add that this UI doesn't special-case. */
+export interface GitHubProjectItem {
+  itemId: string;
+  contentType: "Issue" | "PullRequest" | "DraftIssue" | "other";
+  number: number | null;
+  title: string;
+  statusOptionId: string | null;
+  statusOptionName: string | null;
+}
+
+/** `statusField` is the project's field named "Status" (if it's a
+ *  single-select field) — the UI uses its `options` to populate each row's
+ *  status dropdown. Null when the project has no such field, in which case
+ *  the UI hides the status column entirely. */
+export interface GitHubProjectItemsResult {
+  items: GitHubProjectItem[];
+  statusField: GitHubProjectField | null;
+}
+
+/** A GitHub Discussions thread (GraphQL-only — F22/G12). `answered` is derived
+ *  from `isAnswered`/`answerChosenAt` — true once one of the thread's comments
+ *  has been marked the accepted answer. `author` is null for a deleted
+ *  account (GraphQL nulls the field rather than erroring). */
+export interface GitHubDiscussion {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  category: string;
+  author: string | null;
+  createdAt: string;
+  answered: boolean;
+}
+
+/** A Discussions category (e.g. "Q&A", "Announcements") — listed only to
+ *  populate the create-discussion form's category picker. Scope decision A2:
+ *  category *management* (create/edit/delete a category) is out of scope. */
+export interface GitHubDiscussionCategory {
+  id: string;
+  name: string;
+}
+
+/** `auth` mirrors `GitHubListResult.auth`: discussions are readable without a
+ *  token, but the UI gates create/comment/answer on `auth !== "none"` — any
+ *  authenticated user can do those, not just someone with push access (G12
+ *  gating note; distinct from every other manager panel, which gates writes
+ *  on push). */
+export interface GitHubDiscussionsResult {
+  discussions: GitHubDiscussion[];
+  categories: GitHubDiscussionCategory[];
+  auth: "token" | "none";
+}
+
+/** A single comment on a discussion thread. `isAnswer` reflects whether GitHub
+ *  currently has this comment marked as the discussion's accepted answer. */
+export interface GitHubDiscussionComment {
+  id: string;
+  body: string;
+  author: string | null;
+  createdAt: string;
+  isAnswer: boolean;
+}
+
+/** A discussion's full detail — body + comments. `answerable` reflects the
+ *  discussion's *category* (`category.isAnswerable`, e.g. "Q&A" is answerable,
+ *  "Announcements" isn't) — the UI hides the mark/unmark-answer control when
+ *  false regardless of who's viewing. */
+export interface GitHubDiscussionDetail {
+  id: string;
+  title: string;
+  body: string;
+  comments: GitHubDiscussionComment[];
+  answerable: boolean;
+}
+
+/** GitHub's mergeability verdict for a PR, from `GET /pulls/:n`.
+ *  `mergeable` is null while GitHub computes it in the background (poll again).
+ *  `mergeableState` is GitHub's coarse status: clean | dirty (conflicts) |
+ *  behind (base moved) | blocked (required reviews/checks) | unstable (checks
+ *  pending/failing but mergeable) | draft | has_hooks | unknown.
+ *  `autoMerge` reflects the REST `auto_merge` field (non-null once enabled). */
+export interface GitHubPullMergeability {
+  repo: string;
+  pullNumber: number;
+  mergeable: boolean | null;
+  mergeableState: string;
+  rebaseable: boolean | null;
+  merged: boolean;
+  draft: boolean;
+  headRef: string;
+  baseRef: string;
+  headSha: string;
+  autoMerge: boolean;
+}
+
+export type GitHubPullReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+export type GitHubPullMergeMethod = "merge" | "squash" | "rebase";
+
+export interface GitHubActionResult {
+  ok: true;
+  message?: string;
+  commentPosted?: boolean;
+}
+
+export interface GitHubPullMergeResult extends GitHubActionResult {
+  merged: boolean;
+  sha: string | null;
+}
+
+export interface GitHubPullDefaultsResult {
+  repo: string;
+  head: string;
+  base: string;
+}
+
+export type GitHubReactionContent = "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" | "rocket" | "eyes";
+
+/** Discriminates which entity a reaction (or reaction list) targets. For `issue`,
+ *  `id` is the issue/PR **number** — issues and PRs share the
+ *  `/issues/:number/reactions` endpoint. `issueComment` / `reviewComment` carry a
+ *  comment's REST id (`/issues/comments/:id` vs `/pulls/comments/:id`). */
+export interface GitHubReactionSubject {
+  type: "issue" | "issueComment" | "reviewComment";
+  id: number;
+}
+
+/** One content's aggregated reaction count for a subject, plus the viewer's own
+ *  reaction id (non-null only when the viewer has reacted with this content) so
+ *  the UI can toggle a chip off via DELETE without a second lookup. */
+export interface GitHubReactionSummary {
+  content: GitHubReactionContent;
+  count: number;
+  viewerReactionId: number | null;
+}
+
+export interface GitHubReactionsResult {
+  reactions: GitHubReactionSummary[];
+}
+
+/** A GitHub notification thread (`GET /notifications`), scoped to the current
+ *  repo (F14). `subjectType` is GitHub's own subject kind ("PullRequest",
+ *  "Issue", "Commit", "Discussion", …) — not narrowed to `GitHubItemKind`
+ *  since notifications cover subjects the rest of the UI doesn't model.
+ *  `subjectUrl`/`latestCommentUrl` are api.github.com URLs (or null); the UI
+ *  opens whichever is present via `api.openExternal`. */
+export interface GitHubNotification {
+  id: string;
+  unread: boolean;
+  reason: string;
+  updatedAt: string;
+  title: string;
+  subjectType: string;
+  subjectUrl: string | null;
+  /** Browsable HTML URL derived from `subjectUrl` (api.github.com → github.com),
+   *  so the UI opens the page rather than the raw JSON. Null when not derivable. */
+  htmlUrl: string | null;
+  latestCommentUrl: string | null;
+  repo: string;
+}
+
+export interface GitHubNotificationsResult {
+  repo: string;
+  notifications: GitHubNotification[];
 }
 
 /**

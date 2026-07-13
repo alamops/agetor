@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -68,6 +69,7 @@ type TaskRow = {
   branch: string | null; worktree_path: string | null; base_ref: string | null;
   mode: string | null; model: string | null; effort: string | null;
   refs: string;
+  backlog: string;
   run_id: string | null; created_at: number; updated_at: number;
   archived_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
@@ -97,6 +99,33 @@ const parseRefs = (raw: string): TaskReference[] => {
   } catch { return []; }
 };
 
+/** Coerce the raw refs value (already a TaskReference[]-ish) through the same
+ *  sanitizer `parseRefs` applies to on-disk JSON, so a backlog item's refs are
+ *  validated identically whether they come from the DB column or a fresh
+ *  client payload. */
+const sanitizeRefs = (value: unknown): TaskReference[] =>
+  Array.isArray(value) ? parseRefs(JSON.stringify(value)) : [];
+
+const parseBacklog = (raw: string): BacklogMessage[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((m): BacklogMessage[] => {
+      if (!m || typeof m !== "object") return [];
+      const id = (m as { id?: unknown }).id;
+      if (typeof id !== "string" || !id) return [];
+      const text = (m as { text?: unknown }).text;
+      const createdAt = (m as { createdAt?: unknown }).createdAt;
+      return [{
+        id,
+        text: typeof text === "string" ? text : "",
+        references: sanitizeRefs((m as { references?: unknown }).references),
+        createdAt: typeof createdAt === "number" ? createdAt : 0,
+      }];
+    });
+  } catch { return []; }
+};
+
 const toTask = (r: TaskRow): Task => ({
   id: r.id,
   title: r.title,
@@ -113,6 +142,7 @@ const toTask = (r: TaskRow): Task => ({
   model: r.model,
   effort: r.effort,
   references: parseRefs(r.refs),
+  backlog: parseBacklog(r.backlog),
   runId: r.run_id,
   // `has_openable_run` comes back as SQLite's 0/1; missing means we didn't
   // join (e.g. insert/update returning the freshly-written shape, where
@@ -155,14 +185,15 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, worktree_path, base_ref, mode, model, effort, refs,
+          branch, worktree_path, base_ref, mode, model, effort, refs, backlog,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
         t.branch, t.worktreePath, t.baseRef, t.mode, t.model, t.effort,
         JSON.stringify(t.references ?? []),
+        JSON.stringify(t.backlog ?? []),
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
       ],
     );
@@ -178,7 +209,7 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?,
+         branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?, backlog=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
@@ -186,6 +217,7 @@ export const tasks = {
         next.taskType,
         next.branch, next.worktreePath, next.baseRef, next.mode, next.model, next.effort,
         JSON.stringify(next.references ?? []),
+        JSON.stringify(next.backlog ?? []),
         next.runId, next.updatedAt, next.archivedAt ?? null, id,
       ],
     );
@@ -199,6 +231,79 @@ export const tasks = {
   },
   delete(id: string) {
     db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  },
+};
+
+/**
+ * Per-task backlog of saved, not-yet-sent draft messages. Every op is a
+ * read-modify-write on the task's `backlog` JSON column (via `tasks.update`)
+ * and returns the freshly-updated Task, or null when the task is gone. Item
+ * ids are minted here so clients never supply their own. Array order is the
+ * display order the UI renders and the user reorders. All ops are pure list
+ * transforms — there is no process side effect, so the server can call them
+ * directly without going through the orchestrator.
+ */
+export const backlog = {
+  add(taskId: string, input: { text: string; references?: TaskReference[] }): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    const item: BacklogMessage = {
+      id: randomUUID(),
+      text: input.text,
+      references: sanitizeRefs(input.references),
+      createdAt: Date.now(),
+    };
+    // Newest draft on top: the thing you just jotted is the one most likely
+    // to be sent or edited next.
+    return tasks.update(taskId, { backlog: [item, ...task.backlog] });
+  },
+  updateItem(
+    taskId: string,
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    // Unknown id → return the task unchanged rather than writing a no-op row.
+    if (!task.backlog.some((m) => m.id === itemId)) return task;
+    const next = task.backlog.map((m) =>
+      m.id === itemId
+        ? {
+            ...m,
+            text: patch.text !== undefined ? patch.text : m.text,
+            references:
+              patch.references !== undefined ? sanitizeRefs(patch.references) : m.references,
+          }
+        : m,
+    );
+    return tasks.update(taskId, { backlog: next });
+  },
+  remove(taskId: string, itemId: string): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    return tasks.update(taskId, {
+      backlog: task.backlog.filter((m) => m.id !== itemId),
+    });
+  },
+  /** Reorder the backlog to match `order` (item ids in the desired sequence).
+   *  Ids not in the current backlog are ignored; items absent from `order` are
+   *  appended in their existing relative order — so a stale or partial `order`
+   *  can never silently drop a saved draft. */
+  reorder(taskId: string, order: string[]): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    const byId = new Map(task.backlog.map((m) => [m.id, m]));
+    const seen = new Set<string>();
+    const next: BacklogMessage[] = [];
+    for (const id of order) {
+      const m = byId.get(id);
+      if (m && !seen.has(id)) {
+        next.push(m);
+        seen.add(id);
+      }
+    }
+    for (const m of task.backlog) if (!seen.has(m.id)) next.push(m);
+    return tasks.update(taskId, { backlog: next });
   },
 };
 
@@ -513,6 +618,7 @@ type RunRow = {
   tmux_session: string | null;
   claude_session_id: string | null;
   codex_session_id: string | null;
+  origin: string | null;
 };
 
 const toRun = (r: RunRow): Run => ({
@@ -526,6 +632,7 @@ const toRun = (r: RunRow): Run => ({
   tmuxSession: r.tmux_session,
   claudeSessionId: r.claude_session_id,
   codexSessionId: r.codex_session_id,
+  origin: (r.origin as Run["origin"]) ?? null,
 });
 
 export const runs = {
@@ -538,13 +645,17 @@ export const runs = {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
     return row ? toRun(row) : null;
   },
+  /** `r.origin` is optional on the `Run` type (most callers don't set it —
+   *  only the continuation-run factory does) so `?? null` keeps a
+   *  user-initiated run's row explicitly NULL rather than the JS `undefined`
+   *  bun:sqlite would otherwise bind. */
   insert(r: Run): Run {
     db.run(
-      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId],
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.origin ?? null],
     );
-    return r;
+    return { ...r, origin: r.origin ?? null };
   },
   update(id: string, patch: Partial<Run>): Run | null {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
@@ -712,5 +823,72 @@ export const subagents = {
   },
   setStatus(id: string, status: SubagentStatus, endedAt: number | null): void {
     db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, endedAt, id]);
+  },
+  /** Settle a single subagent by id — the DB half of an *externally*-detected
+   *  completion (a parent task-notification naming the finishing agent, or
+   *  boot reconciliation finding its session gone), as opposed to the
+   *  watcher's own `checkDone` idle-detection. Idempotent: only flips a row
+   *  whose status is currently `running`, so a duplicate/late signal (e.g.
+   *  the watcher's own idle-detection racing the same completion) is a
+   *  harmless no-op rather than double-firing `ended_at`. Returns whether a
+   *  row actually changed, plus its `taskId` (cheap — same SELECT) so the
+   *  caller can trigger the settle/release-hold bookkeeping without a second
+   *  query. */
+  markSettledById(id: string, status: "completed" | "orphaned"): { changed: boolean; taskId: string | null } {
+    const row = db.query<SubagentRow, [string]>(
+      `SELECT * FROM subagents WHERE id = ? AND status = 'running'`,
+    ).get(id);
+    if (!row) return { changed: false, taskId: null };
+    const now = Date.now();
+    db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, now, id]);
+    return { changed: true, taskId: row.task_id };
+  },
+  /** True when at least one subagent row for this task is still `running`. */
+  hasRunning(taskId: string): boolean {
+    const row = db.query<{ 1: number }, [string]>(
+      `SELECT 1 FROM subagents WHERE task_id = ? AND status = 'running' LIMIT 1`,
+    ).get(taskId);
+    return row !== null;
+  },
+  /** How many of this task's subagents are `running`. Distinct from
+   *  `runningCountsByTask` so a single-task caller doesn't scan every row. */
+  runningCountForTask(taskId: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM subagents WHERE task_id = ? AND status = 'running'`,
+    ).get(taskId);
+    return row?.n ?? 0;
+  },
+  /** Flip every `running` row for this task to `orphaned` (ended_at = now).
+   *  Returns the affected rows (post-update shape) so the caller can emit a
+   *  `finished` lifecycle event per row. Returns [] when nothing was running. */
+  orphanRunning(taskId: string, now: number): Subagent[] {
+    const rows = db.query<SubagentRow, [string]>(
+      `SELECT * FROM subagents WHERE task_id = ? AND status = 'running'`,
+    ).all(taskId);
+    if (rows.length === 0) return [];
+    db.run(
+      `UPDATE subagents SET status = 'orphaned', ended_at = ? WHERE task_id = ? AND status = 'running'`,
+      [now, taskId],
+    );
+    return rows.map((r) => toSubagent({ ...r, status: "orphaned", ended_at: now }));
+  },
+  /** taskId -> count of `running` rows. One grouped query, for the board poll. */
+  runningCountsByTask(): Map<string, number> {
+    const rows = db.query<{ task_id: string; n: number }, []>(
+      `SELECT task_id, COUNT(*) AS n FROM subagents WHERE status = 'running' GROUP BY task_id`,
+    ).all();
+    return new Map(rows.map((r) => [r.task_id, r.n]));
+  },
+  /** Distinct ids of every task with at least one `running` subagents row,
+   *  regardless of the task's own `column`. Boot reconciliation's held-task
+   *  pass used to source from `tasks WHERE column = 'running'`, which misses
+   *  a task whose terminal run already resolved and moved the card to
+   *  `review`/`done`/etc. before the crash — this is the wider source set
+   *  that also catches that case. */
+  taskIdsWithRunning(): string[] {
+    const rows = db.query<{ task_id: string }, []>(
+      `SELECT DISTINCT task_id FROM subagents WHERE status = 'running'`,
+    ).all();
+    return rows.map((r) => r.task_id);
   },
 };

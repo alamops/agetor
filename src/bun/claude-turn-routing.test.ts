@@ -122,7 +122,7 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
       mode: null,
       model: "claude-opus-4-7",
       effort: "medium",
-      references: [],
+      references: [], backlog: [],
       runId: null, // idle — no in-flight run to fold this follow-up into
       hasOpenableRun: false,
       pendingInteractionCount: 0,
@@ -226,7 +226,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
       // stub-bin path — see claude-followup-restart.test.ts's identical note.
       model: "claude-opus-4-7",
       effort: "medium",
-      references: [],
+      references: [], backlog: [],
       runId: priorRunId,
       hasOpenableRun: false,
       pendingInteractionCount: 0,

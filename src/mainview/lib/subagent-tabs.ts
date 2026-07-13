@@ -35,10 +35,27 @@ export function resolveActiveStream(active: string, show: boolean, subs: Subagen
 }
 
 /**
+ * Order tabs so the *active* (running) agents sit first, immediately after the
+ * pinned "Main" tab, with finished ones trailing behind. Within each group the
+ * incoming spawn order is preserved, so a tab only ever moves across the
+ * running→finished boundary — never shuffles among its peers.
+ *
+ * Returns a NEW array: the caller passes React state (`subagentList`) straight
+ * in, and an in-place `.sort()` would mutate it.
+ */
+export function sortSubagentTabs(subs: Subagent[]): Subagent[] {
+  const running: Subagent[] = [];
+  const finished: Subagent[] = [];
+  for (const s of subs) (s.status === "running" ? running : finished).push(s);
+  return [...running, ...finished];
+}
+
+/**
  * Split tabs into an always-visible head + an overflow tail for the "+N" pill.
- * Spawn order is preserved, and a running agent or the currently-active tab is
- * never pushed into overflow (you should always see what's live and what you're
- * looking at) — so `visible` can exceed `limit` when many agents run at once.
+ * The incoming order is preserved (callers pass a `sortSubagentTabs`-ordered
+ * list), and a running agent or the currently-active tab is never pushed into
+ * overflow (you should always see what's live and what you're looking at) — so
+ * `visible` can exceed `limit` when many agents run at once.
  */
 export function splitTabsForOverflow(
   subs: Subagent[],
