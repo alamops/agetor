@@ -555,17 +555,37 @@ async function run(cmd: string[], cwd?: string, timeoutMs = 10_000): Promise<Com
   }
 }
 
-function parseGitHubRemote(raw: string): GitHubRepo | null {
+/** Map a remote's host to its canonical provider host. Users pin per-identity
+ *  SSH keys via `~/.ssh/config` host aliases (`github-work.com`, `bitbucket-x.org`,
+ *  …), so the host in a remote URL is often not the provider's real hostname.
+ *  Any host containing the provider's name resolves to that provider. */
+function canonicalGitHost(host: string): string {
+  const lower = host.toLowerCase();
+  if (lower.includes("github")) return "github.com";
+  if (lower.includes("gitlab")) return "gitlab.com";
+  if (lower.includes("bitbucket")) return "bitbucket.org";
+  return lower;
+}
+
+/** Extract host + owner/name from a git remote URL in https, ssh://, or
+ *  scp-like (`[user@]host:owner/repo`) form, canonicalizing the host via
+ *  canonicalGitHost. Returns null for local paths and anything unrecognized. */
+function parseGitRemote(raw: string): { host: string; owner: string; name: string } | null {
   const remote = raw.trim();
   if (!remote) return null;
 
-  const https = /^https?:\/\/github\.com\/([^/]+)\/([^/#?]+?)(?:\.git)?(?:[/?#].*)?$/i.exec(remote);
-  if (https) return { owner: https[1]!, name: https[2]! };
+  const https = /^https?:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/([^/]+)\/([^/#?]+?)(?:\.git)?(?:[/?#].*)?$/i.exec(remote);
+  const ssh = /^ssh:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/([^/]+)\/(.+?)(?:\.git)?$/i.exec(remote);
+  const scp = /^(?:[^@/\s]+@)?([^/:\s]+):([^/:]+)\/(.+?)(?:\.git)?$/i.exec(remote);
+  const m = https ?? ssh ?? scp;
+  if (!m) return null;
+  return { host: canonicalGitHost(m[1]!), owner: m[2]!, name: m[3]! };
+}
 
-  const ssh = /^(?:ssh:\/\/)?git@github\.com[:/]([^/]+)\/(.+?)(?:\.git)?$/i.exec(remote);
-  if (ssh) return { owner: ssh[1]!, name: ssh[2]! };
-
-  return null;
+function parseGitHubRemote(raw: string): GitHubRepo | null {
+  const parsed = parseGitRemote(raw);
+  if (!parsed || parsed.host !== "github.com") return null;
+  return { owner: parsed.owner, name: parsed.name };
 }
 
 export function githubRepoFromRemoteForTest(remote: string): string | null {
@@ -730,6 +750,8 @@ function buildIssueUpdatePatch(input: {
 
 // Internal helpers exposed for unit tests only — no other consumers.
 export const __githubInternals = {
+  canonicalGitHost,
+  parseGitRemote,
   matchesFilters,
   normalizeItem,
   normalizeComment,
