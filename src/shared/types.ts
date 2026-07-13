@@ -332,7 +332,7 @@ export interface BranchTemplateTag {
 
 /** Ordered list used by the UI helper text under the Branch name field. */
 export const BRANCH_TEMPLATE_TAGS: readonly BranchTemplateTag[] = [
-  { tag: "<slug>", description: "Task title, slugified" },
+  { tag: "<slug>", description: "Task title, slugified (short id when empty)" },
   { tag: "<project_name>", description: "Project folder name, slugified" },
   { tag: "<type>", description: "Task type (task, bug, or spike)" },
   { tag: "<date>", description: "Creation date (YYYY-MM-DD)" },

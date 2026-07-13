@@ -45,9 +45,10 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
 
 const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
 
-/** Short unique token used as the branch body when the title slug is disabled
- *  or empty, so the auto-generated name is always valid and collision-free. */
-const newBranchToken = () => Math.random().toString(36).slice(2, 8);
+/** Short unique token seeding the `<slug>`/`<token>` fallback in the preview.
+ *  Always exactly 6 hex chars, mirroring the server's task-id-derived token,
+ *  so the client-side validation can't reject a name the server would accept. */
+const newBranchToken = () => crypto.randomUUID().replace(/-/g, "").slice(0, 6);
 
 interface Props {
   onSubmit: (
