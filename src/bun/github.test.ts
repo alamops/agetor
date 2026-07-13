@@ -89,12 +89,48 @@ test("githubRepoFromRemoteForTest parses GitHub https remotes", () => {
 
 test("githubRepoFromRemoteForTest parses GitHub ssh remotes", () => {
   expect(githubRepoFromRemoteForTest("git@github.com:openai/codex.git")).toBe("openai/codex");
+  expect(githubRepoFromRemoteForTest("git@github.com:openai/codex.GIT")).toBe("openai/codex");
   expect(githubRepoFromRemoteForTest("ssh://git@github.com/openai/codex.git")).toBe("openai/codex");
 });
 
 test("githubRepoFromRemoteForTest ignores non-GitHub remotes", () => {
   expect(githubRepoFromRemoteForTest("git@gitlab.com:openai/codex.git")).toBeNull();
+  expect(githubRepoFromRemoteForTest("git@gitlab-work.com:openai/codex.git")).toBeNull();
+  expect(githubRepoFromRemoteForTest("/Users/me/repos/codex")).toBeNull();
   expect(githubRepoFromRemoteForTest("")).toBeNull();
+});
+
+test("githubRepoFromRemoteForTest resolves custom ssh host aliases containing github", () => {
+  expect(githubRepoFromRemoteForTest("git@github-alamops.com:alamops/agetor.git")).toBe("alamops/agetor");
+  expect(githubRepoFromRemoteForTest("git@github-work:openai/codex.git")).toBe("openai/codex");
+  expect(githubRepoFromRemoteForTest("github-work:openai/codex")).toBe("openai/codex");
+  expect(githubRepoFromRemoteForTest("ssh://git@github-work/openai/codex.git")).toBe("openai/codex");
+  expect(githubRepoFromRemoteForTest("https://github-mirror.example.com/openai/codex.git")).toBe("openai/codex");
+});
+
+test("canonicalGitHost maps alias hosts to provider hosts", () => {
+  const { canonicalGitHost } = __githubInternals;
+  expect(canonicalGitHost("github.com")).toBe("github.com");
+  expect(canonicalGitHost("GitHub-Alamops.com")).toBe("github.com");
+  expect(canonicalGitHost("gitlab-work.io")).toBe("gitlab.com");
+  expect(canonicalGitHost("bitbucket-work.org")).toBe("bitbucket.org");
+  expect(canonicalGitHost("git.internal.corp")).toBe("git.internal.corp");
+});
+
+test("parseGitRemote extracts host/owner/name across url syntaxes", () => {
+  const { parseGitRemote } = __githubInternals;
+  expect(parseGitRemote("git@bitbucket-work.org:acme/app.git")).toEqual({
+    host: "bitbucket.org",
+    owner: "acme",
+    name: "app",
+  });
+  expect(parseGitRemote("https://gitlab.com/group/project")).toEqual({
+    host: "gitlab.com",
+    owner: "group",
+    name: "project",
+  });
+  expect(parseGitRemote("../relative/path")).toBeNull();
+  expect(parseGitRemote("/absolute/path/repo.git")).toBeNull();
 });
 
 test("matchesFilters matches on assignee login (case-insensitive), rejects non-assignees", () => {
