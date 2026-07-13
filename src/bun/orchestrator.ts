@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { basename } from "node:path";
 import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
@@ -11,7 +12,8 @@ import {
   MODEL_EFFORT_SUPPORT,
   SESSION_DIED_STATUS_PREFIX,
   TASK_TYPES,
-  buildBranchName,
+  branchPattern,
+  renderBranchTemplate,
   validateBranchName,
   type AgentKind,
   type Harness,
@@ -1643,20 +1645,30 @@ export async function createTask(
   // workdir is a git repo. An explicit override (from the New Task sidebar's
   // editable branch field) wins when valid; otherwise the name is composed from
   // the project's branch nomenclature (falling back to the built-in defaults).
-  // Either way it's made unique within the repo so two same-title/type tasks
-  // don't collide on one branch.
+  // Either way, any branch-template tags (`<slug>`, `<project_name>`, `<type>`,
+  // `<date>`, `<timestamp>`, `<token>`) are resolved server-side (the server is
+  // authoritative for direct API callers and for `<timestamp>` at true creation
+  // time) BEFORE validation, and the resolved name is made unique within the
+  // repo so two same-title/type tasks don't collide on one branch.
   let plannedBranch: string | null = null;
   if (workdirRoot) {
     const override = typeof input.branch === "string" ? input.branch.trim() : "";
+    const token = id.replace(/-/g, "").slice(0, 6);
+    const ctx = { title: input.title, projectName: basename(workdir), taskType, token, now: new Date() };
     let desired: string;
     if (override) {
-      const v = validateBranchName(override);
-      if (!v.ok) return { error: `invalid branch name "${override}": ${v.reason}` };
-      desired = override;
+      const rendered = renderBranchTemplate(override, ctx);
+      const v = validateBranchName(rendered);
+      if (!v.ok) {
+        const detail = rendered !== override
+          ? `invalid branch name "${rendered}" (from template "${override}"): ${v.reason}`
+          : `invalid branch name "${override}": ${v.reason}`;
+        return { error: detail };
+      }
+      desired = rendered;
     } else {
       const config = projects.get(workdir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
-      const token = id.replace(/-/g, "").slice(0, 6);
-      desired = buildBranchName(config, taskType, input.title, { token });
+      desired = renderBranchTemplate(branchPattern(config, taskType), ctx);
       // Defensive: a hand-edited/corrupt config shouldn't hard-fail task
       // creation — fall back to the legacy scheme if it produced an illegal name.
       if (!validateBranchName(desired).ok) desired = branchName({ id, title: input.title });

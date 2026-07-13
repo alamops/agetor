@@ -1,13 +1,18 @@
 import { test, expect, describe } from "bun:test";
 import {
+  BRANCH_TEMPLATE_TAGS,
   DEFAULT_BRANCH_CONFIG,
   branchCommitType,
+  branchPattern,
   buildBranchName,
   conventionalCommitType,
+  hasBranchTemplateTags,
+  renderBranchTemplate,
   slugifyBranch,
   validateBranchConfig,
   validateBranchName,
   type BranchNamingConfig,
+  type BranchTemplateContext,
 } from "./types.ts";
 
 describe("slugifyBranch", () => {
@@ -132,5 +137,91 @@ describe("branchCommitType", () => {
     expect(branchCommitType("agetor/abc123def456-fix-the-thing", "bug")).toBe("fix");
     expect(branchCommitType("agetor/abc123def456-add-login", "task")).toBe("feat");
     expect(branchCommitType("agetor/abc123def456-try-sse", "spike")).toBe("chore");
+  });
+});
+
+const FIXED_NOW = new Date(2026, 6, 13, 4, 15, 2); // 2026-07-13 04:15:02 local
+
+function ctx(overrides: Partial<BranchTemplateContext> = {}): BranchTemplateContext {
+  return {
+    title: "Add login page",
+    projectName: "my-cool-app",
+    taskType: "task",
+    token: "abc123",
+    now: FIXED_NOW,
+    ...overrides,
+  };
+}
+
+describe("renderBranchTemplate", () => {
+  test("substitutes <slug>", () => {
+    expect(renderBranchTemplate("feature/<slug>", ctx())).toBe("feature/add-login-page");
+  });
+  test("falls back to the token when the title slugifies to empty", () => {
+    expect(renderBranchTemplate("feature/<slug>", ctx({ title: "!!!" }))).toBe("feature/abc123");
+  });
+  test("substitutes <project_name>", () => {
+    expect(renderBranchTemplate("<project_name>/<slug>", ctx())).toBe("my-cool-app/add-login-page");
+  });
+  test("falls back to 'project' when the project name slugifies to empty", () => {
+    expect(renderBranchTemplate("<project_name>/<slug>", ctx({ projectName: "###" })))
+      .toBe("project/add-login-page");
+  });
+  test("substitutes <type>", () => {
+    expect(renderBranchTemplate("<type>/<slug>", ctx({ taskType: "bug" }))).toBe("bug/add-login-page");
+    expect(renderBranchTemplate("<type>/<slug>", ctx({ taskType: "spike" }))).toBe("spike/add-login-page");
+  });
+  test("substitutes <date> with local-time YYYY-MM-DD", () => {
+    expect(renderBranchTemplate("archive/<date>", ctx())).toBe("archive/2026-07-13");
+  });
+  test("substitutes <timestamp> with local-time YYYYMMDD-HHmmss, zero-padded", () => {
+    expect(renderBranchTemplate("archive/<timestamp>", ctx())).toBe("archive/20260713-041502");
+  });
+  test("substitutes <token>", () => {
+    expect(renderBranchTemplate("wip/<token>", ctx())).toBe("wip/abc123");
+  });
+  test("handles multiple and repeated tags in one template", () => {
+    expect(renderBranchTemplate("<type>/<date>-<slug>-<token>-<slug>", ctx()))
+      .toBe("task/2026-07-13-add-login-page-abc123-add-login-page");
+  });
+  test("passes unknown tags through literally", () => {
+    expect(renderBranchTemplate("feature/<slug>/<unknown>", ctx()))
+      .toBe("feature/add-login-page/<unknown>");
+  });
+  test("is the identity on a tag-free string (back-compat for literal overrides)", () => {
+    expect(renderBranchTemplate("feature/my-manual-branch", ctx())).toBe("feature/my-manual-branch");
+  });
+});
+
+describe("hasBranchTemplateTags", () => {
+  test("true for each known tag", () => {
+    for (const { tag } of BRANCH_TEMPLATE_TAGS) {
+      expect(hasBranchTemplateTags(`feature/${tag}`)).toBe(true);
+    }
+  });
+  test("false for a tag-free literal", () => {
+    expect(hasBranchTemplateTags("feature/my-manual-branch")).toBe(false);
+  });
+  test("false for an unknown angle-bracket sequence", () => {
+    expect(hasBranchTemplateTags("feature/<unknown>")).toBe(false);
+  });
+});
+
+describe("branchPattern", () => {
+  test("uses <slug> when includeSlug is true", () => {
+    expect(branchPattern(DEFAULT_BRANCH_CONFIG, "task")).toBe("feature/<slug>");
+    expect(branchPattern(DEFAULT_BRANCH_CONFIG, "bug")).toBe("fix/<slug>");
+    expect(branchPattern(DEFAULT_BRANCH_CONFIG, "spike")).toBe("spike/<slug>");
+  });
+  test("uses <token> when includeSlug is false", () => {
+    const cfg: BranchNamingConfig = { ...DEFAULT_BRANCH_CONFIG, includeSlug: false };
+    expect(branchPattern(cfg, "task")).toBe("feature/<token>");
+  });
+  test("falls back to DEFAULT_BRANCH_CONFIG's rule for a task type missing from the config", () => {
+    const cfg = {
+      includeSlug: true,
+      rules: { task: { prefix: "features/" } },
+    } as unknown as BranchNamingConfig;
+    expect(branchPattern(cfg, "bug")).toBe("fix/<slug>");
   });
 });
