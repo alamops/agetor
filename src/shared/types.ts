@@ -337,6 +337,10 @@ export interface Task {
    * default kanban filter and rendered read-only in the run panel.
    */
   archivedAt: number | null;
+  /** Count of this task's subagents currently `status:"running"`. Derived per
+   *  request by the server (never persisted, never patchable). Absent on payloads
+   *  that don't join the subagents table. */
+  runningSubagents?: number;
 }
 
 /** A live terminal tab for a task. Returned by the terminal REST endpoints;
@@ -642,6 +646,17 @@ export interface Run {
    * for claude-code and legacy rows.
    */
   codexSessionId: string | null;
+  /**
+   * How this run came to exist. `null`/undefined = user-initiated (Run
+   * button, a follow-up message typed into the panel — every run before
+   * this field existed). `"continuation"` = opened automatically by the
+   * orchestrator after the same claude session auto-resumed post `end_turn`
+   * (e.g. it delegated to a background task and later kept talking once
+   * that task finished). Optional so callers that don't pass it (most of
+   * them — only the continuation-run factory sets it) keep compiling
+   * unchanged; DB rows predating migration 023 read back as null.
+   */
+  origin?: "continuation" | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */

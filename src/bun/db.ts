@@ -587,6 +587,7 @@ type RunRow = {
   tmux_session: string | null;
   claude_session_id: string | null;
   codex_session_id: string | null;
+  origin: string | null;
 };
 
 const toRun = (r: RunRow): Run => ({
@@ -600,6 +601,7 @@ const toRun = (r: RunRow): Run => ({
   tmuxSession: r.tmux_session,
   claudeSessionId: r.claude_session_id,
   codexSessionId: r.codex_session_id,
+  origin: (r.origin as Run["origin"]) ?? null,
 });
 
 export const runs = {
@@ -612,13 +614,17 @@ export const runs = {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
     return row ? toRun(row) : null;
   },
+  /** `r.origin` is optional on the `Run` type (most callers don't set it —
+   *  only the continuation-run factory does) so `?? null` keeps a
+   *  user-initiated run's row explicitly NULL rather than the JS `undefined`
+   *  bun:sqlite would otherwise bind. */
   insert(r: Run): Run {
     db.run(
-      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId],
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.origin ?? null],
     );
-    return r;
+    return { ...r, origin: r.origin ?? null };
   },
   update(id: string, patch: Partial<Run>): Run | null {
     const row = db.query<RunRow, [string]>(`SELECT * FROM runs WHERE id = ?`).get(id);
@@ -699,13 +705,21 @@ export const runs = {
    *  re-emit them onto the reattached (still-`running`) run's chunk
    *  handler — corrupting its event history and, worse, firing
    *  `onEndOfTurn` on the wrong turn and prematurely resolving the
-   *  current run. */
+   *  current run.
+   *
+   *  `subagent_id IS NULL`: this seeds the MAIN session tailer's dedup set
+   *  only — subagent transcripts live in separate sidechain files and are
+   *  deduped independently via `seenLineUuidsForSubagent`, keyed by
+   *  `(run_id, subagent_id, line_uuid)`. Mixing subagent uuids into this set
+   *  is a no-op in practice (uuid namespaces don't collide) but is the wrong
+   *  scope conceptually, and matches the same filter applied elsewhere for
+   *  subagent-tagged rows. */
   seenLineUuidsForTask(taskId: string): Set<string> {
     const rows = db.query<{ line_uuid: string }, [string]>(
       `SELECT e.line_uuid
        FROM run_events e
        JOIN runs r ON r.id = e.run_id
-       WHERE r.task_id = ? AND e.line_uuid IS NOT NULL`,
+       WHERE r.task_id = ? AND e.line_uuid IS NOT NULL AND e.subagent_id IS NULL`,
     ).all(taskId);
     return new Set(rows.map((r) => r.line_uuid));
   },
@@ -778,5 +792,72 @@ export const subagents = {
   },
   setStatus(id: string, status: SubagentStatus, endedAt: number | null): void {
     db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, endedAt, id]);
+  },
+  /** Settle a single subagent by id — the DB half of an *externally*-detected
+   *  completion (a parent task-notification naming the finishing agent, or
+   *  boot reconciliation finding its session gone), as opposed to the
+   *  watcher's own `checkDone` idle-detection. Idempotent: only flips a row
+   *  whose status is currently `running`, so a duplicate/late signal (e.g.
+   *  the watcher's own idle-detection racing the same completion) is a
+   *  harmless no-op rather than double-firing `ended_at`. Returns whether a
+   *  row actually changed, plus its `taskId` (cheap — same SELECT) so the
+   *  caller can trigger the settle/release-hold bookkeeping without a second
+   *  query. */
+  markSettledById(id: string, status: "completed" | "orphaned"): { changed: boolean; taskId: string | null } {
+    const row = db.query<SubagentRow, [string]>(
+      `SELECT * FROM subagents WHERE id = ? AND status = 'running'`,
+    ).get(id);
+    if (!row) return { changed: false, taskId: null };
+    const now = Date.now();
+    db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, now, id]);
+    return { changed: true, taskId: row.task_id };
+  },
+  /** True when at least one subagent row for this task is still `running`. */
+  hasRunning(taskId: string): boolean {
+    const row = db.query<{ 1: number }, [string]>(
+      `SELECT 1 FROM subagents WHERE task_id = ? AND status = 'running' LIMIT 1`,
+    ).get(taskId);
+    return row !== null;
+  },
+  /** How many of this task's subagents are `running`. Distinct from
+   *  `runningCountsByTask` so a single-task caller doesn't scan every row. */
+  runningCountForTask(taskId: string): number {
+    const row = db.query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM subagents WHERE task_id = ? AND status = 'running'`,
+    ).get(taskId);
+    return row?.n ?? 0;
+  },
+  /** Flip every `running` row for this task to `orphaned` (ended_at = now).
+   *  Returns the affected rows (post-update shape) so the caller can emit a
+   *  `finished` lifecycle event per row. Returns [] when nothing was running. */
+  orphanRunning(taskId: string, now: number): Subagent[] {
+    const rows = db.query<SubagentRow, [string]>(
+      `SELECT * FROM subagents WHERE task_id = ? AND status = 'running'`,
+    ).all(taskId);
+    if (rows.length === 0) return [];
+    db.run(
+      `UPDATE subagents SET status = 'orphaned', ended_at = ? WHERE task_id = ? AND status = 'running'`,
+      [now, taskId],
+    );
+    return rows.map((r) => toSubagent({ ...r, status: "orphaned", ended_at: now }));
+  },
+  /** taskId -> count of `running` rows. One grouped query, for the board poll. */
+  runningCountsByTask(): Map<string, number> {
+    const rows = db.query<{ task_id: string; n: number }, []>(
+      `SELECT task_id, COUNT(*) AS n FROM subagents WHERE status = 'running' GROUP BY task_id`,
+    ).all();
+    return new Map(rows.map((r) => [r.task_id, r.n]));
+  },
+  /** Distinct ids of every task with at least one `running` subagents row,
+   *  regardless of the task's own `column`. Boot reconciliation's held-task
+   *  pass used to source from `tasks WHERE column = 'running'`, which misses
+   *  a task whose terminal run already resolved and moved the card to
+   *  `review`/`done`/etc. before the crash — this is the wider source set
+   *  that also catches that case. */
+  taskIdsWithRunning(): string[] {
+    const rows = db.query<{ task_id: string }, []>(
+      `SELECT DISTINCT task_id FROM subagents WHERE status = 'running'`,
+    ).all();
+    return rows.map((r) => r.task_id);
   },
 };

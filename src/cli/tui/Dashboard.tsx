@@ -98,10 +98,9 @@ export function Dashboard({
       return;
     }
     if (input === "c" && selected) {
-      if (selected.column === "running") {
-        setStatus("task is still working — commit when it finishes");
-        return;
-      }
+      // No column gate: committing mid-turn is supported (the prompt folds
+      // into the in-flight run), and a task held in `running` by background
+      // agents may have finished work ready to commit anyway.
       sendMessage(selected, COMMIT_PUSH_PROMPT, "→ commit & push requested");
       return;
     }

@@ -4,6 +4,7 @@ import {
   shouldShowSubagentTabs,
   resolveActiveStream,
   splitTabsForOverflow,
+  sortSubagentTabs,
   anySubagentRunning,
   MAX_VISIBLE_TABS,
 } from "./subagent-tabs.ts";
@@ -65,6 +66,42 @@ test("splitTabsForOverflow: never hides a running or the active tab", () => {
   expect(visible.map((s) => s.id)).toContain("s7");
   expect(overflow.map((s) => s.id)).not.toContain("s8");
   expect(overflow.map((s) => s.id)).not.toContain("s7");
+});
+
+test("sortSubagentTabs: running agents sort ahead of finished ones", () => {
+  const subs = [sub("a", "completed", 0), sub("b", "running", 1), sub("c", "failed", 2), sub("d", "running", 3)];
+  expect(sortSubagentTabs(subs).map((s) => s.id)).toEqual(["b", "d", "a", "c"]);
+});
+
+test("sortSubagentTabs: stable — spawn order kept within each group", () => {
+  // Every non-"running" status trails, in spawn order; no shuffling among peers.
+  const subs = [
+    sub("a", "cancelled", 0), sub("b", "running", 1), sub("c", "orphaned", 2),
+    sub("d", "running", 3), sub("e", "completed", 4),
+  ];
+  expect(sortSubagentTabs(subs).map((s) => s.id)).toEqual(["b", "d", "a", "c", "e"]);
+});
+
+test("sortSubagentTabs: does not mutate its input (it's React state)", () => {
+  const subs = [sub("a", "completed", 0), sub("b", "running", 1)];
+  const sorted = sortSubagentTabs(subs);
+  expect(subs.map((s) => s.id)).toEqual(["a", "b"]); // original untouched
+  expect(sorted).not.toBe(subs);
+});
+
+test("sortSubagentTabs: no-ops on empty and all-same-status lists", () => {
+  expect(sortSubagentTabs([])).toEqual([]);
+  const running = [sub("a", "running", 0), sub("b", "running", 1)];
+  expect(sortSubagentTabs(running).map((s) => s.id)).toEqual(["a", "b"]);
+});
+
+test("sortSubagentTabs + splitTabsForOverflow: running fill the head, finished overflow", () => {
+  // 9 agents, the last 3 running → sorted head is the running ones, and the
+  // oldest finished tabs are what fall behind the "+N" pill.
+  const subs = Array.from({ length: 9 }, (_, i) => sub(`s${i}`, i >= 6 ? "running" : "completed", i));
+  const { visible, overflow } = splitTabsForOverflow(sortSubagentTabs(subs), "main", 6);
+  expect(visible.map((s) => s.id)).toEqual(["s6", "s7", "s8", "s0", "s1", "s2"]);
+  expect(overflow.map((s) => s.id)).toEqual(["s3", "s4", "s5"]);
 });
 
 test("MAX_VISIBLE_TABS default applies", () => {

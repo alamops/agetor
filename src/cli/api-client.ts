@@ -141,7 +141,7 @@ export class AgetorClient {
   getDiff(id: string): Promise<TaskDiff> {
     return this.req("GET", `/tasks/${id}/diff`);
   }
-  getGitStatus(id: string): Promise<{ hasChanges: boolean; ignored?: boolean }> {
+  getGitStatus(id: string): Promise<{ hasChanges: boolean; ahead: number; ignored?: boolean }> {
     return this.req("GET", `/tasks/${id}/git-status`);
   }
 

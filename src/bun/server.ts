@@ -33,6 +33,7 @@ import {
   getTmuxSource,
   resolveTmuxBin,
   setTmuxSource,
+  tmuxSocketArgs,
   type TmuxSource,
 } from "./tmux-resolution.ts";
 import {
@@ -46,7 +47,14 @@ import {
   sessionNameFor,
 } from "./claude-tmux.ts";
 import { planAskAnswers } from "./claude-questions.ts";
-import { getTaskDiff, gitFetch, gitPull, hasUncommittedChanges, listBranches } from "./worktree.ts";
+import {
+  getAheadCount,
+  getTaskDiff,
+  gitFetch,
+  gitPull,
+  hasUncommittedChanges,
+  listBranches,
+} from "./worktree.ts";
 import {
   attachSocket,
   closeTerminal,
@@ -102,6 +110,17 @@ const json = (data: unknown, init?: ResponseInit) =>
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
     status: init?.status,
   });
+
+// Derived, never-persisted count of this task's still-`running` subagent
+// rows — drives the kanban card's "N background agents" badge. Single-task
+// routes are called far less often than the 2s `/tasks` poll, so a one-off
+// filter over `listForTask` (already exported, already indexed by task_id)
+// is fine here; `/tasks` itself uses the grouped `runningCountsByTask()`
+// query instead of calling this per row.
+function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
+  const runningSubagents = subagents.listForTask(t.id).filter((s) => s.status === "running").length;
+  return { ...t, runningSubagents };
+}
 
 // Turn raw path strings into references: keep only existing absolute paths,
 // dedupe, and read directory-ness from the filesystem (authoritative — more
@@ -230,6 +249,14 @@ export interface ApiNative {
     /** Task to deep-link to on click, e.g. via terminal-notifier's -open. */
     taskId?: string;
   }): void;
+  /** Raise + focus the app window. Returns `false` when there is no window to
+   *  act on — never to report a failed native call, so callers can map `false`
+   *  to "no window" without conflating it with a platform hiccup. Lives behind
+   *  this interface (rather than calling `focusWindow` here) because resolving
+   *  the display layout needs `Screen` from `electrobun/bun`, and importing
+   *  that at module scope would drag Electrobun — and its transitive `three`
+   *  dependency — into the headless CLI daemon, which imports this file. */
+  focusWindow(): boolean;
   quit(): void;
   updates: {
     snapshot(): UpdaterSnapshot;
@@ -463,6 +490,32 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           if (win.isMaximized()) win.unmaximize();
           else win.maximize();
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Bring the main window to the front from the webview side — the
+      // counterpart to `focusMainWindow()` in index.ts (notification click,
+      // Dock reopen). The webview needs this too: a clicked toast's `onOpen`
+      // runs entirely in the renderer, and a WKWebView's own `window.focus()`
+      // can't activate the host NSApplication, so it has to round-trip
+      // through here.
+      //
+      // Native-gated rather than calling `focusWindow()` inline (the way
+      // `/window/toggle-zoom` above pokes `getMainWindow()` directly): raising
+      // a window means first checking the frame against the live display
+      // layout, which needs `Screen` from `electrobun/bun`. Importing that
+      // here would pull Electrobun into the headless CLI daemon, which imports
+      // this module — see the note on ApiNative.
+      "/window/focus": {
+        POST: authed((req) => {
+          if (!native) return notAvailableHeadless(req);
+          if (!native.focusWindow()) {
+            return json(
+              { error: "no main window" },
+              { status: 503, headers: corsHeaders(req) },
+            );
+          }
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
@@ -881,7 +934,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       "/tasks": {
-        GET: authed((req) => json(tasks.list(), { headers: corsHeaders(req) })),
+        GET: authed((req) => {
+          const counts = subagents.runningCountsByTask();
+          return json(
+            tasks.list().map((t) => ({ ...t, runningSubagents: counts.get(t.id) ?? 0 })),
+            { headers: corsHeaders(req) },
+          );
+        }),
         POST: authed(async (req) => {
           const body = (await req.json()) as Partial<Task> & {
             baseRef?: string;
@@ -920,7 +979,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if ("error" in result) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
-          return json(result.task, { headers: corsHeaders(req) });
+          return json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
@@ -928,7 +987,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         GET: authed((req) => {
           const t = tasks.get(req.params.id);
           return t
-            ? json(t, { headers: corsHeaders(req) })
+            ? json(withRunningSubagents(t), { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         PATCH: authed(async (req) => {
@@ -1025,7 +1084,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           reconcileTaskSession(req.params.id, before, updated).catch((err: unknown) => {
             console.error("reconcileTaskSession failed:", err);
           });
-          return json(updated, { headers: corsHeaders(req) });
+          return json(withRunningSubagents(updated), { headers: corsHeaders(req) });
         }),
         DELETE: authed(async (req) => {
           await deleteTask(req.params.id);
@@ -1047,7 +1106,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const result = archiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
-            : json(result.task, { headers: corsHeaders(req) });
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
@@ -1056,7 +1115,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const result = unarchiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
-            : json(result.task, { headers: corsHeaders(req) });
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
@@ -1138,8 +1197,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // contain `agetor-<hex>` so they don't strictly need escaping, but
           // we apply the same helper for symmetry.
           const shellEscape = (s: string) => s.replace(/(["\\$`])/g, "\\$1");
+          // Honor an active non-default socket (test isolation / a future
+          // dedicated production socket) so "Open in Terminal" attaches to
+          // the same server the session actually lives on, not whatever the
+          // default socket happens to be. Empty in production today.
+          const socketArgsStr = tmuxSocketArgs()
+            .map((a) => `\\"${shellEscape(a)}\\"`)
+            .join(" ");
           const script =
-            `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\" attach -t \\"${shellEscape(sessionName)}\\""\n` +
+            `tell application "Terminal" to do script "exec \\"${shellEscape(tmuxPath)}\\"${socketArgsStr ? " " + socketArgsStr : ""} attach -t \\"${shellEscape(sessionName)}\\""\n` +
             `activate application "Terminal"`;
           const proc = Bun.spawn(["osascript", "-e", script], {
             stdout: "ignore",
@@ -1159,11 +1225,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
-      // Whether the task's working tree has uncommitted changes. Drives the
-      // "Commit & push" action in the run panel, which only makes sense to
-      // show when there's actually something to commit. `ignored: true` means
-      // we couldn't tell (not a git repo, dir missing, git failed) — the UI
-      // treats that as "don't offer the action" rather than guessing.
+      // Whether the task's working tree has uncommitted changes, and how many
+      // commits on HEAD haven't been pushed yet. Drives the "Commit & push"
+      // chip in the run panel: `hasChanges` gates the "commit" half, `ahead`
+      // gates the "push" half, and the chip appears on git state alone —
+      // regardless of whether a run is active. `ignored: true` means we
+      // couldn't tell (not a git repo, dir missing, git failed) — the UI
+      // treats that as "don't offer the action" rather than guessing, and in
+      // that case we don't bother computing `ahead` either. An `ahead`
+      // lookup failure (no upstream, no baseRef, or a git error) degrades to
+      // `0` rather than flipping `ignored` — that flag stays keyed to
+      // `hasUncommittedChanges` alone.
       "/tasks/:id/git-status": {
         GET: authed(async (req) => {
           const t = tasks.get(req.params.id);
@@ -1171,11 +1243,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const dir = t.worktreePath ?? t.workdir;
-          const result = await hasUncommittedChanges(dir);
+          const [result, aheadResult] = await Promise.all([
+            hasUncommittedChanges(dir),
+            getAheadCount(dir, t.baseRef ?? null),
+          ]);
           if (result === null) {
-            return json({ hasChanges: false, ignored: true }, { headers: corsHeaders(req) });
+            return json(
+              { hasChanges: false, ahead: 0, ignored: true },
+              { headers: corsHeaders(req) },
+            );
           }
-          return json({ hasChanges: result, ignored: false }, { headers: corsHeaders(req) });
+          return json(
+            { hasChanges: result, ahead: aheadResult ?? 0, ignored: false },
+            { headers: corsHeaders(req) },
+          );
         }),
       },
 

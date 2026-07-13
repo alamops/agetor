@@ -18,6 +18,7 @@
 // AppKit + UserNotifications (see scripts/build-notifier.ts).
 
 import AppKit
+import Foundation
 import UserNotifications
 
 struct Options {
@@ -109,17 +110,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   func userNotificationCenter(
     _ center: UNUserNotificationCenter,
     didReceive response: UNNotificationResponse,
-    withCompletionHandler completionHandler: @escaping () -> Void
+    withCompletionHandler unCompletionHandler: @escaping () -> Void
   ) {
-    if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+    guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
       let urlString = response.notification.request.content.userInfo["url"] as? String,
       let url = URL(string: urlString),
       url.scheme == "agetor"  // defense in depth: only ever open our own deep links
-    {
-      NSWorkspace.shared.open(url)
+    else {
+      unCompletionHandler()
+      exit(0)
     }
-    completionHandler()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(0) }
+
+    // Ack UN only *after* the open has been handed to LaunchServices, never
+    // before. Acking declares we're done handling the response, at which
+    // point nothing obliges the system to keep this relaunched agent alive —
+    // and a deep link that never left the process is exactly the silent
+    // "click does nothing" failure this helper exists to prevent. A late ack
+    // costs at most a UN warning; an early one can cost the click.
+    activateMainAppAndOpen(url, ack: unCompletionHandler)
+  }
+
+  // Opens the agetor:// deep link and brings the main app forward. Split out
+  // of didReceive because there are two distinct completion callbacks in play
+  // here — UN's (`ack`) and NSWorkspace's (below) — and keeping them in one
+  // function invites confusing them.
+  private func activateMainAppAndOpen(_ url: URL, ack: @escaping () -> Void) {
+    let target = NSRunningApplication.runningApplications(
+      withBundleIdentifier: "sh.alamops.agetor"
+    ).first
+
+    // macOS 14 (Sonoma) made activation cooperative: NSApplication.activate
+    // and NSRunningApplication.activate(options: .activateIgnoringOtherApps)
+    // are deprecated no-ops now — a denied activation request just bounces
+    // the Dock icon instead of raising the window. A request is honored only
+    // once the currently-active app YIELDS its activation right to the
+    // target (or NSWorkspace performs that yield on our behalf below).
+    // Clicking a notification makes this helper — even though it's
+    // .accessory — the active app, holding a real, yieldable activation
+    // right. Explicitly yielding it to the main app before opening is what
+    // makes the subsequent activation request actually get honored instead
+    // of just bouncing. yieldActivation(to:) itself only exists on macOS
+    // 14.0+, and the helper is built targeting macOS 13, so it must stay
+    // guarded.
+    if let target, #available(macOS 14.0, *) {
+      NSApp.yieldActivation(to: target)
+    }
+
+    // Safety net: if NSWorkspace's completion handler below never fires (the
+    // open hangs, LaunchServices is slow, whatever), don't leave the
+    // relaunched helper running forever.
+    scheduleExit(after: 5)
+
+    let cfg = NSWorkspace.OpenConfiguration()
+    cfg.activates = true
+    NSWorkspace.shared.open(url, configuration: cfg) { openedApp, openError in
+      // NSWorkspace's own completion, on a background queue — not UN's `ack`.
+      if openedApp == nil || openError != nil {
+        // The cooperative yield only helps if NSWorkspace's own activation
+        // follow-through succeeds; if the open itself failed, fall back to a
+        // direct activate request. No .activateIgnoringOtherApps — that flag
+        // is ignored on 14+ and the selector is deprecated.
+        target?.activate(options: [.activateAllWindows])
+        if let openError {
+          let msg = "AgetorNotifier: open agetor:// failed: \(openError)\n"
+          FileHandle.standardError.write(Data(msg.utf8))
+        }
+      }
+      exit(0)
+    }
+
+    // `open` returns once the request is queued with LaunchServices, so by
+    // here the deep link survives this process dying. Safe to ack UN.
+    ack()
   }
 
   // If agetor is frontmost when the notification arrives, still show the banner

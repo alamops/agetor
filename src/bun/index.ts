@@ -1,5 +1,5 @@
 import { writeFileSync, existsSync } from "node:fs";
-import Electrobun, { ApplicationMenu, BrowserWindow, Updater, Utils } from "electrobun/bun";
+import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
@@ -9,6 +9,8 @@ import { refreshDiscoveredModels } from "./agent-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
+import { focusWindow } from "./window-focus.ts";
+import { repairFrame } from "./screen-frame.ts";
 import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
 import { resolveNotifier, resolveNotifierApp, buildNotifierArgs } from "./notifier.ts";
 import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
@@ -236,6 +238,7 @@ const native: ApiNative = {
   openPath: (p) => Utils.openPath(p),
   openExternal: (url) => Utils.openExternal(url),
   showNotification: (n) => showTaskNotification(n),
+  focusWindow: () => focusMainWindow(),
   quit: () => Utils.quit(),
   updates: {
     snapshot: () => getUpdateSnapshot(),
@@ -377,6 +380,18 @@ const windowLifecycle = makeWindowLifecycle({
       token: API_TOKEN,
     })};`;
     const isHttpUrl = url.startsWith("http://") || url.startsWith("https://");
+    // `remembered` (window-lifecycle.ts) is in-memory only, updated live from
+    // "move"/"resize" events — it's never validated against the display
+    // layout at the time it was captured. If the user unplugs the display the
+    // window was last on and then closes + reopens the window within the
+    // same process (no restart, so this isn't the boot-reconciliation path),
+    // `frame` here can describe a rect no longer on any screen. Neither
+    // `BrowserWindow`'s construction nor a later `setFrame` auto-constrains
+    // an out-of-bounds frame onto a live display — AppKit's
+    // `constrainFrameRect` only clamps within the window's *current* screen,
+    // which doesn't help a window that hasn't been placed yet — so repair
+    // has to happen here, before construction, not after.
+    const safeFrame = repairFrame(frame, Screen.getAllDisplays());
     // macOS-only chrome: `hiddenInset` removes the native title bar background
     // + text but keeps inset traffic lights, letting the React header at the
     // top of App.tsx render full-bleed on the same row. `trafficLightOffset`
@@ -389,12 +404,21 @@ const windowLifecycle = makeWindowLifecycle({
       trafficLightOffset: { x: 8, y: 8 },
       url: isHttpUrl ? `${url}#api=${API_PORT}&token=${API_TOKEN}` : url,
       preload: bootGlobals,
-      frame,
+      frame: safeFrame,
     });
     setMainWindow(mainWindow);
     console.log("[agetor] main window ready");
   },
 });
+
+/** Shared "bring the app to front" call for every raise trigger (notification
+ *  click, Dock reopen) — wraps focusWindow() with this process's concrete
+ *  getMainWindow()/Screen.getAllDisplays() so the three call sites below
+ *  don't each re-spell the deps. Returns false when there's no window to
+ *  focus (caller's cue to create one instead). */
+function focusMainWindow(): boolean {
+  return focusWindow(getMainWindow(), { getAllDisplays: () => Screen.getAllDisplays() });
+}
 
 // Shadow the window's frame as the user moves / resizes it, so the next
 // reopen restores their last placement. Both events carry `id`; we filter
@@ -431,15 +455,23 @@ Electrobun.events.on("close", (e: { data: { id: number } }) => {
 // `applicationShouldHandleReopen:hasVisibleWindows:`, which Electrobun
 // surfaces as the "reopen" event (see node_modules/electrobun/dist/api/
 // bun/proc/native.ts setAppReopenHandler). Re-create the window if the
-// user dismissed it earlier — this is the modern replacement for the
-// old HTTP /focus endpoint, and it's what makes agetor feel like a real
-// macOS app rather than a webapp that happens to live in a window.
+// user dismissed it earlier, or raise+focus it if it's merely buried or
+// minimized — createMainWindow() no-ops when a window is already
+// registered, so without the focus branch a Dock click on a minimized or
+// background window did nothing from our side. This is the modern
+// replacement for the old HTTP /focus endpoint, and it's what makes agetor
+// feel like a real macOS app rather than a webapp that happens to live in
+// a window.
 //
 // We catch errors here because a silent fail-to-recreate would look
 // like "Dock click does nothing" to the user, with no diagnostic. The
 // boot-time await further below surfaces first-launch failures via the
 // top-level await; this catch covers every subsequent reopen.
 Electrobun.events.on("reopen", () => {
+  if (getMainWindow()) {
+    focusMainWindow();
+    return;
+  }
   windowLifecycle.createMainWindow().catch((err) => {
     console.error("[agetor] failed to recreate window on reopen:", err);
   });
@@ -453,16 +485,26 @@ Electrobun.events.on("reopen", () => {
 // the app — see the design note at src/mainview/lib/api.ts:424.
 //
 // We ALWAYS stash the taskId in pending-open.ts (short-TTL) and, if a window
-// already exists, ALSO broadcast immediately:
+// already exists, ALSO broadcast immediately and raise the window:
 //   - Window exists: the webview is connected to /app/events, so the direct
 //     broadcast arrives instantly. The pending stash is belt-and-suspenders —
 //     if the broadcast happens to land while the webview is mid-reload or
 //     between EventSource reconnects, the next subscriber flushes the pending
-//     entry (within its TTL) so the click isn't silently lost.
+//     entry (within its TTL) so the click isn't silently lost. We broadcast
+//     BEFORE focusing: the SSE message is a fire-and-forget dispatch (no
+//     round-trip to wait on), so issuing it first lets the webview start
+//     selecting the task while the native activate/un-minimize calls are
+//     still in flight, instead of the reverse order where the window
+//     visibly raises a beat before the UI catches up to it.
 //   - No window (app was fully dismissed / cold start): there's no SSE
 //     subscriber yet, so we rely entirely on the pending flush — create the
 //     window and the freshly-booted webview picks it up when it subscribes
 //     (see the consumePendingOpenTask() flush in server.ts's SSE route).
+//     No focusMainWindow() call here: constructing a BrowserWindow already
+//     calls showWindow(ptr, activate=true) natively, so a freshly built
+//     window is activated on creation — calling focusMainWindow() too would
+//     be redundant, not incorrect, but it'd suggest the two paths need
+//     separate raise logic when they don't.
 // The pending entry's TTL (pending-open.ts) prevents a much-later, unrelated
 // reconnect from resurrecting a stale click. Re-opening the same task is
 // idempotent (webview just re-selects it), so a rare double-delivery is
@@ -475,6 +517,7 @@ Electrobun.events.on("open-url", (e: { data: { url: string } }) => {
     setPendingOpenTask(taskId);
     if (getMainWindow()) {
       broadcastAppEvent({ type: "open_task", taskId, ts: Date.now() });
+      focusMainWindow();
     } else {
       windowLifecycle.createMainWindow().catch((err) => {
         console.error("[agetor] failed to create window for open-url:", err);
