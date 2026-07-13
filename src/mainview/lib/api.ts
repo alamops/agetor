@@ -348,6 +348,31 @@ export const api = {
       `/runs/${runId}/input`,
       { method: "POST", body: JSON.stringify({ line }) },
     ),
+
+  // Messages backlog — saved, not-yet-sent draft messages parked on a task.
+  // Every mutation returns the full updated Task so the caller can re-sync.
+  addBacklogItem: (taskId: string, input: { text: string; references?: TaskReference[] }) =>
+    j<Task>(`/tasks/${taskId}/backlog`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateBacklogItem: (
+    taskId: string,
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) =>
+    j<Task>(`/tasks/${taskId}/backlog/${itemId}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteBacklogItem: (taskId: string, itemId: string) =>
+    j<Task>(`/tasks/${taskId}/backlog/${itemId}`, { method: "DELETE" }),
+  /** Replace the backlog order with `order` (item ids, desired sequence). */
+  reorderBacklog: (taskId: string, order: string[]) =>
+    j<Task>(`/tasks/${taskId}/backlog`, {
+      method: "PUT",
+      body: JSON.stringify({ order }),
+    }),
   /**
    * Open a file or directory with the OS default app. `path` may be absolute
    * or, when `taskId` is supplied, relative to the task's cwd

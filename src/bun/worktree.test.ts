@@ -49,7 +49,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     mode: null,
     model: null,
     effort: null,
-    references: [],
+    references: [],    backlog: [],
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,

@@ -40,7 +40,7 @@ function makeTask(workdir: string, extra: Partial<Task> = {}): Task {
     mode: null,
     model: null,
     effort: null,
-    references: [],
+    references: [],    backlog: [],
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,

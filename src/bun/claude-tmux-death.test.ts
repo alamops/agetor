@@ -293,7 +293,7 @@ function baseTask(id: string): Task {
     mode: "auto",
     model: null,
     effort: null,
-    references: [],
+    references: [], backlog: [],
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,

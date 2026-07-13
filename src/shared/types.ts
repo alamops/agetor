@@ -287,6 +287,14 @@ export interface Task {
    * launch prompt as text — agetor never copies or uploads these.
    */
   references: TaskReference[];
+  /**
+   * Saved, not-yet-sent draft messages for this task — a per-task memory of
+   * things the user wants to send later but isn't ready to send now. Ordered
+   * newest-intent-first by array position (the UI lets the user reorder).
+   * Persisted as a JSON column, mirroring `references`. Empty list when none.
+   * Sending a backlog item consumes it (removes it from this list).
+   */
+  backlog: BacklogMessage[];
   runId: string | null;
   /**
    * True when this task has at least one run whose status is
@@ -359,6 +367,24 @@ export interface TaskReference {
   path: string;
   /** True for directories — affects icon + trailing slash in prompts. */
   isDirectory: boolean;
+}
+
+/**
+ * A saved, not-yet-sent draft message parked on a task's backlog. Carries the
+ * same shape a follow-up message assembles from the composer: free-text plus
+ * any attached file/folder references. When the user sends it, the text and
+ * references are inlined (via `appendReferences`) exactly like a normal
+ * follow-up, then the item is removed from the backlog.
+ */
+export interface BacklogMessage {
+  /** Stable id, assigned server-side, used to target edit/delete/reorder/send. */
+  id: string;
+  /** The draft message text. May be empty when the item is references-only. */
+  text: string;
+  /** File/folder references to inline when this draft is eventually sent. */
+  references: TaskReference[];
+  /** Unix ms timestamp when the draft was saved. */
+  createdAt: number;
 }
 
 export interface AgentOption {

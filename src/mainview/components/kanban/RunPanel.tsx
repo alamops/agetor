@@ -3,9 +3,9 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, Bot, Check, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
   GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash,
-  Sparkles, Square, Terminal, Wrench, X,
+  Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, COMMIT_PUSH_PROMPT, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
@@ -25,6 +25,7 @@ import {
   type AgentKind,
   type AgentStatus,
   type Harness,
+  type BacklogMessage,
   type Run,
   type RunEvent,
   type Subagent,
@@ -757,6 +758,15 @@ function RunPanelBody({
   const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
+  // Messages backlog — saved, not-yet-sent drafts for this task. Seeded from
+  // the task prop and kept in sync as the 2s task poll refreshes `task.backlog`;
+  // each mutation also updates this optimistically from the endpoint's returned
+  // Task so the tray reacts immediately instead of waiting for the next poll.
+  const [backlogItems, setBacklogItems] = useState<BacklogMessage[]>(task.backlog);
+  // Guards concurrent backlog mutations (and shares the send lock so a
+  // "Send now" from the tray can't race a composer send).
+  const [backlogBusy, setBacklogBusy] = useState(false);
+  useEffect(() => { setBacklogItems(task.backlog); }, [task.backlog]);
   // The task's live git status (uncommitted changes / unpushed commits).
   // Drives the "Commit & push" action chip above the textarea via
   // `shouldOfferCommitPush`. Deliberately independent of run status —
@@ -833,6 +843,17 @@ function RunPanelBody({
     const line = input.trim();
     if (!line && !sendRefs.length) return;
     if (!resumableRunId) return;
+    // Never deliver while a native modal is up: claude is blocked on it inside
+    // the tmux REPL, so the keystrokes would paste into the modal instead of
+    // reaching the agent (and the run would hang "working"). The Send button is
+    // already disabled here, but the textarea now stays typable while a prompt
+    // is pending — so you can stash a draft — which means Enter can reach this
+    // function. Guard it at the source rather than relying on the field.
+    if (modalPending) return;
+    // Don't fire a send while a backlog op (e.g. Save-for-later stashing this
+    // same text) is mid-flight — otherwise a fast Enter could both send and
+    // save the same message.
+    if (sending || backlogBusy) return;
     setSending(true);
     setSendHint(null);
     const body = appendReferences(line, sendRefs);
@@ -874,6 +895,127 @@ function RunPanelBody({
   const stop = async () => {
     if (!liveRunId) return;
     try { await api.cancelRun(liveRunId); } catch { /* surfaced via log */ }
+  };
+
+  // Park the current composer content on the backlog instead of sending it —
+  // "a message that came to mind but isn't ready to send yet." Consumes the
+  // composer (text + refs) exactly like `send()` does, so the two actions feel
+  // symmetric. Available in every state the composer renders — including before
+  // the task's first run and while a prompt is pending. Those are exactly the
+  // moments you can't send but most want to jot something down, so the textarea
+  // stays typable there and only *sending* is gated (see `send()`).
+  const saveForLater = async () => {
+    const text = input.trim();
+    if (!text && !sendRefs.length) return;
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.addBacklogItem(task.id, { text, references: sendRefs });
+      setBacklogItems(updated.backlog);
+      setInput("");
+      setSendRefs([]);
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
+  // Send a saved draft to the agent, then consume it from the backlog. Reuses
+  // the exact `sendRunInput` plumbing (and success side-effects) as the
+  // composer's `send()` so a backlog send is indistinguishable from a typed
+  // one — same run row, streamed events, scroll-to-bottom. Only removes the
+  // item once the send is actually accepted.
+  const sendBacklogItem = async (item: BacklogMessage) => {
+    if (!resumableRunId || sending || backlogBusy || modalPending) return;
+    setSending(true);
+    setBacklogBusy(true);
+    setSendHint(null);
+    const body = appendReferences(item.text, item.references);
+    try {
+      const res = await api.sendRunInput(resumableRunId, body);
+      if (!res.delivered) {
+        setSendHint(res.reason);
+      } else {
+        try {
+          const updated = await api.deleteBacklogItem(task.id, item.id);
+          setBacklogItems(updated.backlog);
+        } catch {
+          // The send landed; if the consume call fails, drop it locally so the
+          // user doesn't accidentally resend. The next task poll reconciles.
+          setBacklogItems((prev) => prev.filter((m) => m.id !== item.id));
+        }
+        setRebuilt(null);
+        setRebuildNote(null);
+        // No optimistic git-status touch here (main's #94 dropped that): the
+        // git-status polling effect keeps `gitStatus` current on its own.
+        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        nearBottomRef.current = true;
+        requestAnimationFrame(() => {
+          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+        });
+      }
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+      setBacklogBusy(false);
+    }
+  };
+
+  const editBacklogItem = async (
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) => {
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.updateBacklogItem(task.id, itemId, patch);
+      setBacklogItems(updated.backlog);
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
+  const removeBacklogItem = async (itemId: string) => {
+    setBacklogBusy(true);
+    setSendHint(null);
+    const prev = backlogItems;
+    setBacklogItems((p) => p.filter((m) => m.id !== itemId)); // optimistic
+    try {
+      const updated = await api.deleteBacklogItem(task.id, itemId);
+      setBacklogItems(updated.backlog);
+    } catch (e) {
+      setBacklogItems(prev); // roll back
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
+  // Move a draft up (dir -1) or down (dir +1) one slot and persist the new
+  // order. Optimistic: reorders locally first, then confirms from the server's
+  // returned Task.
+  const moveBacklogItem = async (itemId: string, dir: -1 | 1) => {
+    const idx = backlogItems.findIndex((m) => m.id === itemId);
+    const to = idx + dir;
+    if (idx < 0 || to < 0 || to >= backlogItems.length) return;
+    const next = [...backlogItems];
+    const [moved] = next.splice(idx, 1);
+    next.splice(to, 0, moved!);
+    setBacklogItems(next);
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.reorderBacklog(task.id, next.map((m) => m.id));
+      setBacklogItems(updated.backlog);
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
   };
 
   // One-click follow-up: ask the agent to commit & push the changes it just
@@ -1113,6 +1255,27 @@ function RunPanelBody({
         )}
       </div>
 
+      {/* Messages backlog — saved drafts to send later. Sits just above the
+          composer so the "stash a thought / send it when ready" loop is one
+          glance apart. Hidden when empty and on a background-agent (subagent)
+          tab — those streams are read-only, so an interactive tray whose "Send
+          now" targets the main run would sit contradictorily above the
+          read-only footer. On an archived task the tray still renders, but
+          view-only (`readOnly`), so saved drafts aren't silently invisible. */}
+      {activeStream === "main" && backlogItems.length > 0 && (
+        <BacklogTray
+          items={backlogItems}
+          canSend={canSend && !modalPending}
+          busy={sending || backlogBusy}
+          readOnly={archived}
+          startingFolder={task.worktreePath ?? task.workdir}
+          onSend={sendBacklogItem}
+          onEdit={editBacklogItem}
+          onDelete={removeBacklogItem}
+          onMove={moveBacklogItem}
+        />
+      )}
+
       {/* Bottom-fixed input. Enabled the moment the task has had at least one
           run — the backend reattaches to the live tmux session if there is one,
           or spawns a fresh one seeded with the previous turn's last response
@@ -1152,38 +1315,61 @@ function RunPanelBody({
           onDragLeave={onSendDragLeave}
           onDrop={onSendDrop}
         >
-          {canSend && (
-            <ReferencesPicker
-              variant="inline"
-              refs={sendRefs}
-              onChange={setSendRefs}
-              startingFolder={task.worktreePath ?? task.workdir}
-            />
-          )}
-          {canSend && (
-            // Picker on the left; "Commit & push" (when offered) pushed to the
-            // right so it isn't stacked directly on top of the picker.
+          {/* Always available: refs can be attached to a draft you're only
+              stashing, before the task has ever run. */}
+          <ReferencesPicker
+            variant="inline"
+            refs={sendRefs}
+            onChange={setSendRefs}
+            startingFolder={task.worktreePath ?? task.workdir}
+          />
+          {/* Shown once the task is sendable, OR as soon as there's something to
+              stash — that's what lets "Save for later" work pre-run. */}
+          {(canSend || input.trim() || sendRefs.length > 0) && (
+            // Picker on the left; "Save for later" / "Commit & push" pushed to
+            // the right so they aren't stacked directly on top of the picker.
             <div className="flex items-center justify-between gap-2">
-              <ExtensionPicker
-                extensions={sendExtensions}
-                value={input}
-                onChange={setInput}
-                textareaRef={sendRef}
-                placement="above"
-                // Already gated by the enclosing `canSend &&`, so only the
-                // in-flight send needs to disable the trigger here.
-                disabled={sending}
-              />
-              {shouldOfferCommitPush(gitStatus) && !sending && (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => void sendCommitPush()}
-                  title="Ask the agent to commit the working-tree changes and push the current branch to origin."
-                >
-                  <GitCommit className="mr-1 size-3" /> Commit &amp; push
-                </Button>
+              {canSend ? (
+                <ExtensionPicker
+                  extensions={sendExtensions}
+                  value={input}
+                  onChange={setInput}
+                  textareaRef={sendRef}
+                  placement="above"
+                  // Only the in-flight send needs to disable the trigger here.
+                  disabled={sending}
+                />
+              ) : (
+                // Keep `justify-between` pushing the buttons right when the
+                // picker isn't offered (pre-run).
+                <span />
               )}
+              <div className="flex items-center gap-2">
+                {(input.trim() || sendRefs.length > 0) && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void saveForLater()}
+                    disabled={sending || backlogBusy}
+                    title="Save this message to the backlog to send later — without sending it now."
+                  >
+                    <BookmarkPlus className="mr-1 size-3" /> Save for later
+                  </Button>
+                )}
+                {/* Commit & push keys on live git state (uncommitted changes or
+                    unpushed commits), not run status — see `shouldOfferCommitPush`.
+                    Can surface even mid-run (a background agent dirtied the tree). */}
+                {shouldOfferCommitPush(gitStatus) && !sending && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void sendCommitPush()}
+                    title="Ask the agent to commit the working-tree changes and push the current branch to origin."
+                  >
+                    <GitCommit className="mr-1 size-3" /> Commit &amp; push
+                  </Button>
+                )}
+              </div>
             </div>
           )}
           <div className="flex items-stretch gap-2">
@@ -1203,22 +1389,42 @@ function RunPanelBody({
                   if (e.defaultPrevented) return;
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
+                    // The field is typable in states we can't send from (before
+                    // the first run, or while a prompt is pending). Swallowing
+                    // Enter there would be a dead key, so it does the thing the
+                    // user means: stash the draft. `send()` guards both states
+                    // too, so this is the only place that decides.
+                    if (!canSend || modalPending) {
+                      void saveForLater();
+                      return;
+                    }
                     void send();
                   }
                 }}
                 placeholder={
                   modalPending
-                    ? "Answer the prompt above — or press Stop to cancel, then send a new message."
+                    ? "Answer the prompt above — or type a message and Save it for later."
                     : canSend
                     ? task.column === "running"
                       ? "Agent is working — your message will be added to the current turn. Type / for commands."
                       : task.column === "blocked"
                         ? "Answer the question, or send any follow-up. Type / for commands."
                         : "Send a message — resumes the conversation in a fresh session. Type / for commands."
-                    : "Press Run task first to start a conversation."
+                    // `!canSend` covers two states: never run, and "ran but has
+                    // no resumable session" (a codex task whose run_id was
+                    // cleared — claude falls back to its newest run). Don't
+                    // claim "not running yet" in the latter.
+                    : runs.length > 0
+                      ? "No live session to send to — save this message for later, or re-run the task."
+                      : "Not running yet — type a message and Save it for later, ready to send once the task runs."
                 }
                 rows={2}
-                disabled={!canSend || sending || modalPending}
+                // Typing is allowed in every state the composer renders, even
+                // when we can't send: that's the point of "Save for later".
+                // Sending is gated separately — the Send button below plus the
+                // `canSend` / `modalPending` guards inside `send()` — so a
+                // keystroke can never leak into a live tmux modal.
+                disabled={sending || backlogBusy}
                 className="h-16 min-h-0 w-full resize-none text-xs"
               />
               <SlashAutocomplete
@@ -1235,7 +1441,7 @@ function RunPanelBody({
             <Button
               size="icon"
               onClick={() => void send()}
-              disabled={!canSend || sending || modalPending || (!input.trim() && sendRefs.length === 0)}
+              disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
               title={
                 // Distinguish "live session exists" from "needs resume" — not
                 // "turn in flight". `liveRunId` (task.runId) stays set while the
@@ -1258,6 +1464,257 @@ function RunPanelBody({
         </div>
       )}
     </>
+  );
+}
+
+/** Shared styling for the compact icon buttons in a backlog item's action row. */
+const BACKLOG_ICON_BTN =
+  "rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground "
+  + "disabled:pointer-events-none disabled:opacity-40";
+
+/**
+ * The messages-backlog tray: a list of saved, not-yet-sent drafts shown just
+ * above the composer. Purely presentational — all mutations are handed back to
+ * RunPanelBody, which owns the optimistic state and the API calls. Manages only
+ * which item is currently in inline-edit mode.
+ */
+function BacklogTray({
+  items,
+  canSend,
+  busy,
+  readOnly,
+  startingFolder,
+  onSend,
+  onEdit,
+  onDelete,
+  onMove,
+}: {
+  items: BacklogMessage[];
+  /** Whether "Send now" is available (task has a resumable run and no pending prompt). */
+  canSend: boolean;
+  /** A send / backlog mutation is in flight — disables destructive actions. */
+  busy: boolean;
+  /** View-only mode (archived task): render the drafts but strip every
+   *  mutation affordance, since the server freezes backlog edits on archived
+   *  tasks. The drafts stay visible so they aren't silently hidden. */
+  readOnly: boolean;
+  startingFolder: string;
+  onSend: (item: BacklogMessage) => void;
+  onEdit: (
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) => void | Promise<void>;
+  onDelete: (itemId: string) => void;
+  onMove: (itemId: string, dir: -1 | 1) => void;
+}) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  return (
+    <div className="shrink-0 border-t border-border/60">
+      <div className="flex items-center gap-1.5 px-3 pb-1 pt-2 text-[11px] font-medium text-muted-foreground">
+        <ClipboardList className="size-3.5" />
+        <span>Backlog</span>
+        <span className="rounded bg-muted px-1 text-[10px]">{items.length}</span>
+        <span className="ml-1 font-normal text-muted-foreground/70">
+          {readOnly
+            ? "saved messages — unarchive the task to edit or send"
+            : "saved messages — send when you're ready"}
+        </span>
+      </div>
+      <div className="max-h-40 space-y-1 overflow-y-auto px-2 pb-2">
+        {items.map((item, i) => (
+          <BacklogItemRow
+            key={item.id}
+            item={item}
+            index={i}
+            total={items.length}
+            canSend={canSend}
+            busy={busy}
+            readOnly={readOnly}
+            editing={editingId === item.id}
+            startingFolder={startingFolder}
+            onStartEdit={() => setEditingId(item.id)}
+            onCancelEdit={() => setEditingId(null)}
+            onSaveEdit={async (patch) => {
+              await onEdit(item.id, patch);
+              setEditingId(null);
+            }}
+            onSend={() => onSend(item)}
+            onDelete={() => onDelete(item.id)}
+            onMove={(dir) => onMove(item.id, dir)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** One saved draft: a read-only row with hover actions, or an inline editor
+ *  (textarea + references picker) when `editing` is true. */
+function BacklogItemRow({
+  item,
+  index,
+  total,
+  canSend,
+  busy,
+  readOnly,
+  editing,
+  startingFolder,
+  onStartEdit,
+  onCancelEdit,
+  onSaveEdit,
+  onSend,
+  onDelete,
+  onMove,
+}: {
+  item: BacklogMessage;
+  index: number;
+  total: number;
+  canSend: boolean;
+  busy: boolean;
+  readOnly: boolean;
+  editing: boolean;
+  startingFolder: string;
+  onStartEdit: () => void;
+  onCancelEdit: () => void;
+  onSaveEdit: (patch: { text: string; references: TaskReference[] }) => void;
+  onSend: () => void;
+  onDelete: () => void;
+  onMove: (dir: -1 | 1) => void;
+}) {
+  const [draft, setDraft] = useState(item.text);
+  const [draftRefs, setDraftRefs] = useState<TaskReference[]>(item.references);
+  // Re-seed the edit form only when we *enter* edit mode. We deliberately do
+  // NOT depend on `item.text` / `item.references`: the 2s task poll rebuilds
+  // `task.backlog` into fresh objects (new array references) on every tick, so
+  // depending on them would re-run this effect every poll and clobber the
+  // user's in-progress edit back to the saved value. The row is keyed by
+  // `item.id`, so `useState` already seeds the initial value on mount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (editing) {
+      setDraft(item.text);
+      setDraftRefs(item.references);
+    }
+  }, [editing]);
+
+  // `readOnly` wins over `editing` — an archived task can never open the editor
+  // (the Edit button is hidden), but guard here too so a stale `editingId` from
+  // just before an archive can't strand the row in an uncommittable form.
+  if (editing && !readOnly) {
+    const canSave = draft.trim().length > 0 || draftRefs.length > 0;
+    return (
+      <div className="space-y-1.5 rounded-md border border-border/60 bg-background/50 p-2">
+        <Textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          rows={2}
+          autoFocus
+          className="min-h-0 w-full resize-none text-xs"
+        />
+        <ReferencesPicker
+          variant="inline"
+          refs={draftRefs}
+          onChange={setDraftRefs}
+          startingFolder={startingFolder}
+        />
+        <div className="flex items-center justify-end gap-1.5">
+          <Button size="sm" variant="ghost" onClick={onCancelEdit}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            disabled={!canSave || busy}
+            onClick={() => onSaveEdit({ text: draft.trim(), references: draftRefs })}
+          >
+            <Check className="mr-1 size-3" /> Save
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="group flex items-start gap-2 rounded-md border border-transparent px-2 py-1.5 hover:border-border/60 hover:bg-background/40">
+      <div className="min-w-0 flex-1">
+        <p className="line-clamp-3 whitespace-pre-wrap break-words text-xs text-foreground/90">
+          {item.text || (
+            <span className="italic text-muted-foreground">(references only)</span>
+          )}
+        </p>
+        {item.references.length > 0 && (
+          <div className="mt-1 flex flex-wrap gap-1">
+            {item.references.map((r) => {
+              const Icon = iconForRef(r);
+              return (
+                <span
+                  key={r.path}
+                  title={r.path}
+                  className="inline-flex items-center gap-1 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground"
+                >
+                  <Icon className="size-3 shrink-0 opacity-70" />
+                  {refBasename(r.path)}{r.isDirectory ? "/" : ""}
+                </span>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      {!readOnly && (
+        <div className="flex shrink-0 items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={index === 0 || busy}
+            onClick={() => onMove(-1)}
+            title="Move up"
+          >
+            <ArrowUp className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={index === total - 1 || busy}
+            onClick={() => onMove(1)}
+            title="Move down"
+          >
+            <ArrowDown className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            onClick={onStartEdit}
+            title="Edit"
+          >
+            <FilePenLine className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={!canSend || busy}
+            onClick={onSend}
+            // `canSend` here is the parent's `canSend && !modalPending`, so it
+            // goes false for two different reasons — no live/resumable session,
+            // or a prompt is waiting. Keep the copy true for both.
+            title={
+              canSend
+                ? "Send now"
+                : "Can't send right now — run the task, or answer the pending prompt first"
+            }
+          >
+            <Send className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
+            disabled={busy}
+            onClick={onDelete}
+            title="Delete"
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
