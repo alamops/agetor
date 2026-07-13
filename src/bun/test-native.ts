@@ -14,6 +14,9 @@ export function makeTestNative(over: Partial<ApiNative> = {}): ApiNative {
     openPath: () => true,
     openExternal: () => true,
     showNotification: () => {},
+    // Matches the headless/no-window reality: `false` means "no window to
+    // focus", which the /window/focus route maps to 503.
+    focusWindow: () => false,
     quit: () => {},
     updates: {
       snapshot: () => ({

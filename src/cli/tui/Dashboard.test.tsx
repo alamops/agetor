@@ -91,7 +91,7 @@ test("the 'c' key sends the canned commit & push prompt to the selected task", a
   unmount();
 });
 
-test("the 'c' key refuses to commit while the task is still running", async () => {
+test("the 'c' key commits even while the task is running (mid-turn commit folds into the run)", async () => {
   const sends: Array<{ runId: string; line: string }> = [];
   const client = {
     listTasks: async () => [task({ id: "taskR", column: "running", runId: "runR", title: "R" })],
@@ -102,13 +102,12 @@ test("the 'c' key refuses to commit while the task is still running", async () =
     },
   } as unknown as AgetorClient;
 
-  const { stdin, lastFrame, unmount } = render(
+  const { stdin, unmount } = render(
     <Dashboard client={client} core={core} dataDir="/nonexistent-agetor-test" />,
   );
   await wait(90);
   stdin.write("c");
   await wait(80);
-  expect(sends).toEqual([]); // nothing sent
-  expect(lastFrame() ?? "").toContain("still working");
+  expect(sends).toEqual([{ runId: "runR", line: COMMIT_PUSH_PROMPT }]);
   unmount();
 });

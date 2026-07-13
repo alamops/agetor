@@ -41,6 +41,12 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Claude Code local settings
 .claude/settings.local.json
 
+# Locally-installed Claude skills + agents (managed per-machine, not committed)
+.claude/skills/
+/.agents/
+/agent/
+skills-lock.json
+
 # IntelliJ based IDEs
 .idea
 

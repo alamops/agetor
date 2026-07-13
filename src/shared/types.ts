@@ -287,6 +287,14 @@ export interface Task {
    * launch prompt as text — agetor never copies or uploads these.
    */
   references: TaskReference[];
+  /**
+   * Saved, not-yet-sent draft messages for this task — a per-task memory of
+   * things the user wants to send later but isn't ready to send now. Ordered
+   * newest-intent-first by array position (the UI lets the user reorder).
+   * Persisted as a JSON column, mirroring `references`. Empty list when none.
+   * Sending a backlog item consumes it (removes it from this list).
+   */
+  backlog: BacklogMessage[];
   runId: string | null;
   /**
    * True when this task has at least one run whose status is
@@ -329,6 +337,10 @@ export interface Task {
    * default kanban filter and rendered read-only in the run panel.
    */
   archivedAt: number | null;
+  /** Count of this task's subagents currently `status:"running"`. Derived per
+   *  request by the server (never persisted, never patchable). Absent on payloads
+   *  that don't join the subagents table. */
+  runningSubagents?: number;
 }
 
 /** A live terminal tab for a task. Returned by the terminal REST endpoints;
@@ -355,6 +367,24 @@ export interface TaskReference {
   path: string;
   /** True for directories — affects icon + trailing slash in prompts. */
   isDirectory: boolean;
+}
+
+/**
+ * A saved, not-yet-sent draft message parked on a task's backlog. Carries the
+ * same shape a follow-up message assembles from the composer: free-text plus
+ * any attached file/folder references. When the user sends it, the text and
+ * references are inlined (via `appendReferences`) exactly like a normal
+ * follow-up, then the item is removed from the backlog.
+ */
+export interface BacklogMessage {
+  /** Stable id, assigned server-side, used to target edit/delete/reorder/send. */
+  id: string;
+  /** The draft message text. May be empty when the item is references-only. */
+  text: string;
+  /** File/folder references to inline when this draft is eventually sent. */
+  references: TaskReference[];
+  /** Unix ms timestamp when the draft was saved. */
+  createdAt: number;
 }
 
 export interface AgentOption {
@@ -616,6 +646,17 @@ export interface Run {
    * for claude-code and legacy rows.
    */
   codexSessionId: string | null;
+  /**
+   * How this run came to exist. `null`/undefined = user-initiated (Run
+   * button, a follow-up message typed into the panel — every run before
+   * this field existed). `"continuation"` = opened automatically by the
+   * orchestrator after the same claude session auto-resumed post `end_turn`
+   * (e.g. it delegated to a background task and later kept talking once
+   * that task finished). Optional so callers that don't pass it (most of
+   * them — only the continuation-run factory sets it) keep compiling
+   * unchanged; DB rows predating migration 023 read back as null.
+   */
+  origin?: "continuation" | null;
 }
 
 /** One changed file in a task's git diff (worktree vs its pinned base). */

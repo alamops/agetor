@@ -170,10 +170,76 @@ test("getGitStatus reports uncommitted changes via { hasChanges }", async () => 
     const t = await client.createTask({
       title: "GS", prompt: "p", agent: "claude-code", isolation: "none", workdir: repo,
     });
-    expect((await client.getGitStatus(t.id)).hasChanges).toBe(false);
+    // isolation "none" never resolves a workdirRoot in createTask, so baseRef
+    // stays null — confirm that assumption, since it's what pins the `ahead`
+    // expectation below to 0 rather than a baseRef..HEAD comparison.
+    expect(t.baseRef).toBeNull();
+
+    const clean = await client.getGitStatus(t.id);
+    expect(clean.hasChanges).toBe(false);
+    expect(typeof clean.ahead).toBe("number");
+    // No upstream configured and no baseRef to fall back to → getAheadCount's
+    // third tier: a bare 0, not null (see worktree.ts).
+    expect(clean.ahead).toBe(0);
+    expect(clean.ignored).toBe(false);
 
     writeFileSync(path.join(repo, "a.txt"), "two\n"); // modify a tracked file
-    expect((await client.getGitStatus(t.id)).hasChanges).toBe(true);
+    const dirty = await client.getGitStatus(t.id);
+    expect(dirty.hasChanges).toBe(true);
+    // An uncommitted change doesn't add a commit, so ahead is unaffected.
+    expect(dirty.ahead).toBe(0);
+
+    await client.deleteTask(t.id);
+    rmSync(repo, { recursive: true, force: true });
+  });
+}, 30_000);
+
+test("getGitStatus: ignored short-circuit for a non-git workdir", async () => {
+  await withClient(4536, async (client) => {
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-gs-nogit-"));
+
+    const t = await client.createTask({
+      title: "GS-nogit", prompt: "p", agent: "claude-code", isolation: "none", workdir: dir,
+    });
+    expect(await client.getGitStatus(t.id)).toEqual({ hasChanges: false, ahead: 0, ignored: true });
+
+    await client.deleteTask(t.id);
+    rmSync(dir, { recursive: true, force: true });
+  });
+}, 30_000);
+
+test("getGitStatus: ahead reflects commits made after a pinned baseRef", async () => {
+  await withClient(4537, async (client) => {
+    const repo = mkdtempSync(path.join(tmpdir(), "agetor-gs-ahead-"));
+    Bun.spawnSync(["git", "init", "-q", repo]);
+    writeFileSync(path.join(repo, "a.txt"), "one\n");
+    Bun.spawnSync(["git", "-C", repo, "add", "-A"]);
+    Bun.spawnSync([
+      "git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t",
+      "commit", "-q", "-m", "init",
+    ]);
+
+    // isolation "worktree" against a git repo pins baseRef to HEAD's sha at
+    // create time, even though the worktree itself isn't materialized until
+    // the task is started — dir = t.worktreePath ?? t.workdir falls back to
+    // the repo itself, so a direct commit here is what getAheadCount compares
+    // baseRef against (no upstream configured, so it's tier 2: baseRef..HEAD).
+    const t = await client.createTask({
+      title: "GS-ahead", prompt: "p", agent: "claude-code", isolation: "worktree", workdir: repo,
+    });
+    expect(typeof t.baseRef).toBe("string");
+    expect((await client.getGitStatus(t.id)).ahead).toBe(0);
+
+    writeFileSync(path.join(repo, "b.txt"), "two\n");
+    Bun.spawnSync(["git", "-C", repo, "add", "-A"]);
+    Bun.spawnSync([
+      "git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t",
+      "commit", "-q", "-m", "second",
+    ]);
+
+    const status = await client.getGitStatus(t.id);
+    expect(status.ahead).toBe(1);
+    expect(status.hasChanges).toBe(false);
 
     await client.deleteTask(t.id);
     rmSync(repo, { recursive: true, force: true });

@@ -45,6 +45,10 @@ test("follow-up to a task whose session outlived the process resumes instead of 
   const { db, tasks, runs } = await import("./db.ts");
   const { sendInput } = await import("./orchestrator.ts");
   const { sessionNameFor, dropSession } = await import("./claude-tmux.ts");
+  // Dynamic import (not top-level) so db.ts — which tmux-resolution.ts pulls
+  // in and which opens on module load — can't load before AGETOR_DATA_DIR is
+  // set at the top of this file.
+  const { tmuxSocketArgs } = await import("./tmux-resolution.ts");
 
   const taskId = `task-followup-${randomUUID()}`;
   const priorRunId = `run-followup-${randomUUID()}`;
@@ -54,8 +58,21 @@ test("follow-up to a task whose session outlived the process resumes instead of 
 
   // Simulate a claude REPL that survived an agetor restart: a real tmux session
   // with the task's deterministic name, created OUTSIDE agetor so there is no
-  // in-memory SessionState for it.
-  const create = Bun.spawnSync(["tmux", "new-session", "-d", "-s", sessionName, "--", "sleep", "30"]);
+  // in-memory SessionState for it. Must use the same socket args as the code
+  // under test (`agetor-test` under bun test) — the follow-up path probes and
+  // kills on the isolated socket, so a survivor created on the default socket
+  // would be invisible to it (and would pollute the user's real tmux server).
+  const create = Bun.spawnSync([
+    "tmux",
+    ...tmuxSocketArgs(),
+    "new-session",
+    "-d",
+    "-s",
+    sessionName,
+    "--",
+    "sleep",
+    "30",
+  ]);
   expect(create.exitCode).toBe(0);
 
   try {
@@ -79,6 +96,7 @@ test("follow-up to a task whose session outlived the process resumes instead of 
       model: "claude-opus-4-7",
       effort: "medium",
       references: [],
+      backlog: [],
       runId: priorRunId,
       hasOpenableRun: false,
       pendingInteractionCount: 0,

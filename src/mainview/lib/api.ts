@@ -293,6 +293,15 @@ export const api = {
    *  implement the native title-bar double-click gesture. */
   toggleWindowZoom: () =>
     j<{ ok: boolean; skipped?: string }>("/window/toggle-zoom", { method: "POST" }),
+  /** Ask the main process to raise + focus the app window. A WKWebView's own
+   *  `window.focus()` can't activate the host NSApplication, so every "bring
+   *  agetor to front" affordance (toast clicks, etc.) has to round-trip
+   *  through here instead. Best-effort UI polish: swallows failures behind a
+   *  console.warn rather than throwing into a React event handler. */
+  focusWindow: (): Promise<void> =>
+    j<{ ok: true }>("/window/focus", { method: "POST" })
+      .then(() => undefined)
+      .catch((e) => { console.warn("[agetor] focusWindow failed", e); }),
   getUpdateStatus: () => j<UpdateSnapshot>("/updates/status"),
   checkForUpdate: () => j<UpdateSnapshot>("/updates/check", { method: "POST" }),
   applyUpdate: () => j<{ ok: true }>("/updates/apply", { method: "POST" }),
@@ -979,7 +988,7 @@ export const api = {
    *  + a `note` when there's no worktree or no diff. */
   getTaskDiff: (taskId: string) => j<TaskDiff>(`/tasks/${taskId}/diff`),
   getTaskGitStatus: (taskId: string) =>
-    j<{ hasChanges: boolean; ignored: boolean }>(`/tasks/${taskId}/git-status`),
+    j<{ hasChanges: boolean; ahead: number; ignored: boolean }>(`/tasks/${taskId}/git-status`),
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
   sendRunInput: (runId: string, line: string) =>
@@ -987,6 +996,31 @@ export const api = {
       `/runs/${runId}/input`,
       { method: "POST", body: JSON.stringify({ line }) },
     ),
+
+  // Messages backlog — saved, not-yet-sent draft messages parked on a task.
+  // Every mutation returns the full updated Task so the caller can re-sync.
+  addBacklogItem: (taskId: string, input: { text: string; references?: TaskReference[] }) =>
+    j<Task>(`/tasks/${taskId}/backlog`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateBacklogItem: (
+    taskId: string,
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) =>
+    j<Task>(`/tasks/${taskId}/backlog/${itemId}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteBacklogItem: (taskId: string, itemId: string) =>
+    j<Task>(`/tasks/${taskId}/backlog/${itemId}`, { method: "DELETE" }),
+  /** Replace the backlog order with `order` (item ids, desired sequence). */
+  reorderBacklog: (taskId: string, order: string[]) =>
+    j<Task>(`/tasks/${taskId}/backlog`, {
+      method: "PUT",
+      body: JSON.stringify({ order }),
+    }),
   /**
    * Open a file or directory with the OS default app. `path` may be absolute
    * or, when `taskId` is supplied, relative to the task's cwd

@@ -1,4 +1,4 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll, describe } from "bun:test";
 import { mkdtempSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -13,6 +13,14 @@ process.env.AGETOR_DATA_DIR = DATA_DIR;
 async function git(args: string[], cwd: string) {
   const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   await proc.exited;
+}
+
+// Standalone helper: run `git rev-parse` and capture the resolved sha/ref.
+async function revParse(cwd: string, ref: string): Promise<string> {
+  const proc = Bun.spawn(["git", "rev-parse", ref], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const out = (await new Response(proc.stdout).text()).trim();
+  await proc.exited;
+  return out;
 }
 
 async function makeRepo(): Promise<string> {
@@ -41,7 +49,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     mode: null,
     model: null,
     effort: null,
-    references: [],
+    references: [],    backlog: [],
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,
@@ -702,4 +710,75 @@ test("gitPush returns an error when the dir isn't a git repo", async () => {
   const r = await gitPush(dir, "main");
   expect(r.ok).toBe(false);
   expect(r.error).toContain("not a git repository");
+});
+
+describe("getAheadCount", () => {
+  test("returns null when the dir doesn't exist", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const missing = path.join(tmpdir(), `agetor-wt-missing-${randomUUID()}`);
+    expect(await getAheadCount(missing, null)).toBeNull();
+  });
+
+  test("returns null for a non-git directory", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-ahead-"));
+    expect(await getAheadCount(dir, null)).toBeNull();
+  });
+
+  test("counts commits ahead of a given baseRef when there's no upstream", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const baseSha = await revParse(repo, "HEAD");
+
+    writeFileSync(path.join(repo, "a.txt"), "a\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "second"], repo);
+
+    writeFileSync(path.join(repo, "b.txt"), "b\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "third"], repo);
+
+    expect(await getAheadCount(repo, baseSha)).toBe(2);
+
+    const headSha = await revParse(repo, "HEAD");
+    expect(await getAheadCount(repo, headSha)).toBe(0);
+  });
+
+  test("returns 0 (unknown-but-not-blocking) when there's no upstream and no baseRef", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await getAheadCount(repo, null)).toBe(0);
+  });
+
+  test("prefers the upstream count over baseRef, including a stale/misleading baseRef", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    // A bare repo stands in for the remote: `push -u` gives `repo` a real
+    // `@{u}` so getAheadCount should use tier 1 (upstream), not baseRef.
+    const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-ahead-bare-"));
+    await git(["init", "--bare", "-b", "main"], bare);
+
+    const repo = await makeRepo();
+    await git(["remote", "add", "origin", bare], repo);
+    await git(["push", "-u", "origin", "main"], repo);
+
+    expect(await getAheadCount(repo, null)).toBe(0);
+
+    writeFileSync(path.join(repo, "c.txt"), "c\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "after-push"], repo);
+
+    expect(await getAheadCount(repo, null)).toBe(1);
+
+    // A stale baseRef pointing at the current HEAD would give a
+    // baseRef..HEAD count of 0 if the baseRef tier were (incorrectly) used —
+    // but the upstream tier must win, so the answer stays 1.
+    const headSha = await revParse(repo, "HEAD");
+    expect(await getAheadCount(repo, headSha)).toBe(1);
+  });
+
+  test("returns null for an invalid baseRef when there's no upstream", async () => {
+    const { getAheadCount } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await getAheadCount(repo, "no-such-ref")).toBeNull();
+  });
 });

@@ -3,12 +3,13 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, Bot, Check, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
   GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash,
-  Sparkles, Square, Terminal, Wrench, X,
+  Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, COMMIT_PUSH_PROMPT, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
-import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow } from "@/lib/subagent-tabs";
+import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
+import { shouldOfferCommitPush, type TaskGitStatus } from "@/lib/commit-push";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/select";
@@ -24,6 +25,7 @@ import {
   type AgentKind,
   type AgentStatus,
   type Harness,
+  type BacklogMessage,
   type Run,
   type RunEvent,
   type Subagent,
@@ -34,6 +36,8 @@ import {
 import { appendReferences } from "../../../shared/refs.ts";
 import { createEventDeduper } from "@/lib/event-dedup";
 import { createEventBuffer } from "@/lib/event-buffer";
+import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
+import { cleanPromptPane } from "@/lib/prompt-noise";
 import { AgentIcon } from "./AgentIcon";
 import {
   ReferencesPicker,
@@ -45,6 +49,8 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
 import { TerminalView } from "./TerminalView";
+import { deriveTodoProgress } from "@/lib/todo-progress";
+import { TodoProgressCard } from "./TodoProgressCard";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -55,6 +61,17 @@ import { TerminalView } from "./TerminalView";
 function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
   return harnesses.find((h) => h.id === harnessId)?.kind ?? "claude-code";
 }
+
+/**
+ * `RunEvent` as held in the panel's local `events` state, tagged with a
+ * client-assigned monotonic id. The server doesn't expose a stable event id
+ * over SSE (`run_events.id` never leaves the DB layer) — `id` here is
+ * assigned by `nextEventIdRef` the moment an event is accepted into the
+ * unified stream, purely so `rebuilt-mask.ts` can tell a genuinely NEW live
+ * event apart from one the server re-delivers on SSE reconnect (full-history
+ * replay) when deciding whether the JSONL rebuild snapshot has gone stale.
+ */
+type StreamEvent = RunEvent & { id: number };
 
 interface Props {
   /** When null, the panel slides off-screen and unmounts after the exit animation. */
@@ -232,16 +249,25 @@ function RunPanelBody({
    *  codex stdout/stderr chunk. The renderer dispatches on `stream` to
    *  pick a component (assistant text, thinking, tool call, tool result,
    *  status divider, error). Events from EVERY run of the task are
-   *  merged here so the user sees one unified scrollback. */
-  const [events, setEvents] = useState<RunEvent[]>([]);
+   *  merged here so the user sees one unified scrollback. Each event is
+   *  tagged with a client-assigned `id` (see `StreamEvent`) as it's
+   *  accepted, in arrival order. */
+  const [events, setEvents] = useState<StreamEvent[]>([]);
   /** When the user clicks "Rebuild from session JSONL" (or the auto-
    *  rebuild fires after a run finishes), we patch the latest claude
    *  session's events with the freshly-parsed on-disk version.
    *  `sessionId` is the `claudeSessionId` the rebuild covers — used at
    *  render time to splice the rebuilt events into the unified stream
    *  in place of the live ones for runs that share that session id.
-   *  Null means "use the live streamed events as normal". */
-  const [rebuilt, setRebuilt] = useState<{ sessionId: string; events: RunEvent[] } | null>(null);
+   *  `maxLiveEventIdAtSnapshot` is the highest `StreamEvent.id` observed
+   *  at capture time — the SSE delivery path (below) uses it, together
+   *  with `rebuiltRunIds`, to detect a genuinely NEW live event landing
+   *  for a masked run and clear the snapshot so live events render again
+   *  (see `rebuilt-mask.ts`). Null means "use the live streamed events
+   *  as normal". */
+  const [rebuilt, setRebuilt] = useState<
+    { sessionId: string; events: RunEvent[]; maxLiveEventIdAtSnapshot: number } | null
+  >(null);
   const [rebuildBusy, setRebuildBusy] = useState(false);
   const [rebuildNote, setRebuildNote] = useState<string | null>(null);
   const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
@@ -259,6 +285,14 @@ function RunPanelBody({
   // true, so a user who scrolls up to read history isn't yanked back down on
   // every streamed chunk.
   const nearBottomRef = useRef(true);
+  // Monotonic id source for `StreamEvent.id`, incremented once per event as
+  // it's accepted into the unified stream (see the SSE subscription effect
+  // below). Assigning synchronously at push time — rather than deriving from
+  // `events.length` inside a render — means it's always current even while a
+  // batch is buffered and hasn't flushed into React state yet, which is what
+  // the rebuild-snapshot-invalidation check needs to be race-free. Reset to
+  // 0 on task switch alongside the rest of the stream state.
+  const nextEventIdRef = useRef(0);
 
   // Reset on task switch (no remount because we no longer key on task.id).
   // Re-arm the auto-scroll heuristic so opening a different task pins the
@@ -288,7 +322,12 @@ function RunPanelBody({
         setRebuildNote(res.reason ?? "no events found in JSONL");
         return;
       }
-      setRebuilt({ sessionId: latestRun.claudeSessionId, events: res.events });
+      setRebuilt({
+        sessionId: latestRun.claudeSessionId,
+        events: res.events,
+        // "Everything observed so far" — see `nextEventIdRef`.
+        maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
+      });
       setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
     } catch (e) {
       setRebuildNote(`rebuild failed: ${(e as Error).message}`);
@@ -362,6 +401,7 @@ function RunPanelBody({
   // panel shows the whole conversation as a single scrollback.
   useEffect(() => {
     setEvents([]);
+    nextEventIdRef.current = 0;
     // Collapse the dual-emit + replay duplicates the server stream carries
     // (live echo + JSONL twin per user message; full-history replay on every
     // reconnect). The deduper keeps `user` keys in a never-trimmed set so a
@@ -388,8 +428,38 @@ function RunPanelBody({
     // arm/flush bookkeeping (and the re-arm-after-flush invariant that fixes
     // the freeze) lives in `createEventBuffer` so it can be unit-tested.
     const FLUSH_FALLBACK_MS = 250;
-    const buffer = createEventBuffer<RunEvent>(
-      (batch) => setEvents((cur) => [...cur, ...batch]),
+    const buffer = createEventBuffer<StreamEvent>(
+      (batch) => {
+        setEvents((cur) => [...cur, ...batch]);
+        // A newer live MAIN-stream event landing for a run the rebuilt-from-
+        // JSONL snapshot is currently masking means the snapshot is stale —
+        // clear it so `displayedEvents` falls back to the live stream. This
+        // is what un-freezes the panel when a post-`end_turn` background-
+        // agent continuation keeps emitting into a run the panel already
+        // considers finished (the snapshot only ever covers events observed
+        // up to the moment it was captured). `rebuiltMaskRef` (defined below,
+        // synced from `rebuilt`/`rebuiltRunIds`) is read fresh on every batch
+        // rather than closed over at effect-setup time, since this callback
+        // is created once per SSE subscription and would otherwise see a
+        // stale snapshot. Clearing here does NOT touch `latestRun`, so the
+        // auto-rebuild effect (deps: latestRun id/status/claudeSessionId)
+        // does not immediately re-fire and re-mask — it only fires again
+        // when the newest run itself next resolves.
+        const mask = rebuiltMaskRef.current;
+        if (mask) {
+          const invalidated = batch.some((e) =>
+            invalidatesRebuiltSnapshot(
+              { maxLiveEventIdAtSnapshot: mask.maxLiveEventIdAtSnapshot },
+              e,
+              mask.runIds,
+            ),
+          );
+          if (invalidated) {
+            setRebuilt(null);
+            setRebuildNote(null);
+          }
+        }
+      },
       (flush) => {
         const raf = requestAnimationFrame(flush);
         const timer = setTimeout(flush, FLUSH_FALLBACK_MS);
@@ -440,7 +510,11 @@ function RunPanelBody({
         } catch { /* ignore malformed */ }
         return;
       }
-      buffer.push(e);
+      // Tag with the next client-assigned id (see `StreamEvent`) — the
+      // server doesn't send one over SSE, and the invalidation check above
+      // needs a monotonic ordering to distinguish a genuinely new event from
+      // one the replay burst re-delivers on reconnect.
+      buffer.push({ ...e, id: nextEventIdRef.current++ });
     });
     return () => {
       buffer.dispose();
@@ -484,16 +558,52 @@ function RunPanelBody({
   // at 500 chars), so the JSONL is the canonical source. Skips while
   // a run is in flight (live tailing is still appending) and codex
   // (no JSONL transcript).
+  //
+  // This effect's deps are ONLY `latestRun` id/status/claudeSessionId, which
+  // is deliberate and load-bearing: when the SSE batch-flush callback above
+  // detects a newer live event for a masked run and calls
+  // `setRebuilt(null)`/`setRebuildNote(null)`, none of those three fields
+  // change (the run itself hasn't — its status is still whatever it was),
+  // so this effect does NOT re-run and immediately re-mask the stream it
+  // was just un-frozen from. It only fires again — legitimately re-snapshot-
+  // ting — when the newest run's own id/status/sessionId next changes, i.e.
+  // when a later run resolves. This is what makes clearing the snapshot on a
+  // background-agent continuation's post-`end_turn` activity actually stick
+  // instead of flapping.
   useEffect(() => {
     if (!latestRun) return;
-    if (latestRun.status === "running") return;
+    if (latestRun.status === "running") {
+      // The newest run just became "running" again — e.g. a background-agent
+      // continuation turn that shares `claudeSessionId` with the run the
+      // current `rebuilt` snapshot was captured from, whose first live events
+      // can land before the 2s runs-poll updates `runs`/`latestRun` (see
+      // `rebuiltRunIds` and the SSE batch-flush invalidation above). If a
+      // snapshot is still set at that point, `displayedEvents` will mask the
+      // new run's live events behind it — and because this effect only
+      // re-fires on `latestRun` id/status/claudeSessionId changes, the
+      // freeze would persist until the run resolves. Clear eagerly instead:
+      // "the newest run is live again ⇒ no snapshot should mask the stream."
+      // Functional updaters read the current value without adding
+      // `rebuilt`/`rebuildNote` to this effect's deps, so this can't loop —
+      // clearing them doesn't change `latestRun`, the only thing gating
+      // re-runs, and is a no-op (bails to the same reference) once already
+      // clear.
+      setRebuilt((prev) => (prev ? null : prev));
+      setRebuildNote((prev) => (prev ? null : prev));
+      return;
+    }
     if (!latestRun.claudeSessionId) return;
     const sessionId = latestRun.claudeSessionId;
     let cancelled = false;
     void api.rebuildRunEvents(latestRun.id).then((res) => {
       if (cancelled) return;
       if (res.events.length > 0) {
-        setRebuilt({ sessionId, events: res.events });
+        setRebuilt({
+          sessionId,
+          events: res.events,
+          // "Everything observed so far" — see `nextEventIdRef`.
+          maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
+        });
         setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
       } else if (res.reason) {
         setRebuildNote(res.reason);
@@ -514,6 +624,20 @@ function RunPanelBody({
     }
     return ids;
   }, [rebuilt, runs]);
+
+  /** Live mirror of `{ maxLiveEventIdAtSnapshot, runIds }` derived from
+   *  `rebuilt`/`rebuiltRunIds`, read by the SSE batch-flush callback in the
+   *  subscription effect above. That callback is created once per task
+   *  subscription and closes over whatever `rebuilt`/`rebuiltRunIds` were at
+   *  effect-setup time — without this ref it would keep checking against a
+   *  stale (or even already-cleared) snapshot instead of the current one.
+   *  `null` (no active snapshot) short-circuits the check entirely. */
+  const rebuiltMaskRef = useRef<{ maxLiveEventIdAtSnapshot: number; runIds: Set<string> } | null>(null);
+  useEffect(() => {
+    rebuiltMaskRef.current = rebuilt && rebuiltRunIds
+      ? { maxLiveEventIdAtSnapshot: rebuilt.maxLiveEventIdAtSnapshot, runIds: rebuiltRunIds }
+      : null;
+  }, [rebuilt, rebuiltRunIds]);
 
   /** The task's own (main) agent events — everything not tagged to a subagent.
    *  The rebuild-from-JSONL path only ever covers the main session transcript,
@@ -542,6 +666,12 @@ function RunPanelBody({
     const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId));
     return [...others, ...rebuilt.events];
   }, [activeStream, subagentEventsById, mainEvents, rebuilt, rebuiltRunIds]);
+
+  /** The current to-do list for whichever stream is selected. Claude re-emits
+   *  the whole TodoWrite list on every change, so this is a latest-wins scan
+   *  (see lib/todo-progress.ts). Memoized on `displayedEvents` alone — it is
+   *  recomputed on every SSE frame, so it must stay a single O(n) pass. */
+  const todoProgress = useMemo(() => deriveTodoProgress(displayedEvents), [displayedEvents]);
 
   /** Indicator mode for the bottom-pinned heartbeat. A follow-up sent while
    *  the agent is working is folded into the active run (the backend pastes it
@@ -636,14 +766,25 @@ function RunPanelBody({
   const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
-  // Whether the task's working tree has uncommitted changes. Drives the
-  // "Commit & push" action chip above the textarea. Reset to `false`
-  // whenever the latest run is not in a succeeded state so the chip
-  // disappears the moment a new turn starts (`send()` refreshes the runs
-  // list immediately, so `latestRun.status` flips to "running" within
-  // ~200ms of the click). A polling effect keeps the flag in sync with
-  // the actual git state while the run sits idle on success.
-  const [hasChanges, setHasChanges] = useState(false);
+  // Messages backlog — saved, not-yet-sent drafts for this task. Seeded from
+  // the task prop and kept in sync as the 2s task poll refreshes `task.backlog`;
+  // each mutation also updates this optimistically from the endpoint's returned
+  // Task so the tray reacts immediately instead of waiting for the next poll.
+  const [backlogItems, setBacklogItems] = useState<BacklogMessage[]>(task.backlog);
+  // Guards concurrent backlog mutations (and shares the send lock so a
+  // "Send now" from the tray can't race a composer send).
+  const [backlogBusy, setBacklogBusy] = useState(false);
+  useEffect(() => { setBacklogItems(task.backlog); }, [task.backlog]);
+  // The task's live git status (uncommitted changes / unpushed commits).
+  // Drives the "Commit & push" action chip above the textarea via
+  // `shouldOfferCommitPush`. Deliberately independent of run status —
+  // background agents can dirty the worktree (or add unpushed commits)
+  // while the latest run is still `running`, so the chip must be able to
+  // surface then too, not just after a run succeeds. `null` means unknown
+  // (not yet polled, or the last poll failed) and hides the chip. A
+  // polling effect keeps this in sync with the actual git state for as
+  // long as the panel is mounted.
+  const [gitStatus, setGitStatus] = useState<TaskGitStatus | null>(null);
   const [sendDragging, setSendDragging] = useState(false);
   // `/`-command and skill autocomplete for the send field. Same list the
   // New Task form uses — depends on (agent, workdir, branch) so a slash
@@ -674,42 +815,53 @@ function RunPanelBody({
     return () => { cancelled = true; };
   }, [task.agent, task.workdir, task.branch]);
 
-  // Keep `hasChanges` aligned with the latest run's terminal state. We only
-  // ever offer "Commit & push" when the latest run succeeded — any other
-  // status (running / failed / cancelled / orphaned / no runs yet) hides
-  // the chip. While in the succeeded state, poll every 5s so the chip
-  // disappears if the agent (or the user, from a separate terminal)
-  // commits the changes through another path. The loop is sequential
-  // (each tick waits for the previous git status to resolve before
-  // sleeping) so a slow `git status` can't produce out-of-order
-  // setHasChanges calls.
+  // Poll the task's git status every 5s for as long as the panel is
+  // mounted, regardless of run status — with background agents, most of a
+  // task's life is spent `running`, and the worktree can get dirty (or
+  // gain unpushed commits) during that window, not just after a run
+  // succeeds. The 5s cadence also lets the chip disappear if the agent (or
+  // the user, from a separate terminal) commits the changes through
+  // another path. The loop is sequential (each tick waits for the
+  // previous git status to resolve before sleeping) so a slow `git
+  // status` can't produce out-of-order setGitStatus calls.
+  //
+  // Deps are `[task.id]` ONLY — App.tsx polls /tasks every 2s and rebuilds
+  // the task object each tick, so depending on `latestRun`/`task` fields
+  // here would restart this effect (and its poll cadence) every 2s.
   useEffect(() => {
-    if (latestRun?.status !== "succeeded") {
-      setHasChanges(false);
-      return;
-    }
     let cancelled = false;
     const tick = async () => {
       while (!cancelled) {
         try {
           const res = await api.getTaskGitStatus(task.id);
           if (cancelled) return;
-          setHasChanges(res.hasChanges && !res.ignored);
+          setGitStatus(res);
         } catch {
           if (cancelled) return;
-          setHasChanges(false);
+          setGitStatus(null);
         }
         await new Promise((r) => setTimeout(r, 5000));
       }
     };
     void tick();
     return () => { cancelled = true; };
-  }, [task.id, latestRun?.id, latestRun?.status]);
+  }, [task.id]);
 
   const send = async () => {
     const line = input.trim();
     if (!line && !sendRefs.length) return;
     if (!resumableRunId) return;
+    // Never deliver while a native modal is up: claude is blocked on it inside
+    // the tmux REPL, so the keystrokes would paste into the modal instead of
+    // reaching the agent (and the run would hang "working"). The Send button is
+    // already disabled here, but the textarea now stays typable while a prompt
+    // is pending — so you can stash a draft — which means Enter can reach this
+    // function. Guard it at the source rather than relying on the field.
+    if (modalPending) return;
+    // Don't fire a send while a backlog op (e.g. Save-for-later stashing this
+    // same text) is mid-flight — otherwise a fast Enter could both send and
+    // save the same message.
+    if (sending || backlogBusy) return;
     setSending(true);
     setSendHint(null);
     const body = appendReferences(line, sendRefs);
@@ -727,11 +879,6 @@ function RunPanelBody({
         // message never appears.
         setRebuilt(null);
         setRebuildNote(null);
-        // Hide the "Commit & push" chip optimistically — a new turn is
-        // about to land. Without this there's a brief window between this
-        // finally and the listRuns response where `latestRun.status` is
-        // still "succeeded" and the chip flickers back into view.
-        setHasChanges(false);
         // Refresh the runs list right away so the new run row appears
         // immediately, rather than waiting up to 2s for the next poll.
         void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
@@ -758,6 +905,127 @@ function RunPanelBody({
     try { await api.cancelRun(liveRunId); } catch { /* surfaced via log */ }
   };
 
+  // Park the current composer content on the backlog instead of sending it —
+  // "a message that came to mind but isn't ready to send yet." Consumes the
+  // composer (text + refs) exactly like `send()` does, so the two actions feel
+  // symmetric. Available in every state the composer renders — including before
+  // the task's first run and while a prompt is pending. Those are exactly the
+  // moments you can't send but most want to jot something down, so the textarea
+  // stays typable there and only *sending* is gated (see `send()`).
+  const saveForLater = async () => {
+    const text = input.trim();
+    if (!text && !sendRefs.length) return;
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.addBacklogItem(task.id, { text, references: sendRefs });
+      setBacklogItems(updated.backlog);
+      setInput("");
+      setSendRefs([]);
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
+  // Send a saved draft to the agent, then consume it from the backlog. Reuses
+  // the exact `sendRunInput` plumbing (and success side-effects) as the
+  // composer's `send()` so a backlog send is indistinguishable from a typed
+  // one — same run row, streamed events, scroll-to-bottom. Only removes the
+  // item once the send is actually accepted.
+  const sendBacklogItem = async (item: BacklogMessage) => {
+    if (!resumableRunId || sending || backlogBusy || modalPending) return;
+    setSending(true);
+    setBacklogBusy(true);
+    setSendHint(null);
+    const body = appendReferences(item.text, item.references);
+    try {
+      const res = await api.sendRunInput(resumableRunId, body);
+      if (!res.delivered) {
+        setSendHint(res.reason);
+      } else {
+        try {
+          const updated = await api.deleteBacklogItem(task.id, item.id);
+          setBacklogItems(updated.backlog);
+        } catch {
+          // The send landed; if the consume call fails, drop it locally so the
+          // user doesn't accidentally resend. The next task poll reconciles.
+          setBacklogItems((prev) => prev.filter((m) => m.id !== item.id));
+        }
+        setRebuilt(null);
+        setRebuildNote(null);
+        // No optimistic git-status touch here (main's #94 dropped that): the
+        // git-status polling effect keeps `gitStatus` current on its own.
+        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        nearBottomRef.current = true;
+        requestAnimationFrame(() => {
+          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+        });
+      }
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+      setBacklogBusy(false);
+    }
+  };
+
+  const editBacklogItem = async (
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) => {
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.updateBacklogItem(task.id, itemId, patch);
+      setBacklogItems(updated.backlog);
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
+  const removeBacklogItem = async (itemId: string) => {
+    setBacklogBusy(true);
+    setSendHint(null);
+    const prev = backlogItems;
+    setBacklogItems((p) => p.filter((m) => m.id !== itemId)); // optimistic
+    try {
+      const updated = await api.deleteBacklogItem(task.id, itemId);
+      setBacklogItems(updated.backlog);
+    } catch (e) {
+      setBacklogItems(prev); // roll back
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
+  // Move a draft up (dir -1) or down (dir +1) one slot and persist the new
+  // order. Optimistic: reorders locally first, then confirms from the server's
+  // returned Task.
+  const moveBacklogItem = async (itemId: string, dir: -1 | 1) => {
+    const idx = backlogItems.findIndex((m) => m.id === itemId);
+    const to = idx + dir;
+    if (idx < 0 || to < 0 || to >= backlogItems.length) return;
+    const next = [...backlogItems];
+    const [moved] = next.splice(idx, 1);
+    next.splice(to, 0, moved!);
+    setBacklogItems(next);
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.reorderBacklog(task.id, next.map((m) => m.id));
+      setBacklogItems(updated.backlog);
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
   // One-click follow-up: ask the agent to commit & push the changes it just
   // made. Reuses the same `sendRunInput` plumbing as a typed message so the
   // resulting turn shows up as a normal run row with streamed events.
@@ -777,9 +1045,6 @@ function RunPanelBody({
         setRebuilt(null);
         setRebuildNote(null);
         void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
-        // Optimistically hide the chip — the new turn is in flight so we
-        // won't render it again until the next succeeded state.
-        setHasChanges(false);
         nearBottomRef.current = true;
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -948,6 +1213,15 @@ function RunPanelBody({
         />
       )}
 
+      {/* Full-bleed section with inner padding, matching RunsList /
+          TerminalsSection above — the card itself is rounded, so it needs the
+          px-3 inset to avoid sitting flush against the panel edges. */}
+      {todoProgress && (
+        <div className="border-b border-border/60 px-3 py-2">
+          <TodoProgressCard progress={todoProgress} />
+        </div>
+      )}
+
       <div
         ref={logRef}
         onScroll={(e) => {
@@ -998,6 +1272,27 @@ function RunPanelBody({
         )}
       </div>
 
+      {/* Messages backlog — saved drafts to send later. Sits just above the
+          composer so the "stash a thought / send it when ready" loop is one
+          glance apart. Hidden when empty and on a background-agent (subagent)
+          tab — those streams are read-only, so an interactive tray whose "Send
+          now" targets the main run would sit contradictorily above the
+          read-only footer. On an archived task the tray still renders, but
+          view-only (`readOnly`), so saved drafts aren't silently invisible. */}
+      {activeStream === "main" && backlogItems.length > 0 && (
+        <BacklogTray
+          items={backlogItems}
+          canSend={canSend && !modalPending}
+          busy={sending || backlogBusy}
+          readOnly={archived}
+          startingFolder={task.worktreePath ?? task.workdir}
+          onSend={sendBacklogItem}
+          onEdit={editBacklogItem}
+          onDelete={removeBacklogItem}
+          onMove={moveBacklogItem}
+        />
+      )}
+
       {/* Bottom-fixed input. Enabled the moment the task has had at least one
           run — the backend reattaches to the live tmux session if there is one,
           or spawns a fresh one seeded with the previous turn's last response
@@ -1037,38 +1332,61 @@ function RunPanelBody({
           onDragLeave={onSendDragLeave}
           onDrop={onSendDrop}
         >
-          {canSend && (
-            <ReferencesPicker
-              variant="inline"
-              refs={sendRefs}
-              onChange={setSendRefs}
-              startingFolder={task.worktreePath ?? task.workdir}
-            />
-          )}
-          {canSend && (
-            // Picker on the left; "Commit & push" (when offered) pushed to the
-            // right so it isn't stacked directly on top of the picker.
+          {/* Always available: refs can be attached to a draft you're only
+              stashing, before the task has ever run. */}
+          <ReferencesPicker
+            variant="inline"
+            refs={sendRefs}
+            onChange={setSendRefs}
+            startingFolder={task.worktreePath ?? task.workdir}
+          />
+          {/* Shown once the task is sendable, OR as soon as there's something to
+              stash — that's what lets "Save for later" work pre-run. */}
+          {(canSend || input.trim() || sendRefs.length > 0) && (
+            // Picker on the left; "Save for later" / "Commit & push" pushed to
+            // the right so they aren't stacked directly on top of the picker.
             <div className="flex items-center justify-between gap-2">
-              <ExtensionPicker
-                extensions={sendExtensions}
-                value={input}
-                onChange={setInput}
-                textareaRef={sendRef}
-                placement="above"
-                // Already gated by the enclosing `canSend &&`, so only the
-                // in-flight send needs to disable the trigger here.
-                disabled={sending}
-              />
-              {latestRun?.status === "succeeded" && hasChanges && !sending && (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => void sendCommitPush()}
-                  title="Ask the agent to commit the working-tree changes and push the current branch to origin."
-                >
-                  <GitCommit className="mr-1 size-3" /> Commit &amp; push
-                </Button>
+              {canSend ? (
+                <ExtensionPicker
+                  extensions={sendExtensions}
+                  value={input}
+                  onChange={setInput}
+                  textareaRef={sendRef}
+                  placement="above"
+                  // Only the in-flight send needs to disable the trigger here.
+                  disabled={sending}
+                />
+              ) : (
+                // Keep `justify-between` pushing the buttons right when the
+                // picker isn't offered (pre-run).
+                <span />
               )}
+              <div className="flex items-center gap-2">
+                {(input.trim() || sendRefs.length > 0) && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void saveForLater()}
+                    disabled={sending || backlogBusy}
+                    title="Save this message to the backlog to send later — without sending it now."
+                  >
+                    <BookmarkPlus className="mr-1 size-3" /> Save for later
+                  </Button>
+                )}
+                {/* Commit & push keys on live git state (uncommitted changes or
+                    unpushed commits), not run status — see `shouldOfferCommitPush`.
+                    Can surface even mid-run (a background agent dirtied the tree). */}
+                {shouldOfferCommitPush(gitStatus) && !sending && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void sendCommitPush()}
+                    title="Ask the agent to commit the working-tree changes and push the current branch to origin."
+                  >
+                    <GitCommit className="mr-1 size-3" /> Commit &amp; push
+                  </Button>
+                )}
+              </div>
             </div>
           )}
           <div className="flex items-stretch gap-2">
@@ -1088,22 +1406,42 @@ function RunPanelBody({
                   if (e.defaultPrevented) return;
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
+                    // The field is typable in states we can't send from (before
+                    // the first run, or while a prompt is pending). Swallowing
+                    // Enter there would be a dead key, so it does the thing the
+                    // user means: stash the draft. `send()` guards both states
+                    // too, so this is the only place that decides.
+                    if (!canSend || modalPending) {
+                      void saveForLater();
+                      return;
+                    }
                     void send();
                   }
                 }}
                 placeholder={
                   modalPending
-                    ? "Answer the prompt above — or press Stop to cancel, then send a new message."
+                    ? "Answer the prompt above — or type a message and Save it for later."
                     : canSend
                     ? task.column === "running"
                       ? "Agent is working — your message will be added to the current turn. Type / for commands."
                       : task.column === "blocked"
                         ? "Answer the question, or send any follow-up. Type / for commands."
                         : "Send a message — resumes the conversation in a fresh session. Type / for commands."
-                    : "Press Run task first to start a conversation."
+                    // `!canSend` covers two states: never run, and "ran but has
+                    // no resumable session" (a codex task whose run_id was
+                    // cleared — claude falls back to its newest run). Don't
+                    // claim "not running yet" in the latter.
+                    : runs.length > 0
+                      ? "No live session to send to — save this message for later, or re-run the task."
+                      : "Not running yet — type a message and Save it for later, ready to send once the task runs."
                 }
                 rows={2}
-                disabled={!canSend || sending || modalPending}
+                // Typing is allowed in every state the composer renders, even
+                // when we can't send: that's the point of "Save for later".
+                // Sending is gated separately — the Send button below plus the
+                // `canSend` / `modalPending` guards inside `send()` — so a
+                // keystroke can never leak into a live tmux modal.
+                disabled={sending || backlogBusy}
                 className="h-16 min-h-0 w-full resize-none text-xs"
               />
               <SlashAutocomplete
@@ -1120,7 +1458,7 @@ function RunPanelBody({
             <Button
               size="icon"
               onClick={() => void send()}
-              disabled={!canSend || sending || modalPending || (!input.trim() && sendRefs.length === 0)}
+              disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
               title={
                 // Distinguish "live session exists" from "needs resume" — not
                 // "turn in flight". `liveRunId` (task.runId) stays set while the
@@ -1143,6 +1481,257 @@ function RunPanelBody({
         </div>
       )}
     </>
+  );
+}
+
+/** Shared styling for the compact icon buttons in a backlog item's action row. */
+const BACKLOG_ICON_BTN =
+  "rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground "
+  + "disabled:pointer-events-none disabled:opacity-40";
+
+/**
+ * The messages-backlog tray: a list of saved, not-yet-sent drafts shown just
+ * above the composer. Purely presentational — all mutations are handed back to
+ * RunPanelBody, which owns the optimistic state and the API calls. Manages only
+ * which item is currently in inline-edit mode.
+ */
+function BacklogTray({
+  items,
+  canSend,
+  busy,
+  readOnly,
+  startingFolder,
+  onSend,
+  onEdit,
+  onDelete,
+  onMove,
+}: {
+  items: BacklogMessage[];
+  /** Whether "Send now" is available (task has a resumable run and no pending prompt). */
+  canSend: boolean;
+  /** A send / backlog mutation is in flight — disables destructive actions. */
+  busy: boolean;
+  /** View-only mode (archived task): render the drafts but strip every
+   *  mutation affordance, since the server freezes backlog edits on archived
+   *  tasks. The drafts stay visible so they aren't silently hidden. */
+  readOnly: boolean;
+  startingFolder: string;
+  onSend: (item: BacklogMessage) => void;
+  onEdit: (
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) => void | Promise<void>;
+  onDelete: (itemId: string) => void;
+  onMove: (itemId: string, dir: -1 | 1) => void;
+}) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  return (
+    <div className="shrink-0 border-t border-border/60">
+      <div className="flex items-center gap-1.5 px-3 pb-1 pt-2 text-[11px] font-medium text-muted-foreground">
+        <ClipboardList className="size-3.5" />
+        <span>Backlog</span>
+        <span className="rounded bg-muted px-1 text-[10px]">{items.length}</span>
+        <span className="ml-1 font-normal text-muted-foreground/70">
+          {readOnly
+            ? "saved messages — unarchive the task to edit or send"
+            : "saved messages — send when you're ready"}
+        </span>
+      </div>
+      <div className="max-h-40 space-y-1 overflow-y-auto px-2 pb-2">
+        {items.map((item, i) => (
+          <BacklogItemRow
+            key={item.id}
+            item={item}
+            index={i}
+            total={items.length}
+            canSend={canSend}
+            busy={busy}
+            readOnly={readOnly}
+            editing={editingId === item.id}
+            startingFolder={startingFolder}
+            onStartEdit={() => setEditingId(item.id)}
+            onCancelEdit={() => setEditingId(null)}
+            onSaveEdit={async (patch) => {
+              await onEdit(item.id, patch);
+              setEditingId(null);
+            }}
+            onSend={() => onSend(item)}
+            onDelete={() => onDelete(item.id)}
+            onMove={(dir) => onMove(item.id, dir)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** One saved draft: a read-only row with hover actions, or an inline editor
+ *  (textarea + references picker) when `editing` is true. */
+function BacklogItemRow({
+  item,
+  index,
+  total,
+  canSend,
+  busy,
+  readOnly,
+  editing,
+  startingFolder,
+  onStartEdit,
+  onCancelEdit,
+  onSaveEdit,
+  onSend,
+  onDelete,
+  onMove,
+}: {
+  item: BacklogMessage;
+  index: number;
+  total: number;
+  canSend: boolean;
+  busy: boolean;
+  readOnly: boolean;
+  editing: boolean;
+  startingFolder: string;
+  onStartEdit: () => void;
+  onCancelEdit: () => void;
+  onSaveEdit: (patch: { text: string; references: TaskReference[] }) => void;
+  onSend: () => void;
+  onDelete: () => void;
+  onMove: (dir: -1 | 1) => void;
+}) {
+  const [draft, setDraft] = useState(item.text);
+  const [draftRefs, setDraftRefs] = useState<TaskReference[]>(item.references);
+  // Re-seed the edit form only when we *enter* edit mode. We deliberately do
+  // NOT depend on `item.text` / `item.references`: the 2s task poll rebuilds
+  // `task.backlog` into fresh objects (new array references) on every tick, so
+  // depending on them would re-run this effect every poll and clobber the
+  // user's in-progress edit back to the saved value. The row is keyed by
+  // `item.id`, so `useState` already seeds the initial value on mount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (editing) {
+      setDraft(item.text);
+      setDraftRefs(item.references);
+    }
+  }, [editing]);
+
+  // `readOnly` wins over `editing` — an archived task can never open the editor
+  // (the Edit button is hidden), but guard here too so a stale `editingId` from
+  // just before an archive can't strand the row in an uncommittable form.
+  if (editing && !readOnly) {
+    const canSave = draft.trim().length > 0 || draftRefs.length > 0;
+    return (
+      <div className="space-y-1.5 rounded-md border border-border/60 bg-background/50 p-2">
+        <Textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          rows={2}
+          autoFocus
+          className="min-h-0 w-full resize-none text-xs"
+        />
+        <ReferencesPicker
+          variant="inline"
+          refs={draftRefs}
+          onChange={setDraftRefs}
+          startingFolder={startingFolder}
+        />
+        <div className="flex items-center justify-end gap-1.5">
+          <Button size="sm" variant="ghost" onClick={onCancelEdit}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            disabled={!canSave || busy}
+            onClick={() => onSaveEdit({ text: draft.trim(), references: draftRefs })}
+          >
+            <Check className="mr-1 size-3" /> Save
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="group flex items-start gap-2 rounded-md border border-transparent px-2 py-1.5 hover:border-border/60 hover:bg-background/40">
+      <div className="min-w-0 flex-1">
+        <p className="line-clamp-3 whitespace-pre-wrap break-words text-xs text-foreground/90">
+          {item.text || (
+            <span className="italic text-muted-foreground">(references only)</span>
+          )}
+        </p>
+        {item.references.length > 0 && (
+          <div className="mt-1 flex flex-wrap gap-1">
+            {item.references.map((r) => {
+              const Icon = iconForRef(r);
+              return (
+                <span
+                  key={r.path}
+                  title={r.path}
+                  className="inline-flex items-center gap-1 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground"
+                >
+                  <Icon className="size-3 shrink-0 opacity-70" />
+                  {refBasename(r.path)}{r.isDirectory ? "/" : ""}
+                </span>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      {!readOnly && (
+        <div className="flex shrink-0 items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={index === 0 || busy}
+            onClick={() => onMove(-1)}
+            title="Move up"
+          >
+            <ArrowUp className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={index === total - 1 || busy}
+            onClick={() => onMove(1)}
+            title="Move down"
+          >
+            <ArrowDown className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            onClick={onStartEdit}
+            title="Edit"
+          >
+            <FilePenLine className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={!canSend || busy}
+            onClick={onSend}
+            // `canSend` here is the parent's `canSend && !modalPending`, so it
+            // goes false for two different reasons — no live/resumable session,
+            // or a prompt is waiting. Keep the copy true for both.
+            title={
+              canSend
+                ? "Send now"
+                : "Can't send right now — run the task, or answer the pending prompt first"
+            }
+          >
+            <Send className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
+            disabled={busy}
+            onClick={onDelete}
+            title="Delete"
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1215,7 +1804,8 @@ function basename(p: string): string {
  * agent stream and each background/sub agent it has spawned. Shown only while
  * background agents are active (see `showSubagentTabs`). The Main tab is always
  * first and visually emphasised — it's the one stream you can actually talk to;
- * the background tabs are watch-only. A running agent shows a pulsing green dot,
+ * the background tabs are watch-only, and the running ones sort directly after
+ * Main (see `sortSubagentTabs`). A running agent shows a pulsing green dot,
  * a finished one a check.
  */
 function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean; onSelect: (id: string) => void }) {
@@ -1262,12 +1852,17 @@ function SubagentTabs({
   active: string;
   onSelect: (id: string) => void;
 }) {
-  // Collapse a large fan-out behind a "+N" pill; expanding wraps the strip onto
-  // multiple rows rather than forcing a long horizontal scroll. A running or
-  // currently-active tab is never hidden (see `splitTabsForOverflow`).
+  // Running agents sort first, right after Main, so what's live is always the
+  // closest thing to hand (see `sortSubagentTabs`). Then collapse a large
+  // fan-out behind a "+N" pill; expanding wraps the strip onto multiple rows
+  // rather than forcing a long horizontal scroll. A running or currently-active
+  // tab is never hidden (see `splitTabsForOverflow`).
   const [expanded, setExpanded] = useState(false);
-  const { visible, overflow } = splitTabsForOverflow(subagents, active);
-  const shown = expanded ? subagents : visible;
+  // No useMemo: the 2s poll rebuilds `subagents` into a fresh array every tick,
+  // so memoising on it would never hit. The partition is O(n) on a handful.
+  const sorted = sortSubagentTabs(subagents);
+  const { visible, overflow } = splitTabsForOverflow(sorted, active);
+  const shown = expanded ? sorted : visible;
 
   return (
     <div
@@ -1352,6 +1947,15 @@ function RunsList({ runs }: { runs: Run[] }) {
           <Badge variant={STATUS_VARIANT[latest.status]} className="shrink-0">
             {latest.status}
           </Badge>
+          {latest.origin === "continuation" && (
+            <Badge
+              variant="secondary"
+              className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+              title="auto-continued after a background task"
+            >
+              auto
+            </Badge>
+          )}
           <span className="truncate">
             Run #{ordinalFor(latest.id)} · {formatTime(latest.startedAt)}
           </span>
@@ -1382,6 +1986,15 @@ function RunsList({ runs }: { runs: Run[] }) {
                 <Badge variant={STATUS_VARIANT[r.status]} className="shrink-0">
                   {r.status}
                 </Badge>
+                {r.origin === "continuation" && (
+                  <Badge
+                    variant="secondary"
+                    className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground"
+                    title="auto-continued after a background task"
+                  >
+                    auto
+                  </Badge>
+                )}
                 <span className="truncate text-muted-foreground">
                   #{ordinalFor(r.id)} · {formatTime(r.startedAt)}
                 </span>
@@ -3019,27 +3632,11 @@ function AskQuestionsCard({
  * background) so the user recognises that they're looking at what's
  * actually on the tmux screen, not an agetor-synthesised question.
  */
-/** claude's TUI keyboard-shortcut footers — meaningless when answering through
- *  agetor's buttons, and they bury the actual prompt. Stripped from the scraped
- *  pane before display. Display-only; the parsed choices are unaffected. */
-const PROMPT_NOISE_RE = [
-  /^esc to cancel\b/i,
-  /^enter to (confirm|select|continue)\b/i,
-  /^↑\/↓/,
-  /^tab to amend\b/i,
-  /\bctrl\+e to explain\b/i,
-  /\(ctrl\+b ctrl\+b/i,
-  /to run in background\)/i,
-];
-function cleanPromptPane(text: string): string {
-  const out: string[] = [];
-  for (const line of text.split("\n")) {
-    if (PROMPT_NOISE_RE.some((re) => re.test(line.trim()))) continue;
-    if (out.length > 0 && out[out.length - 1] === line) continue; // repaint dup row
-    out.push(line);
-  }
-  return out.join("\n").replace(/^\n+|\n+$/g, "");
-}
+// claude's TUI keyboard-shortcut footers and working-spinner status line —
+// meaningless when answering through agetor's buttons, and they bury the
+// actual prompt. Stripped from the scraped pane before display via
+// `cleanPromptPane` (see `@/lib/prompt-noise` for the pattern list and the
+// rationale for each). Display-only; the parsed choices are unaffected.
 
 function TmuxPromptCard({
   req,
