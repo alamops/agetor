@@ -9,13 +9,16 @@ import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
 import {
   AGENT_OPTIONS,
+  BRANCH_TEMPLATE_TAGS,
   CODE_PLAN_MODE,
   DEFAULT_BRANCH_CONFIG,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
   TASK_TYPES,
-  buildBranchName,
+  branchPattern,
+  hasBranchTemplateTags,
+  renderBranchTemplate,
   supportedEfforts,
   supportedModes,
   validateBranchName,
@@ -42,9 +45,10 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
 
 const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
 
-/** Short unique token used as the branch body when the title slug is disabled
- *  or empty, so the auto-generated name is always valid and collision-free. */
-const newBranchToken = () => Math.random().toString(36).slice(2, 8);
+/** Short unique token seeding the `<slug>`/`<token>` fallback in the preview.
+ *  Always exactly 6 hex chars, mirroring the server's task-id-derived token,
+ *  so the client-side validation can't reject a name the server would accept. */
+const newBranchToken = () => crypto.randomUUID().replace(/-/g, "").slice(0, 6);
 
 interface Props {
   onSubmit: (
@@ -110,9 +114,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   const [baseRef, setBaseRef] = useState("");
   // Branch nomenclature for the selected project (loaded from the server;
   // falls back to the built-in defaults). `branchOverride` is the value shown
-  // in the editable preview field; it auto-tracks the computed name until the
-  // user edits it (`branchDirty`), at which point their value wins and is sent
-  // verbatim. `branchToken` seeds the no-slug fallback body.
+  // in the editable field; it auto-tracks the tag-visible PATTERN (e.g.
+  // `feature/<slug>`) until the user edits it (`branchDirty`), at which point
+  // their value wins and is sent to the server verbatim — tags and all, the
+  // server resolves them authoritatively at create time. `branchToken` seeds
+  // the client-side preview/validation fallback (used when `<slug>` would
+  // otherwise render empty).
   const [branchConfig, setBranchConfig] = useState<BranchNamingConfig>(DEFAULT_BRANCH_CONFIG);
   const [branchOverride, setBranchOverride] = useState("");
   const [branchDirty, setBranchDirty] = useState(false);
@@ -130,21 +137,46 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     return () => { cancelled = true; };
   }, [workdir]);
 
-  // The branch name agetor will use, derived from config + type + title. The
-  // token only surfaces when the title slug is disabled or empty.
-  const computedBranch = useMemo(
-    () => buildBranchName(branchConfig, taskType, title, { token: branchToken }),
-    [branchConfig, taskType, title, branchToken],
+  // The tag-visible pattern for the current config + type, e.g. `feature/<slug>`.
+  // Deliberately stable while the title is typed — only config/taskType move
+  // it — so the field never rewrites itself into a jarring live value.
+  const computedPattern = useMemo(
+    () => branchPattern(branchConfig, taskType),
+    [branchConfig, taskType],
   );
-  // Keep the editable field in sync with the computed name until the user takes
-  // it over; once dirty, their value is preserved as the override.
+  // Keep the editable field in sync with the pattern until the user takes it
+  // over; once dirty, their value (tags and all) is preserved as the override.
   useEffect(() => {
-    if (!branchDirty) setBranchOverride(computedBranch);
-  }, [computedBranch, branchDirty]);
+    if (!branchDirty) setBranchOverride(computedPattern);
+  }, [computedPattern, branchDirty]);
 
+  // Last path segment of the workdir, used as `<project_name>` in the live
+  // preview — mirrors the server's own resolution so the preview matches what
+  // will actually be created.
+  const projectName = useMemo(() => {
+    const parts = workdir.trim().split("/").filter(Boolean);
+    return parts[parts.length - 1] ?? "";
+  }, [workdir]);
+
+  // Live resolved name shown under the field when the override still contains
+  // tags — purely a preview; the server re-resolves at create time with the
+  // real task id and creation timestamp.
+  const resolvedBranch = useMemo(
+    () => renderBranchTemplate(branchOverride, {
+      title,
+      projectName,
+      taskType,
+      token: branchToken,
+    }),
+    [branchOverride, title, projectName, taskType, branchToken],
+  );
+
+  // Validation gates on the RESOLVED name (a template like `feature/<slug>` is
+  // always git-legal since `<`/`>` are allowed in ref names, but we want the
+  // error — and canSubmit — to reflect what will actually be created).
   const branchValidation = useMemo(
-    () => validateBranchName(branchOverride.trim()),
-    [branchOverride],
+    () => validateBranchName(resolvedBranch.trim()),
+    [resolvedBranch],
   );
   const [mode, setMode] = useState<string>(initialMode("claude-code"));
   const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
@@ -611,11 +643,19 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                 "font-mono text-[11px]",
                 !branchValidation.ok && "border-destructive focus-visible:ring-destructive",
               )}
-              title="Git branch the worktree will use. Auto-generated from this project's nomenclature; edit to override, or use the settings button in the header to change the pattern."
+              title="Git branch the worktree will use. Supports tags like <slug>, <project_name>, <type>, <date>, <timestamp>, and <token>, resolved when the task is created. Auto-generated from this project's nomenclature; edit to override, or use the settings button in the header to change the pattern."
             />
             {!branchValidation.ok ? (
               <p className="text-[10px] text-destructive">{branchValidation.reason}</p>
-            ) : branchDirty ? (
+            ) : hasBranchTemplateTags(branchOverride) ? (
+              <p
+                className="text-[10px] font-mono text-muted-foreground truncate"
+                title={resolvedBranch}
+              >
+                → {resolvedBranch}
+              </p>
+            ) : null}
+            {branchDirty && (
               <button
                 type="button"
                 onClick={() => setBranchDirty(false)}
@@ -623,7 +663,16 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
               >
                 Reset to pattern
               </button>
-            ) : null}
+            )}
+            <p className="text-[10px] text-muted-foreground">
+              Tags are replaced when the task is created:{" "}
+              {BRANCH_TEMPLATE_TAGS.map(({ tag, description }, i) => (
+                <span key={tag}>
+                  <span className="font-mono">{tag}</span> {description}
+                  {i < BRANCH_TEMPLATE_TAGS.length - 1 ? " · " : "."}
+                </span>
+              ))}
+            </p>
           </div>
         )}
 

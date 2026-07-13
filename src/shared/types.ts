@@ -318,6 +318,112 @@ export function buildBranchName(
 }
 
 /**
+ * A template tag the branch-name field recognizes and substitutes. Purely
+ * descriptive metadata — {@link BRANCH_TEMPLATE_TAGS} drives the helper text
+ * shown under the Branch name field; the substitution logic itself lives in
+ * {@link renderBranchTemplate}.
+ */
+export interface BranchTemplateTag {
+  /** The literal tag text, e.g. `"<slug>"`. */
+  tag: string;
+  /** One-line human description shown alongside the tag in the UI. */
+  description: string;
+}
+
+/** Ordered list used by the UI helper text under the Branch name field. */
+export const BRANCH_TEMPLATE_TAGS: readonly BranchTemplateTag[] = [
+  { tag: "<slug>", description: "Task title, slugified (short id when empty)" },
+  { tag: "<project_name>", description: "Project folder name, slugified" },
+  { tag: "<type>", description: "Task type (task, bug, or spike)" },
+  { tag: "<date>", description: "Creation date (YYYY-MM-DD)" },
+  { tag: "<timestamp>", description: "Creation timestamp (YYYYMMDD-HHmmss)" },
+  { tag: "<token>", description: "Short unique id" },
+];
+
+/** Inputs {@link renderBranchTemplate} substitutes into a template string. */
+export interface BranchTemplateContext {
+  title: string;
+  /** Raw project folder name; the renderer slugifies it. */
+  projectName: string;
+  taskType: TaskType;
+  /** Short unique token, e.g. 6 chars of the task id. */
+  token: string;
+  /** Injected for deterministic tests/previews; defaults to `new Date()`. */
+  now?: Date;
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : `${n}`;
+}
+
+/** Local-time `YYYY-MM-DD`. */
+function formatBranchDate(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/** Local-time `YYYYMMDD-HHmmss`. */
+function formatBranchTimestamp(d: Date): string {
+  const date = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
+  const time = `${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+  return `${date}-${time}`;
+}
+
+/**
+ * True iff `value` contains at least one KNOWN template tag, i.e. one listed
+ * in {@link BRANCH_TEMPLATE_TAGS}. An unknown `<...>` sequence does not count
+ * — {@link renderBranchTemplate} passes those through literally, so a string
+ * containing only unrecognized angle-bracket text is not "templated" from the
+ * caller's point of view.
+ */
+export function hasBranchTemplateTags(value: string): boolean {
+  return BRANCH_TEMPLATE_TAGS.some(({ tag }) => value.includes(tag));
+}
+
+/**
+ * Render a branch-name template by substituting every known tag
+ * ({@link BRANCH_TEMPLATE_TAGS}) with its resolved value:
+ * - `<slug>` → the slugified title, falling back to `ctx.token` so it can
+ *   never render empty (which would otherwise leave a dangling `feature/`).
+ * - `<project_name>` → the slugified project name, falling back to
+ *   `"project"`.
+ * - `<type>` → `ctx.taskType` verbatim.
+ * - `<date>` / `<timestamp>` → local-time formatted from `ctx.now` (defaults
+ *   to `new Date()`); callers inject `now` for deterministic previews/tests.
+ * - `<token>` → `ctx.token` verbatim.
+ *
+ * Unknown `<...>` sequences (e.g. a stray `<foo>`) are left untouched — git
+ * allows `<`/`>` in ref names, so there's no need to reject or strip them.
+ * A tag-free string is returned unchanged (identity); this is what lets a
+ * plain literal branch name — the pre-template back-compat path — flow
+ * through {@link renderBranchTemplate} unmodified.
+ */
+export function renderBranchTemplate(template: string, ctx: BranchTemplateContext): string {
+  const now = ctx.now ?? new Date();
+  const slug = slugifyBranch(ctx.title) || ctx.token;
+  const projectSlug = slugifyBranch(ctx.projectName) || "project";
+  return template
+    .split("<slug>").join(slug)
+    .split("<project_name>").join(projectSlug)
+    .split("<type>").join(ctx.taskType)
+    .split("<date>").join(formatBranchDate(now))
+    .split("<timestamp>").join(formatBranchTimestamp(now))
+    .split("<token>").join(ctx.token);
+}
+
+/**
+ * The stable, tag-containing branch-name pattern for a task type — what the
+ * New Task form shows before the user edits the field, and what the server
+ * renders against at creation time when no override is supplied. Mirrors
+ * {@link buildBranchName}'s rule-resolution fallback chain (per-type rule →
+ * default config's rule for that type → empty prefix), but returns the
+ * un-rendered template (`<slug>`/`<token>`) rather than a resolved body.
+ */
+export function branchPattern(config: BranchNamingConfig, taskType: TaskType): string {
+  const rule = config.rules[taskType] ?? DEFAULT_BRANCH_CONFIG.rules[taskType] ?? { prefix: "" };
+  return `${rule.prefix}${config.includeSlug ? "<slug>" : "<token>"}`;
+}
+
+/**
  * Validate a full git branch name against the same rules as
  * `git check-ref-format refs/heads/<name>`. Returns the offending reason on
  * failure so the UI can explain why an override was rejected. Note: underscore
