@@ -229,6 +229,191 @@ export function taskTypeMeta(t: TaskType | null | undefined): TaskTypeMeta {
   return TASK_TYPES.find((x) => x.id === t) ?? TASK_TYPES[0]!;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Branch nomenclature (per project)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * How agetor names the git branch it creates for a worktree-isolated task.
+ * One rule per {@link TaskType}, so "feature"/"bug"/"spike" work can land on
+ * differently-prefixed branches.
+ */
+export interface BranchNamingRule {
+  /**
+   * Leading segment of the branch, typically ending in "/" (e.g. `"feature/"`).
+   * Fully customizable; validated to git-legal characters. May be empty.
+   */
+  prefix: string;
+}
+
+/**
+ * Per-project branch nomenclature. Stored on the project row (JSON); a project
+ * with no stored config falls back to {@link DEFAULT_BRANCH_CONFIG}.
+ */
+export interface BranchNamingConfig {
+  /** Per-task-type prefix. Every {@link TaskType} id must have an entry. */
+  rules: Record<TaskType, BranchNamingRule>;
+  /** When true, the card title (slugified) forms the branch body. */
+  includeSlug: boolean;
+}
+
+/**
+ * Built-in defaults. The existing task types (task | bug | spike) map to the
+ * conventional feature/ | fix/ | spike/ prefixes.
+ */
+export const DEFAULT_BRANCH_CONFIG: BranchNamingConfig = {
+  rules: {
+    task: { prefix: "feature/" },
+    bug: { prefix: "fix/" },
+    spike: { prefix: "spike/" },
+  },
+  includeSlug: true,
+};
+
+/**
+ * Prefix of the pre-nomenclature branch scheme (`agetor/<short-id>-<slug>`).
+ * Still emitted by `branchName()` as a legacy fallback, used to hide
+ * agetor-managed branches from the base-ref picker, and treated as "no
+ * meaningful prefix" by {@link branchCommitType}. Lives in shared so the one
+ * magic prefix has a single definition rather than a copy per call site.
+ */
+export const LEGACY_BRANCH_PREFIX = "agetor/";
+
+/** Max length of the slug portion of a branch body. */
+const BRANCH_SLUG_MAX = 40;
+
+/**
+ * Turn arbitrary text into a git-legal, kebab-cased branch segment: lowercased,
+ * every run of non-alphanumerics collapsed to a single "-", leading/trailing
+ * "-" trimmed, length capped. Returns "" when the input has no usable
+ * characters (callers supply a fallback such as a short id token).
+ */
+export function slugifyBranch(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, BRANCH_SLUG_MAX)
+    .replace(/-+$/g, "");
+}
+
+/**
+ * Compose the branch name for a task from its project config + type + title.
+ * `token` is a short unique suffix used as the body when no slug is available
+ * (slug disabled, or an empty/symbol-only title) so the result is always a
+ * non-empty branch. The assembled name is NOT re-validated here — callers that
+ * accept user overrides should run {@link validateBranchName} separately, and
+ * the server makes it unique within the repo before pinning it.
+ */
+export function buildBranchName(
+  config: BranchNamingConfig,
+  taskType: TaskType,
+  title: string,
+  opts?: { token?: string },
+): string {
+  const rule = config.rules[taskType] ?? DEFAULT_BRANCH_CONFIG.rules[taskType] ?? { prefix: "" };
+  const slug = config.includeSlug ? slugifyBranch(title) : "";
+  const body = slug || opts?.token || "task";
+  return `${rule.prefix}${body}`;
+}
+
+/**
+ * Validate a full git branch name against the same rules as
+ * `git check-ref-format refs/heads/<name>`. Returns the offending reason on
+ * failure so the UI can explain why an override was rejected. Note: underscore
+ * is allowed; backslash is not.
+ */
+export function validateBranchName(
+  name: string,
+): { ok: true } | { ok: false; reason: string } {
+  if (!name) return { ok: false, reason: "Branch name is empty." };
+  if (name.startsWith("/") || name.endsWith("/")) {
+    return { ok: false, reason: "Cannot start or end with '/'." };
+  }
+  if (name.endsWith(".")) return { ok: false, reason: "Cannot end with '.'." };
+  if (name.includes("//")) return { ok: false, reason: "Cannot contain '//'." };
+  if (name.includes("..")) return { ok: false, reason: "Cannot contain '..'." };
+  if (name.includes("@{")) return { ok: false, reason: "Cannot contain '@{'." };
+  if (name === "@") return { ok: false, reason: "Cannot be a single '@'." };
+  // Control chars (incl. DEL), space, and ~ ^ : ? * [ \ are all forbidden.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x20\x7f ~^:?*[\\]/.test(name)) {
+    return {
+      ok: false,
+      reason: "Contains a disallowed character (space, ~, ^, :, ?, *, [, \\, or a control char).",
+    };
+  }
+  for (const seg of name.split("/")) {
+    if (seg === "") continue; // empty segments are caught by the "//" check above
+    if (seg.startsWith(".")) return { ok: false, reason: "A path segment cannot start with '.'." };
+    if (seg.endsWith(".lock")) return { ok: false, reason: "A path segment cannot end with '.lock'." };
+  }
+  return { ok: true };
+}
+
+/**
+ * Validate a whole {@link BranchNamingConfig}: every task type must have a
+ * string prefix that composes into a legal branch. Used by the settings dialog
+ * (client) and the persist route (server) so a bad prefix can't be saved.
+ */
+export function validateBranchConfig(
+  config: BranchNamingConfig,
+): { ok: true } | { ok: false; reason: string } {
+  for (const t of TASK_TYPES) {
+    const rule = config.rules[t.id];
+    if (!rule || typeof rule.prefix !== "string") {
+      return { ok: false, reason: `Missing prefix for "${t.label}".` };
+    }
+    // Compose the prefix with a representative body so a bare "feature/" passes
+    // but "feat ure/" (space) or "/x" (leading slash) is rejected.
+    const sample = buildBranchName(config, t.id, "example task", { token: "abc123" });
+    const v = validateBranchName(sample);
+    if (!v.ok) return { ok: false, reason: `"${rule.prefix}" is not a valid prefix — ${v.reason}` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Conventional-commit type suggested for a task's commit message, derived from
+ * its {@link TaskType}. Keeps the "Commit & push" message consistent with the
+ * branch nomenclature scheme (bug → fix, spike → chore, everything else feat).
+ */
+export function conventionalCommitType(t: TaskType | null | undefined): string {
+  switch (t) {
+    case "bug":
+      return "fix";
+    case "spike":
+      return "chore";
+    default:
+      return "feat";
+  }
+}
+
+/**
+ * Commit-message type for a task, derived from its actual branch so the commit
+ * matches the branch nomenclature: the branch's prefix with the trailing slash
+ * removed (e.g. `"feature/add-login"` → `"feature"`, `"hotfix/nav"` → `"hotfix"`).
+ * Because the branch body is always a single slash-free segment (slugify strips
+ * slashes; the token has none), everything before the final `/` is exactly the
+ * configured prefix. Used by the "Commit & push" action.
+ *
+ * Falls back to {@link conventionalCommitType} when the branch carries no
+ * meaningful prefix:
+ *  - no `/` at all — a slash-less manual override, or isolation off (no branch);
+ *  - the legacy `agetor/` scheme (`agetor/<id>-<slug>`, pre-nomenclature rows),
+ *    whose prefix is an internal implementation detail, not a commit type.
+ */
+export function branchCommitType(
+  branch: string | null | undefined,
+  taskType: TaskType | null | undefined,
+): string {
+  if (branch && !branch.startsWith(LEGACY_BRANCH_PREFIX)) {
+    const i = branch.lastIndexOf("/");
+    if (i > 0) return branch.slice(0, i);
+  }
+  return conventionalCommitType(taskType);
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -1463,43 +1648,52 @@ export interface ToolResultEventData {
 }
 
 /**
- * A working directory the user has registered as a "project". Surfaced in the
- * workdir picker on the New Task form so common paths don't need to be typed
- * every time. Auto-populated on `createTask`; explicit entries come from the
- * native folder dialog (POST /projects/pick).
+ * The "Commit & push" follow-up prompt, shared by the webview's RunPanel chip
+ * and the CLI's `agetor commit` / dashboard `c` action so the instruction stays
+ * identical across surfaces.
+ *
+ * The commit-subject type is derived from the task's branch prefix, so the
+ * commit matches the project's branch nomenclature (`feature/x` → `feature:`),
+ * falling back to feat/fix/chore by task type when the branch carries no
+ * prefix. The branch is shell-quoted because git ref names may legally contain
+ * shell metacharacters; `'\''` is the POSIX escape for an embedded quote.
  */
-/** The canned "Commit & push" follow-up prompt, shared by the webview's
- *  RunPanel chip and the CLI's `agetor commit` / dashboard `c` action so the
- *  instruction stays identical across surfaces. */
-export const COMMIT_PUSH_PROMPT =
-  "Commit all changes with a clear, conventional commit message " +
-  "summarizing the work and push the current branch to origin. " +
-  "If the branch has no upstream yet, set it with `git push -u origin <branch>`.";
-
-/** A branch in a project repo, as returned by `GET /projects/branches`.
- *  Single source of truth shared by the server, webview, and CLI. */
-export interface BranchInfo {
-  /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */
-  name: string;
-  /** Unix-ms timestamp of the tip commit, used to sort recents first. */
-  committedAt: number;
-  /** True for the branch currently checked out at the queried dir. */
-  current: boolean;
-  /** True for remote-tracking refs (`refs/remotes/<remote>/<name>`). */
-  remote: boolean;
+export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): string {
+  const ccType = branchCommitType(task.branch, task.taskType);
+  const branchLabel = task.branch ? `'${task.branch.replace(/'/g, "'\\''")}'` : "<branch>";
+  return (
+    `Commit all changes with a clear commit message ` +
+    `(prefix the subject with "${ccType}:", e.g. "${ccType}: ...") summarizing the work, ` +
+    `then push the current branch to origin. ` +
+    `If the branch has no upstream yet, set it with \`git push -u origin ${branchLabel}\`.`
+  );
 }
 
+/**
+ * A working directory the user has registered as a "project". Surfaced in the
+ * workdir picker on the New Task form so common paths don't need to be typed
+ * every time. Explicit entries come from the native folder dialog
+ * (POST /projects/pick).
+ */
 export interface Project {
   path: string;
   name: string;
   addedAt: number;
+  /**
+   * Per-project branch nomenclature. Null when the user hasn't customized it —
+   * consumers fall back to {@link DEFAULT_BRANCH_CONFIG}.
+   */
+  branchConfig: BranchNamingConfig | null;
 }
 
 /**
- * A branch surfaced by the new-task base-ref picker. Shared so the server
- * (`listBranches` in src/bun/worktree.ts) and the webview (`api.ts` /
- * `BranchPicker`) agree on a single wire shape — the previous per-side copies
- * had already silently drifted (the client one omitted `remote`).
+ * A branch in a project repo, as returned by `GET /projects/branches` and
+ * surfaced by the new-task base-ref picker. The single source of truth shared
+ * by the server (`listBranches` in src/bun/worktree.ts), the webview (`api.ts` /
+ * `BranchPicker`), and the CLI — the previous per-side copies had already
+ * silently drifted (the client one omitted `remote`). Keep it that way: do not
+ * re-declare this interface, since TypeScript would silently merge the two
+ * declarations rather than flag the duplicate.
  */
 export interface BranchInfo {
   /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */

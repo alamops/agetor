@@ -158,10 +158,11 @@ import {
   listPendingForTask,
   type AskQuestionsAnswer,
 } from "./interactions.ts";
-import { MODEL_EFFORT_SUPPORT, TASK_TYPES } from "../shared/types.ts";
+import { DEFAULT_BRANCH_CONFIG, MODEL_EFFORT_SUPPORT, TASK_TYPES, validateBranchConfig } from "../shared/types.ts";
 import type {
   AgentKind,
   AppEvent,
+  BranchNamingConfig,
   GitHubItemKind,
   GitHubItemState,
   GitHubPullMergeMethod,
@@ -321,6 +322,31 @@ function backlogGuard(req: { params: { id: string } } & Request): Response | nul
     );
   }
   return null;
+}
+
+/**
+ * Coerce an untrusted request body into a well-formed BranchNamingConfig,
+ * dropping unknown fields and filling every task-type rule (missing ones fall
+ * back to the built-in default). Returns `{ error }` when the shape is
+ * unusable or a prefix wouldn't produce a legal branch.
+ */
+function coerceBranchConfig(raw: unknown): { config: BranchNamingConfig } | { error: string } {
+  if (!raw || typeof raw !== "object") return { error: "config (object) required" };
+  const src = raw as { rules?: unknown; includeSlug?: unknown };
+  const rulesSrc = (src.rules && typeof src.rules === "object" ? src.rules : {}) as Record<string, unknown>;
+  const rules = {} as BranchNamingConfig["rules"];
+  for (const t of TASK_TYPES) {
+    const r = rulesSrc[t.id] as { prefix?: unknown } | undefined;
+    const prefix = r && typeof r.prefix === "string" ? r.prefix : DEFAULT_BRANCH_CONFIG.rules[t.id].prefix;
+    rules[t.id] = { prefix };
+  }
+  const config: BranchNamingConfig = {
+    rules,
+    includeSlug: typeof src.includeSlug === "boolean" ? src.includeSlug : true,
+  };
+  const v = validateBranchConfig(config);
+  if (!v.ok) return { error: v.reason };
+  return { config };
 }
 
 /**
@@ -506,7 +532,42 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const url = new URL(req.url);
           const dir = url.searchParams.get("path");
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
-          return json(await listBranches(dir), { headers: corsHeaders(req) });
+          // Hide branches agetor created for its own tasks so they don't clutter
+          // the base-ref picker. The legacy `agetor/` prefix is filtered inside
+          // listBranches; custom-prefixed branches (feature/…, fix/…) are only
+          // recognizable via the pinned names on task rows, so pass those too.
+          const managed = new Set(
+            tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
+          );
+          return json(await listBranches(dir, { exclude: managed }), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Per-project branch nomenclature. GET resolves to the built-in defaults
+      // when the project has no stored config (or isn't registered), so the
+      // client always renders a usable form. PUT persists a validated config.
+      "/projects/settings": {
+        GET: authed((req) => {
+          const url = new URL(req.url);
+          const p = url.searchParams.get("path");
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const config = projects.get(p)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
+          return json(config, { headers: corsHeaders(req) });
+        }),
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: unknown; config?: unknown };
+          if (typeof body.path !== "string" || !body.path) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const coerced = coerceBranchConfig(body.config);
+          if ("error" in coerced) {
+            return json({ error: coerced.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const updated = projects.setBranchConfig(body.path, coerced.config);
+          if (!updated) {
+            return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(updated, { headers: corsHeaders(req) });
         }),
       },
 

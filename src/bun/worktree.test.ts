@@ -102,6 +102,103 @@ test("prepareWorkdir creates a worktree + branch inside a git repo", async () =>
   expect(existsSync(path.join(r.cwd, "README"))).toBe(true);
 });
 
+test("isBranchNameTakenError matches both git collision wordings, not a stale worktree dir", async () => {
+  const { isBranchNameTakenError } = await import("./worktree.ts");
+  // Both strings captured verbatim from real `git worktree add` failures.
+  // Re-attach form: `git worktree add <path> <branch>` when it's checked out elsewhere.
+  expect(isBranchNameTakenError("fatal: 'feature/x' is already used by worktree at '/tmp/wt-b'")).toBe(true);
+  // New-branch form: `git worktree add -b <branch> <path>` when a twin created it first.
+  expect(isBranchNameTakenError("fatal: a branch named 'feature/x' already exists")).toBe(true);
+  // Older git phrasing for the re-attach form.
+  expect(isBranchNameTakenError("fatal: 'feature/x' is already checked out at '/tmp/wt-b'")).toBe(true);
+  // A stale worktree *directory* is not a name collision — re-pinning wouldn't help.
+  expect(isBranchNameTakenError("fatal: '/tmp/wt-a' already exists")).toBe(false);
+  expect(isBranchNameTakenError("fatal: invalid reference: nope")).toBe(false);
+});
+
+test("prepareWorkdir re-pins a unique branch when the pinned name is already checked out (create-time race)", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  // Task A pins and materializes feature/x.
+  const a = fakeTask({ workdir: repo, branch: "feature/x" });
+  const ra = await prepareWorkdir(a);
+  if ("error" in ra) throw new Error(ra.error);
+  expect(ra.branch).toBe("feature/x");
+  // Task B raced A at create time and pinned the SAME branch. Materializing it
+  // must not fail trying to check the already-checked-out branch into a second
+  // worktree — it should recover onto a unique variant.
+  const b = fakeTask({ workdir: repo, branch: "feature/x" });
+  const rb = await prepareWorkdir(b);
+  if ("error" in rb) throw new Error(rb.error);
+  expect(rb.branch).not.toBe("feature/x");
+  expect(rb.branch!.startsWith("feature/x")).toBe(true);
+  expect(existsSync(rb.worktreePath!)).toBe(true);
+});
+
+test("prepareWorkdir re-pin never steals a branch another task has pinned but not started", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const a = fakeTask({ workdir: repo, branch: "feature/y" });
+  const ra = await prepareWorkdir(a);
+  if ("error" in ra) throw new Error(ra.error);
+  // Task B raced onto feature/y; task C has already pinned feature/y-2 but has
+  // no ref yet, so a ref-only search would hand B that name. Pass it as taken.
+  const b = fakeTask({ workdir: repo, branch: "feature/y" });
+  const rb = await prepareWorkdir(b, { takenBranches: new Set(["feature/y-2"]) });
+  if ("error" in rb) throw new Error(rb.error);
+  expect(rb.branch).not.toBe("feature/y");
+  expect(rb.branch).not.toBe("feature/y-2");
+  expect(rb.branch).toBe("feature/y-3");
+});
+
+test("prepareWorkdir re-attaches (keeps branch + prior commits) when the worktree dir was deleted", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+
+  const r1 = await prepareWorkdir(task);
+  if ("error" in r1) throw new Error(r1.error);
+  // The previous run makes a commit on the task's branch.
+  writeFileSync(path.join(r1.cwd, "work.txt"), "agent output\n");
+  await git(["add", "."], r1.cwd);
+  await git(["commit", "-m", "prior run"], r1.cwd);
+  rmSync(r1.cwd, { recursive: true, force: true });
+
+  // The persisted row: worktreePath set (it HAS materialized), branch pinned.
+  const rerun = { ...task, branch: r1.branch, worktreePath: r1.worktreePath };
+  const r2 = await prepareWorkdir(rerun);
+  if ("error" in r2) throw new Error(r2.error);
+  // Must re-attach to the SAME branch, not re-pin off base — the commit survives.
+  expect(r2.branch).toBe(r1.branch);
+  expect(existsSync(path.join(r2.cwd, "work.txt"))).toBe(true);
+});
+
+test("prepareWorkdir errors (does NOT re-pin) when a materialized task's branch is checked out elsewhere", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+
+  const r1 = await prepareWorkdir(task);
+  if ("error" in r1) throw new Error(r1.error);
+  writeFileSync(path.join(r1.cwd, "work.txt"), "agent output\n");
+  await git(["add", "."], r1.cwd);
+  await git(["commit", "-m", "prior run"], r1.cwd);
+
+  // User deletes the worktree dir, then checks the branch out somewhere else
+  // (e.g. in their main repo) to inspect the agent's work.
+  rmSync(r1.cwd, { recursive: true, force: true });
+  await git(["worktree", "prune"], repo);
+  // `git worktree add` requires a path that doesn't exist yet.
+  const elsewhere = path.join(mkdtempSync(path.join(tmpdir(), "agetor-wt-elsewhere-")), "wt");
+  await git(["worktree", "add", elsewhere, r1.branch!], repo);
+
+  // Re-running must surface a hard error, NOT silently re-pin to a fresh branch
+  // off base — that would orphan the "prior run" commit.
+  const rerun = { ...task, branch: r1.branch, worktreePath: r1.worktreePath };
+  const r2 = await prepareWorkdir(rerun);
+  expect("error" in r2).toBe(true);
+});
+
 test("gitWritableRootsSync returns the source repo's .git for a linked worktree", async () => {
   const { prepareWorkdir, gitWritableRootsSync } = await import("./worktree.ts");
   const repo = await makeRepo();

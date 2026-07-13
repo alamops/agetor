@@ -1,15 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { db, tasks, runs, harnesses, subagents } from "./db.ts";
+import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import {
   AGENT_OPTIONS,
+  DEFAULT_BRANCH_CONFIG,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
   MODEL_EFFORT_SUPPORT,
   SESSION_DIED_STATUS_PREFIX,
   TASK_TYPES,
+  buildBranchName,
+  validateBranchName,
   type AgentKind,
   type Harness,
   type TaskType,
@@ -66,7 +69,7 @@ import {
   orphanRunningSubagents,
   attachSubagentWatcher,
 } from "./claude-subagents.ts";
-import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName } from "./worktree.ts";
+import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName, ensureUniqueBranch } from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
@@ -645,7 +648,17 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     return { error: `${harness.label} is not available — ${status.reason}.${hint}` };
   }
 
-  const prepared = await prepareWorkdir(task);
+  // Pass the branches other tasks have pinned. If materializing this task's
+  // branch hits a create-time uniqueness race, the recovery re-pins to a name
+  // that's free of both existing refs AND those not-yet-started pins.
+  const prepared = await prepareWorkdir(task, {
+    takenBranches: new Set(
+      tasks.list()
+        .filter((t) => t.id !== taskId)
+        .map((t) => t.branch)
+        .filter((b): b is string => Boolean(b)),
+    ),
+  });
   if ("error" in prepared) return { error: prepared.error };
 
   // Lazy-pin baseRef: workdir wasn't a git repo when the task was created but
@@ -1598,10 +1611,6 @@ export async function createTask(
   // worktree temp paths and stray ad-hoc dirs in the sidebar.
 
   const id = randomUUID();
-  // Pin the branch name now so renaming the task later (before the first run)
-  // doesn't produce a different branch name on each start attempt. Only set
-  // when workdir is confirmed to be a git repo.
-  const plannedBranch = workdirRoot ? branchName({ id, title: input.title }) : null;
 
   // Resolve the harness so we can default model/effort by kind. A bad alias
   // id is rejected up-front rather than persisted and surfacing as a launch
@@ -1628,6 +1637,36 @@ export async function createTask(
     requestedType && TASK_TYPES.some((t) => t.id === requestedType)
       ? requestedType
       : DEFAULT_TASK_TYPE;
+
+  // Pin the branch name now so renaming the task later (before the first run)
+  // doesn't produce a different name on each start attempt. Only set when the
+  // workdir is a git repo. An explicit override (from the New Task sidebar's
+  // editable branch field) wins when valid; otherwise the name is composed from
+  // the project's branch nomenclature (falling back to the built-in defaults).
+  // Either way it's made unique within the repo so two same-title/type tasks
+  // don't collide on one branch.
+  let plannedBranch: string | null = null;
+  if (workdirRoot) {
+    const override = typeof input.branch === "string" ? input.branch.trim() : "";
+    let desired: string;
+    if (override) {
+      const v = validateBranchName(override);
+      if (!v.ok) return { error: `invalid branch name "${override}": ${v.reason}` };
+      desired = override;
+    } else {
+      const config = projects.get(workdir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
+      const token = id.replace(/-/g, "").slice(0, 6);
+      desired = buildBranchName(config, taskType, input.title, { token });
+      // Defensive: a hand-edited/corrupt config shouldn't hard-fail task
+      // creation — fall back to the legacy scheme if it produced an illegal name.
+      if (!validateBranchName(desired).ok) desired = branchName({ id, title: input.title });
+    }
+    const taken = new Set(
+      tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
+    );
+    plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
+  }
+
   const task = tasks.insert({
     id,
     title: input.title,

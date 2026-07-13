@@ -3,6 +3,7 @@ import type {
   AgentStatus,
   AppEvent,
   BranchInfo,
+  BranchNamingConfig,
   ColumnId,
   GlobalEvent,
   GitHubItemKind,
@@ -84,7 +85,7 @@ export interface UpdateSnapshot {
 // Re-exported from shared so existing `import { type BranchInfo } from "@/lib/api"`
 // callers (BranchPicker) keep working while the single definition lives in
 // src/shared/types.ts (server + webview share one wire shape).
-export type { BranchInfo };
+export type { BranchInfo, BranchNamingConfig };
 export type {
   GitHubCheckRun,
   GitHubChecksResult,
@@ -140,7 +141,7 @@ export type {
   GitHubWorkflowRunsResult,
   GitHubWorkflowsResult,
 };
-export { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
+export { commitPushPrompt } from "../../shared/types.ts";
 
 /** Where a command/extension comes from. `plugin` entries are contributed by an
  *  enabled Claude Code plugin and are namespaced `<plugin>:<name>`; `builtin`
@@ -337,6 +338,15 @@ export const api = {
     }),
   deleteProject: (p: string) =>
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
+  /** Per-project branch nomenclature. GET resolves to built-in defaults when the
+   *  project has no stored config, so the form always gets a usable shape. */
+  getProjectBranchConfig: (p: string) =>
+    j<BranchNamingConfig>(`/projects/settings?path=${encodeURIComponent(p)}`),
+  setProjectBranchConfig: (p: string, config: BranchNamingConfig) =>
+    j<Project>("/projects/settings", {
+      method: "PUT",
+      body: JSON.stringify({ path: p, config }),
+    }),
   /** Open a native file/folder picker and return the chosen references.
    *  WKWebView never exposes `File.path`, so this native panel is the only
    *  reliable way to turn a user pick into an absolute path. Returns `[]` on
@@ -952,6 +962,9 @@ export const api = {
     workdir: string;
     isolation: Isolation;
     baseRef?: string;
+    /** Explicit branch name for worktree isolation. Overrides the project's
+     *  nomenclature; the server validates it and makes it unique. */
+    branch?: string;
     mode?: string | null;
     model?: string | null;
     effort?: string | null;

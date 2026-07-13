@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { dataDir } from "./db.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
+import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff } from "../shared/types.ts";
 
 export type { BranchInfo };
@@ -214,7 +215,11 @@ export async function resolveRef(dir: string, ref: string): Promise<string | nul
  * float it to the top regardless of recency. `HEAD` pointer aliases such as
  * `origin/HEAD` are skipped.
  */
-export async function listBranches(dir: string): Promise<BranchInfo[]> {
+export async function listBranches(
+  dir: string,
+  opts?: { exclude?: Set<string> },
+): Promise<BranchInfo[]> {
+  const exclude = opts?.exclude;
   const root = await repoRoot(dir);
   if (!root) return [];
   const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], root);
@@ -248,7 +253,11 @@ export async function listBranches(dir: string): Promise<BranchInfo[]> {
     if (!line) continue;
     const parts = line.split("\t");
     if (parts.length < 3) continue;
-    if (parts[0]!.startsWith("refs/heads/") && !parts[1]!.startsWith("agetor/")) {
+    if (
+      parts[0]!.startsWith("refs/heads/") &&
+      !parts[1]!.startsWith(LEGACY_BRANCH_PREFIX) &&
+      !exclude?.has(parts[1]!)
+    ) {
       localNames.add(parts[1]!);
     }
   }
@@ -279,8 +288,12 @@ export async function listBranches(dir: string): Promise<BranchInfo[]> {
       seenRemote.add(bare);
     } else {
       // Branches agetor manages itself aren't the user's own — hide them. Local
-      // short-names are unique, so no further dedup is needed for heads.
-      if (shortName.startsWith("agetor/")) continue;
+      // short-names are unique, so no further dedup is needed for heads. Legacy
+      // per-task branches carry the `agetor/` prefix; custom-nomenclature ones
+      // (feature/…, fix/…) are recognized via the caller-supplied `exclude` set
+      // of pinned task branches.
+      if (shortName.startsWith(LEGACY_BRANCH_PREFIX)) continue;
+      if (exclude?.has(shortName)) continue;
     }
     // Upstream tracking. Only meaningful for local branches with a configured
     // upstream that still exists. `track` looks like "[ahead 2, behind 3]",
@@ -443,7 +456,49 @@ function slugify(s: string): string {
 }
 
 export function branchName(task: Pick<Task, "id" | "title">): string {
-  return `agetor/${task.id.replace(/-/g, "").slice(0, 12)}-${slugify(task.title)}`;
+  return `${LEGACY_BRANCH_PREFIX}${task.id.replace(/-/g, "").slice(0, 12)}-${slugify(task.title)}`;
+}
+
+/**
+ * Whether a failed `git worktree add` means "that branch name is taken" — a
+ * create-time uniqueness race we can recover from by re-pinning. Git words it
+ * differently depending on which add form was used:
+ *   • `worktree add <path> <branch>`    → "'X' is already used by worktree at …"
+ *                                          (older git: "is already checked out at …")
+ *   • `worktree add -b <branch> <path>` → "a branch named 'X' already exists"
+ *
+ * Deliberately excludes `"'<path>' already exists"` — a stale worktree directory,
+ * where renaming the branch would not help and the error should surface as-is.
+ */
+export function isBranchNameTakenError(output: string): boolean {
+  return /is already used by worktree|already checked out|a branch named .* already exists/i
+    .test(output);
+}
+
+/**
+ * Return a branch name based on `desired` that is free within the repo at
+ * `root`: not already a local branch AND not in `taken` (the set of names
+ * pinned on other task rows, which may not exist as refs yet because branches
+ * are created lazily at start-time). Appends `-2`, `-3`, … until a free name
+ * is found. Guards against two tasks with the same title+type — and therefore
+ * the same computed name — colliding on one branch.
+ */
+export async function ensureUniqueBranch(
+  root: string,
+  desired: string,
+  taken: Set<string>,
+): Promise<string> {
+  const free = async (name: string): Promise<boolean> => {
+    if (taken.has(name)) return false;
+    const res = await git(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`], root, 5_000);
+    return !res.ok; // rev-parse fails (non-zero) when the ref doesn't exist
+  };
+  if (await free(desired)) return desired;
+  for (let n = 2; n < 10_000; n++) {
+    const candidate = `${desired}-${n}`;
+    if (await free(candidate)) return candidate;
+  }
+  return desired; // give up after 10k collisions — practically unreachable
 }
 
 export function worktreePath(task: Task): string {
@@ -478,7 +533,17 @@ export type PrepareResult = PreparedWorkdir | PrepareError;
  * the user's live working tree when they asked for isolation is worse than a
  * clear error. Callers should surface the message and abort the run.
  */
-export async function prepareWorkdir(task: Task): Promise<PrepareResult> {
+export async function prepareWorkdir(
+  task: Task,
+  opts?: {
+    /**
+     * Branch names already pinned on other task rows. Used by the collision
+     * recovery below so a re-pin can't steal a name a not-yet-started task is
+     * holding (those have no git ref yet, so a ref-only search can't see them).
+     */
+    takenBranches?: Set<string>;
+  },
+): Promise<PrepareResult> {
   if (task.isolation !== "worktree") {
     return { cwd: task.workdir, branch: null, worktreePath: null, note: "isolation: none" };
   }
@@ -515,8 +580,9 @@ export async function prepareWorkdir(task: Task): Promise<PrepareResult> {
   const wt = worktreePath(task);
   // Branch name: pinned at create time (task.branch is set by createTask for
   // worktree-isolation tasks). Fall back to computing it for legacy rows
-  // created before the pinning was added.
-  const branch = task.branch ?? branchName(task);
+  // created before the pinning was added. `let` because a create-time
+  // uniqueness race may force us to re-pin below.
+  let branch = task.branch ?? branchName(task);
   // Pinned base sha if set on the task; otherwise use HEAD at start time.
   // The sha makes the start state sticky across re-runs even when HEAD moves.
   const base = task.baseRef ?? "HEAD";
@@ -530,9 +596,49 @@ export async function prepareWorkdir(task: Task): Promise<PrepareResult> {
   // a path it still tracks as a missing-but-registered worktree without a
   // prune step first.
   await git(["worktree", "prune"], root, 10_000);
-  const created = branchExists
+  let created = branchExists
     ? await git(["worktree", "add", wt, branch], root)
     : await git(["worktree", "add", "-b", branch, wt, base], root);
+
+  // Collision recovery — ONLY on a first materialization (`!task.worktreePath`).
+  //
+  // Branch names are pinned at create time but only materialized here, so two
+  // tasks that computed the same name (a create-time uniqueness race — neither
+  // branch exists as a ref yet, so the create-time dedup can't see its twin) can
+  // end up pointing at one branch. Depending on which task wins, git rejects the
+  // loser in one of two ways, so neither `branchExists` arm can be assumed:
+  //   • re-attach path (branchExists) → "'X' is already used by worktree at …"
+  //   • new-branch path (-b)          → "a branch named 'X' already exists"
+  //     (the twin created it between our branchExists probe and this add)
+  // Rather than fail the run, pin a fresh unique variant off the base. The
+  // re-pinned name flows back via the returned `branch`; startTask persists it.
+  //
+  // The `!task.worktreePath` gate is load-bearing. Once a task HAS materialized,
+  // `task.branch` is ours and may hold the previous run's commits; we reach this
+  // code again only when the worktree dir was deleted, and the `worktree add`
+  // above is a deliberate *re-attach* that preserves those commits (see the `-B`
+  // note further up). Re-pinning there would create a fresh branch at `base` and
+  // silently orphan that work — so a re-attach failure must stay a hard error
+  // (e.g. the user checked the branch out in their main repo; they can free it).
+  //
+  // `takenBranches` keeps the replacement from stealing a name that another task
+  // has pinned but not yet started (no ref exists for those, so a ref-only search
+  // would miss them). See `isBranchNameTakenError` for the exact git wordings,
+  // and what it deliberately does not match (e.g. a stale worktree directory).
+  if (
+    !created.ok &&
+    !task.worktreePath &&
+    isBranchNameTakenError(`${created.stderr}\n${created.stdout}`)
+  ) {
+    const unique = await ensureUniqueBranch(root, branch, opts?.takenBranches ?? new Set());
+    if (unique !== branch) {
+      const retry = await git(["worktree", "add", "-b", unique, wt, base], root);
+      if (retry.ok) {
+        branch = unique;
+        created = retry;
+      }
+    }
+  }
 
   if (!created.ok) {
     return {

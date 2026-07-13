@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task, RunEvent } from "../../shared/types.ts";
-import { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
+import { commitPushPrompt } from "../../shared/types.ts";
 import { useTasks } from "./useTasks.ts";
 import { useCoalescedStream, eventKey } from "./useCoalescedStream.ts";
 import { useSpinner } from "./useSpinner.ts";
@@ -101,7 +101,7 @@ export function Dashboard({
       // No column gate: committing mid-turn is supported (the prompt folds
       // into the in-flight run), and a task held in `running` by background
       // agents may have finished work ready to commit anyway.
-      sendMessage(selected, COMMIT_PUSH_PROMPT, "→ commit & push requested");
+      sendMessage(selected, commitPushPrompt(selected), "→ commit & push requested");
       return;
     }
     if (input === "s" && selected) {
