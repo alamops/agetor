@@ -141,16 +141,19 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
                     spellCheck={false}
                     className="h-8 font-mono text-xs"
                   />
-                  <p className="font-mono text-[10px] text-muted-foreground">
-                    {pattern}
+                  <p className="text-[10px] text-muted-foreground">
+                    pattern{" "}
+                    <span className="font-mono text-foreground/70">
+                      {pattern}
+                    </span>
                   </p>
                   <p
                     className={cn(
-                      "font-mono text-[10px]",
+                      "text-[10px]",
                       legal ? "text-muted-foreground" : "text-destructive",
                     )}
                   >
-                    {example}
+                    e.g. <span className="font-mono">{example}</span>
                   </p>
                 </div>
               </div>

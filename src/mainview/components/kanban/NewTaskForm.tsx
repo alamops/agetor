@@ -493,13 +493,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     >
       <div className="flex shrink-0 items-center justify-between border-b border-border/60 px-4 py-3">
         <span className="text-sm font-semibold">New task</span>
-        <div className="flex items-center gap-2">
-          {selectedStatus?.available && selectedStatus.version && (
-            <span className="text-[11px] text-muted-foreground">
-              {selectedStatus.version}
-            </span>
-          )}
-        </div>
+        {selectedStatus?.available && selectedStatus.version && (
+          <span className="text-[11px] text-muted-foreground">
+            {selectedStatus.version}
+          </span>
+        )}
       </div>
 
       <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3 text-xs">
