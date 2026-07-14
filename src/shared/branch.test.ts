@@ -282,6 +282,8 @@ describe("branchPattern", () => {
       rules: { task: { prefix: "feature/<slug>" }, bug: { prefix: "fix/" }, spike: { prefix: "spike/" } },
     };
     expect(branchPattern(cfg, "task")).toBe("feature/<slug>");
+    expect(renderBranchTemplate(branchPattern(cfg, "task"), ctx({ title: "Add login page" })))
+      .toBe("feature/add-login-page");
   });
   test("a non-body tag (<date>) does not suppress the appended body tag", () => {
     const cfg: BranchNamingConfig = {

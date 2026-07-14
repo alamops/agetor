@@ -320,6 +320,14 @@ export const BRANCH_TEMPLATE_TAGS: readonly BranchTemplateTag[] = [
   { tag: "<token>", description: "Short unique id" },
 ];
 
+/**
+ * The tags that carry the branch *body* (its per-task uniqueness). A rule
+ * value containing one of these is a full template, so {@link branchPattern}
+ * appends nothing to it; the other tags are decoration and don't suppress the
+ * appended body.
+ */
+export const BRANCH_BODY_TAGS = ["<slug>", "<token>"] as const;
+
 /** Inputs {@link renderBranchTemplate} substitutes into a template string. */
 export interface BranchTemplateContext {
   title: string;
@@ -408,7 +416,7 @@ export function renderBranchTemplate(template: string, ctx: BranchTemplateContex
  */
 export function branchPattern(config: BranchNamingConfig, taskType: TaskType): string {
   const rule = config.rules[taskType] ?? DEFAULT_BRANCH_CONFIG.rules[taskType] ?? { prefix: "" };
-  if (rule.prefix.includes("<slug>") || rule.prefix.includes("<token>")) return rule.prefix;
+  if (BRANCH_BODY_TAGS.some((tag) => rule.prefix.includes(tag))) return rule.prefix;
   return `${rule.prefix}${config.includeSlug ? "<slug>" : "<token>"}`;
 }
 
