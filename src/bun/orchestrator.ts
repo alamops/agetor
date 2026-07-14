@@ -117,6 +117,55 @@ interface ActiveRun {
 }
 const active = new Map<string, ActiveRun>(); // runId -> handle
 
+// Archive/delete teardown (tmux session kill, terminal teardown, worktree
+// detach/remove) is deferred onto a single global FIFO queue so `archiveTask`
+// can flip the DB column and respond in milliseconds instead of blocking on
+// `spawnSync` tmux kills and `git worktree remove --force`/`prune`. The
+// serialization is deliberate, not incidental: concurrent `git worktree
+// remove`/`prune` invocations against the SAME source repo contend on git's
+// internal locks (`.git/worktrees/.lock` etc.), so archiving several tasks
+// back-to-back must still tear them down one at a time — just not on the
+// request's critical path. `teardownTail` is the chain itself; `teardowns`
+// lets callers (unarchive/start/delete, plus the boot-time sweep) await a
+// specific task's in-flight teardown before touching the same worktree.
+let teardownTail: Promise<void> = Promise.resolve();
+const teardowns = new Map<string, Promise<void>>();
+
+/**
+ * Chain `job` onto the global teardown FIFO and track it per-task so
+ * `pendingTeardown` can be awaited by callers that must not race a deferred
+ * teardown (unarchive, start, delete, the orphan sweep). Errors from `job`
+ * are caught and logged — a single misbehaving teardown must never break the
+ * chain for every task queued behind it.
+ */
+function enqueueTeardown(taskId: string, job: () => Promise<void>): Promise<void> {
+  const p = teardownTail
+    .then(job)
+    .catch((err) => {
+      console.warn(`[agetor] deferred teardown failed for task ${taskId}:`, err);
+    });
+  teardownTail = p;
+  teardowns.set(taskId, p);
+  p.finally(() => {
+    // Only clear the entry if it's still ours — a later enqueue for the same
+    // task (e.g. delete right after archive) must not have its promise
+    // clobbered by this settle.
+    if (teardowns.get(taskId) === p) teardowns.delete(taskId);
+  });
+  return p;
+}
+
+/**
+ * Await any deferred teardown currently in flight (or queued) for `taskId`.
+ * Resolves immediately when nothing is pending. Exported so `unarchiveTask`,
+ * `startTask`, and the boot-time sweep can serialize against a still-running
+ * archive/delete teardown before touching the same worktree, and so tests can
+ * drain the queue deterministically.
+ */
+export function pendingTeardown(taskId: string): Promise<void> {
+  return teardowns.get(taskId) ?? Promise.resolve();
+}
+
 export function subscribe(fn: Listener): () => void {
   listeners.add(fn);
   return () => listeners.delete(fn);
@@ -634,6 +683,12 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
+
+  // startTask auto-unarchives and materializes the worktree below — it must
+  // not race a teardown archiveTask (or deleteTask) deferred for this task,
+  // or a `detachWorktree`/`removeWorktree` still in flight could yank the
+  // directory out from under the freshly-prepared one.
+  await pendingTeardown(taskId);
 
   // Starting an archived task auto-unarchives it — otherwise the card would
   // move through columns (running → review/ready) while hidden behind the
@@ -1161,6 +1216,11 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   if (task.archivedAt != null) {
     tasks.update(row.task_id, { archivedAt: null });
   }
+
+  // Same race as unarchiveTask/startTask: a deferred archive teardown may
+  // still be removing this task's worktree — let it finish before the
+  // existsSync check decides whether a restore is needed.
+  await pendingTeardown(row.task_id);
 
   if (task.worktreePath && !existsSync(task.worktreePath)) {
     // Re-fetch so the restore sees the just-cleared archivedAt (prepareWorkdir
@@ -1791,19 +1851,32 @@ export async function archiveTask(taskId: string): Promise<{ task: Task } | { er
   }
   const updated = tasks.update(taskId, { archivedAt: Date.now() });
   if (!updated) return { error: "task not found" };
-  // Same contract as deleteTask: dropSession is non-throwing (it best-efforts
-  // tmux teardown internally). Don't wrap — a silent catch would hide a
-  // regression in claude-tmux from the next reviewer.
+  // Resolved up front (before enqueueing) — same as before, just no longer
+  // re-read inside the deferred job.
   const archiveKind = resolveHarness(task.agent)?.kind;
-  if (archiveKind === "claude-code") dropSession(taskId);
-  else if (archiveKind === "codex") dropCodexSession(taskId);
+  // codexTurnQueue is cheap in-memory bookkeeping (no I/O), so it's dropped
+  // inline rather than folded into the deferred job.
   codexTurnQueue.delete(taskId);
-  // Tear down terminal tabs before detaching the worktree — a live shell
-  // cwd'd inside the worktree would block `git worktree remove`, exactly like
-  // deleteTask's ordering. Awaited (not fire-and-forget) so the shells are
-  // actually gone before detachWorktree runs.
-  await killTerminalsForTask(taskId);
-  await detachWorktree(updated);
+  // Deferred: the actual teardown (tmux kill, terminal shells, worktree
+  // detach) is pushed onto the global teardown queue rather than awaited
+  // here, so `archiveTask` can flip the DB column and return in milliseconds.
+  // Archiving several tasks back-to-back no longer blocks each POST on
+  // `spawnSync` tmux kills or `git worktree remove --force`/`prune` — those
+  // still run (serialized, see `enqueueTeardown`), just off the request's
+  // critical path. Callers that must not race a deferred teardown (unarchive,
+  // start, delete, the boot sweep) await `pendingTeardown(taskId)` first.
+  void enqueueTeardown(taskId, async () => {
+    // Same contract as deleteTask: dropSession is non-throwing (it
+    // best-efforts tmux teardown internally). Don't wrap — a silent catch
+    // would hide a regression in claude-tmux from the next reviewer.
+    if (archiveKind === "claude-code") dropSession(taskId);
+    else if (archiveKind === "codex") dropCodexSession(taskId);
+    // Tear down terminal tabs before detaching the worktree — a live shell
+    // cwd'd inside the worktree would block `git worktree remove`, exactly
+    // like deleteTask's ordering.
+    await killTerminalsForTask(taskId);
+    await detachWorktree(updated);
+  });
   return { task: updated };
 }
 
@@ -1817,6 +1890,13 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.archivedAt == null) return { task };
+  // Wait out any teardown archiveTask deferred for this task BEFORE deciding
+  // whether the worktree needs restoring. Without this, a still-in-flight
+  // `detachWorktree` could delete the worktree right after the `existsSync`
+  // check below decided it was still present (or right after a restore
+  // recreated it), leaving the task unarchived but pointing at a directory
+  // that's about to vanish out from under it.
+  await pendingTeardown(taskId);
   const updated = tasks.update(taskId, { archivedAt: null });
   if (!updated) return { error: "task not found" };
   if (updated.worktreePath && updated.branch && !existsSync(updated.worktreePath)) {
@@ -1849,15 +1929,62 @@ export async function deleteTask(taskId: string): Promise<void> {
   // for codex it only exists during an in-flight turn — dropCodexSession also
   // clears any in-memory tailer. No-op when no session exists.
   const deleteKind = resolveHarness(task.agent)?.kind;
-  if (deleteKind === "claude-code") dropSession(taskId);
-  else if (deleteKind === "codex") dropCodexSession(taskId);
   codexTurnQueue.delete(taskId);
-  // Kill any open terminal tabs before removing the worktree — a live shell
-  // sitting in the worktree dir would block `git worktree remove`. Awaited so
-  // the shells are actually gone before we tear the directory down.
-  await killTerminalsForTask(taskId);
-  await removeWorktree(task);
+  // Routed through the same global teardown queue archiveTask uses — DELETE's
+  // semantics are unchanged (still awaited before `tasks.delete` below), but
+  // this serializes it behind any archive teardown already in flight for
+  // another task, so two `git worktree remove`/`prune` calls against the same
+  // source repo never contend on git's locks at the same time.
+  await enqueueTeardown(taskId, async () => {
+    if (deleteKind === "claude-code") dropSession(taskId);
+    else if (deleteKind === "codex") dropCodexSession(taskId);
+    // Kill any open terminal tabs before removing the worktree — a live shell
+    // sitting in the worktree dir would block `git worktree remove`. Awaited
+    // so the shells are actually gone before we tear the directory down.
+    await killTerminalsForTask(taskId);
+    await removeWorktree(task);
+  });
   // No per-task attachments directory to clean up — refs are path-only,
   // agetor never copied anything to disk.
   tasks.delete(taskId);
+}
+
+/**
+ * Boot-time healing pass for teardowns that never ran: if agetor quit or
+ * crashed between an `archiveTask` response landing (DB flipped, teardown
+ * enqueued) and the deferred job actually executing, the in-memory queue is
+ * gone on restart but the worktree is still sitting on disk. This also heals
+ * the pre-existing crash-mid-archive case that could strand a worktree even
+ * before teardown was deferred (a crash between the DB update and the old
+ * synchronous `detachWorktree` call).
+ *
+ * `tasks.list()` already includes archived rows (no archived filter in its
+ * query), so a plain scan is enough. Re-enqueues the identical teardown job
+ * `archiveTask` would have run — session drop keyed to the task's own id,
+ * `killTerminalsForTask`, `detachWorktree` — through the same global queue,
+ * so it's serialized against anything already in flight. Kills are always
+ * keyed to a specific task id from this instance's own DB; this never
+ * enumerates or kills `agetor-*` tmux sessions directly (the shared-socket
+ * rule reconcileOrphans documents above applies here too).
+ *
+ * Fire-and-forget from the caller's perspective — returns the count enqueued,
+ * not a promise, since it only needs to kick the jobs off.
+ */
+export function sweepArchivedTeardowns(): number {
+  let enqueued = 0;
+  for (const task of tasks.list()) {
+    if (task.archivedAt == null) continue;
+    if (!task.worktreePath) continue;
+    if (!existsSync(task.worktreePath)) continue;
+    const taskId = task.id;
+    const kind = resolveHarness(task.agent)?.kind;
+    enqueueTeardown(taskId, async () => {
+      if (kind === "claude-code") dropSession(taskId);
+      else if (kind === "codex") dropCodexSession(taskId);
+      await killTerminalsForTask(taskId);
+      await detachWorktree(task);
+    });
+    enqueued++;
+  }
+  return enqueued;
 }

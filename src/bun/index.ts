@@ -3,7 +3,7 @@ import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } fr
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
-import { reconcileOrphans } from "./orchestrator.ts";
+import { reconcileOrphans, sweepArchivedTeardowns } from "./orchestrator.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
@@ -118,6 +118,12 @@ rehydratePath();
 // Mark any runs that were "running" when we last shut down as orphaned, so the
 // kanban doesn't show stuck cards.
 reconcileOrphans();
+
+// Heal any archive/delete teardown (tmux kill, terminal shells, worktree
+// detach) that was deferred to the in-memory teardown queue but never ran
+// because agetor quit or crashed before the job fired. Fire-and-forget — it
+// only enqueues jobs onto that queue, keyed to this instance's own task ids.
+sweepArchivedTeardowns();
 
 installNativeMenu();
 
