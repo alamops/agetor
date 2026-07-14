@@ -207,6 +207,22 @@ export type PendingInteraction =
   | PendingAskQuestions
   | PendingTmuxPrompt;
 
+/** One stored per-host GitHub PAT, as surfaced to the webview. The raw token
+ *  is never returned — `tokenPreview` is a redacted tail (e.g. "…abcd"). */
+export interface GitHubTokenInfo {
+  host: string;
+  label: string | null;
+  tokenPreview: string;
+}
+
+/** Response shape for the GitHub tokens routes. `detectedHosts` are the
+ *  distinct raw remote hosts (including ssh aliases) seen across registered
+ *  project dirs — used to suggest hosts that don't have a token yet. */
+export interface GitHubTokensResult {
+  tokens: GitHubTokenInfo[];
+  detectedHosts: string[];
+}
+
 // Read api port + token, preferring globals injected by the Bun side via
 // BrowserWindow's `preload` option — that path works under the native
 // views:// scheme, which rejects URLs carrying a fragment or query.
@@ -923,6 +939,18 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  /** Stored per-host GitHub tokens + hosts detected across registered
+   *  projects (drives the "GitHub tokens" Settings section). */
+  listGitHubTokens: () => j<GitHubTokensResult>("/github/tokens"),
+  /** Upsert the token for `input.host`. Returns the refreshed list — never
+   *  the raw token. */
+  setGitHubToken: (input: { host: string; token: string; label?: string | null }) =>
+    j<GitHubTokensResult>("/github/tokens", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubToken: (host: string) =>
+    j<{ ok: true }>(`/github/tokens/${encodeURIComponent(host)}`, { method: "DELETE" }),
   getTmuxSource: () =>
     j<{
       source: "system" | "bundled";

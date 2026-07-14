@@ -54,9 +54,10 @@ const {
   parseDiscussionDetail,
   createdDiscussionFromGraphql,
   addedDiscussionCommentIdFromGraphql,
+  privateRepoHint,
 } = __githubInternals;
 
-const REPO = { owner: "o", name: "r" };
+const REPO = { owner: "o", name: "r", remoteHost: "github.com" };
 
 function makeItem(overrides: Partial<GitHubListItem> = {}): GitHubListItem {
   return {
@@ -101,7 +102,7 @@ test("githubRepoFromRemoteForTest ignores non-GitHub remotes", () => {
 });
 
 test("githubRepoFromRemoteForTest resolves custom ssh host aliases containing github", () => {
-  expect(githubRepoFromRemoteForTest("git@github-alamops.com:alamops/agetor.git")).toBe("alamops/agetor");
+  expect(githubRepoFromRemoteForTest("git@github-acme.com:acme/widgets.git")).toBe("acme/widgets");
   expect(githubRepoFromRemoteForTest("git@github-work:openai/codex.git")).toBe("openai/codex");
   expect(githubRepoFromRemoteForTest("github-work:openai/codex")).toBe("openai/codex");
   expect(githubRepoFromRemoteForTest("ssh://git@github-work/openai/codex.git")).toBe("openai/codex");
@@ -121,11 +122,13 @@ test("parseGitRemote extracts host/owner/name across url syntaxes", () => {
   const { parseGitRemote } = __githubInternals;
   expect(parseGitRemote("git@bitbucket-work.org:acme/app.git")).toEqual({
     host: "bitbucket.org",
+    rawHost: "bitbucket-work.org",
     owner: "acme",
     name: "app",
   });
   expect(parseGitRemote("https://gitlab.com/group/project")).toEqual({
     host: "gitlab.com",
+    rawHost: "gitlab.com",
     owner: "group",
     name: "project",
   });
@@ -1243,4 +1246,42 @@ test("addedDiscussionCommentIdFromGraphql digs data.addDiscussionComment.comment
   expect(addedDiscussionCommentIdFromGraphql({})).toBeNull();
   expect(addedDiscussionCommentIdFromGraphql({ data: { addDiscussionComment: null } })).toBeNull();
   expect(addedDiscussionCommentIdFromGraphql({ data: { addDiscussionComment: { comment: {} } } })).toBeNull();
+});
+
+test("privateRepoHint on a 404 with no token points at Settings for the remote host", () => {
+  const msg = privateRepoHint(404, "Not Found", REPO, false);
+  expect(msg).toContain("o/r");
+  expect(msg).toContain("private");
+  expect(msg).toContain(REPO.remoteHost);
+  expect(msg).toContain("Settings");
+});
+
+test("privateRepoHint on a 404 with a token mentions the configured token can't access it", () => {
+  const msg = privateRepoHint(404, "Not Found", REPO, true);
+  expect(msg).toContain("o/r");
+  expect(msg).toContain(REPO.remoteHost);
+  expect(msg).toContain("Settings");
+  expect(msg).toContain("cannot access it");
+});
+
+test("privateRepoHint uses the repo's own remoteHost (alias), not github.com, in the Settings pointer", () => {
+  const aliasRepo = { owner: "o", name: "r", remoteHost: "github-work.com" };
+  const msg = privateRepoHint(404, "Not Found", aliasRepo, false);
+  expect(msg).toContain("github-work.com");
+});
+
+test("privateRepoHint returns the input message unchanged for non-404 statuses", () => {
+  expect(privateRepoHint(500, "Internal Server Error", REPO, false)).toBe("Internal Server Error");
+  expect(privateRepoHint(403, "rate limited", REPO, true)).toBe("rate limited");
+  expect(privateRepoHint(401, "bad credentials", REPO, false)).toBe("bad credentials");
+});
+
+test("parseGitRemote preserves rawHost for a github ssh host alias while canonicalizing host", () => {
+  const { parseGitRemote } = __githubInternals;
+  expect(parseGitRemote("git@github-work.com:o/r.git")).toEqual({
+    host: "github.com",
+    rawHost: "github-work.com",
+    owner: "o",
+    name: "r",
+  });
 });

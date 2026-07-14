@@ -19,6 +19,7 @@ import {
 } from "./db.ts";
 import { archiveTask, createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
   buildHarnessTerminalCommand,
   harnessEnv,
@@ -148,6 +149,7 @@ import {
   updateGitHubMilestone,
   updateGitHubPullBranch,
   updateGitHubRelease,
+  remoteHostsForDirs,
 } from "./github.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
@@ -330,6 +332,17 @@ function backlogGuard(req: { params: { id: string } } & Request): Response | nul
  * back to the built-in default). Returns `{ error }` when the shape is
  * unusable or a prefix wouldn't produce a legal branch.
  */
+/** Wire shape for a stored GitHub PAT: the raw token never leaves the Bun
+ *  process — only a last-4-chars preview, and even that is withheld when the
+ *  token is so short the suffix would be the entire secret. */
+function sanitizedTokenInfo(t: { host: string; label: string | null; token: string }) {
+  return {
+    host: t.host,
+    label: t.label,
+    tokenPreview: t.token.length > 4 ? `…${t.token.slice(-4)}` : "…",
+  };
+}
+
 function coerceBranchConfig(raw: unknown): { config: BranchNamingConfig } | { error: string } {
   if (!raw || typeof raw !== "object") return { error: "config (object) required" };
   const src = raw as { rules?: unknown; includeSlug?: unknown };
@@ -2387,6 +2400,39 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
           return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Per-host GitHub PATs (github-tokens.ts), keyed by the raw ssh-alias
+      // remote host — see docs/plans/github-multi-identity-tokens.md. The raw
+      // token is write-only from the webview's perspective: GET/PUT both
+      // reply with a `tokenPreview` (last 4 chars — withheld entirely for
+      // tokens so short the suffix would be the whole secret), never the
+      // token itself.
+      "/github/tokens": {
+        GET: authed(async (req) => {
+          const tokens = listGitHubTokens().map(sanitizedTokenInfo);
+          const detectedHosts = await remoteHostsForDirs(projects.list().map((p) => p.path));
+          return json({ tokens, detectedHosts }, { headers: corsHeaders(req) });
+        }),
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { host?: unknown; token?: unknown; label?: unknown };
+          const host = typeof body.host === "string" ? body.host.trim().toLowerCase() : "";
+          const token = typeof body.token === "string" ? body.token.trim() : "";
+          if (!host) return json({ error: "host required" }, { status: 400, headers: corsHeaders(req) });
+          if (!token) return json({ error: "token required" }, { status: 400, headers: corsHeaders(req) });
+          const label = typeof body.label === "string" && body.label.trim() ? body.label.trim() : null;
+          setGitHubToken(host, token, label);
+          const tokens = listGitHubTokens().map(sanitizedTokenInfo);
+          const detectedHosts = await remoteHostsForDirs(projects.list().map((p) => p.path));
+          return json({ tokens, detectedHosts }, { headers: corsHeaders(req) });
+        }),
+      },
+      "/github/tokens/:host": {
+        DELETE: authed((req) => {
+          const removed = deleteGitHubToken(req.params.host);
+          if (!removed) return json({ error: "token not found" }, { status: 404, headers: corsHeaders(req) });
+          return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
 
