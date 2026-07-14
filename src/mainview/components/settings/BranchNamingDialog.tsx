@@ -12,7 +12,7 @@ import {
   DEFAULT_BRANCH_CONFIG,
   TASK_TYPES,
   branchPattern,
-  buildBranchName,
+  renderBranchTemplate,
   validateBranchConfig,
   validateBranchName,
   type TaskType,
@@ -68,6 +68,11 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
 
   const validation = useMemo(() => validateBranchConfig(config), [config]);
 
+  const exampleProjectName = useMemo(
+    () => projectName || projectPath.split("/").filter(Boolean).pop() || "project",
+    [projectName, projectPath],
+  );
+
   const save = async () => {
     if (!validation.ok) { toast.error(validation.reason); return; }
     setSaving(true);
@@ -117,7 +122,12 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, ac
           {TASK_TYPES.map((t, i) => {
             const prefix = config.rules[t.id]?.prefix ?? "";
             const pattern = branchPattern(config, t.id);
-            const example = buildBranchName(config, t.id, EXAMPLE_TITLE, { token: "a1b2c3" });
+            const example = renderBranchTemplate(branchPattern(config, t.id), {
+              title: EXAMPLE_TITLE,
+              projectName: exampleProjectName,
+              taskType: t.id,
+              token: "a1b2c3",
+            });
             const legal = validateBranchName(example).ok;
             const active = activeTaskType === t.id;
             return (
