@@ -63,6 +63,7 @@ import type {
   TaskDiff,
 } from "../shared/types.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
+import { tokenForHost } from "./github-tokens.ts";
 
 interface CommandResult {
   ok: boolean;
@@ -81,6 +82,11 @@ interface PipedProcess {
 interface GitHubRepo {
   owner: string;
   name: string;
+  /** Raw (pre-canonicalization) remote host — e.g. `github-work.com` for an
+   *  ssh host alias, or `github.com` for a plain remote. This is the identity
+   *  key tokens are stored under (see github-tokens.ts) since one env var or
+   *  `gh auth token` can't cover more than one GitHub identity. */
+  remoteHost: string;
 }
 
 interface ListGitHubItemsInput {
@@ -568,9 +574,12 @@ function canonicalGitHost(host: string): string {
 }
 
 /** Extract host + owner/name from a git remote URL in https, ssh://, or
- *  scp-like (`[user@]host:owner/repo`) form, canonicalizing the host via
- *  canonicalGitHost. Returns null for local paths and anything unrecognized. */
-function parseGitRemote(raw: string): { host: string; owner: string; name: string } | null {
+ *  scp-like (`[user@]host:owner/repo`) form. `host` is canonicalized via
+ *  canonicalGitHost; `rawHost` is the lowercased pre-canonicalization host
+ *  (the ssh alias itself, when one is in play) — callers that need to route a
+ *  per-identity token use `rawHost`, not `host`. Returns null for local paths
+ *  and anything unrecognized. */
+function parseGitRemote(raw: string): { host: string; rawHost: string; owner: string; name: string } | null {
   const remote = raw.trim();
   if (!remote) return null;
 
@@ -579,13 +588,14 @@ function parseGitRemote(raw: string): { host: string; owner: string; name: strin
   const scp = /^(?:[^@/\s]+@)?([^/:\s]+):([^/:]+)\/(.+?)(?:\.git)?$/i.exec(remote);
   const m = https ?? ssh ?? scp;
   if (!m) return null;
-  return { host: canonicalGitHost(m[1]!), owner: m[2]!, name: m[3]! };
+  const rawHost = m[1]!.toLowerCase();
+  return { host: canonicalGitHost(rawHost), rawHost, owner: m[2]!, name: m[3]! };
 }
 
 function parseGitHubRemote(raw: string): GitHubRepo | null {
   const parsed = parseGitRemote(raw);
   if (!parsed || parsed.host !== "github.com") return null;
-  return { owner: parsed.owner, name: parsed.name };
+  return { owner: parsed.owner, name: parsed.name, remoteHost: parsed.rawHost };
 }
 
 export function githubRepoFromRemoteForTest(remote: string): string | null {
@@ -804,6 +814,7 @@ export const __githubInternals = {
   parseDiscussionDetail,
   createdDiscussionFromGraphql,
   addedDiscussionCommentIdFromGraphql,
+  privateRepoHint,
 };
 
 async function repoForDir(dir: string): Promise<GitHubRepo | null> {
@@ -821,7 +832,30 @@ async function repoForDir(dir: string): Promise<GitHubRepo | null> {
   return null;
 }
 
-async function githubToken(): Promise<string | null> {
+/** Distinct raw GitHub hosts (the ssh-alias identity, or `github.com` for a
+ *  plain remote) across the given project dirs, sorted — drives the Settings
+ *  "detected hosts" suggestion list so a user's real aliases are one click
+ *  away instead of hand-typed. Dirs with no GitHub remote (or that aren't a
+ *  repo at all) are tolerated silently, same as `repoForDir`. */
+export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
+  const repos = await Promise.all(dirs.map((dir) => repoForDir(dir)));
+  const hosts = new Set<string>();
+  for (const repo of repos) {
+    if (repo) hosts.add(repo.remoteHost);
+  }
+  return Array.from(hosts).sort();
+}
+
+/** Resolve the token to authenticate a GitHub request with, for a repo whose
+ *  raw remote host is `host` (null when there's no repo in scope). Order:
+ *  (1) a stored token for `host` (or the `github.com` default entry —
+ *  `tokenForHost` implements that fallback), (2) `GITHUB_TOKEN`/`GH_TOKEN`
+ *  env, (3) `gh auth token`. `host` is a required parameter (not optional) so
+ *  every call site has to thread it through explicitly rather than silently
+ *  falling back to the single-identity env/gh behavior this replaces. */
+async function githubToken(host: string | null): Promise<string | null> {
+  const stored = tokenForHost(host);
+  if (stored) return stored;
   const envToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   if (envToken) return envToken;
   const gh = await run(["gh", "auth", "token"], undefined, 5_000);
@@ -1248,6 +1282,21 @@ function apiError(body: unknown, status: number, statusText: string): string {
     : `${status} ${statusText}`;
 }
 
+/** Enriches a plain 404 with an actionable pointer to Settings. GitHub answers
+ *  404 — not 403 — for a private repo the caller can't see, so an unadorned
+ *  passthrough of `message` reads as "this repo doesn't exist" even when it's
+ *  just an auth gap. Any other status is returned unchanged. Pure — the
+ *  `hadToken` flag (was a request even attempted with a token?) picks between
+ *  "add a token" and "the token you have doesn't work here". */
+function privateRepoHint(status: number, message: string, repo: GitHubRepo, hadToken: boolean): string {
+  if (status !== 404) return message;
+  const host = repo.remoteHost || "github.com";
+  const base = `${repo.owner}/${repo.name} was not found on GitHub — if the repo is private, add a token for ${host} in Settings → GitHub tokens`;
+  return hadToken
+    ? `${base} (the configured token cannot access it — check it belongs to the right account)`
+    : base;
+}
+
 async function pullHeadSha(repo: GitHubRepo, token: string | null, number: number): Promise<string | GitHubListError> {
   const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${number}`;
   const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
@@ -1293,7 +1342,7 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const slug = repoSlug(repo);
   const labels = input.labels?.map((s) => s.trim()).filter(Boolean) ?? [];
   const assignee = input.assignee?.trim() ?? "";
@@ -1382,7 +1431,7 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
         // GitHub's own "Validation Failed" is opaque — the query syntax is the fault.
         msg = "Invalid GitHub search query — check your qualifiers (e.g. is:open label:bug sort:updated).";
       }
-      return { ok: false, error: msg };
+      return { ok: false, error: privateRepoHint(res.status, msg, repo, !!token) };
     }
     // The list endpoints return a bare array; search wraps items in `.items`.
     const raws = useSearch
@@ -1566,7 +1615,7 @@ export async function createGitHubPull(input: CreateGitHubPullInput): Promise<Gi
   if (!head) return { ok: false, error: "head branch required" };
   if (!base) return { ok: false, error: "base branch required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to create a pull request" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls`;
   const res = await fetchGitHub(
@@ -1623,7 +1672,7 @@ export async function getGitHubPullDiff(input: GetGitHubPullDiffInput): Promise<
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const res = await fetchGitHub(url, token, "application/vnd.github.v3.diff");
   if (!("status" in res)) return res;
@@ -1677,7 +1726,7 @@ export async function listGitHubComments(input: GitHubItemNumberInput): Promise<
     return { ok: false, error: "item number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const url = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/comments`);
   url.searchParams.set("per_page", "100");
   const res = await fetchGitHub(url.toString(), token, "application/vnd.github+json");
@@ -1707,7 +1756,7 @@ export async function createGitHubComment(input: CreateGitHubCommentInput): Prom
   const body = input.body.trim();
   if (!body) return { ok: false, error: "comment body required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to comment" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/comments`;
   const res = await fetchGitHub(
@@ -1748,7 +1797,7 @@ export async function createGitHubPullLineComment(
     return { ok: false, error: "comment side must be LEFT or RIGHT" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to comment on a line" };
   const sha = await pullHeadSha(repo, token, input.number);
   if (typeof sha !== "string") return sha;
@@ -1786,7 +1835,7 @@ export async function listGitHubPullReviewComments(
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const url = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/comments`);
   url.searchParams.set("per_page", "100");
   const res = await fetchGitHub(url.toString(), token, "application/vnd.github+json");
@@ -1816,7 +1865,7 @@ export async function replyGitHubPullLineComment(
   const body = input.body.trim();
   if (!body) return { ok: false, error: "reply body required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to reply" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/comments/${input.commentId}/replies`;
   const res = await fetchGitHub(
@@ -1854,7 +1903,7 @@ export async function applyGitHubSuggestion(input: ApplyGitHubSuggestionInput): 
     return { ok: false, error: "review comment id must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to apply a suggestion" };
 
   const reviewCommentUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/comments/${input.commentId}`;
@@ -1949,7 +1998,7 @@ export async function getGitHubPullChecks(input: GitHubItemNumberInput): Promise
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const sha = await pullHeadSha(repo, token, input.number);
   if (typeof sha !== "string") return sha;
 
@@ -1987,7 +2036,7 @@ export async function getGitHubCommitStatus(input: GetGitHubCommitStatusInput): 
   const ref = input.ref.trim();
   if (!ref) return { ok: false, error: "commit ref required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/commits/${encodeURIComponent(ref)}/status`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
@@ -2007,7 +2056,7 @@ export async function listGitHubPullCommits(input: GitHubItemNumberInput): Promi
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const commits: GitHubPullCommit[] = [];
   let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/commits?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
@@ -2036,7 +2085,7 @@ export async function reviewGitHubPull(input: ReviewGitHubPullInput): Promise<Gi
   const invalid = reviewValidationError(input.event, body, comments.length > 0);
   if (invalid) return { ok: false, error: invalid };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to review" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/reviews`;
   const res = await fetchGitHub(
@@ -2076,7 +2125,7 @@ export async function mergeGitHubPull(input: MergeGitHubPullInput): Promise<GitH
     return { ok: false, error: "unsupported merge method" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to merge" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/merge`;
   const res = await fetchGitHub(
@@ -2111,7 +2160,7 @@ export async function closeGitHubPull(input: CloseGitHubPullInput): Promise<GitH
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to close a pull request" };
   const comment = input.comment?.trim() ?? "";
 
@@ -2151,7 +2200,7 @@ export async function createGitHubIssue(input: CreateGitHubIssueInput): Promise<
   const title = input.title.trim();
   if (!title) return { ok: false, error: "issue title required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to create an issue" };
   const labels = input.labels?.map((s) => s.trim()).filter(Boolean) ?? [];
   const assignees = input.assignees?.map((s) => s.trim()).filter(Boolean) ?? [];
@@ -2189,7 +2238,7 @@ export async function updateGitHubIssue(input: UpdateGitHubIssueInput): Promise<
     return { ok: false, error: "unsupported issue state" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to update an issue" };
   const kind = input.kind === "pulls" ? "pulls" : "issues";
   const noun = kind === "pulls" ? "pull request" : "issue";
@@ -2225,7 +2274,7 @@ export async function requestGitHubPullReviewers(
     return { ok: false, error: "at least one reviewer or team is required" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to request reviewers" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/requested_reviewers`;
   const res = await fetchGitHub(
@@ -2281,7 +2330,7 @@ export async function getGitHubPullMergeability(input: GitHubItemNumberInput): P
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   // GitHub computes `mergeable` asynchronously — the first read after a push can
   // return null. Poll a couple of times before giving up so the UI usually gets
@@ -2309,7 +2358,7 @@ export async function updateGitHubPullBranch(input: GitHubItemNumberInput): Prom
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to update the branch" };
   // Merges the base branch into the PR head. 202 Accepted with a message body.
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/update-branch`;
@@ -2330,7 +2379,7 @@ export async function reopenGitHubPull(input: GitHubItemNumberInput): Promise<Gi
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to reopen a pull request" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const res = await fetchGitHub(
@@ -2745,7 +2794,7 @@ export async function setGitHubPullDraft(input: SetGitHubPullDraftInput): Promis
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to change draft state" };
   const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
@@ -2789,7 +2838,7 @@ export async function setGitHubPullAutoMerge(input: SetGitHubPullAutoMergeInput)
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to change auto-merge" };
   const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
@@ -2837,7 +2886,7 @@ export async function setGitHubIssueLock(input: SetGitHubIssueLockInput): Promis
     return { ok: false, error: "item number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to lock/unlock" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/lock`;
 
@@ -2874,7 +2923,7 @@ export async function setGitHubIssuePinned(input: SetGitHubIssuePinnedInput): Pr
     return { ok: false, error: "issue number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to pin/unpin" };
   const issueUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
   const issueRes = await fetchGitHub(issueUrl, token, "application/vnd.github+json");
@@ -2920,7 +2969,7 @@ export async function getGitHubIssuePinned(input: GitHubItemNumberInput): Promis
     return { ok: false, error: "issue number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: true, pinned: false };
   const query = `query($owner:String!,$name:String!,$number:Int!){`
     + `repository(owner:$owner,name:$name){issue(number:$number){isPinned}}}`;
@@ -2958,7 +3007,7 @@ export async function listGitHubSubIssues(input: GitHubItemNumberInput): Promise
     return { ok: false, error: "issue number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const subIssues: GitHubSubIssue[] = [];
   let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issues?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
@@ -2989,7 +3038,7 @@ export async function addGitHubSubIssue(input: AddGitHubSubIssueInput): Promise<
     return { ok: false, error: "child issue number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to add a sub-issue" };
 
   const childUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.childNumber}`;
@@ -3031,7 +3080,7 @@ export async function removeGitHubSubIssue(input: RemoveGitHubSubIssueInput): Pr
     return { ok: false, error: "child issue id must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to remove a sub-issue" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issue`;
   const res = await fetchGitHub(
@@ -3062,7 +3111,7 @@ export async function transferGitHubIssue(input: TransferGitHubIssueInput): Prom
   const target = parseTargetRepo(input.targetRepo);
   if (!target) return { ok: false, error: "target repo must be in the form owner/name" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to transfer an issue" };
 
   const issueUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
@@ -3117,7 +3166,7 @@ export async function transferGitHubIssue(input: TransferGitHubIssueInput): Prom
 export async function listGitHubProjectsV2(input: { dir: string }): Promise<GitHubProjectsV2Response> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to view projects" };
 
   const query = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){projectsV2(first:20){nodes{id number title url}}}}`;
@@ -3145,7 +3194,7 @@ export async function getGitHubProjectItems(input: GetGitHubProjectItemsInput): 
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!input.projectId.trim()) return { ok: false, error: "project id required" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to view project items" };
 
   const query = `query($id:ID!){ node(id:$id){ ... on ProjectV2 {`
@@ -3182,7 +3231,7 @@ export async function addGitHubProjectItem(input: AddGitHubProjectItemInput): Pr
   if (!Number.isInteger(input.contentNumber) || input.contentNumber <= 0) {
     return { ok: false, error: "issue/PR number must be positive" };
   }
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to add a project item" };
 
   const segment = input.contentKind === "pr" ? "pulls" : "issues";
@@ -3220,7 +3269,7 @@ export async function removeGitHubProjectItem(input: RemoveGitHubProjectItemInpu
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!input.projectId.trim()) return { ok: false, error: "project id required" };
   if (!input.itemId.trim()) return { ok: false, error: "item id required" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to remove a project item" };
 
   const query = `mutation($p:ID!,$i:ID!){ deleteProjectV2Item(input:{ projectId:$p, itemId:$i }){ deletedItemId } }`;
@@ -3250,7 +3299,7 @@ export async function setGitHubProjectItemStatus(input: SetGitHubProjectItemStat
   if (!input.itemId.trim()) return { ok: false, error: "item id required" };
   if (!input.fieldId.trim()) return { ok: false, error: "field id required" };
   if (!input.optionId.trim()) return { ok: false, error: "option id required" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to update a project item" };
 
   const query = `mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){ updateProjectV2ItemFieldValue(input:{ projectId:$p, itemId:$i, fieldId:$f, value:{ singleSelectOptionId:$o } }){ projectV2Item { id } } }`;
@@ -3279,7 +3328,7 @@ export async function setGitHubProjectItemStatus(input: SetGitHubProjectItemStat
 export async function listGitHubDiscussions(input: { dir: string }): Promise<GitHubDiscussionsResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
 
   const query = `query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){`
     + `discussions(first:25, orderBy:{field:UPDATED_AT, direction:DESC}){ nodes{ id number title url createdAt isAnswered category{ name } author{ login } } }`
@@ -3313,7 +3362,7 @@ export async function getGitHubDiscussion(input: GetGitHubDiscussionInput): Prom
   if (!Number.isInteger(input.number) || input.number <= 0) {
     return { ok: false, error: "discussion number must be positive" };
   }
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
 
   const query = `query($owner:String!,$name:String!,$number:Int!){ repository(owner:$owner,name:$name){`
     + `discussion(number:$number){ id title body category{ isAnswerable } comments(first:50){ nodes{ id body createdAt isAnswer author{ login } } } }`
@@ -3347,7 +3396,7 @@ export async function createGitHubDiscussion(input: CreateGitHubDiscussionInput)
   const body = input.body.trim();
   if (!body) return { ok: false, error: "discussion body required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to create a discussion" };
 
   const repoIdQuery = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id}}`;
@@ -3390,7 +3439,7 @@ export async function addGitHubDiscussionComment(input: AddGitHubDiscussionComme
   if (!input.discussionId.trim()) return { ok: false, error: "discussion id required" };
   const body = input.body.trim();
   if (!body) return { ok: false, error: "comment body required" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to comment" };
 
   const query = `mutation($d:ID!,$b:String!){ addDiscussionComment(input:{ discussionId:$d, body:$b }){ comment{ id } } }`;
@@ -3419,7 +3468,7 @@ export async function setGitHubDiscussionAnswer(input: SetGitHubDiscussionAnswer
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!input.commentId.trim()) return { ok: false, error: "comment id required" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to mark an answer" };
 
   const field = input.answer ? "markDiscussionCommentAsAnswer" : "unmarkDiscussionCommentAsAnswer";
@@ -3446,7 +3495,7 @@ export async function deleteGitHubDiscussion(input: DeleteGitHubDiscussionInput)
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!input.discussionId.trim()) return { ok: false, error: "discussion id required" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to delete a discussion" };
 
   const query = `mutation($id:ID!){ deleteDiscussion(input:{ id:$id }){ clientMutationId } }`;
@@ -3470,7 +3519,7 @@ export async function deleteGitHubDiscussionComment(input: DeleteGitHubDiscussio
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!input.commentId.trim()) return { ok: false, error: "comment id required" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to delete a comment" };
 
   const query = `mutation($id:ID!){ deleteDiscussionComment(input:{ id:$id }){ clientMutationId } }`;
@@ -3494,12 +3543,12 @@ export async function deleteGitHubDiscussionComment(input: DeleteGitHubDiscussio
 export async function getGitHubViewer(input: { dir: string }): Promise<GitHubViewerResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: true, login: "" };
   const res = await fetchGitHub("https://api.github.com/user", token, "application/vnd.github+json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: privateRepoHint(res.status, apiError(json, res.status, res.statusText), repo, !!token) };
   const login = json && typeof json === "object" && typeof (json as { login?: unknown }).login === "string"
     ? (json as { login: string }).login
     : "";
@@ -3514,13 +3563,13 @@ export async function getGitHubViewer(input: { dir: string }): Promise<GitHubVie
 export async function getGitHubRepoPermissions(input: { dir: string }): Promise<GitHubRepoPermissionsResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: true, push: false, admin: false, maintain: false };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: privateRepoHint(res.status, apiError(json, res.status, res.statusText), repo, !!token) };
   const perms = json && typeof json === "object" && (json as { permissions?: unknown }).permissions
     && typeof (json as { permissions?: unknown }).permissions === "object"
     ? (json as { permissions: Record<string, unknown> }).permissions
@@ -3549,7 +3598,7 @@ export async function updateGitHubComment(input: UpdateGitHubCommentInput): Prom
   const body = input.body.trim();
   if (!body) return { ok: false, error: "comment body required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to edit a comment" };
   const res = await fetchGitHub(
     commentUrl(repo, input.kind, input.commentId),
@@ -3572,7 +3621,7 @@ export async function deleteGitHubComment(input: DeleteGitHubCommentInput): Prom
     return { ok: false, error: "comment id must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to delete a comment" };
   const res = await fetchGitHub(
     commentUrl(repo, input.kind, input.commentId),
@@ -3644,7 +3693,7 @@ export async function getGitHubPullReviewThreads(input: GitHubItemNumberInput): 
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: true, repo: repoSlug(repo), pullNumber: input.number, threads: [], truncated: false };
   // `comments(first:1)` is the thread's ROOT comment — GitHub returns a review
   // thread's comments oldest-first, so the first is the one that started the
@@ -3683,7 +3732,7 @@ export async function getGitHubPullLinkedIssues(input: GitHubItemNumberInput): P
     return { ok: false, error: "pull request number must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: true, repo: repoSlug(repo), pullNumber: input.number, issues: [] };
   const query = `query($owner:String!,$name:String!,$number:Int!){`
     + `repository(owner:$owner,name:$name){pullRequest(number:$number){`
@@ -3709,7 +3758,7 @@ export async function setGitHubReviewThreadResolved(
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!input.threadId) return { ok: false, error: "review thread id required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to resolve a thread" };
   const field = input.resolved ? "resolveReviewThread" : "unresolveReviewThread";
   const query = `mutation($id:ID!){ ${field}(input:{threadId:$id}){ thread { isResolved } } }`;
@@ -3762,7 +3811,7 @@ export async function listGitHubLabels(input: { dir: string }): Promise<GitHubLa
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const labels: GitHubRepoLabel[] = [];
   let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/labels?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
@@ -3785,7 +3834,7 @@ export async function listGitHubAssignees(input: { dir: string }): Promise<GitHu
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const assignees: GitHubUser[] = [];
   let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/assignees?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
@@ -3811,7 +3860,7 @@ export async function createGitHubLabel(input: CreateGitHubLabelInput): Promise<
   if (!name) return { ok: false, error: "label name required" };
   const color = normalizeColor(input.color) ?? "";
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to create a label" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/labels`;
   const res = await fetchGitHub(
@@ -3840,7 +3889,7 @@ export async function updateGitHubLabel(input: UpdateGitHubLabelInput): Promise<
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!input.name.trim()) return { ok: false, error: "label name required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to edit a label" };
   const patch: { new_name?: string; color?: string; description?: string } = {};
   if (input.newName !== undefined) {
@@ -3874,7 +3923,7 @@ export async function deleteGitHubLabel(input: DeleteGitHubLabelInput): Promise<
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!input.name.trim()) return { ok: false, error: "label name required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to delete a label" };
   const res = await fetchGitHub(labelUrl(repo, input.name), token, "application/vnd.github+json", { method: "DELETE" });
   if (!("status" in res)) return res;
@@ -3920,7 +3969,7 @@ export async function listGitHubMilestones(input: { dir: string }): Promise<GitH
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const milestones: GitHubRepoMilestone[] = [];
   let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones?state=all&per_page=100&sort=due_on&direction=asc`;
   for (let page = 0; next && page < 3; page++) {
@@ -3944,7 +3993,7 @@ export async function createGitHubMilestone(input: CreateGitHubMilestoneInput): 
   const title = input.title.trim();
   if (!title) return { ok: false, error: "milestone title required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to create a milestone" };
   const dueOn = normalizeDueOn(input.dueOn);
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones`;
@@ -3974,7 +4023,7 @@ export async function updateGitHubMilestone(input: UpdateGitHubMilestoneInput): 
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!Number.isInteger(input.number) || input.number <= 0) return { ok: false, error: "valid milestone number required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to edit a milestone" };
   const patch: { title?: string; description?: string; due_on?: string; state?: "open" | "closed" } = {};
   if (input.title !== undefined) {
@@ -4062,7 +4111,7 @@ export async function listGitHubReactions(input: ListGitHubReactionsInput): Prom
     return { ok: false, error: "reaction subject id must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const raw: unknown[] = [];
   let next: string | null = `${reactionSubjectPath(repo, input.subject)}?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
@@ -4087,7 +4136,7 @@ export async function addGitHubReaction(input: AddGitHubReactionInput): Promise<
     return { ok: false, error: "unsupported reaction content" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to react" };
   const res = await fetchGitHub(
     reactionSubjectPath(repo, input.subject),
@@ -4115,7 +4164,7 @@ export async function removeGitHubReaction(input: RemoveGitHubReactionInput): Pr
     return { ok: false, error: "reaction id must be positive" };
   }
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to remove a reaction" };
   const res = await fetchGitHub(
     `${reactionSubjectPath(repo, input.subject)}/${input.reactionId}`,
@@ -4136,7 +4185,7 @@ export async function deleteGitHubMilestone(input: DeleteGitHubMilestoneInput): 
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!Number.isInteger(input.number) || input.number <= 0) return { ok: false, error: "valid milestone number required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to delete a milestone" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones/${input.number}`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "DELETE" });
@@ -4155,7 +4204,7 @@ export async function listGitHubReleases(input: { dir: string }): Promise<GitHub
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const releases: GitHubRelease[] = [];
   let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
@@ -4180,7 +4229,7 @@ export async function listGitHubTags(input: { dir: string }): Promise<GitHubTags
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const tags: GitHubTag[] = [];
   let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/tags?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
@@ -4204,7 +4253,7 @@ export async function createGitHubRelease(input: CreateGitHubReleaseInput): Prom
   const tagName = input.tagName.trim();
   if (!tagName) return { ok: false, error: "tag name required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to create a release" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases`;
   const res = await fetchGitHub(
@@ -4236,7 +4285,7 @@ export async function updateGitHubRelease(input: UpdateGitHubReleaseInput): Prom
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!Number.isInteger(input.id) || input.id <= 0) return { ok: false, error: "valid release id required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to edit a release" };
   const patch: { tag_name?: string; name?: string; body?: string; draft?: boolean; prerelease?: boolean } = {};
   if (input.tagName !== undefined) {
@@ -4267,7 +4316,7 @@ export async function deleteGitHubRelease(input: DeleteGitHubReleaseInput): Prom
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!Number.isInteger(input.id) || input.id <= 0) return { ok: false, error: "valid release id required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to delete a release" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases/${input.id}`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "DELETE" });
@@ -4328,7 +4377,7 @@ export async function listGitHubNotifications(input: ListGitHubNotificationsInpu
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to view notifications" };
 
   const notifications: GitHubNotification[] = [];
@@ -4357,7 +4406,7 @@ export async function markGitHubNotificationRead(input: GitHubThreadInput): Prom
   const threadId = input.threadId.trim();
   if (!threadId) return { ok: false, error: "thread id required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to mark a notification read" };
   const res = await fetchGitHub(
     `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}`,
@@ -4380,7 +4429,7 @@ export async function markAllGitHubNotificationsRead(input: { dir: string }): Pr
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to mark notifications read" };
   const res = await fetchGitHub(
     `https://api.github.com/repos/${repo.owner}/${repo.name}/notifications`,
@@ -4406,7 +4455,7 @@ export async function getGitHubThreadSubscription(input: GitHubThreadInput): Pro
   const threadId = input.threadId.trim();
   if (!threadId) return { ok: false, error: "thread id required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to view thread subscription" };
   const res = await fetchGitHub(
     `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
@@ -4430,7 +4479,7 @@ export async function setGitHubThreadSubscription(input: SetGitHubThreadSubscrip
   const threadId = input.threadId.trim();
   if (!threadId) return { ok: false, error: "thread id required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to update thread subscription" };
   const res = await fetchGitHub(
     `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
@@ -4454,7 +4503,7 @@ export async function unsubscribeGitHubThread(input: GitHubThreadInput): Promise
   const threadId = input.threadId.trim();
   if (!threadId) return { ok: false, error: "thread id required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to unsubscribe from a thread" };
   const res = await fetchGitHub(
     `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
@@ -4479,7 +4528,7 @@ export async function listGitHubWorkflowRuns(input: { dir: string }): Promise<Gi
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/runs?per_page=30`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
@@ -4500,7 +4549,7 @@ export async function listGitHubWorkflows(input: { dir: string }): Promise<GitHu
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/workflows?per_page=100`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
@@ -4522,7 +4571,7 @@ export async function rerunGitHubWorkflowRun(input: RerunGitHubWorkflowRunInput)
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!Number.isInteger(input.runId) || input.runId <= 0) return { ok: false, error: "valid run id required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to re-run a workflow" };
   const segment = input.failedOnly ? "rerun-failed-jobs" : "rerun";
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/runs/${input.runId}/${segment}`;
@@ -4542,7 +4591,7 @@ export async function cancelGitHubWorkflowRun(input: CancelGitHubWorkflowRunInpu
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!Number.isInteger(input.runId) || input.runId <= 0) return { ok: false, error: "valid run id required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to cancel a workflow run" };
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/runs/${input.runId}/cancel`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "POST" });
@@ -4569,7 +4618,7 @@ export async function dispatchGitHubWorkflow(input: DispatchGitHubWorkflowInput)
   const ref = input.ref.trim();
   if (!ref) return { ok: false, error: "ref required" };
 
-  const token = await githubToken();
+  const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to dispatch a workflow" };
   const inputs = input.inputs && Object.keys(input.inputs).length > 0 ? input.inputs : undefined;
   const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/workflows/${input.workflowId}/dispatches`;

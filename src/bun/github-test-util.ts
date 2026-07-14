@@ -30,6 +30,20 @@ export async function makeGitHubRepo(owner = "o", name = "r"): Promise<string> {
   return dir;
 }
 
+/** A throwaway git repo whose `origin` is an ssh host-alias remote
+ *  (`git@<aliasHost>:<owner>/<name>.git`), e.g. `git@github-work.com:acme/widgets.git`.
+ *  `repoForDir(dir)` still resolves this to the canonical `github.com` API host
+ *  (via `canonicalGitHost`), but `repo.remoteHost` carries the raw alias — the
+ *  identity that per-host token routing (`github-tokens.ts`) keys on. Mirrors
+ *  `makeGitHubRepo` but for exercising the multi-identity token resolution
+ *  paths end-to-end. */
+export async function makeAliasGitHubRepo(owner = "o", name = "r", aliasHost = "github-alias.com"): Promise<string> {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-gh-repo-alias-"));
+  await git(["init", "-b", "main"], dir);
+  await git(["remote", "add", "origin", `git@${aliasHost}:${owner}/${name}.git`], dir);
+  return dir;
+}
+
 export interface MockRoute {
   /** HTTP method to match (case-insensitive). Omit to match any method. */
   method?: string;

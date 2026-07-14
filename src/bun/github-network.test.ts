@@ -6,7 +6,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, beforeAll } from "bun:test";
-import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
+import { makeAliasGitHubRepo, makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
+import { setGitHubToken } from "./github-tokens.ts";
 import {
   addGitHubDiscussionComment,
   addGitHubProjectItem,
@@ -2490,4 +2491,120 @@ test("addGitHubDiscussionComment / setGitHubDiscussionAnswer / deleteGitHubDiscu
     if (priorToken !== undefined) process.env.GITHUB_TOKEN = priorToken;
     if (priorGhToken !== undefined) process.env.GH_TOKEN = priorGhToken;
   }
+});
+
+// ---------------------------------------------------------------------------
+// Multi-identity token resolution — end-to-end through the request layer
+// (docs/plans/github-multi-identity-tokens.md, T6). These exercise the same
+// `githubToken()` resolution order §3 the pure-helper tests in
+// github-tokens.test.ts cover in isolation, but here via a real API function
+// (`getGitHubViewer`) hitting the fetch mock, so the whole chain — remote
+// parsing → token resolution → request header → error enrichment — is proven
+// together.
+//
+// The token store file lives under `AGETOR_DATA_DIR`, resolved lazily at call
+// time by github-tokens.ts. This file's `beforeAll` never sets that var, so
+// each test below points it at its own throwaway directory for the duration
+// of the test and restores the prior value afterwards — never touching a
+// real dataDir (dev or prod).
+async function withGitHubTokenStore<T>(fn: () => Promise<T>): Promise<T> {
+  const priorDataDir = process.env.AGETOR_DATA_DIR;
+  process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-gh-tokenstore-"));
+  try {
+    return await fn();
+  } finally {
+    if (priorDataDir !== undefined) process.env.AGETOR_DATA_DIR = priorDataDir;
+    else delete process.env.AGETOR_DATA_DIR;
+  }
+}
+
+test("githubToken resolution: a stored alias-host token beats GITHUB_TOKEN env", async () => {
+  // beforeAll already set process.env.GITHUB_TOKEN = "test-token", so this
+  // exercises the "alias beats env" ordering directly — no need to touch it.
+  await withGitHubTokenStore(async () => {
+    const aliasDir = await makeAliasGitHubRepo("acme", "widgets", "github-testalias.com");
+    setGitHubToken("github-testalias.com", "alias-token-abc");
+    const mock = mockGitHubFetch([{ match: "https://api.github.com/user", json: { login: "octocat" } }]);
+    try {
+      const res = await getGitHubViewer({ dir: aliasDir });
+      expect(res).toEqual({ ok: true, login: "octocat" });
+      expect(mock.calls).toHaveLength(1);
+      expect(mock.calls[0]!.url).toBe("https://api.github.com/user");
+      expect(mock.calls[0]!.headers.authorization).toBe("Bearer alias-token-abc");
+    } finally {
+      mock.restore();
+    }
+  });
+});
+
+test("githubToken resolution: an alias-host repo with no stored token falls back to GITHUB_TOKEN env (regression)", async () => {
+  await withGitHubTokenStore(async () => {
+    // Fresh AGETOR_DATA_DIR for this test → no stored tokens exist at all, so
+    // resolution must fall through to the env var, exactly as it did before
+    // per-host token storage existed.
+    const aliasDir = await makeAliasGitHubRepo("acme", "widgets", "github-testalias-env.com");
+    const mock = mockGitHubFetch([{ match: "https://api.github.com/user", json: { login: "octocat" } }]);
+    try {
+      const res = await getGitHubViewer({ dir: aliasDir });
+      expect(res).toEqual({ ok: true, login: "octocat" });
+      expect(mock.calls).toHaveLength(1);
+      // Still the canonical github.com API host — only the token routing
+      // keys off the raw alias, requests always go to api.github.com.
+      expect(mock.calls[0]!.url).toBe("https://api.github.com/user");
+      expect(mock.calls[0]!.headers.authorization).toBe("Bearer test-token");
+    } finally {
+      mock.restore();
+    }
+  });
+});
+
+test("githubToken resolution: a stored github.com entry is used as the default for a plain github.com repo", async () => {
+  const priorToken = process.env.GITHUB_TOKEN;
+  const priorGhToken = process.env.GH_TOKEN;
+  delete process.env.GITHUB_TOKEN;
+  delete process.env.GH_TOKEN;
+  try {
+    await withGitHubTokenStore(async () => {
+      setGitHubToken("github.com", "default-token-xyz");
+      const mock = mockGitHubFetch([{ match: "https://api.github.com/user", json: { login: "octocat" } }]);
+      try {
+        // REPO_DIR's origin is a plain https://github.com/acme/widgets.git
+        // remote (set up in this file's top-level beforeAll) — remoteHost
+        // resolves to "github.com" itself, so the stored default entry (not
+        // an alias) is what should be picked up here.
+        const res = await getGitHubViewer({ dir: REPO_DIR });
+        expect(res).toEqual({ ok: true, login: "octocat" });
+        expect(mock.calls).toHaveLength(1);
+        expect(mock.calls[0]!.headers.authorization).toBe("Bearer default-token-xyz");
+      } finally {
+        mock.restore();
+      }
+    });
+  } finally {
+    if (priorToken !== undefined) process.env.GITHUB_TOKEN = priorToken;
+    if (priorGhToken !== undefined) process.env.GH_TOKEN = priorGhToken;
+  }
+});
+
+test("a 404 on an alias-host repo is enriched with the Settings pointer, naming that host", async () => {
+  // beforeAll's GITHUB_TOKEN stays set, so a request is attempted (hadToken
+  // === true) and the 404 hint includes the "doesn't work here" clause on top
+  // of the base "add a token" pointer.
+  await withGitHubTokenStore(async () => {
+    const aliasDir = await makeAliasGitHubRepo("acme", "secret-repo", "github-testalias-404.com");
+    const mock = mockGitHubFetch([
+      { match: "https://api.github.com/user", status: 404, json: { message: "Not Found" } },
+    ]);
+    try {
+      const res = await getGitHubViewer({ dir: aliasDir });
+      expect(res.ok).toBe(false);
+      if (res.ok) throw new Error("expected getGitHubViewer to fail on a 404");
+      expect(res.error).toContain(
+        "add a token for github-testalias-404.com in Settings → GitHub tokens",
+      );
+      expect(res.error).toContain("configured token cannot access it");
+    } finally {
+      mock.restore();
+    }
+  });
 });
