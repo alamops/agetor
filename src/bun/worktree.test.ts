@@ -879,3 +879,129 @@ describe("getAheadCount", () => {
     expect(await getAheadCount(repo, "no-such-ref")).toBeNull();
   });
 });
+
+describe("detachWorktree", () => {
+  test("removes the checkout but keeps the branch and its commits", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    writeFileSync(path.join(created.cwd, "work.txt"), "agent output\n");
+    await git(["add", "."], created.cwd);
+    await git(["commit", "-m", "agent work"], created.cwd);
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live);
+    expect(result).toEqual({ removed: true });
+    expect(existsSync(created.cwd)).toBe(false);
+
+    // The branch must survive in the source repo — that's the whole point of
+    // detach vs removeWorktree.
+    const branchProc = Bun.spawn(["git", "branch", "--list", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const branchOut = (await new Response(branchProc.stdout).text()).trim();
+    await branchProc.exited;
+    expect(branchOut).toContain(created.branch!);
+
+    // The commit made inside the (now-removed) worktree is still reachable on
+    // the branch in the source repo.
+    const logProc = Bun.spawn(["git", "log", "--oneline", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const log = (await new Response(logProc.stdout).text()).trim();
+    await logProc.exited;
+    expect(log).toContain("agent work");
+  });
+
+  test("round-trip: prepareWorkdir re-materializes the checkout at the same path with the prior commit intact", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    writeFileSync(path.join(created.cwd, "work.txt"), "agent output\n");
+    await git(["add", "."], created.cwd);
+    await git(["commit", "-m", "agent work"], created.cwd);
+
+    // The orchestrator keeps worktreePath + branch on the task row across
+    // detach (that's what makes the later re-attach deterministic).
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const detached = await detachWorktree(live);
+    expect(detached).toEqual({ removed: true });
+    expect(existsSync(created.cwd)).toBe(false);
+
+    const restored = await prepareWorkdir(live);
+    if ("error" in restored) throw new Error(restored.error);
+    expect(restored.cwd).toBe(created.cwd);
+    expect(restored.worktreePath).toBe(created.worktreePath);
+    expect(restored.branch).toBe(created.branch);
+    expect(existsSync(path.join(restored.cwd, "work.txt"))).toBe(true);
+  });
+
+  test("skips removal when the worktree has uncommitted changes", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    writeFileSync(path.join(created.cwd, "dirty.txt"), "uncommitted\n");
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live);
+    expect(result).toEqual({ removed: false, reason: "dirty" });
+    expect(existsSync(created.cwd)).toBe(true);
+    expect(existsSync(path.join(created.cwd, "dirty.txt"))).toBe(true);
+  });
+
+  test("no-op when the task never materialized a worktree", async () => {
+    const { detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo, worktreePath: null, branch: null });
+    const result = await detachWorktree(task);
+    expect(result).toEqual({ removed: false, reason: "no-worktree" });
+  });
+
+  test("no-op when the worktree dir is already gone", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+    rmSync(created.cwd, { recursive: true, force: true });
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live);
+    expect(result).toEqual({ removed: false, reason: "already-absent" });
+  });
+
+  test("detaching twice is idempotent — second call reports already-absent without throwing", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const first = await detachWorktree(live);
+    expect(first).toEqual({ removed: true });
+
+    const second = await detachWorktree(live);
+    expect(second).toEqual({ removed: false, reason: "already-absent" });
+
+    // Branch still exists throughout — detach never deletes it.
+    const branchProc = Bun.spawn(["git", "branch", "--list", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const branchOut = (await new Response(branchProc.stdout).text()).trim();
+    await branchProc.exited;
+    expect(branchOut).toContain(created.branch!);
+  });
+});

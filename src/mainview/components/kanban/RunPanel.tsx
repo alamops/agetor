@@ -1303,10 +1303,14 @@ function RunPanelBody({
           height as the textarea so they baseline together. The whole dock is
           one drop zone so dragging a screenshot anywhere over the input area
           (chips, textarea, send button gap) routes through the same capture
-          path. */}
-      {archived ? (
+          path. An archived task with a resumable run gets the same composer as
+          an idle one — the backend auto-unarchives and rematerializes the
+          worktree on send (see the inline hint below); only a genuinely
+          non-sendable archived task (no resumable run) falls back to the
+          static notice. */}
+      {archived && !canSend ? (
         <div className="shrink-0 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
-          This task is archived. Unarchive it to send messages.
+          This task is archived. Unarchive it to interact.
         </div>
       ) : activeStream !== "main" ? (
         // Background-agent streams are read-only — you can watch them but not
@@ -1343,6 +1347,16 @@ function RunPanelBody({
             onChange={setSendRefs}
             startingFolder={task.worktreePath ?? task.workdir}
           />
+          {/* Archived-but-sendable: the task has a resumable run, so the
+              composer above is fully live — but sending here has a side
+              effect (auto-unarchive + worktree restore) that a non-archived
+              idle task doesn't have, so call it out inline rather than
+              silently. */}
+          {archived && (
+            <p className="text-[10px] text-muted-foreground">
+              Sending will unarchive this task and restore its worktree.
+            </p>
+          )}
           {/* Shown once the task is sendable, OR as soon as there's something to
               stash — that's what lets "Save for later" work pre-run. */}
           {(canSend || input.trim() || sendRefs.length > 0) && (
@@ -1365,7 +1379,10 @@ function RunPanelBody({
                 <span />
               )}
               <div className="flex items-center gap-2">
-                {(input.trim() || sendRefs.length > 0) && (
+                {/* Backlog mutations are frozen server-side while archived
+                    (`backlogGuard`) — only Send (which auto-unarchives) is
+                    offered on an archived task. */}
+                {!archived && (input.trim() || sendRefs.length > 0) && (
                   <Button
                     size="sm"
                     variant="ghost"
@@ -1415,7 +1432,9 @@ function RunPanelBody({
                     // user means: stash the draft. `send()` guards both states
                     // too, so this is the only place that decides.
                     if (!canSend || modalPending) {
-                      void saveForLater();
+                      // Archived tasks can't stash drafts (server freezes the
+                      // backlog) — swallow Enter instead of surfacing a 400.
+                      if (!archived) void saveForLater();
                       return;
                     }
                     void send();

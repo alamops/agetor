@@ -144,7 +144,7 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
       codexSessionId: null,
     });
 
-    const result = sendInput(priorRunId, "still there?");
+    const result = await sendInput(priorRunId, "still there?");
     expect(result.delivered).toBe(true);
 
     // Let the fire-and-forget paste chain (queuePaste) run its course.
@@ -248,7 +248,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
       codexSessionId: null,
     });
 
-    const result = sendInput(priorRunId, "please continue");
+    const result = await sendInput(priorRunId, "please continue");
     expect(result.delivered).toBe(true);
 
     const entries = readLog(logPath);

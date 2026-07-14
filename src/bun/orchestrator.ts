@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
@@ -71,7 +72,7 @@ import {
   orphanRunningSubagents,
   attachSubagentWatcher,
 } from "./claude-subagents.ts";
-import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName, ensureUniqueBranch } from "./worktree.ts";
+import { prepareWorkdir, removeWorktree, detachWorktree, repoRoot, resolveRef, branchName, ensureUniqueBranch } from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
@@ -630,9 +631,16 @@ export function reconcileOrphans(): number {
 
 
 export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
-  const task = tasks.get(taskId);
+  let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
+
+  // Starting an archived task auto-unarchives it — otherwise the card would
+  // move through columns (running → review/ready) while hidden behind the
+  // archive filter, which is confusing at best.
+  if (task.archivedAt != null) {
+    task = tasks.update(taskId, { archivedAt: null }) ?? task;
+  }
 
   const harness = resolveHarness(task.agent);
   if (!harness) {
@@ -1130,12 +1138,45 @@ export type SendInputResult =
  *     `sendTurnInExistingSession`.
  *
  *   • codex: writes to the active run's stdin (single-run model unchanged).
+ *
+ * Archived / detached-worktree restore: a message to an archived task
+ * auto-unarchives it (sending is an unambiguous signal of continued
+ * interest), and if the task's worktree was detached (by archive) or is
+ * otherwise missing on disk, it's rematerialized via `prepareWorkdir` before
+ * dispatch — same deterministic path, branch, and history, so the resumed
+ * turn lands in the same place the agent left off. A hard restore failure
+ * (e.g. the branch was deleted or checked out elsewhere) is surfaced as a
+ * `delivered: false` result rather than silently falling back to an
+ * unisolated cwd.
  */
-export function sendInput(runId: string, line: string): SendInputResult {
+export async function sendInput(runId: string, line: string): Promise<SendInputResult> {
   const row = db.query<{ task_id: string; agent: string }, [string]>(
     `SELECT task_id, agent FROM runs WHERE id = ?`,
   ).get(runId);
   if (!row) return { delivered: false, reason: "run not found" };
+
+  const task = tasks.get(row.task_id);
+  if (!task) return { delivered: false, reason: "task not found" };
+
+  if (task.archivedAt != null) {
+    tasks.update(row.task_id, { archivedAt: null });
+  }
+
+  if (task.worktreePath && !existsSync(task.worktreePath)) {
+    // Re-fetch so the restore sees the just-cleared archivedAt (prepareWorkdir
+    // doesn't care about it, but keeping the object fresh avoids acting on a
+    // stale snapshot).
+    const fresh = tasks.get(row.task_id) ?? task;
+    try {
+      const restored = await prepareWorkdir(fresh);
+      if ("error" in restored) {
+        return { delivered: false, reason: `worktree restore failed: ${restored.error}` };
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { delivered: false, reason: `worktree restore failed: ${msg}` };
+    }
+  }
 
   const kind = resolveHarness(row.agent)?.kind;
   if (kind === "claude-code") {
@@ -1720,13 +1761,18 @@ export async function createTask(
  * Archive a finished task: stamp `archivedAt`, kill its claude tmux session
  * AND any open terminal tabs (both best-effort) so no background shell outlives
  * the user's interest in the task — once archived the card is hidden, so the
- * user can no longer reach those shells to close them. Worktree, run history,
- * and prompt stay intact for later reference.
+ * user can no longer reach those shells to close them — then **detach** the
+ * worktree from disk (`detachWorktree`): the checkout is removed to reclaim
+ * space, but the branch, every commit, the run/run_events history, and
+ * claude's external JSONL transcript all survive untouched. Sending a
+ * follow-up message or unarchiving later rematerializes the worktree at the
+ * same deterministic path (`prepareWorkdir`'s re-attach path) and resumes the
+ * conversation right where it left off.
  *
  * Only allowed when the task is in the `done` column — archive is the
  * terminal step of the explicit review → done → archive flow.
  */
-export function archiveTask(taskId: string): { task: Task } | { error: string } {
+export async function archiveTask(taskId: string): Promise<{ task: Task } | { error: string }> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.column !== "done") {
@@ -1752,24 +1798,37 @@ export function archiveTask(taskId: string): { task: Task } | { error: string } 
   if (archiveKind === "claude-code") dropSession(taskId);
   else if (archiveKind === "codex") dropCodexSession(taskId);
   codexTurnQueue.delete(taskId);
-  // Tear down terminal tabs too — same rationale as the tmux session above.
-  // Fire-and-forget (archive keeps the worktree, so there's no removal race);
-  // the synchronous part of killTerminalsForTask drops the tabs immediately,
-  // the awaited part just reaps the shells. `.catch` keeps the async function's
-  // best-effort failures from surfacing as an unhandled rejection.
-  void killTerminalsForTask(taskId).catch(() => { /* best-effort */ });
+  // Tear down terminal tabs before detaching the worktree — a live shell
+  // cwd'd inside the worktree would block `git worktree remove`, exactly like
+  // deleteTask's ordering. Awaited (not fire-and-forget) so the shells are
+  // actually gone before detachWorktree runs.
+  await killTerminalsForTask(taskId);
+  await detachWorktree(updated);
   return { task: updated };
 }
 
-/** Reverse of `archiveTask`: clear the timestamp. No tmux work — sending a
- *  follow-up message on a non-archived task already spawns a fresh session via
- *  the resume path. */
-export function unarchiveTask(taskId: string): { task: Task } | { error: string } {
+/**
+ * Reverse of `archiveTask`: clear the timestamp and, best-effort, restore the
+ * worktree if `archiveTask` detached it (or it's otherwise missing on disk).
+ * Restore failure doesn't block the unarchive — the card comes back either
+ * way; a later send/start/terminal-open retries the restore lazily.
+ */
+export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { error: string }> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.archivedAt == null) return { task };
   const updated = tasks.update(taskId, { archivedAt: null });
   if (!updated) return { error: "task not found" };
+  if (updated.worktreePath && updated.branch && !existsSync(updated.worktreePath)) {
+    try {
+      const restored = await prepareWorkdir(updated);
+      if ("error" in restored) {
+        console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}: ${restored.error}`);
+      }
+    } catch (err) {
+      console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}:`, err);
+    }
+  }
   return { task: updated };
 }
 

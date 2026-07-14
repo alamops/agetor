@@ -118,7 +118,7 @@ test("follow-up to a task whose session outlived the process resumes instead of 
       codexSessionId: null,
     });
 
-    const result = sendInput(priorRunId, "please continue");
+    const result = await sendInput(priorRunId, "please continue");
     expect(result.delivered).toBe(true);
     if (!result.delivered) throw new Error(result.reason);
 
