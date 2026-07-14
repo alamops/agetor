@@ -1831,3 +1831,197 @@ export interface BranchInfo {
  * the shape is now per-harness (multiple rows can share a `kind`).
  */
 export type AgentStatus = HarnessStatus;
+
+/**
+ * Multi-provider git-forge support (docs/plans/multi-provider-git-modal.md).
+ * `canonicalGitHost` in `src/bun/github.ts` already maps any host containing
+ * "github"/"gitlab"/"bitbucket" to the provider's cloud hostname — this is
+ * the provider identifier that maps to that canonical host 1:1.
+ */
+export type GitProvider = "github" | "gitlab" | "bitbucket";
+
+/**
+ * A resolved provider + repo identity for a project directory, as returned by
+ * `providerRepoForDir` (`src/bun/git-provider.ts`) and the `provider-info`
+ * route consumed by the GitHub/GitLab/Bitbucket dialog.
+ */
+export interface ProviderRepoInfo {
+  provider: GitProvider;
+  /** Canonical provider host, e.g. "gitlab.com" — NOT the token-store key. */
+  host: string;
+  /** Raw (pre-canonicalization) remote host — e.g. the ssh-alias host a user
+   *  pins per-identity in `~/.ssh/config`. This is the token-store key (see
+   *  `github-tokens.ts`'s host-keyed store and `docs/plans/github-multi-identity-tokens.md`) —
+   *  callers resolving a token for this repo must use `remoteHost`, not `host`. */
+  remoteHost: string;
+  owner: string;
+  name: string;
+}
+
+/**
+ * Per-provider feature flags + terminology driving the GitHub/GitLab/Bitbucket
+ * dialog's gating (Wave 4, `GitHubDialog.tsx`): affordances the selected
+ * provider doesn't support are hidden rather than shown broken. GitHub is the
+ * baseline the dialog was originally built against, so every flag is `true`
+ * there; GitLab/Bitbucket flip off whatever their APIs can't back (see the
+ * provider API facts in the plan's §2 for the source of each flag).
+ */
+export interface ProviderCaps {
+  labels: boolean;
+  milestones: boolean;
+  /** GitHub's raw search-qualifier syntax (`label:bug sort:updated`) — GitHub
+   *  only; GitLab/Bitbucket use structured filters instead. */
+  searchSyntax: boolean;
+  reviewRequestedFilter: boolean;
+  checks: boolean;
+  /** The separate GitHub commit-status panel (distinct from the CheckRuns UI,
+   *  which GitLab/Bitbucket statuses are normalized into instead). */
+  commitStatusPanel: boolean;
+  reactions: boolean;
+  draft: boolean;
+  autoMerge: boolean;
+  suggestions: boolean;
+  subIssues: boolean;
+  projects: boolean;
+  discussions: boolean;
+  actions: boolean;
+  notifications: boolean;
+  releases: boolean;
+  issueTracker: boolean;
+  requestChanges: boolean;
+  updateBranch: boolean;
+  linkedIssues: boolean;
+  commentSort: boolean;
+  lockConversation: boolean;
+  pinIssue: boolean;
+  issueTransfer: boolean;
+  mergeMethods: GitHubPullMergeMethod[];
+  providerName: string;
+  /** Singular term for a "pull request" in this provider's own terminology. */
+  pullNoun: string;
+  pullNounPlural: string;
+  pullAbbrev: string;
+  pullAbbrevPlural: string;
+}
+
+/**
+ * Per-provider capability + terminology table. GitHub is full-featured (the
+ * dialog's original baseline); GitLab and Bitbucket flip off flags for panels
+ * and actions their APIs don't support (Projects/Discussions/Actions/
+ * Notifications/Releases/Reactions/SubIssues/Suggestions/AutoMerge/
+ * UpdateBranch/LinkedIssues/CommentSort/Lock/Pin/Transfer are GitHub-only).
+ *
+ * `mergeMethods` reuses {@link GitHubPullMergeMethod} ("merge"|"squash"|"rebase")
+ * as the neutral merge-strategy vocabulary:
+ * - GitHub: merge, squash, rebase (all three, unchanged).
+ * - GitLab: merge, squash (GitLab has no rebase-as-a-merge-strategy option —
+ *   its "rebase" action rewrites the branch before merging, it isn't a merge
+ *   strategy choice like GitHub's).
+ * - Bitbucket: merge, squash, rebase — Bitbucket's three `merge_strategy`
+ *   values are `merge_commit` / `squash` / `fast_forward`. There is no
+ *   fast-forward entry in {@link GitHubPullMergeMethod}, so `fast_forward`
+ *   (a linear, no-merge-commit history — the same end result GitHub's
+ *   "rebase and merge" produces) is mapped to `"rebase"` here; the adapter
+ *   (Wave 2/T3, `src/bun/bitbucket.ts`) is responsible for translating
+ *   `"rebase"` back to `merge_strategy: "fast_forward"` on the wire.
+ */
+export const PROVIDER_CAPS: Record<GitProvider, ProviderCaps> = {
+  github: {
+    labels: true,
+    milestones: true,
+    searchSyntax: true,
+    reviewRequestedFilter: true,
+    checks: true,
+    commitStatusPanel: true,
+    reactions: true,
+    draft: true,
+    autoMerge: true,
+    suggestions: true,
+    subIssues: true,
+    projects: true,
+    discussions: true,
+    actions: true,
+    notifications: true,
+    releases: true,
+    issueTracker: true,
+    requestChanges: true,
+    updateBranch: true,
+    linkedIssues: true,
+    commentSort: true,
+    lockConversation: true,
+    pinIssue: true,
+    issueTransfer: true,
+    mergeMethods: ["merge", "squash", "rebase"],
+    providerName: "GitHub",
+    pullNoun: "Pull request",
+    pullNounPlural: "Pull requests",
+    pullAbbrev: "PR",
+    pullAbbrevPlural: "PRs",
+  },
+  gitlab: {
+    labels: true,
+    milestones: false,
+    searchSyntax: false,
+    reviewRequestedFilter: true,
+    checks: true,
+    commitStatusPanel: false,
+    reactions: false,
+    draft: true,
+    autoMerge: false,
+    suggestions: false,
+    subIssues: false,
+    projects: false,
+    discussions: false,
+    actions: false,
+    notifications: false,
+    releases: false,
+    issueTracker: true,
+    requestChanges: false,
+    updateBranch: false,
+    linkedIssues: false,
+    commentSort: false,
+    lockConversation: false,
+    pinIssue: false,
+    issueTransfer: false,
+    mergeMethods: ["merge", "squash"],
+    providerName: "GitLab",
+    pullNoun: "Merge request",
+    pullNounPlural: "Merge requests",
+    pullAbbrev: "MR",
+    pullAbbrevPlural: "MRs",
+  },
+  bitbucket: {
+    labels: false,
+    milestones: false,
+    searchSyntax: false,
+    reviewRequestedFilter: true,
+    checks: true,
+    commitStatusPanel: false,
+    reactions: false,
+    draft: true,
+    autoMerge: false,
+    suggestions: false,
+    subIssues: false,
+    projects: false,
+    discussions: false,
+    actions: false,
+    notifications: false,
+    releases: false,
+    issueTracker: true,
+    requestChanges: true,
+    updateBranch: false,
+    linkedIssues: false,
+    commentSort: false,
+    lockConversation: false,
+    pinIssue: false,
+    issueTransfer: false,
+    // merge_commit/squash/fast_forward → merge/squash/rebase; see the
+    // ProviderCaps doc comment above for the fast_forward↔"rebase" mapping.
+    mergeMethods: ["merge", "squash", "rebase"],
+    providerName: "Bitbucket",
+    pullNoun: "Pull request",
+    pullNounPlural: "Pull requests",
+    pullAbbrev: "PR",
+    pullAbbrevPlural: "PRs",
+  },
+};

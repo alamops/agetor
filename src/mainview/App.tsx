@@ -606,8 +606,8 @@ export default function App() {
             variant="ghost"
             size="icon"
             onClick={() => setGithubOpen(true)}
-            aria-label="GitHub"
-            title="GitHub pull requests and issues"
+            aria-label="Git"
+            title="Git pull requests and issues (GitHub, GitLab, Bitbucket)"
           >
             <GitPullRequest className="size-4" />
           </Button>
