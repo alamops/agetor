@@ -8,11 +8,14 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import {
+  BRANCH_TEMPLATE_TAGS,
   DEFAULT_BRANCH_CONFIG,
   TASK_TYPES,
+  branchPattern,
   buildBranchName,
   validateBranchConfig,
   validateBranchName,
+  type TaskType,
 } from "../../../shared/types.ts";
 
 interface Props {
@@ -22,6 +25,9 @@ interface Props {
   projectPath: string;
   /** Display name for the header (defaults to the path basename). */
   projectName?: string;
+  /** The task type driving the field that opened this dialog, if any — its
+   *  row is visually highlighted so the user sees which rule is in play. */
+  activeTaskType?: TaskType;
   /** Called with the saved config so the parent can refresh its preview. */
   onSaved: (config: BranchNamingConfig) => void;
 }
@@ -31,10 +37,11 @@ const EXAMPLE_TITLE = "Add login page";
 
 /**
  * Per-project branch nomenclature editor. One prefix field per task type plus a
- * global "include card slug" toggle, with a live example and git-legal
- * validation. Opened from the gear button in the New Task sidebar header.
+ * global "include card slug" toggle, with the configured pattern + a live
+ * example and git-legal validation per row, plus a tags-legend footer. Opened
+ * from the config icon button inside the New Task form's branch-name field.
  */
-export function BranchNamingDialog({ open, onClose, projectPath, projectName, onSaved }: Props) {
+export function BranchNamingDialog({ open, onClose, projectPath, projectName, activeTaskType, onSaved }: Props) {
   const [config, setConfig] = useState<BranchNamingConfig>(DEFAULT_BRANCH_CONFIG);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -109,10 +116,18 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, on
         <section className="space-y-2.5">
           {TASK_TYPES.map((t, i) => {
             const prefix = config.rules[t.id]?.prefix ?? "";
+            const pattern = branchPattern(config, t.id);
             const example = buildBranchName(config, t.id, EXAMPLE_TITLE, { token: "a1b2c3" });
             const legal = validateBranchName(example).ok;
+            const active = activeTaskType === t.id;
             return (
-              <div key={t.id} className="grid grid-cols-[4.5rem_1fr] items-center gap-2">
+              <div
+                key={t.id}
+                className={cn(
+                  "grid grid-cols-[4.5rem_1fr] items-center gap-2 rounded-md p-1 -m-1",
+                  active && "ring-1 ring-primary/50 bg-primary/5",
+                )}
+              >
                 <label className="text-xs text-muted-foreground" htmlFor={`prefix-${t.id}`}>
                   {t.label}
                 </label>
@@ -126,6 +141,9 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, on
                     spellCheck={false}
                     className="h-8 font-mono text-xs"
                   />
+                  <p className="font-mono text-[10px] text-muted-foreground">
+                    {pattern}
+                  </p>
                   <p
                     className={cn(
                       "font-mono text-[10px]",
@@ -152,6 +170,16 @@ export function BranchNamingDialog({ open, onClose, projectPath, projectName, on
             onCheckedChange={(v) => setConfig((c) => ({ ...c, includeSlug: v }))}
           />
         </label>
+
+        <p className="text-[10px] text-muted-foreground">
+          Tags are replaced when the task is created:{" "}
+          {BRANCH_TEMPLATE_TAGS.map(({ tag, description }, i) => (
+            <span key={tag}>
+              <span className="font-mono">{tag}</span> {description}
+              {i < BRANCH_TEMPLATE_TAGS.length - 1 ? " · " : "."}
+            </span>
+          ))}
+        </p>
 
         {!validation.ok && (
           <p className="text-xs text-destructive">{validation.reason}</p>
