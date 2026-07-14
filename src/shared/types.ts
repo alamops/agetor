@@ -298,26 +298,6 @@ export function slugifyBranch(s: string): string {
 }
 
 /**
- * Compose the branch name for a task from its project config + type + title.
- * `token` is a short unique suffix used as the body when no slug is available
- * (slug disabled, or an empty/symbol-only title) so the result is always a
- * non-empty branch. The assembled name is NOT re-validated here — callers that
- * accept user overrides should run {@link validateBranchName} separately, and
- * the server makes it unique within the repo before pinning it.
- */
-export function buildBranchName(
-  config: BranchNamingConfig,
-  taskType: TaskType,
-  title: string,
-  opts?: { token?: string },
-): string {
-  const rule = config.rules[taskType] ?? DEFAULT_BRANCH_CONFIG.rules[taskType] ?? { prefix: "" };
-  const slug = config.includeSlug ? slugifyBranch(title) : "";
-  const body = slug || opts?.token || "task";
-  return `${rule.prefix}${body}`;
-}
-
-/**
  * A template tag the branch-name field recognizes and substitutes. Purely
  * descriptive metadata — {@link BRANCH_TEMPLATE_TAGS} drives the helper text
  * shown under the Branch name field; the substitution logic itself lives in
@@ -339,6 +319,14 @@ export const BRANCH_TEMPLATE_TAGS: readonly BranchTemplateTag[] = [
   { tag: "<timestamp>", description: "Creation timestamp (YYYYMMDD-HHmmss)" },
   { tag: "<token>", description: "Short unique id" },
 ];
+
+/**
+ * The tags that carry the branch *body* (its per-task uniqueness). A rule
+ * value containing one of these is a full template, so {@link branchPattern}
+ * appends nothing to it; the other tags are decoration and don't suppress the
+ * appended body.
+ */
+export const BRANCH_BODY_TAGS = ["<slug>", "<token>"] as const;
 
 /** Inputs {@link renderBranchTemplate} substitutes into a template string. */
 export interface BranchTemplateContext {
@@ -413,13 +401,22 @@ export function renderBranchTemplate(template: string, ctx: BranchTemplateContex
 /**
  * The stable, tag-containing branch-name pattern for a task type — what the
  * New Task form shows before the user edits the field, and what the server
- * renders against at creation time when no override is supplied. Mirrors
- * {@link buildBranchName}'s rule-resolution fallback chain (per-type rule →
- * default config's rule for that type → empty prefix), but returns the
- * un-rendered template (`<slug>`/`<token>`) rather than a resolved body.
+ * renders against at creation time when no override is supplied. Resolves the
+ * per-type rule via the fallback chain (per-type rule → default config's rule
+ * for that type → empty prefix), then returns the un-rendered template
+ * (`<slug>`/`<token>`, `<date>`, `<type>`, …).
+ *
+ * If `rule.prefix` already contains a body tag (`<slug>` or `<token>`), it is
+ * treated as a full template and returned verbatim — an explicit `<slug>` in
+ * the prefix wins even when `config.includeSlug` is false, and nothing is
+ * appended (that would double the tag). Otherwise the body tag
+ * (`config.includeSlug ? "<slug>" : "<token>"`) is appended to the prefix as
+ * before. Non-body tags (`<date>`, `<type>`, `<project_name>`, `<timestamp>`)
+ * do not suppress the append — only `<slug>`/`<token>` count as a body.
  */
 export function branchPattern(config: BranchNamingConfig, taskType: TaskType): string {
   const rule = config.rules[taskType] ?? DEFAULT_BRANCH_CONFIG.rules[taskType] ?? { prefix: "" };
+  if (BRANCH_BODY_TAGS.some((tag) => rule.prefix.includes(tag))) return rule.prefix;
   return `${rule.prefix}${config.includeSlug ? "<slug>" : "<token>"}`;
 }
 
@@ -470,9 +467,15 @@ export function validateBranchConfig(
     if (!rule || typeof rule.prefix !== "string") {
       return { ok: false, reason: `Missing prefix for "${t.label}".` };
     }
-    // Compose the prefix with a representative body so a bare "feature/" passes
-    // but "feat ure/" (space) or "/x" (leading slash) is rejected.
-    const sample = buildBranchName(config, t.id, "example task", { token: "abc123" });
+    // Render the type's pattern through the authoritative template path so a
+    // bare "feature/" passes but "feat ure/" (space) or "/x" (leading slash)
+    // is rejected.
+    const sample = renderBranchTemplate(branchPattern(config, t.id), {
+      title: "example task",
+      projectName: "project",
+      taskType: t.id,
+      token: "abc123",
+    });
     const v = validateBranchName(sample);
     if (!v.ok) return { ok: false, reason: `"${rule.prefix}" is not a valid prefix — ${v.reason}` };
   }

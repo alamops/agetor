@@ -4,7 +4,6 @@ import {
   DEFAULT_BRANCH_CONFIG,
   branchCommitType,
   branchPattern,
-  buildBranchName,
   conventionalCommitType,
   hasBranchTemplateTags,
   renderBranchTemplate,
@@ -14,6 +13,19 @@ import {
   type BranchNamingConfig,
   type BranchTemplateContext,
 } from "./types.ts";
+
+const FIXED_NOW = new Date(2026, 6, 13, 4, 15, 2); // 2026-07-13 04:15:02 local
+
+function ctx(overrides: Partial<BranchTemplateContext> = {}): BranchTemplateContext {
+  return {
+    title: "Add login page",
+    projectName: "my-cool-app",
+    taskType: "task",
+    token: "abc123",
+    now: FIXED_NOW,
+    ...overrides,
+  };
+}
 
 describe("slugifyBranch", () => {
   test("kebab-cases and lowercases", () => {
@@ -33,27 +45,40 @@ describe("slugifyBranch", () => {
   });
 });
 
-describe("buildBranchName", () => {
-  test("prefix + title slug by task type", () => {
-    expect(buildBranchName(DEFAULT_BRANCH_CONFIG, "task", "Add login")).toBe("feature/add-login");
-    expect(buildBranchName(DEFAULT_BRANCH_CONFIG, "bug", "Broken nav")).toBe("fix/broken-nav");
-    expect(buildBranchName(DEFAULT_BRANCH_CONFIG, "spike", "Try SSE")).toBe("spike/try-sse");
+// `buildBranchName` was removed — branch composition now always flows through
+// `branchPattern` (resolve the per-type template) + `renderBranchTemplate`
+// (substitute it against a context). These tests re-express the same
+// behavioral coverage the old direct-composition helper had.
+describe("branch composition (via branchPattern + renderBranchTemplate)", () => {
+  test("default config composes prefix + title slug by task type", () => {
+    expect(renderBranchTemplate(branchPattern(DEFAULT_BRANCH_CONFIG, "task"), ctx({ title: "Add login" })))
+      .toBe("feature/add-login");
+    expect(
+      renderBranchTemplate(branchPattern(DEFAULT_BRANCH_CONFIG, "bug"), ctx({ title: "Broken nav", taskType: "bug" })),
+    ).toBe("fix/broken-nav");
+    expect(
+      renderBranchTemplate(branchPattern(DEFAULT_BRANCH_CONFIG, "spike"), ctx({ title: "Try SSE", taskType: "spike" })),
+    ).toBe("spike/try-sse");
   });
   test("falls back to the token when the slug is empty", () => {
-    expect(buildBranchName(DEFAULT_BRANCH_CONFIG, "task", "!!!", { token: "abc123" }))
-      .toBe("feature/abc123");
+    expect(
+      renderBranchTemplate(branchPattern(DEFAULT_BRANCH_CONFIG, "task"), ctx({ title: "!!!", token: "abc123" })),
+    ).toBe("feature/abc123");
   });
   test("uses the token as body when includeSlug is off", () => {
     const cfg: BranchNamingConfig = { ...DEFAULT_BRANCH_CONFIG, includeSlug: false };
-    expect(buildBranchName(cfg, "task", "Add login", { token: "abc123" })).toBe("feature/abc123");
+    expect(renderBranchTemplate(branchPattern(cfg, "task"), ctx({ title: "Add login", token: "abc123" })))
+      .toBe("feature/abc123");
   });
-  test("honors a custom prefix", () => {
+  test("honors a custom plain prefix", () => {
     const cfg: BranchNamingConfig = {
       includeSlug: true,
       rules: { task: { prefix: "features/" }, bug: { prefix: "hotfix/" }, spike: { prefix: "poc/" } },
     };
-    expect(buildBranchName(cfg, "task", "Add login")).toBe("features/add-login");
-    expect(buildBranchName(cfg, "bug", "Broken nav")).toBe("hotfix/broken-nav");
+    expect(renderBranchTemplate(branchPattern(cfg, "task"), ctx({ title: "Add login" })))
+      .toBe("features/add-login");
+    expect(renderBranchTemplate(branchPattern(cfg, "bug"), ctx({ title: "Broken nav", taskType: "bug" })))
+      .toBe("hotfix/broken-nav");
   });
 });
 
@@ -106,6 +131,27 @@ describe("validateBranchConfig", () => {
     };
     expect(validateBranchConfig(cfg).ok).toBe(false);
   });
+  test("accepts a bare prefix with no explicit tag (implicit <slug>/<token> append)", () => {
+    const cfg: BranchNamingConfig = {
+      includeSlug: true,
+      rules: { task: { prefix: "feature/" }, bug: { prefix: "fix/" }, spike: { prefix: "spike/" } },
+    };
+    expect(validateBranchConfig(cfg).ok).toBe(true);
+  });
+  test("accepts a rule whose prefix is already a full <slug> template", () => {
+    const cfg: BranchNamingConfig = {
+      includeSlug: true,
+      rules: { task: { prefix: "feature/<slug>" }, bug: { prefix: "fix/" }, spike: { prefix: "spike/" } },
+    };
+    expect(validateBranchConfig(cfg).ok).toBe(true);
+  });
+  test("rejects a <slug> template prefix containing an illegal character (rendered form is checked)", () => {
+    const cfg: BranchNamingConfig = {
+      includeSlug: true,
+      rules: { task: { prefix: "feat ure/<slug>" }, bug: { prefix: "fix/" }, spike: { prefix: "spike/" } },
+    };
+    expect(validateBranchConfig(cfg).ok).toBe(false);
+  });
 });
 
 describe("conventionalCommitType", () => {
@@ -139,19 +185,6 @@ describe("branchCommitType", () => {
     expect(branchCommitType("agetor/abc123def456-try-sse", "spike")).toBe("chore");
   });
 });
-
-const FIXED_NOW = new Date(2026, 6, 13, 4, 15, 2); // 2026-07-13 04:15:02 local
-
-function ctx(overrides: Partial<BranchTemplateContext> = {}): BranchTemplateContext {
-  return {
-    title: "Add login page",
-    projectName: "my-cool-app",
-    taskType: "task",
-    token: "abc123",
-    now: FIXED_NOW,
-    ...overrides,
-  };
-}
 
 describe("renderBranchTemplate", () => {
   test("substitutes <slug>", () => {
@@ -223,5 +256,48 @@ describe("branchPattern", () => {
       rules: { task: { prefix: "features/" } },
     } as unknown as BranchNamingConfig;
     expect(branchPattern(cfg, "bug")).toBe("fix/<slug>");
+  });
+
+  // Target spec: a prefix that already contains a body tag (<slug> or <token>)
+  // is returned verbatim — nothing is appended on top of it. This is the fix
+  // for the reported bug where a prefix like "feature/<slug>" rendered as
+  // "feature/<slug><slug>"-equivalent (double-appended body).
+  test("a prefix already containing <slug> is returned verbatim — no second <slug> appended (regression for the reported bug)", () => {
+    const cfg: BranchNamingConfig = {
+      includeSlug: true,
+      rules: { task: { prefix: "feature/<slug>" }, bug: { prefix: "fix/" }, spike: { prefix: "spike/" } },
+    };
+    expect(branchPattern(cfg, "task")).toBe("feature/<slug>");
+  });
+  test("a prefix already containing <token> is returned verbatim", () => {
+    const cfg: BranchNamingConfig = {
+      includeSlug: true,
+      rules: { task: { prefix: "wip/<token>" }, bug: { prefix: "fix/" }, spike: { prefix: "spike/" } },
+    };
+    expect(branchPattern(cfg, "task")).toBe("wip/<token>");
+  });
+  test("an explicit <slug> tag wins even when includeSlug is false", () => {
+    const cfg: BranchNamingConfig = {
+      includeSlug: false,
+      rules: { task: { prefix: "feature/<slug>" }, bug: { prefix: "fix/" }, spike: { prefix: "spike/" } },
+    };
+    expect(branchPattern(cfg, "task")).toBe("feature/<slug>");
+    expect(renderBranchTemplate(branchPattern(cfg, "task"), ctx({ title: "Add login page" })))
+      .toBe("feature/add-login-page");
+  });
+  test("a non-body tag (<date>) does not suppress the appended body tag", () => {
+    const cfg: BranchNamingConfig = {
+      includeSlug: true,
+      rules: { task: { prefix: "archive/<date>-" }, bug: { prefix: "fix/" }, spike: { prefix: "spike/" } },
+    };
+    expect(branchPattern(cfg, "task")).toBe("archive/<date>-<slug>");
+  });
+  test("end-to-end: a <slug> template prefix renders with exactly one slug substitution", () => {
+    const cfg: BranchNamingConfig = {
+      includeSlug: true,
+      rules: { task: { prefix: "feature/<slug>" }, bug: { prefix: "fix/" }, spike: { prefix: "spike/" } },
+    };
+    expect(renderBranchTemplate(branchPattern(cfg, "task"), ctx({ title: "Add login page" })))
+      .toBe("feature/add-login-page");
   });
 });
