@@ -75,6 +75,7 @@ import type {
   TerminalTab,
   UpdateStatus,
 } from "../../shared/types.ts";
+import { fetchWithRecovery } from "./net-retry.ts";
 
 export interface UpdateSnapshot {
   status: UpdateStatus;
@@ -261,26 +262,19 @@ export class ApiError extends Error {
 }
 
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`${BASE}${path}`, {
-      ...init,
-      headers: {
-        "content-type": "application/json",
-        "authorization": `Bearer ${API_TOKEN}`,
-        ...(init?.headers ?? {}),
-      },
-    });
-  } catch (e) {
-    // WebKit's bare "Load failed" tells us nothing — replace with
-    // something the user can act on.
-    const msg = (e as Error).message ?? String(e);
-    throw new Error(
-      msg === "Load failed"
-        ? `cannot reach agetor API at ${BASE} (${path}) — is the bun process running? Try restarting \`bun run dev\`.`
-        : msg,
-    );
-  }
+  // fetchWithRecovery absorbs transient socket-layer rejections (WebKit's
+  // bare "Load failed" — see net-retry.ts) via a health-gated single retry
+  // before giving up; it throws a truthful error when the server really is
+  // unreachable. HTTP error statuses still fall through to the !res.ok
+  // handling below unchanged.
+  const res = await fetchWithRecovery({ fetchImpl: fetch, base: BASE }, path, {
+    ...init,
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${API_TOKEN}`,
+      ...(init?.headers ?? {}),
+    },
+  });
   if (res.status === 204) return undefined as T;
   const body = await res.json().catch(() => null);
   if (!res.ok) {

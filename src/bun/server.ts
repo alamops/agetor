@@ -444,6 +444,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
     port: PORT,
     hostname: "127.0.0.1",
     development: false,
+    // Bun's default idleTimeout is 10s, which is far too short here: it closes
+    // idle pooled keep-alive sockets that WKWebView then reuses for a POST
+    // (CFNetwork never auto-retries on a dropped reused connection, so the
+    // webview surfaces "cannot reach agetor API"), and it kills any handler
+    // that awaits >10s before writing bytes. 255 is Bun's max; some handlers
+    // below opt out entirely via server.timeout(req, 0).
+    idleTimeout: 255,
     websocket: terminalWebSocket,
     routes: {
       // Unauthenticated probes only — never returns data.
@@ -3088,6 +3095,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return json(withRunningSubagents(updated), { headers: corsHeaders(req) });
         }),
         DELETE: authed(async (req) => {
+          // Worktree teardown (`git worktree remove` + branch delete, with an
+          // rm -rf fallback) can exceed even the 255s idleTimeout ceiling on
+          // large repos — opt this request out of idle timeout entirely.
+          server.timeout(req, 0);
           await deleteTask(req.params.id);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
         }),
@@ -3095,6 +3106,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/start": {
         POST: authed(async (req) => {
+          server.timeout(req, 0);
           const result = await startTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
@@ -3104,6 +3116,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/archive": {
         POST: authed(async (req) => {
+          server.timeout(req, 0);
           const result = await archiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
@@ -3113,6 +3126,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/unarchive": {
         POST: authed(async (req) => {
+          server.timeout(req, 0);
           const result = await unarchiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })

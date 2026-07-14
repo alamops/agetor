@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { dataDir } from "./db.ts";
@@ -768,7 +769,10 @@ export async function removeWorktree(task: Task): Promise<void> {
     task.worktreePath.startsWith(ownedPrefix)
     && existsSync(task.worktreePath)
   ) {
-    try { rmSync(task.worktreePath, { recursive: true, force: true }); }
+    // Async on purpose: a synchronous rmSync over a large worktree (e.g. one
+    // with node_modules) would block the event loop for seconds, starving
+    // every other HTTP connection and SSE stream.
+    try { await rm(task.worktreePath, { recursive: true, force: true }); }
     catch { /* best-effort */ }
   }
 }
@@ -816,7 +820,10 @@ export async function detachWorktree(
     task.worktreePath.startsWith(ownedPrefix)
     && existsSync(task.worktreePath)
   ) {
-    try { rmSync(task.worktreePath, { recursive: true, force: true }); }
+    // Async on purpose: a synchronous rmSync over a large worktree (e.g. one
+    // with node_modules) would block the event loop for seconds, starving
+    // every other HTTP connection and SSE stream.
+    try { await rm(task.worktreePath, { recursive: true, force: true }); }
     catch { /* best-effort */ }
   }
   return { removed: !existsSync(task.worktreePath) };
