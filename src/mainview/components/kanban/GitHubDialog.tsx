@@ -13,6 +13,7 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   CircleDot,
   ExternalLink,
@@ -64,6 +65,14 @@ import {
 import { cn } from "@/lib/utils";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
 import { mergeabilityView, type MergeTone } from "@/lib/mergeability";
+import {
+  backToList,
+  openDetail,
+  resolveEscape,
+  togglePanel,
+  type GitHubDialogView,
+  type GitHubPanelKind,
+} from "@/lib/github-dialog-view";
 import type {
   DiffFile,
   GitHubCheckRun,
@@ -113,7 +122,7 @@ const basename = (p: string) => {
 /** Stable per-item identity (G8, multi-repo aggregation). Item numbers are
  *  per-repo, so an aggregated list routinely holds two items with the same
  *  kind+number (repo A PR #5 and repo B PR #5). Keying anything on number alone
- *  collides — React row keys, `expandedKey`, and every per-item state map. The
+ *  collides — React row keys, the detail-view lookup, and every per-item state map. The
  *  composite key disambiguates by the item's own repo path. In single-repo mode
  *  `sourcePath` is null, so the key is exactly the historical `${kind}-${number}`
  *  — existing behavior (and tests) unchanged. */
@@ -361,6 +370,18 @@ const AGGREGATE_PROJECT_PATH = "__agetor_all_repositories__";
 // aggregate mode since they need a single concrete repo.
 const AGGREGATE_DISABLED_TITLE = "Select a single project — not available across all repositories";
 
+// Human titles for the manager-panel header (back-chevron subpage treatment),
+// keyed by `GitHubPanelKind`.
+const PANEL_TITLES: Record<GitHubPanelKind, string> = {
+  labels: "Labels",
+  milestones: "Milestones",
+  releases: "Releases",
+  notifications: "Notifications",
+  actions: "Actions",
+  projects: "Projects",
+  discussions: "Discussions",
+};
+
 /** Subtle "API: 4823/5000" (or "search: 27/30") indicator (F17). Muted by
  *  default; tints amber when remaining budget drops under 10% of the limit —
  *  the Search API's ~30/min ceiling is small enough that this can trip during
@@ -425,17 +446,14 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [reloadPending, setReloadPending] = useState(false);
   // All repo labels (powers the label datalist + the label manager).
   const [repoLabels, setRepoLabels] = useState<GitHubRepoLabel[]>([]);
-  const [labelManagerOpen, setLabelManagerOpen] = useState(false);
   // All repo milestones (powers the milestone manager).
   const [repoMilestones, setRepoMilestones] = useState<GitHubRepoMilestone[]>([]);
-  const [milestoneManagerOpen, setMilestoneManagerOpen] = useState(false);
   // All assignable repo users (powers the triage assignee picker). Convenience
   // data only — no manager UI, so failures are swallowed like labels/milestones.
   const [repoAssignees, setRepoAssignees] = useState<GitHubUser[]>([]);
   // Repo releases (F18) — powers the releases manager. Repo-scoped like
   // labels/milestones, so disabled in aggregate mode.
   const [repoReleases, setRepoReleases] = useState<GitHubRelease[]>([]);
-  const [releaseManagerOpen, setReleaseManagerOpen] = useState(false);
   // Repo tags — feeds the release manager's tag-name datalist. Lazy — only
   // fetched while the manager is open, mirroring notifications below.
   const [repoTags, setRepoTags] = useState<GitHubTag[]>([]);
@@ -443,7 +461,6 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // lazy — like notifications/tags, only fetched while the manager is open.
   const [workflowRuns, setWorkflowRuns] = useState<GitHubWorkflowRun[]>([]);
   const [workflows, setWorkflows] = useState<GitHubWorkflow[]>([]);
-  const [actionsManagerOpen, setActionsManagerOpen] = useState(false);
   const [actionsLoading, setActionsLoading] = useState(false);
   const [actionsError, setActionsError] = useState<string | null>(null);
   const actionsSeq = useRef(0);
@@ -466,7 +483,6 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // Guards both the lazy-load effect and the manual refresh so a slower fetch
   // (e.g. unread→all toggled mid-request) can't clobber a newer result.
   const notificationsSeq = useRef(0);
-  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationsLoading, setNotificationsLoading] = useState(false);
   const [notificationsError, setNotificationsError] = useState<string | null>(null);
   // false = unread only (GitHub's own default); true = all recent notifications.
@@ -498,7 +514,18 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // Bounds the self-healing re-poll when GitHub returns mergeable=null. Keyed by
   // itemKey (G8) so two same-numbered PRs across repos don't share a retry budget.
   const mergeabilityRetries = useRef<Record<string, number>>({});
-  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [view, setView] = useState<GitHubDialogView>({ kind: "list" });
+  // Derived rather than independent booleans — the 7 manager panels are
+  // mutually exclusive with each other and with the detail subpage by
+  // construction of the `GitHubDialogView` union, so there's no "close the
+  // other six" bookkeeping left to do on toggle (see `togglePanel`).
+  const labelManagerOpen = view.kind === "panel" && view.panel === "labels";
+  const milestoneManagerOpen = view.kind === "panel" && view.panel === "milestones";
+  const releaseManagerOpen = view.kind === "panel" && view.panel === "releases";
+  const notificationsOpen = view.kind === "panel" && view.panel === "notifications";
+  const actionsManagerOpen = view.kind === "panel" && view.panel === "actions";
+  const projectsManagerOpen = view.kind === "panel" && view.panel === "projects";
+  const discussionsManagerOpen = view.kind === "panel" && view.panel === "discussions";
   const [diffs, setDiffs] = useState<Record<string, TaskDiff | undefined>>({});
   const [diffLoading, setDiffLoading] = useState<Record<string, boolean | undefined>>({});
   const [diffErrors, setDiffErrors] = useState<Record<string, string | undefined>>({});
@@ -710,7 +737,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     commitsSeq.current += 1;
     linkedIssuesSeq.current += 1;
     reviewCommentSeq.current += 1;
-    setExpandedKey(null);
+    // Only pop an open detail view back to the list — a manager panel (still
+    // showing the filter controls) should survive a filter edit. Functional
+    // update so `view` doesn't need to be a dep (popping must not re-trigger
+    // this effect on its own view-driven state changes).
+    setView((cur) => (cur.kind === "detail" ? backToList() : cur));
     setDiffs({});
     setDiffLoading({});
     setDiffErrors({});
@@ -764,7 +795,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setTransferDrafts({});
     setTransferConfirm({});
     setTransferNotice(null);
-  }, [projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested, sortField, sortDirection]);
+  }, [projectPath, kind, state, effectiveQuery, searchSyntax, labels, assignee, createdByMe, assignedToMe, reviewRequested, sortField, sortDirection, aggregatePathsKey]);
 
   // "Review requested" is a PR-only qualifier — drop it when viewing issues.
   useEffect(() => {
@@ -816,9 +847,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   }, [projects, projectPath]);
 
   const expandedItem = useMemo(() => {
-    if (!expandedKey) return null;
-    return result?.items.find((item) => itemKey(item) === expandedKey) ?? null;
-  }, [expandedKey, result]);
+    if (view.kind !== "detail") return null;
+    // Re-resolve against the freshest `result.items` (by composite key) so the
+    // detail subpage reflects live updates (labels, state, …) the same way the
+    // old accordion did; fall back to the snapshot captured on navigation if
+    // the item has since dropped out of the filtered results.
+    return result?.items.find((candidate) => itemKey(candidate) === itemKey(view.item)) ?? view.item;
+  }, [view, result]);
   // Resolved path for the currently-expanded item's per-item data fetches
   // (diff/checks/mergeability/commits/linkedIssues/comments/reviewComments) —
   // falls back to `projectPath` in single-repo mode; in aggregate mode every
@@ -1318,7 +1353,6 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // decision A1: manage items + status on EXISTING projects, not creation or
   // field-schema edits.
   const [projectsV2, setProjectsV2] = useState<GitHubProjectV2[]>([]);
-  const [projectsManagerOpen, setProjectsManagerOpen] = useState(false);
   const [projectsLoading, setProjectsLoading] = useState(false);
   const [projectsError, setProjectsError] = useState<string | null>(null);
   const projectsSeq = useRef(0);
@@ -1494,7 +1528,6 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [discussions, setDiscussions] = useState<GitHubDiscussion[]>([]);
   const [discussionCategories, setDiscussionCategories] = useState<GitHubDiscussionCategory[]>([]);
   const [discussionsAuth, setDiscussionsAuth] = useState<"token" | "none">("none");
-  const [discussionsManagerOpen, setDiscussionsManagerOpen] = useState(false);
   const [discussionsLoading, setDiscussionsLoading] = useState(false);
   const [discussionsError, setDiscussionsError] = useState<string | null>(null);
   const discussionsSeq = useRef(0);
@@ -2119,21 +2152,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   // Identity is the closed PR itself (kind+number+sourcePath), not just the
   // number — in aggregate mode (G8) two repos can each have a PR #5, and only
   // the one that was actually closed should flip/drop.
+  // Routed through `upsertListItem`'s `keepIfPresent` (like reopen) so the row
+  // stays in `result.items` with its updated state even when "merged"/"closed"
+  // no longer matches the active filter (default "open") — otherwise the open
+  // detail subpage falls back to its frozen open-state navigation snapshot.
   const markPullClosed = (target: GitHubListItem, replacement?: GitHubListItem) => {
-    setResult((cur) => {
-      if (!cur) return cur;
-      let found = false;
-      const items = cur.items.flatMap((item) => {
-        if (item.kind !== "pulls" || !sameItem(item, target)) return [item];
-        found = true;
-        const next = replacement ?? { ...item, state: "closed" as const, closedAt: new Date().toISOString() };
-        return itemMatchesActiveFilters(next) ? [next] : [];
-      });
-      return {
-        ...cur,
-        items: found ? items : cur.items,
-      };
-    });
+    const next = replacement ?? { ...target, state: "closed" as const, closedAt: new Date().toISOString() };
+    upsertListItem(next, false, true);
   };
 
   const runPullReview = async (item: GitHubListItem, event: GitHubPullReviewEvent) => {
@@ -2392,7 +2417,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       // The issue no longer lives in this repo — drop it from the list rather
       // than reconciling it in place.
       setResult((cur) => cur && { ...cur, items: cur.items.filter((it) => !sameItem(it, item)) });
-      setExpandedKey((cur) => (cur === itemKey(item) ? null : cur));
+      setView((cur) => (cur.kind === "detail" && sameItem(cur.item, item) ? backToList() : cur));
       setTransferDrafts((cur) => ({ ...cur, [itemKey(item)]: "" }));
       setTransferConfirm((cur) => ({ ...cur, [itemKey(item)]: false }));
     } catch (e) {
@@ -2516,7 +2541,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
       const result = await api.updateGitHubIssue({ path: itemPath, number: item.number, state: nextState });
-      upsertListItem(result.item);
+      // Keep the row (and its updated state) visible even under a filter it no
+      // longer matches — mirrors pull merge/close and reopen so the open detail
+      // subpage reflects the close immediately instead of a frozen snapshot.
+      upsertListItem(result.item, false, true);
       setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Issue updated." }));
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
@@ -2616,49 +2644,119 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     }
   };
 
+  // Detail and panel are distinct, mutually-exclusive members of the
+  // `GitHubDialogView` union, so no defensive "is anything else open" check
+  // is needed — opening either just replaces `view`.
+  const showDetail = view.kind === "detail";
+  const isPanelView = view.kind === "panel";
+
+  const openItemDetail = (item: GitHubListItem) => {
+    setView(openDetail(item));
+  };
+  const closeDetail = () => setView(backToList());
+
   return (
     <Dialog
       open={open}
-      onClose={onClose}
+      onClose={() => {
+        if (resolveEscape(view) === "pop") {
+          closeDetail();
+          return;
+        }
+        onClose();
+      }}
       labelledBy="github-dialog-title"
       className="flex max-h-[86vh] w-full max-w-5xl flex-col p-0"
     >
       <header className="flex items-start justify-between gap-3 border-b border-border/60 p-3">
-        <div className="min-w-0">
-          <div id="github-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
-            <GitPullRequest className="size-4 shrink-0 text-muted-foreground" />
-            GitHub
+        {showDetail && expandedItem ? (
+          <div className="flex min-w-0 items-center gap-2">
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Back"
+              title="Back to list"
+              onClick={closeDetail}
+            >
+              <ChevronLeft className="size-4" />
+            </Button>
+            <div className="min-w-0">
+              <div id="github-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
+                {expandedItem.kind === "pulls" ? "Pull request" : "Issue"} #{expandedItem.number}
+                {isAggregate && repoLabelFor(expandedItem) && (
+                  <span
+                    className="rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground"
+                    title="Repository this item belongs to"
+                  >
+                    {repoLabelFor(expandedItem)}
+                  </span>
+                )}
+              </div>
+              <div className="mt-0.5 truncate text-xs text-muted-foreground">{expandedItem.title}</div>
+            </div>
           </div>
-          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 truncate text-xs text-muted-foreground">
-            {result ? (
-              <>
-                <span className="truncate">
-                  {result.repo}
-                  {result.auth === "none" && " · unauthenticated"}
-                </span>
-                {result.rateLimit && <RateLimitBadge rateLimit={result.rateLimit} />}
-              </>
-            ) : (
-              "Pull requests and issues"
-            )}
+        ) : isPanelView ? (
+          <div className="flex min-w-0 items-center gap-2">
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Back"
+              title="Back to list"
+              onClick={closeDetail}
+            >
+              <ChevronLeft className="size-4" />
+            </Button>
+            <div className="min-w-0">
+              <div id="github-dialog-title" className="text-sm font-semibold">
+                {PANEL_TITLES[view.panel]}
+              </div>
+              <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                {result ? result.repo : "GitHub"}
+              </div>
+            </div>
           </div>
-        </div>
+        ) : (
+          <div className="min-w-0">
+            <div id="github-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
+              <GitPullRequest className="size-4 shrink-0 text-muted-foreground" />
+              GitHub
+            </div>
+            <div className="mt-0.5 flex flex-wrap items-center gap-x-2 truncate text-xs text-muted-foreground">
+              {result ? (
+                <>
+                  <span className="truncate">
+                    {result.repo}
+                    {result.auth === "none" && " · unauthenticated"}
+                  </span>
+                  {result.rateLimit && <RateLimitBadge rateLimit={result.rateLimit} />}
+                </>
+              ) : (
+                "Pull requests and issues"
+              )}
+            </div>
+          </div>
+        )}
         <div className="flex shrink-0 items-center gap-2">
+          {showDetail && expandedItem && (
+            <Button
+              size="icon"
+              variant="ghost"
+              title="Open on GitHub"
+              aria-label="Open on GitHub"
+              onClick={() => { void api.openExternal(expandedItem.htmlUrl); }}
+            >
+              <ExternalLink className="size-4" />
+            </Button>
+          )}
+          {!showDetail && (
+          <>
           <Button
             size="icon"
             variant={labelManagerOpen ? "secondary" : "ghost"}
             title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage labels"}
             aria-label="Manage labels"
             disabled={!projectPath || isAggregate}
-            onClick={() => {
-              setLabelManagerOpen((v) => !v);
-              setMilestoneManagerOpen(false);
-              setReleaseManagerOpen(false);
-              setNotificationsOpen(false);
-              setActionsManagerOpen(false);
-              setProjectsManagerOpen(false);
-              setDiscussionsManagerOpen(false);
-            }}
+            onClick={() => setView((cur) => togglePanel(cur, "labels"))}
           >
             <Tag className="size-4" />
           </Button>
@@ -2668,15 +2766,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage milestones"}
             aria-label="Manage milestones"
             disabled={!projectPath || isAggregate}
-            onClick={() => {
-              setMilestoneManagerOpen((v) => !v);
-              setLabelManagerOpen(false);
-              setReleaseManagerOpen(false);
-              setNotificationsOpen(false);
-              setActionsManagerOpen(false);
-              setProjectsManagerOpen(false);
-              setDiscussionsManagerOpen(false);
-            }}
+            onClick={() => setView((cur) => togglePanel(cur, "milestones"))}
           >
             <Milestone className="size-4" />
           </Button>
@@ -2686,15 +2776,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage releases"}
             aria-label="Manage releases"
             disabled={!projectPath || isAggregate}
-            onClick={() => {
-              setReleaseManagerOpen((v) => !v);
-              setLabelManagerOpen(false);
-              setMilestoneManagerOpen(false);
-              setNotificationsOpen(false);
-              setActionsManagerOpen(false);
-              setProjectsManagerOpen(false);
-              setDiscussionsManagerOpen(false);
-            }}
+            onClick={() => setView((cur) => togglePanel(cur, "releases"))}
           >
             <Rocket className="size-4" />
           </Button>
@@ -2704,15 +2786,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Notifications"}
             aria-label="Notifications"
             disabled={!projectPath || isAggregate}
-            onClick={() => {
-              setNotificationsOpen((v) => !v);
-              setLabelManagerOpen(false);
-              setMilestoneManagerOpen(false);
-              setReleaseManagerOpen(false);
-              setActionsManagerOpen(false);
-              setProjectsManagerOpen(false);
-              setDiscussionsManagerOpen(false);
-            }}
+            onClick={() => setView((cur) => togglePanel(cur, "notifications"))}
           >
             <Bell className="size-4" />
           </Button>
@@ -2722,15 +2796,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Actions"}
             aria-label="Actions"
             disabled={!projectPath || isAggregate}
-            onClick={() => {
-              setActionsManagerOpen((v) => !v);
-              setLabelManagerOpen(false);
-              setMilestoneManagerOpen(false);
-              setReleaseManagerOpen(false);
-              setNotificationsOpen(false);
-              setProjectsManagerOpen(false);
-              setDiscussionsManagerOpen(false);
-            }}
+            onClick={() => setView((cur) => togglePanel(cur, "actions"))}
           >
             <Workflow className="size-4" />
           </Button>
@@ -2740,15 +2806,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Projects"}
             aria-label="Projects"
             disabled={!projectPath || isAggregate}
-            onClick={() => {
-              setProjectsManagerOpen((v) => !v);
-              setLabelManagerOpen(false);
-              setMilestoneManagerOpen(false);
-              setReleaseManagerOpen(false);
-              setNotificationsOpen(false);
-              setActionsManagerOpen(false);
-              setDiscussionsManagerOpen(false);
-            }}
+            onClick={() => setView((cur) => togglePanel(cur, "projects"))}
           >
             <Kanban className="size-4" />
           </Button>
@@ -2758,15 +2816,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Discussions"}
             aria-label="Discussions"
             disabled={!projectPath || isAggregate}
-            onClick={() => {
-              setDiscussionsManagerOpen((v) => !v);
-              setLabelManagerOpen(false);
-              setMilestoneManagerOpen(false);
-              setReleaseManagerOpen(false);
-              setNotificationsOpen(false);
-              setActionsManagerOpen(false);
-              setProjectsManagerOpen(false);
-            }}
+            onClick={() => setView((cur) => togglePanel(cur, "discussions"))}
           >
             <MessagesSquare className="size-4" />
           </Button>
@@ -2781,6 +2831,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               <ExternalLink className="size-4" />
             </Button>
           )}
+          </>
+          )}
           <Button
             size="icon"
             variant="ghost"
@@ -2794,6 +2846,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         </div>
       </header>
 
+      {!showDetail && (
       <div className="grid gap-2 border-b border-border/60 p-3 md:grid-cols-[minmax(0,1.2fr)_auto_auto]">
         <Select
           value={projectPath}
@@ -2955,8 +3008,173 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           })()}
         </div>
       </div>
+      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        {showDetail && expandedItem ? (
+          <GitHubItemDetail
+            item={expandedItem}
+            itemPath={expandedItemPath}
+            canPush={canPush}
+            viewerLogin={viewerLogin}
+            diff={expandedItem.kind === "pulls" ? diffs[itemKey(expandedItem)] : undefined}
+            diffLoading={expandedItem.kind === "pulls" ? !!diffLoading[itemKey(expandedItem)] : false}
+            diffError={expandedItem.kind === "pulls" ? diffErrors[itemKey(expandedItem)] : undefined}
+            checks={expandedItem.kind === "pulls" ? checks[itemKey(expandedItem)] : undefined}
+            checksLoading={expandedItem.kind === "pulls" ? !!checksLoading[itemKey(expandedItem)] : false}
+            checksError={expandedItem.kind === "pulls" ? checksErrors[itemKey(expandedItem)] : undefined}
+            commitStatus={expandedItem.kind === "pulls" ? commitStatus[itemKey(expandedItem)] : undefined}
+            commitStatusLoading={expandedItem.kind === "pulls" ? !!commitStatusLoading[itemKey(expandedItem)] : false}
+            commitStatusError={expandedItem.kind === "pulls" ? commitStatusErrors[itemKey(expandedItem)] : undefined}
+            mergeability={expandedItem.kind === "pulls" ? mergeability[itemKey(expandedItem)] : undefined}
+            mergeabilityLoading={expandedItem.kind === "pulls" ? !!mergeabilityLoading[itemKey(expandedItem)] : false}
+            mergeabilityError={expandedItem.kind === "pulls" ? mergeabilityErrors[itemKey(expandedItem)] : undefined}
+            commits={expandedItem.kind === "pulls" ? commits[itemKey(expandedItem)] : undefined}
+            commitsLoading={expandedItem.kind === "pulls" ? !!commitsLoading[itemKey(expandedItem)] : false}
+            commitsError={expandedItem.kind === "pulls" ? commitsErrors[itemKey(expandedItem)] : undefined}
+            linkedIssues={expandedItem.kind === "pulls" ? linkedIssues[itemKey(expandedItem)] : undefined}
+            reviewComments={expandedItem.kind === "pulls" ? reviewComments[itemKey(expandedItem)] : undefined}
+            reviewCommentsLoading={expandedItem.kind === "pulls" ? !!reviewCommentsLoading[itemKey(expandedItem)] : false}
+            reviewCommentError={expandedItem.kind === "pulls" ? reviewCommentErrors[itemKey(expandedItem)] : undefined}
+            reviewReplyDrafts={reviewReplyDrafts}
+            reviewReplySubmitting={reviewReplySubmitting}
+            applySuggestionBusy={applySuggestionBusy}
+            comments={comments[itemKey(expandedItem)]}
+            commentsLoading={!!commentsLoading[itemKey(expandedItem)]}
+            commentError={commentErrors[itemKey(expandedItem)]}
+            commentDraft={commentDrafts[itemKey(expandedItem)] ?? ""}
+            commentSubmitting={!!commentSubmitting[itemKey(expandedItem)]}
+            reviewDraft={reviewDrafts[itemKey(expandedItem)] ?? ""}
+            closeDraft={closeDrafts[itemKey(expandedItem)] ?? ""}
+            mergeMethod={mergeMethods[itemKey(expandedItem)] ?? "merge"}
+            actionBusy={actionBusy[itemKey(expandedItem)]}
+            actionError={actionErrors[itemKey(expandedItem)]}
+            actionMessage={actionMessages[itemKey(expandedItem)]}
+            actionSource={actionSource[itemKey(expandedItem)]}
+            repoLabels={repoLabels}
+            repoAssignees={repoAssignees}
+            repoMilestones={repoMilestones}
+            labelDraft={labelDrafts[itemKey(expandedItem)] ?? expandedItem.labels.map((label) => label.name).join(", ")}
+            assigneeDraft={assigneeDrafts[itemKey(expandedItem)] ?? expandedItem.assignees.map((a) => a.login).join(", ")}
+            milestoneDraft={milestoneDrafts[itemKey(expandedItem)] ?? (expandedItem.milestone ? String(expandedItem.milestone.number) : "")}
+            reviewerDraft={reviewerDrafts[itemKey(expandedItem)] ?? ""}
+            teamReviewerDraft={teamReviewerDrafts[itemKey(expandedItem)] ?? ""}
+            editorOpen={!!editorOpen[itemKey(expandedItem)]}
+            titleDraft={titleDrafts[itemKey(expandedItem)] ?? expandedItem.title}
+            bodyDraft={bodyDrafts[itemKey(expandedItem)] ?? expandedItem.body}
+            onEditToggle={(next) => {
+              const key = itemKey(expandedItem);
+              setEditorOpen((cur) => ({ ...cur, [key]: next }));
+              if (next) {
+                setTitleDrafts((cur) => ({ ...cur, [key]: cur[key] ?? expandedItem.title }));
+                setBodyDrafts((cur) => ({ ...cur, [key]: cur[key] ?? expandedItem.body }));
+              } else {
+                // Cancel discards the draft so reopening reflects the live item.
+                setTitleDrafts((cur) => ({ ...cur, [key]: undefined }));
+                setBodyDrafts((cur) => ({ ...cur, [key]: undefined }));
+                setActionErrors((cur) => ({ ...cur, [key]: undefined }));
+              }
+            }}
+            onTitleDraftChange={(body) => setTitleDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onBodyDraftChange={(body) => setBodyDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onSaveEdit={() => { void saveEdit(expandedItem); }}
+            onReviewerDraftChange={(body) => setReviewerDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onTeamReviewerDraftChange={(body) => setTeamReviewerDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onRequestReviewers={() => { void requestReviewers(expandedItem); }}
+            onReviewDraftChange={(body) => setReviewDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onCloseDraftChange={(body) => setCloseDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onMergeMethodChange={(method) => setMergeMethods((cur) => ({ ...cur, [itemKey(expandedItem)]: method }))}
+            onReview={(event) => { void runPullReview(expandedItem, event); }}
+            onMerge={() => { void runPullMerge(expandedItem); }}
+            onUpdateBranch={() => { void runUpdateBranch(expandedItem); }}
+            onReopenPull={() => { void runReopenPull(expandedItem); }}
+            onToggleDraft={() => { void runToggleDraft(expandedItem); }}
+            onToggleAutoMerge={() => { void runToggleAutoMerge(expandedItem); }}
+            onClosePull={() => { void runPullClose(expandedItem); }}
+            pendingReview={expandedItem.kind === "pulls" ? (pendingReview[itemKey(expandedItem)] ?? []) : []}
+            pendingStale={expandedItem.kind === "pulls" ? !!pendingStale[itemKey(expandedItem)] : false}
+            onAddToReview={(target) => addToReview(expandedItem, target)}
+            onRemovePendingReview={(index) => removePendingReview(expandedItem, index)}
+            onLineComment={(target) => submitLineComment(expandedItem, target)}
+            onReviewReplyDraftChange={(commentId, body) => setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: body }))}
+            onSubmitReviewReply={(commentId) => { void submitReviewReply(expandedItem, commentId); }}
+            reviewThreads={expandedItem.kind === "pulls" ? (reviewThreads[itemKey(expandedItem)] ?? []) : []}
+            reviewThreadsTruncated={expandedItem.kind === "pulls" ? !!reviewThreadsTruncated[itemKey(expandedItem)] : false}
+            onToggleThreadResolved={(thread) => toggleThreadResolved(expandedItem, thread)}
+            onEditReviewComment={(commentId, body) => editReviewComment(expandedItem, commentId, body)}
+            onDeleteReviewComment={(commentId) => deleteReviewComment(expandedItem, commentId)}
+            onApplySuggestion={(commentId) => { void applySuggestion(expandedItem, commentId); }}
+            onEditComment={(commentId, body) => editConversationComment(expandedItem, commentId, body)}
+            onDeleteComment={(commentId) => deleteConversationComment(expandedItem, commentId)}
+            onRetryReviewComments={() => {
+              if (expandedItem.kind !== "pulls") return;
+              setReviewCommentErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+            }}
+            onLabelDraftChange={(body) => setLabelDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onAssigneeDraftChange={(body) => setAssigneeDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onMilestoneDraftChange={(body) => setMilestoneDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onIssueState={(nextState) => { void updateIssueState(expandedItem, nextState); }}
+            onIssueLabels={() => { void updateIssueLabels(expandedItem); }}
+            lockReasonDraft={lockReasonDrafts[itemKey(expandedItem)] ?? ""}
+            onLockReasonDraftChange={(body) => setLockReasonDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onToggleLock={() => { void runToggleLock(expandedItem); }}
+            transferDraft={transferDrafts[itemKey(expandedItem)] ?? ""}
+            onTransferDraftChange={(body) => {
+              setTransferDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }));
+              setTransferConfirm((cur) => ({ ...cur, [itemKey(expandedItem)]: false }));
+            }}
+            transferConfirming={!!transferConfirm[itemKey(expandedItem)]}
+            onTransferIssue={() => { void runTransferIssue(expandedItem); }}
+            onCancelTransfer={() => setTransferConfirm((cur) => ({ ...cur, [itemKey(expandedItem)]: false }))}
+            onCommentDraftChange={(body) => setCommentDrafts((cur) => ({ ...cur, [itemKey(expandedItem)]: body }))}
+            onSubmitComment={() => { void submitComment(expandedItem); }}
+            onRetryComments={() => {
+              setCommentErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+            }}
+            onRetryDiff={() => {
+              if (expandedItem.kind !== "pulls") return;
+              setDiffErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+            }}
+            onRetryChecks={() => {
+              if (expandedItem.kind !== "pulls") return;
+              setChecksErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+            }}
+            onRetryCommitStatus={() => {
+              if (expandedItem.kind !== "pulls") return;
+              setCommitStatusErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+            }}
+            onRefreshDiff={() => {
+              if (expandedItem.kind !== "pulls") return;
+              setDiffs((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+              setDiffErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+              // A refreshed diff may renumber lines under any queued comments.
+              if ((pendingReview[itemKey(expandedItem)] ?? []).length > 0) {
+                setPendingStale((cur) => ({ ...cur, [itemKey(expandedItem)]: true }));
+              }
+            }}
+            onRefreshChecks={() => {
+              if (expandedItem.kind !== "pulls") return;
+              setChecks((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+              setChecksErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+            }}
+            onRefreshCommitStatus={() => {
+              if (expandedItem.kind !== "pulls") return;
+              setCommitStatus((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+              setCommitStatusErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+            }}
+            onRefreshMergeability={() => {
+              if (expandedItem.kind !== "pulls") return;
+              mergeabilityRetries.current[itemKey(expandedItem)] = 0;
+              setMergeability((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+              setMergeabilityErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+            }}
+            onRetryCommits={() => {
+              if (expandedItem.kind !== "pulls") return;
+              setCommitsErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+            }}
+          />
+        ) : (
+        <>
         {labelManagerOpen && (
           <LabelManager
             labels={repoLabels}
@@ -2965,7 +3183,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onEdit={editLabel}
             onDelete={removeLabel}
             onRefresh={() => { void refreshRepoLabels(); }}
-            onClose={() => setLabelManagerOpen(false)}
+            onClose={() => setView(backToList())}
           />
         )}
         {milestoneManagerOpen && (
@@ -2976,7 +3194,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onEdit={editMilestone}
             onDelete={removeMilestone}
             onRefresh={() => { void refreshRepoMilestones(); }}
-            onClose={() => setMilestoneManagerOpen(false)}
+            onClose={() => setView(backToList())}
           />
         )}
         {releaseManagerOpen && (
@@ -2988,7 +3206,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onEdit={editRelease}
             onDelete={removeRelease}
             onRefresh={() => { void refreshRepoReleases(); }}
-            onClose={() => setReleaseManagerOpen(false)}
+            onClose={() => setView(backToList())}
           />
         )}
         {notificationsOpen && (
@@ -3006,7 +3224,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onUnsubscribe={(id) => { void unsubscribeNotificationThread(id); }}
             busy={notificationBusy}
             rowErrors={notificationRowErrors}
-            onClose={() => setNotificationsOpen(false)}
+            onClose={() => setView(backToList())}
           />
         )}
         {actionsManagerOpen && (
@@ -3034,7 +3252,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             dispatchMessage={dispatchMessage}
             onDispatch={() => { void dispatchWorkflow(); }}
             onRefresh={() => { void refreshActions(); }}
-            onClose={() => setActionsManagerOpen(false)}
+            onClose={() => setView(backToList())}
           />
         )}
         {projectsManagerOpen && (
@@ -3062,7 +3280,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             onAddItem={() => { void addProjectItem(); }}
             onRefresh={() => { void refreshProjects(); }}
             onRefreshItems={() => { void refreshProjectItems(); }}
-            onClose={() => setProjectsManagerOpen(false)}
+            onClose={() => setView(backToList())}
           />
         )}
         {discussionsManagerOpen && (
@@ -3103,7 +3321,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             createError={discussionCreateError}
             onCreate={() => { void createDiscussion(); }}
             onRefresh={() => { void refreshDiscussions(); }}
-            onClose={() => setDiscussionsManagerOpen(false)}
+            onClose={() => setView(backToList())}
           />
         )}
         {kind === "pulls" && !isAggregate && (
@@ -3197,169 +3415,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               <GitHubItemRow
                 key={itemKey(item)}
                 item={item}
-                projectPath={projectPath}
                 repoBadge={isAggregate ? repoLabelFor(item) : undefined}
-                expanded={expandedKey === itemKey(item)}
-                diff={item.kind === "pulls" ? diffs[itemKey(item)] : undefined}
-                diffLoading={item.kind === "pulls" ? !!diffLoading[itemKey(item)] : false}
-                diffError={item.kind === "pulls" ? diffErrors[itemKey(item)] : undefined}
-                checks={item.kind === "pulls" ? checks[itemKey(item)] : undefined}
-                checksLoading={item.kind === "pulls" ? !!checksLoading[itemKey(item)] : false}
-                checksError={item.kind === "pulls" ? checksErrors[itemKey(item)] : undefined}
-                commitStatus={item.kind === "pulls" ? commitStatus[itemKey(item)] : undefined}
-                commitStatusLoading={item.kind === "pulls" ? !!commitStatusLoading[itemKey(item)] : false}
-                commitStatusError={item.kind === "pulls" ? commitStatusErrors[itemKey(item)] : undefined}
-                mergeability={item.kind === "pulls" ? mergeability[itemKey(item)] : undefined}
-                mergeabilityLoading={item.kind === "pulls" ? !!mergeabilityLoading[itemKey(item)] : false}
-                mergeabilityError={item.kind === "pulls" ? mergeabilityErrors[itemKey(item)] : undefined}
-                commits={item.kind === "pulls" ? commits[itemKey(item)] : undefined}
-                commitsLoading={item.kind === "pulls" ? !!commitsLoading[itemKey(item)] : false}
-                commitsError={item.kind === "pulls" ? commitsErrors[itemKey(item)] : undefined}
-                linkedIssues={item.kind === "pulls" ? linkedIssues[itemKey(item)] : undefined}
-                reviewComments={item.kind === "pulls" ? reviewComments[itemKey(item)] : undefined}
-                reviewCommentsLoading={item.kind === "pulls" ? !!reviewCommentsLoading[itemKey(item)] : false}
-                reviewCommentError={item.kind === "pulls" ? reviewCommentErrors[itemKey(item)] : undefined}
-                reviewReplyDrafts={reviewReplyDrafts}
-                reviewReplySubmitting={reviewReplySubmitting}
-                applySuggestionBusy={applySuggestionBusy}
-                comments={comments[itemKey(item)]}
-                commentsLoading={!!commentsLoading[itemKey(item)]}
-                commentError={commentErrors[itemKey(item)]}
-                commentDraft={commentDrafts[itemKey(item)] ?? ""}
-                commentSubmitting={!!commentSubmitting[itemKey(item)]}
-                reviewDraft={reviewDrafts[itemKey(item)] ?? ""}
-                closeDraft={closeDrafts[itemKey(item)] ?? ""}
-                mergeMethod={mergeMethods[itemKey(item)] ?? "merge"}
-                actionBusy={actionBusy[itemKey(item)]}
-                actionError={actionErrors[itemKey(item)]}
-                actionMessage={actionMessages[itemKey(item)]}
-                actionSource={actionSource[itemKey(item)]}
-                repoLabels={repoLabels}
-                repoAssignees={repoAssignees}
-                repoMilestones={repoMilestones}
-                labelDraft={labelDrafts[itemKey(item)] ?? item.labels.map((label) => label.name).join(", ")}
-                assigneeDraft={assigneeDrafts[itemKey(item)] ?? item.assignees.map((a) => a.login).join(", ")}
-                milestoneDraft={milestoneDrafts[itemKey(item)] ?? (item.milestone ? String(item.milestone.number) : "")}
-                reviewerDraft={reviewerDrafts[itemKey(item)] ?? ""}
-                teamReviewerDraft={teamReviewerDrafts[itemKey(item)] ?? ""}
-                editorOpen={!!editorOpen[itemKey(item)]}
-                titleDraft={titleDrafts[itemKey(item)] ?? item.title}
-                bodyDraft={bodyDrafts[itemKey(item)] ?? item.body}
-                onEditToggle={(next) => {
-                  setEditorOpen((cur) => ({ ...cur, [itemKey(item)]: next }));
-                  if (next) {
-                    setTitleDrafts((cur) => ({ ...cur, [itemKey(item)]: cur[itemKey(item)] ?? item.title }));
-                    setBodyDrafts((cur) => ({ ...cur, [itemKey(item)]: cur[itemKey(item)] ?? item.body }));
-                  } else {
-                    // Cancel discards the draft so reopening reflects the live item.
-                    setTitleDrafts((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                    setBodyDrafts((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                    setActionErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                  }
-                }}
-                onTitleDraftChange={(body) => setTitleDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onBodyDraftChange={(body) => setBodyDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onSaveEdit={() => { void saveEdit(item); }}
-                onReviewerDraftChange={(body) => setReviewerDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onTeamReviewerDraftChange={(body) => setTeamReviewerDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onRequestReviewers={() => { void requestReviewers(item); }}
-                onReviewDraftChange={(body) => setReviewDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onCloseDraftChange={(body) => setCloseDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onMergeMethodChange={(method) => setMergeMethods((cur) => ({ ...cur, [itemKey(item)]: method }))}
-                onReview={(event) => { void runPullReview(item, event); }}
-                onMerge={() => { void runPullMerge(item); }}
-                onUpdateBranch={() => { void runUpdateBranch(item); }}
-                onReopenPull={() => { void runReopenPull(item); }}
-                onToggleDraft={() => { void runToggleDraft(item); }}
-                onToggleAutoMerge={() => { void runToggleAutoMerge(item); }}
-                onClosePull={() => { void runPullClose(item); }}
-                pendingReview={item.kind === "pulls" ? (pendingReview[itemKey(item)] ?? []) : []}
-                pendingStale={item.kind === "pulls" ? !!pendingStale[itemKey(item)] : false}
-                onAddToReview={(target) => addToReview(item, target)}
-                onRemovePendingReview={(index) => removePendingReview(item, index)}
-                onLineComment={(target) => submitLineComment(item, target)}
-                onReviewReplyDraftChange={(commentId, body) => setReviewReplyDrafts((cur) => ({ ...cur, [commentId]: body }))}
-                onSubmitReviewReply={(commentId) => { void submitReviewReply(item, commentId); }}
-                viewerLogin={viewerLogin}
-                reviewThreads={item.kind === "pulls" ? (reviewThreads[itemKey(item)] ?? []) : []}
-                reviewThreadsTruncated={item.kind === "pulls" ? !!reviewThreadsTruncated[itemKey(item)] : false}
-                onToggleThreadResolved={(thread) => toggleThreadResolved(item, thread)}
-                onEditReviewComment={(commentId, body) => editReviewComment(item, commentId, body)}
-                onDeleteReviewComment={(commentId) => deleteReviewComment(item, commentId)}
-                onApplySuggestion={(commentId) => { void applySuggestion(item, commentId); }}
-                onEditComment={(commentId, body) => editConversationComment(item, commentId, body)}
-                onDeleteComment={(commentId) => deleteConversationComment(item, commentId)}
-                onRetryReviewComments={() => {
-                  if (item.kind !== "pulls") return;
-                  setReviewCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                }}
-                onLabelDraftChange={(body) => setLabelDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onAssigneeDraftChange={(body) => setAssigneeDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onMilestoneDraftChange={(body) => setMilestoneDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onIssueState={(nextState) => { void updateIssueState(item, nextState); }}
-                onIssueLabels={() => { void updateIssueLabels(item); }}
-                lockReasonDraft={lockReasonDrafts[itemKey(item)] ?? ""}
-                onLockReasonDraftChange={(body) => setLockReasonDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onToggleLock={() => { void runToggleLock(item); }}
-                transferDraft={transferDrafts[itemKey(item)] ?? ""}
-                onTransferDraftChange={(body) => {
-                  setTransferDrafts((cur) => ({ ...cur, [itemKey(item)]: body }));
-                  setTransferConfirm((cur) => ({ ...cur, [itemKey(item)]: false }));
-                }}
-                transferConfirming={!!transferConfirm[itemKey(item)]}
-                onTransferIssue={() => { void runTransferIssue(item); }}
-                onCancelTransfer={() => setTransferConfirm((cur) => ({ ...cur, [itemKey(item)]: false }))}
-                onCommentDraftChange={(body) => setCommentDrafts((cur) => ({ ...cur, [itemKey(item)]: body }))}
-                onSubmitComment={() => { void submitComment(item); }}
-                onRetryComments={() => {
-                  setCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                }}
-                onRetryDiff={() => {
-                  if (item.kind !== "pulls") return;
-                  setDiffErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                }}
-                onRetryChecks={() => {
-                  if (item.kind !== "pulls") return;
-                  setChecksErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                }}
-                onRetryCommitStatus={() => {
-                  if (item.kind !== "pulls") return;
-                  setCommitStatusErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                }}
-                onRefreshDiff={() => {
-                  if (item.kind !== "pulls") return;
-                  setDiffs((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                  setDiffErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                  // A refreshed diff may renumber lines under any queued comments.
-                  if ((pendingReview[itemKey(item)] ?? []).length > 0) {
-                    setPendingStale((cur) => ({ ...cur, [itemKey(item)]: true }));
-                  }
-                }}
-                onRefreshChecks={() => {
-                  if (item.kind !== "pulls") return;
-                  setChecks((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                  setChecksErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                }}
-                onRefreshCommitStatus={() => {
-                  if (item.kind !== "pulls") return;
-                  setCommitStatus((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                  setCommitStatusErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                }}
-                onRefreshMergeability={() => {
-                  if (item.kind !== "pulls") return;
-                  mergeabilityRetries.current[itemKey(item)] = 0;
-                  setMergeability((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                  setMergeabilityErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                }}
-                onRetryCommits={() => {
-                  if (item.kind !== "pulls") return;
-                  setCommitsErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-                }}
-                onToggle={() => {
-                  const key = itemKey(item);
-                  setExpandedKey((cur) => (cur === key ? null : key));
-                }}
-                canPush={canPush}
+                onToggle={() => openItemDetail(item)}
               />
             ))}
             {/* "Load more" is disabled in aggregate mode (G8) — each aggregate
@@ -3380,6 +3437,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
               </div>
             )}
           </div>
+        )}
+        </>
         )}
       </div>
     </Dialog>
@@ -5667,8 +5726,126 @@ function DiscussionCommentRow({
 
 function GitHubItemRow({
   item,
-  projectPath,
-  expanded,
+  repoBadge,
+  onToggle,
+}: {
+  item: GitHubListItem;
+  // Aggregate mode (G8/F15): shows a small repo badge next to the title
+  // (redundant, and hidden, in single-repo mode) so items from different
+  // repos are distinguishable in the merged list.
+  repoBadge?: string;
+  // Navigates to the detail subpage for this item (GitHubDialogView).
+  onToggle: () => void;
+}) {
+  const merged = item.kind === "pulls" && !!item.mergedAt;
+  const stateClass = item.state === "open"
+    ? "text-emerald-400"
+    : merged
+      ? "text-violet-400"
+      : "text-rose-400";
+  return (
+    <div className="rounded-md border border-border/60 bg-card">
+      <div className="flex items-start gap-3 p-3">
+        <GitPullRequest className={cn("mt-0.5 size-4 shrink-0", stateClass)} />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            <button
+              type="button"
+              className="min-w-0 truncate text-left text-sm font-medium hover:underline"
+              onClick={onToggle}
+              title="Open details"
+            >
+              #{item.number} {item.title}
+            </button>
+            {item.draft && (
+              <span className="rounded border border-border/60 px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
+                Draft
+              </span>
+            )}
+            {repoBadge && (
+              <span
+                className="rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                title="Repository this item belongs to"
+              >
+                {repoBadge}
+              </span>
+            )}
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+            <span>{merged ? "merged" : item.state}</span>
+            {item.author && <span>by {item.author.login}</span>}
+            {item.assignees.length > 0 && <span>assigned {item.assignees.map((a) => a.login).join(", ")}</span>}
+            {item.milestone && <span>milestone {item.milestone.title}</span>}
+            <span>updated {fmtDate(item.updatedAt)}</span>
+            {item.comments > 0 && (
+              <span className="inline-flex items-center gap-1">
+                <MessageSquare className="size-3" />
+                {item.comments}
+              </span>
+            )}
+          </div>
+          {item.labels.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {item.labels.map((label) => (
+                <span
+                  key={label.name}
+                  className="rounded border px-1.5 py-0.5 text-[11px]"
+                  style={{
+                    borderColor: label.color ? `#${label.color}` : undefined,
+                    backgroundColor: label.color ? `#${label.color}22` : undefined,
+                  }}
+                >
+                  {label.name}
+                </span>
+              ))}
+            </div>
+          )}
+          {item.body && (
+            <div className="markdown-body mt-2 max-h-28 overflow-hidden text-xs text-muted-foreground">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {item.body}
+              </ReactMarkdown>
+            </div>
+          )}
+        </div>
+        <Button
+          size="icon"
+          variant="ghost"
+          title="Open details"
+          aria-label={`Open details for #${item.number}`}
+          onClick={onToggle}
+        >
+          <ChevronRight className="size-4" />
+        </Button>
+        <Button
+          size="icon"
+          variant="ghost"
+          title="Open on GitHub"
+          aria-label={`Open #${item.number} on GitHub`}
+          onClick={() => { void api.openExternal(item.htmlUrl); }}
+        >
+          <ExternalLink className="size-4" />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Full-panel detail subpage for a single PR/issue (T1, replaces the old
+ * inline accordion expansion of `GitHubItemRow`). Renders the exact same
+ * content the accordion used to show — item header + Edit, linked issues,
+ * body/editor, reactions, and (kind-specific) merge/triage/checks/commits/
+ * diff/reviews or issue actions, then the conversation thread — just
+ * full-width instead of nested under a row. All data/props are threaded from
+ * `GitHubDialog`'s own per-item state maps, keyed by `itemKey(item)`, exactly
+ * as they were when passed into `GitHubItemRow`'s expanded block.
+ */
+function GitHubItemDetail({
+  item,
+  itemPath,
+  canPush,
+  viewerLogin,
   diff,
   diffLoading,
   diffError,
@@ -5738,7 +5915,6 @@ function GitHubItemRow({
   onLineComment,
   onReviewReplyDraftChange,
   onSubmitReviewReply,
-  viewerLogin,
   reviewThreads,
   reviewThreadsTruncated,
   onToggleThreadResolved,
@@ -5772,13 +5948,11 @@ function GitHubItemRow({
   onRefreshCommitStatus,
   onRefreshMergeability,
   onRetryCommits,
-  onToggle,
-  canPush,
-  repoBadge,
 }: {
   item: GitHubListItem;
-  projectPath: string;
-  expanded: boolean;
+  itemPath: string;
+  canPush: boolean;
+  viewerLogin: string;
   diff?: TaskDiff;
   diffLoading: boolean;
   diffError?: string;
@@ -5848,7 +6022,6 @@ function GitHubItemRow({
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onReviewReplyDraftChange: (commentId: number, body: string) => void;
   onSubmitReviewReply: (commentId: number) => void;
-  viewerLogin: string;
   reviewThreads: GitHubReviewThread[];
   reviewThreadsTruncated: boolean;
   onToggleThreadResolved: (thread: GitHubReviewThread) => Promise<void>;
@@ -5882,287 +6055,182 @@ function GitHubItemRow({
   onRefreshCommitStatus: () => void;
   onRefreshMergeability: () => void;
   onRetryCommits: () => void;
-  onToggle: () => void;
-  // Whether the viewer has push access to this repo (F13). Threaded down to
-  // every push-only control this row renders (merge, lock, pin, transfer,
-  // sub-issues, reviewers, triage save, apply-suggestion, …).
-  canPush: boolean;
-  // Aggregate mode (G8/F15): shows a small repo badge next to the title
-  // (redundant, and hidden, in single-repo mode) so items from different
-  // repos are distinguishable in the merged list.
-  repoBadge?: string;
 }) {
-  const merged = item.kind === "pulls" && !!item.mergedAt;
   // The item's own author may close/reopen and edit the title/body of their own
   // issue/PR without repo push access — so those specific controls gate on this
   // wider flag, while genuinely push-only actions (merge, lock, pin, transfer,
   // labels/milestones, reviewers, auto-merge) stay on `canPush` alone.
   const canModifyOwn = canPush || (!!viewerLogin && item.author?.login === viewerLogin);
-  // Per-item action path (G8, multi-repo aggregation): every api.* call this
-  // row (and everything it renders) makes resolves the item's own repo first,
-  // falling back to the dialog-level `projectPath` in single-repo mode.
-  const itemPath = item.sourcePath ?? projectPath;
-  const stateClass = item.state === "open"
-    ? "text-emerald-400"
-    : merged
-      ? "text-violet-400"
-      : "text-rose-400";
   return (
-    <div className="rounded-md border border-border/60 bg-card">
-      <div className="flex items-start gap-3 p-3">
-        <GitPullRequest className={cn("mt-0.5 size-4 shrink-0", stateClass)} />
-        <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-            <button
-              type="button"
-              className="min-w-0 truncate text-left text-sm font-medium hover:underline"
-              onClick={onToggle}
-              title="View in Agetor"
-            >
-              #{item.number} {item.title}
-            </button>
-            {item.draft && (
-              <span className="rounded border border-border/60 px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
-                Draft
-              </span>
-            )}
-            {repoBadge && (
-              <span
-                className="rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
-                title="Repository this item belongs to"
-              >
-                {repoBadge}
-              </span>
-            )}
-          </div>
-          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-            <span>{merged ? "merged" : item.state}</span>
-            {item.author && <span>by {item.author.login}</span>}
-            {item.assignees.length > 0 && <span>assigned {item.assignees.map((a) => a.login).join(", ")}</span>}
-            {item.milestone && <span>milestone {item.milestone.title}</span>}
-            <span>updated {fmtDate(item.updatedAt)}</span>
-            {item.comments > 0 && (
-              <span className="inline-flex items-center gap-1">
-                <MessageSquare className="size-3" />
-                {item.comments}
-              </span>
-            )}
-          </div>
-          {item.labels.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1">
-              {item.labels.map((label) => (
-                <span
-                  key={label.name}
-                  className="rounded border px-1.5 py-0.5 text-[11px]"
-                  style={{
-                    borderColor: label.color ? `#${label.color}` : undefined,
-                    backgroundColor: label.color ? `#${label.color}22` : undefined,
-                  }}
-                >
-                  {label.name}
-                </span>
-              ))}
-            </div>
-          )}
-          {item.body && (
-            <div className="markdown-body mt-2 max-h-28 overflow-hidden text-xs text-muted-foreground">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {item.body}
-              </ReactMarkdown>
-            </div>
-          )}
+    <div>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="text-[11px] font-medium uppercase text-muted-foreground">
+          {item.kind === "pulls" ? "Pull request" : "Issue"} #{item.number}
         </div>
-        <Button
-          size="icon"
-          variant="ghost"
-          title={expanded ? "Collapse" : "Expand"}
-          aria-label={`${expanded ? "Collapse" : "Expand"} #${item.number}`}
-          onClick={onToggle}
-        >
-          {expanded ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
-        </Button>
-        <Button
-          size="icon"
-          variant="ghost"
-          title="Open on GitHub"
-          aria-label={`Open #${item.number} on GitHub`}
-          onClick={() => { void api.openExternal(item.htmlUrl); }}
-        >
-          <ExternalLink className="size-4" />
-        </Button>
+        {!editorOpen && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7"
+            disabled={!canModifyOwn}
+            title={canModifyOwn ? undefined : PUSH_ONLY_TITLE}
+            onClick={() => onEditToggle(true)}
+          >
+            <FilePen className="mr-2 size-3.5" />
+            Edit
+          </Button>
+        )}
       </div>
-      {expanded && (
-        <div className="border-t border-border/60 bg-background/40 p-3">
-          <div className="mb-2 flex items-center justify-between gap-2">
-            <div className="text-[11px] font-medium uppercase text-muted-foreground">
-              {item.kind === "pulls" ? "Pull request" : "Issue"} #{item.number}
-            </div>
-            {!editorOpen && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7"
-                disabled={!canModifyOwn}
-                title={canModifyOwn ? undefined : PUSH_ONLY_TITLE}
-                onClick={() => onEditToggle(true)}
-              >
-                <FilePen className="mr-2 size-3.5" />
-                Edit
-              </Button>
-            )}
-          </div>
-          {item.kind === "pulls" && linkedIssues && linkedIssues.length > 0 && (
-            <LinkedIssuesLine issues={linkedIssues} />
-          )}
-          {editorOpen ? (
-            <ItemEditor
-              title={titleDraft}
-              body={bodyDraft}
-              busy={actionBusy === "edit"}
-              error={actionSource === "edit" ? actionError : undefined}
-              canSave={canModifyOwn}
-              onTitleChange={onTitleDraftChange}
-              onBodyChange={onBodyDraftChange}
-              onCancel={() => onEditToggle(false)}
-              onSave={onSaveEdit}
-            />
+      {item.kind === "pulls" && linkedIssues && linkedIssues.length > 0 && (
+        <LinkedIssuesLine issues={linkedIssues} />
+      )}
+      {editorOpen ? (
+        <ItemEditor
+          title={titleDraft}
+          body={bodyDraft}
+          busy={actionBusy === "edit"}
+          error={actionSource === "edit" ? actionError : undefined}
+          canSave={canModifyOwn}
+          onTitleChange={onTitleDraftChange}
+          onBodyChange={onBodyDraftChange}
+          onCancel={() => onEditToggle(false)}
+          onSave={onSaveEdit}
+        />
+      ) : (
+        <div className="max-h-64 overflow-y-auto rounded-md border border-border/50 bg-card px-3 py-2 text-sm">
+          {item.body ? (
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              {item.body}
+            </ReactMarkdown>
           ) : (
-            <div className="max-h-64 overflow-y-auto rounded-md border border-border/50 bg-card px-3 py-2 text-sm">
-              {item.body ? (
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {item.body}
-                </ReactMarkdown>
-              ) : (
-                <div className="text-sm italic text-muted-foreground">No description.</div>
-              )}
-            </div>
+            <div className="text-sm italic text-muted-foreground">No description.</div>
           )}
-          <Reactions path={itemPath} subject={{ type: "issue", id: item.number }} viewer={viewerLogin} />
-          {item.kind === "pulls" && (
-            <>
-              <PullActions
-                item={item}
-                reviewDraft={reviewDraft}
-                closeDraft={closeDraft}
-                mergeMethod={mergeMethod}
-                busy={actionBusy}
-                error={actionSource === "actions" ? actionError : undefined}
-                message={actionSource === "actions" ? actionMessage : undefined}
-                mergeability={mergeability}
-                mergeabilityLoading={mergeabilityLoading}
-                mergeabilityError={mergeabilityError}
-                onReviewDraftChange={onReviewDraftChange}
-                onCloseDraftChange={onCloseDraftChange}
-                onMergeMethodChange={onMergeMethodChange}
-                pendingCount={pendingReview.length}
-                onReview={onReview}
-                onMerge={onMerge}
-                onUpdateBranch={onUpdateBranch}
-                onReopenPull={onReopenPull}
-                onToggleDraft={onToggleDraft}
-                onToggleAutoMerge={onToggleAutoMerge}
-                onClosePull={onClosePull}
-                onRefreshMergeability={onRefreshMergeability}
-                canPush={canPush}
-                canModifyOwn={canModifyOwn}
-              />
-              <PullTriage
-                repoLabels={repoLabels}
-                repoAssignees={repoAssignees}
-                repoMilestones={repoMilestones}
-                labelDraft={labelDraft}
-                assigneeDraft={assigneeDraft}
-                milestoneDraft={milestoneDraft}
-                reviewerDraft={reviewerDraft}
-                teamReviewerDraft={teamReviewerDraft}
-                busy={actionBusy}
-                prOpen={item.state === "open"}
-                error={actionSource === "triage" ? actionError : undefined}
-                message={actionSource === "triage" ? actionMessage : undefined}
-                onLabelDraftChange={onLabelDraftChange}
-                onAssigneeDraftChange={onAssigneeDraftChange}
-                onMilestoneDraftChange={onMilestoneDraftChange}
-                onReviewerDraftChange={onReviewerDraftChange}
-                onTeamReviewerDraftChange={onTeamReviewerDraftChange}
-                onSaveTriage={onIssueLabels}
-                onRequestReviewers={onRequestReviewers}
-                canPush={canPush}
-              />
-              <CheckRuns checks={checks} loading={checksLoading} error={checksError} onRetry={onRetryChecks} onRefresh={onRefreshChecks} />
-              <CommitStatus status={commitStatus} loading={commitStatusLoading} error={commitStatusError} onRetry={onRetryCommitStatus} onRefresh={onRefreshCommitStatus} />
-              <PullCommits commits={commits} loading={commitsLoading} error={commitsError} onRetry={onRetryCommits} />
-              <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} />
-              <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
-              <ReviewComments
-                path={itemPath}
-                comments={reviewComments}
-                loading={reviewCommentsLoading}
-                error={reviewCommentError}
-                replyDrafts={reviewReplyDrafts}
-                replySubmitting={reviewReplySubmitting}
-                viewerLogin={viewerLogin}
-                threads={reviewThreads}
-                threadsTruncated={reviewThreadsTruncated}
-                prOpen={item.state === "open"}
-                applyBusy={applySuggestionBusy}
-                onToggleResolved={onToggleThreadResolved}
-                onEdit={onEditReviewComment}
-                onDelete={onDeleteReviewComment}
-                onApply={onApplySuggestion}
-                onDraftChange={onReviewReplyDraftChange}
-                onSubmitReply={onSubmitReviewReply}
-                onRetry={onRetryReviewComments}
-                canPush={canPush}
-                canResolveThreads={canModifyOwn}
-              />
-            </>
-          )}
-          {item.kind === "issues" && (
-            <IssueActions
-              item={item}
-              path={itemPath}
-              repoLabels={repoLabels}
-              repoAssignees={repoAssignees}
-              repoMilestones={repoMilestones}
-              labelDraft={labelDraft}
-              assigneeDraft={assigneeDraft}
-              milestoneDraft={milestoneDraft}
-              busy={actionBusy}
-              canPush={canPush}
-              canModifyOwn={canModifyOwn}
-              error={actionSource === "actions" || actionSource === "triage" ? actionError : undefined}
-              message={actionSource === "actions" || actionSource === "triage" ? actionMessage : undefined}
-              onLabelDraftChange={onLabelDraftChange}
-              onAssigneeDraftChange={onAssigneeDraftChange}
-              onMilestoneDraftChange={onMilestoneDraftChange}
-              onIssueState={onIssueState}
-              onIssueLabels={onIssueLabels}
-              lockReasonDraft={lockReasonDraft}
-              onLockReasonDraftChange={onLockReasonDraftChange}
-              onToggleLock={onToggleLock}
-              transferDraft={transferDraft}
-              onTransferDraftChange={onTransferDraftChange}
-              transferConfirming={transferConfirming}
-              onTransferIssue={onTransferIssue}
-              onCancelTransfer={onCancelTransfer}
-            />
-          )}
-          <Conversation
-            path={itemPath}
-            comments={comments}
-            loading={commentsLoading}
-            error={commentError}
-            draft={commentDraft}
-            submitting={commentSubmitting}
-            viewerLogin={viewerLogin}
-            onEdit={onEditComment}
-            onDelete={onDeleteComment}
-            onDraftChange={onCommentDraftChange}
-            onSubmit={onSubmitComment}
-            onRetry={onRetryComments}
-          />
         </div>
       )}
+      <Reactions path={itemPath} subject={{ type: "issue", id: item.number }} viewer={viewerLogin} />
+      {item.kind === "pulls" && (
+        <>
+          <PullActions
+            item={item}
+            reviewDraft={reviewDraft}
+            closeDraft={closeDraft}
+            mergeMethod={mergeMethod}
+            busy={actionBusy}
+            error={actionSource === "actions" ? actionError : undefined}
+            message={actionSource === "actions" ? actionMessage : undefined}
+            mergeability={mergeability}
+            mergeabilityLoading={mergeabilityLoading}
+            mergeabilityError={mergeabilityError}
+            onReviewDraftChange={onReviewDraftChange}
+            onCloseDraftChange={onCloseDraftChange}
+            onMergeMethodChange={onMergeMethodChange}
+            pendingCount={pendingReview.length}
+            onReview={onReview}
+            onMerge={onMerge}
+            onUpdateBranch={onUpdateBranch}
+            onReopenPull={onReopenPull}
+            onToggleDraft={onToggleDraft}
+            onToggleAutoMerge={onToggleAutoMerge}
+            onClosePull={onClosePull}
+            onRefreshMergeability={onRefreshMergeability}
+            canPush={canPush}
+            canModifyOwn={canModifyOwn}
+          />
+          <PullTriage
+            repoLabels={repoLabels}
+            repoAssignees={repoAssignees}
+            repoMilestones={repoMilestones}
+            labelDraft={labelDraft}
+            assigneeDraft={assigneeDraft}
+            milestoneDraft={milestoneDraft}
+            reviewerDraft={reviewerDraft}
+            teamReviewerDraft={teamReviewerDraft}
+            busy={actionBusy}
+            prOpen={item.state === "open"}
+            error={actionSource === "triage" ? actionError : undefined}
+            message={actionSource === "triage" ? actionMessage : undefined}
+            onLabelDraftChange={onLabelDraftChange}
+            onAssigneeDraftChange={onAssigneeDraftChange}
+            onMilestoneDraftChange={onMilestoneDraftChange}
+            onReviewerDraftChange={onReviewerDraftChange}
+            onTeamReviewerDraftChange={onTeamReviewerDraftChange}
+            onSaveTriage={onIssueLabels}
+            onRequestReviewers={onRequestReviewers}
+            canPush={canPush}
+          />
+          <CheckRuns checks={checks} loading={checksLoading} error={checksError} onRetry={onRetryChecks} onRefresh={onRefreshChecks} />
+          <CommitStatus status={commitStatus} loading={commitStatusLoading} error={commitStatusError} onRetry={onRetryCommitStatus} onRefresh={onRefreshCommitStatus} />
+          <PullCommits commits={commits} loading={commitsLoading} error={commitsError} onRetry={onRetryCommits} />
+          <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} />
+          <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
+          <ReviewComments
+            path={itemPath}
+            comments={reviewComments}
+            loading={reviewCommentsLoading}
+            error={reviewCommentError}
+            replyDrafts={reviewReplyDrafts}
+            replySubmitting={reviewReplySubmitting}
+            viewerLogin={viewerLogin}
+            threads={reviewThreads}
+            threadsTruncated={reviewThreadsTruncated}
+            prOpen={item.state === "open"}
+            applyBusy={applySuggestionBusy}
+            onToggleResolved={onToggleThreadResolved}
+            onEdit={onEditReviewComment}
+            onDelete={onDeleteReviewComment}
+            onApply={onApplySuggestion}
+            onDraftChange={onReviewReplyDraftChange}
+            onSubmitReply={onSubmitReviewReply}
+            onRetry={onRetryReviewComments}
+            canPush={canPush}
+            canResolveThreads={canModifyOwn}
+          />
+        </>
+      )}
+      {item.kind === "issues" && (
+        <IssueActions
+          item={item}
+          path={itemPath}
+          repoLabels={repoLabels}
+          repoAssignees={repoAssignees}
+          repoMilestones={repoMilestones}
+          labelDraft={labelDraft}
+          assigneeDraft={assigneeDraft}
+          milestoneDraft={milestoneDraft}
+          busy={actionBusy}
+          canPush={canPush}
+          canModifyOwn={canModifyOwn}
+          error={actionSource === "actions" || actionSource === "triage" ? actionError : undefined}
+          message={actionSource === "actions" || actionSource === "triage" ? actionMessage : undefined}
+          onLabelDraftChange={onLabelDraftChange}
+          onAssigneeDraftChange={onAssigneeDraftChange}
+          onMilestoneDraftChange={onMilestoneDraftChange}
+          onIssueState={onIssueState}
+          onIssueLabels={onIssueLabels}
+          lockReasonDraft={lockReasonDraft}
+          onLockReasonDraftChange={onLockReasonDraftChange}
+          onToggleLock={onToggleLock}
+          transferDraft={transferDraft}
+          onTransferDraftChange={onTransferDraftChange}
+          transferConfirming={transferConfirming}
+          onTransferIssue={onTransferIssue}
+          onCancelTransfer={onCancelTransfer}
+        />
+      )}
+      <Conversation
+        path={itemPath}
+        comments={comments}
+        loading={commentsLoading}
+        error={commentError}
+        draft={commentDraft}
+        submitting={commentSubmitting}
+        viewerLogin={viewerLogin}
+        onEdit={onEditComment}
+        onDelete={onDeleteComment}
+        onDraftChange={onCommentDraftChange}
+        onSubmit={onSubmitComment}
+        onRetry={onRetryComments}
+      />
     </div>
   );
 }
