@@ -8493,20 +8493,25 @@ function DiffFileBlock({
 }) {
   const meta = STATUS_META[file.status];
   const Icon = meta.icon;
+  const bodyId = `diff-file-${file.path}`;
   const [open, setOpen] = useState(true);
   return (
     <div className="border-b border-border/60 last:border-b-0">
       <div className="sticky top-0 z-10 bg-background">
         <button
           type="button"
-          className="flex w-full items-center gap-2 bg-muted/40 px-2 py-1.5 text-left"
-          onClick={() => setOpen((cur) => !cur)}
+          className="flex w-full select-text items-center gap-2 bg-muted/40 px-2 py-1.5 text-left"
+          onClick={() => {
+            if (window.getSelection()?.toString()) return;
+            setOpen((cur) => !cur);
+          }}
           aria-expanded={open}
+          aria-controls={bodyId}
         >
           {open ? (
-            <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
+            <ChevronDown aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
           ) : (
-            <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+            <ChevronRight aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
           )}
           <Icon className={cn("size-3.5 shrink-0", meta.cls)} />
           <span className="min-w-0 flex-1 truncate font-mono text-xs">
@@ -8519,18 +8524,20 @@ function DiffFileBlock({
         </button>
       </div>
       {open && (
-        file.binary ? (
-          <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>
-        ) : (
-          <>
-            <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} onAddToReview={onAddToReview} queuedKeys={queuedKeys} allowBatchReview={allowBatchReview} />
-            {file.truncated && (
-              <div className="border-t border-border/60 px-3 py-1.5 text-[11px] italic text-muted-foreground">
-                Diff truncated because this file's changes are too large to display in full.
-              </div>
-            )}
-          </>
-        )
+        <div id={bodyId}>
+          {file.binary ? (
+            <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>
+          ) : (
+            <>
+              <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} onAddToReview={onAddToReview} queuedKeys={queuedKeys} allowBatchReview={allowBatchReview} />
+              {file.truncated && (
+                <div className="border-t border-border/60 px-3 py-1.5 text-[11px] italic text-muted-foreground">
+                  Diff truncated because this file's changes are too large to display in full.
+                </div>
+              )}
+            </>
+          )}
+        </div>
       )}
     </div>
   );
