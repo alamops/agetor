@@ -772,3 +772,52 @@ export async function removeWorktree(task: Task): Promise<void> {
     catch { /* best-effort */ }
   }
 }
+
+/**
+ * Branch-preserving teardown for archive. Unlike `removeWorktree`, this keeps
+ * the branch (and thus every commit on it) intact — it only removes the
+ * worktree *checkout* from disk, so `prepareWorkdir`'s re-attach path
+ * (`task.worktreePath` recorded but the dir is gone, branch still exists) can
+ * rematerialize it later at the same deterministic path. This is what lets an
+ * archived task's session (claude JSONL, run history, codex thread id — none
+ * of which live inside the worktree) be resumed after unarchiving or after a
+ * follow-up message.
+ *
+ * No-op when there's nothing to detach: `task.worktreePath` is null, or the
+ * directory is already gone (idempotent — safe to call repeatedly).
+ *
+ * Skips removal when the worktree has uncommitted changes — `git worktree
+ * remove --force` would otherwise permanently discard them with no way back
+ * (the branch only has what was committed). `hasUncommittedChanges` returns
+ * null whenever it can't get an answer — dir gone (vanished between the two
+ * checks), path not a git repo, or `git status` failing on a broken/pruned
+ * registration; all of those are "can't confirm clean" → skip removal.
+ *
+ * Never throws — best-effort, mirroring `removeWorktree`.
+ */
+export async function detachWorktree(
+  task: Task,
+): Promise<{ removed: boolean; reason?: string }> {
+  if (!task.worktreePath) return { removed: false, reason: "no-worktree" };
+  if (!existsSync(task.worktreePath)) return { removed: false, reason: "already-absent" };
+
+  const dirty = await hasUncommittedChanges(task.worktreePath);
+  if (dirty !== false) return { removed: false, reason: "dirty" };
+
+  const root = await repoRoot(task.workdir);
+  if (root) {
+    await git(["worktree", "remove", "--force", task.worktreePath], root);
+    // Deliberately no `git branch -D` — the whole point of detach is to keep
+    // the branch around for a later re-attach.
+    await git(["worktree", "prune"], root, 10_000);
+  }
+  const ownedPrefix = WORKTREES_DIR + path.sep;
+  if (
+    task.worktreePath.startsWith(ownedPrefix)
+    && existsSync(task.worktreePath)
+  ) {
+    try { rmSync(task.worktreePath, { recursive: true, force: true }); }
+    catch { /* best-effort */ }
+  }
+  return { removed: !existsSync(task.worktreePath) };
+}

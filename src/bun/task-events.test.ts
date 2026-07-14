@@ -189,7 +189,7 @@ test("sendInput on a finished claude-code task inserts a NEW run row with status
   // through spawnResumedSession deterministically (regardless of whether a
   // stray tmux session with this name exists), which uses the fake driver
   // (AGETOR_CLAUDE_DRIVER=fake) and inserts a fresh run row.
-  const result = sendInput(firstRunId, "follow-up");
+  const result = await sendInput(firstRunId, "follow-up");
   if (!result.delivered) throw new Error(`sendInput failed: ${result.reason}`);
   expect(result.runId).not.toBe(firstRunId);
 

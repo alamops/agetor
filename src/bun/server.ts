@@ -3050,8 +3050,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       "/tasks/:id/archive": {
-        POST: authed((req) => {
-          const result = archiveTask(req.params.id);
+        POST: authed(async (req) => {
+          const result = await archiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
@@ -3059,8 +3059,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       "/tasks/:id/unarchive": {
-        POST: authed((req) => {
-          const result = unarchiveTask(req.params.id);
+        POST: authed(async (req) => {
+          const result = await unarchiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
@@ -3416,7 +3416,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               // REPL prompt before the paste lands, so it isn't eaten by the
               // dismissing modal.
               await Bun.sleep(150);
-              ok = sendInput(pending.runId, plan.text).delivered;
+              ok = (await sendInput(pending.runId, plan.text)).delivered;
             }
             // Drop the card. `resolveAskCard` also clears the session's
             // `askCardId` tracker, so if a drive FAILED and the modal is still
@@ -3615,7 +3615,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
           return json(
-            sendInput(req.params.id, line),
+            await sendInput(req.params.id, line),
             { headers: corsHeaders(req) },
           );
         }),
