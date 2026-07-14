@@ -65,7 +65,7 @@ import type {
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { tokenForHost } from "./github-tokens.ts";
 
-interface CommandResult {
+export interface CommandResult {
   ok: boolean;
   stdout: string;
   stderr: string;
@@ -79,7 +79,7 @@ interface PipedProcess {
   kill: () => void;
 }
 
-interface GitHubRepo {
+export interface GitHubRepo {
   owner: string;
   name: string;
   /** Raw (pre-canonicalization) remote host — e.g. `github-work.com` for an
@@ -526,7 +526,7 @@ const GITHUB_DIFF_BODY_CAP_BYTES = 8_000_000;
  *  unrecognized/absent value locks without a reason instead of erroring. */
 const ISSUE_LOCK_REASONS = new Set(["off-topic", "too heated", "resolved", "spam"]);
 
-async function run(cmd: string[], cwd?: string, timeoutMs = 10_000): Promise<CommandResult> {
+export async function run(cmd: string[], cwd?: string, timeoutMs = 10_000): Promise<CommandResult> {
   let proc: PipedProcess;
   try {
     proc = Bun.spawn(cmd, {
@@ -565,7 +565,7 @@ async function run(cmd: string[], cwd?: string, timeoutMs = 10_000): Promise<Com
  *  SSH keys via `~/.ssh/config` host aliases (`github-work.com`, `bitbucket-x.org`,
  *  …), so the host in a remote URL is often not the provider's real hostname.
  *  Any host containing the provider's name resolves to that provider. */
-function canonicalGitHost(host: string): string {
+export function canonicalGitHost(host: string): string {
   const lower = host.toLowerCase();
   if (lower.includes("github")) return "github.com";
   if (lower.includes("gitlab")) return "gitlab.com";
@@ -579,7 +579,7 @@ function canonicalGitHost(host: string): string {
  *  (the ssh alias itself, when one is in play) — callers that need to route a
  *  per-identity token use `rawHost`, not `host`. Returns null for local paths
  *  and anything unrecognized. */
-function parseGitRemote(raw: string): { host: string; rawHost: string; owner: string; name: string } | null {
+export function parseGitRemote(raw: string): { host: string; rawHost: string; owner: string; name: string } | null {
   const remote = raw.trim();
   if (!remote) return null;
 
@@ -817,7 +817,7 @@ export const __githubInternals = {
   privateRepoHint,
 };
 
-async function repoForDir(dir: string): Promise<GitHubRepo | null> {
+export async function repoForDir(dir: string): Promise<GitHubRepo | null> {
   if (!existsSync(dir)) return null;
   const remotes = await run(["git", "remote"], dir);
   if (!remotes.ok) return null;
@@ -853,7 +853,7 @@ export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
  *  env, (3) `gh auth token`. `host` is a required parameter (not optional) so
  *  every call site has to thread it through explicitly rather than silently
  *  falling back to the single-identity env/gh behavior this replaces. */
-async function githubToken(host: string | null): Promise<string | null> {
+export async function githubToken(host: string | null): Promise<string | null> {
   const stored = tokenForHost(host);
   if (stored) return stored;
   const envToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;

@@ -76,14 +76,9 @@ import {
   addGitHubSubIssue,
   applyGitHubSuggestion,
   cancelGitHubWorkflowRun,
-  closeGitHubPull,
-  createGitHubComment,
   createGitHubDiscussion,
-  createGitHubIssue,
-  createGitHubPull,
   createGitHubLabel,
   createGitHubMilestone,
-  createGitHubPullLineComment,
   createGitHubRelease,
   deleteGitHubComment,
   deleteGitHubDiscussion,
@@ -96,26 +91,17 @@ import {
   getGitHubDiscussion,
   getGitHubIssuePinned,
   getGitHubProjectItems,
-  getGitHubPullChecks,
   getGitHubPullLinkedIssues,
   getGitHubRepoPermissions,
   getGitHubThreadSubscription,
-  getGitHubViewer,
-  getGitHubPullDefaults,
-  getGitHubPullDiff,
   getGitHubPullMergeability,
   getGitHubPullReviewThreads,
   listGitHubAssignees,
-  listGitHubComments,
   listGitHubDiscussions,
-  listGitHubItems,
-  listGitHubItemsAcrossRepos,
-  listGitHubLabels,
   listGitHubMilestones,
   listGitHubNotifications,
   listGitHubProjectsV2,
   listGitHubPullCommits,
-  listGitHubPullReviewComments,
   listGitHubReactions,
   listGitHubReleases,
   listGitHubSubIssues,
@@ -124,15 +110,11 @@ import {
   listGitHubWorkflows,
   markAllGitHubNotificationsRead,
   markGitHubNotificationRead,
-  mergeGitHubPull,
   removeGitHubProjectItem,
   removeGitHubReaction,
   removeGitHubSubIssue,
-  reopenGitHubPull,
-  replyGitHubPullLineComment,
   requestGitHubPullReviewers,
   rerunGitHubWorkflowRun,
-  reviewGitHubPull,
   setGitHubDiscussionAnswer,
   setGitHubIssueLock,
   setGitHubIssuePinned,
@@ -144,13 +126,13 @@ import {
   transferGitHubIssue,
   unsubscribeGitHubThread,
   updateGitHubComment,
-  updateGitHubIssue,
   updateGitHubLabel,
   updateGitHubMilestone,
   updateGitHubPullBranch,
   updateGitHubRelease,
   remoteHostsForDirs,
 } from "./github.ts";
+import * as gitHost from "./git-host.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
@@ -665,7 +647,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (direction !== null && direction !== "asc" && direction !== "desc") {
             return json({ error: "direction must be asc or desc" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await listGitHubItems({
+          const result = await gitHost.listItems({
             dir,
             kind: kind as GitHubItemKind,
             state: state as GitHubItemState,
@@ -729,7 +711,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const labels = Array.isArray(body.labels)
             ? body.labels.filter((s): s is string => typeof s === "string" && s.trim().length > 0)
             : [];
-          const result = await listGitHubItemsAcrossRepos({
+          const result = await gitHost.listItemsAcrossRepos({
             dirs: paths,
             kind: kind as GitHubItemKind,
             state: state as GitHubItemState,
@@ -772,7 +754,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
             return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await getGitHubPullDiff({ dir, number });
+          const result = await gitHost.pullDiff({ dir, number });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
@@ -785,7 +767,23 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const url = new URL(req.url);
           const dir = url.searchParams.get("path");
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
-          const result = await getGitHubViewer({ dir });
+          const result = await gitHost.viewer({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Provider detection (T4, docs/plans/multi-provider-git-modal.md) — the
+      // dialog calls this before anything else to pick terminology/gating for
+      // the project's resolved provider (GitHub/GitLab/Bitbucket).
+      "/github/provider-info": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitHost.providerInfoForDir(dir);
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
@@ -798,7 +796,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const url = new URL(req.url);
           const dir = url.searchParams.get("path");
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
-          const result = await listGitHubLabels({ dir });
+          const result = await gitHost.labels({ dir });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
@@ -1220,21 +1218,29 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const url = new URL(req.url);
           const dir = url.searchParams.get("path");
           const number = Number(url.searchParams.get("number"));
+          const rawKind = url.searchParams.get("kind");
+          const kind = rawKind === "pulls" || rawKind === "issues" ? rawKind : undefined;
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
           if (!Number.isInteger(number) || number <= 0) {
             return json({ error: "valid item number required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await listGitHubComments({ dir, number });
+          const result = await gitHost.listComments({ dir, number, kind });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
           return json(result, { headers: corsHeaders(req) });
         }),
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; body?: string };
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            body?: string;
+            kind?: string;
+          };
           const dir = body.path;
           const rawNumber = body.number;
           const commentBody = body.body;
+          const kind = body.kind === "pulls" || body.kind === "issues" ? body.kind : undefined;
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
           if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
             return json({ error: "valid item number required" }, { status: 400, headers: corsHeaders(req) });
@@ -1243,10 +1249,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof commentBody !== "string" || !commentBody.trim()) {
             return json({ error: "comment body required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await createGitHubComment({
+          const result = await gitHost.createComment({
             dir,
             number,
             body: commentBody,
+            kind,
           });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
@@ -1283,7 +1290,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (body.side !== "LEFT" && body.side !== "RIGHT") {
             return json({ error: "valid comment side required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await createGitHubPullLineComment({
+          const result = await gitHost.pullLineComment({
             dir,
             number: rawNumber,
             body: body.body,
@@ -1307,7 +1314,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (!Number.isInteger(number) || number <= 0) {
             return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await listGitHubPullReviewComments({ dir, number });
+          const result = await gitHost.pullReviewComments({ dir, number });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
@@ -1372,7 +1379,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof body.body !== "string" || !body.body.trim()) {
             return json({ error: "reply body required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await replyGitHubPullLineComment({
+          const result = await gitHost.pullLineCommentReply({
             dir,
             number: rawNumber,
             commentId: rawCommentId,
@@ -1394,7 +1401,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (!Number.isInteger(number) || number <= 0) {
             return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await getGitHubPullChecks({ dir, number });
+          const result = await gitHost.pullChecks({ dir, number });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
@@ -1462,7 +1469,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
             return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await reopenGitHubPull({ dir, number: rawNumber });
+          const result = await gitHost.pullReopen({ dir, number: rawNumber });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
@@ -1559,7 +1566,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const url = new URL(req.url);
           const dir = url.searchParams.get("path");
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
-          const result = await getGitHubPullDefaults({ dir });
+          const result = await gitHost.pullDefaults({ dir });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
@@ -1589,7 +1596,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof body.base !== "string" || !body.base.trim()) {
             return json({ error: "base branch required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await createGitHubPull({
+          const result = await gitHost.pullCreate({
             dir,
             title: body.title,
             head: body.head,
@@ -1624,7 +1631,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "valid review event required" }, { status: 400, headers: corsHeaders(req) });
           }
           const event = body.event as GitHubPullReviewEvent;
-          // Inline comments are re-validated/sanitized in reviewGitHubPull; here
+          // Inline comments are re-validated/sanitized in gitHost.pullReview; here
           // we just narrow the wire shape.
           const comments = Array.isArray(body.comments)
             ? body.comments.flatMap((c) => {
@@ -1637,7 +1644,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
                 return [{ path: o.path, line: o.line, side, body: o.body }];
               })
             : undefined;
-          const result = await reviewGitHubPull({
+          const result = await gitHost.pullReview({
             dir,
             number: rawNumber,
             event,
@@ -1670,7 +1677,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "valid merge method required" }, { status: 400, headers: corsHeaders(req) });
           }
           const method = body.method as GitHubPullMergeMethod;
-          const result = await mergeGitHubPull({
+          const result = await gitHost.pullMerge({
             dir,
             number: rawNumber,
             method,
@@ -1697,7 +1704,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
             return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await closeGitHubPull({
+          const result = await gitHost.pullClose({
             dir,
             number: rawNumber,
             comment: typeof body.comment === "string" ? body.comment : undefined,
@@ -1724,7 +1731,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof body.title !== "string" || !body.title.trim()) {
             return json({ error: "issue title required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await createGitHubIssue({
+          const result = await gitHost.issueCreate({
             dir,
             title: body.title,
             body: typeof body.body === "string" ? body.body : undefined,
@@ -1761,7 +1768,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (body.state && body.state !== "open" && body.state !== "closed") {
             return json({ error: "valid issue state required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await updateGitHubIssue({
+          const result = await gitHost.issueUpdate({
             dir,
             number: rawNumber,
             kind: body.kind === "pulls" ? "pulls" : "issues",

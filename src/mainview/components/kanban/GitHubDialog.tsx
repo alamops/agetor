@@ -102,9 +102,12 @@ import type {
   GitHubUser,
   GitHubWorkflow,
   GitHubWorkflowRun,
+  GitProvider,
   Project,
+  ProviderCaps,
   TaskDiff,
 } from "../../../shared/types.ts";
+import { PROVIDER_CAPS } from "../../../shared/types.ts";
 
 interface Props {
   open: boolean;
@@ -190,6 +193,12 @@ function LabelAssigneeMilestoneFields({
   assigneeDraft,
   milestoneDraft,
   disabled,
+  // Provider gating (T5): labels are Bitbucket-unsupported (caps.labels) and
+  // milestones are GitLab/Bitbucket-unsupported (caps.milestones). Both
+  // default to `true` so every existing GitHub call site (which never passes
+  // these) renders exactly as before.
+  showLabels = true,
+  showMilestones = true,
   onLabelDraftChange,
   onAssigneeDraftChange,
   onMilestoneDraftChange,
@@ -201,6 +210,8 @@ function LabelAssigneeMilestoneFields({
   assigneeDraft: string;
   milestoneDraft: string;
   disabled?: boolean;
+  showLabels?: boolean;
+  showMilestones?: boolean;
   onLabelDraftChange: (body: string) => void;
   onAssigneeDraftChange: (body: string) => void;
   onMilestoneDraftChange: (body: string) => void;
@@ -249,7 +260,7 @@ function LabelAssigneeMilestoneFields({
 
   return (
     <>
-      {repoLabels.length > 0 ? (
+      {showLabels && (repoLabels.length > 0 ? (
         <div
           className="flex h-8 flex-wrap items-center gap-1 overflow-y-auto rounded-md border border-input bg-transparent px-1.5 py-1"
           title="Labels"
@@ -274,7 +285,7 @@ function LabelAssigneeMilestoneFields({
           className="h-8 text-xs"
           disabled={disabled}
         />
-      )}
+      ))}
       {repoAssignees.length > 0 ? (
         <div
           className="flex h-8 flex-wrap items-center gap-1 overflow-y-auto rounded-md border border-input bg-transparent px-1.5 py-1"
@@ -301,7 +312,7 @@ function LabelAssigneeMilestoneFields({
           disabled={disabled}
         />
       )}
-      {repoMilestones.length > 0 ? (
+      {showMilestones && (repoMilestones.length > 0 ? (
         <Select
           value={milestoneDraft}
           onChange={(e) => onMilestoneDraftChange(e.target.value)}
@@ -324,7 +335,7 @@ function LabelAssigneeMilestoneFields({
           className="h-8 text-xs"
           disabled={disabled}
         />
-      )}
+      ))}
     </>
   );
 }
@@ -402,6 +413,15 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [projectPath, setProjectPath] = useState("");
   // "All repositories" (G8/F15) — see AGGREGATE_PROJECT_PATH.
   const isAggregate = projectPath === AGGREGATE_PROJECT_PATH;
+  // Provider awareness (T5, docs/plans/multi-provider-git-modal.md): which git
+  // forge the current project (or, in aggregate mode, the whole registered set)
+  // resolves to. `null` while unresolved (or on lookup failure) — treated the
+  // same as "mixed" by `caps` below so the dialog never renders a half-known
+  // provider's gaps; it only ever narrows once resolution lands. Cached per
+  // project path so switching between two already-seen projects is instant and
+  // aggregate mode doesn't refetch on every render.
+  const [provider, setProvider] = useState<GitProvider | "mixed" | null>(null);
+  const providerCache = useRef<Map<string, GitProvider | null>>(new Map());
   const [kind, setKind] = useState<GitHubItemKind>("pulls");
   const [state, setState] = useState<GitHubItemState>("open");
   const [query, setQuery] = useState("");
@@ -639,6 +659,78 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     () => (isAggregate ? projects.map((p) => p.path).join("\n") : ""),
     [isAggregate, projects],
   );
+
+  // Resolve provider-info (T5) whenever the selected project (or, in aggregate
+  // mode, the candidate set) changes. Single-repo: one lookup, cached by path.
+  // Aggregate: resolve every registered project (cached individually so
+  // re-entering aggregate mode doesn't refetch already-known repos), then
+  // collapse to "github" only if every one of them is GitHub — otherwise
+  // "mixed". `provider` starts `null` each time the target changes, so a
+  // stale provider from the previously-selected project can never leak onto
+  // the next one while the new lookup is in flight.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const resolveOne = async (path: string): Promise<GitProvider | null> => {
+      const cached = providerCache.current.get(path);
+      if (cached !== undefined) return cached;
+      try {
+        const res = await api.getProviderInfo(path);
+        const resolved = res.ok ? res.provider : null;
+        providerCache.current.set(path, resolved);
+        return resolved;
+      } catch {
+        providerCache.current.set(path, null);
+        return null;
+      }
+    };
+    if (isAggregate) {
+      setProvider(null);
+      void (async () => {
+        const resolved = await Promise.all(projects.map((p) => resolveOne(p.path)));
+        if (cancelled) return;
+        setProvider(resolved.length > 0 && resolved.every((r) => r === "github") ? "github" : "mixed");
+      })();
+    } else if (projectPath) {
+      setProvider(null);
+      void resolveOne(projectPath).then((resolved) => {
+        if (!cancelled) setProvider(resolved);
+      });
+    } else {
+      setProvider(null);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [open, isAggregate, projectPath, aggregatePathsKey]);
+
+  // While unresolved (null) or in aggregate mode with mixed providers, default
+  // to GitHub's capability set so terminology/gating never flicker for the
+  // (overwhelmingly common) GitHub case during the brief lookup window.
+  const caps: ProviderCaps = provider === "mixed" || provider === null ? PROVIDER_CAPS.github : PROVIDER_CAPS[provider];
+  // GitHub-exclusive panels (Labels/Milestones/Releases/Notifications/Actions/
+  // Projects/Discussions manager buttons, per plan §8.6) require a *confirmed*
+  // GitHub repo, unlike `caps` above which defaults to GitHub's flags while
+  // unresolved — a manager panel that briefly appears then vanishes once a
+  // non-GitHub project resolves is worse than a beat of extra latency before
+  // it appears. Mixed aggregate mode has no single repo these panels could
+  // act on either way.
+  const panelsEnabled = provider === "github";
+
+  // GitLab/Bitbucket have no raw search-qualifier syntax (caps.searchSyntax) —
+  // if a provider switch lands on one of them while "GH mode" was left on from
+  // a previously-selected GitHub project, fall back to the plain substring
+  // filter rather than silently keeping the query box in a mode it can't use.
+  useEffect(() => {
+    if (!caps.searchSyntax && searchSyntax) setSearchSyntax(false);
+  }, [caps.searchSyntax, searchSyntax]);
+
+  // Same guard for the "Comments" sort option (GitHub-only, caps.commentSort)
+  // — a provider switch away from GitHub can't leave the sort stuck on an
+  // option that no longer appears in the dropdown.
+  useEffect(() => {
+    if (!caps.commentSort && sortField === "comments") setSortField("best-match");
+  }, [caps.commentSort, sortField]);
 
   // `page`/`append` power the "Load more" flow (F16): a plain refresh or a
   // filter/sort change always fetches page 1 and replaces `result`; "Load
@@ -1937,7 +2029,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     const requestId = ++commentSeq.current;
     setCommentsLoading((cur) => ({ ...cur, [key]: true }));
     setCommentErrors((cur) => ({ ...cur, [key]: undefined }));
-    api.listGitHubComments({ path: expandedItemPath, number })
+    api.listGitHubComments({ path: expandedItemPath, number, kind: expandedItem.kind })
       .then((payload) => {
         if (requestId !== commentSeq.current) return;
         setComments((cur) => ({ ...cur, [key]: payload.comments }));
@@ -1990,7 +2082,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setCommentSubmitting((cur) => ({ ...cur, [itemKey(item)]: true }));
     setCommentErrors((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
-      const { comment } = await api.createGitHubComment({ path: itemPath, number: item.number, body });
+      const { comment } = await api.createGitHubComment({ path: itemPath, number: item.number, body, kind: item.kind });
       setComments((cur) => ({ ...cur, [itemKey(item)]: [...(cur[itemKey(item)] ?? []), comment] }));
       setCommentDrafts((cur) => ({ ...cur, [itemKey(item)]: "" }));
     } catch (e) {
@@ -2611,7 +2703,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       setEditorOpen((cur) => ({ ...cur, [itemKey(item)]: false }));
       setTitleDrafts((cur) => ({ ...cur, [itemKey(item)]: undefined }));
       setBodyDrafts((cur) => ({ ...cur, [itemKey(item)]: undefined }));
-      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: `${item.kind === "pulls" ? "Pull request" : "Issue"} updated.` }));
+      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: `${item.kind === "pulls" ? caps.pullNoun : "Issue"} updated.` }));
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
@@ -2682,7 +2774,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             </Button>
             <div className="min-w-0">
               <div id="github-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
-                {expandedItem.kind === "pulls" ? "Pull request" : "Issue"} #{expandedItem.number}
+                {expandedItem.kind === "pulls" ? caps.pullNoun : "Issue"} #{expandedItem.number}
                 {isAggregate && repoLabelFor(expandedItem) && (
                   <span
                     className="rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground"
@@ -2711,7 +2803,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                 {PANEL_TITLES[view.panel]}
               </div>
               <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                {result ? result.repo : "GitHub"}
+                {result ? result.repo : caps.providerName}
               </div>
             </div>
           </div>
@@ -2719,7 +2811,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           <div className="min-w-0">
             <div id="github-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
               <GitPullRequest className="size-4 shrink-0 text-muted-foreground" />
-              GitHub
+              {provider === "mixed" ? "Git" : caps.providerName}
             </div>
             <div className="mt-0.5 flex flex-wrap items-center gap-x-2 truncate text-xs text-muted-foreground">
               {result ? (
@@ -2728,10 +2820,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
                     {result.repo}
                     {result.auth === "none" && " · unauthenticated"}
                   </span>
-                  {result.rateLimit && <RateLimitBadge rateLimit={result.rateLimit} />}
+                  {/* Rate-limit badge is GitHub API-specific (F17) — gate it so a
+                      GitLab/Bitbucket repo never renders a "GitHub API" tooltip. */}
+                  {result.rateLimit && provider === "github" && <RateLimitBadge rateLimit={result.rateLimit} />}
                 </>
               ) : (
-                "Pull requests and issues"
+                `${caps.pullNounPlural} and issues`
               )}
             </div>
           </div>
@@ -2741,8 +2835,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             <Button
               size="icon"
               variant="ghost"
-              title="Open on GitHub"
-              aria-label="Open on GitHub"
+              title={`Open on ${caps.providerName}`}
+              aria-label={`Open on ${caps.providerName}`}
               onClick={() => { void api.openExternal(expandedItem.htmlUrl); }}
             >
               <ExternalLink className="size-4" />
@@ -2750,82 +2844,96 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
           )}
           {!showDetail && (
           <>
-          <Button
-            size="icon"
-            variant={labelManagerOpen ? "secondary" : "ghost"}
-            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage labels"}
-            aria-label="Manage labels"
-            disabled={!projectPath || isAggregate}
-            onClick={() => setView((cur) => togglePanel(cur, "labels"))}
-          >
-            <Tag className="size-4" />
-          </Button>
-          <Button
-            size="icon"
-            variant={milestoneManagerOpen ? "secondary" : "ghost"}
-            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage milestones"}
-            aria-label="Manage milestones"
-            disabled={!projectPath || isAggregate}
-            onClick={() => setView((cur) => togglePanel(cur, "milestones"))}
-          >
-            <Milestone className="size-4" />
-          </Button>
-          <Button
-            size="icon"
-            variant={releaseManagerOpen ? "secondary" : "ghost"}
-            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage releases"}
-            aria-label="Manage releases"
-            disabled={!projectPath || isAggregate}
-            onClick={() => setView((cur) => togglePanel(cur, "releases"))}
-          >
-            <Rocket className="size-4" />
-          </Button>
-          <Button
-            size="icon"
-            variant={notificationsOpen ? "secondary" : "ghost"}
-            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Notifications"}
-            aria-label="Notifications"
-            disabled={!projectPath || isAggregate}
-            onClick={() => setView((cur) => togglePanel(cur, "notifications"))}
-          >
-            <Bell className="size-4" />
-          </Button>
-          <Button
-            size="icon"
-            variant={actionsManagerOpen ? "secondary" : "ghost"}
-            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Actions"}
-            aria-label="Actions"
-            disabled={!projectPath || isAggregate}
-            onClick={() => setView((cur) => togglePanel(cur, "actions"))}
-          >
-            <Workflow className="size-4" />
-          </Button>
-          <Button
-            size="icon"
-            variant={projectsManagerOpen ? "secondary" : "ghost"}
-            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Projects"}
-            aria-label="Projects"
-            disabled={!projectPath || isAggregate}
-            onClick={() => setView((cur) => togglePanel(cur, "projects"))}
-          >
-            <Kanban className="size-4" />
-          </Button>
-          <Button
-            size="icon"
-            variant={discussionsManagerOpen ? "secondary" : "ghost"}
-            title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Discussions"}
-            aria-label="Discussions"
-            disabled={!projectPath || isAggregate}
-            onClick={() => setView((cur) => togglePanel(cur, "discussions"))}
-          >
-            <MessagesSquare className="size-4" />
-          </Button>
+          {panelsEnabled && caps.labels && (
+            <Button
+              size="icon"
+              variant={labelManagerOpen ? "secondary" : "ghost"}
+              title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage labels"}
+              aria-label="Manage labels"
+              disabled={!projectPath || isAggregate}
+              onClick={() => setView((cur) => togglePanel(cur, "labels"))}
+            >
+              <Tag className="size-4" />
+            </Button>
+          )}
+          {panelsEnabled && caps.milestones && (
+            <Button
+              size="icon"
+              variant={milestoneManagerOpen ? "secondary" : "ghost"}
+              title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage milestones"}
+              aria-label="Manage milestones"
+              disabled={!projectPath || isAggregate}
+              onClick={() => setView((cur) => togglePanel(cur, "milestones"))}
+            >
+              <Milestone className="size-4" />
+            </Button>
+          )}
+          {panelsEnabled && caps.releases && (
+            <Button
+              size="icon"
+              variant={releaseManagerOpen ? "secondary" : "ghost"}
+              title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Manage releases"}
+              aria-label="Manage releases"
+              disabled={!projectPath || isAggregate}
+              onClick={() => setView((cur) => togglePanel(cur, "releases"))}
+            >
+              <Rocket className="size-4" />
+            </Button>
+          )}
+          {panelsEnabled && caps.notifications && (
+            <Button
+              size="icon"
+              variant={notificationsOpen ? "secondary" : "ghost"}
+              title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Notifications"}
+              aria-label="Notifications"
+              disabled={!projectPath || isAggregate}
+              onClick={() => setView((cur) => togglePanel(cur, "notifications"))}
+            >
+              <Bell className="size-4" />
+            </Button>
+          )}
+          {panelsEnabled && caps.actions && (
+            <Button
+              size="icon"
+              variant={actionsManagerOpen ? "secondary" : "ghost"}
+              title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Actions"}
+              aria-label="Actions"
+              disabled={!projectPath || isAggregate}
+              onClick={() => setView((cur) => togglePanel(cur, "actions"))}
+            >
+              <Workflow className="size-4" />
+            </Button>
+          )}
+          {panelsEnabled && caps.projects && (
+            <Button
+              size="icon"
+              variant={projectsManagerOpen ? "secondary" : "ghost"}
+              title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Projects"}
+              aria-label="Projects"
+              disabled={!projectPath || isAggregate}
+              onClick={() => setView((cur) => togglePanel(cur, "projects"))}
+            >
+              <Kanban className="size-4" />
+            </Button>
+          )}
+          {panelsEnabled && caps.discussions && (
+            <Button
+              size="icon"
+              variant={discussionsManagerOpen ? "secondary" : "ghost"}
+              title={isAggregate ? AGGREGATE_DISABLED_TITLE : "Discussions"}
+              aria-label="Discussions"
+              disabled={!projectPath || isAggregate}
+              onClick={() => setView((cur) => togglePanel(cur, "discussions"))}
+            >
+              <MessagesSquare className="size-4" />
+            </Button>
+          )}
           {result && result.webUrl && (
             <Button
               size="icon"
               variant="ghost"
-              title="Open repository on GitHub"
-              aria-label="Open repository on GitHub"
+              title={`Open repository on ${caps.providerName}`}
+              aria-label={`Open repository on ${caps.providerName}`}
               onClick={() => { void api.openExternal(result.webUrl!); }}
             >
               <ExternalLink className="size-4" />
@@ -2868,7 +2976,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             className="h-7"
             onClick={() => setKind("pulls")}
           >
-            PRs
+            {caps.pullAbbrevPlural}
           </Button>
           <Button
             size="sm"
@@ -2904,32 +3012,36 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             placeholder={searchSyntax ? "GitHub search — press Enter (is:open label:bug sort:updated…)" : "Search title, body, number, author…"}
             className="h-8 pl-8 pr-14 text-xs"
           />
-          <Button
-            size="sm"
-            variant={searchSyntax ? "secondary" : "ghost"}
-            className="absolute right-1 top-1/2 h-6 -translate-y-1/2 px-2 text-[10px] font-medium uppercase"
-            disabled={result?.auth === "none"}
-            title={
-              result?.auth === "none"
-                ? "Sign in to GitHub to use search syntax"
-                : "Toggle GitHub search syntax (is:open author:me label:bug sort:updated…) — runs server-side via the Search API on Enter"
-            }
-            onClick={() => {
-              const next = !searchSyntax;
-              setSearchSyntax(next);
-              if (next) setSearchSubmitted(query);
-            }}
-          >
-            GH
-          </Button>
+          {caps.searchSyntax && (
+            <Button
+              size="sm"
+              variant={searchSyntax ? "secondary" : "ghost"}
+              className="absolute right-1 top-1/2 h-6 -translate-y-1/2 px-2 text-[10px] font-medium uppercase"
+              disabled={result?.auth === "none"}
+              title={
+                result?.auth === "none"
+                  ? "Sign in to GitHub to use search syntax"
+                  : "Toggle GitHub search syntax (is:open author:me label:bug sort:updated…) — runs server-side via the Search API on Enter"
+              }
+              onClick={() => {
+                const next = !searchSyntax;
+                setSearchSyntax(next);
+                if (next) setSearchSubmitted(query);
+              }}
+            >
+              GH
+            </Button>
+          )}
         </div>
-        <Input
-          value={labels}
-          onChange={(e) => setLabels(e.target.value)}
-          placeholder="Labels, comma separated"
-          className="h-8 text-xs"
-          list="github-dialog-labels"
-        />
+        {caps.labels && (
+          <Input
+            value={labels}
+            onChange={(e) => setLabels(e.target.value)}
+            placeholder="Labels, comma separated"
+            className="h-8 text-xs"
+            list="github-dialog-labels"
+          />
+        )}
         <Input
           value={assignee}
           onChange={(e) => setAssignee(e.target.value)}
@@ -2948,7 +3060,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
             <option value="best-match">Best match</option>
             <option value="created">Created</option>
             <option value="updated">Updated</option>
-            <option value="comments">Comments</option>
+            {caps.commentSort && <option value="comments">Comments</option>}
           </Select>
           <Button
             size="icon"
@@ -3014,6 +3126,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         {showDetail && expandedItem ? (
           <GitHubItemDetail
             item={expandedItem}
+            caps={caps}
+            provider={provider}
             itemPath={expandedItemPath}
             canPush={canPush}
             viewerLogin={viewerLogin}
@@ -3326,6 +3440,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         )}
         {kind === "pulls" && !isAggregate && (
           <PullComposer
+            caps={caps}
             open={pullComposerOpen}
             title={newPullTitle}
             body={newPullBody}
@@ -3352,6 +3467,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
 
         {kind === "issues" && !isAggregate && (
           <IssueComposer
+            caps={caps}
             open={issueComposerOpen}
             title={newIssueTitle}
             body={newIssueBody}
@@ -3402,19 +3518,20 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         {!loading && !error && result && result.items.length === 0 && (
           <div className="flex flex-col items-center justify-center gap-2 py-12 text-center text-sm text-muted-foreground">
             <GitPullRequest className="size-6 opacity-40" />
-            No {kind === "pulls" ? "pull requests" : "issues"} match these filters.
+            No {kind === "pulls" ? caps.pullNounPlural.toLowerCase() : "issues"} match these filters.
           </div>
         )}
 
         {result && result.items.length > 0 && (
           <div className="flex flex-col gap-2">
             <div className="px-1 text-xs text-muted-foreground">
-              {result.items.length} {kind === "pulls" ? "pull requests" : "issues"}
+              {result.items.length} {kind === "pulls" ? caps.pullNounPlural.toLowerCase() : "issues"}
             </div>
             {result.items.map((item) => (
               <GitHubItemRow
                 key={itemKey(item)}
                 item={item}
+                caps={caps}
                 repoBadge={isAggregate ? repoLabelFor(item) : undefined}
                 onToggle={() => openItemDetail(item)}
               />
@@ -3446,6 +3563,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
 }
 
 function PullComposer({
+  caps,
   open,
   title,
   body,
@@ -3468,6 +3586,7 @@ function PullComposer({
   onPushHead,
   onSubmit,
 }: {
+  caps: ProviderCaps;
   open: boolean;
   title: string;
   body: string;
@@ -3495,7 +3614,7 @@ function PullComposer({
       <div className="mb-3 flex justify-end">
         <Button size="sm" onClick={() => onOpenChange(true)}>
           <Plus className="mr-2 size-3.5" />
-          New PR
+          New {caps.pullAbbrev}
         </Button>
       </div>
     );
@@ -3506,7 +3625,7 @@ function PullComposer({
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
           <GitPullRequest className="size-3.5" />
-          New pull request
+          New {caps.pullNoun.toLowerCase()}
         </div>
         {error && (
           <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
@@ -3559,7 +3678,7 @@ function PullComposer({
             variant="outline"
             disabled={submitting || pushing || !head.trim()}
             onClick={onPushHead}
-            title="Push the head branch to its remote so GitHub can open the pull request"
+            title={`Push the head branch to its remote so ${caps.providerName} can open the ${caps.pullNoun.toLowerCase()}`}
           >
             {pushing ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <ArrowUpFromLine className="mr-2 size-3.5" />}
             Push head
@@ -3578,7 +3697,7 @@ function PullComposer({
           )}
         </div>
         <p className="text-[11px] text-muted-foreground">
-          The head branch must exist on the remote before GitHub can open the pull request — push it first if it's a new local branch.
+          The head branch must exist on the remote before {caps.providerName} can open the {caps.pullNoun.toLowerCase()} — push it first if it's a new local branch.
         </p>
       </div>
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
@@ -3597,7 +3716,7 @@ function PullComposer({
           </Button>
           <Button size="sm" disabled={submitting || !title.trim() || !head.trim() || !base.trim()} onClick={onSubmit}>
             {submitting ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <Plus className="mr-2 size-3.5" />}
-            Create PR
+            Create {caps.pullAbbrev}
           </Button>
         </div>
       </div>
@@ -3606,6 +3725,7 @@ function PullComposer({
 }
 
 function IssueComposer({
+  caps,
   open,
   title,
   body,
@@ -3622,6 +3742,7 @@ function IssueComposer({
   onMilestoneChange,
   onSubmit,
 }: {
+  caps: ProviderCaps;
   open: boolean;
   title: string;
   body: string;
@@ -3678,13 +3799,15 @@ function IssueComposer({
           className="min-h-24 resize-y text-sm"
           disabled={submitting}
         />
-        <Input
-          value={labels}
-          onChange={(e) => onLabelsChange(e.target.value)}
-          placeholder="Labels, comma separated"
-          className="h-8 text-xs"
-          disabled={submitting}
-        />
+        {caps.labels && (
+          <Input
+            value={labels}
+            onChange={(e) => onLabelsChange(e.target.value)}
+            placeholder="Labels, comma separated"
+            className="h-8 text-xs"
+            disabled={submitting}
+          />
+        )}
         <div className="grid gap-2 md:grid-cols-2">
           <Input
             value={assignees}
@@ -3693,13 +3816,15 @@ function IssueComposer({
             className="h-8 text-xs"
             disabled={submitting}
           />
-          <Input
-            value={milestone}
-            onChange={(e) => onMilestoneChange(e.target.value)}
-            placeholder="Milestone number"
-            className="h-8 text-xs"
-            disabled={submitting}
-          />
+          {caps.milestones && (
+            <Input
+              value={milestone}
+              onChange={(e) => onMilestoneChange(e.target.value)}
+              placeholder="Milestone number"
+              className="h-8 text-xs"
+              disabled={submitting}
+            />
+          )}
         </div>
       </div>
       <div className="mt-3 flex justify-end gap-2">
@@ -5726,10 +5851,14 @@ function DiscussionCommentRow({
 
 function GitHubItemRow({
   item,
+  caps,
   repoBadge,
   onToggle,
 }: {
   item: GitHubListItem;
+  // Terminology/link labels follow the project's provider (multi-provider
+  // support, docs/plans/multi-provider-git-modal.md).
+  caps: ProviderCaps;
   // Aggregate mode (G8/F15): shows a small repo badge next to the title
   // (redundant, and hidden, in single-repo mode) so items from different
   // repos are distinguishable in the merged list.
@@ -5820,8 +5949,8 @@ function GitHubItemRow({
         <Button
           size="icon"
           variant="ghost"
-          title="Open on GitHub"
-          aria-label={`Open #${item.number} on GitHub`}
+          title={`Open on ${caps.providerName}`}
+          aria-label={`Open #${item.number} on ${caps.providerName}`}
           onClick={() => { void api.openExternal(item.htmlUrl); }}
         >
           <ExternalLink className="size-4" />
@@ -5843,6 +5972,8 @@ function GitHubItemRow({
  */
 function GitHubItemDetail({
   item,
+  caps,
+  provider,
   itemPath,
   canPush,
   viewerLogin,
@@ -5950,6 +6081,13 @@ function GitHubItemDetail({
   onRetryCommits,
 }: {
   item: GitHubListItem;
+  caps: ProviderCaps;
+  // "github" gates the GitHub-exclusive per-item affordances (reactions,
+  // sub-issues, pin, lock, transfer, suggestion-apply, pending-review batch,
+  // thread-resolve, reviewer-request UI) that even `caps` can't express
+  // because their write path is GitHub GraphQL/REST-specific, not merely
+  // "unsupported on this provider's core API".
+  provider: GitProvider | "mixed" | null;
   itemPath: string;
   canPush: boolean;
   viewerLogin: string;
@@ -6065,7 +6203,7 @@ function GitHubItemDetail({
     <div>
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="text-[11px] font-medium uppercase text-muted-foreground">
-          {item.kind === "pulls" ? "Pull request" : "Issue"} #{item.number}
+          {item.kind === "pulls" ? caps.pullNoun : "Issue"} #{item.number}
         </div>
         {!editorOpen && (
           <Button
@@ -6081,7 +6219,7 @@ function GitHubItemDetail({
           </Button>
         )}
       </div>
-      {item.kind === "pulls" && linkedIssues && linkedIssues.length > 0 && (
+      {item.kind === "pulls" && caps.linkedIssues && linkedIssues && linkedIssues.length > 0 && (
         <LinkedIssuesLine issues={linkedIssues} />
       )}
       {editorOpen ? (
@@ -6107,11 +6245,15 @@ function GitHubItemDetail({
           )}
         </div>
       )}
-      <Reactions path={itemPath} subject={{ type: "issue", id: item.number }} viewer={viewerLogin} />
+      {caps.reactions && (
+        <Reactions path={itemPath} subject={{ type: "issue", id: item.number }} viewer={viewerLogin} />
+      )}
       {item.kind === "pulls" && (
         <>
           <PullActions
             item={item}
+            caps={caps}
+            provider={provider}
             reviewDraft={reviewDraft}
             closeDraft={closeDraft}
             mergeMethod={mergeMethod}
@@ -6137,6 +6279,8 @@ function GitHubItemDetail({
             canModifyOwn={canModifyOwn}
           />
           <PullTriage
+            caps={caps}
+            provider={provider}
             repoLabels={repoLabels}
             repoAssignees={repoAssignees}
             repoMilestones={repoMilestones}
@@ -6159,12 +6303,18 @@ function GitHubItemDetail({
             canPush={canPush}
           />
           <CheckRuns checks={checks} loading={checksLoading} error={checksError} onRetry={onRetryChecks} onRefresh={onRefreshChecks} />
-          <CommitStatus status={commitStatus} loading={commitStatusLoading} error={commitStatusError} onRetry={onRetryCommitStatus} onRefresh={onRefreshCommitStatus} />
+          {caps.commitStatusPanel && (
+            <CommitStatus status={commitStatus} loading={commitStatusLoading} error={commitStatusError} onRetry={onRetryCommitStatus} onRefresh={onRefreshCommitStatus} />
+          )}
           <PullCommits commits={commits} loading={commitsLoading} error={commitsError} onRetry={onRetryCommits} />
-          <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} />
-          <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
+          <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} allowBatchReview={provider === "github"} />
+          {provider === "github" && (
+            <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
+          )}
           <ReviewComments
             path={itemPath}
+            caps={caps}
+            resolveSupported={provider === "github"}
             comments={reviewComments}
             loading={reviewCommentsLoading}
             error={reviewCommentError}
@@ -6190,6 +6340,7 @@ function GitHubItemDetail({
       {item.kind === "issues" && (
         <IssueActions
           item={item}
+          caps={caps}
           path={itemPath}
           repoLabels={repoLabels}
           repoAssignees={repoAssignees}
@@ -6219,6 +6370,7 @@ function GitHubItemDetail({
       )}
       <Conversation
         path={itemPath}
+        caps={caps}
         comments={comments}
         loading={commentsLoading}
         error={commentError}
@@ -6260,8 +6412,22 @@ const MERGE_TONE_CLASS: Record<MergeTone, string> = {
   muted: "text-muted-foreground",
 };
 
+/** Merge-method dropdown label for the neutral `GitHubPullMergeMethod`
+ *  vocabulary (see the `PROVIDER_CAPS.mergeMethods` doc comment in
+ *  shared/types.ts): Bitbucket has no "rebase and merge" strategy — its
+ *  linear-history option is `fast_forward`, mapped onto the shared "rebase"
+ *  value, so it reads as "Fast-forward" rather than GitHub/GitLab's "Rebase
+ *  and merge" wording. */
+function mergeMethodLabel(method: GitHubPullMergeMethod, provider: GitProvider | "mixed" | null): string {
+  if (method === "rebase" && provider === "bitbucket") return "Fast-forward";
+  if (method === "merge") return "Create merge commit";
+  if (method === "squash") return "Squash and merge";
+  return "Rebase and merge";
+}
+
 function IssueActions({
   item,
+  caps,
   path,
   repoLabels,
   repoAssignees,
@@ -6289,6 +6455,7 @@ function IssueActions({
   canModifyOwn,
 }: {
   item: GitHubListItem;
+  caps: ProviderCaps;
   path: string;
   repoLabels: GitHubRepoLabel[];
   repoAssignees: GitHubUser[];
@@ -6352,6 +6519,8 @@ function IssueActions({
           assigneeDraft={assigneeDraft}
           milestoneDraft={milestoneDraft}
           disabled={isBusy}
+          showLabels={caps.labels}
+          showMilestones={caps.milestones}
           onLabelDraftChange={onLabelDraftChange}
           onAssigneeDraftChange={onAssigneeDraftChange}
           onMilestoneDraftChange={onMilestoneDraftChange}
@@ -6372,66 +6541,70 @@ function IssueActions({
           {busy === nextState ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
           {item.state === "open" ? "Close issue" : "Reopen issue"}
         </Button>
-        <IssuePinToggle path={path} number={item.number} canPush={canPush} />
+        {caps.pinIssue && <IssuePinToggle path={path} number={item.number} canPush={canPush} />}
       </div>
 
-      <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/40 pt-3">
-        <Select
-          value={lockReasonDraft}
-          onChange={(e) => onLockReasonDraftChange(e.target.value)}
-          className="h-8 w-40 text-xs"
-          disabled={isBusy || item.locked || !canPush}
-          title="Lock reason (optional)"
-          aria-label="Lock reason"
-        >
-          <option value="">No reason</option>
-          <option value="off-topic">Off-topic</option>
-          <option value="too heated">Too heated</option>
-          <option value="resolved">Resolved</option>
-          <option value="spam">Spam</option>
-        </Select>
-        <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onToggleLock}>
-          {busy === "lock" ? (
-            <Loader2 className="mr-2 size-3.5 animate-spin" />
-          ) : item.locked ? (
-            <Unlock className="mr-2 size-3.5" />
-          ) : (
-            <Lock className="mr-2 size-3.5" />
-          )}
-          {item.locked ? "Unlock conversation" : "Lock conversation"}
-        </Button>
-      </div>
-
-      <SubIssues path={path} issueNumber={item.number} canPush={canPush} />
-
-      <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/40 pt-3">
-        <Input
-          value={transferDraft}
-          onChange={(e) => onTransferDraftChange(e.target.value)}
-          placeholder="Transfer to owner/repo"
-          className="h-8 w-48 text-xs"
-          disabled={isBusy || !canPush}
-        />
-        {transferConfirming ? (
-          <>
-            <span className="text-[11px] text-amber-400">
-              Transfer #{item.number} to {transferDraft.trim() || "…"}? This can't be undone.
-            </span>
-            <Button size="sm" variant="destructive" disabled={pushDisabled || !transferDraft.trim()} title={pushTitle} onClick={onTransferIssue}>
-              {busy === "transfer" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <ArrowRightLeft className="mr-2 size-3.5" />}
-              Confirm transfer
-            </Button>
-            <Button size="sm" variant="ghost" disabled={isBusy} onClick={onCancelTransfer}>
-              Cancel
-            </Button>
-          </>
-        ) : (
-          <Button size="sm" variant="outline" disabled={pushDisabled || !transferDraft.trim()} title={pushTitle} onClick={onTransferIssue}>
-            <ArrowRightLeft className="mr-2 size-3.5" />
-            Transfer issue
+      {caps.lockConversation && (
+        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/40 pt-3">
+          <Select
+            value={lockReasonDraft}
+            onChange={(e) => onLockReasonDraftChange(e.target.value)}
+            className="h-8 w-40 text-xs"
+            disabled={isBusy || item.locked || !canPush}
+            title="Lock reason (optional)"
+            aria-label="Lock reason"
+          >
+            <option value="">No reason</option>
+            <option value="off-topic">Off-topic</option>
+            <option value="too heated">Too heated</option>
+            <option value="resolved">Resolved</option>
+            <option value="spam">Spam</option>
+          </Select>
+          <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onToggleLock}>
+            {busy === "lock" ? (
+              <Loader2 className="mr-2 size-3.5 animate-spin" />
+            ) : item.locked ? (
+              <Unlock className="mr-2 size-3.5" />
+            ) : (
+              <Lock className="mr-2 size-3.5" />
+            )}
+            {item.locked ? "Unlock conversation" : "Lock conversation"}
           </Button>
-        )}
-      </div>
+        </div>
+      )}
+
+      {caps.subIssues && <SubIssues path={path} issueNumber={item.number} canPush={canPush} />}
+
+      {caps.issueTransfer && (
+        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/40 pt-3">
+          <Input
+            value={transferDraft}
+            onChange={(e) => onTransferDraftChange(e.target.value)}
+            placeholder="Transfer to owner/repo"
+            className="h-8 w-48 text-xs"
+            disabled={isBusy || !canPush}
+          />
+          {transferConfirming ? (
+            <>
+              <span className="text-[11px] text-amber-400">
+                Transfer #{item.number} to {transferDraft.trim() || "…"}? This can't be undone.
+              </span>
+              <Button size="sm" variant="destructive" disabled={pushDisabled || !transferDraft.trim()} title={pushTitle} onClick={onTransferIssue}>
+                {busy === "transfer" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <ArrowRightLeft className="mr-2 size-3.5" />}
+                Confirm transfer
+              </Button>
+              <Button size="sm" variant="ghost" disabled={isBusy} onClick={onCancelTransfer}>
+                Cancel
+              </Button>
+            </>
+          ) : (
+            <Button size="sm" variant="outline" disabled={pushDisabled || !transferDraft.trim()} title={pushTitle} onClick={onTransferIssue}>
+              <ArrowRightLeft className="mr-2 size-3.5" />
+              Transfer issue
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -6704,6 +6877,8 @@ function ItemEditor({
 }
 
 function PullTriage({
+  caps,
+  provider,
   repoLabels,
   repoAssignees,
   repoMilestones,
@@ -6725,6 +6900,11 @@ function PullTriage({
   onRequestReviewers,
   canPush,
 }: {
+  caps: ProviderCaps;
+  // Reviewer-request UI is GitHub-only (GitLab/Bitbucket reviewer assignment
+  // isn't part of the adapters' core subset — see git-host.ts's `pullCreate`
+  // doc comment); gate on a confirmed GitHub repo, not merely `caps`.
+  provider: GitProvider | "mixed" | null;
   repoLabels: GitHubRepoLabel[];
   repoAssignees: GitHubUser[];
   repoMilestones: GitHubRepoMilestone[];
@@ -6781,6 +6961,8 @@ function PullTriage({
           assigneeDraft={assigneeDraft}
           milestoneDraft={milestoneDraft}
           disabled={isBusy}
+          showLabels={caps.labels}
+          showMilestones={caps.milestones}
           onLabelDraftChange={onLabelDraftChange}
           onAssigneeDraftChange={onAssigneeDraftChange}
           onMilestoneDraftChange={onMilestoneDraftChange}
@@ -6790,38 +6972,42 @@ function PullTriage({
           Save triage
         </Button>
       </div>
-      <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
-        <Input
-          value={reviewerDraft}
-          onChange={(e) => onReviewerDraftChange(e.target.value)}
-          placeholder={prOpen ? "Reviewers, comma separated" : "Reviewers can only be requested on open PRs"}
-          className="h-8 text-xs"
-          disabled={isBusy || !prOpen || !canPush}
-        />
-        <Input
-          value={teamReviewerDraft}
-          onChange={(e) => onTeamReviewerDraftChange(e.target.value)}
-          placeholder={prOpen ? "Teams, comma separated (org slugs)" : "Teams can only be requested on open PRs"}
-          className="h-8 text-xs"
-          disabled={isBusy || !prOpen || !canPush}
-        />
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={pushDisabled || !prOpen || (!reviewerDraft.trim() && !teamReviewerDraft.trim())}
-          title={reviewersTitle}
-          onClick={onRequestReviewers}
-        >
-          {busy === "reviewers" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitPullRequest className="mr-2 size-3.5" />}
-          Request review
-        </Button>
-      </div>
+      {provider === "github" && (
+        <div className="mt-3 grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+          <Input
+            value={reviewerDraft}
+            onChange={(e) => onReviewerDraftChange(e.target.value)}
+            placeholder={prOpen ? "Reviewers, comma separated" : "Reviewers can only be requested on open PRs"}
+            className="h-8 text-xs"
+            disabled={isBusy || !prOpen || !canPush}
+          />
+          <Input
+            value={teamReviewerDraft}
+            onChange={(e) => onTeamReviewerDraftChange(e.target.value)}
+            placeholder={prOpen ? "Teams, comma separated (org slugs)" : "Teams can only be requested on open PRs"}
+            className="h-8 text-xs"
+            disabled={isBusy || !prOpen || !canPush}
+          />
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={pushDisabled || !prOpen || (!reviewerDraft.trim() && !teamReviewerDraft.trim())}
+            title={reviewersTitle}
+            onClick={onRequestReviewers}
+          >
+            {busy === "reviewers" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitPullRequest className="mr-2 size-3.5" />}
+            Request review
+          </Button>
+        </div>
+      )}
     </div>
   );
 }
 
 function PullActions({
   item,
+  caps,
+  provider,
   reviewDraft,
   closeDraft,
   mergeMethod,
@@ -6847,6 +7033,12 @@ function PullActions({
   canModifyOwn,
 }: {
   item: GitHubListItem;
+  caps: ProviderCaps;
+  // The draft-toggle *write* is GitHub GraphQL-only even though GitLab and
+  // Bitbucket both support draft PRs at creation time (caps.draft stays true
+  // for them) — see the ProviderCaps doc comment. Gate the toggle control
+  // itself on a confirmed GitHub repo; the draft badge elsewhere is ungated.
+  provider: GitProvider | "mixed" | null;
   reviewDraft: string;
   closeDraft: string;
   mergeMethod: GitHubPullMergeMethod;
@@ -6892,7 +7084,7 @@ function PullActions({
           <GitPullRequest className="size-3.5" />
           Actions
         </div>
-        {item.state === "open" && (
+        {item.state === "open" && provider === "github" && (
           <Button size="sm" variant="ghost" className="h-7" disabled={!!busy || !canPush} title={pushTitle} onClick={onToggleDraft}>
             {busy === "draft" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <FilePen className="mr-2 size-3.5" />}
             {item.draft ? "Mark ready for review" : "Convert to draft"}
@@ -6943,7 +7135,7 @@ function PullActions({
             <span className="text-[11px] text-muted-foreground">Mergeability unavailable.</span>
           )}
           <div className="ml-auto flex items-center gap-2">
-            {view?.showUpdateBranch && (
+            {caps.updateBranch && view?.showUpdateBranch && (
               <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onUpdateBranch}>
                 {busy === "update-branch" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <ArrowUpFromLine className="mr-2 size-3.5" />}
                 Update branch
@@ -7001,15 +7193,17 @@ function PullActions({
               {busy === "COMMENT" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}
               Comment
             </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={disabled || (!reviewDraft.trim() && pendingCount === 0)}
-              onClick={() => onReview("REQUEST_CHANGES")}
-            >
-              {busy === "REQUEST_CHANGES" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
-              Request
-            </Button>
+            {caps.requestChanges && (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={disabled || (!reviewDraft.trim() && pendingCount === 0)}
+                onClick={() => onReview("REQUEST_CHANGES")}
+              >
+                {busy === "REQUEST_CHANGES" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
+                Request
+              </Button>
+            )}
           </div>
         </div>
 
@@ -7023,9 +7217,11 @@ function PullActions({
             title="Merge method"
             aria-label="Merge method"
           >
-            <option value="merge">Create merge commit</option>
-            <option value="squash">Squash and merge</option>
-            <option value="rebase">Rebase and merge</option>
+            {caps.mergeMethods.map((method) => (
+              <option key={method} value={method}>
+                {mergeMethodLabel(method, provider)}
+              </option>
+            ))}
           </Select>
           <Button
             size="sm"
@@ -7037,7 +7233,7 @@ function PullActions({
             {busy === "merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
             Merge
           </Button>
-          {item.state === "open" && (
+          {item.state === "open" && caps.autoMerge && (
             <div className="mt-2 flex items-center gap-2">
               {mergeability?.autoMerge ? (
                 <>
@@ -7180,8 +7376,8 @@ function PullCommits({
                   <button
                     type="button"
                     className="shrink-0 font-mono text-[11px] text-muted-foreground hover:underline"
-                    title="Open commit on GitHub"
-                    aria-label={`Open commit ${commit.sha.slice(0, 7)} on GitHub`}
+                    title="Open commit"
+                    aria-label={`Open commit ${commit.sha.slice(0, 7)}`}
                     onClick={() => { void api.openExternal(commit.htmlUrl); }}
                   >
                     {commit.sha.slice(0, 7)}
@@ -7274,8 +7470,8 @@ function CheckRuns({
                 <Button
                   size="icon"
                   variant="ghost"
-                  title="Open check on GitHub"
-                  aria-label={`Open ${run.name} check on GitHub`}
+                  title="Open check"
+                  aria-label={`Open ${run.name} check`}
                   onClick={() => { void api.openExternal(run.htmlUrl!); }}
                 >
                   <ExternalLink className="size-3.5" />
@@ -7394,6 +7590,7 @@ function PullDiff({
   onLineComment,
   onAddToReview,
   pending,
+  allowBatchReview,
 }: {
   diff?: TaskDiff;
   loading: boolean;
@@ -7403,6 +7600,13 @@ function PullDiff({
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onAddToReview: (target: LineCommentTarget) => void;
   pending: LineCommentTarget[];
+  // GitLab/Bitbucket reviews don't support GitHub's "pending review" batch of
+  // inline comments (see git-host.ts's `PullReviewInput` doc comment — the
+  // facade silently drops a non-GitHub review's `comments` array), so
+  // "Add to review" would queue comments that are never actually submitted.
+  // Hide the batch affordance entirely on those providers; a single inline
+  // comment still posts immediately via `onLineComment`.
+  allowBatchReview: boolean;
 }) {
   const totals = useMemo(() => {
     const files = diff?.files ?? [];
@@ -7476,6 +7680,7 @@ function PullDiff({
               onLineComment={onLineComment}
               onAddToReview={onAddToReview}
               queuedKeys={queuedKeys}
+              allowBatchReview={allowBatchReview}
             />
           ))}
         </div>
@@ -7536,6 +7741,7 @@ function PendingReview({
 
 function ReviewComments({
   path,
+  caps,
   comments,
   loading,
   error,
@@ -7555,8 +7761,10 @@ function ReviewComments({
   onRetry,
   canPush,
   canResolveThreads,
+  resolveSupported,
 }: {
   path: string;
+  caps: ProviderCaps;
   comments?: GitHubPullLineComment[];
   loading: boolean;
   error?: string;
@@ -7582,6 +7790,11 @@ function ReviewComments({
   // this is the wider `canPush || prAuthorIsViewer` flag — distinct from
   // `canPush`, which the apply-suggestion write still needs on its own.
   canResolveThreads: boolean;
+  // Thread resolve/reopen is a GitHub GraphQL-only concept — GitLab/Bitbucket
+  // review threads have no equivalent — so this is gated separately from
+  // `canResolveThreads` (which only expresses *who* may resolve, not whether
+  // the provider supports resolving at all).
+  resolveSupported: boolean;
 }) {
   const [busyThread, setBusyThread] = useState<string | null>(null);
   const [threadError, setThreadError] = useState<{ id: string; msg: string } | null>(null);
@@ -7663,7 +7876,7 @@ function ReviewComments({
                       outdated
                     </span>
                   )}
-                  {thread && (
+                  {thread && resolveSupported && (
                     <Button
                       size="sm"
                       variant="ghost"
@@ -7690,16 +7903,18 @@ function ReviewComments({
                   canModify={!!viewerLogin && comment.author?.login === viewerLogin}
                   onEdit={(body) => onEdit(comment.id, body)}
                   onDelete={() => onDelete(comment.id)}
-                  suggestion={hasSuggestion(comment.body) ? {
+                  suggestion={caps.suggestions && hasSuggestion(comment.body) ? {
                     canApply: !!viewerLogin && prOpen,
                     canPush,
                     applying: !!applyBusy[comment.id],
                     onApply: () => onApply(comment.id),
                   } : undefined}
                 />
-                <div className="px-3 pb-2">
-                  <Reactions path={path} subject={{ type: "reviewComment", id: comment.id }} viewer={viewerLogin} />
-                </div>
+                {caps.reactions && (
+                  <div className="px-3 pb-2">
+                    <Reactions path={path} subject={{ type: "reviewComment", id: comment.id }} viewer={viewerLogin} />
+                  </div>
+                )}
                 <div className="border-t border-border/50 p-2">
                   <Textarea
                     value={draft}
@@ -7726,6 +7941,7 @@ function ReviewComments({
 
 function Conversation({
   path,
+  caps,
   comments,
   loading,
   error,
@@ -7739,6 +7955,7 @@ function Conversation({
   onRetry,
 }: {
   path: string;
+  caps: ProviderCaps;
   comments?: GitHubComment[];
   loading: boolean;
   error?: string;
@@ -7793,6 +8010,7 @@ function Conversation({
               <CommentBlock
                 key={comment.id}
                 path={path}
+                caps={caps}
                 comment={comment}
                 viewerLogin={viewerLogin}
                 canModify={!!viewerLogin && comment.author?.login === viewerLogin}
@@ -7829,6 +8047,7 @@ function Conversation({
 
 function CommentBlock({
   path,
+  caps,
   comment,
   viewerLogin,
   canModify,
@@ -7836,6 +8055,7 @@ function CommentBlock({
   onDelete,
 }: {
   path: string;
+  caps: ProviderCaps;
   comment: GitHubComment;
   viewerLogin: string;
   canModify: boolean;
@@ -7850,9 +8070,11 @@ function CommentBlock({
         {comment.updatedAt && comment.updatedAt !== comment.createdAt && <span>edited {fmtDate(comment.updatedAt)}</span>}
       </div>
       <EditableCommentBody body={comment.body} canModify={canModify} onEdit={onEdit} onDelete={onDelete} />
-      <div className="px-3 pb-2">
-        <Reactions path={path} subject={{ type: "issueComment", id: comment.id }} viewer={viewerLogin} />
-      </div>
+      {caps.reactions && (
+        <div className="px-3 pb-2">
+          <Reactions path={path} subject={{ type: "issueComment", id: comment.id }} viewer={viewerLogin} />
+        </div>
+      )}
     </div>
   );
 }
@@ -8261,11 +8483,13 @@ function DiffFileBlock({
   onLineComment,
   onAddToReview,
   queuedKeys,
+  allowBatchReview,
 }: {
   file: DiffFile;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onAddToReview: (target: LineCommentTarget) => void;
   queuedKeys: Set<string>;
+  allowBatchReview: boolean;
 }) {
   const meta = STATUS_META[file.status];
   const Icon = meta.icon;
@@ -8285,7 +8509,7 @@ function DiffFileBlock({
         <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>
       ) : (
         <>
-          <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} onAddToReview={onAddToReview} queuedKeys={queuedKeys} />
+          <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} onAddToReview={onAddToReview} queuedKeys={queuedKeys} allowBatchReview={allowBatchReview} />
           {file.truncated && (
             <div className="border-t border-border/60 px-3 py-1.5 text-[11px] italic text-muted-foreground">
               Diff truncated because this file's changes are too large to display in full.
@@ -8303,12 +8527,14 @@ function DiffBody({
   onLineComment,
   onAddToReview,
   queuedKeys,
+  allowBatchReview,
 }: {
   file: DiffFile;
   hunks: string;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onAddToReview: (target: LineCommentTarget) => void;
   queuedKeys: Set<string>;
+  allowBatchReview: boolean;
 }) {
   const rows = useMemo(() => toRows(hunks), [hunks]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -8417,7 +8643,7 @@ function DiffBody({
               {postedKey === rowKey && (
                 <span className="sticky right-0 shrink-0 bg-card/90 px-1 text-[11px] text-emerald-400">commented</span>
               )}
-              {queued && postedKey !== rowKey && (
+              {allowBatchReview && queued && postedKey !== rowKey && (
                 <span className="sticky right-0 shrink-0 bg-card/90 px-1 text-[11px] text-sky-400">queued</span>
               )}
             </div>
@@ -8470,16 +8696,18 @@ function DiffBody({
                   >
                     Cancel
                   </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={submitting || !draft.trim()}
-                    title="Queue this comment for a single review submission"
-                    onClick={() => queue(target)}
-                  >
-                    <Plus className="mr-2 size-3.5" />
-                    Add to review
-                  </Button>
+                  {allowBatchReview && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={submitting || !draft.trim()}
+                      title="Queue this comment for a single review submission"
+                      onClick={() => queue(target)}
+                    >
+                      <Plus className="mr-2 size-3.5" />
+                      Add to review
+                    </Button>
+                  )}
                   <Button size="sm" disabled={submitting || !draft.trim()} onClick={() => { void submit(target); }}>
                     {submitting ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}
                     Comment

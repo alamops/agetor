@@ -143,18 +143,26 @@ export function deleteGitHubToken(host: string): boolean {
 
 /**
  * Resolve a stored token for `host`, implementing only steps 1–2 of the
- * full resolution order (exact host match, then the `github.com` entry as
- * default) — env var and `gh auth token` fallback live in github.ts, which
- * calls this as its first step. `host` is expected pre-lowercased by the
- * caller's parsing, but is normalized again here defensively.
+ * full resolution order (exact host match, then the provider's canonical-host
+ * entry as default) — env var and CLI fallback live in the callers. `host` is
+ * expected pre-lowercased by the caller's parsing, but is normalized again
+ * here defensively.
+ *
+ * Cross-provider callers (`gitlabToken`/`bitbucketCreds` in
+ * `src/bun/git-provider.ts`) also call this as their first resolution step,
+ * since the store is host-keyed and needs no schema change to hold gitlab/
+ * bitbucket alias hosts alongside github ones. They pass their own provider's
+ * canonical host (`gitlab.com` / `bitbucket.org`) as `fallbackHost` so a
+ * no-exact-match lookup never leaks a GitHub token to another provider's API
+ * — it falls through to null and lets the caller's env/CLI steps run instead.
  */
-export function tokenForHost(host: string | null): string | null {
+export function tokenForHost(host: string | null, fallbackHost: string = "github.com"): string | null {
   const tokens = readTokensFile();
   if (host !== null) {
     const normalized = normalizeHost(host);
     const exact = tokens.find((t) => t.host === normalized);
     if (exact) return exact.token;
   }
-  const fallback = tokens.find((t) => t.host === "github.com");
+  const fallback = tokens.find((t) => t.host === fallbackHost);
   return fallback ? fallback.token : null;
 }

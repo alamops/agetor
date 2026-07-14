@@ -15,6 +15,7 @@ import type {
   GitHubCommitStatus,
   GitHubCommitStatusResult,
   GitHubAssigneesResult,
+  GitProvider,
   GitHubDiscussion,
   GitHubDiscussionCategory,
   GitHubDiscussionComment,
@@ -95,6 +96,7 @@ export type {
   GitHubCommitStatusResult,
   GitHubItemKind,
   GitHubItemState,
+  GitProvider,
   GitHubAssigneesResult,
   GitHubDiscussion,
   GitHubDiscussionCategory,
@@ -539,14 +541,20 @@ export const api = {
     const q = new URLSearchParams({ path: input.path });
     return j<GitHubPullDefaultsResult>(`/github/pull-defaults?${q.toString()}`);
   },
-  listGitHubComments: (input: { path: string; number: number }) => {
+  // `kind` ("pulls"|"issues") lets GitLab/Bitbucket route to the right
+  // notes/comments endpoint (their APIs split MR/PR comments from issue
+  // comments, unlike GitHub's single endpoint) — see git-host.ts's
+  // `ListCommentsInput` doc comment. Optional/additive: omitted, the server
+  // defaults to "pulls" (GitHub ignores it entirely).
+  listGitHubComments: (input: { path: string; number: number; kind?: GitHubItemKind }) => {
     const q = new URLSearchParams({
       path: input.path,
       number: String(input.number),
     });
+    if (input.kind) q.set("kind", input.kind);
     return j<GitHubCommentsResult>(`/github/comments?${q.toString()}`);
   },
-  createGitHubComment: (input: { path: string; number: number; body: string }) =>
+  createGitHubComment: (input: { path: string; number: number; body: string; kind?: GitHubItemKind }) =>
     j<{ comment: GitHubComment }>("/github/comments", {
       method: "POST",
       body: JSON.stringify(input),
@@ -554,6 +562,15 @@ export const api = {
   getGitHubViewer: (input: { path: string }) => {
     const q = new URLSearchParams({ path: input.path });
     return j<{ ok: true; login: string }>(`/github/viewer?${q.toString()}`);
+  },
+  // Provider detection (T4, docs/plans/multi-provider-git-modal.md) — call
+  // before the other GitHub* helpers to learn which provider (GitHub/GitLab/
+  // Bitbucket) a project's git remote resolves to.
+  getProviderInfo: (path: string) => {
+    const q = new URLSearchParams({ path });
+    return j<{ ok: true; provider: GitProvider; owner: string; name: string; host: string; remoteHost: string }>(
+      `/github/provider-info?${q.toString()}`,
+    );
   },
   listGitHubLabels: (input: { path: string }) => {
     const q = new URLSearchParams({ path: input.path });
