@@ -3315,7 +3315,10 @@ const DEFERRED_PROMPT_POLL_MS = 400;
  *  composer before pasting best-effort anyway. Generous — matches
  *  BOOT_TIMEOUT_MS below — because the same startup work (auth probe,
  *  plugin/skill scan, model warmup) that can delay the JSONL also delays the
- *  composer. */
+ *  composer. Deliberately the same literal as `BOOT_TIMEOUT_MS`: both bound
+ *  the same claude startup work, so keeping them numerically co-sized reads
+ *  naturally, but they're independent constants — there's no shared source
+ *  and no requirement to change one when the other changes. */
 const DEFERRED_PROMPT_TIMEOUT_MS = 30_000;
 
 /**
@@ -3426,9 +3429,18 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   disposeSessionState(sessions.get(opts.taskId), true);
   sessions.set(opts.taskId, state);
 
+  // Keep a handle on the pushed slot (mirrors `sendTurn`'s idiom below) so
+  // the deferred-paste loop can (a) recognise cancellation — `kill()`
+  // splices `turnQueue` without touching `sessions`, so slot-presence is the
+  // only reliable "has this launch been cancelled?" signal — and (b) settle
+  // this exact slot on a paste failure instead of leaving the run `running`
+  // forever.
+  const initialSlot: TurnSlot = { onChunk: opts.onChunk, resolve: null, reject: null };
   const done = new Promise<number>((resolve, reject) => {
-    state.turnQueue.push({ onChunk: opts.onChunk, resolve, reject });
+    initialSlot.resolve = resolve;
+    initialSlot.reject = reject;
   });
+  state.turnQueue.push(initialSlot);
   // Brand-new session has no prior turn to inherit metadata from, but
   // seed `lastChunk` so any metadata claude writes before its first
   // user/assistant entries (e.g. permission-mode banner) still lands on
@@ -3439,12 +3451,20 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // CLAUDE_PROMPT_ARGV_MAX_BYTES from argv — embedding it would blow tmux's
   // client-command cap and fail `new-session` outright — and hands it back
   // as `deferredPrompt` instead. Paste it in once claude's composer is
-  // confirmed idle (`readPaneMode` returns non-null), which also naturally
-  // waits out any startup consent dialog: the boot poller below auto-confirms
-  // those, and the composer can't be idle while one is still on screen.
-  // Fire-and-forget, wrapped in try/catch so a throw here can never become an
-  // unhandled rejection (mirrors the boot-dialog poller's posture a few lines
-  // down) — this must never affect the JSONL boot wait itself.
+  // confirmed idle (`readPaneMode` returns non-null). Known startup consent
+  // dialogs (the bypass-permissions warning, trust-folder prompt) are handled
+  // for free: the boot poller below auto-confirms those, and the composer
+  // can't be idle while one is still painted over it. A *generic* startup
+  // question (something only the user can answer — see the boot poller's
+  // "other interactive question" branch) is different: it surfaces as a
+  // `tmux_prompt` card, and pasting over it would corrupt whatever partial
+  // answer is on screen. So each readiness window that times out re-checks
+  // `activeTmuxPromptsForTask` and, if one is still pending, re-arms instead
+  // of pasting — mirroring the boot JSONL-wait's re-arm loop a few dozen
+  // lines down. Fire-and-forget, wrapped in try/catch so a throw here can
+  // never become an unhandled rejection (mirrors the boot-dialog poller's
+  // posture a few lines down) — this must never affect the JSONL boot wait
+  // itself.
   if (opts.deferredPrompt) {
     const deferredPrompt = opts.deferredPrompt;
     opts.onChunk(
@@ -3453,23 +3473,57 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
     );
     void (async () => {
       try {
-        const deadline = Date.now() + DEFERRED_PROMPT_TIMEOUT_MS;
+        // `kill()` (a cancel, or any other path that settles/removes the
+        // initial slot) splices it out of `turnQueue` without touching
+        // `sessions` or the tmux session itself, so neither of the liveness/
+        // identity checks below would ever catch a cancel on their own —
+        // slot-presence is the signal. Checked on every poll tick, on every
+        // re-arm, and immediately before the final paste attempt.
+        const slotLive = () => state.turnQueue.includes(initialSlot);
         let ready = false;
-        while (Date.now() < deadline) {
-          if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return; // session died — nothing to paste into
-          if (sessions.get(opts.taskId) !== state) return; // superseded by a newer spawn/reattach
-          if (readPaneMode(state) !== null) { ready = true; break; }
-          await Bun.sleep(DEFERRED_PROMPT_POLL_MS);
+        windows: for (;;) {
+          const deadline = Date.now() + DEFERRED_PROMPT_TIMEOUT_MS;
+          while (Date.now() < deadline) {
+            if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return; // session died — nothing to paste into
+            if (sessions.get(opts.taskId) !== state) return; // superseded by a newer spawn/reattach
+            if (!slotLive()) return; // cancelled (or otherwise settled) — never paste over it
+            if (readPaneMode(state) !== null) { ready = true; break windows; }
+            await Bun.sleep(DEFERRED_PROMPT_POLL_MS);
+          }
+          // Window timed out. Don't paste over an unanswered startup
+          // question — re-arm a fresh window instead, as long as there's
+          // still something to wait for.
+          if (activeTmuxPromptsForTask(opts.taskId).length === 0) break;
+          if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return;
+          if (sessions.get(opts.taskId) !== state) return;
+          if (!slotLive()) return;
         }
         // Re-check liveness/identity before the final attempt — the loop can
         // exit via the timeout with the session still alive, and a dropped
         // prompt is worse than a best-effort paste into whatever's on screen.
         if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return;
         if (sessions.get(opts.taskId) !== state) return;
+        if (!slotLive()) return; // cancelled during the final liveness check
         if (!ready) {
           opts.onChunk("status", "claude readiness never confirmed — delivering prompt anyway");
         }
-        void queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, { bracketed: true });
+        void queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, {
+          bracketed: true,
+          onPasteFailure: () => {
+            // Mirror `sendTurn`'s onPasteFailure idiom exactly: guard against
+            // the (theoretical) race where the slot already popped normally
+            // between the paste call and this failure callback, remove it
+            // from the queue if still present, then reject `done` so the run
+            // settles instead of hanging in `running` forever.
+            if (!initialSlot.reject) return;
+            const idx = state.turnQueue.indexOf(initialSlot);
+            if (idx !== -1) state.turnQueue.splice(idx, 1);
+            const reject = initialSlot.reject;
+            initialSlot.resolve = null;
+            initialSlot.reject = null;
+            reject(new Error("paste failed"));
+          },
+        });
       } catch { /* never let the deferred-paste poller crash the spawn */ }
     })();
   }

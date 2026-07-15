@@ -477,6 +477,268 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
   }
 });
 
+// Regression tests for the opus code-review findings on the deferred-paste
+// fix above (commits de27191 + c6242ae): cancel-during-wait must abort the
+// deferred paste instead of pasting a prompt the user already cancelled, and
+// a failed paste must settle the run instead of leaving it `running` forever.
+
+test("cancelling a run while its large prompt is deferred (composer never confirmed idle) never pastes it — the run settles cancelled", async () => {
+  const { bin, logPath } = fakeDeferredPasteTmuxBin();
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER; // force the real spawnClaudeViaTmux path
+  process.env.AGETOR_CLAUDE_BIN = "/bin/echo"; // harmless stub launch command
+
+  const { tasks, runs } = await import("./db.ts");
+  const { sendInput, cancelRun } = await import("./orchestrator.ts");
+  const { __forTest, dropSession, jsonlPathFor } = await import("./claude-tmux.ts");
+  const { CLAUDE_PROMPT_ARGV_MAX_BYTES } = await import("./agents.ts");
+
+  const taskId = `task-cancel-deferred-${randomUUID()}`;
+  const priorRunId = `run-cancel-deferred-${randomUUID()}`;
+  const priorClaudeSessionId = "prior-claude-session-id-cancel";
+  const now = Date.now();
+  const workdir = mkdtempSync(path.join(tmpdir(), "agetor-cancel-wd-"));
+
+  const expectedJsonlPath = jsonlPathFor(workdir, priorClaudeSessionId, null);
+  mkdirSync(path.dirname(expectedJsonlPath), { recursive: true });
+  writeFileSync(expectedJsonlPath, "");
+
+  // Keep the composer looking perpetually NOT ready — the deferred-paste
+  // loop's readiness gate (`readPaneMode`) never fires, so it sits in its
+  // poll loop exactly like a launch whose claude session is slow to boot.
+  // This is the window a Stop click needs to land in for the bug to repro.
+  const prevCapture = __forTest.setCaptureModePane(() => "");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+
+  const largePrompt = "y".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES + 500);
+
+  try {
+    tasks.insert({
+      id: taskId,
+      title: "cancel-deferred-resume",
+      prompt: "p",
+      column: "review",
+      agent: "claude-code",
+      workdir,
+      isolation: "none",
+      taskType: "task",
+      branch: null,
+      worktreePath: null,
+      baseRef: null,
+      mode: null,
+      model: "claude-opus-4-7",
+      effort: "medium",
+      references: [], backlog: [],
+      runId: priorRunId,
+      hasOpenableRun: false,
+      pendingInteractionCount: 0,
+      openTerminalCount: 0,
+      archivedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    runs.insert({
+      id: priorRunId,
+      taskId,
+      agent: "claude-code",
+      status: "succeeded",
+      startedAt: now,
+      endedAt: now,
+      exitCode: 0,
+      tmuxSession: "agetor-stale-name",
+      claudeSessionId: priorClaudeSessionId,
+      codexSessionId: null,
+    });
+
+    const result = await sendInput(priorRunId, largePrompt);
+    expect(result.delivered).toBe(true);
+    if (!result.delivered) throw new Error(result.reason);
+    const newRunId = result.runId;
+
+    // Give the spawn a moment to run `new-session` and let the deferred-paste
+    // IIFE reach its poll loop (composer stays "" so it never breaks out).
+    await new Promise((r) => setTimeout(r, 150));
+
+    expect(cancelRun(newRunId)).toBe(true);
+
+    // Let the poll loop wake at least once (DEFERRED_PROMPT_POLL_MS = 400ms)
+    // after the cancel and observe the slot is gone.
+    await new Promise((r) => setTimeout(r, 700));
+
+    // Now flip the composer to "ready" — if the abort check were missing,
+    // the very next poll tick would go ahead and paste. Give it another
+    // full poll interval to prove it doesn't.
+    __forTest.setCaptureModePane(() => "? for shortcuts");
+    await new Promise((r) => setTimeout(r, 700));
+
+    const entries = readLog(logPath);
+    // The whole point of the fix: a cancelled launch must never paste the
+    // deferred prompt, no matter how long the wait or how the composer
+    // eventually looks.
+    expect(entries.some((e) => e.argv.includes("load-buffer"))).toBe(false);
+    expect(entries.some((e) => e.argv.includes("paste-buffer"))).toBe(false);
+
+    const list = runs.listForTask(taskId);
+    const settled = list.find((r) => r.id === newRunId);
+    expect(settled?.status).toBe("cancelled");
+  } finally {
+    __forTest.setCaptureModePane(prevCapture);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
+    dropSession(taskId);
+    rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
+  }
+});
+
+test("a failed deferred paste (load-buffer errors) settles the run instead of leaving it running forever", async () => {
+  // Same fake tmux as the happy-path deferred test, except `load-buffer`
+  // always fails — simulates a dead socket / vanished pane mid-paste.
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-deferred-fail-tmux-"));
+  const bin = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  const markerDir = path.join(dir, "markers");
+  mkdirSync(markerDir, { recursive: true });
+  writeFileSync(
+    bin,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";\n` +
+      `import path from "node:path";\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `let stdin = "";\n` +
+      `try { stdin = readFileSync(0, "utf8"); } catch {}\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ argv, stdin }) + "\\n");\n` +
+      `function sessionArg() {\n` +
+      `  const sIdx = argv.indexOf("-s");\n` +
+      `  if (sIdx !== -1) return argv[sIdx + 1];\n` +
+      `  const tIdx = argv.indexOf("-t");\n` +
+      `  if (tIdx !== -1) { let v = argv[tIdx + 1]; if (v && v.startsWith("=")) v = v.slice(1); return v; }\n` +
+      `  return null;\n` +
+      `}\n` +
+      `const markerDir = ${JSON.stringify(markerDir)};\n` +
+      `if (argv.includes("new-session")) {\n` +
+      `  const name = sessionArg();\n` +
+      `  if (name) writeFileSync(path.join(markerDir, name), "1");\n` +
+      `  process.exit(0);\n` +
+      `}\n` +
+      `if (argv.includes("kill-session")) {\n` +
+      `  const name = sessionArg();\n` +
+      `  if (name) { try { rmSync(path.join(markerDir, name)); } catch {} }\n` +
+      `  process.exit(0);\n` +
+      `}\n` +
+      `if (argv.includes("has-session")) {\n` +
+      `  const name = sessionArg();\n` +
+      `  if (name && existsSync(path.join(markerDir, name))) process.exit(0);\n` +
+      `  process.stderr.write("can't find session: =" + (name ?? "unknown"));\n` +
+      `  process.exit(1);\n` +
+      `}\n` +
+      // The failure under test: load-buffer (the first step of the deferred
+      // paste) always errors.
+      `if (argv.includes("load-buffer")) {\n` +
+      `  process.stderr.write("no such file or directory");\n` +
+      `  process.exit(1);\n` +
+      `}\n` +
+      `process.exit(0);\n`,
+  );
+  chmodSync(bin, 0o755);
+
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER; // force the real spawnClaudeViaTmux path
+  process.env.AGETOR_CLAUDE_BIN = "/bin/echo"; // harmless stub launch command
+
+  const { tasks, runs } = await import("./db.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  const { __forTest, dropSession, jsonlPathFor } = await import("./claude-tmux.ts");
+  const { CLAUDE_PROMPT_ARGV_MAX_BYTES } = await import("./agents.ts");
+
+  const taskId = `task-paste-fail-${randomUUID()}`;
+  const priorRunId = `run-paste-fail-${randomUUID()}`;
+  const priorClaudeSessionId = "prior-claude-session-id-fail";
+  const now = Date.now();
+  const workdir = mkdtempSync(path.join(tmpdir(), "agetor-paste-fail-wd-"));
+
+  const expectedJsonlPath = jsonlPathFor(workdir, priorClaudeSessionId, null);
+  mkdirSync(path.dirname(expectedJsonlPath), { recursive: true });
+  writeFileSync(expectedJsonlPath, "");
+
+  // Make the composer look immediately idle so the deferred-paste loop fires
+  // its (doomed) paste attempt right away instead of spinning toward the
+  // 30s timeout.
+  const prevCapture = __forTest.setCaptureModePane(() => "? for shortcuts");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+
+  const largePrompt = "z".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES + 500);
+
+  try {
+    tasks.insert({
+      id: taskId,
+      title: "paste-fail-resume",
+      prompt: "p",
+      column: "review",
+      agent: "claude-code",
+      workdir,
+      isolation: "none",
+      taskType: "task",
+      branch: null,
+      worktreePath: null,
+      baseRef: null,
+      mode: null,
+      model: "claude-opus-4-7",
+      effort: "medium",
+      references: [], backlog: [],
+      runId: priorRunId,
+      hasOpenableRun: false,
+      pendingInteractionCount: 0,
+      openTerminalCount: 0,
+      archivedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    runs.insert({
+      id: priorRunId,
+      taskId,
+      agent: "claude-code",
+      status: "succeeded",
+      startedAt: now,
+      endedAt: now,
+      exitCode: 0,
+      tmuxSession: "agetor-stale-name",
+      claudeSessionId: priorClaudeSessionId,
+      codexSessionId: null,
+    });
+
+    const result = await sendInput(priorRunId, largePrompt);
+    expect(result.delivered).toBe(true);
+    if (!result.delivered) throw new Error(result.reason);
+    const newRunId = result.runId;
+
+    // Let the spawn + the fire-and-forget deferred-paste chain run their
+    // course, including the doomed load-buffer call and its failure
+    // handling.
+    await new Promise((r) => setTimeout(r, 800));
+
+    const entries = readLog(logPath);
+    expect(entries.some((e) => e.argv.includes("load-buffer"))).toBe(true);
+    // paste-buffer must never have been reached — load-buffer failed first.
+    expect(entries.some((e) => e.argv.includes("paste-buffer"))).toBe(false);
+
+    // The whole point of the fix: a failed deferred paste must settle the
+    // run (not leave it stuck `running` forever waiting on an end_turn that
+    // will never arrive, since claude never received the prompt).
+    const list = runs.listForTask(taskId);
+    const settled = list.find((r) => r.id === newRunId);
+    expect(settled?.status).not.toBe("running");
+    expect(settled?.status).toBe("failed");
+  } finally {
+    __forTest.setCaptureModePane(prevCapture);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
+    dropSession(taskId);
+    rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
+  }
+});
+
 test("a small (<=4KB) follow-up resume still embeds the prompt in new-session argv — deferral doesn't fire for the common case", async () => {
   // Reuse the fixed-verdict stub (uniform "gone" so the routing gate always
   // takes the respawn path) — this test only cares about the argv shape of
