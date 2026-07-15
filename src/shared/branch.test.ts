@@ -214,6 +214,13 @@ describe("commitPushPrompt", () => {
     // Title fence is asked for before the description fence.
     expect(p.indexOf("PR title:")).toBeLessThan(p.indexOf("PR description:"));
   });
+  test("wraps the description in a four-backtick fence so nested ``` blocks don't truncate the copy", () => {
+    const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task" });
+    // Verified against micromark: a 4-tick outer fence survives inner ``` fences
+    // (common in PR descriptions), where a 3-tick fence would close early.
+    expect(p).toContain("````");
+    expect(p).toContain("four backticks");
+  });
 });
 
 describe("renderBranchTemplate", () => {

@@ -1775,11 +1775,18 @@ export interface ToolResultEventData {
  * shell metacharacters; `'\''` is the POSIX escape for an embedded quote.
  *
  * After the commit/push, the prompt also asks the agent to propose a pull
- * request title and description, each emitted in its own fenced ``` code block
- * so agetor renders a one-click copy button per field — the user copies the
- * title into the New PR composer's Title field and the description into its
+ * request title and description, each emitted in its own fenced code block so
+ * agetor renders a one-click copy button per field — the user copies the title
+ * into the New PR composer's Title field and the description into its
  * Description field without a second turn. Two blocks (not one) because the
  * composer has two separate fields; the copy button grabs a whole fenced block.
+ *
+ * The description block uses a FOUR-backtick fence on purpose: PR descriptions
+ * routinely contain their own ``` code fences (test output, snippets), and a
+ * 3-backtick outer fence is closed early by the first inner ```, truncating the
+ * copied text. A 4-backtick fence is closed only by >=4 backticks, so inner ```
+ * blocks survive verbatim (verified against micromark, react-markdown's parser:
+ * 4-tick outer -> one <pre>; 3-tick outer -> two, split at the inner fence).
  */
 export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): string {
   const ccType = branchCommitType(task.branch, task.taskType);
@@ -1789,11 +1796,12 @@ export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): strin
     `(prefix the subject with "${ccType}:", e.g. "${ccType}: ...") summarizing the work, ` +
     `then push the current branch to origin. ` +
     `If the branch has no upstream yet, set it with \`git push -u origin ${branchLabel}\`. ` +
-    `After pushing, propose a pull request so it can be opened without a second turn. ` +
-    `Output exactly two fenced code blocks, each on its own so it can be copied with ` +
-    `one click: first a "PR title:" line followed by a \`\`\` block containing only the ` +
-    `concise one-line title, then a "PR description:" line followed by a \`\`\` block ` +
-    `containing the description in markdown (what changed and why).`
+    `After pushing, propose the pull request as two fenced code blocks so each can be ` +
+    `copied with one click: first a "PR title:" line followed by a \`\`\` block containing ` +
+    `only the concise one-line title, then a "PR description:" line followed by a ` +
+    `\`\`\`\` four-backtick block containing the description in markdown (what changed and ` +
+    `why) — use four backticks so any \`\`\` code fences inside the description don't ` +
+    `close the block early.`
   );
 }
 
