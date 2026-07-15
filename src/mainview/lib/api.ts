@@ -75,6 +75,7 @@ import type {
   TerminalTab,
   UpdateStatus,
 } from "../../shared/types.ts";
+import { fetchWithRecovery } from "./net-retry.ts";
 
 export interface UpdateSnapshot {
   status: UpdateStatus;
@@ -260,27 +261,26 @@ export class ApiError extends Error {
   }
 }
 
-async function j<T>(path: string, init?: RequestInit): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`${BASE}${path}`, {
-      ...init,
-      headers: {
-        "content-type": "application/json",
-        "authorization": `Bearer ${API_TOKEN}`,
-        ...(init?.headers ?? {}),
-      },
-    });
-  } catch (e) {
-    // WebKit's bare "Load failed" tells us nothing — replace with
-    // something the user can act on.
-    const msg = (e as Error).message ?? String(e);
-    throw new Error(
-      msg === "Load failed"
-        ? `cannot reach agetor API at ${BASE} (${path}) — is the bun process running? Try restarting \`bun run dev\`.`
-        : msg,
-    );
-  }
+async function j<T>(
+  path: string,
+  init?: RequestInit,
+  opts?: { retry?: boolean },
+): Promise<T> {
+  // fetchWithRecovery absorbs transient socket-layer rejections (WebKit's
+  // bare "Load failed" — see net-retry.ts) via a health-gated single retry
+  // before giving up; it throws a truthful error when the server really is
+  // unreachable. HTTP error statuses still fall through to the !res.ok
+  // handling below unchanged. `opts.retry: false` (set by a handful of
+  // non-idempotent callers below) still probes health for the error
+  // message but never re-issues the request.
+  const res = await fetchWithRecovery({ fetchImpl: fetch, base: BASE }, path, {
+    ...init,
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${API_TOKEN}`,
+      ...(init?.headers ?? {}),
+    },
+  }, opts);
   if (res.status === 204) return undefined as T;
   const body = await res.json().catch(() => null);
   if (!res.ok) {
@@ -555,10 +555,11 @@ export const api = {
     return j<GitHubCommentsResult>(`/github/comments?${q.toString()}`);
   },
   createGitHubComment: (input: { path: string; number: number; body: string; kind?: GitHubItemKind }) =>
+    // retry: false — a replay would post a duplicate PR/issue comment.
     j<{ comment: GitHubComment }>("/github/comments", {
       method: "POST",
       body: JSON.stringify(input),
-    }),
+    }, { retry: false }),
   getGitHubViewer: (input: { path: string }) => {
     const q = new URLSearchParams({ path: input.path });
     return j<{ ok: true; login: string }>(`/github/viewer?${q.toString()}`);
@@ -1017,7 +1018,9 @@ export const api = {
     column?: ColumnId;
     references?: TaskReference[];
     taskType?: TaskType;
-  }) => j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }),
+  }) =>
+    // retry: false — a replay would create a duplicate task + branch.
+    j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
   updateTask: (id: string, patch: Partial<Task>) =>
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   moveTask: (id: string, column: ColumnId) =>
@@ -1050,9 +1053,12 @@ export const api = {
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
   sendRunInput: (runId: string, line: string) =>
+    // retry: false — a replay would paste a duplicate message into a live
+    // agent tmux session.
     j<{ delivered: true; runId: string } | { delivered: false; reason: string }>(
       `/runs/${runId}/input`,
       { method: "POST", body: JSON.stringify({ line }) },
+      { retry: false },
     ),
 
   // Messages backlog — saved, not-yet-sent draft messages parked on a task.
