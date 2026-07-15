@@ -225,6 +225,15 @@ export interface ClaudeLaunchOptions {
    * installation — see `ensureInstalledForCwd` in hook-installer.ts.)
    */
   mode: string | null;
+  /**
+   * Set by `agents.ts` (`buildCommand` → `spawnAgent`) when the prompt was
+   * too large to embed in `argv` (over `CLAUDE_PROMPT_ARGV_MAX_BYTES` — tmux's
+   * ~16KB client-command cap). When present, `argv` carries no prompt at all
+   * and this raw text is delivered post-launch by pasting it into the tmux
+   * pane once claude's composer is idle, via the same load-buffer/paste-
+   * buffer machinery `sendTurn` uses for live-session follow-ups.
+   */
+  deferredPrompt?: string;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -3296,13 +3305,34 @@ function attachTailer(state: SessionState): void {
  * Public entry points.
  * ────────────────────────────────────────────────────────────────────────── */
 
+/** How often `spawnClaudeViaTmux`'s deferred-paste loop polls `readPaneMode`
+ *  while waiting for a large prompt's target session to reach an idle
+ *  composer. Same cadence as the startup-dialog poller (STARTUP_DIALOG_POLL_MS)
+ *  — frequent enough to paste promptly once claude draws, cheap enough to run
+ *  for the duration of the timeout below. */
+const DEFERRED_PROMPT_POLL_MS = 400;
+/** Bound on how long the deferred-paste loop waits for a confirmed-idle
+ *  composer before pasting best-effort anyway. Generous — matches
+ *  BOOT_TIMEOUT_MS below — because the same startup work (auth probe,
+ *  plugin/skill scan, model warmup) that can delay the JSONL also delays the
+ *  composer. */
+const DEFERRED_PROMPT_TIMEOUT_MS = 30_000;
+
 /**
- * Start a new claude tmux session for the task. The initial prompt rides
- * inside `opts.argv` (claude's documented `claude "query"` form), so we
- * don't paste anything via tmux for the first turn — claude submits it
- * itself on startup. Assumes `sessionExists(taskId)` is false; the caller
- * (orchestrator) is responsible for routing follow-up turns through
- * `sendTurn`.
+ * Start a new claude tmux session for the task. Two delivery modes for the
+ * initial prompt, chosen by `agents.ts` before this is called:
+ *
+ *   - Common case: the prompt rides inside `opts.argv` (claude's documented
+ *     `claude "query"` form), so we don't paste anything via tmux for the
+ *     first turn — claude submits it itself on startup.
+ *   - Large prompt (`opts.deferredPrompt` set, `opts.argv` carries none):
+ *     `argv` boots a bare claude with no initial query, and once the
+ *     composer is confirmed idle (or a bounded timeout elapses) the prompt
+ *     is pasted in via the same load-buffer/paste-buffer machinery
+ *     live-session follow-ups use — see the deferred-paste block below.
+ *
+ * Assumes `sessionExists(taskId)` is false; the caller (orchestrator) is
+ * responsible for routing follow-up turns through `sendTurn`.
  */
 export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   const sessionName = sessionNameFor(opts.taskId);
@@ -3404,6 +3434,45 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // user/assistant entries (e.g. permission-mode banner) still lands on
   // the opening run's stream.
   state.lastChunk = opts.onChunk;
+
+  // Large-prompt delivery: `buildCommand` (agents.ts) omits any prompt over
+  // CLAUDE_PROMPT_ARGV_MAX_BYTES from argv — embedding it would blow tmux's
+  // client-command cap and fail `new-session` outright — and hands it back
+  // as `deferredPrompt` instead. Paste it in once claude's composer is
+  // confirmed idle (`readPaneMode` returns non-null), which also naturally
+  // waits out any startup consent dialog: the boot poller below auto-confirms
+  // those, and the composer can't be idle while one is still on screen.
+  // Fire-and-forget, wrapped in try/catch so a throw here can never become an
+  // unhandled rejection (mirrors the boot-dialog poller's posture a few lines
+  // down) — this must never affect the JSONL boot wait itself.
+  if (opts.deferredPrompt) {
+    const deferredPrompt = opts.deferredPrompt;
+    opts.onChunk(
+      "status",
+      "prompt too large for launch argv — delivering via paste once claude is ready",
+    );
+    void (async () => {
+      try {
+        const deadline = Date.now() + DEFERRED_PROMPT_TIMEOUT_MS;
+        let ready = false;
+        while (Date.now() < deadline) {
+          if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return; // session died — nothing to paste into
+          if (sessions.get(opts.taskId) !== state) return; // superseded by a newer spawn/reattach
+          if (readPaneMode(state) !== null) { ready = true; break; }
+          await Bun.sleep(DEFERRED_PROMPT_POLL_MS);
+        }
+        // Re-check liveness/identity before the final attempt — the loop can
+        // exit via the timeout with the session still alive, and a dropped
+        // prompt is worse than a best-effort paste into whatever's on screen.
+        if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return;
+        if (sessions.get(opts.taskId) !== state) return;
+        if (!ready) {
+          opts.onChunk("status", "claude readiness never confirmed — delivering prompt anyway");
+        }
+        void queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, { bracketed: true });
+      } catch { /* never let the deferred-paste poller crash the spawn */ }
+    })();
+  }
 
   // Bounded wait for claude to create the JSONL. This is just claude's
   // bootup (auth probe, plugin/skill scan, model warmup, MCP initialize on
