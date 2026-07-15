@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  AlertCircle, ChevronDown, ChevronRight, FileMinus, FilePen, FilePlus,
-  FileSymlink, GitCompare, Loader2,
+  AlertCircle, BookmarkPlus, ChevronDown, ChevronRight, FileMinus, FilePen, FilePlus,
+  FileSymlink, GitCompare, Loader2, Send, X,
 } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import { api } from "@/lib/api";
-import { toRows } from "@/lib/diff-rows";
-import type { DiffFile, Task, TaskDiff } from "../../../shared/types.ts";
+import { api, type PendingInteraction } from "@/lib/api";
+import { toRows, type DiffRow } from "@/lib/diff-rows";
+import { composeDiffMessage, groupSelectedRows, type DiffSelectionBlock } from "@/lib/diff-selection";
+import type { AgentKind, DiffFile, Harness, Run, Task, TaskDiff } from "../../../shared/types.ts";
 
 interface Props {
   open: boolean;
@@ -24,10 +26,24 @@ const STATUS_META: Record<DiffFile["status"], { label: string; icon: typeof File
 };
 
 /**
+ * Resolve a task's harness id to its underlying kind. Duplicated (rather than
+ * imported) from RunPanel.tsx's private `harnessKindOf` — that function isn't
+ * exported, and this dialog is scoped to touch only this file, so a small
+ * local copy is cheaper than widening RunPanel's surface for one call site.
+ */
+function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
+  return harnesses.find((h) => h.id === harnessId)?.kind ?? "claude-code";
+}
+
+const SELECTABLE_KINDS = new Set<DiffRow["kind"]>(["ctx", "add", "del"]);
+
+/**
  * Read-only viewer for everything a task's worktree changed vs its pinned base
- * ref. Fetches on open, renders a per-file collapsible unified diff. When the
- * task has no worktree (or nothing changed) the server returns a friendly
- * `note` which we show in place of the file list.
+ * ref, plus click-to-select diff lines that compose into a message you can
+ * send to the agent or park on the task's messages backlog. Fetches on open,
+ * renders a per-file collapsible unified diff. When the task has no worktree
+ * (or nothing changed) the server returns a friendly `note` which we show in
+ * place of the file list.
  */
 export function DiffDialog({ open, task, onClose }: Props) {
   const taskId = task?.id ?? null;
@@ -36,7 +52,28 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const [loading, setLoading] = useState(false);
   const [openFiles, setOpenFiles] = useState<Set<string>>(new Set());
 
+  // Selection: file path -> selected row indices into that file's `toRows`
+  // output. `lastClicked` anchors shift-click range extension.
+  const [selected, setSelected] = useState<Map<string, Set<number>>>(new Map());
+  const [lastClicked, setLastClicked] = useState<{ path: string; index: number } | null>(null);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [hint, setHint] = useState<string | null>(null);
+
+  // Gating data — same shape RunPanel uses to decide whether Send is safe.
+  // Fetched lazily (below) once the composer first becomes visible, rather
+  // than on every dialog open, since most diff views never select a line.
+  const [runs, setRuns] = useState<Run[]>([]);
+  const [interactions, setInteractions] = useState<PendingInteraction[]>([]);
+  const [harnesses, setHarnesses] = useState<Harness[]>([]);
+
   useEffect(() => {
+    // Reset selection + composer state on every dialog close/reopen and on
+    // every diff refetch (this effect's deps mirror the fetch below).
+    setSelected(new Map());
+    setLastClicked(null);
+    setDraft("");
+    setHint(null);
     if (!open || !taskId) return;
     let cancelled = false;
     setLoading(true);
@@ -81,6 +118,138 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const allOpen = !!diff && diff.files.length > 0 && openFiles.size === diff.files.length;
   const setAll = (on: boolean) =>
     setOpenFiles(on && diff ? new Set(diff.files.map((f) => f.path)) : new Set());
+
+  // Plain click toggles a row; shift-click extends from `lastClicked` when it
+  // sits in the same file (adding the contiguous selectable range), otherwise
+  // it behaves like a plain click on the clicked row. `lastClicked` updates on
+  // every selecting click (both branches).
+  const handleRowClick = useCallback(
+    (path: string, index: number, rows: DiffRow[], shiftKey: boolean) => {
+      const row = rows[index];
+      if (!row || !SELECTABLE_KINDS.has(row.kind)) return;
+      setSelected((prev) => {
+        const next = new Map(prev);
+        const current = new Set(next.get(path) ?? []);
+        if (shiftKey && lastClicked && lastClicked.path === path) {
+          const lo = Math.min(lastClicked.index, index);
+          const hi = Math.max(lastClicked.index, index);
+          for (let i = lo; i <= hi; i++) {
+            const kind = rows[i]?.kind;
+            if (kind && SELECTABLE_KINDS.has(kind)) current.add(i);
+          }
+        } else if (current.has(index)) {
+          current.delete(index);
+        } else {
+          current.add(index);
+        }
+        if (current.size === 0) next.delete(path);
+        else next.set(path, current);
+        return next;
+      });
+      setLastClicked({ path, index });
+    },
+    [lastClicked],
+  );
+
+  const totalSelected = useMemo(() => {
+    let n = 0;
+    for (const set of selected.values()) n += set.size;
+    return n;
+  }, [selected]);
+  const composerVisible = totalSelected > 0;
+
+  // Fetch gating data the moment the composer first becomes visible
+  // (selection empty -> non-empty). Not refetched on every additional click —
+  // the effect only reruns when `composerVisible` flips or the task changes.
+  useEffect(() => {
+    if (!composerVisible || !taskId) return;
+    let cancelled = false;
+    Promise.all([
+      api.listRuns(taskId),
+      api.listPendingInteractions(taskId),
+      api.listHarnesses(),
+    ])
+      .then(([runList, interactionList, harnessPayload]) => {
+        if (cancelled) return;
+        setRuns(runList);
+        setInteractions(interactionList);
+        setHarnesses(harnessPayload.harnesses);
+      })
+      .catch(() => { /* gating falls back to safe (disabled) defaults */ });
+    return () => { cancelled = true; };
+  }, [composerVisible, taskId]);
+
+  const kind = task ? harnessKindOf(task.agent, harnesses) : "claude-code";
+  const liveRunId = task?.runId ?? null;
+  // Mirrors RunPanel.tsx's `resumableRunId`: claude-code can resume from its
+  // most recent run even once `task.runId` has been cleared (orphan-
+  // reconciled); codex has no resume mechanism.
+  const resumableRunId = liveRunId ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
+  const modalPending = interactions.length > 0;
+  const archived = task?.archivedAt != null;
+  const canSend = !!resumableRunId && !modalPending && !busy;
+
+  const blocks = useMemo<DiffSelectionBlock[]>(() => {
+    if (!diff) return [];
+    const result: DiffSelectionBlock[] = [];
+    for (const f of diff.files) {
+      const indices = selected.get(f.path);
+      if (!indices || indices.size === 0) continue;
+      result.push(...groupSelectedRows(f.path, toRows(f.hunks), indices));
+    }
+    return result;
+  }, [diff, selected]);
+
+  const clearSelection = () => {
+    setSelected(new Map());
+    setLastClicked(null);
+    setDraft("");
+    setHint(null);
+  };
+
+  const doSend = async () => {
+    if (!task || !resumableRunId || modalPending || busy) return;
+    setBusy(true);
+    setHint(null);
+    try {
+      // Re-check right before delivering — load-bearing: a message reaching a
+      // live tmux native prompt pastes into the modal instead of the agent.
+      const pending = await api.listPendingInteractions(task.id);
+      if (pending.length > 0) {
+        setInteractions(pending);
+        setHint("A prompt is waiting for a response — answer it, or Save for later instead.");
+        return;
+      }
+      const composed = composeDiffMessage(draft.trim(), blocks);
+      const res = await api.sendRunInput(resumableRunId, composed);
+      if (!res.delivered) {
+        setHint(res.reason);
+        return;
+      }
+      clearSelection();
+      setHint("Sent to agent.");
+    } catch (e) {
+      setHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doSave = async () => {
+    if (!task || archived || busy) return;
+    setBusy(true);
+    setHint(null);
+    try {
+      const composed = composeDiffMessage(draft.trim(), blocks);
+      await api.addBacklogItem(task.id, { text: composed, references: [] });
+      clearSelection();
+      setHint("Saved to backlog.");
+    } catch (e) {
+      setHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <Dialog
@@ -148,16 +317,93 @@ export function DiffDialog({ open, task, onClose }: Props) {
                 file={f}
                 open={openFiles.has(f.path)}
                 onToggle={() => toggle(f.path)}
+                selectedIndices={selected.get(f.path)}
+                onRowClick={handleRowClick}
               />
             ))}
           </div>
         )}
       </div>
+
+      {composerVisible && (
+        <div className="shrink-0 border-t border-border/60 p-3">
+          <div className="mb-2 flex items-center justify-between text-xs text-muted-foreground">
+            <span>
+              {totalSelected} {totalSelected === 1 ? "line" : "lines"} in{" "}
+              {selected.size} {selected.size === 1 ? "file" : "files"}
+            </span>
+            <Button size="sm" variant="ghost" onClick={clearSelection} disabled={busy}>
+              <X className="mr-1 size-3" /> Clear
+            </Button>
+          </div>
+          <Textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                if (canSend) {
+                  void doSend();
+                } else if (!archived) {
+                  void doSave();
+                }
+              }
+            }}
+            placeholder="Add a message about the selected lines… (optional)"
+            rows={2}
+            disabled={busy}
+            className="h-16 min-h-0 w-full resize-none text-xs"
+          />
+          {archived && (
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              Sending will unarchive this task and restore its worktree.
+            </p>
+          )}
+          <div className="mt-2 flex items-center justify-end gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => void doSave()}
+              disabled={archived || busy}
+              title={archived ? "Unarchive the task to save drafts." : "Save this message to the backlog to send later."}
+            >
+              <BookmarkPlus className="mr-1 size-3" /> Save for later
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => void doSend()}
+              disabled={!canSend}
+              title={
+                !resumableRunId
+                  ? "This task hasn't run yet — Save for later instead."
+                  : modalPending
+                    ? "A prompt is waiting for a response — answer it, or Save for later instead."
+                    : "Send to the agent"
+              }
+            >
+              <Send className="mr-1 size-3" /> Send to agent
+            </Button>
+          </div>
+          {hint && <p className="mt-1 text-[10px] text-muted-foreground">{hint}</p>}
+        </div>
+      )}
     </Dialog>
   );
 }
 
-function FileBlock({ file, open, onToggle }: { file: DiffFile; open: boolean; onToggle: () => void }) {
+function FileBlock({
+  file,
+  open,
+  onToggle,
+  selectedIndices,
+  onRowClick,
+}: {
+  file: DiffFile;
+  open: boolean;
+  onToggle: () => void;
+  selectedIndices: Set<number> | undefined;
+  onRowClick: (path: string, index: number, rows: DiffRow[], shiftKey: boolean) => void;
+}) {
   const meta = STATUS_META[file.status];
   const Icon = meta.icon;
   return (
@@ -182,7 +428,7 @@ function FileBlock({ file, open, onToggle }: { file: DiffFile; open: boolean; on
           <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file — no textual diff.</div>
         ) : (
           <>
-            <DiffBody hunks={file.hunks} />
+            <DiffBody path={file.path} hunks={file.hunks} selectedIndices={selectedIndices} onRowClick={onRowClick} />
             {file.truncated && (
               <div className="border-t border-border/60 px-3 py-1.5 text-[11px] italic text-muted-foreground">
                 Diff truncated — this file's changes are too large to display in full.
@@ -195,39 +441,57 @@ function FileBlock({ file, open, onToggle }: { file: DiffFile; open: boolean; on
   );
 }
 
-function DiffBody({ hunks }: { hunks: string }) {
+function DiffBody({
+  path,
+  hunks,
+  selectedIndices,
+  onRowClick,
+}: {
+  path: string;
+  hunks: string;
+  selectedIndices: Set<number> | undefined;
+  onRowClick: (path: string, index: number, rows: DiffRow[], shiftKey: boolean) => void;
+}) {
   const rows = useMemo(() => toRows(hunks), [hunks]);
   return (
     <div className="overflow-x-auto bg-card font-mono text-xs leading-relaxed">
-      {rows.map((r, i) => (
-        <div
-          key={i}
-          className={cn(
-            "flex",
-            r.kind === "add" && "bg-emerald-500/10",
-            r.kind === "del" && "bg-rose-500/10",
-            r.kind === "hunk" && "bg-sky-500/10 text-sky-300",
-            r.kind === "meta" && "text-muted-foreground",
-          )}
-        >
-          <span className="w-10 shrink-0 select-none border-r border-border/40 px-1 text-right text-muted-foreground/60">
-            {r.old ?? ""}
-          </span>
-          <span className="w-10 shrink-0 select-none border-r border-border/40 px-1 text-right text-muted-foreground/60">
-            {r.neu ?? ""}
-          </span>
-          <span
+      {rows.map((r, i) => {
+        const selectable = SELECTABLE_KINDS.has(r.kind);
+        const isSelected = selectable && (selectedIndices?.has(i) ?? false);
+        return (
+          <div
+            key={i}
+            onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
+            onClick={selectable ? (e) => onRowClick(path, i, rows, e.shiftKey) : undefined}
             className={cn(
-              "shrink-0 select-none px-1 text-center",
-              r.kind === "add" && "text-emerald-400",
-              r.kind === "del" && "text-rose-400",
+              "flex border-l-2 border-transparent",
+              r.kind === "add" && "bg-emerald-500/10",
+              r.kind === "del" && "bg-rose-500/10",
+              r.kind === "hunk" && "bg-sky-500/10 text-sky-300",
+              r.kind === "meta" && "text-muted-foreground",
+              selectable && "cursor-pointer hover:bg-muted/40",
+              isSelected && "border-primary bg-primary/15",
             )}
           >
-            {r.kind === "add" ? "+" : r.kind === "del" ? "−" : " "}
-          </span>
-          <span className="whitespace-pre px-1">{r.text || " "}</span>
-        </div>
-      ))}
+            <span className="w-10 shrink-0 select-none border-r border-border/40 px-1 text-right text-muted-foreground/60">
+              {r.old ?? ""}
+            </span>
+            <span className="w-10 shrink-0 select-none border-r border-border/40 px-1 text-right text-muted-foreground/60">
+              {r.neu ?? ""}
+            </span>
+            <span
+              className={cn(
+                "shrink-0 select-none px-1 text-center",
+                r.kind === "add" && "text-emerald-400",
+                r.kind === "del" && "text-rose-400",
+              )}
+            >
+              {r.kind === "add" ? "+" : r.kind === "del" ? "−" : " "}
+            </span>
+            <span className="whitespace-pre px-1">{r.text || " "}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }
