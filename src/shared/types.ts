@@ -1620,6 +1620,13 @@ export interface Subagent {
   spawnDepth: number;
   /** Absolute path to the subagent's JSONL transcript. */
   sourcePath: string;
+  /** The parent `Agent` tool_use id (meta.json.toolUseId) — the correlation
+   *  key used to settle this row off a `tool_result` block in the MAIN
+   *  session JSONL when the subagent's own transcript never writes a
+   *  terminal end_turn line. Null pre-fix / when the meta sidecar lacked it.
+   *  Optional (not just nullable) so object literals built before this field
+   *  existed — fixtures across several test files — still satisfy the type. */
+  toolUseId?: string | null;
   status: SubagentStatus;
   startedAt: number;
   endedAt: number | null;
