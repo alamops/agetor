@@ -8,13 +8,15 @@
 -- need to be recreated. Nothing else has a foreign key on this table —
 -- `tasks.agent` stores the harness id/kind as a plain string, not a FK.
 --
--- The CHECK also permits 'cursor': the cursor-agent branch merges BEFORE this
--- one, so by the time this migration runs on a user DB, 024_cursor_harness has
--- already rebuilt the table and seeded a kind='cursor' builtin row — the
--- row-copy below would violate a CHECK that omitted it. (Both branches list
--- all four kinds so the rebuilds stay order-independent regardless; the
--- app-layer whitelist in db.ts still governs which kinds can actually be
--- inserted.) This file is 026 — 024/025 belong to the cursor branch.
+-- The CHECK also permits 'cursor': a concurrent branch adds that kind with
+-- its own harnesses rebuild, and merge order isn't guaranteed — if either
+-- rebuild's CHECK excluded the other's kind, whichever ran second would fail
+-- copying the other's seeded builtin row. Both branches list all four kinds
+-- so the rebuilds stay order-independent; the app-layer whitelist in db.ts
+-- still governs which kinds can actually be inserted. This file is 028 —
+-- 024–027 landed on main while this branch was in flight (024 among them is
+-- reseed_harness_builtins, which only INSERT OR IGNOREs rows; no migration
+-- since 014 has changed this table's columns, so the schema below is current).
 
 CREATE TABLE harnesses_new (
   id         TEXT PRIMARY KEY,

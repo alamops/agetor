@@ -150,7 +150,7 @@ test("getByIdOrKind synthesises a built-in row for legacy kind ids without a mat
   expect(harnesses.getByIdOrKind("does-not-exist")).toBeNull();
 });
 
-// --- grok (T2/T3: migration 026 + db.ts widening) --------------------------
+// --- grok (T2/T3: migration 028 + db.ts widening) --------------------------
 
 test("migrated builtin grok row exists and is seeded disabled by default (D7 rollout)", () => {
   const h = harnesses.get("grok")!;
