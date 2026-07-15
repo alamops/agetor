@@ -132,6 +132,27 @@ test("formatDiffSelection labels a deletion-only block with old-side numbers", (
   expect(out).not.toContain("(lines 10");
 });
 
+test("formatDiffSelection labels a deletion-first block using only new-side numbers, not the old-side start", () => {
+  // Mirrors hunk "@@ -140,6 +100,6 @@": selecting a run that starts with
+  // deleted lines (old-side numbering) and continues into added/context
+  // lines (new-side numbering) must not mix the two sides — e.g. old=140
+  // paired with neu=101 must never render as "(lines 140–101)".
+  const blocks: DiffSelectionBlock[] = [
+    {
+      path: "src/d.ts",
+      lines: [
+        { old: 140, neu: null, kind: "del", text: "removed one" },
+        { old: 141, neu: null, kind: "del", text: "removed two" },
+        { old: 142, neu: 100, kind: "ctx", text: "shared" },
+        { old: null, neu: 101, kind: "add", text: "added" },
+      ],
+    },
+  ];
+  const out = formatDiffSelection(blocks);
+  expect(out).toContain("src/d.ts (lines 100–101)");
+  expect(out).not.toContain("140");
+});
+
 // --- formatDiffSelection: fence safety + re-prefixing -------------------
 
 test("formatDiffSelection re-prefixes lines by kind and uses a plain ```diff fence by default", () => {

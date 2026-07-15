@@ -158,6 +158,24 @@ export function DiffDialog({ open, task, onClose }: Props) {
   }, [selected]);
   const composerVisible = totalSelected > 0;
 
+  // A new selection starting (composer reappearing) supersedes whatever hint
+  // was left over from the last send/save — e.g. the "Sent to agent." success
+  // hint from a moment ago shouldn't linger once the user starts picking new
+  // lines. Only fires on the false->true edge (a selection existing while the
+  // composer is already visible doesn't retrigger this).
+  useEffect(() => {
+    if (composerVisible) setHint(null);
+  }, [composerVisible]);
+
+  // Success/error hints are otherwise sticky (no toast system to auto-dismiss
+  // them) — self-clear after a few seconds so a "Sent to agent." confirmation
+  // doesn't sit there forever once the composer has collapsed away.
+  useEffect(() => {
+    if (!hint) return;
+    const timer = setTimeout(() => setHint(null), 4000);
+    return () => clearTimeout(timer);
+  }, [hint]);
+
   // Fetch gating data the moment the composer first becomes visible
   // (selection empty -> non-empty). Not refetched on every additional click —
   // the effect only reruns when `composerVisible` flips or the task changes.
@@ -325,66 +343,77 @@ export function DiffDialog({ open, task, onClose }: Props) {
         )}
       </div>
 
-      {composerVisible && (
+      {(composerVisible || hint) && (
         <div className="shrink-0 border-t border-border/60 p-3">
-          <div className="mb-2 flex items-center justify-between text-xs text-muted-foreground">
-            <span>
-              {totalSelected} {totalSelected === 1 ? "line" : "lines"} in{" "}
-              {selected.size} {selected.size === 1 ? "file" : "files"}
-            </span>
-            <Button size="sm" variant="ghost" onClick={clearSelection} disabled={busy}>
-              <X className="mr-1 size-3" /> Clear
-            </Button>
-          </div>
-          <Textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                if (canSend) {
-                  void doSend();
-                } else if (!archived) {
-                  void doSave();
-                }
-              }
-            }}
-            placeholder="Add a message about the selected lines… (optional)"
-            rows={2}
-            disabled={busy}
-            className="h-16 min-h-0 w-full resize-none text-xs"
-          />
-          {archived && (
-            <p className="mt-1 text-[10px] text-muted-foreground">
-              Sending will unarchive this task and restore its worktree.
-            </p>
+          {composerVisible ? (
+            <>
+              <div className="mb-2 flex items-center justify-between text-xs text-muted-foreground">
+                <span>
+                  {totalSelected} {totalSelected === 1 ? "line" : "lines"} in{" "}
+                  {selected.size} {selected.size === 1 ? "file" : "files"}
+                </span>
+                <Button size="sm" variant="ghost" onClick={clearSelection} disabled={busy}>
+                  <X className="mr-1 size-3" /> Clear
+                </Button>
+              </div>
+              <Textarea
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    if (canSend) {
+                      void doSend();
+                    } else if (!archived) {
+                      void doSave();
+                    }
+                  }
+                }}
+                placeholder="Add a message about the selected lines… (optional)"
+                rows={2}
+                disabled={busy}
+                className="h-16 min-h-0 w-full resize-none text-xs"
+              />
+              {archived && (
+                <p className="mt-1 text-[10px] text-muted-foreground">
+                  Sending will unarchive this task and restore its worktree.
+                </p>
+              )}
+              <div className="mt-2 flex items-center justify-end gap-2">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void doSave()}
+                  disabled={archived || busy}
+                  title={archived ? "Unarchive the task to save drafts." : "Save this message to the backlog to send later."}
+                >
+                  <BookmarkPlus className="mr-1 size-3" /> Save for later
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={() => void doSend()}
+                  disabled={!canSend}
+                  title={
+                    !resumableRunId
+                      ? "This task hasn't run yet — Save for later instead."
+                      : modalPending
+                        ? "A prompt is waiting for a response — answer it, or Save for later instead."
+                        : "Send to the agent"
+                  }
+                >
+                  <Send className="mr-1 size-3" /> Send to agent
+                </Button>
+              </div>
+              {hint && <p className="mt-1 text-[10px] text-muted-foreground">{hint}</p>}
+            </>
+          ) : (
+            // Hint-only mode: the selection was cleared (success, or a Save
+            // that emptied it) but the confirmation still needs to be visible
+            // for a beat — without this branch the composer's collapse-on-
+            // success behavior would unmount the hint in the same render it
+            // was set, so it was never seen.
+            hint && <p className="text-[10px] text-muted-foreground">{hint}</p>
           )}
-          <div className="mt-2 flex items-center justify-end gap-2">
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => void doSave()}
-              disabled={archived || busy}
-              title={archived ? "Unarchive the task to save drafts." : "Save this message to the backlog to send later."}
-            >
-              <BookmarkPlus className="mr-1 size-3" /> Save for later
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => void doSend()}
-              disabled={!canSend}
-              title={
-                !resumableRunId
-                  ? "This task hasn't run yet — Save for later instead."
-                  : modalPending
-                    ? "A prompt is waiting for a response — answer it, or Save for later instead."
-                    : "Send to the agent"
-              }
-            >
-              <Send className="mr-1 size-3" /> Send to agent
-            </Button>
-          </div>
-          {hint && <p className="mt-1 text-[10px] text-muted-foreground">{hint}</p>}
         </div>
       )}
     </Dialog>

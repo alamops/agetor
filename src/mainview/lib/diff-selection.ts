@@ -68,20 +68,29 @@ function labelFor(block: DiffSelectionBlock): string {
     return `${path} (line ${line.neu ?? line.old})`;
   }
 
-  const first = lines[0]!;
-  const last = lines[lines.length - 1]!;
-  const anyNeu = lines.some((l) => l.neu != null);
-  if (anyNeu) {
-    return `${path} (lines ${first.neu ?? first.old}–${last.neu ?? last.old})`;
+  // Range endpoints must come from the same numbering side, or a
+  // deletion-first block (old-side start, new-side end) mislabels itself —
+  // e.g. hunk "@@ -140,6 +100,6 @@", selecting del(old=140)…ctx(neu=101)
+  // must not read "(lines 140–101)". Prefer new-side numbers, but derive
+  // both endpoints only from lines that actually have one.
+  const neuLines = lines.filter((l) => l.neu != null);
+  if (neuLines.length) {
+    const first = neuLines[0]!;
+    const last = neuLines[neuLines.length - 1]!;
+    return `${path} (lines ${first.neu}–${last.neu})`;
   }
   // No line in the block has a new-side number (a pure deletion run) — label
   // with old-side numbers instead so it isn't misread as new-side.
+  const first = lines[0]!;
+  const last = lines[lines.length - 1]!;
   return `${path} (old lines ${first.old}–${last.old})`;
 }
 
 /** DIFF_SELECTION_HEADING + one labeled fenced snippet per block:
  *    <path> (line N)          — single line
- *    <path> (lines A–B)       — range, new-side numbers when any line has neu
+ *    <path> (lines A–B)       — range, new-side numbers from the lines that
+ *                                have one (never mixed with an old-side
+ *                                endpoint), when any line in the block has neu
  *    <path> (old lines A–B)   — deletion-only blocks (no neu anywhere)
  *  followed by a ```diff fence whose lines are re-prefixed by kind:
  *  "+" for add, "-" for del, " " for ctx. The fence must be longer than the
