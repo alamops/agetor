@@ -780,6 +780,7 @@ interface SubagentRow {
   status: string;
   started_at: number;
   ended_at: number | null;
+  tool_use_id: string | null;
 }
 
 function toSubagent(r: SubagentRow): Subagent {
@@ -792,6 +793,7 @@ function toSubagent(r: SubagentRow): Subagent {
     description: r.description,
     spawnDepth: r.spawn_depth,
     sourcePath: r.source_path,
+    toolUseId: r.tool_use_id,
     status: r.status as SubagentStatus,
     startedAt: r.started_at,
     endedAt: r.ended_at,
@@ -816,13 +818,29 @@ export const subagents = {
   insertIfAbsent(s: Subagent): void {
     db.run(
       `INSERT OR IGNORE INTO subagents
-         (id, task_id, run_id, parent_kind, agent_type, description, spawn_depth, source_path, status, started_at, ended_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [s.id, s.taskId, s.runId, s.parentKind, s.agentType, s.description, s.spawnDepth, s.sourcePath, s.status, s.startedAt, s.endedAt],
+         (id, task_id, run_id, parent_kind, agent_type, description, spawn_depth, source_path, status, started_at, ended_at, tool_use_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [s.id, s.taskId, s.runId, s.parentKind, s.agentType, s.description, s.spawnDepth, s.sourcePath, s.status, s.startedAt, s.endedAt, s.toolUseId ?? null],
     );
   },
   setStatus(id: string, status: SubagentStatus, endedAt: number | null): void {
     db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, endedAt, id]);
+  },
+  /** Backfill the tool_result correlation key for a row created before this
+   *  column existed (or whose meta sidecar hadn't been read yet). Only fills
+   *  a NULL — never overwrites an id already recorded, so a stale re-read of
+   *  the sidecar can't clobber a value another path already set. */
+  setToolUseId(id: string, toolUseId: string): void {
+    db.run(`UPDATE subagents SET tool_use_id = ? WHERE id = ? AND tool_use_id IS NULL`, [toolUseId, id]);
+  },
+  /** The `running` subagent row for this task whose parent `Agent` tool_use id
+   *  matches — the lookup behind the main-JSONL tool_result scan. Scoped by
+   *  taskId (not just toolUseId) since ids are only unique within a session. */
+  getRunningByToolUseId(taskId: string, toolUseId: string): Subagent | null {
+    const row = db.query<SubagentRow, [string, string]>(
+      `SELECT * FROM subagents WHERE task_id = ? AND tool_use_id = ? AND status = 'running'`,
+    ).get(taskId, toolUseId);
+    return row ? toSubagent(row) : null;
   },
   /** Settle a single subagent by id — the DB half of an *externally*-detected
    *  completion (a parent task-notification naming the finishing agent, or

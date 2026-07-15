@@ -18,6 +18,20 @@
  * per-subagent tab. The main session JSONL still shows the launching `Agent`
  * tool-use card; the tab is the drill-in.
  *
+ * A `running` row settles via one of THREE signals, in rough order of how
+ * often each fires: (1) the subagent's own file reaching an assistant
+ * `stop_reason:"end_turn"` line and then going idle for `DONE_IDLE_MS`
+ * (`checkDone` below); (2) a `<task-notification>` for it landing in the MAIN
+ * session JSONL (async/background + nested agents only — claude-tmux.ts's
+ * `fireBackgroundTaskSettled` calls into `settleSubagentById`); (3) this
+ * module's own scan of the MAIN session JSONL for a `tool_result` block whose
+ * `tool_use_id` matches a tracked subagent's `toolUseId` (`scanMainForToolResults`
+ * below) — the fallback for a *synchronous* top-level subagent whose own file
+ * never gets a terminal end_turn line (a flush loss under concurrent
+ * subagents) and which gets no task-notification either. All three funnel
+ * through `settleSubagentById` so the DB write / lifecycle emit / hold-release
+ * bookkeeping only lives in one place.
+ *
  * This module is READ-ONLY w.r.t. the agent: it watches files and tails them.
  * It never spawns, signals, or tears down a tmux session — `detach()` only
  * closes fs watchers + the poll timer.
@@ -151,10 +165,17 @@ interface SubagentMeta {
   agentType: string | null;
   description: string | null;
   spawnDepth: number;
+  /** The parent `Agent` tool_use id — the correlation key for
+   *  `scanMainForToolResults`. Not parsed by earlier builds, so a pre-fix row
+   *  has this NULL in the DB even though the sidecar itself carries it; the
+   *  rehydration loop below re-reads the sidecar to backfill it. */
+  toolUseId: string | null;
 }
 
 /** Read & parse `agent-<id>.meta.json`. Tolerates absence / malformed JSON —
- *  the transcript is the source of truth; the sidecar is just a nicer label. */
+ *  the transcript is the source of truth; the sidecar is just a nicer label
+ *  (except `toolUseId`, which has no transcript equivalent — it's the only
+ *  place the tool_result correlation key exists on disk). */
 function readMeta(subagentsDir: string, id: string): SubagentMeta {
   try {
     const raw = readFileSync(path.join(subagentsDir, `agent-${id}.meta.json`), "utf8");
@@ -163,9 +184,10 @@ function readMeta(subagentsDir: string, id: string): SubagentMeta {
       agentType: typeof o.agentType === "string" ? o.agentType : null,
       description: typeof o.description === "string" ? o.description : null,
       spawnDepth: typeof o.spawnDepth === "number" ? o.spawnDepth : 1,
+      toolUseId: typeof o.toolUseId === "string" ? o.toolUseId : null,
     };
   } catch {
-    return { agentType: null, description: null, spawnDepth: 1 };
+    return { agentType: null, description: null, spawnDepth: 1, toolUseId: null };
   }
 }
 
@@ -206,6 +228,10 @@ interface FileState {
   spawnDepth: number;
   startedAt: number;
   endedAt: number | null;
+  /** The parent `Agent` tool_use id — the correlation key `scanMainForToolResults`
+   *  matches against `tool_result` blocks in the main session JSONL. Null until
+   *  discovery (or rehydration backfill) finds one in the meta sidecar. */
+  toolUseId: string | null;
 }
 
 export interface SubagentWatcherHandle {
@@ -260,6 +286,7 @@ function toSubagentShape(fs: FileState, taskId: string): Subagent {
     description: fs.description,
     spawnDepth: fs.spawnDepth,
     sourcePath: fs.sourcePath,
+    toolUseId: fs.toolUseId,
     status: fs.status,
     startedAt: fs.startedAt,
     endedAt: fs.endedAt,
@@ -342,6 +369,12 @@ export function attachSubagentWatcher(opts: {
   // polling then only re-reads `running` files; resumes of a finished agent
   // after that are caught by the dir watcher's append notification.
   let firstCycle = true;
+  // Byte cursor into the MAIN session JSONL for `scanMainForToolResults`
+  // below — independent of any per-subagent `FileState.offset`. Starts at 0
+  // so a fresh watcher (boot reattach, held-task repair) sees the full
+  // history on its first scan, the same "offset 0 on attach" idiom the
+  // per-subagent rehydration above relies on.
+  let mainOffset = 0;
 
   // Reattach: rehydrate subagents this task already had so we resume their
   // tails from offset 0 (the DB-seeded `seen` set suppresses re-emission of
@@ -353,6 +386,18 @@ export function attachSubagentWatcher(opts: {
   // rather than rely on `cycle()`'s wrapper.
   try {
     for (const row of subagentsDb.listForTask(taskId)) {
+      // Pre-fix rows (and any row whose sidecar wasn't parsed for toolUseId
+      // yet) have this NULL in the DB even though the sidecar itself carries
+      // it — re-read it here so the tool_result scan below can find these
+      // rows too. This is what repairs already-stuck prod rows on restart.
+      let toolUseId = row.toolUseId ?? null;
+      if (!toolUseId) {
+        const meta = readMeta(subagentsDir, row.id);
+        if (meta.toolUseId) {
+          toolUseId = meta.toolUseId;
+          subagentsDb.setToolUseId(row.id, meta.toolUseId);
+        }
+      }
       files.set(row.id, {
         subagentId: row.id,
         runId: row.runId ?? resolveRunId(taskId) ?? row.id,
@@ -367,6 +412,7 @@ export function attachSubagentWatcher(opts: {
         spawnDepth: row.spawnDepth,
         startedAt: row.startedAt,
         endedAt: row.endedAt,
+        toolUseId,
       });
     }
   } catch (e) {
@@ -417,6 +463,7 @@ export function attachSubagentWatcher(opts: {
         spawnDepth: meta.spawnDepth,
         startedAt,
         endedAt: null,
+        toolUseId: meta.toolUseId,
       };
       files.set(id, fs);
       subagentsDb.insertIfAbsent(toSubagentShape(fs, taskId));
@@ -488,6 +535,57 @@ export function attachSubagentWatcher(opts: {
     }
   }
 
+  /**
+   * Third settle signal (see module header): scan the MAIN session JSONL for
+   * `tool_result` blocks whose `tool_use_id` matches a tracked `running`
+   * subagent's `toolUseId` — the fallback for a synchronous top-level
+   * subagent whose own transcript never gets a terminal end_turn line and
+   * gets no task-notification either (see claude-tmux.ts's
+   * `fireBackgroundTaskSettled` for that other path). Only reads the main
+   * file — and only advances `mainOffset` — when there's at least one
+   * `running` row with a known `toolUseId` to look for, so a task with no
+   * subagents (the common case) never pays for this scan, and a subagent
+   * that shows up later still gets the full backlog scanned once it does.
+   */
+  function scanMainForToolResults(): void {
+    const pending = [...files.values()].filter((fs) => fs.status === "running" && fs.toolUseId);
+    if (pending.length === 0) return;
+
+    const { text, next } = readAppendedSync(opts.jsonlPath, mainOffset);
+    if (!text) return;
+    const lines = text.split("\n");
+    const tail = lines.pop() ?? ""; // partial trailing line — re-read next tick
+    mainOffset = next - Buffer.byteLength(tail, "utf8");
+
+    for (const line of lines) {
+      if (!line) continue;
+      // Cheap prefilter before any JSON.parse: the launching `tool_use` line
+      // and a `<tool-use-id>` notification tag also contain this id string,
+      // so a substring hit is NOT sufficient on its own — it only narrows
+      // which lines are worth the strict parse below.
+      const candidates = pending.filter((fs) => line.includes(fs.toolUseId!));
+      if (candidates.length === 0) continue;
+
+      let parsed: { type?: unknown; message?: { content?: unknown } };
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue; // one bad line must not abort the scan of the rest
+      }
+      if (parsed.type !== "user") continue;
+      const content = parsed.message?.content;
+      if (!Array.isArray(content)) continue;
+      for (const block of content) {
+        if (!block || typeof block !== "object") continue;
+        const b = block as { type?: unknown; tool_use_id?: unknown };
+        if (b.type !== "tool_result") continue;
+        for (const fs of candidates) {
+          if (b.tool_use_id === fs.toolUseId) settleSubagentById(fs.subagentId, "completed");
+        }
+      }
+    }
+  }
+
   function armDirWatcher(): void {
     if (dirWatcher || !existsSync(subagentsDir)) return;
     try {
@@ -514,6 +612,7 @@ export function attachSubagentWatcher(opts: {
       for (const fs of files.values()) {
         if (tailAll || fs.status === "running") tailFile(fs);
       }
+      scanMainForToolResults();
       checkDone(now);
     } catch { /* swallow — never crash the timer */ }
   }
