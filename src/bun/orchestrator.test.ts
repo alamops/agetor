@@ -261,7 +261,7 @@ test("archiveTask stamps archivedAt and unarchiveTask clears it", async () => {
 });
 
 test("archiveTask detaches the worktree from disk but keeps branch + DB pointers", async () => {
-  const { createTask, archiveTask } = await import("./orchestrator.ts");
+  const { createTask, archiveTask, pendingTeardown } = await import("./orchestrator.ts");
   const { prepareWorkdir } = await import("./worktree.ts");
   const { db, tasks } = await import("./db.ts");
 
@@ -293,6 +293,11 @@ test("archiveTask detaches the worktree from disk but keeps branch + DB pointers
     expect("task" in archived).toBe(true);
     if (!("task" in archived)) throw new Error(archived.error);
     expect(archived.task.archivedAt).not.toBeNull();
+
+    // Teardown (session drop, terminal kill, worktree detach) is deferred onto
+    // the global FIFO queue rather than run synchronously — wait it out before
+    // asserting on-disk state.
+    await pendingTeardown(taskId);
 
     // Checkout gone from disk…
     expect(existsSync(worktreePath)).toBe(false);
@@ -353,7 +358,7 @@ test("archiveTask keeps a dirty worktree on disk instead of discarding uncommitt
 });
 
 test("unarchiveTask rematerializes a worktree that archive detached", async () => {
-  const { createTask, archiveTask, unarchiveTask } = await import("./orchestrator.ts");
+  const { createTask, archiveTask, unarchiveTask, pendingTeardown } = await import("./orchestrator.ts");
   const { prepareWorkdir } = await import("./worktree.ts");
   const { db, tasks } = await import("./db.ts");
 
@@ -377,6 +382,9 @@ test("unarchiveTask rematerializes a worktree that archive detached", async () =
     const worktreePath = prepared.worktreePath!;
     const archived = await archiveTask(taskId);
     if (!("task" in archived)) throw new Error(archived.error);
+    // Teardown is deferred onto the global FIFO queue — wait it out before
+    // asserting the checkout is gone.
+    await pendingTeardown(taskId);
     expect(existsSync(worktreePath)).toBe(false);
 
     const restored = await unarchiveTask(taskId);
@@ -391,7 +399,7 @@ test("unarchiveTask rematerializes a worktree that archive detached", async () =
 });
 
 test("sendInput to an archived task auto-unarchives it and restores the worktree", async () => {
-  const { createTask, archiveTask, sendInput } = await import("./orchestrator.ts");
+  const { createTask, archiveTask, sendInput, pendingTeardown } = await import("./orchestrator.ts");
   const { prepareWorkdir } = await import("./worktree.ts");
   const { db, tasks, runs } = await import("./db.ts");
 
@@ -434,6 +442,9 @@ test("sendInput to an archived task auto-unarchives it and restores the worktree
 
     const archived = await archiveTask(taskId);
     if (!("task" in archived)) throw new Error(archived.error);
+    // Teardown is deferred onto the global FIFO queue — wait it out before
+    // asserting the checkout is gone.
+    await pendingTeardown(taskId);
     expect(existsSync(worktreePath)).toBe(false);
 
     // sendInput must (1) auto-unarchive, (2) restore the worktree via
