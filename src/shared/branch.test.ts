@@ -4,6 +4,7 @@ import {
   DEFAULT_BRANCH_CONFIG,
   branchCommitType,
   branchPattern,
+  commitPushPrompt,
   conventionalCommitType,
   hasBranchTemplateTags,
   renderBranchTemplate,
@@ -183,6 +184,27 @@ describe("branchCommitType", () => {
     expect(branchCommitType("agetor/abc123def456-fix-the-thing", "bug")).toBe("fix");
     expect(branchCommitType("agetor/abc123def456-add-login", "task")).toBe("feat");
     expect(branchCommitType("agetor/abc123def456-try-sse", "spike")).toBe("chore");
+  });
+});
+
+describe("commitPushPrompt", () => {
+  test("uses the branch-derived commit type and shell-quotes the branch", () => {
+    const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task" });
+    expect(p).toContain('prefix the subject with "feature:"');
+    expect(p).toContain("git push -u origin 'feature/add-login'");
+  });
+  test("falls back to <branch> and the conventional type with no branch", () => {
+    const p = commitPushPrompt({ branch: null, taskType: "bug" });
+    expect(p).toContain('prefix the subject with "fix:"');
+    expect(p).toContain("git push -u origin <branch>");
+  });
+  test("also asks the agent to propose a PR title and description after pushing", () => {
+    const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task" });
+    // The PR ask comes after the commit/push instruction.
+    expect(p).toContain("push the current branch to origin");
+    expect(p).toContain("PR title:");
+    expect(p).toContain("PR description:");
+    expect(p.indexOf("PR title:")).toBeGreaterThan(p.indexOf("push the current branch"));
   });
 });
 
