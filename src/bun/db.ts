@@ -833,15 +833,6 @@ export const subagents = {
   setToolUseId(id: string, toolUseId: string): void {
     db.run(`UPDATE subagents SET tool_use_id = ? WHERE id = ? AND tool_use_id IS NULL`, [toolUseId, id]);
   },
-  /** The `running` subagent row for this task whose parent `Agent` tool_use id
-   *  matches — the lookup behind the main-JSONL tool_result scan. Scoped by
-   *  taskId (not just toolUseId) since ids are only unique within a session. */
-  getRunningByToolUseId(taskId: string, toolUseId: string): Subagent | null {
-    const row = db.query<SubagentRow, [string, string]>(
-      `SELECT * FROM subagents WHERE task_id = ? AND tool_use_id = ? AND status = 'running'`,
-    ).get(taskId, toolUseId);
-    return row ? toSubagent(row) : null;
-  },
   /** Settle a single subagent by id — the DB half of an *externally*-detected
    *  completion (a parent task-notification naming the finishing agent, or
    *  boot reconciliation finding its session gone), as opposed to the

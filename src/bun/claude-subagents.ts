@@ -467,6 +467,10 @@ export function attachSubagentWatcher(opts: {
       };
       files.set(id, fs);
       subagentsDb.insertIfAbsent(toSubagentShape(fs, taskId));
+      // A new correlation key may have a tool_result the scan already read
+      // past (its lines were consumed while only siblings were pending) —
+      // rewind for one full rescan rather than strand the row until reboot.
+      if (fs.toolUseId) mainOffset = 0;
       emitLifecycle(fs, "started");
       fireParkedDiscovery(taskId);
     }
@@ -544,8 +548,11 @@ export function attachSubagentWatcher(opts: {
    * `fireBackgroundTaskSettled` for that other path). Only reads the main
    * file — and only advances `mainOffset` — when there's at least one
    * `running` row with a known `toolUseId` to look for, so a task with no
-   * subagents (the common case) never pays for this scan, and a subagent
-   * that shows up later still gets the full backlog scanned once it does.
+   * subagents (the common case) never pays for this scan. A subagent
+   * discovered AFTER the offset has already advanced past its tool_result
+   * (a readdir-visibility race while a sibling kept the scan running) is
+   * covered by `discover()` rewinding `mainOffset` to 0 for one full
+   * rescan — settles are idempotent, so re-reading old lines is harmless.
    */
   function scanMainForToolResults(): void {
     const pending = [...files.values()].filter((fs) => fs.status === "running" && fs.toolUseId);
