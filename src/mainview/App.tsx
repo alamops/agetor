@@ -724,8 +724,7 @@ export default function App() {
       />
       <DiffDialog
         open={!!diffTask}
-        taskId={diffTask?.id ?? null}
-        taskTitle={diffTask?.title}
+        task={diffTask ? (tasks.find((t) => t.id === diffTask.id) ?? diffTask) : null}
         onClose={() => setDiffTask(null)}
       />
       <GitHubDialog

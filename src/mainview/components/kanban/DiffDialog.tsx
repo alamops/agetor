@@ -7,12 +7,12 @@ import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
-import type { DiffFile, TaskDiff } from "../../../shared/types.ts";
+import { toRows } from "@/lib/diff-rows";
+import type { DiffFile, Task, TaskDiff } from "../../../shared/types.ts";
 
 interface Props {
   open: boolean;
-  taskId: string | null;
-  taskTitle?: string;
+  task: Task | null;
   onClose: () => void;
 }
 
@@ -29,7 +29,8 @@ const STATUS_META: Record<DiffFile["status"], { label: string; icon: typeof File
  * task has no worktree (or nothing changed) the server returns a friendly
  * `note` which we show in place of the file list.
  */
-export function DiffDialog({ open, taskId, taskTitle, onClose }: Props) {
+export function DiffDialog({ open, task, onClose }: Props) {
+  const taskId = task?.id ?? null;
   const [diff, setDiff] = useState<TaskDiff | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -57,6 +58,9 @@ export function DiffDialog({ open, taskId, taskTitle, onClose }: Props) {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
+    // Key on task?.id, not `task` itself — the parent polls /tasks every 2s,
+    // so a new `task` object identity arrives constantly and would otherwise
+    // refetch the diff on every poll tick.
   }, [open, taskId]);
 
   const totals = useMemo(() => {
@@ -92,7 +96,7 @@ export function DiffDialog({ open, taskId, taskTitle, onClose }: Props) {
             Changes
           </div>
           <div className="mt-0.5 truncate text-xs text-muted-foreground">
-            {taskTitle ?? "Task"}
+            {task?.title ?? "Task"}
             {diff?.base && <> · vs base <span className="font-mono">{diff.base}</span></>}
           </div>
         </div>
@@ -189,34 +193,6 @@ function FileBlock({ file, open, onToggle }: { file: DiffFile; open: boolean; on
       )}
     </div>
   );
-}
-
-interface Row { old: number | null; neu: number | null; kind: "ctx" | "add" | "del" | "hunk" | "meta"; text: string }
-
-/** Turn a file's unified-diff hunks into numbered rows. */
-function toRows(hunks: string): Row[] {
-  const rows: Row[] = [];
-  let oldNo = 0;
-  let newNo = 0;
-  for (const line of hunks.split("\n")) {
-    if (line.startsWith("@@")) {
-      const m = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
-      if (m) { oldNo = Number(m[1]); newNo = Number(m[2]); }
-      rows.push({ old: null, neu: null, kind: "hunk", text: line });
-    } else if (line.startsWith("+")) {
-      rows.push({ old: null, neu: newNo++, kind: "add", text: line.slice(1) });
-    } else if (line.startsWith("-")) {
-      rows.push({ old: oldNo++, neu: null, kind: "del", text: line.slice(1) });
-    } else if (line.startsWith("\\")) {
-      // "\ No newline at end of file"
-      rows.push({ old: null, neu: null, kind: "meta", text: line });
-    } else {
-      rows.push({ old: oldNo++, neu: newNo++, kind: "ctx", text: line.startsWith(" ") ? line.slice(1) : line });
-    }
-  }
-  // Drop a trailing empty context row produced by the final newline.
-  if (rows.length && rows[rows.length - 1]!.kind === "ctx" && rows[rows.length - 1]!.text === "") rows.pop();
-  return rows;
 }
 
 function DiffBody({ hunks }: { hunks: string }) {
