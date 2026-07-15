@@ -510,6 +510,15 @@ export function attachSubagentWatcher(opts: {
         fs.status = "running";
         fs.endedAt = null;
         fs.sawEndOfTurn = false;
+        // Retire the tool_result correlation key: the parent's receipt for
+        // the ORIGINAL Agent tool_use predates this resume, so from here on
+        // it can only mis-settle the agent (a reattach replays the main
+        // JSONL from offset 0 and would re-serve it). In-memory only — the
+        // DB keeps the id, and a post-restart replay can still transiently
+        // re-settle a resumed agent, but the next append flips it right
+        // back (dir watcher) and its real completion arrives via
+        // task-notification / its own end_turn.
+        fs.toolUseId = null;
         subagentsDb.setStatus(fs.subagentId, "running", null);
         emitLifecycle(fs, "started");
         fireParkedDiscovery(taskId);
