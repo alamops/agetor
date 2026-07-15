@@ -206,6 +206,14 @@ describe("commitPushPrompt", () => {
     expect(p).toContain("PR description:");
     expect(p.indexOf("PR title:")).toBeGreaterThan(p.indexOf("push the current branch"));
   });
+  test("asks for two separate fenced blocks so agetor's copy button captures each field", () => {
+    const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task" });
+    // Fenced blocks are what agetor's CodeBlock renders a copy button on.
+    expect(p).toContain("```");
+    expect(p).toContain("two fenced code blocks");
+    // Title fence is asked for before the description fence.
+    expect(p.indexOf("PR title:")).toBeLessThan(p.indexOf("PR description:"));
+  });
 });
 
 describe("renderBranchTemplate", () => {

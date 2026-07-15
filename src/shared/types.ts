@@ -1775,8 +1775,11 @@ export interface ToolResultEventData {
  * shell metacharacters; `'\''` is the POSIX escape for an embedded quote.
  *
  * After the commit/push, the prompt also asks the agent to propose a pull
- * request title and description, ended as a clearly-labeled block so the user
- * can copy them straight into agetor's New PR composer without a second turn.
+ * request title and description, each emitted in its own fenced ``` code block
+ * so agetor renders a one-click copy button per field — the user copies the
+ * title into the New PR composer's Title field and the description into its
+ * Description field without a second turn. Two blocks (not one) because the
+ * composer has two separate fields; the copy button grabs a whole fenced block.
  */
 export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): string {
   const ccType = branchCommitType(task.branch, task.taskType);
@@ -1786,9 +1789,11 @@ export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): strin
     `(prefix the subject with "${ccType}:", e.g. "${ccType}: ...") summarizing the work, ` +
     `then push the current branch to origin. ` +
     `If the branch has no upstream yet, set it with \`git push -u origin ${branchLabel}\`. ` +
-    `After pushing, propose a pull request: end your reply with a clearly-labeled ` +
-    `block — a "PR title:" line (concise, one sentence) followed by a "PR description:" ` +
-    `section (markdown summarizing what changed and why) — so it can be used to open the PR.`
+    `After pushing, propose a pull request so it can be opened without a second turn. ` +
+    `Output exactly two fenced code blocks, each on its own so it can be copied with ` +
+    `one click: first a "PR title:" line followed by a \`\`\` block containing only the ` +
+    `concise one-line title, then a "PR description:" line followed by a \`\`\` block ` +
+    `containing the description in markdown (what changed and why).`
   );
 }
 
