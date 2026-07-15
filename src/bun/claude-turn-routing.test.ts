@@ -69,7 +69,7 @@ function fakeRoutingTmuxBin(probeCode: number, probeStderr: string): { bin: stri
   return { bin, logPath };
 }
 
-function readLog(logPath: string): Array<{ argv: string[] }> {
+function readLog(logPath: string): Array<{ argv: string[]; stdin?: string }> {
   let raw: string;
   try {
     raw = readFileSync(logPath, "utf8");
@@ -77,6 +77,73 @@ function readLog(logPath: string): Array<{ argv: string[] }> {
     return [];
   }
   return raw.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
+
+/**
+ * Write an executable fake tmux for the deferred-large-prompt regression
+ * tests below. Unlike `fakeRoutingTmuxBin` (a single fixed `has-session`
+ * verdict for the whole test), this stub needs to answer `has-session`
+ * differently *before* vs *after* the session is actually created: the
+ * routing gate in `sendClaudeTurn` must see "gone" (so the follow-up takes
+ * the respawn path), while `spawnClaudeViaTmux`'s post-launch deferred-paste
+ * loop — which polls the SAME deterministic session name — must see the
+ * session as alive once `new-session` has run, or it bails out without
+ * pasting.
+ *
+ * Session existence is tracked with marker files (one per session name,
+ * created on `new-session`, removed on `kill-session`) rather than a fixed
+ * verdict, so `has-session` reports real create/kill order like actual tmux
+ * would.
+ *
+ * Every invocation also drains and records stdin (`readFileSync(0)`) — this
+ * is how `load-buffer -b <buf> -` receives the pasted prompt in the real
+ * paste path (`pastePromptSync`), and the stub must consume it rather than
+ * leave it unread so the parent's `Bun.spawnSync` write can't block/fail on
+ * a bigger-than-pipe-buffer payload.
+ */
+function fakeDeferredPasteTmuxBin(): { bin: string; logPath: string } {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-deferred-tmux-"));
+  const bin = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  const markerDir = path.join(dir, "markers");
+  mkdirSync(markerDir, { recursive: true });
+  writeFileSync(
+    bin,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";\n` +
+      `import path from "node:path";\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `let stdin = "";\n` +
+      `try { stdin = readFileSync(0, "utf8"); } catch {}\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ argv, stdin }) + "\\n");\n` +
+      `function sessionArg() {\n` +
+      `  const sIdx = argv.indexOf("-s");\n` +
+      `  if (sIdx !== -1) return argv[sIdx + 1];\n` +
+      `  const tIdx = argv.indexOf("-t");\n` +
+      `  if (tIdx !== -1) { let v = argv[tIdx + 1]; if (v && v.startsWith("=")) v = v.slice(1); return v; }\n` +
+      `  return null;\n` +
+      `}\n` +
+      `const markerDir = ${JSON.stringify(markerDir)};\n` +
+      `if (argv.includes("new-session")) {\n` +
+      `  const name = sessionArg();\n` +
+      `  if (name) writeFileSync(path.join(markerDir, name), "1");\n` +
+      `  process.exit(0);\n` +
+      `}\n` +
+      `if (argv.includes("kill-session")) {\n` +
+      `  const name = sessionArg();\n` +
+      `  if (name) { try { rmSync(path.join(markerDir, name)); } catch {} }\n` +
+      `  process.exit(0);\n` +
+      `}\n` +
+      `if (argv.includes("has-session")) {\n` +
+      `  const name = sessionArg();\n` +
+      `  if (name && existsSync(path.join(markerDir, name))) process.exit(0);\n` +
+      `  process.stderr.write("can't find session: =" + (name ?? "unknown"));\n` +
+      `  process.exit(1);\n` +
+      `}\n` +
+      `process.exit(0);\n`,
+  );
+  chmodSync(bin, 0o755);
+  return { bin, logPath };
 }
 
 test("a transient/unreachable tmux probe routes a follow-up through the existing-session path, never the resume pre-kill", async () => {
@@ -265,6 +332,231 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
   } finally {
     // Dispose in-memory state + kill whatever (fake) session is now named
     // for this task, mirroring claude-followup-restart.test.ts's cleanup.
+    dropSession(taskId);
+    rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
+  }
+});
+
+// Regression tests for the fix in commit de27191 (see
+// docs/plans/fix-claude-resume-large-prompt-tmux-argv.md): a follow-up whose
+// prompt is bigger than `CLAUDE_PROMPT_ARGV_MAX_BYTES` used to ride the
+// entire way to `tmux new-session`'s argv, and tmux 3.6a rejects any client
+// command past its ~16KB imsg cap with a literal `command too long` — so a
+// large paste sent to a task whose session had ended failed the spawn
+// outright, before claude ever started. `buildCommand` now omits an
+// oversized prompt from argv and hands it back as `deferredPrompt`;
+// `spawnClaudeViaTmux` boots a bare claude and pastes the prompt in once the
+// composer is confirmed idle via the same load-buffer/paste-buffer machinery
+// live-session follow-ups use.
+
+test("a large (>4KB) follow-up resume never embeds the prompt in new-session argv — it's delivered via load-buffer/paste-buffer instead", async () => {
+  const { bin, logPath } = fakeDeferredPasteTmuxBin();
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER; // force the real spawnClaudeViaTmux path
+  process.env.AGETOR_CLAUDE_BIN = "/bin/echo"; // harmless stub launch command
+
+  const { db, tasks, runs } = await import("./db.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  const { __forTest, dropSession, jsonlPathFor } = await import("./claude-tmux.ts");
+  const { CLAUDE_PROMPT_ARGV_MAX_BYTES } = await import("./agents.ts");
+
+  const taskId = `task-large-${randomUUID()}`;
+  const priorRunId = `run-large-${randomUUID()}`;
+  const priorClaudeSessionId = "prior-claude-session-id-large";
+  const now = Date.now();
+  const workdir = mkdtempSync(path.join(tmpdir(), "agetor-large-wd-"));
+
+  // Same rationale as the "gone" test above: pre-create the JSONL the resume
+  // spawn will look for at the deterministic (workdir, sessionId) path so the
+  // boot-wait resolves synchronously instead of spinning.
+  const expectedJsonlPath = jsonlPathFor(workdir, priorClaudeSessionId, null);
+  mkdirSync(path.dirname(expectedJsonlPath), { recursive: true });
+  writeFileSync(expectedJsonlPath, "");
+
+  // Make claude's composer look immediately idle so the deferred-paste
+  // readiness gate (`readPaneMode`, which reads via this seam) fires on its
+  // first poll instead of spinning toward DEFERRED_PROMPT_TIMEOUT_MS (30s).
+  const prevCapture = __forTest.setCaptureModePane(() => "? for shortcuts");
+  const prevGap = __forTest.setBracketedEnterGapMs(0);
+  const prevSettle = __forTest.setSlashCommandSettleMs(0);
+
+  // Comfortably over the threshold regardless of its exact value.
+  const largePrompt = "x".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES + 500);
+  expect(Buffer.byteLength(largePrompt, "utf8")).toBeGreaterThan(CLAUDE_PROMPT_ARGV_MAX_BYTES);
+
+  try {
+    tasks.insert({
+      id: taskId,
+      title: "large-prompt-resume",
+      prompt: "p",
+      column: "review",
+      agent: "claude-code",
+      workdir,
+      isolation: "none",
+      taskType: "task",
+      branch: null,
+      worktreePath: null,
+      baseRef: null,
+      mode: null,
+      model: "claude-opus-4-7",
+      effort: "medium",
+      references: [], backlog: [],
+      runId: priorRunId,
+      hasOpenableRun: false,
+      pendingInteractionCount: 0,
+      openTerminalCount: 0,
+      archivedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    runs.insert({
+      id: priorRunId,
+      taskId,
+      agent: "claude-code",
+      status: "succeeded",
+      startedAt: now,
+      endedAt: now,
+      exitCode: 0,
+      tmuxSession: "agetor-stale-name",
+      claudeSessionId: priorClaudeSessionId,
+      codexSessionId: null,
+    });
+
+    const result = await sendInput(priorRunId, largePrompt);
+    expect(result.delivered).toBe(true);
+    if (!result.delivered) throw new Error(result.reason);
+    const newRunId = result.runId;
+
+    // Let the spawn + the fire-and-forget deferred-paste chain run their
+    // course (readiness is immediate given the captureModePane stub above,
+    // so this only needs to cover a handful of synchronous tmux round-trips,
+    // not the real 30s timeout).
+    await new Promise((r) => setTimeout(r, 800));
+
+    const entries = readLog(logPath);
+
+    const newSessionEntries = entries.filter((e) => e.argv.includes("new-session"));
+    expect(newSessionEntries.length).toBeGreaterThan(0);
+    // The whole point of the fix: the large prompt must never appear inside
+    // a `new-session` invocation's argv.
+    for (const e of newSessionEntries) {
+      expect(e.argv.some((a) => a.includes(largePrompt))).toBe(false);
+    }
+
+    // It must instead have been delivered over stdin via `load-buffer`.
+    const loadBufferEntries = entries.filter((e) => e.argv.includes("load-buffer"));
+    expect(loadBufferEntries.length).toBeGreaterThan(0);
+    expect(loadBufferEntries.some((e) => e.stdin === largePrompt)).toBe(true);
+
+    // ...followed by a paste-buffer + Enter to actually submit it.
+    const pasteBufferEntries = entries.filter((e) => e.argv.includes("paste-buffer"));
+    expect(pasteBufferEntries.length).toBeGreaterThan(0);
+    const sendKeysEnterEntries = entries.filter(
+      (e) => e.argv.includes("send-keys") && e.argv.includes("Enter"),
+    );
+    expect(sendKeysEnterEntries.length).toBeGreaterThan(0);
+
+    // The run must not have failed with the "command too long" symptom the
+    // fix addresses — since `new-session` never got the oversized argv from
+    // this fake tmux, it always exits 0, but assert the negative directly so
+    // this test would also catch a regression that reintroduced the
+    // embed-in-argv behavior against a real tmux binary's failure text.
+    const runEvents = db
+      .query<{ stream: string; data: string }, [string]>(
+        `SELECT stream, data FROM run_events WHERE run_id = ?`,
+      )
+      .all(newRunId);
+    expect(runEvents.some((e) => e.data.includes("tmux new-session failed"))).toBe(false);
+    expect(runEvents.some((e) => e.data.includes("command too long"))).toBe(false);
+  } finally {
+    __forTest.setCaptureModePane(prevCapture);
+    __forTest.setBracketedEnterGapMs(prevGap);
+    __forTest.setSlashCommandSettleMs(prevSettle);
+    dropSession(taskId);
+    rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
+  }
+});
+
+test("a small (<=4KB) follow-up resume still embeds the prompt in new-session argv — deferral doesn't fire for the common case", async () => {
+  // Reuse the fixed-verdict stub (uniform "gone" so the routing gate always
+  // takes the respawn path) — this test only cares about the argv shape of
+  // the resulting `new-session`, not post-launch readiness polling, so the
+  // simpler stub from the "gone" test above is sufficient.
+  const { bin, logPath } = fakeRoutingTmuxBin(1, "can't find session: =agetor-x");
+  process.env.AGETOR_TMUX_BIN = bin;
+  delete process.env.AGETOR_CLAUDE_DRIVER; // force the real spawnClaudeViaTmux path
+  process.env.AGETOR_CLAUDE_BIN = "/bin/echo"; // harmless stub launch command
+
+  const { tasks, runs } = await import("./db.ts");
+  const { __forTest, dropSession, jsonlPathFor } = await import("./claude-tmux.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+
+  const taskId = `task-small-${randomUUID()}`;
+  const priorRunId = `run-small-${randomUUID()}`;
+  const priorClaudeSessionId = "prior-claude-session-id-small";
+  const now = Date.now();
+  const workdir = mkdtempSync(path.join(tmpdir(), "agetor-small-wd-"));
+
+  const expectedJsonlPath = jsonlPathFor(workdir, priorClaudeSessionId, null);
+  mkdirSync(path.dirname(expectedJsonlPath), { recursive: true });
+  writeFileSync(expectedJsonlPath, "");
+
+  const smallPrompt = "please continue with the small change";
+
+  try {
+    tasks.insert({
+      id: taskId,
+      title: "small-prompt-resume",
+      prompt: "p",
+      column: "review",
+      agent: "claude-code",
+      workdir,
+      isolation: "none",
+      taskType: "task",
+      branch: null,
+      worktreePath: null,
+      baseRef: null,
+      mode: null,
+      model: "claude-opus-4-7",
+      effort: "medium",
+      references: [], backlog: [],
+      runId: priorRunId,
+      hasOpenableRun: false,
+      pendingInteractionCount: 0,
+      openTerminalCount: 0,
+      archivedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    runs.insert({
+      id: priorRunId,
+      taskId,
+      agent: "claude-code",
+      status: "succeeded",
+      startedAt: now,
+      endedAt: now,
+      exitCode: 0,
+      tmuxSession: "agetor-stale-name",
+      claudeSessionId: priorClaudeSessionId,
+      codexSessionId: null,
+    });
+
+    const result = await sendInput(priorRunId, smallPrompt);
+    expect(result.delivered).toBe(true);
+
+    await new Promise((r) => setTimeout(r, 300));
+
+    const entries = readLog(logPath);
+    const newSessionEntries = entries.filter((e) => e.argv.includes("new-session"));
+    expect(newSessionEntries.length).toBeGreaterThan(0);
+    // Guards against accidentally deferring everything: a short prompt must
+    // still ride inside the `new-session` argv, exactly as before the fix.
+    expect(newSessionEntries.some((e) => e.argv.includes(smallPrompt))).toBe(true);
+
+    // And, precisely because it wasn't deferred, no paste machinery should
+    // have fired for it at all.
+    expect(entries.some((e) => e.argv.includes("load-buffer"))).toBe(false);
+  } finally {
     dropSession(taskId);
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
