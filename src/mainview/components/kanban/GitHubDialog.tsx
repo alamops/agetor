@@ -8493,29 +8493,51 @@ function DiffFileBlock({
 }) {
   const meta = STATUS_META[file.status];
   const Icon = meta.icon;
+  const bodyId = `diff-file-${file.path}`;
+  const [open, setOpen] = useState(true);
   return (
     <div className="border-b border-border/60 last:border-b-0">
-      <div className="flex items-center gap-2 bg-muted/40 px-2 py-1.5">
-        <Icon className={cn("size-3.5 shrink-0", meta.cls)} />
-        <span className="min-w-0 flex-1 truncate font-mono text-xs">
-          {file.oldPath && <span className="text-muted-foreground">{file.oldPath} -&gt; </span>}
-          {file.path}
-        </span>
-        <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
-          {file.binary ? "binary" : <><span className="text-emerald-400">+{file.additions}</span> <span className="text-rose-400">-{file.deletions}</span></>}
-        </span>
-      </div>
-      {file.binary ? (
-        <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>
-      ) : (
-        <>
-          <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} onAddToReview={onAddToReview} queuedKeys={queuedKeys} allowBatchReview={allowBatchReview} />
-          {file.truncated && (
-            <div className="border-t border-border/60 px-3 py-1.5 text-[11px] italic text-muted-foreground">
-              Diff truncated because this file's changes are too large to display in full.
-            </div>
+      <div className="sticky top-0 z-10 bg-background">
+        <button
+          type="button"
+          className="flex w-full select-text items-center gap-2 bg-muted/40 px-2 py-1.5 text-left"
+          onClick={() => {
+            if (window.getSelection()?.toString()) return;
+            setOpen((cur) => !cur);
+          }}
+          aria-expanded={open}
+          aria-controls={bodyId}
+        >
+          {open ? (
+            <ChevronDown aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+          ) : (
+            <ChevronRight aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
           )}
-        </>
+          <Icon className={cn("size-3.5 shrink-0", meta.cls)} />
+          <span className="min-w-0 flex-1 truncate font-mono text-xs">
+            {file.oldPath && <span className="text-muted-foreground">{file.oldPath} -&gt; </span>}
+            {file.path}
+          </span>
+          <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+            {file.binary ? "binary" : <><span className="text-emerald-400">+{file.additions}</span> <span className="text-rose-400">-{file.deletions}</span></>}
+          </span>
+        </button>
+      </div>
+      {open && (
+        <div id={bodyId}>
+          {file.binary ? (
+            <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>
+          ) : (
+            <>
+              <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} onAddToReview={onAddToReview} queuedKeys={queuedKeys} allowBatchReview={allowBatchReview} />
+              {file.truncated && (
+                <div className="border-t border-border/60 px-3 py-1.5 text-[11px] italic text-muted-foreground">
+                  Diff truncated because this file's changes are too large to display in full.
+                </div>
+              )}
+            </>
+          )}
+        </div>
       )}
     </div>
   );
