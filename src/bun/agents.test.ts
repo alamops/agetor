@@ -16,8 +16,10 @@ beforeEach(() => {
   // absolute path in argv[0] and the equality checks would drift per host.
   process.env.AGETOR_CLAUDE_BIN = "claude";
   process.env.AGETOR_CODEX_BIN = "codex";
+  process.env.AGETOR_GROK_BIN = "grok";
   delete process.env.AGETOR_CLAUDE_ARGS;
   delete process.env.AGETOR_CODEX_ARGS;
+  delete process.env.AGETOR_GROK_ARGS;
 });
 
 /** Build a built-in harness for tests — kind doubles as id, no overrides. */
@@ -516,6 +518,236 @@ test("AGETOR_CODEX_ARGS extra args land before the stdin sentinel", () => {
   process.env.AGETOR_CODEX_ARGS = "--verbose --foo";
   const { cmd } = buildCommand(builtin("codex"), "p", { ...codexDefaults });
   expect(cmd.slice(-3)).toEqual(["--verbose", "--foo", "-"]);
+});
+
+// --- grok ----------------------------------------------------------------
+// Grok Build is hosted via grok-tmux.ts (mirrors codex's one-shot-per-turn
+// pattern), but per D2 the prompt is NOT an argv element the way codex's
+// stdin sentinel is either: `-p` takes an argument, and embedding raw prompt
+// text into shell-quoted argv is quoting hell, so `spawnGrokViaTmux` splices
+// `--prompt-file <path>` in itself. buildCommand's returned argv must never
+// contain `-p`, `--prompt-file`, or the prompt text — every test below
+// asserts that explicitly rather than just checking the happy-path shape.
+//
+// Session flags (D4/D5): a grok spawn always carries `grokSession — { id,
+// resume }` bundling the pre-seeded/orchestrator-decided session id with
+// whether this is a fresh `-s <id>` (plus the mode's `--sandbox`) or a
+// `--resume <id>` (which must NEVER also carry `--sandbox` — grok hard-errors
+// if an explicit sandbox conflicts with the session's stored profile).
+const grokDefaults = { mode: "auto", model: "grok-build" } as const;
+const grokNewSession = { id: "11111111-1111-1111-1111-111111111111", resume: false } as const;
+const grokResumeSession = { id: "22222222-2222-2222-2222-222222222222", resume: true } as const;
+
+test("grok new session (auto, grok-build, effort medium) emits the exact argv in order, no -p/prompt/prompt-file", () => {
+  const { cmd } = buildCommand(builtin("grok"), "the prompt", {
+    ...grokDefaults,
+    effort: "medium",
+    grokSession: grokNewSession,
+  });
+  expect(cmd).toEqual([
+    "grok",
+    "--output-format", "streaming-json",
+    "-m", "grok-build",
+    "--permission-mode", "bypassPermissions",
+    "-s", grokNewSession.id,
+    "--sandbox", "off",
+    "--effort", "medium",
+  ]);
+  expect(cmd).not.toContain("-p");
+  expect(cmd).not.toContain("--prompt-file");
+  expect(cmd).not.toContain("the prompt");
+});
+
+test("grok 'ask' + resume emits --resume with NO --sandbox and NO --permission-mode, --effort still present", () => {
+  const { cmd } = buildCommand(builtin("grok"), "some prompt text", {
+    mode: "ask",
+    model: "grok-build",
+    effort: "high",
+    grokSession: grokResumeSession,
+  });
+  expect(cmd).toEqual([
+    "grok",
+    "--output-format", "streaming-json",
+    "-m", "grok-build",
+    "--resume", grokResumeSession.id,
+    "--effort", "high",
+  ]);
+  expect(cmd).not.toContain("--sandbox");
+  expect(cmd).not.toContain("--permission-mode");
+  expect(cmd).not.toContain("dontAsk");
+  expect(cmd).not.toContain("-p");
+  expect(cmd).not.toContain("--prompt-file");
+  expect(cmd).not.toContain("some prompt text");
+});
+
+test("grok 'ask' new session emits --sandbox read-only with no --permission-mode flag at all", () => {
+  const { cmd } = buildCommand(builtin("grok"), "p", {
+    mode: "ask",
+    model: "grok-build",
+    effort: "low",
+    grokSession: grokNewSession,
+  });
+  expect(cmd).toEqual([
+    "grok",
+    "--output-format", "streaming-json",
+    "-m", "grok-build",
+    "-s", grokNewSession.id,
+    "--sandbox", "read-only",
+    "--effort", "low",
+  ]);
+  expect(cmd).not.toContain("--permission-mode");
+  expect(cmd).not.toContain("dontAsk");
+  expect(cmd).not.toContain("bypassPermissions");
+});
+
+test("grok unknown model id passes through verbatim to -m", () => {
+  const { cmd } = buildCommand(builtin("grok"), "p", {
+    ...grokDefaults,
+    model: "grok-mystery-9",
+    grokSession: grokNewSession,
+  });
+  const i = cmd.indexOf("-m");
+  expect(cmd[i + 1]).toBe("grok-mystery-9");
+});
+
+test("grok unrecognized mode id falls back to the auto (bypassPermissions/no-sandbox) branch", () => {
+  // Unlike claude-code's verbatim --permission-mode passthrough, grok's D3
+  // mapping is binary: only "ask" is special-cased to the restrictive
+  // read-only posture with no --permission-mode flag. Any other id —
+  // including a future/unknown one — gets the hands-off default, mirroring
+  // the `mode ?? "auto"` convention used by claude-code and codex.
+  const { cmd } = buildCommand(builtin("grok"), "p", {
+    ...grokDefaults,
+    mode: "future-mode",
+    grokSession: grokNewSession,
+  });
+  expect(cmd).toContain("bypassPermissions");
+  expect(cmd).toContain("off");
+  expect(cmd).not.toContain("dontAsk");
+  expect(cmd).not.toContain("read-only");
+});
+
+test("grok throws when model is missing", () => {
+  expect(() =>
+    buildCommand(builtin("grok"), "p", { mode: "auto", grokSession: grokNewSession }),
+  ).toThrow(/model is required/);
+});
+
+test("grok throws when grokSession is missing", () => {
+  // D4/D5: session id + resume decision is mandatory and always
+  // caller-supplied (the orchestrator's `resolveGrokSession`) — buildCommand
+  // never invents one on its own, so an omitted `grokSession` is a hard
+  // error rather than a silent default.
+  expect(() =>
+    buildCommand(builtin("grok"), "p", { ...grokDefaults }),
+  ).toThrow(/grokSession is required/);
+});
+
+test("grok null effort falls back to DEFAULT_EFFORT.grok ('medium') — the legacy-row fallback", () => {
+  const { cmd } = buildCommand(builtin("grok"), "p", {
+    ...grokDefaults,
+    effort: null,
+    grokSession: grokNewSession,
+  });
+  expect(cmd.slice(-2)).toEqual(["--effort", "medium"]);
+});
+
+test("grok unknown model id + null effort still emits --effort (falls back to DEFAULT_EFFORT) — modelDeclinesEffort only declines for a model with a declared-empty support list", () => {
+  // `modelDeclinesEffort` returns true only when
+  // `MODEL_EFFORT_SUPPORT.grok[model]` is an explicit `[]`. An unrecognized
+  // model id has no entry at all (`undefined`), so `Array.isArray(undefined)`
+  // is false and the effort flag is still emitted — same verbatim-passthrough
+  // convention as `-m`.
+  const { cmd } = buildCommand(builtin("grok"), "p", {
+    mode: "auto",
+    model: "grok-future-9000",
+    effort: null,
+    grokSession: grokNewSession,
+  });
+  expect(cmd.slice(-2)).toEqual(["--effort", "medium"]);
+});
+
+test("aliased grok with a home override emits GROK_HOME (not HOME)", () => {
+  const result = buildCommand(
+    alias("grok", { home: "/tmp/agetor-test/grok-2" }),
+    "p",
+    { ...grokDefaults, grokSession: grokNewSession },
+  );
+  expect(result.env?.GROK_HOME).toBe("/tmp/agetor-test/grok-2");
+  expect(result.env?.HOME).toBeUndefined();
+});
+
+test("aliased grok bin override beats the AGETOR_GROK_BIN env fallback", () => {
+  process.env.AGETOR_GROK_BIN = "/env-fallback/grok";
+  expect(
+    buildCommand(builtin("grok"), "p", { ...grokDefaults, grokSession: grokNewSession }).cmd[0],
+  ).toBe("/env-fallback/grok");
+  expect(
+    buildCommand(alias("grok", { bin: "/alias/grok" }), "p", {
+      ...grokDefaults,
+      grokSession: grokNewSession,
+    }).cmd[0],
+  ).toBe("/alias/grok");
+});
+
+test("AGETOR_GROK_ARGS extra args land after --permission-mode and before the session/resume flags", () => {
+  process.env.AGETOR_GROK_ARGS = "--verbose --foo";
+  const { cmd } = buildCommand(builtin("grok"), "p", {
+    ...grokDefaults,
+    grokSession: grokResumeSession,
+  });
+  const permModeIdx = cmd.indexOf("--permission-mode");
+  const extraIdx = cmd.indexOf("--verbose");
+  const resumeIdx = cmd.indexOf("--resume");
+  expect(extraIdx).toBeGreaterThan(permModeIdx);
+  expect(resumeIdx).toBeGreaterThan(extraIdx);
+  expect(cmd.slice(extraIdx, extraIdx + 2)).toEqual(["--verbose", "--foo"]);
+});
+
+// --- grok privacy defaults (docs/plans/grok-privacy-defaults.md, D1) --------
+// harnessEnv's grok branch injects three env vars ahead of the harness's own
+// `env` map so xAI's always-on trace-upload pipeline and session writeback
+// sync are off by default, while an explicit user override in harness `env`
+// (Settings) still wins per D1's "default, not hard block" decision.
+
+test("grok builtin harness env carries exactly the three privacy defaults", () => {
+  const result = buildCommand(builtin("grok"), "p", { ...grokDefaults, grokSession: grokNewSession });
+  expect(result.env?.GROK_TELEMETRY_ENABLED).toBe("0");
+  expect(result.env?.GROK_TELEMETRY_TRACE_UPLOAD).toBe("0");
+  expect(result.env?.GROK_STORAGE_MODE).toBe("local");
+});
+
+test("grok harness env override wins over the privacy defaults; untouched var keeps its default", () => {
+  const result = buildCommand(
+    alias("grok", { env: { GROK_TELEMETRY_ENABLED: "1", GROK_STORAGE_MODE: "writeback" } }),
+    "p",
+    { ...grokDefaults, grokSession: grokNewSession },
+  );
+  expect(result.env?.GROK_TELEMETRY_ENABLED).toBe("1");
+  expect(result.env?.GROK_STORAGE_MODE).toBe("writeback");
+  // GROK_TELEMETRY_TRACE_UPLOAD wasn't overridden — the default still applies.
+  expect(result.env?.GROK_TELEMETRY_TRACE_UPLOAD).toBe("0");
+});
+
+test("aliased grok with a home override still carries GROK_HOME plus all three privacy defaults", () => {
+  const result = buildCommand(
+    alias("grok", { home: "/tmp/agetor-test/grok-2" }),
+    "p",
+    { ...grokDefaults, grokSession: grokNewSession },
+  );
+  expect(result.env?.GROK_HOME).toBe("/tmp/agetor-test/grok-2");
+  expect(result.env?.GROK_TELEMETRY_ENABLED).toBe("0");
+  expect(result.env?.GROK_TELEMETRY_TRACE_UPLOAD).toBe("0");
+  expect(result.env?.GROK_STORAGE_MODE).toBe("local");
+});
+
+test("claude-code and codex env never carry the grok privacy-default keys", () => {
+  const claudeResult = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, effort: "low" });
+  const codexResult = buildCommand(builtin("codex"), "p", { ...codexDefaults });
+  for (const key of ["GROK_TELEMETRY_ENABLED", "GROK_TELEMETRY_TRACE_UPLOAD", "GROK_STORAGE_MODE"]) {
+    expect(claudeResult.env?.[key]).toBeUndefined();
+    expect(codexResult.env?.[key]).toBeUndefined();
+  }
 });
 
 // Invariant test for AGENT_OPTIONS — guards against re-introducing the

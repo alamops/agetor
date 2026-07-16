@@ -18,6 +18,7 @@ let sandbox: string | null = null;
 beforeEach(() => {
   delete process.env.AGETOR_CODEX_BIN;
   delete process.env.AGETOR_CLAUDE_BIN;
+  delete process.env.AGETOR_GROK_BIN;
   delete process.env.AGETOR_TMUX_BIN;
   sandbox = null;
 });
@@ -55,6 +56,38 @@ test("returns available=false with install hint when the bin is missing", async 
   expect(status.path).toBeNull();
   expect(status.reason).toContain("not found on PATH");
   expect(status.installHint).toContain("codex");
+});
+
+test("returns available=true with version for grok using a fake binary (grok needs tmux too)", async () => {
+  // /bin/echo stands in for both grok and tmux so the dual probe passes
+  // without either CLI installed — mirrors the claude-code fake-binary test
+  // above. checkHarness now gates grok on tmux the same way it gates
+  // claude-code, since grok-tmux.ts hosts every one-shot turn in a tmux
+  // session too.
+  process.env.AGETOR_GROK_BIN = "/bin/echo";
+  process.env.AGETOR_TMUX_BIN = "/bin/echo";
+  const status = await checkAgent("grok");
+  expect(status.available).toBe(true);
+  expect(status.path).toBe("/bin/echo");
+  expect(status.reason).toBeNull();
+});
+
+test("grok is unavailable when tmux is missing, with the tmux install hint", async () => {
+  process.env.AGETOR_GROK_BIN = "/bin/echo";
+  process.env.AGETOR_TMUX_BIN = "definitely-not-tmux-xyz123";
+  const status = await checkAgent("grok");
+  expect(status.available).toBe(false);
+  expect(status.reason).toContain("tmux");
+  expect(status.installHint).toContain("tmux");
+});
+
+test("returns available=false with the xAI install hint when the grok bin is missing", async () => {
+  process.env.AGETOR_GROK_BIN = "definitely-not-a-real-binary-xyz123";
+  const status = await checkAgent("grok");
+  expect(status.available).toBe(false);
+  expect(status.path).toBeNull();
+  expect(status.reason).toContain("not found on PATH");
+  expect(status.installHint).toBe("curl -fsSL https://x.ai/cli/install.sh | bash");
 });
 
 /**

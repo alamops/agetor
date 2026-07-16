@@ -64,10 +64,12 @@ export function TmuxMissingBanner({ show, onResolve }: Props) {
   );
 }
 
-/** Detects if any claude-code harness is reporting a tmux-missing failure. */
+/** Detects if any harness is reporting a tmux-missing failure. The reason
+ *  constant is only emitted by `checkHarness`'s tmux pre-flight (claude-code
+ *  and grok today), so matching on it alone stays exact for any kind. */
 export function isTmuxMissing(agents: AgentStatus[]): boolean {
   return agents.some(
-    (a) => a.kind === "claude-code" && !a.available && a.reason === TMUX_MISSING_REASON,
+    (a) => !a.available && a.reason === TMUX_MISSING_REASON,
   );
 }
 

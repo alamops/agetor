@@ -729,7 +729,8 @@ function RunPanelBody({
   //     conversation continues from the same JSONL transcript. `task.runId`
   //     is null in that orphan-reconciled state, so we fall back to the most
   //     recent run id to identify which task → which claude session to
-  //     resume. Codex has no resume mechanism; restrict to claude-code.
+  //     resume. Codex and grok have no such mechanism (each turn is a fresh
+  //     one-shot process, not a live REPL); restrict to claude-code.
   const liveRunId = task.runId;
   // Reconcile against the independently-polled runs list: if the live run has
   // already resolved (succeeded/failed/cancelled/orphaned), the task isn't

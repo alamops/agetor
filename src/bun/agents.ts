@@ -1,5 +1,5 @@
 import path from "node:path";
-import { MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
+import { DEFAULT_EFFORT, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   spawnClaudeViaTmux,
@@ -8,6 +8,7 @@ import {
   type SpawnedAgent,
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
+import { spawnGrokViaTmux } from "./grok-tmux.ts";
 import { gitWritableRootsSync } from "./worktree.ts";
 
 export type { SpawnedAgent };
@@ -57,7 +58,9 @@ export interface AgentRunOptions {
    * For claude-code: the JSONL session uuid, resumed via `claude --resume
    * <id>`. For codex: the `thread_id`, resumed via `codex exec resume <id>`.
    * Either way the new prompt attaches to the full prior conversation instead
-   * of starting fresh.
+   * of starting fresh. Not used by grok — see `grokSession` below, which
+   * bundles id+resume together instead of splitting across this field and
+   * `sessionId`.
    */
   resumeSessionId?: string | null;
   /**
@@ -67,7 +70,7 @@ export interface AgentRunOptions {
    * mtime-based directory poll, and the run row's `claude_session_id` is
    * known synchronously at spawn (no `onSessionId` round-trip). Mutually
    * exclusive with `resumeSessionId` — claude rejects both together.
-   * Ignored by codex.
+   * Ignored by codex and by grok (see `grokSession` below).
    */
   sessionId?: string | null;
   /**
@@ -81,6 +84,41 @@ export interface AgentRunOptions {
    * sandbox (which can't write anything regardless).
    */
   codexExternalGitDirs?: string[];
+  /**
+   * Grok-only session decision (D4/D5, `docs/plans/grok-build-oss-alignment.md`).
+   * The orchestrator's `resolveGrokSession` decides an id AND whether to
+   * resume it as one inseparable unit (a mode change since the session was
+   * created forces a fresh id rather than a resume — see D5), so this field
+   * bundles both rather than reusing the claude-code-style split across
+   * `sessionId`/`resumeSessionId`, which would let a caller send a mismatched
+   * pair (e.g. an id with no resume flag, or vice versa) undetected.
+   *
+   *   - `resume: false` → NEW session: `-s <id>` PLUS the mode's `--sandbox`
+   *     flag (`read-only` for `ask`, `off` for `auto`).
+   *   - `resume: true`  → RESUME: `--resume <id>` and NO `--sandbox` flag at
+   *     all — grok hard-errors (exit 1) if an explicit `--sandbox` differs
+   *     from the session's stored profile, so omitting it lets the CLI
+   *     silently inherit whatever profile the session started with.
+   *
+   * Required for a grok spawn — `buildCommand` throws if `harness.kind ===
+   * "grok"` and this is missing. Ignored by claude-code and codex.
+   */
+  grokSession?: { id: string; resume: boolean } | null;
+  /**
+   * Task-scoped dedup set for grok's `updates.jsonl` tailer — the SAME `Set`
+   * instance `runs.seenLineUuidsForTask(taskId)` (db.ts) produces for
+   * reattach. `GrokLaunchOptions.seenLineUuids` (grok-tmux.ts) is a
+   * *required* field: `updates.jsonl` is a per-SESSION file spanning every
+   * turn and is always tailed from offset 0, so without a task-scoped set a
+   * fresh turn would re-emit every earlier turn's already-persisted
+   * tool_call/plan lines as new chunks under the new run id. Only meaningful
+   * for `harness.kind === "grok"`; ignored by claude-code and codex. Rides
+   * on `AgentRunOptions` rather than `SpawnAgentArgs` directly because both
+   * `buildCommand`-adjacent grok state (`grokSession`) and this dedup set are
+   * decided together by the orchestrator's grok call sites and threaded
+   * through the same `opts` object.
+   */
+  seenLineUuids?: Set<string>;
 }
 
 // Map friendly model ids to the exact strings the claude-code CLI expects.
@@ -147,12 +185,24 @@ function modelDeclinesEffort(kind: AgentKind, model: string): boolean {
  */
 export function resolveBin(harness: Harness): string {
   if (harness.bin) return harness.bin;
-  const fallback = harness.kind === "claude-code" ? "claude" : "codex";
-  const override = harness.kind === "claude-code"
-    ? process.env.AGETOR_CLAUDE_BIN
-    : process.env.AGETOR_CODEX_BIN;
-  if (override) return override;
-  return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+
+  // Explicit per-kind dispatch (D10) — a fourth kind added later without a
+  // matching branch here throws instead of silently resolving to whichever
+  // kind happened to sit in an `else`.
+  if (harness.kind === "claude-code") {
+    if (process.env.AGETOR_CLAUDE_BIN) return process.env.AGETOR_CLAUDE_BIN;
+    return Bun.which("claude", { PATH: process.env.PATH }) ?? "claude";
+  }
+  if (harness.kind === "codex") {
+    if (process.env.AGETOR_CODEX_BIN) return process.env.AGETOR_CODEX_BIN;
+    return Bun.which("codex", { PATH: process.env.PATH }) ?? "codex";
+  }
+  if (harness.kind === "grok") {
+    if (process.env.AGETOR_GROK_BIN) return process.env.AGETOR_GROK_BIN;
+    return Bun.which("grok", { PATH: process.env.PATH }) ?? "grok";
+  }
+  const exhaustive: never = harness.kind;
+  throw new Error(`resolveBin: unknown harness kind: ${exhaustive}`);
 }
 
 /**
@@ -176,13 +226,44 @@ export function harnessEnv(harness: Harness): Record<string, string> {
     // macOS keychain, so re-homing it is harmless — but CODEX_HOME is what
     // actually controls its login & history, so we set both as a belt-and-
     // braces measure.
+    //
+    // grok doesn't use the macOS keychain either (see the `Harness.home`
+    // docstring in shared/types.ts), so re-homing it is safe; it gets its own
+    // GROK_HOME var (mirroring CODEX_HOME) rather than HOME — grok has no
+    // documented HOME-relative config path the way codex's CLI does.
     if (harness.kind === "claude-code") {
       env.CLAUDE_CONFIG_DIR = harness.home;
-    } else {
+    } else if (harness.kind === "codex") {
       env.HOME = harness.home;
       env.CODEX_HOME = path.join(harness.home, ".codex");
+    } else if (harness.kind === "grok") {
+      env.GROK_HOME = harness.home;
+    } else {
+      const exhaustive: never = harness.kind;
+      throw new Error(`harnessEnv: unknown harness kind: ${exhaustive}`);
     }
   }
+
+  // D1 (docs/plans/grok-privacy-defaults.md): grok's always-on trace-upload
+  // pipeline ships per-turn session artifacts (incl. session logs; a tracked
+  // `.env` FILE is not skip-listed) to a GCS bucket, and xAI can flip
+  // telemetry on REMOTELY per account via server-pushed settings — so
+  // disabling it once in the harness's `env` config isn't durable. Grok's own
+  // flag resolver ranks precedence `requirement > cli > env > config >
+  // managed > remote > default` (xai-grok-config-types/src/flags.rs), so an
+  // env var beats both the user's saved config AND a future remote push. The
+  // sandbox can't help either — in-process HTTP is deliberately exempt from
+  // `restrict_network` — so env is the only reliable per-spawn control.
+  // `GROK_STORAGE_MODE=local` additionally blocks the session writeback sync
+  // a server flag can silently re-enable. Set BEFORE the harness's own `env`
+  // map below so an explicit user override (someone who consciously wants
+  // xAI telemetry back on) still wins.
+  if (harness.kind === "grok") {
+    env.GROK_TELEMETRY_ENABLED = "0";
+    env.GROK_TELEMETRY_TRACE_UPLOAD = "0";
+    env.GROK_STORAGE_MODE = "local";
+  }
+
   // User-provided env wins over the home-derived defaults.
   for (const [k, v] of Object.entries(harness.env ?? {})) env[k] = v;
   return env;
@@ -385,6 +466,7 @@ export function buildCommand(
   // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
   // element: it's delivered on stdin (the trailing `-`), so the driver can
   // pipe a prompt file in and no user text touches the shell wrapper.
+  if (harness.kind === "codex") {
   const extra = (process.env.AGETOR_CODEX_ARGS ?? "").split(/\s+/).filter(Boolean);
 
   const args: string[] = [bin, "exec"];
@@ -449,6 +531,86 @@ export function buildCommand(
   // Read the prompt from stdin — `-` is codex's stdin sentinel.
   args.push("-");
   return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
+  // grok — hosted in tmux via grok-tmux.ts. This argv EXCLUDES `-p`,
+  // `--prompt-file`, and the prompt itself: grok's `-p` takes an argument
+  // (not stdin like codex's trailing `-`), so embedding raw prompt text into
+  // shell-quoted argv is quoting hell. `spawnGrokViaTmux` instead writes the
+  // prompt to a per-run file and splices `--prompt-file <path>` in right
+  // before the output redirect — see grok-tmux.ts's `GrokLaunchOptions.argv`
+  // doc comment and its file header.
+  if (harness.kind === "grok") {
+    const extra = (process.env.AGETOR_GROK_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    const args: string[] = [bin, "--output-format", "streaming-json"];
+
+    if (!opts.model) {
+      throw new Error("model is required for grok");
+    }
+    // Unknown model ids pass through verbatim (repo convention) — grok's `-m`
+    // takes friendly ids as-is, same as codex's `--model`.
+    args.push("-m", opts.model);
+
+    // Mode → permission-mode (D3, docs/plans/grok-build-oss-alignment.md).
+    // `auto` — and null/unknown ids, mirroring the claude-code/codex
+    // `mode ?? "auto"` convention — gets `--permission-mode bypassPermissions`
+    // (full auto, agetor's no-sandbox-escalation-needed philosophy — see the
+    // sandbox block below). `ask` gets NO permission-mode flag at all: source
+    // review of `xai-grok-shell/src/util/config/permissions.rs:225-239`
+    // confirms `--permission-mode dontAsk` parses but is wired to nothing —
+    // only `bypassPermissions`/`always-approve`/`auto` are recognized — so
+    // emitting it was dead weight. `ask`'s read-only sandbox (below) already
+    // guarantees there's nothing mutating for grok to need approval on, and
+    // headless grok's default mode auto-cancels any prompt it can't surface
+    // (reported back to the model, never a hang), so dropping the flag changes
+    // no runtime behavior.
+    const mode = opts.mode ?? "auto";
+    if (mode !== "ask") {
+      args.push("--permission-mode", "bypassPermissions");
+    }
+
+    args.push(...extra);
+
+    // Session flags (D4/D5) — see `AgentRunOptions.grokSession`'s doc comment
+    // for the full contract. grok's `-s` is new-session-only and `--resume`
+    // is resume-only — mutually exclusive. A NEW session ALSO gets the
+    // mode's `--sandbox` flag; a RESUMED session gets NO `--sandbox` flag at
+    // all, because the CLI hard-errors (exit 1) if an explicit `--sandbox`
+    // differs from the session's stored profile (`cli.rs:853-867` —
+    // `(None, saved) => Apply(saved)`, so omitting the flag structurally
+    // cannot conflict). Detecting "did the mode change since this session was
+    // created" is the *caller's* job (orchestrator's `resolveGrokSession`,
+    // D5) — by the time `grokSession` reaches here, `resume` has already
+    // been decided.
+    if (!opts.grokSession) {
+      throw new Error("grokSession is required for grok");
+    }
+    if (opts.grokSession.resume) {
+      args.push("--resume", opts.grokSession.id);
+    } else {
+      args.push("-s", opts.grokSession.id);
+      args.push("--sandbox", mode === "ask" ? "read-only" : "off");
+    }
+
+    // Effort (D6): grok-build's MODEL_EFFORT_SUPPORT entry is non-empty
+    // (`low`..`max`, source-confirmed `Effort::VALID_VALUES`). Unknown ids
+    // pass through verbatim (same convention as `-m` above); `buildCommand`
+    // does not itself validate against the canonical set. A null effort
+    // falls back to DEFAULT_EFFORT rather than throwing: grok task rows
+    // created while MODEL_EFFORT_SUPPORT.grok was empty were persisted with
+    // effort = null, and there's no migration backfilling them — throwing
+    // would brick those tasks' next start.
+    if (!modelDeclinesEffort("grok", opts.model)) {
+      const effort = opts.effort ?? DEFAULT_EFFORT.grok;
+      if (effort) args.push("--effort", effort);
+    }
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
+  const exhaustive: never = harness.kind;
+  throw new Error(`buildCommand: unknown harness kind: ${exhaustive}`);
 }
 
 /**
@@ -598,30 +760,77 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
   // codex — hosted in a per-task tmux session via codex-tmux.ts (so a mid-turn
   // run survives an agetor restart and is reattachable), streaming structured
   // events by tailing codex's `--json` log.
-  if (process.env.AGETOR_CODEX_DRIVER === "fake") {
-    buildCommand(harness, prompt, opts);
-    // Hand the orchestrator a thread id so it persists `codex_session_id` and
-    // can route follow-ups through `codex exec resume` — mirrors what a real
-    // `thread.started` event would deliver.
-    onSessionId?.(`fake-codex-thread-${taskId}`);
-    return makeFakeAgent(taskId, prompt, onChunk);
+  if (harness.kind === "codex") {
+    if (process.env.AGETOR_CODEX_DRIVER === "fake") {
+      buildCommand(harness, prompt, opts);
+      // Hand the orchestrator a thread id so it persists `codex_session_id` and
+      // can route follow-ups through `codex exec resume` — mirrors what a real
+      // `thread.started` event would deliver.
+      onSessionId?.(`fake-codex-thread-${taskId}`);
+      return makeFakeAgent(taskId, prompt, onChunk);
+    }
+    // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
+    // worktree) so a codex `auto` run that has to write there escalates its
+    // sandbox to full access. Computed here — the single choke point every codex
+    // spawn path funnels through — rather than at each orchestrator call site.
+    // No-op for an ordinary checkout or a non-git cwd, so the argv is unchanged
+    // there. `buildCodexCommand` is the testable seam for this wiring.
+    const built = buildCodexCommand(harness, prompt, opts, cwd);
+    return spawnCodexViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      onSessionId,
+    });
   }
-  // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
-  // worktree) so a codex `auto` run that has to write there escalates its
-  // sandbox to full access. Computed here — the single choke point every codex
-  // spawn path funnels through — rather than at each orchestrator call site.
-  // No-op for an ordinary checkout or a non-git cwd, so the argv is unchanged
-  // there. `buildCodexCommand` is the testable seam for this wiring.
-  const built = buildCodexCommand(harness, prompt, opts, cwd);
-  return spawnCodexViaTmux({
-    taskId,
-    runId,
-    argv: built.cmd,
-    env: built.env ?? {},
-    cwd,
-    promptText: prompt,
-    onChunk,
-    onSessionId,
-  });
+
+  // grok — hosted in a per-task tmux session via grok-tmux.ts, same
+  // restart-survival rationale as codex. No cwd-based sandbox escalation is
+  // needed (D4: `auto` already runs with no sandbox at all), so unlike codex
+  // this dispatches straight to `buildCommand` with no cwd-dependent seam.
+  if (harness.kind === "grok") {
+    // Resolved session id for THIS turn (D4/D5): the orchestrator's
+    // `opts.grokSession` is expected to always be set (its `.id` is either a
+    // freshly-minted uuid for a new session or the id being resumed — see
+    // `AgentRunOptions.grokSession`'s doc comment). The `crypto.randomUUID()`
+    // fallback only guards a caller that hasn't been updated to pass it yet,
+    // mirroring the claude-code branch's own generate-if-absent pattern
+    // above; a fallback-generated id is treated as a fresh (non-resumed) one.
+    const sessionId = opts.grokSession?.id ?? crypto.randomUUID();
+    // GrokLaunchOptions.seenLineUuids is required; fall back to a fresh Set
+    // (no cross-turn dedup) rather than throwing if the caller omitted it —
+    // see AgentRunOptions.seenLineUuids's doc comment.
+    const dedup = opts.seenLineUuids ?? new Set<string>();
+    const grokSession = opts.grokSession ?? { id: sessionId, resume: false };
+    if (process.env.AGETOR_GROK_DRIVER === "fake") {
+      buildCommand(harness, prompt, { ...opts, grokSession });
+      // Echo the PROVIDED session id (D4: the orchestrator generates and
+      // pre-seeds it now) as confirmation/repair — same role a real `end`
+      // event's sessionId plays — rather than synthesizing our own
+      // `fake-grok-session-<taskId>` id as before.
+      onSessionId?.(sessionId);
+      return makeFakeAgent(taskId, prompt, onChunk);
+    }
+    const built = buildCommand(harness, prompt, { ...opts, grokSession });
+    return spawnGrokViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      onSessionId,
+      sessionId,
+      seenLineUuids: dedup,
+    });
+  }
+
+  const exhaustive: never = harness.kind;
+  throw new Error(`spawnAgent: unknown harness kind: ${exhaustive}`);
 }
 

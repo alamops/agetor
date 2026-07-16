@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
-import { spawnAgent, toClaudeModelArg } from "./agents.ts";
+import { spawnAgent, toClaudeModelArg, harnessEnv } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import {
   AGENT_OPTIONS,
@@ -65,6 +65,11 @@ import {
   reattachCodexSession,
 } from "./codex-tmux.ts";
 import {
+  dropGrokSession,
+  grokSessionExistsOnDisk,
+  reattachGrokSession,
+} from "./grok-tmux.ts";
+import {
   setSubagentEmitter,
   setSubagentSettleHook,
   setParkedDiscoveryHandler,
@@ -72,6 +77,12 @@ import {
   orphanRunningSubagents,
   attachSubagentWatcher,
 } from "./claude-subagents.ts";
+import {
+  setGrokSubagentEmitter,
+  setGrokSubagentSettleHook,
+  setGrokParkedDiscoveryHandler,
+  orphanRunningGrokSubagents,
+} from "./grok-subagents.ts";
 import { prepareWorkdir, removeWorktree, detachWorktree, repoRoot, resolveRef, branchName, ensureUniqueBranch } from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -213,6 +224,14 @@ setSubagentSettleHook(maybeReleaseHeldTask);
 // claude-subagents.ts seams; see `pullBackParkedTask` below for the policy
 // (only from `review`, only when the terminal run actually succeeded).
 setParkedDiscoveryHandler(pullBackParkedTask);
+
+// Grok subagents ride the IDENTICAL hold/settle policy as claude's — every
+// sink below is kind-agnostic (keyed by taskId, never by AgentKind), so
+// grok-subagents.ts' manager is wired to the exact same generic functions
+// claude-subagents.ts is wired to above, not a grok-specific variant.
+setGrokSubagentEmitter(emit);
+setGrokSubagentSettleHook(maybeReleaseHeldTask);
+setGrokParkedDiscoveryHandler(pullBackParkedTask);
 
 // Continuation-run adoption: claude-tmux calls this when a genuinely-new
 // content line arrives on a task's session with no turn in flight — the case
@@ -467,8 +486,8 @@ export function reconcileOrphans(): number {
   // task; only the latest reflects the user's current intent. Older
   // siblings get flipped to orphaned so we never have two SessionState
   // objects fighting for the same tmux session.
-  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; agent: string }, []>(
-    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
+  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; grok_session_id: string | null; agent: string }, []>(
+    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, grok_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
   ).all();
 
   const reattachedTaskIds = new Set<string>();
@@ -478,24 +497,31 @@ export function reconcileOrphans(): number {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
     const kind = resolveHarness(row.agent)?.kind ?? null;
-    // Both claude-code and codex runs can be reattached when their detached
-    // tmux session is still alive. The reattach key differs by kind: claude
-    // needs its JSONL session uuid (`claude_session_id`), codex needs its
-    // thread id (`codex_session_id`) — the per-run log path is derived from
-    // the run id. Note codex's session only lives WHILE its turn is in flight,
-    // so a reattachable codex run is by definition one that was still running
-    // when agetor restarted. Also: if we already reattached a newer sibling
-    // for this task, orphan the older one — only one SessionState can drive a
-    // given tmux session at a time.
+    // claude-code, codex, and grok runs can all be reattached when their
+    // detached tmux session is still alive. The reattach key differs by kind:
+    // claude needs its JSONL session uuid (`claude_session_id`), codex needs
+    // its thread id (`codex_session_id`). grok's key (`grok_session_id`) is
+    // NOT required to reattach — its stdout log path derives from the run id,
+    // and its id is now pre-seeded up front (D4: `resolveGrokSession` mints or
+    // reuses a uuid before spawn, not sniffed from the log), so a `NULL` value
+    // here only means a pre-D4 run row; the updates.jsonl tailer just can't
+    // resolve its path in that case (graceful degrade — stdout still streams).
+    // The `end` event still reports the id as confirmation/repair. Note
+    // codex's and grok's sessions only live WHILE their turn is in flight, so
+    // a reattachable codex/grok run is by definition one that was still
+    // running when agetor restarted. Also: if we already reattached a newer
+    // sibling for this task, orphan the older one — only one SessionState can
+    // drive a given tmux session at a time.
     const reattachKey =
       kind === "claude-code" ? row.claude_session_id
       : kind === "codex" ? row.codex_session_id
+      : kind === "grok" ? row.grok_session_id
       : null;
     const canTryReattach =
-      (kind === "claude-code" || kind === "codex")
+      (kind === "claude-code" || kind === "codex" || kind === "grok")
       && task !== null
       && row.tmux_session !== null
-      && reattachKey !== null
+      && (kind === "grok" || reattachKey !== null)
       && !reattachedTaskIds.has(row.task_id)
       && sessionExistsByName(row.tmux_session);
 
@@ -512,12 +538,26 @@ export function reconcileOrphans(): number {
             onChunk,
             seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
           })
-        : reattachCodexSession({
+        : kind === "codex"
+        ? reattachCodexSession({
             taskId: row.task_id,
             runId: row.id,
             sessionName: row.tmux_session as string,
             onChunk,
             seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+          })
+        : reattachGrokSession({
+            taskId: row.task_id,
+            runId: row.id,
+            sessionName: row.tmux_session as string,
+            onChunk,
+            seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            // Pre-seeded id (D4) — null only for a pre-D4 run row, in which
+            // case the updates.jsonl tailer just never resolves a path
+            // (graceful degrade; stdout tailing is unaffected).
+            sessionId: row.grok_session_id,
+            cwd,
+            env: harness ? harnessEnv(harness) : undefined,
           });
       if (spawned) {
         registerActiveRun(row.id, row.task_id, task, spawned);
@@ -620,9 +660,20 @@ export function reconcileOrphans(): number {
   for (const heldId of heldTaskIds) {
     const task = tasks.get(heldId);
     if (!task) continue;
-    // Only claude-code writes subagent rows; a codex task can never be held, so
-    // it never reaches here. Guard the session probe on kind for clarity.
-    if (resolveHarness(task.agent)?.kind !== "claude-code") continue;
+    // claude-code and grok both write subagent rows; a codex task can never
+    // be held, so it never reaches here. Guard the session probe on kind for
+    // clarity. Widened from claude-code-only (docs/plans/grok-subagent-rendering.md
+    // D5) — grok subagent rows ride the SAME `subagents` table and need the
+    // same on-boot re-arm/orphan treatment, or a stuck grok row would never
+    // clear. The re-arm ACTION still differs by kind below: claude arms its
+    // out-of-band JSONL watcher (`attachSubagentWatcher`); grok has no such
+    // watcher — its subagent rows rehydrate automatically when
+    // `reattachGrokSession` re-tails the parent's updates.jsonl (subagent
+    // lines re-dispatch → `insertIfAbsent`), which the stale-runs reattach
+    // pass above already handles, so grok only needs the dead-session-orphan
+    // path here, never the claude-only watcher-arm path.
+    const kind = resolveHarness(task.agent)?.kind;
+    if (kind !== "claude-code" && kind !== "grok") continue;
 
     if (task.column === "running") {
       // Classic held-task path, unchanged: only proceed when the terminal run
@@ -631,6 +682,12 @@ export function reconcileOrphans(): number {
       // progress that just happens to also have live subagent rows).
       if (!isHeldByBackgroundAgents(heldId)) continue;
       if (sessionExistsByName(sessionNameFor(heldId))) {
+        if (kind === "grok") {
+          // Session still alive: leave it to the normal grok reattach path
+          // (handled by the stale-runs pass above, keyed off `status =
+          // 'running'` runs) — do not skip, but do not claude-watch either.
+          continue;
+        }
         const run = task.runId ? runs.get(task.runId) : null;
         // No JSONL session id means no watch directory to derive, so nothing will
         // ever observe these agents finishing. Treat it exactly like a dead
@@ -647,6 +704,11 @@ export function reconcileOrphans(): number {
           jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null),
         });
         reArmed++;
+      } else if (kind === "grok") {
+        // Session gone: grok's stuck subagent rows have no reattach path left
+        // to rehydrate them (mirrors the claude dead-session branch below).
+        orphanRunningGrokSubagents(heldId);
+        released++;
       } else {
         // Session gone: no watcher could ever observe these agents finishing, so
         // flip the rows now. `orphanRunningSubagents` fires the settle hook →
@@ -667,6 +729,20 @@ export function reconcileOrphans(): number {
     // HARD INVARIANT: never kill or create tmux sessions here — only re-arm
     // watchers and flip DB rows.
     if (sessionExistsByName(sessionNameFor(heldId))) {
+      if (kind === "grok") {
+        // This is the blind-spot pass (task NOT in the `running` column), so
+        // the task's terminal run already resolved. grok's session lives only
+        // during a turn, so a live session here with a resolved run is a
+        // contradiction that shouldn't occur — but if it ever lingered, the
+        // `running` subagent rows are stale (nothing will settle them, since
+        // the turn that spawned them is over and the run-`running` reattach
+        // pass skips a resolved run). Orphan them rather than `continue` into
+        // a reattach that never fires. The settle hook safely bails (column
+        // isn't `running`), so this only clears rows.
+        orphanRunningGrokSubagents(heldId);
+        released++;
+        continue;
+      }
       const run = task.runId ? runs.get(task.runId) : null;
       if (!run?.claudeSessionId) {
         orphanRunningSubagents(heldId);
@@ -680,6 +756,12 @@ export function reconcileOrphans(): number {
         jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null),
       });
       reArmed++;
+    } else if (kind === "grok") {
+      // Session gone: orphan the rows (mirrors the claude branch below). The
+      // settle hook's `maybeReleaseHeldTask` safely bails here (task.column
+      // isn't `running`), so this only clears the stale subagent rows.
+      orphanRunningGrokSubagents(heldId);
+      released++;
     } else {
       // Session gone: orphan the rows. Unlike the held-in-running case, the
       // settle hook's `maybeReleaseHeldTask` safely bails here (task.column
@@ -756,6 +838,16 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   const now = Date.now();
   const prevColumn: ColumnId = task.column;
 
+  // Grok pre-seeds its session id up front (D4 in
+  // docs/plans/grok-build-oss-alignment.md) rather than sniffing it from the
+  // log after the fact: `resolveGrokSession` decides between resuming the
+  // task's most recent session (e.g. this is a re-Start after a stop, not the
+  // task's first-ever run) and minting a fresh one, and forces a fresh
+  // session when the task's mode changed since the prior session was created
+  // (D5 — `--resume` never re-sends `--sandbox`, so resuming across a mode
+  // change would silently keep the OLD mode's sandbox).
+  const grokSession = harness.kind === "grok" ? resolveGrokSession(taskId, task) : null;
+
   // Single transaction: flip the task into running with the new run id, branch,
   // worktree path; insert the run row. Either everything sticks or nothing does.
   const persist = db.transaction(() => {
@@ -773,13 +865,16 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
       startedAt: now,
       endedAt: null,
       exitCode: null,
-      // Both kinds now run in a per-task tmux session.
+      // All three kinds now run in a per-task tmux session.
       tmuxSession: sessionNameFor(taskId),
-      // Filled in by spawnAgent's onSessionId callback once the session id is
-      // known: claude's JSONL uuid → claudeSessionId, codex's thread_id →
-      // codexSessionId. Exactly one is non-null per run.
+      // claude's JSONL uuid and codex's thread_id are still filled in by
+      // spawnAgent's onSessionId callback once known. grok's id is now known
+      // BEFORE spawn (resolveGrokSession, D4) and persisted here directly;
+      // onSessionId below still fires from the `end` event as harmless
+      // confirmation/repair, not the primary persistence path.
       claudeSessionId: null,
       codexSessionId: null,
+      grokSessionId: grokSession?.id ?? null,
     });
   });
   persist();
@@ -797,6 +892,9 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // panel's dedup keys user events on (runId, data) so we don't double
   // up.
   onChunk("user", normalizeUserText(promptWithRefs));
+  if (grokSession) {
+    onChunk("status", grokStatusMessage(grokSession));
+  }
 
   const agent = spawnAgent({
     taskId,
@@ -808,9 +906,18 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     onSessionId: (sessionId) => {
       runs.update(runId, harness.kind === "claude-code"
         ? { claudeSessionId: sessionId }
-        : { codexSessionId: sessionId });
+        : harness.kind === "codex"
+        ? { codexSessionId: sessionId }
+        : { grokSessionId: sessionId });
     },
-    opts: { mode: task.mode, model: task.model, effort: task.effort },
+    opts: {
+      mode: task.mode,
+      model: task.model,
+      effort: task.effort,
+      ...(grokSession
+        ? { grokSession: { id: grokSession.id, resume: grokSession.resume }, seenLineUuids: runs.seenLineUuidsForTask(taskId) }
+        : {}),
+    },
   });
   registerActiveRun(runId, taskId, task, agent);
   emit({
@@ -979,8 +1086,9 @@ function attachDoneHandler(
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       }
-      // Spawn the next queued codex follow-up, if any (no-op otherwise).
+      // Spawn the next queued codex/grok follow-up, if any (no-op otherwise).
       drainCodexQueue(taskId);
+      drainGrokQueue(taskId);
     })
     .catch((err) => {
       const handle = active.get(runId);
@@ -1007,8 +1115,9 @@ function attachDoneHandler(
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       }
-      // Spawn the next queued codex follow-up, if any (no-op otherwise).
+      // Spawn the next queued codex/grok follow-up, if any (no-op otherwise).
       drainCodexQueue(taskId);
+      drainGrokQueue(taskId);
     });
 }
 
@@ -1037,9 +1146,11 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   if (before.agent !== after.agent) {
     if (beforeKind === "claude-code") dropSession(taskId);
     else if (beforeKind === "codex") dropCodexSession(taskId);
-    // Any queued codex follow-ups belong to the old agent — drop them so a
-    // later drain doesn't spawn them against the new harness.
+    else if (beforeKind === "grok") { dropGrokSession(taskId); grokSessionModeAtStart.delete(taskId); }
+    // Any queued codex/grok follow-ups belong to the old agent — drop them so
+    // a later drain doesn't spawn them against the new harness.
     codexTurnQueue.delete(taskId);
+    grokTurnQueue.delete(taskId);
     // Cross-kind switches (e.g. claude-code → codex alias) leave mode/
     // model/effort ids that belong to the old kind's option set; the
     // next spawn would error or fall through to verbatim flags. Reset
@@ -1175,7 +1286,12 @@ export function cancelRun(runId: string): boolean {
     if (!taskId || !isHeldByBackgroundAgents(taskId)) return false;
     cancelPendingForTask(taskId, "cancelled by user");
     interruptTaskSession(taskId);
-    orphanRunningSubagents(taskId);
+    // Route the orphan through the driver that owns this task's subagents:
+    // grok's manager also stops the live child-transcript tailers, whereas
+    // claude's function only flips DB rows. Both fire the settle hook.
+    const cancelKind = resolveHarness(runs.get(runId)?.agent ?? "")?.kind;
+    if (cancelKind === "grok") orphanRunningGrokSubagents(taskId);
+    else orphanRunningSubagents(taskId);
     return true;
   }
   // Stop targets the whole task, not just one run. `kill()` sends Ctrl+C
@@ -1211,7 +1327,12 @@ export type SendInputResult =
  *     messages can't strand surplus run rows in `running`. See
  *     `sendTurnInExistingSession`.
  *
- *   • codex: writes to the active run's stdin (single-run model unchanged).
+ *   • codex: one-shot `exec` per turn — a follow-up while a turn is in
+ *     flight is queued (`codexTurnQueue`) and spawned as a fresh
+ *     `codex exec resume` turn once the active one resolves.
+ *
+ *   • grok: structurally identical to codex — one-shot per turn, no mid-turn
+ *     input, follow-ups queue (`grokTurnQueue`) and resume via session id.
  *
  * Archived / detached-worktree restore: a message to an archived task
  * auto-unarchives it (sending is an unambiguous signal of continued
@@ -1266,6 +1387,12 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   }
   if (kind === "codex") {
     const result = sendCodexTurn(row.task_id, line);
+    return result
+      ? { delivered: true, runId: result }
+      : { delivered: false, reason: "internal: task lookup failed" };
+  }
+  if (kind === "grok") {
+    const result = sendGrokTurn(row.task_id, line);
     return result
       ? { delivered: true, runId: result }
       : { delivered: false, reason: "internal: task lookup failed" };
@@ -1334,6 +1461,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
     // before this run's own `thread.started` re-emits it. onSessionId below
     // re-stamps the same value (idempotent).
     codexSessionId: priorThreadId,
+    grokSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -1413,6 +1541,233 @@ function findLastCodexSessionId(taskId: string): string | null {
      LIMIT 1`,
   ).get(taskId);
   return row?.codex_session_id ?? null;
+}
+
+/**
+ * Per-task queue of follow-up lines received while a grok turn is in flight.
+ * Grok is structurally identical to codex here (D1 in the grok-build plan):
+ * `grok -p … --output-format streaming-json` is a one-shot exec per turn, not
+ * a REPL, so it can't take conversational input mid-turn. We hold the message
+ * and spawn a fresh resume turn for it once the active turn resolves
+ * (`drainGrokQueue`, called from `attachDoneHandler`) — the grok analogue of
+ * `codexTurnQueue` above.
+ */
+const grokTurnQueue = new Map<string, string[]>();
+
+/**
+ * Send a follow-up to a grok task. Each follow-up is its own run row + its own
+ * resumed turn (sequential-turn model, mirrors `sendCodexTurn`). When a turn
+ * is already running, the message is queued; otherwise it spawns immediately.
+ * Returns the run id the message was attached to, or null on lookup failure.
+ */
+function sendGrokTurn(taskId: string, line: string): string | null {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  if (task.runId && active.has(task.runId)) {
+    const q = grokTurnQueue.get(taskId) ?? [];
+    q.push(line);
+    grokTurnQueue.set(taskId, q);
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; the queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    runs.appendEvent(runId, "user", data);
+    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    return runId;
+  }
+  return spawnGrokTurnNow(task, taskId, line);
+}
+
+/**
+ * Spawn a fresh grok turn that resumes the task's prior conversation via its
+ * session id. New run row, new tmux session (the previous turn's exited),
+ * same session id carried forward. Mirrors `spawnCodexTurnNow`.
+ */
+function spawnGrokTurnNow(task: Task, taskId: string, line: string): string {
+  const grokSession = resolveGrokSession(taskId, task);
+  const cwd = task.worktreePath ?? task.workdir;
+  const harness = resolveHarness(task.agent);
+
+  const newRunId = randomUUID();
+  const now = Date.now();
+  runs.insert({
+    id: newRunId,
+    taskId,
+    agent: task.agent,
+    status: "running",
+    startedAt: now,
+    endedAt: null,
+    exitCode: null,
+    tmuxSession: sessionNameFor(taskId),
+    claudeSessionId: null,
+    codexSessionId: null,
+    // Pre-seeded up front (D4) — known before spawn, not sniffed from the
+    // log. `onSessionId` below still re-stamps the same value once the `end`
+    // event confirms it (harmless confirmation/repair, not the primary
+    // persistence path).
+    grokSessionId: grokSession.id,
+  });
+  const prevColumn: ColumnId = task.column;
+  tasks.update(taskId, { column: "running", runId: newRunId });
+  if (prevColumn !== "running") {
+    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+  }
+
+  const kind: AgentKind = harness?.kind ?? "grok";
+  const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+  onChunk("user", normalizeUserText(line));
+  onChunk("status", grokStatusMessage(grokSession));
+
+  if (!harness) {
+    onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+    runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    tasks.update(taskId, { column: "ready", runId: null });
+    return newRunId;
+  }
+
+  const agent = spawnAgent({
+    taskId,
+    runId: newRunId,
+    harness,
+    prompt: line,
+    cwd,
+    onChunk,
+    onSessionId: (sessionId) => {
+      runs.update(newRunId, { grokSessionId: sessionId });
+    },
+    opts: {
+      mode: task.mode,
+      model: task.model,
+      effort: task.effort,
+      grokSession: { id: grokSession.id, resume: grokSession.resume },
+      seenLineUuids: runs.seenLineUuidsForTask(taskId),
+    },
+  });
+  registerActiveRun(newRunId, taskId, task, agent);
+  attachDoneHandler(newRunId, taskId, agent);
+  return newRunId;
+}
+
+/**
+ * After a grok turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh resume turn. No-op for non-grok tasks (their queue is always empty)
+ * and while a run is still active for the task. Mirrors `drainCodexQueue`.
+ */
+function drainGrokQueue(taskId: string): void {
+  const q = grokTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  // Task vanished, or its agent was switched away from grok while a turn was
+  // in flight — abandon the stale queue (same rationale as
+  // `drainCodexQueue`).
+  if (!task || resolveHarness(task.agent)?.kind !== "grok") {
+    grokTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) grokTurnQueue.delete(taskId);
+  if (next !== undefined) spawnGrokTurnNow(task, taskId, next);
+}
+
+/** Most-recent grok session id across the task's runs (for `resume`). */
+function findLastGrokSessionId(taskId: string): string | null {
+  const row = db.query<{ grok_session_id: string }, [string]>(
+    `SELECT grok_session_id FROM runs
+     WHERE task_id = ? AND grok_session_id IS NOT NULL
+     ORDER BY started_at DESC
+     LIMIT 1`,
+  ).get(taskId);
+  return row?.grok_session_id ?? null;
+}
+
+/**
+ * Records the task `mode` in effect at the moment a grok session was CREATED
+ * (D5 in `docs/plans/grok-build-oss-alignment.md`). `resolveGrokSession`
+ * compares a task's current mode against this before resuming: grok's
+ * `--resume` never re-sends `--sandbox` (the CLI silently inherits whatever
+ * sandbox the session was created with), so a mode change since session
+ * creation would otherwise resume under a STALE sandbox instead of the mode
+ * the user just picked. A mismatch forces a fresh session (new uuid, sandbox
+ * flag matching the new mode) instead of resuming.
+ *
+ * In-memory only — cleared at every grok teardown site (`dropGrokSession`
+ * call sites: `reconcileTaskSession` on an agent switch, `archiveTask`,
+ * `deleteTask`) so a later task run doesn't compare against a stale mode from
+ * an unrelated conversation. Empty after an agetor restart; `resolveGrokSession`
+ * treats a missing entry as "assume unchanged" and resumes normally — safe,
+ * because omitting `--sandbox` on resume inherits the CLI's own stored value
+ * regardless of what we think the mode was.
+ */
+const grokSessionModeAtStart = new Map<string, string | null>();
+
+/** Outcome of `resolveGrokSession`: the session id to use for this turn, and
+ *  why — drives both the `spawnAgent` `grokSession` option and the
+ *  user-facing status line. */
+interface GrokSessionDecision {
+  id: string;
+  resume: boolean;
+  reason: "new" | "resumed" | "mode-changed";
+}
+
+/**
+ * Decide the grok session id for an upcoming turn (D4 pre-seeding + D5
+ * mode-change handling). Called from both `startTask` (a task's first turn,
+ * or its first turn after a stop/restart — which may still have a prior
+ * session on an earlier run row) and `spawnGrokTurnNow` (mid-conversation
+ * follow-ups), so the two paths can't diverge on session/sandbox semantics.
+ *
+ * No prior session → mint a fresh uuid, record the task's current mode as
+ * the session's creation mode. Prior session + mode unchanged (or agetor
+ * restarted since creation, so we have no recorded mode to compare) → resume
+ * it. Prior session + mode changed → mint a fresh uuid instead of resuming
+ * (see `grokSessionModeAtStart` above) and re-record the new mode.
+ */
+function resolveGrokSession(taskId: string, task: Task): GrokSessionDecision {
+  const priorId = findLastGrokSessionId(taskId);
+  const currentMode = task.mode ?? "auto";
+  if (priorId) {
+    const recordedMode = grokSessionModeAtStart.get(taskId);
+    if (recordedMode !== undefined && recordedMode !== currentMode) {
+      const freshId = randomUUID();
+      grokSessionModeAtStart.set(taskId, currentMode);
+      return { id: freshId, resume: false, reason: "mode-changed" };
+    }
+    // Pre-seeded ids are persisted at run INSERT (D4), i.e. before grok has
+    // created anything — a turn that died before session creation (auth
+    // failure, immediate exit 1) leaves an id whose `--resume` would
+    // hard-error "session not found" on every retry. Only resume when the
+    // session directory actually exists on disk; otherwise mint fresh. The
+    // fake driver never touches disk, so it trusts the prior id as-is.
+    const fake = process.env.AGETOR_GROK_DRIVER === "fake";
+    const harness = resolveHarness(task.agent);
+    const established = fake || grokSessionExistsOnDisk(
+      harness ? harnessEnv(harness) : {},
+      task.worktreePath ?? task.workdir,
+      priorId,
+    );
+    if (established) {
+      return { id: priorId, resume: true, reason: "resumed" };
+    }
+    const freshId = randomUUID();
+    grokSessionModeAtStart.set(taskId, currentMode);
+    return { id: freshId, resume: false, reason: "new" };
+  }
+  const freshId = randomUUID();
+  grokSessionModeAtStart.set(taskId, currentMode);
+  return { id: freshId, resume: false, reason: "new" };
+}
+
+/** User-facing status line for a `resolveGrokSession` outcome. */
+function grokStatusMessage(decision: GrokSessionDecision): string {
+  switch (decision.reason) {
+    case "resumed":
+      return `resuming grok session ${decision.id.slice(0, 8)}…`;
+    case "mode-changed":
+      return `grok mode changed since the last turn — starting a new session (${decision.id.slice(0, 8)}…)`;
+    case "new":
+      return "no prior grok session — starting fresh";
+  }
 }
 
 /**
@@ -1500,6 +1855,7 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: inheritedSessionId,
     codexSessionId: null,
+    grokSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -1567,6 +1923,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: inheritedSessionId,
     codexSessionId: null,
+    grokSessionId: null,
     origin: "continuation",
   });
   const prevColumn: ColumnId = task.column;
@@ -1624,6 +1981,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: priorSessionId,
     codexSessionId: null,
+    grokSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -1873,9 +2231,10 @@ export async function archiveTask(taskId: string): Promise<{ task: Task } | { er
   // Resolved up front (before enqueueing) — same as before, just no longer
   // re-read inside the deferred job.
   const archiveKind = resolveHarness(task.agent)?.kind;
-  // codexTurnQueue is cheap in-memory bookkeeping (no I/O), so it's dropped
-  // inline rather than folded into the deferred job.
+  // codexTurnQueue/grokTurnQueue are cheap in-memory bookkeeping (no I/O), so
+  // they're dropped inline rather than folded into the deferred job.
   codexTurnQueue.delete(taskId);
+  grokTurnQueue.delete(taskId);
   // Deferred: the actual teardown (tmux kill, terminal shells, worktree
   // detach) is pushed onto this task's source-workdir teardown queue rather
   // than awaited here, so `archiveTask` can flip the DB column and return in
@@ -1892,6 +2251,7 @@ export async function archiveTask(taskId: string): Promise<{ task: Task } | { er
     // would hide a regression in claude-tmux from the next reviewer.
     if (archiveKind === "claude-code") dropSession(taskId);
     else if (archiveKind === "codex") dropCodexSession(taskId);
+    else if (archiveKind === "grok") { dropGrokSession(taskId); grokSessionModeAtStart.delete(taskId); }
     // Tear down terminal tabs before detaching the worktree — a live shell
     // cwd'd inside the worktree would block `git worktree remove`, exactly
     // like deleteTask's ordering.
@@ -1951,6 +2311,7 @@ export async function deleteTask(taskId: string): Promise<void> {
   // clears any in-memory tailer. No-op when no session exists.
   const deleteKind = resolveHarness(task.agent)?.kind;
   codexTurnQueue.delete(taskId);
+  grokTurnQueue.delete(taskId);
   // Routed through the same per-workdir teardown queue archiveTask uses —
   // DELETE's semantics are unchanged (still awaited before `tasks.delete`
   // below), but this serializes it behind any archive teardown already in
@@ -1960,6 +2321,7 @@ export async function deleteTask(taskId: string): Promise<void> {
   await enqueueTeardown(taskId, task.workdir, async () => {
     if (deleteKind === "claude-code") dropSession(taskId);
     else if (deleteKind === "codex") dropCodexSession(taskId);
+    else if (deleteKind === "grok") { dropGrokSession(taskId); grokSessionModeAtStart.delete(taskId); }
     // Kill any open terminal tabs before removing the worktree — a live shell
     // sitting in the worktree dir would block `git worktree remove`. Awaited
     // so the shells are actually gone before we tear the directory down.

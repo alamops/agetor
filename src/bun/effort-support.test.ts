@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { DEFAULT_MODEL, supportedEfforts } from "../shared/types.ts";
+import { DEFAULT_EFFORT, DEFAULT_MODEL, supportedEfforts } from "../shared/types.ts";
 
 test("claude opus-4.8 supports xhigh + max", () => {
   const ids = supportedEfforts("claude-code", "opus-4.8").map((o) => o.id);
@@ -86,4 +86,36 @@ test("ordered highest → lowest (no placeholder at the top)", () => {
   const expectedOrder = ["max", "xhigh", "high", "medium", "low"];
   const filteredExpected = expectedOrder.filter((id) => ids.includes(id));
   expect(ids).toEqual(filteredExpected);
+});
+
+test("grok DEFAULT_MODEL is grok-build", () => {
+  expect(DEFAULT_MODEL.grok).toBe("grok-build");
+});
+
+test("grok DEFAULT_EFFORT is medium", () => {
+  expect(DEFAULT_EFFORT.grok).toBe("medium");
+});
+
+test("grok grok-build supports max/xhigh/high/medium/low (D6 confirmed --effort flag, no 'none')", () => {
+  // grok-build's declared support is the full canonical range minus "none"
+  // (grok has no reasoning-off id) — asserted as an exact match against
+  // MODEL_EFFORT_SUPPORT.grok["grok-build"], not just toContain, so a future
+  // narrowing/widening of the list is caught here.
+  const ids = supportedEfforts("grok", "grok-build").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
+test("grok null model falls back to DEFAULT_MODEL support set (grok-build's full range)", () => {
+  const ids = supportedEfforts("grok", null).map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
+});
+
+test("grok unknown model id falls back to the agent's DEFAULT_MODEL (grok-build) support set", () => {
+  // MODEL_EFFORT_SUPPORT.grok only declares "grok-build" now (old curated
+  // ids grok-4.5 / grok-4-fast-reasoning were dropped, D7) — an id not in
+  // that map falls back to DEFAULT_MODEL[agent]'s set per supportedEfforts'
+  // `?? MODEL_EFFORT_SUPPORT[agent][DEFAULT_MODEL[agent]]` fallback, so an
+  // unrecognized model still gets the full effort picker rather than none.
+  const ids = supportedEfforts("grok", "grok-future-9000").map((o) => o.id);
+  expect(ids).toEqual(["max", "xhigh", "high", "medium", "low"]);
 });

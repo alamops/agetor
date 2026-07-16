@@ -208,7 +208,7 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
       exitCode: 0,
       tmuxSession: state.sessionName,
       claudeSessionId: null,
-      codexSessionId: null,
+      codexSessionId: null, grokSessionId: null,
     });
 
     const result = await sendInput(priorRunId, "still there?");
@@ -312,7 +312,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
       exitCode: 0,
       tmuxSession: state.sessionName,
       claudeSessionId: priorClaudeSessionId,
-      codexSessionId: null,
+      codexSessionId: null, grokSessionId: null,
     });
 
     const result = await sendInput(priorRunId, "please continue");
@@ -419,7 +419,7 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
       exitCode: 0,
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
-      codexSessionId: null,
+      codexSessionId: null, grokSessionId: null,
     });
 
     const result = await sendInput(priorRunId, largePrompt);
@@ -548,7 +548,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
       exitCode: 0,
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
-      codexSessionId: null,
+      codexSessionId: null, grokSessionId: null,
     });
 
     const result = await sendInput(priorRunId, largePrompt);
@@ -705,7 +705,7 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
       exitCode: 0,
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
-      codexSessionId: null,
+      codexSessionId: null, grokSessionId: null,
     });
 
     const result = await sendInput(priorRunId, largePrompt);
@@ -800,7 +800,7 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
       exitCode: 0,
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
-      codexSessionId: null,
+      codexSessionId: null, grokSessionId: null,
     });
 
     const result = await sendInput(priorRunId, smallPrompt);
