@@ -385,6 +385,17 @@ function handleSpawn(state: ManagerState, u: Record<string, unknown>, ctx: GrokS
   if (!subagentId) return; // D6: missing subagent_id — nothing stable to key on
   if (state.children.has(subagentId)) return; // idempotent: duplicate/replayed spawn line
 
+  // Reattach replays the parent updates.jsonl from offset 0, so a spawn line
+  // for a subagent that ALREADY finished before the restart re-dispatches
+  // here. insertIfAbsent/settle are DB-idempotent, but the emit is not — a
+  // "started" lifecycle event would flip a completed subagent back to running
+  // on the live stream (the later "finished" replay then no-ops, since the row
+  // is already terminal). Skip resurrecting an existing terminal row entirely:
+  // don't emit "started", don't tail. Only a row still `running` at crash time
+  // (or a genuinely new one) falls through to re-emit and re-tail.
+  const existing = subagentsDb.get(subagentId);
+  if (existing && existing.status !== "running") return;
+
   const childSessionId = str(u.child_session_id) ?? null;
   const startedAt = Date.now();
   const resolvedPath = childSessionId ? resolveChildPath(ctx.grokHome, ctx.cwd, childSessionId) : null;
@@ -397,6 +408,11 @@ function handleSpawn(state: ManagerState, u: Record<string, unknown>, ctx: GrokS
     agentType: str(u.subagent_type) ?? null,
     description: str(u.description) ?? null,
     spawnDepth: 1, // A4: grok's `resumed_from` is lineage, not nesting depth — v1 ships flat
+    // Advisory only for grok (unlike claude, whose sourcePath is the tailer's
+    // input). The child updates.jsonl almost never exists at spawn time, so
+    // this is usually the placeholder; the tailer re-resolves the real path in
+    // memory each tick (`flushChildTailer`) and never depends on this column,
+    // so it's left un-updated rather than adding a DB writer for a cosmetic value.
     sourcePath: resolvedPath ?? `<unresolved:${childSessionId ?? "no-child-session-id"}>`,
     status: "running",
     startedAt,

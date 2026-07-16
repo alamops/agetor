@@ -730,8 +730,17 @@ export function reconcileOrphans(): number {
     // watchers and flip DB rows.
     if (sessionExistsByName(sessionNameFor(heldId))) {
       if (kind === "grok") {
-        // Same as the held-in-running case: session alive → leave it to the
-        // normal grok reattach path, nothing to re-arm here.
+        // This is the blind-spot pass (task NOT in the `running` column), so
+        // the task's terminal run already resolved. grok's session lives only
+        // during a turn, so a live session here with a resolved run is a
+        // contradiction that shouldn't occur — but if it ever lingered, the
+        // `running` subagent rows are stale (nothing will settle them, since
+        // the turn that spawned them is over and the run-`running` reattach
+        // pass skips a resolved run). Orphan them rather than `continue` into
+        // a reattach that never fires. The settle hook safely bails (column
+        // isn't `running`), so this only clears rows.
+        orphanRunningGrokSubagents(heldId);
+        released++;
         continue;
       }
       const run = task.runId ? runs.get(task.runId) : null;
