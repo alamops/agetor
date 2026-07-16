@@ -66,6 +66,7 @@ import {
 } from "./codex-tmux.ts";
 import {
   dropGrokSession,
+  grokSessionExistsOnDisk,
   reattachGrokSession,
 } from "./grok-tmux.ts";
 import {
@@ -1671,7 +1672,25 @@ function resolveGrokSession(taskId: string, task: Task): GrokSessionDecision {
       grokSessionModeAtStart.set(taskId, currentMode);
       return { id: freshId, resume: false, reason: "mode-changed" };
     }
-    return { id: priorId, resume: true, reason: "resumed" };
+    // Pre-seeded ids are persisted at run INSERT (D4), i.e. before grok has
+    // created anything — a turn that died before session creation (auth
+    // failure, immediate exit 1) leaves an id whose `--resume` would
+    // hard-error "session not found" on every retry. Only resume when the
+    // session directory actually exists on disk; otherwise mint fresh. The
+    // fake driver never touches disk, so it trusts the prior id as-is.
+    const fake = process.env.AGETOR_GROK_DRIVER === "fake";
+    const harness = resolveHarness(task.agent);
+    const established = fake || grokSessionExistsOnDisk(
+      harness ? harnessEnv(harness) : {},
+      task.worktreePath ?? task.workdir,
+      priorId,
+    );
+    if (established) {
+      return { id: priorId, resume: true, reason: "resumed" };
+    }
+    const freshId = randomUUID();
+    grokSessionModeAtStart.set(taskId, currentMode);
+    return { id: freshId, resume: false, reason: "new" };
   }
   const freshId = randomUUID();
   grokSessionModeAtStart.set(taskId, currentMode);

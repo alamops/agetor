@@ -232,21 +232,32 @@ function formatGrokSpend(evt: GrokEvent): string | undefined {
 /**
  * Map a single parsed grok `streaming-json` event to zero or one chunk.
  * `lineIndex` is the NDJSON line's 0-based position within the run's log.
- * `text`/`thought` events carry no id, so `line:${lineIndex}` is already a
- * stable, deterministic key across a reattach replay (the log is always
+ * `text`/`thought` events carry no id, so the file position is the key —
+ * stable and deterministic across a reattach replay (the log is always
  * re-read from offset 0 and this counter restarts at 0 with it — it counts
- * file position, never wall-clock/random). The old id-folded `textKey`
- * scheme is dead for every real event type but is kept for the defensive
- * fallback branch, where an unrecognized future event might still carry an
- * `id` worth keying on.
+ * file position, never wall-clock/random).
+ *
+ * `keyScope` (the run id in production) namespaces every key this mapper
+ * produces. It is load-bearing: the dedup set is TASK-scoped (shared with the
+ * per-session updates.jsonl tailer, which needs cross-run stability), while
+ * the stdout log is per-RUN with lineIndex restarting at 0 — without the
+ * scope, turn 2's `line:0` would collide with turn 1's persisted `line:0`
+ * and the leading chunks of every follow-up turn would be silently dropped.
+ *
+ * The old id-folded `textKey` scheme is dead for every real event type but
+ * is kept for the defensive fallback branch, where an unrecognized future
+ * event might still carry an `id` worth keying on (scoped too — same-id
+ * events in different runs must not cross-dedup).
  */
 export function mapGrokEvent(
   evt: GrokEvent,
   onChunk: ChunkHandler,
   lineIndex: number,
+  keyScope = "",
 ): GrokMapResult {
   const type = evt.type ?? evt.event ?? evt.method ?? "";
-  const lineKey = `line:${lineIndex}`;
+  const prefix = keyScope ? `${keyScope}:` : "";
+  const lineKey = `${prefix}line:${lineIndex}`;
 
   switch (type) {
     case "text": {
@@ -327,7 +338,7 @@ export function mapGrokEvent(
   // string renders as a generic tool_use so nothing goes dark; anything with
   // no recognizable text is silently dropped (pure protocol noise, e.g. an
   // undocumented ping/keepalive type).
-  const key = typeof evt.id === "string" ? `${type}:${evt.id}` : lineKey;
+  const key = typeof evt.id === "string" ? `${prefix}${type}:${evt.id}` : lineKey;
   const fallback = extractText(evt.data) ?? extractText(evt.text) ?? extractText(evt.content)
     ?? extractText(evt.message);
   if (fallback) {
@@ -380,6 +391,31 @@ function grokUpdatesCandidatePath(grokHome: string, cwd: string, sessionId: stri
   const encoded = encodeGrokCwd(cwd);
   if (encoded === null) return null;
   return path.join(grokHome, "sessions", encoded, sessionId, "updates.jsonl");
+}
+
+/**
+ * True when the grok session directory exists on disk under any encoded-cwd
+ * dirname. Used by the orchestrator's resume gate: a pre-seeded (`-s`) id is
+ * persisted on the run row BEFORE grok runs, so a turn that dies before grok
+ * ever creates the session (auth failure, immediate exit) leaves an id whose
+ * `--resume` would hard-error ("session not found") on every retry. Checking
+ * disk distinguishes "session established, resume it" from "never created,
+ * mint a fresh one". env is the harness env (GROK_HOME resolution).
+ */
+export function grokSessionExistsOnDisk(env: Record<string, string>, cwd: string, sessionId: string): boolean {
+  const grokHome = resolveGrokHome(env);
+  const candidate = grokUpdatesCandidatePath(grokHome, cwd, sessionId);
+  // The session dir may exist before updates.jsonl has its first line —
+  // check the directory, not the file.
+  if (candidate && existsSync(path.dirname(candidate))) return true;
+  const sessionsDir = path.join(grokHome, "sessions");
+  let entries: string[];
+  try {
+    entries = readdirSync(sessionsDir);
+  } catch {
+    return false;
+  }
+  return entries.some((entry) => existsSync(path.join(sessionsDir, entry, sessionId)));
 }
 
 /** Fallback: scan `<grokHome>/sessions/<any-encoded-cwd>/<sessionId>/
@@ -602,7 +638,9 @@ function flushGrokLog(state: GrokSessionState): void {
 
 function dispatchGrokEvent(state: GrokSessionState, evt: GrokEvent): void {
   const onChunk = makeDedupChunkHandler(state.onChunk, state.seenLineUuids);
-  const result = mapGrokEvent(evt, onChunk, state.lineNo);
+  // keyScope = runId: the stdout log is per-run (lineNo restarts at 0 each
+  // turn) but the dedup set is task-scoped — see mapGrokEvent's docstring.
+  const result = mapGrokEvent(evt, onChunk, state.lineNo, state.runId);
   state.lineNo++;
   if (result.sessionId && !state.sessionIdSent) {
     state.sessionIdSent = true;
@@ -625,8 +663,16 @@ function dispatchGrokEvent(state: GrokSessionState, evt: GrokEvent): void {
 function flushGrokUpdates(state: GrokSessionState): void {
   if (!state.updatesPath) {
     if (!state.sessionId) return; // nothing to resolve a path from
-    const candidate = grokUpdatesCandidatePath(state.grokHome, state.cwd, state.sessionId)
-      ?? scanForGrokUpdatesPath(state.grokHome, state.sessionId);
+    // Try the computed short-path encoding first, but fall THROUGH to the
+    // directory scan whenever the computed path doesn't exist yet — the scan
+    // is the safety net for both the >255-byte blake3 case (candidate null)
+    // AND any drift between our encodeGrokCwd port and grok's actual
+    // encoder (candidate non-null but wrong). A `??` alone would make the
+    // scan unreachable in that second case.
+    let candidate = grokUpdatesCandidatePath(state.grokHome, state.cwd, state.sessionId);
+    if (!candidate || !existsSync(candidate)) {
+      candidate = scanForGrokUpdatesPath(state.grokHome, state.sessionId);
+    }
     if (!candidate || !existsSync(candidate)) return; // retry next poll tick
     state.updatesPath = candidate;
   }

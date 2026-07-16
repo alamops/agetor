@@ -1,5 +1,5 @@
 import path from "node:path";
-import { MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
+import { DEFAULT_EFFORT, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   spawnClaudeViaTmux,
@@ -573,17 +573,16 @@ export function buildCommand(
     }
 
     // Effort (D6): grok-build's MODEL_EFFORT_SUPPORT entry is non-empty
-    // (`low`..`max`, source-confirmed `Effort::VALID_VALUES`), so — like
-    // claude-code/codex — an explicit id is required unless the resolved
-    // model declines effort entirely. Unknown ids pass through verbatim
-    // (same convention as `-m` above); `buildCommand` does not itself
-    // validate against the canonical set.
-    if (opts.effort) {
-      if (!modelDeclinesEffort("grok", opts.model)) {
-        args.push("--effort", opts.effort);
-      }
-    } else if (!modelDeclinesEffort("grok", opts.model)) {
-      throw new Error(`effort is required for grok model ${opts.model}`);
+    // (`low`..`max`, source-confirmed `Effort::VALID_VALUES`). Unknown ids
+    // pass through verbatim (same convention as `-m` above); `buildCommand`
+    // does not itself validate against the canonical set. A null effort
+    // falls back to DEFAULT_EFFORT rather than throwing: grok task rows
+    // created while MODEL_EFFORT_SUPPORT.grok was empty were persisted with
+    // effort = null, and there's no migration backfilling them — throwing
+    // would brick those tasks' next start.
+    if (!modelDeclinesEffort("grok", opts.model)) {
+      const effort = opts.effort ?? DEFAULT_EFFORT.grok;
+      if (effort) args.push("--effort", effort);
     }
 
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
