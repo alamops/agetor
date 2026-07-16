@@ -704,6 +704,52 @@ test("AGETOR_GROK_ARGS extra args land after --permission-mode and before the se
   expect(cmd.slice(extraIdx, extraIdx + 2)).toEqual(["--verbose", "--foo"]);
 });
 
+// --- grok privacy defaults (docs/plans/grok-privacy-defaults.md, D1) --------
+// harnessEnv's grok branch injects three env vars ahead of the harness's own
+// `env` map so xAI's always-on trace-upload pipeline and session writeback
+// sync are off by default, while an explicit user override in harness `env`
+// (Settings) still wins per D1's "default, not hard block" decision.
+
+test("grok builtin harness env carries exactly the three privacy defaults", () => {
+  const result = buildCommand(builtin("grok"), "p", { ...grokDefaults, grokSession: grokNewSession });
+  expect(result.env?.GROK_TELEMETRY_ENABLED).toBe("0");
+  expect(result.env?.GROK_TELEMETRY_TRACE_UPLOAD).toBe("0");
+  expect(result.env?.GROK_STORAGE_MODE).toBe("local");
+});
+
+test("grok harness env override wins over the privacy defaults; untouched var keeps its default", () => {
+  const result = buildCommand(
+    alias("grok", { env: { GROK_TELEMETRY_ENABLED: "1", GROK_STORAGE_MODE: "writeback" } }),
+    "p",
+    { ...grokDefaults, grokSession: grokNewSession },
+  );
+  expect(result.env?.GROK_TELEMETRY_ENABLED).toBe("1");
+  expect(result.env?.GROK_STORAGE_MODE).toBe("writeback");
+  // GROK_TELEMETRY_TRACE_UPLOAD wasn't overridden — the default still applies.
+  expect(result.env?.GROK_TELEMETRY_TRACE_UPLOAD).toBe("0");
+});
+
+test("aliased grok with a home override still carries GROK_HOME plus all three privacy defaults", () => {
+  const result = buildCommand(
+    alias("grok", { home: "/tmp/agetor-test/grok-2" }),
+    "p",
+    { ...grokDefaults, grokSession: grokNewSession },
+  );
+  expect(result.env?.GROK_HOME).toBe("/tmp/agetor-test/grok-2");
+  expect(result.env?.GROK_TELEMETRY_ENABLED).toBe("0");
+  expect(result.env?.GROK_TELEMETRY_TRACE_UPLOAD).toBe("0");
+  expect(result.env?.GROK_STORAGE_MODE).toBe("local");
+});
+
+test("claude-code and codex env never carry the grok privacy-default keys", () => {
+  const claudeResult = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, effort: "low" });
+  const codexResult = buildCommand(builtin("codex"), "p", { ...codexDefaults });
+  for (const key of ["GROK_TELEMETRY_ENABLED", "GROK_TELEMETRY_TRACE_UPLOAD", "GROK_STORAGE_MODE"]) {
+    expect(claudeResult.env?.[key]).toBeUndefined();
+    expect(codexResult.env?.[key]).toBeUndefined();
+  }
+});
+
 // Invariant test for AGENT_OPTIONS — guards against re-introducing the
 // "default" placeholder. No id in any list should be the literal string
 // "default" anymore (the per-kind DEFAULT_MODEL / DEFAULT_EFFORT constants
