@@ -1317,6 +1317,9 @@ type AskDriveStep = "done" | "send-enter" | "wait" | "fail";
  *    `"review"` sighting here means the just-sent confirm was swallowed by
  *    Ink's repaint and must be resent, bounded by `ASK_VERIFY_MAX_RESENDS`
  *    so a genuinely stuck review screen fails instead of looping forever.
+ *    (A singleFlat plan never renders a review screen, so `confirmSent`
+ *    stays false there; if one ever appeared anyway, the step would send —
+ *    not resend — the confirm, which is the robust choice.)
  *
  * `kind === null` (the modal has left the pane) is `"done"` regardless of
  * phase or resend count — the only success case. `"question"` is always

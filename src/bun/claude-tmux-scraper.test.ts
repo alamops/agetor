@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -10,6 +10,11 @@ process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-scraper-")
 import { __forTest } from "./claude-tmux.ts";
 
 const { matchNumberedModal, matchYesNoModal, matchStartupConsentDialog, clearedStabilityGate } = __forTest;
+
+/** Real tmux pane captures of claude-code 2.1.161's AskUserQuestion modal —
+ *  same fixture directory claude-questions.test.ts reads from. */
+const fx = (name: string): string =>
+  readFileSync(path.join(import.meta.dir, "fixtures", "askuserquestion", `${name}.txt`), "utf8");
 
 test("matchNumberedModal — claude plan-mode dialog (cursor on choice 1)", () => {
   const pane = `
@@ -174,6 +179,32 @@ Esc to cancel · Tab to amend
 
 `);
   expect(m!.highConfidence).toBe(true);
+});
+
+test("matchNumberedModal — AskUserQuestion review/submit screen ('Ready to submit your answers?') matches as a numbered modal", () => {
+  // scrapeOnce now narrows the ask-modal suppression to detectAskModal ===
+  // "question" only (claude-tmux.ts), so a lingering "review" screen falls
+  // through to this matcher instead of being structurally invisible. Slice
+  // the fixture down to the review block itself — tab bar through the
+  // "2. Cancel" line — the way a real 40-line pane tail would present it.
+  const lines = fx("review_submit").split("\n");
+  const tabBarIdx = lines.findIndex((l) => l.includes("✔ Submit"));
+  const cancelIdx = lines.findIndex((l) => /2\.\s+Cancel/.test(l));
+  expect(tabBarIdx).toBeGreaterThan(-1);
+  expect(cancelIdx).toBeGreaterThan(tabBarIdx);
+  const tail = lines.slice(tabBarIdx, cancelIdx + 1).join("\n");
+
+  const m = matchNumberedModal(tail);
+  expect(m).not.toBeNull();
+  expect(m!.choices).toEqual([
+    { key: "1", label: "Submit answers" },
+    { key: "2", label: "Cancel" },
+  ]);
+  expect(m!.cursorIndex).toBe(0);
+  // No "Esc to cancel" footer on the review screen → not high-confidence,
+  // so the two-tick stability gate applies before scrapeOnce registers it
+  // (guards against a mid-drive transient sighting registering a ghost card).
+  expect(m!.highConfidence).toBeFalsy();
 });
 
 test("clearedStabilityGate — high-confidence registers on first sighting; others need two ticks", () => {
