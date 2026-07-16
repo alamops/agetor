@@ -31,6 +31,7 @@ import {
   type ChunkHandler,
   type SpawnedAgent,
 } from "./claude-tmux.ts";
+import { attachGrokSubagentManager, type GrokSubagentManagerHandle } from "./grok-subagents.ts";
 
 /**
  * Driver that hosts a single `grok --output-format streaming-json` turn
@@ -380,7 +381,7 @@ export function encodeGrokCwd(cwd: string): string | null {
   return encoded;
 }
 
-function resolveGrokHome(env: Record<string, string>): string {
+export function resolveGrokHome(env: Record<string, string>): string {
   const home = env.GROK_HOME;
   return home && home.length > 0 ? home : path.join(os.homedir(), ".grok");
 }
@@ -422,7 +423,7 @@ export function grokSessionExistsOnDisk(env: Record<string, string>, cwd: string
  *  updates.jsonl`, one readdir level deep. Covers the blake3 long-path case
  *  and any future encoding drift — cheap enough to retry every poll tick
  *  until found. */
-function scanForGrokUpdatesPath(grokHome: string, sessionId: string): string | null {
+export function scanForGrokUpdatesPath(grokHome: string, sessionId: string): string | null {
   const sessionsDir = path.join(grokHome, "sessions");
   let entries: string[];
   try {
@@ -455,30 +456,60 @@ function makeDedupChunkHandler(onChunk: ChunkHandler, seen: Set<string>): ChunkH
   };
 }
 
+/** Pull display text out of an ACP `ContentChunk`-shaped update field: either
+ *  a nested `{ content: { text: "…" } }` block or a flat `text` string.
+ *  Used only by `mapGrokUpdateEvent`'s `includeText` branch — the parent
+ *  stdout stream already owns message/thought content, so this only matters
+ *  for a subagent's own `updates.jsonl`, which has no stdout of its own. */
+function extractUpdateText(u: Record<string, unknown>): string | undefined {
+  const content = u.content;
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    const t = (content as Record<string, unknown>).text;
+    if (typeof t === "string" && t.length > 0) return t;
+  }
+  if (typeof u.text === "string" && u.text.length > 0) return u.text;
+  return undefined;
+}
+
 /**
- * Map one parsed `updates.jsonl` line. Line shape:
- * `{"timestamp":<unix-s>,"method":"session/update","params":{"sessionId":…,
- * "update":{"sessionUpdate":"<tag>",…}}}`. Legacy lines may omit `method`
- * entirely, in which case the parsed root itself is params-shaped (no
- * wrapper). `method:"_x.ai/session/update"` lines (subagent lifecycle/rewind
- * markers, A3 in the plan) are skipped entirely, as is any `sessionUpdate`
- * tag outside the three handled below — the stdout stream owns
- * message/thought content, so silence on those tags here is correct, not a
- * gap. `lineIndex` is this tailer's own 0-based counter (independent of the
- * stdout tailer's).
+ * Map one already-unwrapped `update` object (the `sessionUpdate`-tagged
+ * payload from a `session/update` — or, for a subagent's own transcript, an
+ * ordinary `session/update` line inside its `updates.jsonl`) to zero or more
+ * chunks. Pure and exported so grok-subagents.ts's child-transcript tailer can
+ * reuse the exact same tool_call/tool_call_update/plan mapping the parent
+ * stream uses, plus (via `includeText`) the message/thought mapping the
+ * parent stream deliberately skips (its stdout log owns that content; a
+ * subagent has no stdout, so its text must come from here instead).
+ *
+ * `keyScope`, when provided, namespaces every key this call produces —
+ * `am:<keyScope>:<lineIndex>` / `at:<keyScope>:<lineIndex>` for text chunks,
+ * `<keyScope>:tc:<id>` / `<keyScope>:tcr:<id>` / etc. for tool/plan chunks.
+ * Omitted (the parent stream's call), the tool/plan keys keep their original
+ * unscoped form (`tc:<id>`, …) — unchanged behavior for existing dedup state.
  */
-function dispatchGrokUpdateLine(parsed: unknown, lineIndex: number, dedupChunk: ChunkHandler): void {
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
-  const root = parsed as Record<string, unknown>;
-  const method = typeof root.method === "string" ? root.method : undefined;
-  if (method !== undefined && method !== "session/update") return; // e.g. "_x.ai/session/update"
-  const paramsSource = method === "session/update" ? root.params : root; // legacy: params-shaped root
-  if (!paramsSource || typeof paramsSource !== "object") return;
-  const update = (paramsSource as Record<string, unknown>).update;
-  if (!update || typeof update !== "object") return;
-  const u = update as Record<string, unknown>;
+export function mapGrokUpdateEvent(
+  u: Record<string, unknown>,
+  lineIndex: number,
+  dedupChunk: ChunkHandler,
+  opts?: { includeText?: boolean; keyScope?: string },
+): void {
   const tag = typeof u.sessionUpdate === "string" ? u.sessionUpdate : undefined;
   if (!tag) return;
+  const scope = opts?.keyScope;
+  const prefix = scope ? `${scope}:` : "";
+
+  if (opts?.includeText && (tag === "agent_message_chunk" || tag === "agent_thought_chunk")) {
+    const text = extractUpdateText(u);
+    if (text) {
+      const scoped = scope ?? "";
+      dedupChunk(
+        tag === "agent_message_chunk" ? "assistant" : "thinking",
+        text,
+        tag === "agent_message_chunk" ? `am:${scoped}:${lineIndex}` : `at:${scoped}:${lineIndex}`,
+      );
+    }
+    return;
+  }
 
   const toolCallId = typeof u.toolCallId === "string" ? u.toolCallId : undefined;
 
@@ -488,10 +519,10 @@ function dispatchGrokUpdateLine(parsed: unknown, lineIndex: number, dedupChunk: 
       dedupChunk(
         "tool_use",
         JSON.stringify({ name: u.title, kind: u.kind, input: u.rawInput }),
-        `tc:${toolCallId}`,
+        `${prefix}tc:${toolCallId}`,
       );
       if (u.rawOutput !== undefined) {
-        dedupChunk("tool_result", JSON.stringify({ content: u.rawOutput }), `tcr:${toolCallId}`);
+        dedupChunk("tool_result", JSON.stringify({ content: u.rawOutput }), `${prefix}tcr:${toolCallId}`);
       }
       return;
     }
@@ -503,7 +534,7 @@ function dispatchGrokUpdateLine(parsed: unknown, lineIndex: number, dedupChunk: 
       dedupChunk(
         "tool_result",
         JSON.stringify({ content: u.rawOutput ?? u.content, isError: status === "failed" }),
-        `tcu:${toolCallId}:${status}`,
+        `${prefix}tcu:${toolCallId}:${status}`,
       );
       return;
     }
@@ -512,17 +543,113 @@ function dispatchGrokUpdateLine(parsed: unknown, lineIndex: number, dedupChunk: 
       dedupChunk(
         "tool_use",
         JSON.stringify({ name: "plan", input: u.entries }),
-        `plan:${lineIndex}`,
+        `${prefix}plan:${lineIndex}`,
       );
       return;
     }
 
     default:
-      // user_message_chunk / agent_message_chunk / agent_thought_chunk /
-      // available_commands_update / current_mode_update / anything else the
-      // stdout stream already owns, or a future tag we don't recognize yet.
+      // user_message_chunk / available_commands_update / current_mode_update
+      // / agent_message_chunk / agent_thought_chunk (when includeText is
+      // false — the parent stream's case) / anything else the owning stream
+      // already covers, or a future tag we don't recognize yet.
       return;
   }
+}
+
+/**
+ * Context threaded onto a `subagent_spawned`/`subagent_finished` line so the
+ * injected hook can register the row and resolve its child transcript path
+ * without needing anything beyond what's already on `GrokSessionState`.
+ */
+export interface GrokSubagentLineCtx {
+  taskId: string;
+  runId: string;
+  cwd: string;
+  env: Record<string, string>;
+  grokHome: string;
+}
+
+/**
+ * Injected hook: grok-subagents.ts registers itself here (via
+ * `setGrokSubagentLineHook`, called the first time a `GrokSubagentManager`
+ * attaches — never at either module's top-level/eval time) so a subagent
+ * lifecycle line routes to the manager without this file needing to reach
+ * into grok-subagents.ts's internals on every parsed `updates.jsonl` line.
+ * Mirrors the `emitFn`/`settleFn` injected-sink pattern claude-subagents.ts
+ * uses (just running in the opposite direction: there, the orchestrator
+ * injects into claude-subagents.ts; here, grok-subagents.ts injects into this
+ * file). `null` (untracked) is the default and always-safe state — a
+ * subagent line with no hook registered is simply dropped, same as the
+ * `AGETOR_GROK_TRACK_SUBAGENTS=0` kill switch's effect. */
+let grokSubagentLineHook: ((update: Record<string, unknown>, ctx: GrokSubagentLineCtx) => void) | null = null;
+
+/** Returns the previously-registered hook — same save/restore contract as
+ *  claude-subagents.ts's `setSubagentEmitter`: a test that installs a spy
+ *  here must put the real one back, or every later test/module loses
+ *  subagent routing. */
+export function setGrokSubagentLineHook(
+  fn: ((update: Record<string, unknown>, ctx: GrokSubagentLineCtx) => void) | null,
+): ((update: Record<string, unknown>, ctx: GrokSubagentLineCtx) => void) | null {
+  const prev = grokSubagentLineHook;
+  grokSubagentLineHook = fn;
+  return prev;
+}
+
+/**
+ * Map one parsed `updates.jsonl` line. Line shape:
+ * `{"timestamp":<unix-s>,"method":"session/update","params":{"sessionId":…,
+ * "update":{"sessionUpdate":"<tag>",…}}}`. Legacy lines may omit `method`
+ * entirely, in which case the parsed root itself is params-shaped (no
+ * wrapper). `method:"_x.ai/session/update"` carries the SAME envelope shape
+ * but is otherwise skipped, EXCEPT for two tags: `subagent_spawned` and
+ * `subagent_finished` (A3 in the plan) route to the injected
+ * `grokSubagentLineHook` — everything else under `_x.ai/*` (rewind_marker,
+ * etc.) stays ignored, an explicit allowlist rather than un-skipping the
+ * whole method. A `sessionUpdate` tag outside the three handled by
+ * `mapGrokUpdateEvent` (for a `session/update` line) is silently dropped too —
+ * the stdout stream owns message/thought content for the PARENT session, so
+ * silence on those tags here is correct, not a gap (the two are unified by
+ * `mapGrokUpdateEvent`'s `includeText` flag, which this call site always
+ * passes `false` — a subagent's child tailer is the one that passes `true`).
+ * `lineIndex` is this tailer's own 0-based counter (independent of the
+ * stdout tailer's). `ctx` carries the metadata a subagent-lifecycle line
+ * needs; omitted, subagent tags are simply dropped (defensive — every real
+ * caller passes it).
+ */
+function dispatchGrokUpdateLine(
+  parsed: unknown,
+  lineIndex: number,
+  dedupChunk: ChunkHandler,
+  ctx?: GrokSubagentLineCtx,
+): void {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+  const root = parsed as Record<string, unknown>;
+  const method = typeof root.method === "string" ? root.method : undefined;
+  const isXai = method === "_x.ai/session/update";
+  if (method !== undefined && method !== "session/update" && !isXai) return;
+  const paramsSource = method === "session/update" || isXai ? root.params : root; // legacy: params-shaped root
+  if (!paramsSource || typeof paramsSource !== "object") return;
+  const update = (paramsSource as Record<string, unknown>).update;
+  if (!update || typeof update !== "object") return;
+  const u = update as Record<string, unknown>;
+  const tag = typeof u.sessionUpdate === "string" ? u.sessionUpdate : undefined;
+  if (!tag) return;
+
+  if (isXai) {
+    if ((tag === "subagent_spawned" || tag === "subagent_finished") && ctx) {
+      try {
+        grokSubagentLineHook?.(u, ctx);
+      } catch (e) {
+        // A bad/unexpected subagent line must never break the parent tailer.
+        console.error(`[grok-tmux] subagent line hook threw for tag ${tag}:`, e);
+      }
+    }
+    // rewind_marker and anything else under _x.ai/* stay explicitly ignored.
+    return;
+  }
+
+  mapGrokUpdateEvent(u, lineIndex, dedupChunk, { includeText: false });
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -556,6 +683,12 @@ interface GrokSessionState {
 
   /** D8: updates.jsonl tailer state. */
   cwd: string;
+  /** Harness env forwarded to grok (GROK_HOME/HOME + harness env). Threaded
+   *  onto subagent-line context (`GrokSubagentLineCtx.env`) — not currently
+   *  read by the subagent manager itself (path resolution only needs
+   *  `grokHome`/`cwd`), but kept for parity with `GrokLaunchOptions.env` and
+   *  in case a future child-tailer concern needs it (e.g. auth env). */
+  env: Record<string, string>;
   grokHome: string;
   /** Pre-seeded (D4) session id, used to resolve the updates.jsonl path.
    *  `null` on a reattach whose run row never captured `grok_session_id` —
@@ -571,6 +704,16 @@ interface GrokSessionState {
   updatesWatcher: FSWatcher | null;
   updatesPollTimer: ReturnType<typeof setInterval> | null;
   updatesLineNo: number;
+
+  /** Context passed to the subagent-lifecycle hook on every dispatched
+   *  `updates.jsonl` line — built once at state-construction time (cheaper
+   *  than rebuilding a fresh object per line). */
+  subagentCtx: GrokSubagentLineCtx;
+  /** Per-session subagent manager (grok-subagents.ts), attached once the
+   *  turn's tmux session is confirmed up. `null` when tracking is disabled
+   *  (`AGETOR_GROK_TRACK_SUBAGENTS=0`) or before attach has run (the launch-
+   *  failure early-return path in `spawnGrokViaTmux` never attaches one). */
+  subagentManager: GrokSubagentManagerHandle | null;
 }
 
 const grokSessions = new Map<string, GrokSessionState>(); // taskId -> state
@@ -590,6 +733,14 @@ function disposeGrokState(state: GrokSessionState): void {
   if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
   if (state.updatesWatcher) { try { state.updatesWatcher.close(); } catch { /* noop */ } state.updatesWatcher = null; }
   if (state.updatesPollTimer) { clearInterval(state.updatesPollTimer); state.updatesPollTimer = null; }
+  // Tear down the subagent manager LAST — it orphans any still-`running`
+  // rows for this task (the parent turn is ending, so nothing will ever
+  // report their completion again). Best-effort: a throwing manager must
+  // never prevent the rest of this session's teardown.
+  if (state.subagentManager) {
+    try { state.subagentManager.dispose(); } catch (e) { console.error(`[grok-tmux] subagent manager dispose threw for task ${state.taskId}:`, e); }
+    state.subagentManager = null;
+  }
 }
 
 /** Read any bytes appended since `state.offset`, split into complete lines,
@@ -709,7 +860,7 @@ function flushGrokUpdates(state: GrokSessionState): void {
       state.updatesLineNo++;
       continue; // grok's own file — skip silently, no stderr noise
     }
-    dispatchGrokUpdateLine(parsed, state.updatesLineNo, dedupChunk);
+    dispatchGrokUpdateLine(parsed, state.updatesLineNo, dedupChunk, state.subagentCtx);
     state.updatesLineNo++;
   }
 }
@@ -943,6 +1094,7 @@ export function spawnGrokViaTmux(opts: GrokLaunchOptions): SpawnedAgent {
   ];
   const res = spawnSync(tmux, args, { encoding: "utf8" });
 
+  const grokHome = resolveGrokHome(opts.env);
   const state: GrokSessionState = {
     taskId: opts.taskId,
     runId: opts.runId,
@@ -963,7 +1115,8 @@ export function spawnGrokViaTmux(opts: GrokLaunchOptions): SpawnedAgent {
     lastCode: null,
     resolveDone: () => { /* replaced in startGrokTailer */ },
     cwd: opts.cwd,
-    grokHome: resolveGrokHome(opts.env),
+    env: opts.env,
+    grokHome,
     sessionId: opts.sessionId,
     updatesPath: null,
     updatesOffset: 0,
@@ -972,6 +1125,8 @@ export function spawnGrokViaTmux(opts: GrokLaunchOptions): SpawnedAgent {
     updatesWatcher: null,
     updatesPollTimer: null,
     updatesLineNo: 0,
+    subagentCtx: { taskId: opts.taskId, runId: opts.runId, cwd: opts.cwd, env: opts.env, grokHome },
+    subagentManager: null,
   };
 
   if (res.status !== 0) {
@@ -987,6 +1142,11 @@ export function spawnGrokViaTmux(opts: GrokLaunchOptions): SpawnedAgent {
     const done = Promise.resolve(1);
     return { kill: () => { /* nothing to kill */ }, writeInput: () => false, done };
   }
+
+  // Attach the subagent manager only once the tmux session is confirmed up —
+  // no point tracking subagents for a turn that never launched. Internally a
+  // no-op when AGETOR_GROK_TRACK_SUBAGENTS=0.
+  state.subagentManager = attachGrokSubagentManager(state.subagentCtx);
 
   const done = startGrokTailer(state);
   return {
@@ -1049,6 +1209,8 @@ export interface GrokReattachOptions {
  */
 export function reattachGrokSession(opts: GrokReattachOptions): SpawnedAgent | null {
   if (!sessionExistsByName(opts.sessionName)) return null;
+  const env = opts.env ?? {};
+  const grokHome = resolveGrokHome(env);
   const state: GrokSessionState = {
     taskId: opts.taskId,
     runId: opts.runId,
@@ -1069,7 +1231,8 @@ export function reattachGrokSession(opts: GrokReattachOptions): SpawnedAgent | n
     lastCode: null,
     resolveDone: () => { /* replaced in startGrokTailer */ },
     cwd: opts.cwd,
-    grokHome: resolveGrokHome(opts.env ?? {}),
+    env,
+    grokHome,
     sessionId: opts.sessionId,
     updatesPath: null,
     updatesOffset: 0,
@@ -1078,7 +1241,15 @@ export function reattachGrokSession(opts: GrokReattachOptions): SpawnedAgent | n
     updatesWatcher: null,
     updatesPollTimer: null,
     updatesLineNo: 0,
+    subagentCtx: { taskId: opts.taskId, runId: opts.runId, cwd: opts.cwd, env, grokHome },
+    subagentManager: null,
   };
+  // Reattach case: the parent updates.jsonl re-tails from offset 0, so any
+  // subagent_spawned/finished lines already written before the restart will
+  // re-dispatch through the (now freshly-attached) manager below, rehydrating
+  // subagent rows via insertIfAbsent — mirrors how the parent stream's own
+  // seenLineUuids dedup makes a reattach behave like a fresh tail-from-zero.
+  state.subagentManager = attachGrokSubagentManager(state.subagentCtx);
   const done = startGrokTailer(state);
   return {
     kill: () => killGrokState(state),

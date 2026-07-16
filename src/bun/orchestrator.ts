@@ -77,6 +77,12 @@ import {
   orphanRunningSubagents,
   attachSubagentWatcher,
 } from "./claude-subagents.ts";
+import {
+  setGrokSubagentEmitter,
+  setGrokSubagentSettleHook,
+  setGrokParkedDiscoveryHandler,
+  orphanRunningGrokSubagents,
+} from "./grok-subagents.ts";
 import { prepareWorkdir, removeWorktree, detachWorktree, repoRoot, resolveRef, branchName, ensureUniqueBranch } from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -218,6 +224,14 @@ setSubagentSettleHook(maybeReleaseHeldTask);
 // claude-subagents.ts seams; see `pullBackParkedTask` below for the policy
 // (only from `review`, only when the terminal run actually succeeded).
 setParkedDiscoveryHandler(pullBackParkedTask);
+
+// Grok subagents ride the IDENTICAL hold/settle policy as claude's — every
+// sink below is kind-agnostic (keyed by taskId, never by AgentKind), so
+// grok-subagents.ts' manager is wired to the exact same generic functions
+// claude-subagents.ts is wired to above, not a grok-specific variant.
+setGrokSubagentEmitter(emit);
+setGrokSubagentSettleHook(maybeReleaseHeldTask);
+setGrokParkedDiscoveryHandler(pullBackParkedTask);
 
 // Continuation-run adoption: claude-tmux calls this when a genuinely-new
 // content line arrives on a task's session with no turn in flight — the case
@@ -646,9 +660,20 @@ export function reconcileOrphans(): number {
   for (const heldId of heldTaskIds) {
     const task = tasks.get(heldId);
     if (!task) continue;
-    // Only claude-code writes subagent rows; a codex task can never be held, so
-    // it never reaches here. Guard the session probe on kind for clarity.
-    if (resolveHarness(task.agent)?.kind !== "claude-code") continue;
+    // claude-code and grok both write subagent rows; a codex task can never
+    // be held, so it never reaches here. Guard the session probe on kind for
+    // clarity. Widened from claude-code-only (docs/plans/grok-subagent-rendering.md
+    // D5) — grok subagent rows ride the SAME `subagents` table and need the
+    // same on-boot re-arm/orphan treatment, or a stuck grok row would never
+    // clear. The re-arm ACTION still differs by kind below: claude arms its
+    // out-of-band JSONL watcher (`attachSubagentWatcher`); grok has no such
+    // watcher — its subagent rows rehydrate automatically when
+    // `reattachGrokSession` re-tails the parent's updates.jsonl (subagent
+    // lines re-dispatch → `insertIfAbsent`), which the stale-runs reattach
+    // pass above already handles, so grok only needs the dead-session-orphan
+    // path here, never the claude-only watcher-arm path.
+    const kind = resolveHarness(task.agent)?.kind;
+    if (kind !== "claude-code" && kind !== "grok") continue;
 
     if (task.column === "running") {
       // Classic held-task path, unchanged: only proceed when the terminal run
@@ -657,6 +682,12 @@ export function reconcileOrphans(): number {
       // progress that just happens to also have live subagent rows).
       if (!isHeldByBackgroundAgents(heldId)) continue;
       if (sessionExistsByName(sessionNameFor(heldId))) {
+        if (kind === "grok") {
+          // Session still alive: leave it to the normal grok reattach path
+          // (handled by the stale-runs pass above, keyed off `status =
+          // 'running'` runs) — do not skip, but do not claude-watch either.
+          continue;
+        }
         const run = task.runId ? runs.get(task.runId) : null;
         // No JSONL session id means no watch directory to derive, so nothing will
         // ever observe these agents finishing. Treat it exactly like a dead
@@ -673,6 +704,11 @@ export function reconcileOrphans(): number {
           jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null),
         });
         reArmed++;
+      } else if (kind === "grok") {
+        // Session gone: grok's stuck subagent rows have no reattach path left
+        // to rehydrate them (mirrors the claude dead-session branch below).
+        orphanRunningGrokSubagents(heldId);
+        released++;
       } else {
         // Session gone: no watcher could ever observe these agents finishing, so
         // flip the rows now. `orphanRunningSubagents` fires the settle hook →
@@ -693,6 +729,11 @@ export function reconcileOrphans(): number {
     // HARD INVARIANT: never kill or create tmux sessions here — only re-arm
     // watchers and flip DB rows.
     if (sessionExistsByName(sessionNameFor(heldId))) {
+      if (kind === "grok") {
+        // Same as the held-in-running case: session alive → leave it to the
+        // normal grok reattach path, nothing to re-arm here.
+        continue;
+      }
       const run = task.runId ? runs.get(task.runId) : null;
       if (!run?.claudeSessionId) {
         orphanRunningSubagents(heldId);
@@ -706,6 +747,12 @@ export function reconcileOrphans(): number {
         jsonlPath: jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null),
       });
       reArmed++;
+    } else if (kind === "grok") {
+      // Session gone: orphan the rows (mirrors the claude branch below). The
+      // settle hook's `maybeReleaseHeldTask` safely bails here (task.column
+      // isn't `running`), so this only clears the stale subagent rows.
+      orphanRunningGrokSubagents(heldId);
+      released++;
     } else {
       // Session gone: orphan the rows. Unlike the held-in-running case, the
       // settle hook's `maybeReleaseHeldTask` safely bails here (task.column
@@ -1230,7 +1277,12 @@ export function cancelRun(runId: string): boolean {
     if (!taskId || !isHeldByBackgroundAgents(taskId)) return false;
     cancelPendingForTask(taskId, "cancelled by user");
     interruptTaskSession(taskId);
-    orphanRunningSubagents(taskId);
+    // Route the orphan through the driver that owns this task's subagents:
+    // grok's manager also stops the live child-transcript tailers, whereas
+    // claude's function only flips DB rows. Both fire the settle hook.
+    const cancelKind = resolveHarness(runs.get(runId)?.agent ?? "")?.kind;
+    if (cancelKind === "grok") orphanRunningGrokSubagents(taskId);
+    else orphanRunningSubagents(taskId);
     return true;
   }
   // Stop targets the whole task, not just one run. `kill()` sends Ctrl+C
