@@ -8,6 +8,7 @@ import {
   type SpawnedAgent,
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
+import { spawnKimiViaTmux } from "./kimi-tmux.ts";
 import { gitWritableRootsSync } from "./worktree.ts";
 
 export type { SpawnedAgent };
@@ -26,6 +27,20 @@ export interface AgentCommand {
    * it has no size-driven argv problem.
    */
   deferredPrompt?: string;
+  /**
+   * Set only by the kimi branch of `buildCommand`. kimi's `--session <id>`
+   * flag both resumes and creates, so it must be present on every turn's
+   * argv — unlike claude (whose session uuid is minted by `spawnAgent`
+   * *before* calling `buildCommand`, so it never needs to travel back out)
+   * and codex (whose thread id is discovered from the event stream, not
+   * chosen up front). `buildCommand` is therefore the single place that
+   * decides "what session id does this turn use" for kimi, and hands it
+   * back here so `spawnAgent` can forward the exact same id to
+   * `spawnKimiViaTmux`'s `sessionId`/`onSessionId` — no second uuid is ever
+   * minted, so the id embedded in argv always matches the one persisted on
+   * the run row. Always undefined for claude-code/codex.
+   */
+  sessionId?: string;
 }
 
 /**
@@ -147,12 +162,24 @@ function modelDeclinesEffort(kind: AgentKind, model: string): boolean {
  */
 export function resolveBin(harness: Harness): string {
   if (harness.bin) return harness.bin;
-  const fallback = harness.kind === "claude-code" ? "claude" : "codex";
-  const override = harness.kind === "claude-code"
-    ? process.env.AGETOR_CLAUDE_BIN
-    : process.env.AGETOR_CODEX_BIN;
-  if (override) return override;
-  return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+  switch (harness.kind) {
+    case "claude-code": {
+      if (process.env.AGETOR_CLAUDE_BIN) return process.env.AGETOR_CLAUDE_BIN;
+      return Bun.which("claude", { PATH: process.env.PATH }) ?? "claude";
+    }
+    case "codex": {
+      if (process.env.AGETOR_CODEX_BIN) return process.env.AGETOR_CODEX_BIN;
+      return Bun.which("codex", { PATH: process.env.PATH }) ?? "codex";
+    }
+    case "kimi": {
+      if (process.env.AGETOR_KIMI_BIN) return process.env.AGETOR_KIMI_BIN;
+      return Bun.which("kimi", { PATH: process.env.PATH }) ?? "kimi";
+    }
+    default: {
+      const _exhaustive: never = harness.kind;
+      throw new Error(`resolveBin: unhandled agent kind "${String(_exhaustive)}"`);
+    }
+  }
 }
 
 /**
@@ -176,11 +203,32 @@ export function harnessEnv(harness: Harness): Record<string, string> {
     // macOS keychain, so re-homing it is harmless — but CODEX_HOME is what
     // actually controls its login & history, so we set both as a belt-and-
     // braces measure.
-    if (harness.kind === "claude-code") {
-      env.CLAUDE_CONFIG_DIR = harness.home;
-    } else {
-      env.HOME = harness.home;
-      env.CODEX_HOME = path.join(harness.home, ".codex");
+    switch (harness.kind) {
+      case "claude-code":
+        env.CLAUDE_CONFIG_DIR = harness.home;
+        break;
+      case "codex":
+        env.HOME = harness.home;
+        env.CODEX_HOME = path.join(harness.home, ".codex");
+        break;
+      case "kimi":
+        // Same belt-and-braces reasoning as codex: kimi doesn't touch the
+        // macOS keychain either, so re-homing it is harmless, and
+        // KIMI_CODE_HOME is what actually controls kimi's own login/config/
+        // session state. Unlike codex's CODEX_HOME (nested under
+        // `<home>/.codex`, mirroring codex's own `$HOME/.codex` default),
+        // there's no doc-verified default subdirectory name for kimi's
+        // config root, so KIMI_CODE_HOME points straight at `harness.home`
+        // itself — the harness template already gives each aliased harness
+        // its own dedicated directory (e.g. `{dataDir}/harnesses/kimi-2`),
+        // so there's no sibling-harness collision risk either way.
+        env.HOME = harness.home;
+        env.KIMI_CODE_HOME = harness.home;
+        break;
+      default: {
+        const _exhaustive: never = harness.kind;
+        throw new Error(`harnessEnv: unhandled agent kind "${String(_exhaustive)}"`);
+      }
     }
   }
   // User-provided env wins over the home-derived defaults.
@@ -382,73 +430,148 @@ export function buildCommand(
     return { cmd: args, env: Object.keys(env).length ? env : undefined, deferredPrompt };
   }
 
-  // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
-  // element: it's delivered on stdin (the trailing `-`), so the driver can
-  // pipe a prompt file in and no user text touches the shell wrapper.
-  const extra = (process.env.AGETOR_CODEX_ARGS ?? "").split(/\s+/).filter(Boolean);
+  if (harness.kind === "kimi") {
+    // kimi's `--session <id>` both resumes and creates — there's no separate
+    // `--resume` flag the way claude/codex each have one, so the id that
+    // ends up in argv IS the turn's session id, full stop. Reuse
+    // `opts.resumeSessionId` when the caller is continuing a conversation;
+    // otherwise mint a fresh one right here. This differs from claude (whose
+    // uuid is minted by `spawnAgent`, *before* it calls `buildCommand`) and
+    // codex (whose thread id is only ever discovered from the event stream,
+    // never chosen up front) — kimi's id has to be decided inside
+    // `buildCommand` itself, because it's unconditionally baked into argv.
+    // `buildCommand` is therefore the single source of truth for "what
+    // session id does this turn use," and hands it back via
+    // `AgentCommand.sessionId` so `spawnAgent` can forward the exact same id
+    // to `spawnKimiViaTmux` (both the argv AND the driver's `onSessionId`
+    // report) — no second uuid is ever minted.
+    const sessionId = opts.resumeSessionId ?? crypto.randomUUID();
 
-  const args: string[] = [bin, "exec"];
+    const extra = (process.env.AGETOR_KIMI_ARGS ?? "").split(/\s+/).filter(Boolean);
 
-  if (!opts.model) {
-    throw new Error("model is required for codex");
+    const args: string[] = [
+      bin,
+      "--print",
+      "--output-format", "stream-json",
+      "--input-format", "stream-json",
+      "--session", sessionId,
+    ];
+
+    if (!opts.model) {
+      throw new Error("model is required for kimi");
+    }
+    args.push("--model", opts.model);
+
+    // Mode: `auto` (default, and `null`/missing for back-compat) needs
+    // nothing extra — `--print` already implies full auto-approval of every
+    // tool call. `ask` (the only other mode id AGENT_OPTIONS.kimi.modes
+    // exposes) maps to `--plan`, kimi's read-only tool set.
+    const mode = opts.mode ?? "auto";
+    if (mode !== "auto") {
+      args.push("--plan");
+    }
+
+    args.push(...extra);
+
+    // kimi-cli exposes only a boolean `--thinking` switch, not a graded
+    // effort parameter — MODEL_EFFORT_SUPPORT["kimi"] declines the flag for
+    // every curated model (mirrors Haiku 4.5's empty-list treatment above).
+    // Unlike claude-code/codex below, kimi never emits an effort flag and
+    // never throws on a missing one — there's nothing to require.
+
+    // Hygiene env: NO_COLOR (clean stdout under `stream-json`, the same role
+    // codex's `--color never` plays) plus telemetry/auto-update opt-outs.
+    // Filled in only for keys `env` doesn't already have — `env` at this
+    // point is `harnessEnv(harness)`'s result, i.e. the home-derived
+    // HOME/KIMI_CODE_HOME layered under the user's own `harness.env`
+    // overrides — so an absence check here has the same net effect as
+    // injecting these defaults BEFORE that merge: a value the harness
+    // config already claims (via `harness.env`) is never clobbered.
+    const kimiHygieneDefaults: Record<string, string> = {
+      NO_COLOR: "1",
+      KIMI_DISABLE_TELEMETRY: "1",
+      KIMI_CODE_NO_AUTO_UPDATE: "1",
+      KIMI_CLI_NO_AUTO_UPDATE: "1",
+    };
+    for (const [k, v] of Object.entries(kimiHygieneDefaults)) {
+      if (!(k in env)) env[k] = v;
+    }
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined, sessionId };
   }
-  args.push("--model", opts.model);
 
-  if (opts.effort) {
-    args.push("-c", `model_reasoning_effort=${opts.effort}`);
-  } else if (!modelDeclinesEffort("codex", opts.model)) {
-    throw new Error(`effort is required for codex model ${opts.model}`);
+  if (harness.kind === "codex") {
+    // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
+    // element: it's delivered on stdin (the trailing `-`), so the driver can
+    // pipe a prompt file in and no user text touches the shell wrapper.
+    const extra = (process.env.AGETOR_CODEX_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    const args: string[] = [bin, "exec"];
+
+    if (!opts.model) {
+      throw new Error("model is required for codex");
+    }
+    args.push("--model", opts.model);
+
+    if (opts.effort) {
+      args.push("-c", `model_reasoning_effort=${opts.effort}`);
+    } else if (!modelDeclinesEffort("codex", opts.model)) {
+      throw new Error(`effort is required for codex model ${opts.model}`);
+    }
+
+    // Structured streaming + deterministic capture: `--json` emits NDJSON events
+    // on stdout (tailed by the driver); `--color never` guarantees clean JSON
+    // even though codex runs under a tmux pty; `--skip-git-repo-check` lets a
+    // task run in a non-git workdir (agetor has no sandbox philosophy).
+    args.push("--json", "--color", "never", "--skip-git-repo-check");
+
+    // Sandbox policy from the agetor mode. `auto` (hands-off) →
+    // `workspace-write` so codex can edit files in the working dir without
+    // approval prompts (codex exec is non-interactive — it can't prompt anyway).
+    // `ask` → `read-only` (the most it can do without changing anything). We use
+    // `--sandbox` rather than the deprecated `--full-auto`, which prints a
+    // warning to stderr on every turn in codex 0.140+.
+    const mode = opts.mode ?? "auto";
+    // Sandbox policy. `ask` → `read-only` (can't change anything). `auto` →
+    // `workspace-write` (edit the cwd without approval prompts) for the common
+    // case, BUT escalated to `danger-full-access` when the task's git writes have
+    // to land OUTSIDE the cwd: a linked worktree's `.git` is a file pointing at
+    // the source repo's shared `.git`, where a commit's objects/refs go, and
+    // `workspace-write` only makes the cwd writable — so `git commit` is blocked.
+    // Granting the external dir via `sandbox_workspace_write.writable_roots` is
+    // unreliable (codex keeps `.git` read-only under some workspace policies), so
+    // for those runs we drop the sandbox entirely. That's consistent with
+    // agetor's no-sandbox philosophy (CLAUDE.md: "Agents run with the user's full
+    // shell privileges … There is no sandbox") and with claude-code's `auto` mode
+    // (`--dangerously-skip-permissions`). `approval_policy=never` pairs with full
+    // access so a headless `codex exec` never stalls on an approval it can't show
+    // — the empirically-validated combo for full filesystem access. Parent flags
+    // must precede the `resume` subcommand, so emit here.
+    const needsExternalGitWrites = (opts.codexExternalGitDirs?.length ?? 0) > 0;
+    if (mode !== "auto") {
+      args.push("--sandbox", "read-only");
+    } else if (needsExternalGitWrites) {
+      args.push("--sandbox", "danger-full-access", "-c", "approval_policy=never");
+    } else {
+      args.push("--sandbox", "workspace-write");
+    }
+
+    args.push(...extra);
+
+    // Multi-turn: parent flags MUST precede the `resume` subcommand (codex
+    // rejects `--json`/`--color` placed after it). codex loads the prior
+    // conversation from its own rollout via `thread_id`, so the new prompt is
+    // just the user's next line.
+    if (opts.resumeSessionId) {
+      args.push("resume", opts.resumeSessionId);
+    }
+    // Read the prompt from stdin — `-` is codex's stdin sentinel.
+    args.push("-");
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
 
-  // Structured streaming + deterministic capture: `--json` emits NDJSON events
-  // on stdout (tailed by the driver); `--color never` guarantees clean JSON
-  // even though codex runs under a tmux pty; `--skip-git-repo-check` lets a
-  // task run in a non-git workdir (agetor has no sandbox philosophy).
-  args.push("--json", "--color", "never", "--skip-git-repo-check");
-
-  // Sandbox policy from the agetor mode. `auto` (hands-off) →
-  // `workspace-write` so codex can edit files in the working dir without
-  // approval prompts (codex exec is non-interactive — it can't prompt anyway).
-  // `ask` → `read-only` (the most it can do without changing anything). We use
-  // `--sandbox` rather than the deprecated `--full-auto`, which prints a
-  // warning to stderr on every turn in codex 0.140+.
-  const mode = opts.mode ?? "auto";
-  // Sandbox policy. `ask` → `read-only` (can't change anything). `auto` →
-  // `workspace-write` (edit the cwd without approval prompts) for the common
-  // case, BUT escalated to `danger-full-access` when the task's git writes have
-  // to land OUTSIDE the cwd: a linked worktree's `.git` is a file pointing at
-  // the source repo's shared `.git`, where a commit's objects/refs go, and
-  // `workspace-write` only makes the cwd writable — so `git commit` is blocked.
-  // Granting the external dir via `sandbox_workspace_write.writable_roots` is
-  // unreliable (codex keeps `.git` read-only under some workspace policies), so
-  // for those runs we drop the sandbox entirely. That's consistent with
-  // agetor's no-sandbox philosophy (CLAUDE.md: "Agents run with the user's full
-  // shell privileges … There is no sandbox") and with claude-code's `auto` mode
-  // (`--dangerously-skip-permissions`). `approval_policy=never` pairs with full
-  // access so a headless `codex exec` never stalls on an approval it can't show
-  // — the empirically-validated combo for full filesystem access. Parent flags
-  // must precede the `resume` subcommand, so emit here.
-  const needsExternalGitWrites = (opts.codexExternalGitDirs?.length ?? 0) > 0;
-  if (mode !== "auto") {
-    args.push("--sandbox", "read-only");
-  } else if (needsExternalGitWrites) {
-    args.push("--sandbox", "danger-full-access", "-c", "approval_policy=never");
-  } else {
-    args.push("--sandbox", "workspace-write");
-  }
-
-  args.push(...extra);
-
-  // Multi-turn: parent flags MUST precede the `resume` subcommand (codex
-  // rejects `--json`/`--color` placed after it). codex loads the prior
-  // conversation from its own rollout via `thread_id`, so the new prompt is
-  // just the user's next line.
-  if (opts.resumeSessionId) {
-    args.push("resume", opts.resumeSessionId);
-  }
-  // Read the prompt from stdin — `-` is codex's stdin sentinel.
-  args.push("-");
-  return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  const _exhaustive: never = harness.kind;
+  throw new Error(`buildCommand: unhandled agent kind "${String(_exhaustive)}"`);
 }
 
 /**
@@ -545,11 +668,14 @@ export interface SpawnAgentArgs {
   cwd: string;
   onChunk: ChunkHandler;
   /**
-   * Fires with claude's session uuid. With `--session-id` we generate the
-   * uuid up-front, so this fires synchronously before claude has even
-   * written its first event — useful for persisting the id on the run row
-   * immediately. Only invoked for claude-code; codex doesn't have a
-   * comparable session id.
+   * Fires with the run's session id. For claude-code: `--session-id`'s
+   * pre-generated uuid, fired synchronously before claude has even written
+   * its first event — useful for persisting the id on the run row
+   * immediately. For kimi: the same `--session <id>` value `buildCommand`
+   * baked into argv (see `AgentCommand.sessionId`), reported by the driver
+   * right after its tmux session starts (no stream event to wait for
+   * either). For codex: the `thread_id` discovered from its `--json`
+   * stream's `thread.started` event, mid-run rather than synchronous.
    */
   onSessionId?: (sessionId: string) => void;
   opts?: AgentRunOptions;
@@ -595,33 +721,71 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
     });
   }
 
-  // codex — hosted in a per-task tmux session via codex-tmux.ts (so a mid-turn
-  // run survives an agetor restart and is reattachable), streaming structured
-  // events by tailing codex's `--json` log.
-  if (process.env.AGETOR_CODEX_DRIVER === "fake") {
-    buildCommand(harness, prompt, opts);
-    // Hand the orchestrator a thread id so it persists `codex_session_id` and
-    // can route follow-ups through `codex exec resume` — mirrors what a real
-    // `thread.started` event would deliver.
-    onSessionId?.(`fake-codex-thread-${taskId}`);
-    return makeFakeAgent(taskId, prompt, onChunk);
+  if (harness.kind === "kimi") {
+    // kimi — hosted in a detached per-task tmux session via kimi-tmux.ts,
+    // one shell-out per turn (same restart-survival rationale as codex),
+    // streaming structured events by tailing its `stream-json` log.
+    if (process.env.AGETOR_KIMI_DRIVER === "fake") {
+      // Build the command anyway so the fake records the prompt going by;
+      // mirrors the codex fake-driver block above exactly, including
+      // reporting a session id via `onSessionId` so orchestrator tests can
+      // assert `kimi_session_id` persistence the same way they do for
+      // codex's fake thread id.
+      buildCommand(harness, prompt, opts);
+      onSessionId?.(`fake-kimi-session-${taskId}`);
+      return makeFakeAgent(taskId, prompt, onChunk);
+    }
+    // `buildCommand` is the single place that decides this turn's session
+    // id (see `AgentCommand.sessionId`'s doc) — forward the exact same id
+    // to the driver so the id embedded in argv (`--session <id>`) always
+    // matches the one reported through `onSessionId` and persisted on the
+    // run row.
+    const built = buildCommand(harness, prompt, opts);
+    return spawnKimiViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      sessionId: built.sessionId,
+      onSessionId,
+    });
   }
-  // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
-  // worktree) so a codex `auto` run that has to write there escalates its
-  // sandbox to full access. Computed here — the single choke point every codex
-  // spawn path funnels through — rather than at each orchestrator call site.
-  // No-op for an ordinary checkout or a non-git cwd, so the argv is unchanged
-  // there. `buildCodexCommand` is the testable seam for this wiring.
-  const built = buildCodexCommand(harness, prompt, opts, cwd);
-  return spawnCodexViaTmux({
-    taskId,
-    runId,
-    argv: built.cmd,
-    env: built.env ?? {},
-    cwd,
-    promptText: prompt,
-    onChunk,
-    onSessionId,
-  });
+
+  if (harness.kind === "codex") {
+    // codex — hosted in a per-task tmux session via codex-tmux.ts (so a mid-turn
+    // run survives an agetor restart and is reattachable), streaming structured
+    // events by tailing codex's `--json` log.
+    if (process.env.AGETOR_CODEX_DRIVER === "fake") {
+      buildCommand(harness, prompt, opts);
+      // Hand the orchestrator a thread id so it persists `codex_session_id` and
+      // can route follow-ups through `codex exec resume` — mirrors what a real
+      // `thread.started` event would deliver.
+      onSessionId?.(`fake-codex-thread-${taskId}`);
+      return makeFakeAgent(taskId, prompt, onChunk);
+    }
+    // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
+    // worktree) so a codex `auto` run that has to write there escalates its
+    // sandbox to full access. Computed here — the single choke point every codex
+    // spawn path funnels through — rather than at each orchestrator call site.
+    // No-op for an ordinary checkout or a non-git cwd, so the argv is unchanged
+    // there. `buildCodexCommand` is the testable seam for this wiring.
+    const built = buildCodexCommand(harness, prompt, opts, cwd);
+    return spawnCodexViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      onChunk,
+      onSessionId,
+    });
+  }
+
+  const _exhaustive: never = harness.kind;
+  throw new Error(`spawnAgent: unhandled agent kind "${String(_exhaustive)}"`);
 }
 

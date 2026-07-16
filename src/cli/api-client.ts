@@ -271,7 +271,8 @@ export interface PatchTaskInput {
   taskType?: string;
 }
 
-/** Body for POST /harnesses (kind must be claude-code; codex is "coming soon"). */
+/** Body for POST /harnesses (kind is claude-code, codex, or kimi — codex and
+ *  kimi ship Experimental). */
 export interface CreateHarnessInput {
   id: string;
   kind: AgentKind;
