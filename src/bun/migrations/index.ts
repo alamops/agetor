@@ -29,6 +29,8 @@ import m025 from "./025_task_backlog.sql" with { type: "text" };
 // merge to avoid the clash with 024_reseed_harness_builtins).
 import m026 from "./026_project_branch_config.sql" with { type: "text" };
 import m027 from "./027_subagent_tool_use_id.sql" with { type: "text" };
+import m028 from "./028_kimi_harness.sql" with { type: "text" };
+import m029 from "./029_kimi_session_id.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -60,4 +62,6 @@ export const migrations: Migration[] = [
   { id: "025_task_backlog", sql: m025 },
   { id: "026_project_branch_config", sql: m026 },
   { id: "027_subagent_tool_use_id", sql: m027 },
+  { id: "028_kimi_harness", sql: m028 },
+  { id: "029_kimi_session_id", sql: m029 },
 ];

@@ -777,9 +777,11 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
       tmuxSession: sessionNameFor(taskId),
       // Filled in by spawnAgent's onSessionId callback once the session id is
       // known: claude's JSONL uuid → claudeSessionId, codex's thread_id →
-      // codexSessionId. Exactly one is non-null per run.
+      // codexSessionId, kimi's pre-generated uuid → kimiSessionId. Exactly
+      // one is non-null per run.
       claudeSessionId: null,
       codexSessionId: null,
+      kimiSessionId: null,
     });
   });
   persist();
@@ -1334,6 +1336,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
     // before this run's own `thread.started` re-emits it. onSessionId below
     // re-stamps the same value (idempotent).
     codexSessionId: priorThreadId,
+    kimiSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -1500,6 +1503,7 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: inheritedSessionId,
     codexSessionId: null,
+    kimiSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -1567,6 +1571,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: inheritedSessionId,
     codexSessionId: null,
+    kimiSessionId: null,
     origin: "continuation",
   });
   const prevColumn: ColumnId = task.column;
@@ -1624,6 +1629,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: priorSessionId,
     codexSessionId: null,
+    kimiSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });

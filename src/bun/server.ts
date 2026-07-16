@@ -2632,9 +2632,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof body.id !== "string" || !body.id.trim()) {
             return json({ error: "id required" }, { status: 400, headers: corsHeaders(req) });
           }
-          if (body.kind !== "claude-code" && body.kind !== "codex") {
+          if (body.kind !== "claude-code" && body.kind !== "codex" && body.kind !== "kimi") {
             return json(
-              { error: "kind must be 'claude-code' or 'codex'" },
+              { error: "kind must be 'claude-code', 'codex', or 'kimi'" },
               { status: 400, headers: corsHeaders(req) },
             );
           }

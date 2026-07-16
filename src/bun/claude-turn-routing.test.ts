@@ -209,6 +209,7 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
       tmuxSession: state.sessionName,
       claudeSessionId: null,
       codexSessionId: null,
+      kimiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, "still there?");
@@ -313,6 +314,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
       tmuxSession: state.sessionName,
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
+      kimiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, "please continue");
@@ -420,6 +422,7 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
+      kimiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, largePrompt);
@@ -549,6 +552,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
+      kimiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, largePrompt);
@@ -706,6 +710,7 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
+      kimiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, largePrompt);
@@ -801,6 +806,7 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
+      kimiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, smallPrompt);
