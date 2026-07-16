@@ -397,7 +397,9 @@ function handleSpawn(state: ManagerState, u: Record<string, unknown>, ctx: GrokS
   if (existing && existing.status !== "running") return;
 
   const childSessionId = str(u.child_session_id) ?? null;
-  const startedAt = Date.now();
+  // Reuse the original spawn time on a still-running reattach replay so the
+  // re-emitted "started" event carries the true startedAt, not a fresh stamp.
+  const startedAt = existing?.startedAt ?? Date.now();
   const resolvedPath = childSessionId ? resolveChildPath(ctx.grokHome, ctx.cwd, childSessionId) : null;
 
   const subagent: Subagent = {

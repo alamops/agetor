@@ -1,7 +1,28 @@
 import { test, expect, beforeAll } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { Task, Run, Subagent } from "../shared/types.ts";
+
+/** Point AGETOR_TMUX_BIN at a fake tmux whose `has-session` probe always exits
+ *  non-zero, so `sessionExistsByName` deterministically reports "gone" for the
+ *  reconcile tests below — regardless of a fake tmux another test file may have
+ *  left pointing at a report-alive stub (bun test shares one process/env, and
+ *  `reconcileOrphans` reads whatever AGETOR_TMUX_BIN is set when it runs).
+ *  Returns a restore fn. Mirrors reconcile.test.ts's `fakeTmux`. */
+function fakeTmuxGone(): () => void {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-grok-faketmux-"));
+  const bin = path.join(dir, "tmux");
+  writeFileSync(bin, `#!/bin/sh\n>&2 printf 'no server'\nexit 1\n`);
+  chmodSync(bin, 0o755);
+  const prev = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = bin;
+  return () => {
+    if (prev === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prev;
+  };
+}
 
 // db.ts captures AGETOR_DATA_DIR at first import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-grok-orch-"));
@@ -17,6 +38,75 @@ process.env.AGETOR_GROK_DRIVER = "fake";
 process.env.AGETOR_GROK_BIN = "/bin/echo";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** A task row shaped like the "held by background agents" state: parked in
+ *  `running` with a run id already set. Mirrors reconcile.test.ts's
+ *  `heldTaskRow` helper (that file doesn't export it, so it's duplicated
+ *  here rather than reaching across files). */
+function heldTaskRow(overrides: Partial<Task> & { id: string; runId: string | null }): Task {
+  const now = Date.now();
+  return {
+    title: "held",
+    prompt: "p",
+    column: "running",
+    agent: "claude-code",
+    workdir: "/tmp",
+    isolation: "none",
+    taskType: "task",
+    branch: null,
+    worktreePath: null,
+    baseRef: null,
+    mode: null,
+    model: null,
+    effort: null,
+    references: [], backlog: [],
+    hasOpenableRun: false,
+    pendingInteractionCount: 0,
+    openTerminalCount: 0,
+    archivedAt: null,
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  };
+}
+
+/** A terminal ("succeeded") run row — the shape a held task's run must have
+ *  per `isHeldByBackgroundAgents`. Mirrors reconcile.test.ts's `succeededRun`. */
+function succeededRun(id: string, taskId: string, overrides: Partial<Run> = {}): Run {
+  const now = Date.now();
+  return {
+    id,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: now,
+    endedAt: now,
+    exitCode: 0,
+    tmuxSession: null,
+    claudeSessionId: `sess-${randomUUID()}`,
+    codexSessionId: null, grokSessionId: null,
+    ...overrides,
+  };
+}
+
+/** A `running` subagent row. Mirrors reconcile.test.ts's `subagentRow`. */
+function subagentRow(id: string, taskId: string, runId: string | null, overrides: Partial<Subagent> = {}): Subagent {
+  const now = Date.now();
+  return {
+    id,
+    taskId,
+    runId,
+    parentKind: "subagent",
+    agentType: "general-purpose",
+    description: "test subagent",
+    spawnDepth: 1,
+    sourcePath: "/tmp/agent-updates.jsonl",
+    status: "running",
+    startedAt: now,
+    endedAt: null,
+    ...overrides,
+  };
+}
 
 beforeAll(async () => {
   const { db } = await import("./db.ts");
@@ -326,4 +416,78 @@ test("createTask (grok) with no explicit effort resolves DEFAULT_EFFORT.grok, an
   const list = runs.listForTask(taskId);
   expect(list.length).toBe(1);
   expect(list[0]?.status).toBe("succeeded");
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * reconcileOrphans' held-task pass (orchestrator.ts ~:675) used to gate on
+ * `resolveHarness(task.agent)?.kind !== "claude-code"` and `continue` for
+ * anything else — silently skipping a grok task's dangling `running`
+ * subagents row forever. docs/plans/grok-subagent-rendering.md D5 widened
+ * that to `kind !== "claude-code" && kind !== "grok"`. These tests seed a
+ * held-shaped grok task directly via the db modules (mirrors
+ * reconcile.test.ts's own held-task fixtures — no tmux session is ever
+ * actually created under these synthetic ids, so the real `tmux has-session`
+ * probe honestly reports "gone" without needing a faked tmux stub) and prove
+ * the row is no longer ignored, while a sibling claude-code task is asserted
+ * to still behave exactly as before (no regression from widening the gate).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("reconcileOrphans (grok): a dead-session held task's running subagent row is orphaned and the card releases to review — previously silently skipped by the claude-code-only gate", async () => {
+  const { tasks, runs, subagents } = await import("./db.ts");
+  const { reconcileOrphans } = await import("./orchestrator.ts");
+
+  const taskId = `task-grok-heldsub-${randomUUID()}`;
+  const runId = `run-grok-heldsub-${randomUUID()}`;
+  const subId = `sub-grok-heldsub-${randomUUID()}`;
+
+  tasks.insert(heldTaskRow({ id: taskId, runId, agent: "grok", model: "grok-build" }));
+  runs.insert(succeededRun(runId, taskId, {
+    agent: "grok", claudeSessionId: null, codexSessionId: null, grokSessionId: `sess-${randomUUID()}`,
+  }));
+  subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
+
+  const restoreTmux = fakeTmuxGone();
+  try {
+    reconcileOrphans();
+  } finally {
+    restoreTmux();
+  }
+
+  const sub = subagents.get(subId);
+  expect(sub?.status).toBe("orphaned");
+  expect(sub?.endedAt).not.toBeNull();
+
+  const task = tasks.get(taskId);
+  expect(task?.column).toBe("review");
+  // Hygiene: nothing running left for a later reconcileOrphans() call (this
+  // one or a sibling test file's) to trip over.
+  expect(runs.listForTask(taskId).every((r) => r.status !== "running")).toBe(true);
+});
+
+test("reconcileOrphans (grok gate widening): a claude-code sibling task's dead-session held subagent row still orphans too — widening the gate to include grok doesn't regress claude", async () => {
+  const { tasks, runs, subagents } = await import("./db.ts");
+  const { reconcileOrphans } = await import("./orchestrator.ts");
+
+  const taskId = `task-claude-heldsub-${randomUUID()}`;
+  const runId = `run-claude-heldsub-${randomUUID()}`;
+  const subId = `sub-claude-heldsub-${randomUUID()}`;
+
+  tasks.insert(heldTaskRow({ id: taskId, runId, agent: "claude-code" }));
+  runs.insert(succeededRun(runId, taskId));
+  subagents.insertIfAbsent(subagentRow(subId, taskId, runId));
+
+  const restoreTmux = fakeTmuxGone();
+  try {
+    reconcileOrphans();
+  } finally {
+    restoreTmux();
+  }
+
+  const sub = subagents.get(subId);
+  expect(sub?.status).toBe("orphaned");
+  expect(sub?.endedAt).not.toBeNull();
+
+  const task = tasks.get(taskId);
+  expect(task?.column).toBe("review");
+  expect(runs.listForTask(taskId).every((r) => r.status !== "running")).toBe(true);
 });
