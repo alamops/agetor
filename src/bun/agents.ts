@@ -243,6 +243,27 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       throw new Error(`harnessEnv: unknown harness kind: ${exhaustive}`);
     }
   }
+
+  // D1 (docs/plans/grok-privacy-defaults.md): grok's always-on trace-upload
+  // pipeline ships per-turn session artifacts (incl. session logs; a tracked
+  // `.env` FILE is not skip-listed) to a GCS bucket, and xAI can flip
+  // telemetry on REMOTELY per account via server-pushed settings — so
+  // disabling it once in the harness's `env` config isn't durable. Grok's own
+  // flag resolver ranks precedence `requirement > cli > env > config >
+  // managed > remote > default` (xai-grok-config-types/src/flags.rs), so an
+  // env var beats both the user's saved config AND a future remote push. The
+  // sandbox can't help either — in-process HTTP is deliberately exempt from
+  // `restrict_network` — so env is the only reliable per-spawn control.
+  // `GROK_STORAGE_MODE=local` additionally blocks the session writeback sync
+  // a server flag can silently re-enable. Set BEFORE the harness's own `env`
+  // map below so an explicit user override (someone who consciously wants
+  // xAI telemetry back on) still wins.
+  if (harness.kind === "grok") {
+    env.GROK_TELEMETRY_ENABLED = "0";
+    env.GROK_TELEMETRY_TRACE_UPLOAD = "0";
+    env.GROK_STORAGE_MODE = "local";
+  }
+
   // User-provided env wins over the home-derived defaults.
   for (const [k, v] of Object.entries(harness.env ?? {})) env[k] = v;
   return env;
