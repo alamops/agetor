@@ -2889,6 +2889,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             {
               "claude-code": getDiscoveredModels("claude-code"),
               "codex": getDiscoveredModels("codex"),
+              "kimi": getDiscoveredModels("kimi"),
             },
             { headers: corsHeaders(req) },
           )),
@@ -2898,6 +2899,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             {
               "claude-code": getDiscoveredModels("claude-code"),
               "codex": getDiscoveredModels("codex"),
+              "kimi": getDiscoveredModels("kimi"),
             },
             { headers: corsHeaders(req) },
           );

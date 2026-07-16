@@ -721,7 +721,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
               title={
                 kind === "codex"
                   ? "Codex has no native plan mode — routed to 'ask' so nothing auto-executes."
-                  : "Plan only — agent describes what it would do without making changes."
+                  : kind === "kimi"
+                    ? "Kimi has no native plan mode — routed to '--plan', kimi's read-only tool set, so nothing auto-executes."
+                    : "Plan only — agent describes what it would do without making changes."
               }
             >
               <ClipboardList className="mr-1 size-3.5" />

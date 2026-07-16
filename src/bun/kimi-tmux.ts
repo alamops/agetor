@@ -169,10 +169,13 @@ export function mapKimiEvent(line: string, onChunk: ChunkHandler, lineNo: number
   try {
     msg = JSON.parse(trimmed);
   } catch {
-    // Malformed line — tolerate silently (log-level only), never surface to
-    // the run panel: an unparsable line is far more likely to be a launch
-    // hiccup from the shell wrapper than agent output worth showing.
-    console.error(`[kimi-tmux] malformed stream-json line ${lineNo}: ${trimmed.slice(0, 200)}`);
+    // Not JSON — kimi shouldn't emit this under `--output-format stream-json`,
+    // but surface it rather than drop it (mirrors codex-tmux.ts): a launch or
+    // auth failure from the shell wrapper is exactly the kind of thing that
+    // must reach the run panel instead of vanishing into the log. Keep the
+    // `kimi:<lineNo>` dedup key so a reattach replay from offset 0 stays
+    // idempotent instead of re-emitting the same stderr line.
+    onChunk("stderr", trimmed, `kimi:${lineNo}`);
     return;
   }
 
@@ -188,7 +191,10 @@ export function mapKimiEvent(line: string, onChunk: ChunkHandler, lineNo: number
 
       const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
       calls.forEach((call, idx) => {
-        if (!call || call.type !== "function") return;
+        // kimi's tool_calls schema is doc-unverified; emitters sometimes omit
+        // `type` entirely. Only skip when it's present and explicitly not
+        // "function" — don't require it to be present.
+        if (!call || (call.type && call.type !== "function")) return;
         const fn = call.function ?? {};
         const id = typeof call.id === "string" && call.id ? call.id : `${lineNo}-${idx}`;
         let input: unknown = fn.arguments;

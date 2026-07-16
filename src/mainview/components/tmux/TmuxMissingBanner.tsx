@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils";
 import { TMUX_MISSING_REASON, type AgentStatus } from "../../../shared/types.ts";
 
 interface Props {
-  /** True when at least one claude-code harness reports tmux as missing. */
+  /** True when at least one harness reports tmux as missing. */
   show: boolean;
   onResolve: () => void;
 }
@@ -41,7 +41,7 @@ export function TmuxMissingBanner({ show, onResolve }: Props) {
       <span className="min-w-0 flex-1">
         <span className="font-medium text-amber-100">tmux not installed.</span>{" "}
         <span className="text-amber-200/80">
-          Claude Code tasks need tmux to run.
+          Agent tasks need tmux to run.
         </span>
       </span>
       <Button
@@ -64,11 +64,12 @@ export function TmuxMissingBanner({ show, onResolve }: Props) {
   );
 }
 
-/** Detects if any claude-code harness is reporting a tmux-missing failure. */
+/** Detects if any harness is reporting a tmux-missing failure. All current
+ *  AgentKinds (claude-code, codex, kimi) are tmux-dependent — each hosts its
+ *  session/turn inside a per-task tmux session — so this isn't scoped to a
+ *  single kind. */
 export function isTmuxMissing(agents: AgentStatus[]): boolean {
-  return agents.some(
-    (a) => a.kind === "claude-code" && !a.available && a.reason === TMUX_MISSING_REASON,
-  );
+  return agents.some((a) => !a.available && a.reason === TMUX_MISSING_REASON);
 }
 
 /** True when a start-task error message embeds the tmux-missing reason
