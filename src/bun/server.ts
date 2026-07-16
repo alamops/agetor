@@ -39,6 +39,7 @@ import {
 } from "./tmux-resolution.ts";
 import {
   dismissTmuxPrompt,
+  driveAskAnswers,
   jsonlPathFor,
   rebuildEventsFromJsonl,
   markTmuxPromptAnswered,
@@ -3448,9 +3449,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // ─── Interactions: claude built-in AskUserQuestion (scraper-sourced) ──
       // The native modal is live on the tmux pane; there's no promise. Plan
       // the keystrokes from the user's picks and drive them into the modal
-      // (planAskAnswers + sendModalKeys), or, for a custom/free-text answer,
-      // Esc the modal and post the answer as a normal follow-up turn. Then
-      // drop the card.
+      // (planAskAnswers + driveAskAnswers, which verifies-and-retries the
+      // review-screen confirm rather than trusting send-keys exit codes), or,
+      // for a custom/free-text answer, Esc the modal (sendModalKeys) and post
+      // the answer as a normal follow-up turn. Then drop the card.
       "/ask-questions/:id/answer": {
         POST: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer>;
@@ -3473,7 +3475,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             const plan = planAskAnswers(specs, sanitised);
             let ok = false;
             if (plan.mode === "drive") {
-              ok = await sendModalKeys(pending.taskId, plan.keys);
+              ok = await driveAskAnswers(pending.taskId, plan);
             } else {
               // Custom/free-text (or anything we can't drive): dismiss the
               // native modal, then deliver the answer as a follow-up turn —
