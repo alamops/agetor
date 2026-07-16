@@ -6,13 +6,17 @@ import path from "node:path";
 // db.ts captures AGETOR_DATA_DIR at first import.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-grok-orch-"));
 // Drive grok through the in-process fake (no tmux, no real CLI). The fake
-// emits canned chunks and calls onSessionId with a synthetic session id, so we
-// can exercise the orchestrator's grok session bookkeeping + multi-turn
+// emits canned chunks and calls onSessionId with the PROVIDED session id
+// (D4: the orchestrator pre-seeds the id before spawn now, so the fake
+// echoes it back rather than synthesizing its own `fake-grok-session-<id>`),
+// so we can exercise the orchestrator's grok session bookkeeping + multi-turn
 // routing deterministically. Mirrors orchestrator-codex.test.ts.
 process.env.AGETOR_GROK_DRIVER = "fake";
 // Availability probe (`checkHarness`) still runs in startTask; point the grok
 // bin at /bin/echo so `--version` succeeds on CI hosts without grok.
 process.env.AGETOR_GROK_BIN = "/bin/echo";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 beforeAll(async () => {
   const { db } = await import("./db.ts");
@@ -32,7 +36,7 @@ async function settle(ms = 80) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-test("startTask (grok) sets tmux_session + persists the session id as grokSessionId", async () => {
+test("startTask (grok) pre-seeds a UUID session id at run INSERT, persisted through the resolved turn", async () => {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { runs, harnesses } = await import("./db.ts");
   const { sessionNameFor } = await import("./claude-tmux.ts");
@@ -54,13 +58,24 @@ test("startTask (grok) sets tmux_session + persists the session id as grokSessio
   const started = await startTask(taskId);
   if ("error" in started) throw new Error(started.error);
 
+  // D4: the session id is minted and persisted on the run row AT INSERT —
+  // i.e. before the turn has resolved (or even necessarily finished
+  // spawning), not sniffed later from an `end`/onSessionId callback. Assert
+  // this BEFORE settle() so we're actually exercising the "known up front"
+  // contract, not just whatever's true once the turn is done.
+  const preSettleList = runs.listForTask(taskId);
+  expect(preSettleList.length).toBe(1);
+  const preSeededId = preSettleList[0]?.grokSessionId ?? "";
+  expect(preSeededId).toMatch(UUID_RE);
+
   await settle();
   const list = runs.listForTask(taskId);
   expect(list.length).toBe(1);
   // All three kinds host their run in a per-task tmux session.
   expect(list[0]?.tmuxSession).toBe(sessionNameFor(taskId));
-  // The fake delivers a synthetic session id via onSessionId → grokSessionId.
-  expect(list[0]?.grokSessionId).toBe(`fake-grok-session-${taskId}`);
+  // The fake echoes back the id it was GIVEN (D4) — same id as pre-seeded,
+  // not a freshly synthesized one.
+  expect(list[0]?.grokSessionId).toBe(preSeededId);
   expect(list[0]?.claudeSessionId).toBeNull();
   expect(list[0]?.codexSessionId).toBeNull();
   // The fake resolves done(0) → succeeded → review column.
@@ -69,7 +84,7 @@ test("startTask (grok) sets tmux_session + persists the session id as grokSessio
   expect(tasks.get(taskId)?.column).toBe("review");
 });
 
-test("sendInput (grok, idle) spawns a NEW run row that resumes the same session", async () => {
+test("sendInput (grok, idle) spawns a NEW run row that resumes the SAME session id (fake driver bypasses the disk-existence gate)", async () => {
   const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
   const { runs, harnesses } = await import("./db.ts");
   harnesses.setEnabled("grok", true);
@@ -92,6 +107,10 @@ test("sendInput (grok, idle) spawns a NEW run row that resumes the same session"
   await settle(); // let the first turn resolve (fake done at ~20ms)
 
   const firstRunId = "runId" in started ? started.runId : "";
+  const firstRun = runs.listForTask(taskId).find((r) => r.id === firstRunId);
+  const firstSessionId = firstRun?.grokSessionId ?? "";
+  expect(firstSessionId).toMatch(UUID_RE);
+
   const res = await sendInput(firstRunId, "turn two");
   expect(res.delivered).toBe(true);
   await settle();
@@ -101,12 +120,16 @@ test("sendInput (grok, idle) spawns a NEW run row that resumes the same session"
   expect(list.length).toBe(2);
   const newRunId = res.delivered ? res.runId : "";
   expect(newRunId).not.toBe(firstRunId);
-  // The resumed turn carries the same session id forward.
+  // resolveGrokSession's disk-existence gate is bypassed for the fake driver
+  // (`AGETOR_GROK_DRIVER === "fake"` short-circuits `grokSessionExistsOnDisk`)
+  // — this is the "resume path" this test verifies: without that bypass, a
+  // fake run (which never touches disk) would always look "not established"
+  // and mint a fresh id on every follow-up instead of resuming.
   const newRun = list.find((r) => r.id === newRunId);
-  expect(newRun?.grokSessionId).toBe(`fake-grok-session-${taskId}`);
+  expect(newRun?.grokSessionId).toBe(firstSessionId);
 });
 
-test("sendInput (grok, busy) queues the follow-up; it spawns after the active turn resolves", async () => {
+test("sendInput (grok, busy) queues the follow-up; it spawns after the active turn resolves, both rows share the session id", async () => {
   // Exploit the fake's ~20ms resolve window: a follow-up sent in the same tick
   // as start lands while the first turn is still active, so it must queue (no
   // new row yet) and then drain into a second run once the first resolves.
@@ -147,6 +170,58 @@ test("sendInput (grok, busy) queues the follow-up; it spawns after the active tu
   const list = runs.listForTask(taskId);
   expect(list.length).toBe(2);
   for (const r of list) expect(r.status).toBe("succeeded");
+  // Same conversation, same session throughout — the drained queued turn
+  // resumes rather than starting fresh.
+  const sessionIds = new Set(list.map((r) => r.grokSessionId));
+  expect(sessionIds.size).toBe(1);
+  expect([...sessionIds][0]).toMatch(UUID_RE);
+});
+
+test("mode change between turns forces a FRESH grok session id (D5: --resume never re-sends --sandbox)", async () => {
+  const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+  const { runs, tasks, harnesses } = await import("./db.ts");
+  harnesses.setEnabled("grok", true);
+
+  const created = await createTask({
+    title: "grok mode change",
+    prompt: "turn one",
+    agent: "grok",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+    model: "grok-build",
+    effort: null,
+    // Mode omitted → null → resolveGrokSession treats it as "auto".
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  expect(tasks.get(taskId)?.mode).toBeNull();
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  await settle(); // let turn one resolve
+
+  const firstRunId = "runId" in started ? started.runId : "";
+  const firstSessionId = runs.listForTask(taskId).find((r) => r.id === firstRunId)?.grokSessionId ?? "";
+  expect(firstSessionId).toMatch(UUID_RE);
+
+  // Grok's two curated modes are "auto" and "ask" (src/shared/types.ts,
+  // AGENT_OPTIONS.grok.modes) — flip from the implicit "auto" default to
+  // "ask", mirroring a PATCH /tasks/:id (mode is in the server's allow-list).
+  tasks.update(taskId, { mode: "ask" });
+
+  const res = await sendInput(firstRunId, "turn two, after mode change");
+  expect(res.delivered).toBe(true);
+  await settle();
+
+  const list = runs.listForTask(taskId);
+  expect(list.length).toBe(2);
+  const secondRunId = res.delivered ? res.runId : "";
+  expect(secondRunId).not.toBe(firstRunId);
+  const secondSessionId = list.find((r) => r.id === secondRunId)?.grokSessionId ?? "";
+  expect(secondSessionId).toMatch(UUID_RE);
+  // The mode change forces a fresh session — NOT the same id as turn one.
+  expect(secondSessionId).not.toBe(firstSessionId);
 });
 
 test("deleteTask (grok) tears down mid-flight without throwing and leaves no running rows", async () => {
@@ -215,4 +290,40 @@ test("archiveTask (grok) tears down the session + queue without throwing", async
 
   // No running rows left behind.
   expect(runs.listForTask(taskId).every((r) => r.status !== "running")).toBe(true);
+});
+
+test("createTask (grok) with no explicit effort resolves DEFAULT_EFFORT.grok, and the fake spawn doesn't throw", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { runs, tasks, harnesses } = await import("./db.ts");
+  const { DEFAULT_EFFORT } = await import("../shared/types.ts");
+  harnesses.setEnabled("grok", true);
+
+  const created = await createTask({
+    title: "grok default effort",
+    prompt: "do a thing",
+    agent: "grok",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+    model: "grok-build",
+    // effort intentionally omitted — createTask must resolve it itself
+    // (grok-build's MODEL_EFFORT_SUPPORT list is non-empty, so this does NOT
+    // fall back to null the way an effort-unsupported model like Haiku 4.5
+    // would — see orchestrator.ts createTask's effort-resolution comment).
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  expect(created.task.effort).toBe(DEFAULT_EFFORT.grok);
+  expect(created.task.effort).toBe("medium");
+  // Re-fetch from the DB too, not just the in-memory return value.
+  expect(tasks.get(taskId)?.effort).toBe("medium");
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  await settle();
+
+  const list = runs.listForTask(taskId);
+  expect(list.length).toBe(1);
+  expect(list[0]?.status).toBe("succeeded");
 });
