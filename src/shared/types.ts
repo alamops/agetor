@@ -242,6 +242,300 @@ export function taskTypeMeta(t: TaskType | null | undefined): TaskTypeMeta {
   return TASK_TYPES.find((x) => x.id === t) ?? TASK_TYPES[0]!;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Branch nomenclature (per project)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * How agetor names the git branch it creates for a worktree-isolated task.
+ * One rule per {@link TaskType}, so "feature"/"bug"/"spike" work can land on
+ * differently-prefixed branches.
+ */
+export interface BranchNamingRule {
+  /**
+   * Leading segment of the branch, typically ending in "/" (e.g. `"feature/"`).
+   * Fully customizable; validated to git-legal characters. May be empty.
+   */
+  prefix: string;
+}
+
+/**
+ * Per-project branch nomenclature. Stored on the project row (JSON); a project
+ * with no stored config falls back to {@link DEFAULT_BRANCH_CONFIG}.
+ */
+export interface BranchNamingConfig {
+  /** Per-task-type prefix. Every {@link TaskType} id must have an entry. */
+  rules: Record<TaskType, BranchNamingRule>;
+  /** When true, the card title (slugified) forms the branch body. */
+  includeSlug: boolean;
+}
+
+/**
+ * Built-in defaults. The existing task types (task | bug | spike) map to the
+ * conventional feature/ | fix/ | spike/ prefixes.
+ */
+export const DEFAULT_BRANCH_CONFIG: BranchNamingConfig = {
+  rules: {
+    task: { prefix: "feature/" },
+    bug: { prefix: "fix/" },
+    spike: { prefix: "spike/" },
+  },
+  includeSlug: true,
+};
+
+/**
+ * Prefix of the pre-nomenclature branch scheme (`agetor/<short-id>-<slug>`).
+ * Still emitted by `branchName()` as a legacy fallback, used to hide
+ * agetor-managed branches from the base-ref picker, and treated as "no
+ * meaningful prefix" by {@link branchCommitType}. Lives in shared so the one
+ * magic prefix has a single definition rather than a copy per call site.
+ */
+export const LEGACY_BRANCH_PREFIX = "agetor/";
+
+/** Max length of the slug portion of a branch body. */
+const BRANCH_SLUG_MAX = 40;
+
+/**
+ * Turn arbitrary text into a git-legal, kebab-cased branch segment: lowercased,
+ * every run of non-alphanumerics collapsed to a single "-", leading/trailing
+ * "-" trimmed, length capped. Returns "" when the input has no usable
+ * characters (callers supply a fallback such as a short id token).
+ */
+export function slugifyBranch(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, BRANCH_SLUG_MAX)
+    .replace(/-+$/g, "");
+}
+
+/**
+ * A template tag the branch-name field recognizes and substitutes. Purely
+ * descriptive metadata — {@link BRANCH_TEMPLATE_TAGS} drives the helper text
+ * shown under the Branch name field; the substitution logic itself lives in
+ * {@link renderBranchTemplate}.
+ */
+export interface BranchTemplateTag {
+  /** The literal tag text, e.g. `"<slug>"`. */
+  tag: string;
+  /** One-line human description shown alongside the tag in the UI. */
+  description: string;
+}
+
+/** Ordered list used by the UI helper text under the Branch name field. */
+export const BRANCH_TEMPLATE_TAGS: readonly BranchTemplateTag[] = [
+  { tag: "<slug>", description: "Task title, slugified (short id when empty)" },
+  { tag: "<project_name>", description: "Project folder name, slugified" },
+  { tag: "<type>", description: "Task type (task, bug, or spike)" },
+  { tag: "<date>", description: "Creation date (YYYY-MM-DD)" },
+  { tag: "<timestamp>", description: "Creation timestamp (YYYYMMDD-HHmmss)" },
+  { tag: "<token>", description: "Short unique id" },
+];
+
+/**
+ * The tags that carry the branch *body* (its per-task uniqueness). A rule
+ * value containing one of these is a full template, so {@link branchPattern}
+ * appends nothing to it; the other tags are decoration and don't suppress the
+ * appended body.
+ */
+export const BRANCH_BODY_TAGS = ["<slug>", "<token>"] as const;
+
+/** Inputs {@link renderBranchTemplate} substitutes into a template string. */
+export interface BranchTemplateContext {
+  title: string;
+  /** Raw project folder name; the renderer slugifies it. */
+  projectName: string;
+  taskType: TaskType;
+  /** Short unique token, e.g. 6 chars of the task id. */
+  token: string;
+  /** Injected for deterministic tests/previews; defaults to `new Date()`. */
+  now?: Date;
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : `${n}`;
+}
+
+/** Local-time `YYYY-MM-DD`. */
+function formatBranchDate(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/** Local-time `YYYYMMDD-HHmmss`. */
+function formatBranchTimestamp(d: Date): string {
+  const date = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
+  const time = `${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+  return `${date}-${time}`;
+}
+
+/**
+ * True iff `value` contains at least one KNOWN template tag, i.e. one listed
+ * in {@link BRANCH_TEMPLATE_TAGS}. An unknown `<...>` sequence does not count
+ * — {@link renderBranchTemplate} passes those through literally, so a string
+ * containing only unrecognized angle-bracket text is not "templated" from the
+ * caller's point of view.
+ */
+export function hasBranchTemplateTags(value: string): boolean {
+  return BRANCH_TEMPLATE_TAGS.some(({ tag }) => value.includes(tag));
+}
+
+/**
+ * Render a branch-name template by substituting every known tag
+ * ({@link BRANCH_TEMPLATE_TAGS}) with its resolved value:
+ * - `<slug>` → the slugified title, falling back to `ctx.token` so it can
+ *   never render empty (which would otherwise leave a dangling `feature/`).
+ * - `<project_name>` → the slugified project name, falling back to
+ *   `"project"`.
+ * - `<type>` → `ctx.taskType` verbatim.
+ * - `<date>` / `<timestamp>` → local-time formatted from `ctx.now` (defaults
+ *   to `new Date()`); callers inject `now` for deterministic previews/tests.
+ * - `<token>` → `ctx.token` verbatim.
+ *
+ * Unknown `<...>` sequences (e.g. a stray `<foo>`) are left untouched — git
+ * allows `<`/`>` in ref names, so there's no need to reject or strip them.
+ * A tag-free string is returned unchanged (identity); this is what lets a
+ * plain literal branch name — the pre-template back-compat path — flow
+ * through {@link renderBranchTemplate} unmodified.
+ */
+export function renderBranchTemplate(template: string, ctx: BranchTemplateContext): string {
+  const now = ctx.now ?? new Date();
+  const slug = slugifyBranch(ctx.title) || ctx.token;
+  const projectSlug = slugifyBranch(ctx.projectName) || "project";
+  return template
+    .split("<slug>").join(slug)
+    .split("<project_name>").join(projectSlug)
+    .split("<type>").join(ctx.taskType)
+    .split("<date>").join(formatBranchDate(now))
+    .split("<timestamp>").join(formatBranchTimestamp(now))
+    .split("<token>").join(ctx.token);
+}
+
+/**
+ * The stable, tag-containing branch-name pattern for a task type — what the
+ * New Task form shows before the user edits the field, and what the server
+ * renders against at creation time when no override is supplied. Resolves the
+ * per-type rule via the fallback chain (per-type rule → default config's rule
+ * for that type → empty prefix), then returns the un-rendered template
+ * (`<slug>`/`<token>`, `<date>`, `<type>`, …).
+ *
+ * If `rule.prefix` already contains a body tag (`<slug>` or `<token>`), it is
+ * treated as a full template and returned verbatim — an explicit `<slug>` in
+ * the prefix wins even when `config.includeSlug` is false, and nothing is
+ * appended (that would double the tag). Otherwise the body tag
+ * (`config.includeSlug ? "<slug>" : "<token>"`) is appended to the prefix as
+ * before. Non-body tags (`<date>`, `<type>`, `<project_name>`, `<timestamp>`)
+ * do not suppress the append — only `<slug>`/`<token>` count as a body.
+ */
+export function branchPattern(config: BranchNamingConfig, taskType: TaskType): string {
+  const rule = config.rules[taskType] ?? DEFAULT_BRANCH_CONFIG.rules[taskType] ?? { prefix: "" };
+  if (BRANCH_BODY_TAGS.some((tag) => rule.prefix.includes(tag))) return rule.prefix;
+  return `${rule.prefix}${config.includeSlug ? "<slug>" : "<token>"}`;
+}
+
+/**
+ * Validate a full git branch name against the same rules as
+ * `git check-ref-format refs/heads/<name>`. Returns the offending reason on
+ * failure so the UI can explain why an override was rejected. Note: underscore
+ * is allowed; backslash is not.
+ */
+export function validateBranchName(
+  name: string,
+): { ok: true } | { ok: false; reason: string } {
+  if (!name) return { ok: false, reason: "Branch name is empty." };
+  if (name.startsWith("/") || name.endsWith("/")) {
+    return { ok: false, reason: "Cannot start or end with '/'." };
+  }
+  if (name.endsWith(".")) return { ok: false, reason: "Cannot end with '.'." };
+  if (name.includes("//")) return { ok: false, reason: "Cannot contain '//'." };
+  if (name.includes("..")) return { ok: false, reason: "Cannot contain '..'." };
+  if (name.includes("@{")) return { ok: false, reason: "Cannot contain '@{'." };
+  if (name === "@") return { ok: false, reason: "Cannot be a single '@'." };
+  // Control chars (incl. DEL), space, and ~ ^ : ? * [ \ are all forbidden.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x20\x7f ~^:?*[\\]/.test(name)) {
+    return {
+      ok: false,
+      reason: "Contains a disallowed character (space, ~, ^, :, ?, *, [, \\, or a control char).",
+    };
+  }
+  for (const seg of name.split("/")) {
+    if (seg === "") continue; // empty segments are caught by the "//" check above
+    if (seg.startsWith(".")) return { ok: false, reason: "A path segment cannot start with '.'." };
+    if (seg.endsWith(".lock")) return { ok: false, reason: "A path segment cannot end with '.lock'." };
+  }
+  return { ok: true };
+}
+
+/**
+ * Validate a whole {@link BranchNamingConfig}: every task type must have a
+ * string prefix that composes into a legal branch. Used by the settings dialog
+ * (client) and the persist route (server) so a bad prefix can't be saved.
+ */
+export function validateBranchConfig(
+  config: BranchNamingConfig,
+): { ok: true } | { ok: false; reason: string } {
+  for (const t of TASK_TYPES) {
+    const rule = config.rules[t.id];
+    if (!rule || typeof rule.prefix !== "string") {
+      return { ok: false, reason: `Missing prefix for "${t.label}".` };
+    }
+    // Render the type's pattern through the authoritative template path so a
+    // bare "feature/" passes but "feat ure/" (space) or "/x" (leading slash)
+    // is rejected.
+    const sample = renderBranchTemplate(branchPattern(config, t.id), {
+      title: "example task",
+      projectName: "project",
+      taskType: t.id,
+      token: "abc123",
+    });
+    const v = validateBranchName(sample);
+    if (!v.ok) return { ok: false, reason: `"${rule.prefix}" is not a valid prefix — ${v.reason}` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Conventional-commit type suggested for a task's commit message, derived from
+ * its {@link TaskType}. Keeps the "Commit & push" message consistent with the
+ * branch nomenclature scheme (bug → fix, spike → chore, everything else feat).
+ */
+export function conventionalCommitType(t: TaskType | null | undefined): string {
+  switch (t) {
+    case "bug":
+      return "fix";
+    case "spike":
+      return "chore";
+    default:
+      return "feat";
+  }
+}
+
+/**
+ * Commit-message type for a task, derived from its actual branch so the commit
+ * matches the branch nomenclature: the branch's prefix with the trailing slash
+ * removed (e.g. `"feature/add-login"` → `"feature"`, `"hotfix/nav"` → `"hotfix"`).
+ * Because the branch body is always a single slash-free segment (slugify strips
+ * slashes; the token has none), everything before the final `/` is exactly the
+ * configured prefix. Used by the "Commit & push" action.
+ *
+ * Falls back to {@link conventionalCommitType} when the branch carries no
+ * meaningful prefix:
+ *  - no `/` at all — a slash-less manual override, or isolation off (no branch);
+ *  - the legacy `agetor/` scheme (`agetor/<id>-<slug>`, pre-nomenclature rows),
+ *    whose prefix is an internal implementation detail, not a commit type.
+ */
+export function branchCommitType(
+  branch: string | null | undefined,
+  taskType: TaskType | null | undefined,
+): string {
+  if (branch && !branch.startsWith(LEGACY_BRANCH_PREFIX)) {
+    const i = branch.lastIndexOf("/");
+    if (i > 0) return branch.slice(0, i);
+  }
+  return conventionalCommitType(taskType);
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -300,6 +594,14 @@ export interface Task {
    * launch prompt as text — agetor never copies or uploads these.
    */
   references: TaskReference[];
+  /**
+   * Saved, not-yet-sent draft messages for this task — a per-task memory of
+   * things the user wants to send later but isn't ready to send now. Ordered
+   * newest-intent-first by array position (the UI lets the user reorder).
+   * Persisted as a JSON column, mirroring `references`. Empty list when none.
+   * Sending a backlog item consumes it (removes it from this list).
+   */
+  backlog: BacklogMessage[];
   runId: string | null;
   /**
    * True when this task has at least one run whose status is
@@ -372,6 +674,24 @@ export interface TaskReference {
   path: string;
   /** True for directories — affects icon + trailing slash in prompts. */
   isDirectory: boolean;
+}
+
+/**
+ * A saved, not-yet-sent draft message parked on a task's backlog. Carries the
+ * same shape a follow-up message assembles from the composer: free-text plus
+ * any attached file/folder references. When the user sends it, the text and
+ * references are inlined (via `appendReferences`) exactly like a normal
+ * follow-up, then the item is removed from the backlog.
+ */
+export interface BacklogMessage {
+  /** Stable id, assigned server-side, used to target edit/delete/reorder/send. */
+  id: string;
+  /** The draft message text. May be empty when the item is references-only. */
+  text: string;
+  /** File/folder references to inline when this draft is eventually sent. */
+  references: TaskReference[];
+  /** Unix ms timestamp when the draft was saved. */
+  createdAt: number;
 }
 
 export interface AgentOption {
@@ -730,6 +1050,554 @@ export interface TaskDiff {
   note?: string;
 }
 
+export type GitHubItemKind = "pulls" | "issues";
+export type GitHubItemState = "open" | "closed" | "all";
+
+export interface GitHubLabel {
+  name: string;
+  color: string | null;
+}
+
+/** A repository label as returned by the labels-management endpoints (carries a
+ *  description, unlike the lighter GitHubLabel embedded in an item). `color` is
+ *  6-hex without a leading `#`. */
+export interface GitHubRepoLabel {
+  name: string;
+  color: string;
+  description: string;
+}
+
+export interface GitHubLabelsResult {
+  repo: string;
+  labels: GitHubRepoLabel[];
+}
+
+export interface GitHubUser {
+  login: string;
+  avatarUrl: string | null;
+  htmlUrl: string | null;
+}
+
+export interface GitHubAssigneesResult {
+  repo: string;
+  assignees: GitHubUser[];
+}
+
+export interface GitHubMilestone {
+  number: number;
+  title: string;
+}
+
+/** A repository milestone as returned by the milestone-management endpoints
+ *  (carries state, description, due date and issue counts, unlike the lighter
+ *  GitHubMilestone embedded in an item). `dueOn` is an ISO8601 string or null. */
+export interface GitHubRepoMilestone {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  description: string;
+  dueOn: string | null;
+  openIssues: number;
+  closedIssues: number;
+  htmlUrl: string;
+}
+
+export interface GitHubMilestonesResult {
+  repo: string;
+  milestones: GitHubRepoMilestone[];
+}
+
+export interface GitHubListItem {
+  kind: GitHubItemKind;
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  draft: boolean;
+  htmlUrl: string;
+  author: GitHubUser | null;
+  assignees: GitHubUser[];
+  milestone: GitHubMilestone | null;
+  body: string;
+  labels: GitHubLabel[];
+  comments: number;
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
+  /** Set (to a timestamp) only for a merged pull request; null otherwise —
+   *  lets the UI distinguish a merged PR from a closed-unmerged one, which the
+   *  `state: "closed"` value alone conflates. Always null for issues. */
+  mergedAt: string | null;
+  /** Whether the conversation is locked (REST `locked` field). Applies to both
+   *  issues and pull requests — GitHub locks both through the same
+   *  `/issues/:number/lock` endpoint. Defaults to `false` when the source
+   *  response omits the field (some list paths do). */
+  locked: boolean;
+  /** Local filesystem path of the project this item came from (G8, multi-repo
+   *  aggregation). Single-repo listing sets this to that repo's dir; every
+   *  per-item action resolves `item.sourcePath ?? projectPath` so writes land
+   *  on the correct repo even when the list aggregates several. Null only for
+   *  items normalized without a known dir (shouldn't happen in practice —
+   *  every list/action call site threads one through). */
+  sourcePath: string | null;
+}
+
+/** Rate-limit snapshot parsed from a GitHub API response's `x-ratelimit-*`
+ *  headers (see `parseRateLimit` in `src/bun/github.ts`). `resource` is
+ *  GitHub's own bucket name (e.g. "core" or "search" — the Search API has a
+ *  much tighter ~30/min budget than the ~5000/hr core budget). */
+export interface GitHubRateLimit {
+  remaining: number;
+  limit: number;
+  resource: string;
+}
+
+/** The viewer's permission level on a repo, from `GET /repos/:o/:r`'s
+ *  `permissions` object. Drives push-only-control gating (F13) — `push` is
+ *  the one the UI cares about; `admin`/`maintain` ride along for future use.
+ *  Unauthenticated (no token) resolves to all-false rather than erroring,
+ *  mirroring `getGitHubViewer`'s no-token behavior. */
+export interface GitHubRepoPermissions {
+  push: boolean;
+  admin: boolean;
+  maintain: boolean;
+}
+
+export interface GitHubListResult {
+  /** Single-repo mode: "owner/name". Aggregate mode (G8): a display summary
+   *  like "3 repositories" — see `repos` for the actual slugs. */
+  repo: string;
+  /** Null in aggregate mode (G8) — there's no single repo to open. */
+  webUrl: string | null;
+  auth: "token" | "none";
+  items: GitHubListItem[];
+  /** Page number this result represents — mirrors the request's `page`
+   *  (defaults to 1). Used by the "Load more" flow to request `page + 1`.
+   *  Aggregate mode (G8) always reports page 1 — "Load more" is disabled. */
+  page: number;
+  /** True when another page is available beyond this one — derived from the
+   *  REST `link: rel="next"` header, or from the Search API's `total_count`
+   *  (capped at GitHub's 1000-result search ceiling). In aggregate mode (G8)
+   *  this instead means "at least one aggregated repo had more than the
+   *  first page fetched" (the merged list is truncated to one page per repo). */
+  hasMore: boolean;
+  /** Rate-limit snapshot from the headers of the response that produced this
+   *  page, or null when the headers were absent. Aggregate mode (G8) reports
+   *  the tightest-remaining snapshot across the fanned-out per-repo calls. */
+  rateLimit: GitHubRateLimit | null;
+  /** Aggregate mode only (G8): the resolved "owner/name" slug of every repo
+   *  whose fetch succeeded (dirs without a GitHub remote, or that otherwise
+   *  failed, are silently skipped). Undefined in single-repo mode. */
+  repos?: string[];
+}
+
+export interface GitHubComment {
+  id: number;
+  body: string;
+  htmlUrl: string;
+  author: GitHubUser | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GitHubPullLineComment extends GitHubComment {
+  path: string;
+  line: number;
+  side: "LEFT" | "RIGHT";
+}
+
+export interface GitHubCommentsResult {
+  repo: string;
+  itemNumber: number;
+  comments: GitHubComment[];
+}
+
+export interface GitHubPullReviewCommentsResult {
+  repo: string;
+  pullNumber: number;
+  comments: GitHubPullLineComment[];
+}
+
+/** A resolvable review-comment thread (from GraphQL). `rootCommentId` is the
+ *  REST databaseId of the thread's first comment, so the UI can match a thread
+ *  to a comment in the flat review-comments list. */
+export interface GitHubReviewThread {
+  threadId: string;
+  rootCommentId: number;
+  isResolved: boolean;
+  isOutdated: boolean;
+}
+
+export interface GitHubPullReviewThreadsResult {
+  repo: string;
+  pullNumber: number;
+  threads: GitHubReviewThread[];
+  /** True when GitHub reported more than the first page of review threads, so
+   *  the resolve controls only cover the first 100. */
+  truncated: boolean;
+}
+
+export interface GitHubCheckRun {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  htmlUrl: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export interface GitHubChecksResult {
+  repo: string;
+  pullNumber: number;
+  sha: string;
+  checkRuns: GitHubCheckRun[];
+}
+
+/** A single context entry in a commit's combined status (`GET
+ *  /commits/:ref/status`) — the legacy Status API, distinct from the
+ *  check-runs `GitHubChecksResult` above (some CI providers still only post
+ *  through this older API, so both are shown). */
+export interface GitHubCommitStatusContext {
+  context: string;
+  state: string;
+  description: string | null;
+  targetUrl: string | null;
+}
+
+/** Normalized combined-status payload — the shape `normalizeCommitStatus`
+ *  produces from the raw response, before the request-scoped `repo`/`ref`
+ *  are stitched on at the call site (see `GitHubCommitStatusResult`). */
+export interface GitHubCommitStatus {
+  state: "success" | "pending" | "failure" | "error" | "";
+  total: number;
+  statuses: GitHubCommitStatusContext[];
+}
+
+export interface GitHubCommitStatusResult extends GitHubCommitStatus {
+  repo: string;
+  ref: string;
+}
+
+/** A single commit on a pull request, from `GET /pulls/:n/commits`.
+ *  `messageHeadline` is the first line of the commit message; `author` prefers
+ *  the top-level GitHub-user `author` (has a `login`) over the raw git author,
+ *  falling back to null when the commit's author isn't a known GitHub user. */
+export interface GitHubPullCommit {
+  sha: string;
+  messageHeadline: string;
+  author: GitHubUser | null;
+  authoredDate: string;
+  htmlUrl: string;
+}
+
+export interface GitHubPullCommitsResult {
+  repo: string;
+  pullNumber: number;
+  commits: GitHubPullCommit[];
+}
+
+/** A repository release, from `GET /repos/:o/:r/releases` (F18). `body` is
+ *  the release notes markdown; `targetCommitish` is the branch/sha the tag
+ *  was (or will be) cut from. */
+export interface GitHubRelease {
+  id: number;
+  tagName: string;
+  name: string;
+  body: string;
+  draft: boolean;
+  prerelease: boolean;
+  publishedAt: string | null;
+  createdAt: string;
+  htmlUrl: string;
+  targetCommitish: string;
+}
+
+export interface GitHubReleasesResult {
+  repo: string;
+  releases: GitHubRelease[];
+}
+
+/** A repository tag, from `GET /repos/:o/:r/tags` — powers the release
+ *  manager's tag-name datalist (F18). Tags aren't paginated per-repo scope in
+ *  the UI, so this result carries no `repo` field (unlike the other list
+ *  results here). */
+export interface GitHubTag {
+  name: string;
+  commitSha: string;
+}
+
+export interface GitHubTagsResult {
+  tags: GitHubTag[];
+}
+
+/** A single GitHub Actions workflow run, from `GET
+ *  /repos/:o/:r/actions/runs` (F20). `status` is GitHub's coarse run state
+ *  (`queued` | `in_progress` | `completed` | …); `conclusion` is only set
+ *  once `status === "completed"` (`success` | `failure` | `cancelled` |
+ *  `skipped` | `neutral` | `timed_out` | `action_required` | …), null while
+ *  still running. */
+export interface GitHubWorkflowRun {
+  id: number;
+  name: string;
+  displayTitle: string;
+  status: string;
+  conclusion: string | null;
+  event: string;
+  headBranch: string;
+  runNumber: number;
+  htmlUrl: string;
+  createdAt: string;
+  workflowId: number;
+}
+
+export interface GitHubWorkflowRunsResult {
+  repo: string;
+  runs: GitHubWorkflowRun[];
+}
+
+/** A single workflow definition, from `GET /repos/:o/:r/actions/workflows`
+ *  (F20) — powers the "run a workflow" dispatch picker. `state` is
+ *  `active` | `disabled_manually` | … ; only `active` ones are dispatchable. */
+export interface GitHubWorkflow {
+  id: number;
+  name: string;
+  path: string;
+  state: string;
+}
+
+export interface GitHubWorkflowsResult {
+  workflows: GitHubWorkflow[];
+}
+
+/** An issue a pull request will close on merge (GraphQL
+ *  `closingIssuesReferences`), read-only — surfaced as a "Closes: #N" line. */
+export interface GitHubLinkedIssue {
+  number: number;
+  title: string;
+  url: string;
+  state: "OPEN" | "CLOSED";
+}
+
+export interface GitHubLinkedIssuesResult {
+  repo: string;
+  pullNumber: number;
+  issues: GitHubLinkedIssue[];
+}
+
+/** A child issue tracked under a parent via GitHub's sub-issues REST API
+ *  (`/issues/:number/sub_issues`). `id` is the child's REST database id —
+ *  distinct from its display `number` — because removing a sub-issue
+ *  (`DELETE /issues/:number/sub_issue`) addresses the child by id, not
+ *  number, so the UI needs it without a second round trip. */
+export interface GitHubSubIssue {
+  id: number;
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  htmlUrl: string;
+}
+
+export interface GitHubSubIssuesResult {
+  repo: string;
+  issueNumber: number;
+  subIssues: GitHubSubIssue[];
+}
+
+/** A repo-linked GitHub Projects v2 board, from GraphQL
+ *  `repository.projectsV2.nodes` (F21/G11). Projects v2 is GraphQL-only —
+ *  there's no REST equivalent. `number` is the project's board number (used
+ *  in its URL), distinct from the opaque GraphQL `id` every mutation keys on. */
+export interface GitHubProjectV2 {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+}
+
+export interface GitHubProjectsV2Result {
+  projects: GitHubProjectV2[];
+}
+
+/** A single-select field on a project (e.g. "Status"), with its selectable
+ *  options. Non-select fields (text, number, date, iteration…) are not
+ *  represented here — `options` is empty for any field this UI doesn't drive
+ *  a dropdown for. */
+export interface GitHubProjectField {
+  id: string;
+  name: string;
+  options: { id: string; name: string }[];
+}
+
+/** A single item on a project board — an Issue, PullRequest, or DraftIssue
+ *  (GraphQL `content.__typename`), plus its current value for the project's
+ *  "Status" single-select field (if any). `number`/`title` come from the
+ *  underlying content for Issue/PullRequest; a DraftIssue has no `number`
+ *  (null) and its own `title`. `contentType: "other"` covers any future
+ *  content type GraphQL might add that this UI doesn't special-case. */
+export interface GitHubProjectItem {
+  itemId: string;
+  contentType: "Issue" | "PullRequest" | "DraftIssue" | "other";
+  number: number | null;
+  title: string;
+  statusOptionId: string | null;
+  statusOptionName: string | null;
+}
+
+/** `statusField` is the project's field named "Status" (if it's a
+ *  single-select field) — the UI uses its `options` to populate each row's
+ *  status dropdown. Null when the project has no such field, in which case
+ *  the UI hides the status column entirely. */
+export interface GitHubProjectItemsResult {
+  items: GitHubProjectItem[];
+  statusField: GitHubProjectField | null;
+}
+
+/** A GitHub Discussions thread (GraphQL-only — F22/G12). `answered` is derived
+ *  from `isAnswered`/`answerChosenAt` — true once one of the thread's comments
+ *  has been marked the accepted answer. `author` is null for a deleted
+ *  account (GraphQL nulls the field rather than erroring). */
+export interface GitHubDiscussion {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  category: string;
+  author: string | null;
+  createdAt: string;
+  answered: boolean;
+}
+
+/** A Discussions category (e.g. "Q&A", "Announcements") — listed only to
+ *  populate the create-discussion form's category picker. Scope decision A2:
+ *  category *management* (create/edit/delete a category) is out of scope. */
+export interface GitHubDiscussionCategory {
+  id: string;
+  name: string;
+}
+
+/** `auth` mirrors `GitHubListResult.auth`: discussions are readable without a
+ *  token, but the UI gates create/comment/answer on `auth !== "none"` — any
+ *  authenticated user can do those, not just someone with push access (G12
+ *  gating note; distinct from every other manager panel, which gates writes
+ *  on push). */
+export interface GitHubDiscussionsResult {
+  discussions: GitHubDiscussion[];
+  categories: GitHubDiscussionCategory[];
+  auth: "token" | "none";
+}
+
+/** A single comment on a discussion thread. `isAnswer` reflects whether GitHub
+ *  currently has this comment marked as the discussion's accepted answer. */
+export interface GitHubDiscussionComment {
+  id: string;
+  body: string;
+  author: string | null;
+  createdAt: string;
+  isAnswer: boolean;
+}
+
+/** A discussion's full detail — body + comments. `answerable` reflects the
+ *  discussion's *category* (`category.isAnswerable`, e.g. "Q&A" is answerable,
+ *  "Announcements" isn't) — the UI hides the mark/unmark-answer control when
+ *  false regardless of who's viewing. */
+export interface GitHubDiscussionDetail {
+  id: string;
+  title: string;
+  body: string;
+  comments: GitHubDiscussionComment[];
+  answerable: boolean;
+}
+
+/** GitHub's mergeability verdict for a PR, from `GET /pulls/:n`.
+ *  `mergeable` is null while GitHub computes it in the background (poll again).
+ *  `mergeableState` is GitHub's coarse status: clean | dirty (conflicts) |
+ *  behind (base moved) | blocked (required reviews/checks) | unstable (checks
+ *  pending/failing but mergeable) | draft | has_hooks | unknown.
+ *  `autoMerge` reflects the REST `auto_merge` field (non-null once enabled). */
+export interface GitHubPullMergeability {
+  repo: string;
+  pullNumber: number;
+  mergeable: boolean | null;
+  mergeableState: string;
+  rebaseable: boolean | null;
+  merged: boolean;
+  draft: boolean;
+  headRef: string;
+  baseRef: string;
+  headSha: string;
+  autoMerge: boolean;
+}
+
+export type GitHubPullReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+export type GitHubPullMergeMethod = "merge" | "squash" | "rebase";
+
+export interface GitHubActionResult {
+  ok: true;
+  message?: string;
+  commentPosted?: boolean;
+}
+
+export interface GitHubPullMergeResult extends GitHubActionResult {
+  merged: boolean;
+  sha: string | null;
+}
+
+export interface GitHubPullDefaultsResult {
+  repo: string;
+  head: string;
+  base: string;
+}
+
+export type GitHubReactionContent = "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" | "rocket" | "eyes";
+
+/** Discriminates which entity a reaction (or reaction list) targets. For `issue`,
+ *  `id` is the issue/PR **number** — issues and PRs share the
+ *  `/issues/:number/reactions` endpoint. `issueComment` / `reviewComment` carry a
+ *  comment's REST id (`/issues/comments/:id` vs `/pulls/comments/:id`). */
+export interface GitHubReactionSubject {
+  type: "issue" | "issueComment" | "reviewComment";
+  id: number;
+}
+
+/** One content's aggregated reaction count for a subject, plus the viewer's own
+ *  reaction id (non-null only when the viewer has reacted with this content) so
+ *  the UI can toggle a chip off via DELETE without a second lookup. */
+export interface GitHubReactionSummary {
+  content: GitHubReactionContent;
+  count: number;
+  viewerReactionId: number | null;
+}
+
+export interface GitHubReactionsResult {
+  reactions: GitHubReactionSummary[];
+}
+
+/** A GitHub notification thread (`GET /notifications`), scoped to the current
+ *  repo (F14). `subjectType` is GitHub's own subject kind ("PullRequest",
+ *  "Issue", "Commit", "Discussion", …) — not narrowed to `GitHubItemKind`
+ *  since notifications cover subjects the rest of the UI doesn't model.
+ *  `subjectUrl`/`latestCommentUrl` are api.github.com URLs (or null); the UI
+ *  opens whichever is present via `api.openExternal`. */
+export interface GitHubNotification {
+  id: string;
+  unread: boolean;
+  reason: string;
+  updatedAt: string;
+  title: string;
+  subjectType: string;
+  subjectUrl: string | null;
+  /** Browsable HTML URL derived from `subjectUrl` (api.github.com → github.com),
+   *  so the UI opens the page rather than the raw JSON. Null when not derivable. */
+  htmlUrl: string | null;
+  latestCommentUrl: string | null;
+  repo: string;
+}
+
+export interface GitHubNotificationsResult {
+  repo: string;
+  notifications: GitHubNotification[];
+}
+
 /**
  * Streams the run panel listens on. Codex (and any unstructured agent)
  * uses the flat trio: stdout / stderr / status. Claude's JSONL is parsed
@@ -809,6 +1677,13 @@ export interface Subagent {
   spawnDepth: number;
   /** Absolute path to the subagent's JSONL transcript. */
   sourcePath: string;
+  /** The parent `Agent` tool_use id (meta.json.toolUseId) — the correlation
+   *  key used to settle this row off a `tool_result` block in the MAIN
+   *  session JSONL when the subagent's own transcript never writes a
+   *  terminal end_turn line. Null pre-fix / when the meta sidecar lacked it.
+   *  Optional (not just nullable) so object literals built before this field
+   *  existed — fixtures across several test files — still satisfy the type. */
+  toolUseId?: string | null;
   status: SubagentStatus;
   startedAt: number;
   endedAt: number | null;
@@ -946,43 +1821,72 @@ export interface ToolResultEventData {
 }
 
 /**
- * A working directory the user has registered as a "project". Surfaced in the
- * workdir picker on the New Task form so common paths don't need to be typed
- * every time. Auto-populated on `createTask`; explicit entries come from the
- * native folder dialog (POST /projects/pick).
+ * The "Commit & push" follow-up prompt, shared by the webview's RunPanel chip
+ * and the CLI's `agetor commit` / dashboard `c` action so the instruction stays
+ * identical across surfaces.
+ *
+ * The commit-subject type is derived from the task's branch prefix, so the
+ * commit matches the project's branch nomenclature (`feature/x` → `feature:`),
+ * falling back to feat/fix/chore by task type when the branch carries no
+ * prefix. The branch is shell-quoted because git ref names may legally contain
+ * shell metacharacters; `'\''` is the POSIX escape for an embedded quote.
+ *
+ * After the commit/push, the prompt also asks the agent to propose a pull
+ * request title and description, each emitted in its own fenced code block so
+ * agetor renders a one-click copy button per field — the user copies the title
+ * into the New PR composer's Title field and the description into its
+ * Description field without a second turn. Two blocks (not one) because the
+ * composer has two separate fields; the copy button grabs a whole fenced block.
+ *
+ * The description block uses a FOUR-backtick fence on purpose: PR descriptions
+ * routinely contain their own ``` code fences (test output, snippets), and a
+ * 3-backtick outer fence is closed early by the first inner ```, truncating the
+ * copied text. A 4-backtick fence is closed only by >=4 backticks, so inner ```
+ * blocks survive verbatim (verified against micromark, react-markdown's parser:
+ * 4-tick outer -> one <pre>; 3-tick outer -> two, split at the inner fence).
  */
-/** The canned "Commit & push" follow-up prompt, shared by the webview's
- *  RunPanel chip and the CLI's `agetor commit` / dashboard `c` action so the
- *  instruction stays identical across surfaces. */
-export const COMMIT_PUSH_PROMPT =
-  "Commit all changes with a clear, conventional commit message " +
-  "summarizing the work and push the current branch to origin. " +
-  "If the branch has no upstream yet, set it with `git push -u origin <branch>`.";
-
-/** A branch in a project repo, as returned by `GET /projects/branches`.
- *  Single source of truth shared by the server, webview, and CLI. */
-export interface BranchInfo {
-  /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */
-  name: string;
-  /** Unix-ms timestamp of the tip commit, used to sort recents first. */
-  committedAt: number;
-  /** True for the branch currently checked out at the queried dir. */
-  current: boolean;
-  /** True for remote-tracking refs (`refs/remotes/<remote>/<name>`). */
-  remote: boolean;
+export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): string {
+  const ccType = branchCommitType(task.branch, task.taskType);
+  const branchLabel = task.branch ? `'${task.branch.replace(/'/g, "'\\''")}'` : "<branch>";
+  return (
+    `Commit all changes with a clear commit message ` +
+    `(prefix the subject with "${ccType}:", e.g. "${ccType}: ...") summarizing the work, ` +
+    `then push the current branch to origin. ` +
+    `If the branch has no upstream yet, set it with \`git push -u origin ${branchLabel}\`. ` +
+    `After pushing, propose the pull request as two fenced code blocks so each can be ` +
+    `copied with one click: first a "PR title:" line followed by a \`\`\` block containing ` +
+    `only the concise one-line title, then a "PR description:" line followed by a ` +
+    `\`\`\`\` four-backtick block containing the description in markdown (what changed and ` +
+    `why) — use four backticks so any \`\`\` code fences inside the description don't ` +
+    `close the block early.`
+  );
 }
 
+/**
+ * A working directory the user has registered as a "project". Surfaced in the
+ * workdir picker on the New Task form so common paths don't need to be typed
+ * every time. Explicit entries come from the native folder dialog
+ * (POST /projects/pick).
+ */
 export interface Project {
   path: string;
   name: string;
   addedAt: number;
+  /**
+   * Per-project branch nomenclature. Null when the user hasn't customized it —
+   * consumers fall back to {@link DEFAULT_BRANCH_CONFIG}.
+   */
+  branchConfig: BranchNamingConfig | null;
 }
 
 /**
- * A branch surfaced by the new-task base-ref picker. Shared so the server
- * (`listBranches` in src/bun/worktree.ts) and the webview (`api.ts` /
- * `BranchPicker`) agree on a single wire shape — the previous per-side copies
- * had already silently drifted (the client one omitted `remote`).
+ * A branch in a project repo, as returned by `GET /projects/branches` and
+ * surfaced by the new-task base-ref picker. The single source of truth shared
+ * by the server (`listBranches` in src/bun/worktree.ts), the webview (`api.ts` /
+ * `BranchPicker`), and the CLI — the previous per-side copies had already
+ * silently drifted (the client one omitted `remote`). Keep it that way: do not
+ * re-declare this interface, since TypeScript would silently merge the two
+ * declarations rather than flag the duplicate.
  */
 export interface BranchInfo {
   /** Short ref name, e.g. "main", "feature/x", or "origin/feature/x". */
@@ -1011,3 +1915,197 @@ export interface BranchInfo {
  * the shape is now per-harness (multiple rows can share a `kind`).
  */
 export type AgentStatus = HarnessStatus;
+
+/**
+ * Multi-provider git-forge support (docs/plans/multi-provider-git-modal.md).
+ * `canonicalGitHost` in `src/bun/github.ts` already maps any host containing
+ * "github"/"gitlab"/"bitbucket" to the provider's cloud hostname — this is
+ * the provider identifier that maps to that canonical host 1:1.
+ */
+export type GitProvider = "github" | "gitlab" | "bitbucket";
+
+/**
+ * A resolved provider + repo identity for a project directory, as returned by
+ * `providerRepoForDir` (`src/bun/git-provider.ts`) and the `provider-info`
+ * route consumed by the GitHub/GitLab/Bitbucket dialog.
+ */
+export interface ProviderRepoInfo {
+  provider: GitProvider;
+  /** Canonical provider host, e.g. "gitlab.com" — NOT the token-store key. */
+  host: string;
+  /** Raw (pre-canonicalization) remote host — e.g. the ssh-alias host a user
+   *  pins per-identity in `~/.ssh/config`. This is the token-store key (see
+   *  `github-tokens.ts`'s host-keyed store and `docs/plans/github-multi-identity-tokens.md`) —
+   *  callers resolving a token for this repo must use `remoteHost`, not `host`. */
+  remoteHost: string;
+  owner: string;
+  name: string;
+}
+
+/**
+ * Per-provider feature flags + terminology driving the GitHub/GitLab/Bitbucket
+ * dialog's gating (Wave 4, `GitHubDialog.tsx`): affordances the selected
+ * provider doesn't support are hidden rather than shown broken. GitHub is the
+ * baseline the dialog was originally built against, so every flag is `true`
+ * there; GitLab/Bitbucket flip off whatever their APIs can't back (see the
+ * provider API facts in the plan's §2 for the source of each flag).
+ */
+export interface ProviderCaps {
+  labels: boolean;
+  milestones: boolean;
+  /** GitHub's raw search-qualifier syntax (`label:bug sort:updated`) — GitHub
+   *  only; GitLab/Bitbucket use structured filters instead. */
+  searchSyntax: boolean;
+  reviewRequestedFilter: boolean;
+  checks: boolean;
+  /** The separate GitHub commit-status panel (distinct from the CheckRuns UI,
+   *  which GitLab/Bitbucket statuses are normalized into instead). */
+  commitStatusPanel: boolean;
+  reactions: boolean;
+  draft: boolean;
+  autoMerge: boolean;
+  suggestions: boolean;
+  subIssues: boolean;
+  projects: boolean;
+  discussions: boolean;
+  actions: boolean;
+  notifications: boolean;
+  releases: boolean;
+  issueTracker: boolean;
+  requestChanges: boolean;
+  updateBranch: boolean;
+  linkedIssues: boolean;
+  commentSort: boolean;
+  lockConversation: boolean;
+  pinIssue: boolean;
+  issueTransfer: boolean;
+  mergeMethods: GitHubPullMergeMethod[];
+  providerName: string;
+  /** Singular term for a "pull request" in this provider's own terminology. */
+  pullNoun: string;
+  pullNounPlural: string;
+  pullAbbrev: string;
+  pullAbbrevPlural: string;
+}
+
+/**
+ * Per-provider capability + terminology table. GitHub is full-featured (the
+ * dialog's original baseline); GitLab and Bitbucket flip off flags for panels
+ * and actions their APIs don't support (Projects/Discussions/Actions/
+ * Notifications/Releases/Reactions/SubIssues/Suggestions/AutoMerge/
+ * UpdateBranch/LinkedIssues/CommentSort/Lock/Pin/Transfer are GitHub-only).
+ *
+ * `mergeMethods` reuses {@link GitHubPullMergeMethod} ("merge"|"squash"|"rebase")
+ * as the neutral merge-strategy vocabulary:
+ * - GitHub: merge, squash, rebase (all three, unchanged).
+ * - GitLab: merge, squash (GitLab has no rebase-as-a-merge-strategy option —
+ *   its "rebase" action rewrites the branch before merging, it isn't a merge
+ *   strategy choice like GitHub's).
+ * - Bitbucket: merge, squash, rebase — Bitbucket's three `merge_strategy`
+ *   values are `merge_commit` / `squash` / `fast_forward`. There is no
+ *   fast-forward entry in {@link GitHubPullMergeMethod}, so `fast_forward`
+ *   (a linear, no-merge-commit history — the same end result GitHub's
+ *   "rebase and merge" produces) is mapped to `"rebase"` here; the adapter
+ *   (Wave 2/T3, `src/bun/bitbucket.ts`) is responsible for translating
+ *   `"rebase"` back to `merge_strategy: "fast_forward"` on the wire.
+ */
+export const PROVIDER_CAPS: Record<GitProvider, ProviderCaps> = {
+  github: {
+    labels: true,
+    milestones: true,
+    searchSyntax: true,
+    reviewRequestedFilter: true,
+    checks: true,
+    commitStatusPanel: true,
+    reactions: true,
+    draft: true,
+    autoMerge: true,
+    suggestions: true,
+    subIssues: true,
+    projects: true,
+    discussions: true,
+    actions: true,
+    notifications: true,
+    releases: true,
+    issueTracker: true,
+    requestChanges: true,
+    updateBranch: true,
+    linkedIssues: true,
+    commentSort: true,
+    lockConversation: true,
+    pinIssue: true,
+    issueTransfer: true,
+    mergeMethods: ["merge", "squash", "rebase"],
+    providerName: "GitHub",
+    pullNoun: "Pull request",
+    pullNounPlural: "Pull requests",
+    pullAbbrev: "PR",
+    pullAbbrevPlural: "PRs",
+  },
+  gitlab: {
+    labels: true,
+    milestones: false,
+    searchSyntax: false,
+    reviewRequestedFilter: true,
+    checks: true,
+    commitStatusPanel: false,
+    reactions: false,
+    draft: true,
+    autoMerge: false,
+    suggestions: false,
+    subIssues: false,
+    projects: false,
+    discussions: false,
+    actions: false,
+    notifications: false,
+    releases: false,
+    issueTracker: true,
+    requestChanges: false,
+    updateBranch: false,
+    linkedIssues: false,
+    commentSort: false,
+    lockConversation: false,
+    pinIssue: false,
+    issueTransfer: false,
+    mergeMethods: ["merge", "squash"],
+    providerName: "GitLab",
+    pullNoun: "Merge request",
+    pullNounPlural: "Merge requests",
+    pullAbbrev: "MR",
+    pullAbbrevPlural: "MRs",
+  },
+  bitbucket: {
+    labels: false,
+    milestones: false,
+    searchSyntax: false,
+    reviewRequestedFilter: true,
+    checks: true,
+    commitStatusPanel: false,
+    reactions: false,
+    draft: true,
+    autoMerge: false,
+    suggestions: false,
+    subIssues: false,
+    projects: false,
+    discussions: false,
+    actions: false,
+    notifications: false,
+    releases: false,
+    issueTracker: true,
+    requestChanges: true,
+    updateBranch: false,
+    linkedIssues: false,
+    commentSort: false,
+    lockConversation: false,
+    pinIssue: false,
+    issueTransfer: false,
+    // merge_commit/squash/fast_forward → merge/squash/rebase; see the
+    // ProviderCaps doc comment above for the fast_forward↔"rebase" mapping.
+    mergeMethods: ["merge", "squash", "rebase"],
+    providerName: "Bitbucket",
+    pullNoun: "Pull request",
+    pullNounPlural: "Pull requests",
+    pullAbbrev: "PR",
+    pullAbbrevPlural: "PRs",
+  },
+};

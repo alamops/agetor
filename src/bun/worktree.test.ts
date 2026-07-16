@@ -49,7 +49,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     mode: null,
     model: null,
     effort: null,
-    references: [],
+    references: [],    backlog: [],
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,
@@ -100,6 +100,103 @@ test("prepareWorkdir creates a worktree + branch inside a git repo", async () =>
   expect(r.worktreePath).toBe(r.cwd);
   // The README from the base commit should be present in the new worktree.
   expect(existsSync(path.join(r.cwd, "README"))).toBe(true);
+});
+
+test("isBranchNameTakenError matches both git collision wordings, not a stale worktree dir", async () => {
+  const { isBranchNameTakenError } = await import("./worktree.ts");
+  // Both strings captured verbatim from real `git worktree add` failures.
+  // Re-attach form: `git worktree add <path> <branch>` when it's checked out elsewhere.
+  expect(isBranchNameTakenError("fatal: 'feature/x' is already used by worktree at '/tmp/wt-b'")).toBe(true);
+  // New-branch form: `git worktree add -b <branch> <path>` when a twin created it first.
+  expect(isBranchNameTakenError("fatal: a branch named 'feature/x' already exists")).toBe(true);
+  // Older git phrasing for the re-attach form.
+  expect(isBranchNameTakenError("fatal: 'feature/x' is already checked out at '/tmp/wt-b'")).toBe(true);
+  // A stale worktree *directory* is not a name collision — re-pinning wouldn't help.
+  expect(isBranchNameTakenError("fatal: '/tmp/wt-a' already exists")).toBe(false);
+  expect(isBranchNameTakenError("fatal: invalid reference: nope")).toBe(false);
+});
+
+test("prepareWorkdir re-pins a unique branch when the pinned name is already checked out (create-time race)", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  // Task A pins and materializes feature/x.
+  const a = fakeTask({ workdir: repo, branch: "feature/x" });
+  const ra = await prepareWorkdir(a);
+  if ("error" in ra) throw new Error(ra.error);
+  expect(ra.branch).toBe("feature/x");
+  // Task B raced A at create time and pinned the SAME branch. Materializing it
+  // must not fail trying to check the already-checked-out branch into a second
+  // worktree — it should recover onto a unique variant.
+  const b = fakeTask({ workdir: repo, branch: "feature/x" });
+  const rb = await prepareWorkdir(b);
+  if ("error" in rb) throw new Error(rb.error);
+  expect(rb.branch).not.toBe("feature/x");
+  expect(rb.branch!.startsWith("feature/x")).toBe(true);
+  expect(existsSync(rb.worktreePath!)).toBe(true);
+});
+
+test("prepareWorkdir re-pin never steals a branch another task has pinned but not started", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const a = fakeTask({ workdir: repo, branch: "feature/y" });
+  const ra = await prepareWorkdir(a);
+  if ("error" in ra) throw new Error(ra.error);
+  // Task B raced onto feature/y; task C has already pinned feature/y-2 but has
+  // no ref yet, so a ref-only search would hand B that name. Pass it as taken.
+  const b = fakeTask({ workdir: repo, branch: "feature/y" });
+  const rb = await prepareWorkdir(b, { takenBranches: new Set(["feature/y-2"]) });
+  if ("error" in rb) throw new Error(rb.error);
+  expect(rb.branch).not.toBe("feature/y");
+  expect(rb.branch).not.toBe("feature/y-2");
+  expect(rb.branch).toBe("feature/y-3");
+});
+
+test("prepareWorkdir re-attaches (keeps branch + prior commits) when the worktree dir was deleted", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+
+  const r1 = await prepareWorkdir(task);
+  if ("error" in r1) throw new Error(r1.error);
+  // The previous run makes a commit on the task's branch.
+  writeFileSync(path.join(r1.cwd, "work.txt"), "agent output\n");
+  await git(["add", "."], r1.cwd);
+  await git(["commit", "-m", "prior run"], r1.cwd);
+  rmSync(r1.cwd, { recursive: true, force: true });
+
+  // The persisted row: worktreePath set (it HAS materialized), branch pinned.
+  const rerun = { ...task, branch: r1.branch, worktreePath: r1.worktreePath };
+  const r2 = await prepareWorkdir(rerun);
+  if ("error" in r2) throw new Error(r2.error);
+  // Must re-attach to the SAME branch, not re-pin off base — the commit survives.
+  expect(r2.branch).toBe(r1.branch);
+  expect(existsSync(path.join(r2.cwd, "work.txt"))).toBe(true);
+});
+
+test("prepareWorkdir errors (does NOT re-pin) when a materialized task's branch is checked out elsewhere", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const task = fakeTask({ workdir: repo });
+
+  const r1 = await prepareWorkdir(task);
+  if ("error" in r1) throw new Error(r1.error);
+  writeFileSync(path.join(r1.cwd, "work.txt"), "agent output\n");
+  await git(["add", "."], r1.cwd);
+  await git(["commit", "-m", "prior run"], r1.cwd);
+
+  // User deletes the worktree dir, then checks the branch out somewhere else
+  // (e.g. in their main repo) to inspect the agent's work.
+  rmSync(r1.cwd, { recursive: true, force: true });
+  await git(["worktree", "prune"], repo);
+  // `git worktree add` requires a path that doesn't exist yet.
+  const elsewhere = path.join(mkdtempSync(path.join(tmpdir(), "agetor-wt-elsewhere-")), "wt");
+  await git(["worktree", "add", elsewhere, r1.branch!], repo);
+
+  // Re-running must surface a hard error, NOT silently re-pin to a fresh branch
+  // off base — that would orphan the "prior run" commit.
+  const rerun = { ...task, branch: r1.branch, worktreePath: r1.worktreePath };
+  const r2 = await prepareWorkdir(rerun);
+  expect("error" in r2).toBe(true);
 });
 
 test("gitWritableRootsSync returns the source repo's .git for a linked worktree", async () => {
@@ -358,6 +455,20 @@ test("getTaskDiff truncates a huge file's body but keeps honest line counts", as
   // Body is capped, but the additions count reflects the full file, not 0.
   expect(huge!.hunks.length).toBeLessThanOrEqual(200_000);
   expect(huge!.additions).toBe(lineCount);
+});
+
+test("parseGitDiff keeps the path for binary-only file sections", async () => {
+  const { parseGitDiff } = await import("./git-diff.ts");
+  const files = parseGitDiff([
+    "diff --git a/assets/logo.png b/assets/logo.png",
+    "index 1234567..89abcde 100644",
+    "Binary files a/assets/logo.png and b/assets/logo.png differ",
+    "",
+  ].join("\n"));
+
+  expect(files).toHaveLength(1);
+  expect(files[0]?.path).toBe("assets/logo.png");
+  expect(files[0]?.binary).toBe(true);
 });
 
 test("removeWorktree tears down both the worktree and the branch", async () => {
@@ -646,6 +757,58 @@ test("gitPull rejects a branch name that could be read as a git flag", async () 
   expect(r.error).toContain("invalid branch name");
 });
 
+test("gitPush pushes a local-only branch to origin and sets its upstream", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  // origin stays checked out on main; pushing a *different* new branch to a
+  // non-bare repo is allowed (only a push to the checked-out branch is denied).
+  const origin = await makeRepo();
+  const clone = mkdtempSync(path.join(tmpdir(), "agetor-wt-push-clone-"));
+  await git(["clone", origin, clone], path.dirname(clone));
+
+  await git(["checkout", "-b", "feature/pushme"], clone);
+  writeFileSync(path.join(clone, "work.txt"), "local work\n");
+  await git(["add", "."], clone);
+  await git(["commit", "-m", "local work"], clone);
+
+  const r = await gitPush(clone, "feature/pushme");
+  expect(r.ok).toBe(true);
+  expect(r.remote).toBe("origin");
+
+  // origin now has the branch, and the clone tracks it.
+  const onOrigin = Bun.spawnSync(["git", "rev-parse", "--verify", "feature/pushme"], { cwd: origin });
+  expect(onOrigin.exitCode).toBe(0);
+  const upstream = Bun.spawnSync(
+    ["git", "rev-parse", "--abbrev-ref", "feature/pushme@{upstream}"],
+    { cwd: clone },
+  );
+  expect(new TextDecoder().decode(upstream.stdout).trim()).toBe("origin/feature/pushme");
+});
+
+test("gitPush errors when the repo has no remote configured", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  await git(["checkout", "-b", "feature/local"], repo);
+  const r = await gitPush(repo, "feature/local");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("no git remote");
+});
+
+test("gitPush rejects a branch name that could be read as a git flag", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const r = await gitPush(repo, "--upload-pack=evil");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("invalid branch name");
+});
+
+test("gitPush returns an error when the dir isn't a git repo", async () => {
+  const { gitPush } = await import("./worktree.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-push-nongit-"));
+  const r = await gitPush(dir, "main");
+  expect(r.ok).toBe(false);
+  expect(r.error).toContain("not a git repository");
+});
+
 describe("getAheadCount", () => {
   test("returns null when the dir doesn't exist", async () => {
     const { getAheadCount } = await import("./worktree.ts");
@@ -714,5 +877,131 @@ describe("getAheadCount", () => {
     const { getAheadCount } = await import("./worktree.ts");
     const repo = await makeRepo();
     expect(await getAheadCount(repo, "no-such-ref")).toBeNull();
+  });
+});
+
+describe("detachWorktree", () => {
+  test("removes the checkout but keeps the branch and its commits", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    writeFileSync(path.join(created.cwd, "work.txt"), "agent output\n");
+    await git(["add", "."], created.cwd);
+    await git(["commit", "-m", "agent work"], created.cwd);
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live);
+    expect(result).toEqual({ removed: true });
+    expect(existsSync(created.cwd)).toBe(false);
+
+    // The branch must survive in the source repo — that's the whole point of
+    // detach vs removeWorktree.
+    const branchProc = Bun.spawn(["git", "branch", "--list", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const branchOut = (await new Response(branchProc.stdout).text()).trim();
+    await branchProc.exited;
+    expect(branchOut).toContain(created.branch!);
+
+    // The commit made inside the (now-removed) worktree is still reachable on
+    // the branch in the source repo.
+    const logProc = Bun.spawn(["git", "log", "--oneline", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const log = (await new Response(logProc.stdout).text()).trim();
+    await logProc.exited;
+    expect(log).toContain("agent work");
+  });
+
+  test("round-trip: prepareWorkdir re-materializes the checkout at the same path with the prior commit intact", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    writeFileSync(path.join(created.cwd, "work.txt"), "agent output\n");
+    await git(["add", "."], created.cwd);
+    await git(["commit", "-m", "agent work"], created.cwd);
+
+    // The orchestrator keeps worktreePath + branch on the task row across
+    // detach (that's what makes the later re-attach deterministic).
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const detached = await detachWorktree(live);
+    expect(detached).toEqual({ removed: true });
+    expect(existsSync(created.cwd)).toBe(false);
+
+    const restored = await prepareWorkdir(live);
+    if ("error" in restored) throw new Error(restored.error);
+    expect(restored.cwd).toBe(created.cwd);
+    expect(restored.worktreePath).toBe(created.worktreePath);
+    expect(restored.branch).toBe(created.branch);
+    expect(existsSync(path.join(restored.cwd, "work.txt"))).toBe(true);
+  });
+
+  test("skips removal when the worktree has uncommitted changes", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    writeFileSync(path.join(created.cwd, "dirty.txt"), "uncommitted\n");
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live);
+    expect(result).toEqual({ removed: false, reason: "dirty" });
+    expect(existsSync(created.cwd)).toBe(true);
+    expect(existsSync(path.join(created.cwd, "dirty.txt"))).toBe(true);
+  });
+
+  test("no-op when the task never materialized a worktree", async () => {
+    const { detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo, worktreePath: null, branch: null });
+    const result = await detachWorktree(task);
+    expect(result).toEqual({ removed: false, reason: "no-worktree" });
+  });
+
+  test("no-op when the worktree dir is already gone", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+    rmSync(created.cwd, { recursive: true, force: true });
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live);
+    expect(result).toEqual({ removed: false, reason: "already-absent" });
+  });
+
+  test("detaching twice is idempotent — second call reports already-absent without throwing", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const first = await detachWorktree(live);
+    expect(first).toEqual({ removed: true });
+
+    const second = await detachWorktree(live);
+    expect(second).toEqual({ removed: false, reason: "already-absent" });
+
+    // Branch still exists throughout — detach never deletes it.
+    const branchProc = Bun.spawn(["git", "branch", "--list", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const branchOut = (await new Response(branchProc.stdout).text()).trim();
+    await branchProc.exited;
+    expect(branchOut).toContain(created.branch!);
   });
 });

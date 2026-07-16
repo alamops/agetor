@@ -23,10 +23,15 @@ import m020 from "./020_task_type.sql" with { type: "text" };
 import m021 from "./021_codex_session_id.sql" with { type: "text" };
 import m022 from "./022_subagents.sql" with { type: "text" };
 import m023 from "./023_run_origin.sql" with { type: "text" };
-// 024–027 landed on main (reseed_harness_builtins, task_backlog,
-// project_branch_config, subagent_tool_use_id) while this branch was in
-// flight; grok's migrations take 028/029. The concurrent cursor-agent branch
-// renumbers likewise when it merges.
+import m024 from "./024_reseed_harness_builtins.sql" with { type: "text" };
+import m025 from "./025_task_backlog.sql" with { type: "text" };
+// Appends after main's 022–025 (this branch originally used 024, renumbered on
+// merge to avoid the clash with 024_reseed_harness_builtins).
+import m026 from "./026_project_branch_config.sql" with { type: "text" };
+import m027 from "./027_subagent_tool_use_id.sql" with { type: "text" };
+// grok's migrations were renumbered twice in flight (024→026→028) as main and
+// this branch raced; the concurrent cursor-agent branch renumbers likewise
+// when it merges.
 import m028 from "./028_grok_harness.sql" with { type: "text" };
 import m029 from "./029_grok_session_id.sql" with { type: "text" };
 
@@ -56,6 +61,10 @@ export const migrations: Migration[] = [
   { id: "021_codex_session_id", sql: m021 },
   { id: "022_subagents", sql: m022 },
   { id: "023_run_origin", sql: m023 },
+  { id: "024_reseed_harness_builtins", sql: m024 },
+  { id: "025_task_backlog", sql: m025 },
+  { id: "026_project_branch_config", sql: m026 },
+  { id: "027_subagent_tool_use_id", sql: m027 },
   { id: "028_grok_harness", sql: m028 },
   { id: "029_grok_session_id", sql: m029 },
 ];

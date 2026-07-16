@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
-import { AlertTriangle, Settings, X } from "lucide-react";
+import { AlertTriangle, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
+import { GitHubDialog } from "@/components/kanban/GitHubDialog";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -16,6 +17,7 @@ import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/componen
 import { UpdateBanner } from "@/components/updater/UpdateBanner";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
+import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
@@ -85,6 +87,7 @@ export default function App() {
   const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [githubOpen, setGithubOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -111,8 +114,15 @@ export default function App() {
     return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
   }, []);
 
-  const refresh = async () => {
-    try { setTasks(await api.listTasks()); } catch { /* keep last good snapshot; retry next tick */ }
+  /** Re-list tasks. Returns the fetched list so callers that need to inspect a
+   *  task right after a mutation don't have to issue a second GET. `null` on
+   *  failure — the last good snapshot stays rendered and the poll retries. */
+  const refresh = async (): Promise<Task[] | null> => {
+    try {
+      const list = await api.listTasks();
+      setTasks(list);
+      return list;
+    } catch { return null; /* keep last good snapshot; retry next tick */ }
   };
   const refreshAgents = async () => {
     try {
@@ -431,11 +441,25 @@ export default function App() {
     }
   };
 
+  // `startTask` materializes the worktree, which can re-pin the branch when a
+  // create-time uniqueness race is only detectable once the branch actually
+  // exists. Surface the change so the user isn't left believing the name they
+  // saw. Reads the new branch out of the refresh we already do — no extra GET.
+  // Best-effort: if the refresh failed, the 2s poll still shows the real branch.
+  const startAndNotifyBranch = async (taskId: string, branchBefore: string | null) => {
+    await api.startTask(taskId);
+    const list = await refresh();
+    if (!branchBefore || !list) return;
+    const after = list.find((t) => t.id === taskId);
+    if (after?.branch && after.branch !== branchBefore) {
+      toast(`Branch changed to “${after.branch}” — “${branchBefore}” was already taken.`);
+    }
+  };
+
   const start = async (t: Task) => {
     try {
       setError(null);
-      await api.startTask(t.id);
-      await refresh();
+      await startAndNotifyBranch(t.id, t.branch);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // tmux-missing errors get a guided fix dialog instead of a toast — the
@@ -581,6 +605,15 @@ export default function App() {
           <Button
             variant="ghost"
             size="icon"
+            onClick={() => setGithubOpen(true)}
+            aria-label="Git"
+            title="Git pull requests and issues (GitHub, GitLab, Bitbucket)"
+          >
+            <GitPullRequest className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={() => setSettingsOpen(true)}
             aria-label="Settings"
             title="Settings"
@@ -605,10 +638,17 @@ export default function App() {
                 ...input,
                 column: start ? "ready" : "backlog",
               });
+              // The server makes the branch unique within the repo, so the
+              // pinned name can differ from what the sidebar showed (a
+              // same-name task already exists). Surface the final name rather
+              // than let the user assume the one they saw.
+              if (input.branch && created.branch && created.branch !== input.branch) {
+                toast(`Branch set to “${created.branch}” to keep it unique.`);
+              }
               await refresh();
               if (start) {
-                await api.startTask(created.id);
-                await refresh();
+                // Refreshes internally, so no second refresh here.
+                await startAndNotifyBranch(created.id, created.branch);
               }
             } catch (e) {
               setError(e instanceof Error ? e.message : String(e));
@@ -684,9 +724,14 @@ export default function App() {
       />
       <DiffDialog
         open={!!diffTask}
-        taskId={diffTask?.id ?? null}
-        taskTitle={diffTask?.title}
+        task={diffTask ? (tasks.find((t) => t.id === diffTask.id) ?? diffTask) : null}
         onClose={() => setDiffTask(null)}
+      />
+      <GitHubDialog
+        open={githubOpen}
+        projects={projects}
+        initialProjectPath={repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        onClose={() => setGithubOpen(false)}
       />
       <SettingsDialog
         open={settingsOpen}

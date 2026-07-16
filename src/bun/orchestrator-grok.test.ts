@@ -92,7 +92,7 @@ test("sendInput (grok, idle) spawns a NEW run row that resumes the same session"
   await settle(); // let the first turn resolve (fake done at ~20ms)
 
   const firstRunId = "runId" in started ? started.runId : "";
-  const res = sendInput(firstRunId, "turn two");
+  const res = await sendInput(firstRunId, "turn two");
   expect(res.delivered).toBe(true);
   await settle();
 
@@ -133,7 +133,7 @@ test("sendInput (grok, busy) queues the follow-up; it spawns after the active tu
 
   // Send immediately — the first turn's fake hasn't resolved yet, so this
   // folds into the queue and reports the still-active run id.
-  const res = sendInput(firstRunId, "queued turn");
+  const res = await sendInput(firstRunId, "queued turn");
   expect(res.delivered).toBe(true);
   if (res.delivered) expect(res.runId).toBe(firstRunId); // attached to active run
 
@@ -209,7 +209,7 @@ test("archiveTask (grok) tears down the session + queue without throwing", async
   // archiveTask requires column 'done'.
   tasks.update(taskId, { column: "done" });
 
-  const archived = archiveTask(taskId);
+  const archived = await archiveTask(taskId);
   if ("error" in archived) throw new Error(archived.error);
   expect(archived.task.archivedAt).not.toBeNull();
 

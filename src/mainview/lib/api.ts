@@ -3,8 +3,63 @@ import type {
   AgentStatus,
   AppEvent,
   BranchInfo,
+  BranchNamingConfig,
   ColumnId,
   GlobalEvent,
+  GitHubItemKind,
+  GitHubItemState,
+  GitHubCheckRun,
+  GitHubComment,
+  GitHubCommentsResult,
+  GitHubChecksResult,
+  GitHubCommitStatus,
+  GitHubCommitStatusResult,
+  GitHubAssigneesResult,
+  GitProvider,
+  GitHubDiscussion,
+  GitHubDiscussionCategory,
+  GitHubDiscussionComment,
+  GitHubDiscussionDetail,
+  GitHubDiscussionsResult,
+  GitHubLabelsResult,
+  GitHubRepoLabel,
+  GitHubMilestonesResult,
+  GitHubRepoMilestone,
+  GitHubLinkedIssue,
+  GitHubLinkedIssuesResult,
+  GitHubListResult,
+  GitHubNotification,
+  GitHubNotificationsResult,
+  GitHubPullCommit,
+  GitHubPullCommitsResult,
+  GitHubPullDefaultsResult,
+  GitHubPullLineComment,
+  GitHubPullMergeability,
+  GitHubPullMergeMethod,
+  GitHubPullReviewCommentsResult,
+  GitHubPullReviewThreadsResult,
+  GitHubPullMergeResult,
+  GitHubPullReviewEvent,
+  GitHubProjectField,
+  GitHubProjectItem,
+  GitHubProjectItemsResult,
+  GitHubProjectV2,
+  GitHubProjectsV2Result,
+  GitHubReactionContent,
+  GitHubReactionsResult,
+  GitHubReactionSubject,
+  GitHubReactionSummary,
+  GitHubRelease,
+  GitHubReleasesResult,
+  GitHubRepoPermissions,
+  GitHubSubIssue,
+  GitHubSubIssuesResult,
+  GitHubTag,
+  GitHubTagsResult,
+  GitHubWorkflow,
+  GitHubWorkflowRun,
+  GitHubWorkflowRunsResult,
+  GitHubWorkflowsResult,
   Harness,
   HarnessStatus,
   HarnessUsage,
@@ -20,6 +75,7 @@ import type {
   TerminalTab,
   UpdateStatus,
 } from "../../shared/types.ts";
+import { fetchWithRecovery } from "./net-retry.ts";
 
 export interface UpdateSnapshot {
   status: UpdateStatus;
@@ -31,8 +87,64 @@ export interface UpdateSnapshot {
 // Re-exported from shared so existing `import { type BranchInfo } from "@/lib/api"`
 // callers (BranchPicker) keep working while the single definition lives in
 // src/shared/types.ts (server + webview share one wire shape).
-export type { BranchInfo };
-export { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
+export type { BranchInfo, BranchNamingConfig };
+export type {
+  GitHubCheckRun,
+  GitHubChecksResult,
+  GitHubComment,
+  GitHubCommentsResult,
+  GitHubCommitStatus,
+  GitHubCommitStatusResult,
+  GitHubItemKind,
+  GitHubItemState,
+  GitProvider,
+  GitHubAssigneesResult,
+  GitHubDiscussion,
+  GitHubDiscussionCategory,
+  GitHubDiscussionComment,
+  GitHubDiscussionDetail,
+  GitHubDiscussionsResult,
+  GitHubLabelsResult,
+  GitHubRepoLabel,
+  GitHubMilestonesResult,
+  GitHubRepoMilestone,
+  GitHubLinkedIssue,
+  GitHubLinkedIssuesResult,
+  GitHubListResult,
+  GitHubNotification,
+  GitHubNotificationsResult,
+  GitHubPullCommit,
+  GitHubPullCommitsResult,
+  GitHubPullDefaultsResult,
+  GitHubPullLineComment,
+  GitHubPullMergeability,
+  GitHubPullMergeMethod,
+  GitHubPullReviewCommentsResult,
+  GitHubPullReviewThreadsResult,
+  GitHubPullMergeResult,
+  GitHubPullReviewEvent,
+  GitHubProjectField,
+  GitHubProjectItem,
+  GitHubProjectItemsResult,
+  GitHubProjectV2,
+  GitHubProjectsV2Result,
+  GitHubReactionContent,
+  GitHubReactionsResult,
+  GitHubReactionSubject,
+  GitHubReactionSummary,
+  GitHubRelease,
+  GitHubReleasesResult,
+  GitHubRepoPermissions,
+  GitHubSubIssue,
+  GitHubSubIssuesResult,
+  GitHubTag,
+  GitHubTagsResult,
+  GitHubWorkflow,
+  GitHubWorkflowRun,
+  GitHubWorkflowRunsResult,
+  GitHubWorkflowsResult,
+};
+export { commitPushPrompt } from "../../shared/types.ts";
 
 /** Where a command/extension comes from. `plugin` entries are contributed by an
  *  enabled Claude Code plugin and are namespaced `<plugin>:<name>`; `builtin`
@@ -99,6 +211,22 @@ export type PendingInteraction =
   | PendingAskQuestions
   | PendingTmuxPrompt;
 
+/** One stored per-host GitHub PAT, as surfaced to the webview. The raw token
+ *  is never returned — `tokenPreview` is a redacted tail (e.g. "…abcd"). */
+export interface GitHubTokenInfo {
+  host: string;
+  label: string | null;
+  tokenPreview: string;
+}
+
+/** Response shape for the GitHub tokens routes. `detectedHosts` are the
+ *  distinct raw remote hosts (including ssh aliases) seen across registered
+ *  project dirs — used to suggest hosts that don't have a token yet. */
+export interface GitHubTokensResult {
+  tokens: GitHubTokenInfo[];
+  detectedHosts: string[];
+}
+
 // Read api port + token, preferring globals injected by the Bun side via
 // BrowserWindow's `preload` option — that path works under the native
 // views:// scheme, which rejects URLs carrying a fragment or query.
@@ -134,27 +262,26 @@ export class ApiError extends Error {
   }
 }
 
-async function j<T>(path: string, init?: RequestInit): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`${BASE}${path}`, {
-      ...init,
-      headers: {
-        "content-type": "application/json",
-        "authorization": `Bearer ${API_TOKEN}`,
-        ...(init?.headers ?? {}),
-      },
-    });
-  } catch (e) {
-    // WebKit's bare "Load failed" tells us nothing — replace with
-    // something the user can act on.
-    const msg = (e as Error).message ?? String(e);
-    throw new Error(
-      msg === "Load failed"
-        ? `cannot reach agetor API at ${BASE} (${path}) — is the bun process running? Try restarting \`bun run dev\`.`
-        : msg,
-    );
-  }
+async function j<T>(
+  path: string,
+  init?: RequestInit,
+  opts?: { retry?: boolean },
+): Promise<T> {
+  // fetchWithRecovery absorbs transient socket-layer rejections (WebKit's
+  // bare "Load failed" — see net-retry.ts) via a health-gated single retry
+  // before giving up; it throws a truthful error when the server really is
+  // unreachable. HTTP error statuses still fall through to the !res.ok
+  // handling below unchanged. `opts.retry: false` (set by a handful of
+  // non-idempotent callers below) still probes health for the error
+  // message but never re-issues the request.
+  const res = await fetchWithRecovery({ fetchImpl: fetch, base: BASE }, path, {
+    ...init,
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${API_TOKEN}`,
+      ...(init?.headers ?? {}),
+    },
+  }, opts);
   if (res.status === 204) return undefined as T;
   const body = await res.json().catch(() => null);
   if (!res.ok) {
@@ -230,6 +357,15 @@ export const api = {
     }),
   deleteProject: (p: string) =>
     j<void>("/projects", { method: "DELETE", body: JSON.stringify({ path: p }) }),
+  /** Per-project branch nomenclature. GET resolves to built-in defaults when the
+   *  project has no stored config, so the form always gets a usable shape. */
+  getProjectBranchConfig: (p: string) =>
+    j<BranchNamingConfig>(`/projects/settings?path=${encodeURIComponent(p)}`),
+  setProjectBranchConfig: (p: string, config: BranchNamingConfig) =>
+    j<Project>("/projects/settings", {
+      method: "PUT",
+      body: JSON.stringify({ path: p, config }),
+    }),
   /** Open a native file/folder picker and return the chosen references.
    *  WKWebView never exposes `File.path`, so this native panel is the only
    *  reliable way to turn a user pick into an absolute path. Returns `[]` on
@@ -266,6 +402,574 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ path: dir, branch }),
     }),
+  /** Push a local `branch` to its remote and set upstream (the New PR composer's
+   *  Push button) so a local-only branch can be opened as a pull request.
+   *  Rejects (ApiError) on a rejected push, missing remote, or network failure —
+   *  the git stderr rides along as the error message. */
+  gitPush: (dir: string, branch: string) =>
+    j<{ ok: true; remote?: string }>("/projects/push", {
+      method: "POST",
+      body: JSON.stringify({ path: dir, branch }),
+    }),
+  listGitHubItems: (input: {
+    path: string;
+    kind: GitHubItemKind;
+    state: GitHubItemState;
+    query?: string;
+    labels?: string[];
+    assignee?: string;
+    createdByMe?: boolean;
+    assignedToMe?: boolean;
+    reviewRequested?: boolean;
+    searchQuery?: string;
+    page?: number;
+    sort?: "created" | "updated" | "comments";
+    direction?: "asc" | "desc";
+  }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      kind: input.kind,
+      state: input.state,
+    });
+    if (input.query) q.set("q", input.query);
+    if (input.labels && input.labels.length > 0) q.set("labels", input.labels.join(","));
+    if (input.assignee) q.set("assignee", input.assignee);
+    if (input.createdByMe) q.set("createdByMe", "1");
+    if (input.assignedToMe) q.set("assignedToMe", "1");
+    if (input.reviewRequested) q.set("reviewRequested", "1");
+    if (input.searchQuery) q.set("searchQuery", input.searchQuery);
+    if (input.page) q.set("page", String(input.page));
+    if (input.sort) q.set("sort", input.sort);
+    if (input.direction) q.set("direction", input.direction);
+    return j<GitHubListResult>(`/github/items?${q.toString()}`);
+  },
+  /** Multi-repo aggregation (G8/F15) — "All repositories" in the GitHub
+   *  dialog. Same filters as `listGitHubItems`, fanned out server-side across
+   *  every path with a GitHub remote and merged into one list; each item
+   *  carries its own repo's path as `sourcePath`. `page`/"Load more" aren't
+   *  supported — the aggregate result always covers the first page per repo. */
+  listGitHubItemsAcrossRepos: (input: {
+    paths: string[];
+    kind: GitHubItemKind;
+    state: GitHubItemState;
+    query?: string;
+    labels?: string[];
+    assignee?: string;
+    createdByMe?: boolean;
+    assignedToMe?: boolean;
+    reviewRequested?: boolean;
+    searchQuery?: string;
+    sort?: "created" | "updated" | "comments";
+    direction?: "asc" | "desc";
+  }) =>
+    j<GitHubListResult>("/github/items-aggregate", {
+      method: "POST",
+      body: JSON.stringify({
+        paths: input.paths,
+        kind: input.kind,
+        state: input.state,
+        q: input.query,
+        labels: input.labels,
+        assignee: input.assignee,
+        createdByMe: input.createdByMe,
+        assignedToMe: input.assignedToMe,
+        reviewRequested: input.reviewRequested,
+        searchQuery: input.searchQuery,
+        sort: input.sort,
+        direction: input.direction,
+      }),
+    }),
+  getGitHubRepoPermissions: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<{ ok: true } & GitHubRepoPermissions>(`/github/repo-permissions?${q.toString()}`);
+  },
+  getGitHubPullDiff: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<TaskDiff>(`/github/pull-diff?${q.toString()}`);
+  },
+  getGitHubPullChecks: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubChecksResult>(`/github/pull-checks?${q.toString()}`);
+  },
+  getGitHubPullMergeability: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullMergeability>(`/github/pull-mergeability?${q.toString()}`);
+  },
+  updateGitHubPullBranch: (input: { path: string; number: number }) =>
+    j<{ ok: true; message?: string }>("/github/pull-update-branch", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  reopenGitHubPull: (input: { path: string; number: number }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/pull-reopen", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubPullDraft: (input: { path: string; number: number; draft: boolean }) =>
+    j<{ ok: true; draft: boolean; message?: string }>("/github/pull-draft", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubPullAutoMerge: (input: { path: string; number: number; enable: boolean; mergeMethod?: GitHubPullMergeMethod }) =>
+    j<{ ok: true; autoMergeEnabled: boolean; message?: string }>("/github/pull-auto-merge", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubPullCommits: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullCommitsResult>(`/github/pull-commits?${q.toString()}`);
+  },
+  getGitHubPullLinkedIssues: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubLinkedIssuesResult>(`/github/pull-linked-issues?${q.toString()}`);
+  },
+  getGitHubPullDefaults: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubPullDefaultsResult>(`/github/pull-defaults?${q.toString()}`);
+  },
+  // `kind` ("pulls"|"issues") lets GitLab/Bitbucket route to the right
+  // notes/comments endpoint (their APIs split MR/PR comments from issue
+  // comments, unlike GitHub's single endpoint) — see git-host.ts's
+  // `ListCommentsInput` doc comment. Optional/additive: omitted, the server
+  // defaults to "pulls" (GitHub ignores it entirely).
+  listGitHubComments: (input: { path: string; number: number; kind?: GitHubItemKind }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    if (input.kind) q.set("kind", input.kind);
+    return j<GitHubCommentsResult>(`/github/comments?${q.toString()}`);
+  },
+  createGitHubComment: (input: { path: string; number: number; body: string; kind?: GitHubItemKind }) =>
+    // retry: false — a replay would post a duplicate PR/issue comment.
+    j<{ comment: GitHubComment }>("/github/comments", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }, { retry: false }),
+  getGitHubViewer: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<{ ok: true; login: string }>(`/github/viewer?${q.toString()}`);
+  },
+  // Provider detection (T4, docs/plans/multi-provider-git-modal.md) — call
+  // before the other GitHub* helpers to learn which provider (GitHub/GitLab/
+  // Bitbucket) a project's git remote resolves to.
+  getProviderInfo: (path: string) => {
+    const q = new URLSearchParams({ path });
+    return j<{ ok: true; provider: GitProvider; owner: string; name: string; host: string; remoteHost: string }>(
+      `/github/provider-info?${q.toString()}`,
+    );
+  },
+  listGitHubLabels: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubLabelsResult>(`/github/labels?${q.toString()}`);
+  },
+  createGitHubLabel: (input: { path: string; name: string; color: string; description?: string }) =>
+    j<{ ok: true; label: GitHubRepoLabel }>("/github/labels", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubLabel: (input: { path: string; name: string; newName?: string; color?: string; description?: string }) =>
+    j<{ ok: true; label: GitHubRepoLabel }>("/github/label-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubLabel: (input: { path: string; name: string }) =>
+    j<{ ok: true; message?: string }>("/github/label-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubAssignees: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubAssigneesResult>(`/github/assignees?${q.toString()}`);
+  },
+  listGitHubMilestones: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubMilestonesResult>(`/github/milestones?${q.toString()}`);
+  },
+  createGitHubMilestone: (input: { path: string; title: string; description?: string; dueOn?: string }) =>
+    j<{ ok: true; milestone: GitHubRepoMilestone }>("/github/milestones", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubMilestone: (input: {
+    path: string;
+    number: number;
+    title?: string;
+    description?: string;
+    dueOn?: string | null;
+    state?: "open" | "closed";
+  }) =>
+    j<{ ok: true; milestone: GitHubRepoMilestone }>("/github/milestone-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubMilestone: (input: { path: string; number: number }) =>
+    j<{ ok: true; message?: string }>("/github/milestone-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubReleases: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubReleasesResult>(`/github/releases?${q.toString()}`);
+  },
+  createGitHubRelease: (input: {
+    path: string;
+    tagName: string;
+    name?: string;
+    body?: string;
+    draft?: boolean;
+    prerelease?: boolean;
+    targetCommitish?: string;
+  }) =>
+    j<{ ok: true; release: GitHubRelease }>("/github/releases", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubRelease: (input: {
+    path: string;
+    id: number;
+    name?: string;
+    body?: string;
+    draft?: boolean;
+    prerelease?: boolean;
+    tagName?: string;
+  }) =>
+    j<{ ok: true; release: GitHubRelease }>("/github/release-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubRelease: (input: { path: string; id: number }) =>
+    j<{ ok: true; message?: string }>("/github/release-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubTags: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubTagsResult>(`/github/tags?${q.toString()}`);
+  },
+  listGitHubWorkflowRuns: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubWorkflowRunsResult>(`/github/workflow-runs?${q.toString()}`);
+  },
+  listGitHubWorkflows: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubWorkflowsResult>(`/github/workflows?${q.toString()}`);
+  },
+  rerunGitHubWorkflowRun: (input: { path: string; runId: number; failedOnly?: boolean }) =>
+    j<{ ok: true; message: string }>("/github/workflow-rerun", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  cancelGitHubWorkflowRun: (input: { path: string; runId: number }) =>
+    j<{ ok: true; message: string }>("/github/workflow-cancel", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  dispatchGitHubWorkflow: (input: { path: string; workflowId: number; ref: string; inputs?: Record<string, string> }) =>
+    j<{ ok: true; message: string }>("/github/workflow-dispatch", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getGitHubCommitStatus: (input: { path: string; ref: string }) => {
+    const q = new URLSearchParams({ path: input.path, ref: input.ref });
+    return j<GitHubCommitStatusResult>(`/github/commit-status?${q.toString()}`);
+  },
+  updateGitHubComment: (input: { path: string; commentId: number; kind: "issue" | "review"; body: string }) =>
+    j<{ ok: true; comment: GitHubComment }>("/github/comment-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubComment: (input: { path: string; commentId: number; kind: "issue" | "review" }) =>
+    j<{ ok: true; message?: string }>("/github/comment-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  createGitHubPullLineComment: (input: {
+    path: string;
+    number: number;
+    body: string;
+    filePath: string;
+    line: number;
+    side: "LEFT" | "RIGHT";
+  }) =>
+    j<{ comment: GitHubPullLineComment }>("/github/pull-line-comment", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubPullReviewComments: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullReviewCommentsResult>(`/github/pull-review-comments?${q.toString()}`);
+  },
+  getGitHubPullReviewThreads: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      number: String(input.number),
+    });
+    return j<GitHubPullReviewThreadsResult>(`/github/pull-review-threads?${q.toString()}`);
+  },
+  setGitHubReviewThreadResolved: (input: { path: string; threadId: string; resolved: boolean }) =>
+    j<{ ok: true; resolved: boolean; message?: string }>("/github/review-thread-resolve", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  replyGitHubPullLineComment: (input: { path: string; number: number; commentId: number; body: string }) =>
+    j<{ comment: GitHubPullLineComment }>("/github/pull-line-comment-reply", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  reviewGitHubPull: (input: {
+    path: string;
+    number: number;
+    event: GitHubPullReviewEvent;
+    body?: string;
+    comments?: { path: string; line: number; side: "LEFT" | "RIGHT"; body: string }[];
+  }) =>
+    j<{ ok: true; message?: string }>("/github/pull-review", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  mergeGitHubPull: (input: {
+    path: string;
+    number: number;
+    method: GitHubPullMergeMethod;
+    title?: string;
+    message?: string;
+  }) =>
+    j<GitHubPullMergeResult>("/github/pull-merge", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  closeGitHubPull: (input: { path: string; number: number; comment?: string }) =>
+    j<{ ok: true; message?: string; item?: GitHubListResult["items"][number]; commentPosted?: boolean }>("/github/pull-close", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  createGitHubPull: (input: {
+    path: string;
+    title: string;
+    head: string;
+    base: string;
+    body?: string;
+    draft?: boolean;
+    reviewers?: string[];
+  }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/pull-create", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  createGitHubIssue: (input: {
+    path: string;
+    title: string;
+    body?: string;
+    labels?: string[];
+    assignees?: string[];
+    milestone?: number | null;
+  }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/issue-create", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateGitHubIssue: (input: {
+    path: string;
+    number: number;
+    kind?: GitHubItemKind;
+    title?: string;
+    body?: string;
+    state?: "open" | "closed";
+    labels?: string[];
+    assignees?: string[];
+    milestone?: number | null;
+  }) =>
+    j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/issue-update", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubIssueLock: (input: { path: string; number: number; locked: boolean; lockReason?: string }) =>
+    j<{ ok: true; locked: boolean; message?: string }>("/github/issue-lock", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubIssuePinned: (input: { path: string; number: number; pinned: boolean }) =>
+    j<{ ok: true; pinned: boolean; message?: string }>("/github/issue-pin", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getGitHubIssuePinned: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({ path: input.path, number: String(input.number) });
+    return j<{ ok: true; pinned: boolean }>(`/github/issue-pinned?${q.toString()}`);
+  },
+  listGitHubSubIssues: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({ path: input.path, number: String(input.number) });
+    return j<GitHubSubIssuesResult>(`/github/sub-issues?${q.toString()}`);
+  },
+  addGitHubSubIssue: (input: { path: string; number: number; childNumber: number }) =>
+    j<{ ok: true; subIssue: GitHubSubIssue; message?: string }>("/github/sub-issue-add", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  removeGitHubSubIssue: (input: { path: string; number: number; childId: number }) =>
+    j<{ ok: true; message?: string }>("/github/sub-issue-remove", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  transferGitHubIssue: (input: { path: string; number: number; targetRepo: string }) =>
+    j<{ ok: true; url: string; message?: string }>("/github/issue-transfer", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubProjectsV2: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubProjectsV2Result>(`/github/projects?${q.toString()}`);
+  },
+  getGitHubProjectItems: (input: { path: string; projectId: string }) => {
+    const q = new URLSearchParams({ path: input.path, projectId: input.projectId });
+    return j<GitHubProjectItemsResult>(`/github/project-items?${q.toString()}`);
+  },
+  addGitHubProjectItem: (input: { path: string; projectId: string; contentNumber: number; contentKind: "issue" | "pr" }) =>
+    j<{ ok: true; itemId: string }>("/github/project-item-add", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  removeGitHubProjectItem: (input: { path: string; projectId: string; itemId: string }) =>
+    j<{ ok: true; message?: string }>("/github/project-item-remove", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubProjectItemStatus: (input: { path: string; projectId: string; itemId: string; fieldId: string; optionId: string }) =>
+    j<{ ok: true; message?: string }>("/github/project-item-status", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubDiscussions: (input: { path: string }) => {
+    const q = new URLSearchParams({ path: input.path });
+    return j<GitHubDiscussionsResult>(`/github/discussions?${q.toString()}`);
+  },
+  getGitHubDiscussion: (input: { path: string; number: number }) => {
+    const q = new URLSearchParams({ path: input.path, number: String(input.number) });
+    return j<{ ok: true; detail: GitHubDiscussionDetail }>(`/github/discussion?${q.toString()}`);
+  },
+  createGitHubDiscussion: (input: { path: string; categoryId: string; title: string; body: string }) =>
+    j<{ ok: true; number: number; url: string }>("/github/discussion-create", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  addGitHubDiscussionComment: (input: { path: string; discussionId: string; body: string }) =>
+    j<{ ok: true; commentId: string }>("/github/discussion-comment", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  setGitHubDiscussionAnswer: (input: { path: string; commentId: string; answer: boolean }) =>
+    j<{ ok: true; isAnswer: boolean }>("/github/discussion-answer", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubDiscussion: (input: { path: string; discussionId: string }) =>
+    j<{ ok: true; message?: string }>("/github/discussion-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubDiscussionComment: (input: { path: string; commentId: string }) =>
+    j<{ ok: true; message?: string }>("/github/discussion-comment-delete", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  requestGitHubPullReviewers: (input: { path: string; number: number; reviewers: string[]; teamReviewers?: string[] }) =>
+    j<{ ok: true; message?: string }>("/github/pull-reviewers", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  applyGitHubSuggestion: (input: { path: string; number: number; commentId: number }) =>
+    j<{ ok: true; message: string }>("/github/pull-apply-suggestion", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  listGitHubReactions: (input: { path: string; subject: GitHubReactionSubject; viewer?: string }) => {
+    const q = new URLSearchParams({
+      path: input.path,
+      subjectType: input.subject.type,
+      subjectId: String(input.subject.id),
+    });
+    if (input.viewer) q.set("viewer", input.viewer);
+    return j<GitHubReactionsResult>(`/github/reactions?${q.toString()}`);
+  },
+  addGitHubReaction: (input: { path: string; subject: GitHubReactionSubject; content: GitHubReactionContent }) =>
+    j<{ ok: true; reactionId: number; content: GitHubReactionContent }>("/github/reaction-add", {
+      method: "POST",
+      body: JSON.stringify({
+        path: input.path,
+        subjectType: input.subject.type,
+        subjectId: input.subject.id,
+        content: input.content,
+      }),
+    }),
+  removeGitHubReaction: (input: { path: string; subject: GitHubReactionSubject; reactionId: number }) =>
+    j<{ ok: true }>("/github/reaction-remove", {
+      method: "POST",
+      body: JSON.stringify({
+        path: input.path,
+        subjectType: input.subject.type,
+        subjectId: input.subject.id,
+        reactionId: input.reactionId,
+      }),
+    }),
+  listGitHubNotifications: (input: { path: string; all?: boolean }) => {
+    const q = new URLSearchParams({ path: input.path, all: input.all ? "true" : "false" });
+    return j<GitHubNotificationsResult>(`/github/notifications?${q.toString()}`);
+  },
+  markGitHubNotificationRead: (input: { path: string; threadId: string }) =>
+    j<{ ok: true }>("/github/notification-read", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  markAllGitHubNotificationsRead: (input: { path: string }) =>
+    j<{ ok: true; message: string }>("/github/notifications-read-all", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getGitHubThreadSubscription: (input: { path: string; threadId: string }) => {
+    const q = new URLSearchParams({ path: input.path, threadId: input.threadId });
+    return j<{ ok: true; subscribed: boolean; ignored: boolean }>(`/github/thread-subscription?${q.toString()}`);
+  },
+  setGitHubThreadSubscription: (input: { path: string; threadId: string; ignored: boolean }) =>
+    j<{ ok: true; subscribed: boolean; ignored: boolean }>("/github/thread-subscription", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  unsubscribeGitHubThread: (input: { path: string; threadId: string }) =>
+    j<{ ok: true }>("/github/thread-unsubscribe", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  /** Stored per-host GitHub tokens + hosts detected across registered
+   *  projects (drives the "GitHub tokens" Settings section). */
+  listGitHubTokens: () => j<GitHubTokensResult>("/github/tokens"),
+  /** Upsert the token for `input.host`. Returns the refreshed list — never
+   *  the raw token. */
+  setGitHubToken: (input: { host: string; token: string; label?: string | null }) =>
+    j<GitHubTokensResult>("/github/tokens", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+  deleteGitHubToken: (host: string) =>
+    j<{ ok: true }>(`/github/tokens/${encodeURIComponent(host)}`, { method: "DELETE" }),
   getTmuxSource: () =>
     j<{
       source: "system" | "bundled";
@@ -305,6 +1009,9 @@ export const api = {
     workdir: string;
     isolation: Isolation;
     baseRef?: string;
+    /** Explicit branch name for worktree isolation. Overrides the project's
+     *  nomenclature; the server validates it and makes it unique. */
+    branch?: string;
     mode?: string | null;
     model?: string | null;
     effort?: string | null;
@@ -312,7 +1019,9 @@ export const api = {
     column?: ColumnId;
     references?: TaskReference[];
     taskType?: TaskType;
-  }) => j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }),
+  }) =>
+    // retry: false — a replay would create a duplicate task + branch.
+    j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),
   updateTask: (id: string, patch: Partial<Task>) =>
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   moveTask: (id: string, column: ColumnId) =>
@@ -345,10 +1054,38 @@ export const api = {
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
   sendRunInput: (runId: string, line: string) =>
+    // retry: false — a replay would paste a duplicate message into a live
+    // agent tmux session.
     j<{ delivered: true; runId: string } | { delivered: false; reason: string }>(
       `/runs/${runId}/input`,
       { method: "POST", body: JSON.stringify({ line }) },
+      { retry: false },
     ),
+
+  // Messages backlog — saved, not-yet-sent draft messages parked on a task.
+  // Every mutation returns the full updated Task so the caller can re-sync.
+  addBacklogItem: (taskId: string, input: { text: string; references?: TaskReference[] }) =>
+    j<Task>(`/tasks/${taskId}/backlog`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateBacklogItem: (
+    taskId: string,
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) =>
+    j<Task>(`/tasks/${taskId}/backlog/${itemId}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteBacklogItem: (taskId: string, itemId: string) =>
+    j<Task>(`/tasks/${taskId}/backlog/${itemId}`, { method: "DELETE" }),
+  /** Replace the backlog order with `order` (item ids, desired sequence). */
+  reorderBacklog: (taskId: string, order: string[]) =>
+    j<Task>(`/tasks/${taskId}/backlog`, {
+      method: "PUT",
+      body: JSON.stringify({ order }),
+    }),
   /**
    * Open a file or directory with the OS default app. `path` may be absolute
    * or, when `taskId` is supplied, relative to the task's cwd
