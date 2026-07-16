@@ -25,7 +25,8 @@ export type InteractionKind =
  * invisible to the user. The scraper in `claude-tmux.ts` detects it on the
  * pane, pairs it with the structured `questions` it saw in the JSONL tool_use,
  * and surfaces it as a structured card. The answer is driven back as keystrokes
- * (`planAskAnswers` + `sendModalKeys`); there is no blocking hook curl.
+ * (`planAskAnswers` + `driveAskAnswers`, or `sendModalKeys(["Escape"])` for the
+ * message-mode fallback); there is no blocking hook curl.
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** One question inside an AskUserQuestion tool call (claude code shape). */
@@ -51,7 +52,7 @@ export interface AskQuestionsRequest {
   /**
    * How the answer is delivered back to claude. Only `"scraper"` exists now:
    * the native modal is detected on the tmux pane and the answer is driven
-   * back as keystrokes (`planAskAnswers` + `sendModalKeys`), then the card is
+   * back as keystrokes (`planAskAnswers` + `driveAskAnswers`), then the card is
    * removed via `resolveScrapedAskQuestions`. Registered by
    * `registerScrapedAskQuestions`.
    */

@@ -293,7 +293,7 @@ describe("planAskAnswers — drive sequences", () => {
     const plan = planAskAnswers(specs, answers);
     expect(plan.mode).toBe("drive");
     // Green = index 1 → Down once, Enter. Flat single-select ⇒ NO trailing submit Enter.
-    expect(plan).toEqual({ mode: "drive", keys: ["Down", "Enter"] });
+    expect(plan).toEqual({ mode: "drive", keys: ["Down", "Enter"], confirmsReview: false });
   });
 
   test("first option of a flat single-select needs no arrow", () => {
@@ -301,7 +301,7 @@ describe("planAskAnswers — drive sequences", () => {
       [{ question: "q", multiSelect: false, options: ["Red", "Green"] }],
       [{ selected: ["Red"] }],
     );
-    expect(plan).toEqual({ mode: "drive", keys: ["Enter"] });
+    expect(plan).toEqual({ mode: "drive", keys: ["Enter"], confirmsReview: false });
   });
 
   test("captured multi example: Toppings[Ham,Mushroom] + Size[Large]", () => {
@@ -320,6 +320,7 @@ describe("planAskAnswers — drive sequences", () => {
     expect(plan).toEqual({
       mode: "drive",
       keys: ["Down", "Enter", "Down", "Enter", "Right", "Down", "Enter", "Enter"],
+      confirmsReview: true,
     });
   });
 
@@ -332,6 +333,7 @@ describe("planAskAnswers — drive sequences", () => {
     expect(plan).toEqual({
       mode: "drive",
       keys: ["Enter", "Down", "Down", "Enter", "Right", "Enter"],
+      confirmsReview: true,
     });
   });
 
@@ -346,6 +348,7 @@ describe("planAskAnswers — drive sequences", () => {
     expect(planAsc).toEqual({
       mode: "drive",
       keys: ["Down", "Enter", "Down", "Down", "Enter", "Right", "Enter"],
+      confirmsReview: true,
     });
   });
 
@@ -359,6 +362,7 @@ describe("planAskAnswers — drive sequences", () => {
     expect(plan).toEqual({
       mode: "drive",
       keys: ["Down", "Enter", "Down", "Down", "Enter", "Enter"],
+      confirmsReview: true,
     });
   });
 });

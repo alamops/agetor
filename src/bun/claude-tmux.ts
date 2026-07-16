@@ -25,7 +25,7 @@ import {
   type TmuxPromptChoice,
 } from "./interactions.ts";
 import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
-import { detectAskModal, parseModalPane, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
+import { detectAskModal, parseModalPane, type AskModalKind, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
 /**
  * Driver that hosts Claude Code's interactive REPL inside a per-task tmux
@@ -1254,6 +1254,182 @@ export async function sendModalKeys(taskId: string, keys: NavKey[]): Promise<boo
       if (!stillCurrent()) return;
     }
     ok = true;
+  }, state);
+  return ok;
+}
+
+/**
+ * Gap between the review-screen tab transition and the first poll for the
+ * "Ready to submit your answers?" screen to render. This is Ink's heaviest
+ * repaint on the whole AskUserQuestion modal — the full review summary,
+ * every question + answer — and the flat 35ms `sendModalKeys` gap that
+ * suffices for every other keystroke was intermittently too short for it:
+ * the confirm Enter would arrive mid-repaint and get swallowed, producing a
+ * false `ok:true` with the modal still stranded on the pane. 80ms per poll,
+ * up to `ASK_REVIEW_POLL_ATTEMPTS` (~800ms total), gives the repaint room
+ * without blocking the common case, where the screen is usually already up
+ * by the first or second poll. Prefer raising over lowering if the race
+ * resurfaces — the cost of raising is a few hundred ms of added drive
+ * latency; the cost of lowering is a return of the swallowed-Enter bug this
+ * whole driver exists to fix.
+ */
+const ASK_REVIEW_POLL_MS = 80;
+/** Poll budget for `ASK_REVIEW_POLL_MS` — bounds how long `driveAskAnswers`
+ *  waits for the review screen before giving up on the confirm-gate and
+ *  falling through to verification without ever sending a blind Enter. */
+const ASK_REVIEW_POLL_ATTEMPTS = 10;
+
+/**
+ * Poll gap for the post-confirm verification phase (`detectAskModal` →
+ * `null` = the modal actually closed). Looser than the review-wait gap
+ * because there's no repaint to catch mid-frame here — this loop is purely
+ * confirming the confirm landed, and a lone "review" sighting is the signal
+ * to resend, not a race to win. `ASK_VERIFY_POLL_ATTEMPTS` (~1s total at
+ * this gap) comfortably covers ordinary repaint + teardown latency; a
+ * mis-drive that never resolves times out to `false` rather than hanging
+ * the answer route.
+ */
+const ASK_VERIFY_POLL_MS = 120;
+const ASK_VERIFY_POLL_ATTEMPTS = 8;
+/** Cap on resending the confirm Enter when verification still sees
+ *  "review" — i.e. the earlier send (from the review-wait phase or a prior
+ *  resend) was swallowed. A stray extra Enter lands on the empty REPL
+ *  prompt once the modal genuinely closes, which is a no-op, so this is
+ *  purely a loop-termination bound, not a correctness one. */
+const ASK_VERIFY_MAX_RESENDS = 2;
+
+/** Outcome of one poll in `driveAskAnswers`'s confirm/verify phases. */
+type AskDriveStep = "done" | "send-enter" | "wait" | "fail";
+
+/**
+ * Pure per-poll decision for `driveAskAnswers`, factored out of the
+ * tmux-driving loop so the swallowed-confirm retry logic is unit-testable
+ * without a live tmux pane (mirrors `decideScrapeTick`'s split). The same
+ * decision table drives both of `driveAskAnswers`'s phases:
+ *
+ *  - waiting for the review screen to render before sending the confirm
+ *    (`confirmSent: false`) — a `"review"` sighting fires the confirm
+ *    immediately (not bounded by `resends`, since this is the first send,
+ *    not a resend); a lingering `"question"` (still navigating the tab bar)
+ *    or an already-vanished modal both fall through without a blind Enter;
+ *  - verifying the modal actually closed after the confirm (`confirmSent:
+ *    true`, or no confirm phase at all for a singleFlat plan) — a
+ *    `"review"` sighting here means the just-sent confirm was swallowed by
+ *    Ink's repaint and must be resent, bounded by `ASK_VERIFY_MAX_RESENDS`
+ *    so a genuinely stuck review screen fails instead of looping forever.
+ *    (A singleFlat plan never renders a review screen, so `confirmSent`
+ *    stays false there; if one ever appeared anyway, the step would send —
+ *    not resend — the confirm, which is the robust choice.)
+ *
+ * `kind === null` (the modal has left the pane) is `"done"` regardless of
+ * phase or resend count — the only success case. `"question"` is always
+ * `"wait"`: mid-drive it's normal progress toward the review screen, and
+ * during verification it's treated as a teardown transient rather than a
+ * fresh mis-drive (a genuine mis-drive times out via the caller's attempt
+ * budget, which this function doesn't own).
+ */
+function decideAskDriveStep(
+  kind: AskModalKind | null,
+  confirmSent: boolean,
+  resends: number,
+): AskDriveStep {
+  if (kind === null) return "done";
+  if (kind === "review") {
+    if (!confirmSent) return "send-enter";
+    return resends < ASK_VERIFY_MAX_RESENDS ? "send-enter" : "fail";
+  }
+  return "wait";
+}
+
+/**
+ * Drive a `planAskAnswers` `mode: "drive"` plan into the task's tmux
+ * session, verified-and-retried rather than trusting `send-keys` exit codes.
+ *
+ * This supersedes the blind trailing Enter `sendModalKeys` used to send for
+ * plans that end on the "Ready to submit your answers?" review screen: that
+ * Enter arrived a flat 35ms after the tab-transition key while Ink was still
+ * repainting the heaviest screen in the whole modal, and was intermittently
+ * swallowed. `driveAskAnswers` instead:
+ *
+ *  1. Sends every key up to (but not including) a review-confirming trailing
+ *     Enter exactly like `sendModalKeys` — same 35ms gap, same per-key
+ *     `stillCurrent()` re-gate. (`plan.confirmsReview` is false for the
+ *     singleFlat shape, which has no review screen and no confirm to gate —
+ *     the full key list is sent here and phase 2 below just verifies.)
+ *  2. When `confirmsReview`, polls the pane (`ASK_REVIEW_POLL_MS` /
+ *     `ASK_REVIEW_POLL_ATTEMPTS`) until the review screen is actually
+ *     rendered, then sends the confirm Enter. A mis-drive that never reaches
+ *     the review screen within the window is not force-confirmed with a
+ *     blind Enter — it falls through to verification, which will time out.
+ *  3. Always verifies (including singleFlat): polls
+ *     (`ASK_VERIFY_POLL_MS` / `ASK_VERIFY_POLL_ATTEMPTS`) until the modal is
+ *     gone, resending the confirm on a `"review"` sighting (bounded by
+ *     `ASK_VERIFY_MAX_RESENDS`) and waiting out a `"question"` sighting.
+ *
+ * The whole sequence runs inside one `queueTmuxOp` callback (same
+ * serialization-behind-any-in-flight-paste rationale as `sendModalKeys`), so
+ * the confirm-wait and verify polls can't interleave with a racing user
+ * paste either. `sendModalKeys` is unchanged and still used for the
+ * `Escape` dismissal paths, which have no review screen to wait for.
+ */
+export async function driveAskAnswers(
+  taskId: string,
+  plan: { keys: NavKey[]; confirmsReview: boolean },
+): Promise<boolean> {
+  const state = sessions.get(taskId);
+  if (!state) return false;
+  const { keys, confirmsReview } = plan;
+  if (keys.length === 0) return true;
+  // The trailing key IS the confirm Enter when confirmsReview — split it off
+  // so it can be gated on the review screen actually rendering (step 2)
+  // instead of fired blind after the flat inter-key gap (step 1).
+  const body = confirmsReview ? keys.slice(0, -1) : keys;
+
+  let ok = false;
+  await queueTmuxOp(taskId, async (stillCurrent) => {
+    for (const key of body) {
+      if (!tmux(["send-keys", "-t", state.sessionName, key]).ok) return;
+      // Inter-key gap mirrors sendModalKeys: a bursted pair can read as a
+      // single Ink event, and the gap lets the dispose re-gate fire.
+      await Bun.sleep(35);
+      if (!stillCurrent()) return;
+    }
+
+    let confirmSent = false;
+    if (confirmsReview) {
+      for (let attempt = 0; attempt < ASK_REVIEW_POLL_ATTEMPTS && !confirmSent; attempt++) {
+        await Bun.sleep(ASK_REVIEW_POLL_MS);
+        if (!stillCurrent()) return;
+        const step = decideAskDriveStep(detectAskModal(captureTail(state)), confirmSent, 0);
+        if (step === "done") { ok = true; return; }
+        if (step === "send-enter") {
+          if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
+          confirmSent = true;
+        }
+        // "wait" — review screen not up yet; keep polling. ("fail" cannot
+        // occur here — decideAskDriveStep only returns it once confirmSent.)
+      }
+      // Attempts exhausted without a "review" sighting: don't send a blind
+      // Enter (see doc comment). Fall through to verification below, which
+      // times out to false if the modal genuinely never resolves.
+    }
+
+    let resends = 0;
+    for (let attempt = 0; attempt < ASK_VERIFY_POLL_ATTEMPTS; attempt++) {
+      await Bun.sleep(ASK_VERIFY_POLL_MS);
+      if (!stillCurrent()) return;
+      const step = decideAskDriveStep(detectAskModal(captureTail(state)), confirmSent, resends);
+      if (step === "done") { ok = true; return; }
+      if (step === "fail") return;
+      if (step === "send-enter") {
+        if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
+        confirmSent = true;
+        resends++;
+      }
+      // "wait" — keep polling; a persistent "question" sighting times out
+      // here rather than being force-resolved.
+    }
+    // Verify budget exhausted without ever seeing the modal close.
   }, state);
   return ok;
 }
@@ -3003,12 +3179,33 @@ function scrapeOnce(state: SessionState): void {
   // Native AskUserQuestion modal handling. Its options render as a numbered
   // checkbox list (`❯ 1. [✔] Cheese …`) that matchNumberedModal would otherwise
   // grab, producing a competing single-keystroke tmux_prompt card. So whenever
-  // the modal is on the pane we (a) suppress the numbered matcher and (b) drive
-  // the structured-card flow off the pane (collectAndRegisterAskCard). When the
-  // modal leaves the pane (answered/cancelled) we drop the card. ExitPlanMode's
-  // approval modal carries no AskUserQuestion signature, so it still flows
-  // through the numbered matcher as intended.
-  const askOnPane = detectAskModal(tail) !== null;
+  // the *question* screen is on the pane we (a) suppress the numbered matcher
+  // and (b) drive the structured-card flow off the pane
+  // (collectAndRegisterAskCard). When it leaves the pane (answered/cancelled)
+  // we drop the card. ExitPlanMode's approval modal carries no AskUserQuestion
+  // signature, so it still flows through the numbered matcher as intended.
+  //
+  // The *review* screen ("Ready to submit your answers?") is deliberately
+  // NOT included in this suppression, even though `detectAskModal` reports it
+  // too. `driveAskAnswers` (claude-tmux.ts) verifies its own confirm Enter
+  // and self-heals a swallowed one, but two cases still land a review screen
+  // that nothing is driving: the drive's bounded resends genuinely exhausted
+  // (a real failure, not just a slow repaint), or the user attached to tmux
+  // directly and navigated to review by hand. `parseModalPane` can't parse
+  // the review screen (no question/footer signature) and the JSONL has no
+  // tool_use until the modal is answered, so with the old blanket suppression
+  // a stranded review screen matched nothing on every tick, forever — the
+  // bug this whole change fixes. Letting `askOnPane` go false for "review"
+  // lets it fall through to `matchNumberedModal`, which DOES match it
+  // (`❯ 1. Submit answers` / `2. Cancel` — ≥2 numbered choices, cursor
+  // marker, "1." anchor) and, after the usual two-tick stability gate,
+  // registers an ordinary clickable tmux_prompt card. If an ask card is
+  // still registered when that happens (the driver hadn't dropped it yet,
+  // or the user reached review by hand), the `else` branch below resolves it
+  // as externally-answered — the same semantics external dismissal already
+  // has for the question screen.
+  const askKind = detectAskModal(tail);
+  const askOnPane = askKind === "question";
   if (askOnPane) {
     if (state.askFirstSeenAt === null) state.askFirstSeenAt = now;
     if (!claudeIsWriting && !state.askCardId && !state.askCollecting) {
@@ -4358,6 +4555,16 @@ export const __forTest = {
   SCRAPE_IDLE_POLL_MS,
   SCRAPE_DEEP_IDLE_AFTER_MS,
   SCRAPE_DEEP_IDLE_POLL_MS,
+  /** Pure per-poll decision used by `driveAskAnswers`'s confirm/verify
+   *  phases — exposed so the swallowed-confirm retry logic (resend on a
+   *  "review" sighting, wait out a "question" sighting, bounded resends)
+   *  can be asserted without a live tmux pane. */
+  decideAskDriveStep,
+  ASK_REVIEW_POLL_MS,
+  ASK_REVIEW_POLL_ATTEMPTS,
+  ASK_VERIFY_POLL_MS,
+  ASK_VERIFY_POLL_ATTEMPTS,
+  ASK_VERIFY_MAX_RESENDS,
   readPendingAskQuestionsFromJsonl,
   shouldWaitForAskJsonl,
   resumeJsonlOffset,
