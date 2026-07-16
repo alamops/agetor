@@ -1559,7 +1559,16 @@ function BacklogTray({
             : "saved messages — send when you're ready"}
         </span>
       </div>
-      <div className="max-h-40 space-y-1 overflow-y-auto px-2 pb-2">
+      {/* Grow the window while a row is being edited: the inline editor is
+          ~140px tall, so under the resting max-h-40 (160px) its Save/Cancel row
+          would be clipped below the fold whenever another draft sits above it —
+          which reads as "there is no save button". */}
+      <div
+        className={cn(
+          "space-y-1 overflow-y-auto px-2 pb-2",
+          editingId !== null ? "max-h-72" : "max-h-40",
+        )}
+      >
         {items.map((item, i) => (
           <BacklogItemRow
             key={item.id}
@@ -1622,6 +1631,7 @@ function BacklogItemRow({
 }) {
   const [draft, setDraft] = useState(item.text);
   const [draftRefs, setDraftRefs] = useState<TaskReference[]>(item.references);
+  const actionsRef = useRef<HTMLDivElement>(null);
   // Re-seed the edit form only when we *enter* edit mode. We deliberately do
   // NOT depend on `item.text` / `item.references`: the 2s task poll rebuilds
   // `task.backlog` into fresh objects (new array references) on every tick, so
@@ -1633,6 +1643,11 @@ function BacklogItemRow({
     if (editing) {
       setDraft(item.text);
       setDraftRefs(item.references);
+      // The editor expands the row well past what was visible before the
+      // click. Anchor the scroll on the Save/Cancel row — the form's last
+      // element — so the buttons are revealed even when the form itself is
+      // taller than the tray's scroll window (many reference chips).
+      actionsRef.current?.scrollIntoView({ block: "nearest" });
     }
   }, [editing]);
 
@@ -1656,7 +1671,7 @@ function BacklogItemRow({
           onChange={setDraftRefs}
           startingFolder={startingFolder}
         />
-        <div className="flex items-center justify-end gap-1.5">
+        <div ref={actionsRef} className="flex items-center justify-end gap-1.5">
           <Button size="sm" variant="ghost" onClick={onCancelEdit}>
             Cancel
           </Button>
