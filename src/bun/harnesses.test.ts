@@ -11,10 +11,15 @@ const { db, harnesses, HarnessBuiltinError, HarnessInUseError } = await import("
 
 beforeEach(() => {
   // Wipe any user-added aliases between tests; built-ins (is_builtin=1)
-  // stay so each test sees the seeded baseline. Also re-enable any built-in
-  // a prior test may have toggled off, so the baseline truly is "default".
+  // stay so each test sees the seeded baseline. Also re-enable any
+  // claude-code/codex builtin a prior test may have toggled off. kimi's
+  // seeded baseline is *disabled* (migration 028 — no local binary existed
+  // to smoke-test the driver against at implementation time), so it's reset
+  // to 0 rather than 1; otherwise a test asserting "seeded disabled" would
+  // drift after any earlier test enabled it.
   db.run(`DELETE FROM harnesses WHERE is_builtin = 0`);
-  db.run(`UPDATE harnesses SET enabled = 1 WHERE is_builtin = 1`);
+  db.run(`UPDATE harnesses SET enabled = 1 WHERE is_builtin = 1 AND kind != 'kimi'`);
+  db.run(`UPDATE harnesses SET enabled = 0 WHERE kind = 'kimi'`);
 });
 
 test("seed leaves the two built-in harnesses in place", () => {
@@ -144,4 +149,44 @@ test("getByIdOrKind synthesises a built-in row for legacy kind ids without a mat
   expect(synth?.isBuiltin).toBe(true);
   // And unknown ids still return null — no silent fallback to a random kind.
   expect(harnesses.getByIdOrKind("does-not-exist")).toBeNull();
+});
+
+test("kind CHECK permits 'cursor' at the SQLite layer, but harnesses.insert rejects it; 'kimi' is fully implemented", () => {
+  // Migration 028 widened the CHECK to the UNION of every in-flight
+  // AgentKind across sibling branches — including kinds not yet implemented
+  // on this branch ('cursor', 'grok') — so a raw insert with one of those
+  // kinds succeeds at the SQLite layer.
+  expect(() => {
+    db.run(
+      `INSERT INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+       VALUES (?, ?, ?, 0, NULL, NULL, '{}', ?, ?, 1)`,
+      ["cursor-raw", "cursor", "Cursor (raw)", Date.now(), Date.now()],
+    );
+  }).not.toThrow();
+  expect(
+    db.query<{ id: string }, [string]>(`SELECT id FROM harnesses WHERE id = ?`).get("cursor-raw"),
+  ).not.toBeNull();
+
+  // harnesses.insert whitelists only kinds this branch actually implements
+  // (buildCommand/resolveBin/harnessEnv have a branch for them), so 'cursor'
+  // is rejected at the app layer even though the CHECK constraint allows it.
+  expect(() =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    harnesses.insert({ id: "cursor-app", kind: "cursor" as any, label: "Cursor" }),
+  ).toThrow(/unknown harness kind/);
+
+  // 'kimi' IS implemented at the app layer, so it succeeds.
+  const inserted = harnesses.insert({ id: "kimi-app", kind: "kimi", label: "Kimi alias" });
+  expect(inserted.kind).toBe("kimi");
+  expect(harnesses.get("kimi-app")?.kind).toBe("kimi");
+});
+
+test("kimi builtin row is seeded disabled by migration, labeled 'Kimi Code', resolvable via getByIdOrKind", () => {
+  const row = harnesses.get("kimi");
+  expect(row).not.toBeNull();
+  expect(row!.isBuiltin).toBe(true);
+  expect(row!.kind).toBe("kimi");
+  expect(row!.enabled).toBe(false);
+  expect(row!.label).toBe("Kimi Code");
+  expect(harnesses.getByIdOrKind("kimi")?.id).toBe("kimi");
 });
