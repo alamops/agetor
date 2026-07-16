@@ -730,11 +730,22 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
   "codex": "high",
-  // grok has no confirmed CLI reasoning-effort flag — every curated model's
-  // MODEL_EFFORT_SUPPORT entry is `[]`, so this value is never dereferenced
-  // (supportedEfforts/the orchestrator short-circuit on the empty support
-  // list before reading DEFAULT_EFFORT). "none" documents the intent.
-  "grok": "none",
+  // DEVIATION FROM OWNER PREFERENCE, FLAGGED: the owner wants grok to launch
+  // with NO --effort flag by default. That "omit by default" behavior is
+  // representable in this codebase (see `orchestrator.ts`'s createTask: when
+  // `MODEL_EFFORT_SUPPORT[kind][model]` is `[]`, the resolved effort is `null`
+  // and no flag is emitted — the mechanism this file previously relied on for
+  // grok) but ONLY when the model's support list is empty. Grok Build's CLI
+  // has a real, source-confirmed `--effort low|medium|high|xhigh|max` flag
+  // (D6), so `MODEL_EFFORT_SUPPORT.grok["grok-build"]` below is now
+  // non-empty — the null-by-default path no longer applies, and every
+  // consumer (`orchestrator.ts` createTask, `NewTaskForm`/`RunPanel`'s
+  // initial-effort state) structurally requires a concrete id here. "medium"
+  // is picked as the least-surprising concrete default (balanced, matches its
+  // EFFORT_OPTIONS hint) until the owner confirms the omit-by-default
+  // preference should instead be threaded through as an explicit
+  // nullable-default mechanism.
+  "grok": "medium",
 };
 
 /**
@@ -798,14 +809,16 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  *       https://developers.openai.com/codex/config-advanced
  *     gpt-5.5 / gpt-5 / gpt-5-codex → low/medium/high/xhigh
  *     (minimal kept out of UI)
- *   - Grok Build (xAI): no first-class CLI reasoning-effort flag is
- *     confirmed as of this integration (docs.x.ai/build, verified
- *     2026-07-10) — every curated model maps to `[]`, same treatment as
- *     Haiku 4.5.
+ *   - Grok Build (xAI): `--reasoning-effort`/`--effort` is a real, confirmed
+ *     CLI flag (`xai-grok-agent/src/config.rs`, `Effort::VALID_VALUES =
+ *     ["low","medium","high","xhigh","max"]`, verified against
+ *     xai-org/grok-build source) — the full canonical range intersects
+ *     cleanly with `EFFORT_OPTIONS` (only `none` drops out, since grok has no
+ *     reasoning-off id). Emitted as `--effort <id>` by `buildCommand`.
  *
  * An empty list means "this model does not accept the effort flag at all"
- * (e.g. Haiku 4.5, every grok model) — the UI collapses the dropdown and
- * `buildCommand` emits no env var / `-c` flag for that case.
+ * (e.g. Haiku 4.5) — the UI collapses the dropdown and `buildCommand` emits
+ * no env var / `-c`/`--effort` flag for that case.
  */
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
@@ -834,11 +847,10 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
   },
   grok: {
-    // No confirmed reasoning-effort CLI flag for any grok model — picker
-    // collapses for all three (Haiku-4.5 precedent).
-    "grok-build": [],
-    "grok-4.5": [],
-    "grok-4-fast-reasoning": [],
+    // Intersection of EFFORT_OPTIONS with the CLI's confirmed
+    // Effort::VALID_VALUES (`low`,`medium`,`high`,`xhigh`,`max` — `none` has
+    // no grok equivalent, so it's the only id excluded).
+    "grok-build": ["max", "xhigh", "high", "medium", "low"],
   },
 };
 
@@ -882,8 +894,6 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   codex: {},
   grok: {
     "grok-build": [],
-    "grok-4.5": [],
-    "grok-4-fast-reasoning": [],
   },
 };
 
@@ -934,14 +944,19 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     efforts: EFFORT_OPTIONS,
   },
   grok: {
+    // Curated to `grok-build` only — it's the CLI's own default model
+    // (`xai-grok-models/default_models.json`) and the only one shipped
+    // outside xAI's internal test fixtures (`grok-4.5` / `grok-4-fast-reasoning`
+    // are test-fixture-only ids, verified against source — dropped from the
+    // curated list). Unknown ids still pass through verbatim (repo
+    // convention, see `agents.ts`), so a power user can type any other model
+    // id xAI ships in the future without a code change.
     models: [
-      { id: "grok-build", label: "Grok Build", hint: "xAI's coding model — recommended default." },
-      { id: "grok-4.5", label: "Grok 4.5", hint: "General-purpose flagship model." },
-      { id: "grok-4-fast-reasoning", label: "Grok 4 Fast Reasoning", hint: "Faster, reasoning-tuned variant." },
+      { id: "grok-build", label: "Grok Build", hint: "xAI's default coding model for the Grok Build CLI." },
     ],
     modes: [
       { id: "auto", label: "Auto", hint: "Full auto — bypassPermissions, no sandbox." },
-      { id: "ask", label: "Read-only", hint: "Inspect only — read-only sandbox, prompts silently denied." },
+      { id: "ask", label: "Read-only", hint: "Inspect only — read-only sandbox. Permission prompts are auto-cancelled headless (reported back to the model), never a hang." },
     ],
     efforts: EFFORT_OPTIONS,
   },
@@ -989,12 +1004,16 @@ export interface Run {
    */
   codexSessionId: string | null;
   /**
-   * Grok Build's own headless session id (surfaced as `sessionId` in its
-   * `--output-format streaming-json` event stream). Captured when the grok
-   * tmux driver tails the run's NDJSON log. Drives `grok --resume <id>` for
-   * follow-up turns and is the reattach key for a mid-turn grok run. Distinct
-   * namespace from claude's and codex's session ids — never cross-compare.
-   * NULL for claude-code, codex, and legacy rows.
+   * Grok Build's own headless session id. Pre-seeded by the orchestrator
+   * (a fresh `crypto.randomUUID()` passed via `-s <uuid>` on the first turn
+   * of a new grok session, since `-s` is new-session-only — see D4/D5 in
+   * `docs/plans/grok-build-oss-alignment.md`) rather than sniffed after the
+   * fact. The `end` event's top-level `sessionId` (the only event carrying
+   * one — `streaming-json`'s success terminal) is still cross-checked as
+   * confirmation/repair, not the primary source anymore. Drives `grok
+   * --resume <id>` for follow-up turns and is the reattach key for a
+   * mid-turn grok run. Distinct namespace from claude's and codex's session
+   * ids — never cross-compare. NULL for claude-code, codex, and legacy rows.
    */
   grokSessionId: string | null;
   /**

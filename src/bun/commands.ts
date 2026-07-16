@@ -196,6 +196,25 @@ function codexSystemSkills(home: string): AvailableCommand[] {
   return discoverSkills(path.join(defaultCodexHome(), "skills", ".system"), "builtin");
 }
 
+function defaultGrokHome(): string {
+  return process.env.GROK_HOME || path.join(homedir(), ".grok");
+}
+
+/**
+ * Resolve `$GROK_HOME` the same way the spawned `grok` process would see it.
+ * Mirrors `codexHome` below, but with one structural difference: `harnessEnv`
+ * (agents.ts) sets `env.GROK_HOME = harness.home` directly — no `.grok`
+ * subdirectory join like codex's `CODEX_HOME = <home>/.codex` — because grok
+ * has no documented HOME-relative config path the way codex's CLI does. So a
+ * caller that only threads `harnessHome` (no pre-built `harnessEnv`, e.g. a
+ * test) resolves to `harnessHome` verbatim, not `<harnessHome>/.grok`.
+ */
+function grokHome(opts: { harnessHome?: string | null; harnessEnv?: Record<string, string> | null }): string {
+  if (opts.harnessEnv?.GROK_HOME) return opts.harnessEnv.GROK_HOME;
+  if (opts.harnessHome) return opts.harnessHome;
+  return defaultGrokHome();
+}
+
 /**
  * Return the slash commands + skills that an agent will see when started with
  * the given workdir. User-level entries are always included; project-level
@@ -261,16 +280,33 @@ export async function listAvailableCommands(
     all.push(...builtinCommands(opts.agent));
     all.push(...codexSystemSkills(userCmdRoot));
   } else if (opts.agent === "grok") {
-    // Grok Build has a `~/.grok` home (config.toml + skills/plugins-style
-    // conventions per xAI's docs) but the exact on-disk layout — command
-    // directory name, skill manifest shape, project-level override path —
-    // isn't reliably documented as of 2026-07-10 (see plan A5). Rather than
-    // guess a directory shape that might silently be wrong (the historical
-    // trap: codex's picker returned [] because builtins were claude-only —
-    // see docs/plans/grok-build-agent-support.md §"Historical traps" #1),
-    // this is an explicit, documented degrade: builtins only for v1. Add
-    // user/project filesystem discovery once the layout is confirmed
-    // against a real `grok` install.
+    // Grok Build's on-disk skills/commands layout is now documented in
+    // xai-org/grok-build (docs/user-guide/08-skills.md, 09-plugins.md,
+    // reviewed 2026-07-16 per docs/plans/grok-build-oss-alignment.md D9):
+    // user-scope skills live at `<grokHome>/skills/<name>/SKILL.md`
+    // (directory-per-skill, YAML frontmatter `name`/`description` — same
+    // shape `discoverSkills` already parses for claude/codex) and user-scope
+    // commands at `<grokHome>/commands/<name>.md` (flat `.md`, slash name =
+    // filename stem, description from frontmatter else first heading/line —
+    // exactly `discoverCommands`'s existing behavior). Project scope mirrors
+    // claude/codex: `<repoRoot>/.grok/skills|commands/`. `grokHome` resolves
+    // `GROK_HOME` the same way `codexHome` resolves `CODEX_HOME` above.
+    // Missing directories degrade to builtins-only (discoverCommands/
+    // discoverSkills both no-op on a non-existent dir) — no errors surfaced.
+    //
+    // Plugin/MCP discovery for grok is explicitly OUT of scope here (see the
+    // no-op comment in discoverMcpAndPluginExtensions below) — xAI's plugin
+    // manifest shape isn't parsed yet.
+    const userGrokHome = grokHome(opts);
+    all.push(...discoverCommands(path.join(userGrokHome, "commands"), "user"));
+    all.push(...discoverSkills(path.join(userGrokHome, "skills"), "user"));
+    if (opts.workdir) {
+      const root = (await repoRoot(opts.workdir)) ?? opts.workdir;
+      all.push(...discoverCommands(path.join(root, ".grok", "commands"), "project"));
+      all.push(...discoverSkills(path.join(root, ".grok", "skills"), "project"));
+    }
+    // Binary built-ins go LAST so a same-named user/project entry above wins
+    // the dedupe (matches the claude-code/codex precedence above).
     all.push(...builtinCommands(opts.agent));
   }
 
@@ -582,10 +618,11 @@ function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null
       all.push(...codexTomlMcpServers(path.join(root, ".codex", "config.toml"), "project"));
     }
   }
-  // grok: no MCP/plugin discovery in v1 — same undocumented-layout rationale
-  // as listAvailableCommands' grok branch above. Explicit no-op rather than
-  // an implicit fallthrough so a future reader doesn't mistake the gap for
-  // an oversight.
+  // grok: skills/commands discovery is real (see listAvailableCommands'
+  // grok branch above), but plugin/MCP discovery is deliberately NOT
+  // implemented here — xAI's plugin manifest + MCP config shape (09-plugins.md)
+  // is out of scope for this pass. Explicit no-op rather than an implicit
+  // fallthrough so a future reader doesn't mistake the gap for an oversight.
   return all;
 }
 
