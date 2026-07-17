@@ -17,7 +17,7 @@ import {
   HarnessInUseError,
   dataDir,
 } from "./db.ts";
-import { archiveTask, createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -3118,7 +3118,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       "/tasks/:id/archive": {
         POST: authed(async (req) => {
           server.timeout(req, 0);
-          const result = await archiveTask(req.params.id);
+          // Optional body — no body (or a malformed one) means force: false,
+          // same as the pre-existing behaviour. Only used by the Worktrees
+          // page's delete action to bypass the done-column gate.
+          const body = (await req.json().catch(() => ({}))) as { force?: boolean };
+          const result = await archiveTask(req.params.id, { force: body.force === true });
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
@@ -3132,6 +3136,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Every agetor-managed git worktree materialized on disk, with staleness
+      // classification — backs the Worktrees list page.
+      "/worktrees": {
+        GET: authed((req) => json(listWorktrees(), { headers: corsHeaders(req) })),
+      },
+
+      // Delete an orphaned worktree directory (no owning task row — see
+      // `deleteOrphanWorktree`). A worktree still owned by a task is deleted
+      // by archiving the task instead (`POST /tasks/:id/archive`).
+      "/worktrees/:id": {
+        DELETE: authed(async (req) => {
+          // Same rationale as DELETE /tasks/:id — `rm -rf` over a large
+          // worktree can exceed the idle timeout.
+          server.timeout(req, 0);
+          const result = await deleteOrphanWorktree(req.params.id);
+          return "error" in result
+            ? json(result, { status: 400, headers: corsHeaders(req) })
+            : new Response(null, { status: 204, headers: corsHeaders(req) });
         }),
       },
 

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
@@ -9,7 +9,7 @@ import type { BranchInfo, Task, TaskDiff } from "../shared/types.ts";
 
 export type { BranchInfo };
 
-const WORKTREES_DIR = path.join(dataDir, "worktrees");
+export const WORKTREES_DIR = path.join(dataDir, "worktrees");
 
 interface GitResult {
   ok: boolean;
@@ -506,6 +506,33 @@ export function worktreePath(task: Task): string {
   return path.join(WORKTREES_DIR, task.id);
 }
 
+/**
+ * Best-effort parse of a linked worktree's `.git` file — for a worktree
+ * (unlike an ordinary checkout) `.git` is a *file* containing a single line
+ * `gitdir: <repo>/.git/worktrees/<id>`, pointing back at the source repo's
+ * common dir. Used for orphaned worktree dirs (no task row to read `workdir`
+ * from) so the worktrees list can still show which repo they came from.
+ *
+ * Plain fs only — no git subprocess. Returns null when `.git` is missing,
+ * isn't a pointer file, or the path doesn't match the expected
+ * `.git/worktrees/<id>` shape.
+ */
+export function parseWorktreeGitPointer(worktreeDir: string): string | null {
+  try {
+    const gitFile = path.join(worktreeDir, ".git");
+    const contents = readFileSync(gitFile, "utf8").trim();
+    const match = /^gitdir:\s*(.+)$/.exec(contents);
+    if (!match) return null;
+    const gitdir = match[1]!;
+    const marker = `${path.sep}.git${path.sep}worktrees${path.sep}`;
+    const idx = gitdir.indexOf(marker);
+    if (idx < 0) return null;
+    return gitdir.slice(0, idx);
+  } catch {
+    return null;
+  }
+}
+
 export interface PreparedWorkdir {
   /** Where the agent should actually `spawn` from. */
   cwd: string;
@@ -775,6 +802,17 @@ export async function removeWorktree(task: Task): Promise<void> {
     try { await rm(task.worktreePath, { recursive: true, force: true }); }
     catch { /* best-effort */ }
   }
+}
+
+/**
+ * Best-effort `git worktree prune` in `root` — clears the stale
+ * `.git/worktrees/<id>` registration left behind after a worktree directory
+ * is removed outside of `git worktree remove` (e.g. `deleteOrphanWorktree`,
+ * which `rm -rf`s an orphaned dir with no task row to drive a proper
+ * removal). Never throws.
+ */
+export async function pruneWorktrees(root: string): Promise<void> {
+  await git(["worktree", "prune"], root, 10_000);
 }
 
 /**

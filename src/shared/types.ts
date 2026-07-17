@@ -637,6 +637,49 @@ export interface Task {
   runningSubagents?: number;
 }
 
+/** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can
+ *  carry more than one reason at once (e.g. archived AND past the inactivity
+ *  threshold). */
+export type WorktreeStaleReason = "orphaned" | "archived" | "inactive";
+
+/** How long a task can go without an update before its worktree is flagged
+ *  `"inactive"` — 7 days. */
+export const WORKTREE_STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/**
+ * A git worktree materialized on disk under `dataDir/worktrees/`, as surfaced
+ * by `GET /worktrees`. One row per directory found on disk — computed live by
+ * `orchestrator.listWorktrees()` from fs + DB signals only (no git
+ * subprocesses in the bulk listing).
+ */
+export interface WorktreeInfo {
+  /** Directory basename under `dataDir/worktrees/` — equal to the owning task's id by construction. */
+  id: string;
+  /** Absolute worktree directory path on disk. */
+  path: string;
+  /** Owning task id, or null for an orphaned dir with no matching task row. */
+  taskId: string | null;
+  /** Owning task's title, or null when orphaned. */
+  taskTitle: string | null;
+  /** Owning task's kanban column, or null when orphaned. */
+  column: ColumnId | null;
+  /** Owning task's `archivedAt`, or null when orphaned or not archived. */
+  archivedAt: number | null;
+  /** Owning task's `updatedAt`, or null when orphaned. */
+  taskUpdatedAt: number | null;
+  /** Owning task's branch, or null when orphaned. */
+  branch: string | null;
+  /** Source repo path — `task.workdir` for an owned worktree; for an orphan, a
+   *  best-effort parse of the `.git` pointer file, or null if unreadable. */
+  workdir: string | null;
+  /** True when the owning task currently has a run in flight. */
+  runActive: boolean;
+  /** True when `staleReasons` is non-empty. */
+  stale: boolean;
+  /** Every reason this worktree is considered stale; empty when not stale. */
+  staleReasons: WorktreeStaleReason[];
+}
+
 /** A live terminal tab for a task. Returned by the terminal REST endpoints;
  *  state lives only in memory in `src/bun/terminals.ts`. */
 export interface TerminalTab {

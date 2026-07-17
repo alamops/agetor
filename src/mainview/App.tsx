@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
-import { AlertTriangle, GitPullRequest, Settings, X } from "lucide-react";
+import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
@@ -15,6 +15,7 @@ import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
 import { UpdateBanner } from "@/components/updater/UpdateBanner";
+import { WorktreesDialog } from "@/components/worktrees/WorktreesDialog";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
@@ -88,6 +89,7 @@ export default function App() {
   const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [githubOpen, setGithubOpen] = useState(false);
+  const [worktreesOpen, setWorktreesOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -614,6 +616,15 @@ export default function App() {
           <Button
             variant="ghost"
             size="icon"
+            onClick={() => setWorktreesOpen(true)}
+            aria-label="Worktrees"
+            title="Worktrees"
+          >
+            <FolderGit2 className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={() => setSettingsOpen(true)}
             aria-label="Settings"
             title="Settings"
@@ -732,6 +743,17 @@ export default function App() {
         projects={projects}
         initialProjectPath={repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
         onClose={() => setGithubOpen(false)}
+      />
+      <WorktreesDialog
+        open={worktreesOpen}
+        onClose={() => setWorktreesOpen(false)}
+        tasks={tasks}
+        projects={projects}
+        homeDir={homeDir}
+        onOpenTask={(t) => {
+          setWorktreesOpen(false);
+          setSelected(t);
+        }}
       />
       <SettingsDialog
         open={settingsOpen}
