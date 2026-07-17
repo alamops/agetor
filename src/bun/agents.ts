@@ -1,5 +1,11 @@
 import path from "node:path";
-import { MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
+import {
+  KIMI_RETRYABLE_STATUS_PREFIX,
+  MODEL_EFFORT_SUPPORT,
+  SESSION_DIED_STATUS_PREFIX,
+  type AgentKind,
+  type Harness,
+} from "../shared/types.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   spawnClaudeViaTmux,
@@ -643,6 +649,26 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
       onChunk("status", `${SESSION_DIED_STATUS_PREFIX}tmux session agetor-fake ended unexpectedly — task blocked`);
     }, 5);
     setTimeout(() => { resolveDone(0); }, resolveDelayMs);
+  } else if (
+    process.env.AGETOR_FAKE_KIMI_EXIT_CODE !== undefined &&
+    Number.isFinite(Number(process.env.AGETOR_FAKE_KIMI_EXIT_CODE))
+  ) {
+    // Test hook: simulate a kimi turn exiting with an arbitrary code, kind-agnostic
+    // like the AGETOR_FAKE_CLAUDE_* hooks above. Mirrors the real driver's
+    // exit-75 death-watch path (kimi-tmux.ts): always emits the usual stdout
+    // chunk, and — only when the code is exactly 75 — also emits the
+    // KIMI_RETRYABLE_STATUS_PREFIX sentinel status chunk that makeChunkHandler
+    // pattern-matches to flag the run retryable. Resolves `done` with the
+    // configured exit code (not 0) so orchestrator retry tests can drive the
+    // auto-retry branch end-to-end.
+    const exitCode = Number(process.env.AGETOR_FAKE_KIMI_EXIT_CODE);
+    setTimeout(() => {
+      onChunk("stdout", `fake response to: ${prompt}`);
+      if (exitCode === 75) {
+        onChunk("status", `${KIMI_RETRYABLE_STATUS_PREFIX}kimi exited with code 75`);
+      }
+    }, 5);
+    setTimeout(() => { resolveDone(exitCode); }, 20);
   } else {
     setTimeout(() => onChunk("stdout", `fake response to: ${prompt}`), 5);
     setTimeout(() => { onChunk("status", "turn complete"); resolveDone(0); }, 20);
