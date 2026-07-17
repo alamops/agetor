@@ -2081,11 +2081,15 @@ export function listWorktrees(): WorktreeInfo[] {
     // Same active-run check archiveTask uses for its defence-in-depth guard.
     const runActive = !!(task?.runId && active.has(task.runId));
     if (!task) {
+      // No owning row — nothing else applies (can't be archived or idle-by-age).
       staleReasons.push("orphaned");
-    } else if (task.archivedAt != null) {
-      staleReasons.push("archived");
-    } else if (!runActive && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS) {
-      staleReasons.push("inactive");
+    } else {
+      // A worktree can carry both reasons at once (archived AND past the
+      // inactivity threshold), so these are independent checks, not a chain.
+      if (task.archivedAt != null) staleReasons.push("archived");
+      if (!runActive && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS) {
+        staleReasons.push("inactive");
+      }
     }
 
     out.push({
@@ -2130,6 +2134,13 @@ export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | {
     return { error: "invalid worktree id" };
   }
   const dirPath = join(WORKTREES_DIR, id);
+  // Confinement backstop: the resolved path must be a direct child of
+  // WORKTREES_DIR, never the directory itself. Guards against ids like `"."`
+  // that pass the checks above but normalize to WORKTREES_DIR — deleting it
+  // would `rm -rf` every task's worktree.
+  if (basename(dirPath) !== id) {
+    return { error: "invalid worktree id" };
+  }
   let isDir = false;
   try {
     isDir = statSync(dirPath).isDirectory();
