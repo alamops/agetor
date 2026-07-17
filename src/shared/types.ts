@@ -17,6 +17,16 @@ export const TMUX_MISSING_REASON = "tmux is required to drive claude-code intera
  * claude and codex drivers emit it and the orchestrator consumes it. */
 export const SESSION_DIED_STATUS_PREFIX = "session ended: ";
 
+/**
+ * Sentinel prefix for the `status` chunk kimi-tmux emits when a turn exits
+ * with Moonshot's documented *retryable* exit code (75 — rate limit / 5xx /
+ * timeout). The orchestrator's chunk handler pattern-matches this prefix
+ * (same technique as {@link SESSION_DIED_STATUS_PREFIX}) to flag the run as
+ * retryable instead of dumping the task back to `ready` on a transient
+ * failure. Lives here (not in kimi-tmux.ts) so both the driver and the
+ * orchestrator import the same literal. */
+export const KIMI_RETRYABLE_STATUS_PREFIX = "kimi retryable exit: ";
+
 export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "backlog", label: "Backlog" },
   { id: "ready", label: "Ready" },

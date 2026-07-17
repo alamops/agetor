@@ -7,16 +7,18 @@ import {
   readSync as fsReadSync,
   closeSync as fsCloseSync,
   statSync as fsStatSync,
+  readdirSync,
   readFileSync,
   writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import path from "node:path";
+import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { dataDir } from "./db.ts";
 import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
-import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import { SESSION_DIED_STATUS_PREFIX, KIMI_RETRYABLE_STATUS_PREFIX } from "../shared/types.ts";
 import {
   DEATH_JSONL_QUIET_MS,
   DEATH_MISS_THRESHOLD,
@@ -69,6 +71,45 @@ import {
  * seconds after kimi's own process has already exited. This is an accepted
  * trade-off for reusing the shared, well-tested death-watch primitives from
  * claude-tmux.ts rather than inventing a second detection path.
+ *
+ * ## wire.jsonl thinking tailer (best-effort)
+ *
+ * Kimi's reasoning is absent from the `stream-json` stdout stream by design
+ * (it's an OpenAI-chat-shaped log — no `reasoning`/`thinking` field), but
+ * both kimi products persist it to an internal `wire.jsonl` artifact per
+ * session. A second, independent tailer inside this file (not a new module)
+ * discovers and follows that file to surface `thinking` chunks in the run
+ * panel:
+ *
+ * - **Layouts probed** (first existing candidate wins — see
+ *   `discoverKimiWirePath`): `<home>/.kimi/sessions/<hash>/<sessionId>/wire.jsonl`
+ *   (kimi-cli) and `<kimiCodeHome>/sessions/<slug>/<sessionId>/agents/main/wire.jsonl`
+ *   (kimi-code). Rather than reimplementing either product's own hashing
+ *   scheme for the session-root directory name, we scan one level and match
+ *   on a child directory literally named `<sessionId>` — our own uuid,
+ *   unique enough that a false match is not a concern.
+ * - **Leaf shape** (identical in both products, verified against both
+ *   repos' source): `{"type":"think","think":"<text>","encrypted":null|string}`,
+ *   wrapped in one of two envelopes — `{"message":{"type":…,"payload":{…leaf…}}}`
+ *   (kimi-cli) or `{"event":{"type":"content.part","part":{…leaf…}}}`
+ *   (kimi-code). See `mapKimiWireEvent`, the pure/exported/unit-tested
+ *   mapper. Thinking arrives as coalesced chunks, not per-token deltas.
+ * - **Kill switch**: `AGETOR_KIMI_TRACK_THINKING=0` disables the tailer
+ *   entirely for the run (checked once at tailer start) — precedent:
+ *   `AGETOR_GROK_TRACK_SUBAGENTS`. Default ON.
+ * - **Best-effort semantics throughout**: a malformed wire.jsonl line is
+ *   silently ignored (never surfaced as stderr — unlike `mapKimiEvent`,
+ *   which treats malformed stdout as a real error worth surfacing); a
+ *   `wire.jsonl` that never appears within `WIRE_DISCOVERY_TIMEOUT_MS`
+ *   silently stops being probed; a metadata header whose
+ *   `protocol_version` major isn't "1" disables the tailer for the rest of
+ *   the run rather than risk misparsing an incompatible leaf shape. Worst
+ *   case in every failure mode: no `thinking` chunks render for that run —
+ *   never an error surfaced to the user, never a delay to the primary
+ *   stream. The tailer is multiplexed onto the same 150ms poll interval as
+ *   the primary log (see `tickKimiWire`), self-throttling its own discovery
+ *   probes to a slower cadence, and shares that timer's lifecycle —
+ *   `disposeKimiState` tearing down `pollTimer` stops both.
  */
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -260,6 +301,40 @@ interface KimiSessionState {
   resolved: boolean;
   lastCode: number | null;
   resolveDone: (code: number) => void;
+
+  /* ── wire.jsonl thinking tailer (best-effort — see file header) ────────── */
+
+  /** kimi's `--session` uuid — the directory name the tailer looks for under
+   *  both candidate session roots. Empty string when unknown (reattach
+   *  without a persisted session id), which disables discovery outright. */
+  sessionId: string;
+  /** The cwd the turn is running in. Not currently used for discovery
+   *  (session dirs are keyed by a content hash agetor doesn't reimplement —
+   *  see the header), but carried on the state for future use and so
+   *  callers have one place to pass it through. */
+  cwd: string;
+  /** Resolved HOME root used to build the kimi-cli candidate
+   *  (`<home>/.kimi/sessions/<hash>/<sessionId>/wire.jsonl`). */
+  home: string;
+  /** Resolved KIMI_CODE_HOME root used to build the kimi-code candidate
+   *  (`<kimiCodeHome>/sessions/<slug>/<sessionId>/agents/main/wire.jsonl`). */
+  kimiCodeHome: string;
+  /** Discovered wire.jsonl path, or null while still probing. */
+  wirePath: string | null;
+  wireOffset: number;
+  wirePartial: string;
+  wireLineNo: number;
+  wireDecoder: StringDecoder;
+  /** `Date.now()` deadline after which discovery gives up silently. */
+  wireDiscoveryDeadline: number;
+  /** Set true by the kill switch, a missing sessionId, discovery timeout, or
+   *  a `mapKimiWireEvent` protocol-version mismatch. Once true the tailer
+   *  does no further work for the rest of this run. */
+  wireDisabled: boolean;
+  /** Counts poll ticks while `wirePath` is still null, so discovery (a
+   *  readdir per candidate root) runs on a slower cadence than the 150ms
+   *  primary-log poll rather than on every tick. */
+  wireDiscoveryTickCount: number;
 }
 
 const kimiSessions = new Map<string, KimiSessionState>(); // taskId -> state
@@ -272,10 +347,237 @@ const DEATH_POLL_MS = 400;
  *  flushed and read. */
 const DEATH_GRACE_MS = 250;
 
+/** How long the wire tailer keeps probing for wire.jsonl before giving up
+ *  silently. kimi may take a beat to create the session dir + write the
+ *  metadata header line; after this, thinking just doesn't render for the
+ *  run — best-effort, never surfaced as an error. */
+const WIRE_DISCOVERY_TIMEOUT_MS = 60_000;
+/** Run discovery (readdir on both candidate roots) once every N primary
+ *  poll ticks (~150ms each) instead of every tick, once wirePath is found
+ *  this no longer applies (flushKimiWire runs every tick like the primary
+ *  log). */
+const WIRE_DISCOVERY_EVERY_N_TICKS = 7; // ≈1s at POLL_MS=150
+
+function wireTrackingDisabled(): boolean {
+  // Kill switch, precedent: AGETOR_GROK_TRACK_SUBAGENTS. Checked once at
+  // tailer start (not re-read mid-run) — flipping the env var doesn't affect
+  // an in-flight run.
+  return process.env.AGETOR_KIMI_TRACK_THINKING === "0";
+}
+
+/** Resolve the HOME / KIMI_CODE_HOME roots the wire tailer probes under.
+ *  Mirrors `harnessEnv()`'s per-harness home block in agents.ts: an aliased
+ *  harness re-homes both vars to the same directory, so a spawn caller
+ *  should pass `opts.env.HOME`/`opts.env.KIMI_CODE_HOME` straight through;
+ *  a reattach caller (which doesn't have the merged spawn env available)
+ *  passes the harness's resolved `home` field via `homeOverride` /
+ *  `kimiCodeHomeOverride`. Falls back to the process's own os.homedir() and
+ *  `<home>/.kimi-code`, which is only correct for the built-in (non-aliased)
+ *  harness — an aliased harness reattaching without an override will simply
+ *  look in the wrong place and time out silently (best-effort, no error). */
+function resolveKimiHomeRoots(
+  homeOverride: string | null | undefined,
+  kimiCodeHomeOverride: string | null | undefined,
+): { home: string; kimiCodeHome: string } {
+  const home = homeOverride || os.homedir();
+  const kimiCodeHome = kimiCodeHomeOverride || path.join(home, ".kimi-code");
+  return { home, kimiCodeHome };
+}
+
+/** Probe both candidate session-root layouts for a directory literally named
+ *  `state.sessionId` (our own uuid — unique enough that we don't need to
+ *  reimplement either product's own hashing scheme to find it) and return
+ *  the first existing `wire.jsonl` path, or null if neither is present yet.
+ *  All fs errors (root doesn't exist, permission denied, …) are swallowed —
+ *  this runs on a timer and errors here must never surface as noise. */
+function discoverKimiWirePath(state: KimiSessionState): string | null {
+  if (!state.sessionId) return null;
+
+  // kimi-cli: <home>/.kimi/sessions/<hash-of-cwd>/<sessionId>/wire.jsonl
+  try {
+    const cliSessionsDir = path.join(state.home, ".kimi", "sessions");
+    for (const entry of readdirSync(cliSessionsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(cliSessionsDir, entry.name, state.sessionId, "wire.jsonl");
+      if (existsSync(candidate)) return candidate;
+    }
+  } catch { /* root doesn't exist yet, or transient fs error — keep probing */ }
+
+  // kimi-code: <kimiCodeHome>/sessions/<slug>/<sessionId>/agents/main/wire.jsonl
+  try {
+    const codeSessionsDir = path.join(state.kimiCodeHome, "sessions");
+    for (const entry of readdirSync(codeSessionsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(codeSessionsDir, entry.name, state.sessionId, "agents", "main", "wire.jsonl");
+      if (existsSync(candidate)) return candidate;
+    }
+  } catch { /* root doesn't exist yet, or transient fs error — keep probing */ }
+
+  return null;
+}
+
+/**
+ * Pure mapper: extract a `thinking` chunk from one raw wire.jsonl line, if
+ * present. Unlike {@link mapKimiEvent}, this is best-effort by design — the
+ * wire log is an internal artifact, not a documented public contract, so a
+ * malformed or unrecognized line is silently ignored rather than surfaced as
+ * stderr noise. Handles exactly two envelope shapes (verified against both
+ * products' source — see the file header):
+ *
+ *   - kimi-cli:  `{"message":{"type":"ContentPart"|"SubagentEvent","payload":{…leaf…}}}`
+ *   - kimi-code: `{"event":{"type":"content.part","part":{…leaf…}}}`
+ *
+ * where the leaf is `{"type":"think","think":"<text>","encrypted":null|string}`.
+ * `SubagentEvent`-wrapped messages are skipped in v1 (subagent thinking is
+ * intentionally excluded — see plan §8.3). The metadata header line
+ * (`{"type":"metadata","protocol_version":"1.10"}`) is recognized and
+ * skipped; a major version other than "1" returns `{disable: true}` so the
+ * caller stops tailing this run (the leaf shape is no longer trustworthy).
+ *
+ * Returns `{disable: true}` only for that one case; otherwise returns
+ * `undefined` (nothing to disable, chunk already emitted via `onChunk` if
+ * applicable).
+ */
+export function mapKimiWireEvent(
+  line: string,
+  onChunk: ChunkHandler,
+  lineNo: number,
+): { disable?: boolean } | void {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  let obj: unknown;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    return; // malformed — best-effort, no stderr noise (unlike mapKimiEvent)
+  }
+  if (!obj || typeof obj !== "object") return;
+  const rec = obj as Record<string, unknown>;
+
+  if (rec.type === "metadata") {
+    const version = typeof rec.protocol_version === "string" ? rec.protocol_version : "";
+    if (!version.startsWith("1.")) return { disable: true };
+    return;
+  }
+
+  // kimi-cli shape.
+  if (rec.message && typeof rec.message === "object") {
+    const message = rec.message as Record<string, unknown>;
+    if (message.type === "SubagentEvent") return; // v1: subagent thinking excluded
+    emitKimiWireThink(message.payload, onChunk, lineNo);
+    return;
+  }
+
+  // kimi-code shape.
+  if (rec.event && typeof rec.event === "object") {
+    const event = rec.event as Record<string, unknown>;
+    if (event.type !== "content.part") return;
+    emitKimiWireThink(event.part, onChunk, lineNo);
+    return;
+  }
+
+  // Unrecognized shape — silent.
+}
+
+/** Shared leaf-extraction for both wire.jsonl envelope shapes: only a
+ *  `{"type":"think","think":"<non-empty string>"}` leaf emits a chunk.
+ *  Text/tool leaves and encrypted-only think leaves (no plaintext `think`
+ *  field) are silently dropped. */
+function emitKimiWireThink(leaf: unknown, onChunk: ChunkHandler, lineNo: number): void {
+  if (!leaf || typeof leaf !== "object") return;
+  const l = leaf as Record<string, unknown>;
+  if (l.type !== "think") return;
+  if (typeof l.think !== "string" || !l.think) return;
+  onChunk("thinking", l.think, `kimiwire:${lineNo}`);
+}
+
+/** Read any bytes appended to the discovered wire.jsonl since
+ *  `state.wireOffset`, split into complete lines, and dispatch each through
+ *  {@link mapKimiWireEvent}. Mirrors `flushKimiLog`'s stat/read/offset/
+ *  partial-utf8 skeleton, plus a truncation guard: kimi may rewrite/truncate
+ *  the file (healing rewrites, session fork) — when the file has shrunk
+ *  below our offset, reset to 0 and re-read from the start rather than
+ *  erroring or stalling. The dedup keys (`kimiwire:<lineNo>`) make a
+ *  replayed rewrite idempotent for identical content; content that
+ *  genuinely diverged after a rewrite is accepted best-effort. */
+function flushKimiWire(state: KimiSessionState): void {
+  if (!state.wirePath) return;
+  let fd: number;
+  let size: number;
+  try {
+    size = fsStatSync(state.wirePath).size;
+    if (size < state.wireOffset) {
+      state.wireOffset = 0;
+      state.wirePartial = "";
+      state.wireLineNo = 0;
+      state.wireDecoder = new StringDecoder("utf8");
+    }
+    if (size <= state.wireOffset) return;
+    fd = fsOpenSync(state.wirePath, "r");
+  } catch {
+    return; // file vanished mid-tail, or transient stat error
+  }
+  try {
+    const len = size - state.wireOffset;
+    if (len <= 0) return;
+    const buf = Buffer.allocUnsafe(len);
+    const read = fsReadSync(fd, buf, 0, len, state.wireOffset);
+    state.wireOffset += read;
+    state.wirePartial += state.wireDecoder.write(buf.subarray(0, read));
+  } finally {
+    fsCloseSync(fd);
+  }
+
+  const lines = state.wirePartial.split("\n");
+  state.wirePartial = lines.pop() ?? "";
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const lineNo = state.wireLineNo++;
+    const onChunk: ChunkHandler = (stream, data, lineUuid) => {
+      if (lineUuid) {
+        if (state.seenLineUuids.has(lineUuid)) return;
+        state.seenLineUuids.add(lineUuid);
+      }
+      state.onChunk(stream, data, lineUuid);
+    };
+    const result = mapKimiWireEvent(line, onChunk, lineNo);
+    if (result?.disable) {
+      state.wireDisabled = true;
+      return;
+    }
+  }
+}
+
+/** Poll-tick entry point for the wire tailer: while undiscovered, probes for
+ *  the wire.jsonl path on a slower cadence than the primary log poll (see
+ *  `WIRE_DISCOVERY_EVERY_N_TICKS`); once found, flushes every tick like the
+ *  primary log. No-ops once disabled (kill switch, missing sessionId,
+ *  discovery timeout, or a protocol-version mismatch from
+ *  `mapKimiWireEvent`). */
+function tickKimiWire(state: KimiSessionState): void {
+  if (state.wireDisabled) return;
+  if (!state.wirePath) {
+    if (Date.now() > state.wireDiscoveryDeadline) {
+      state.wireDisabled = true;
+      return;
+    }
+    state.wireDiscoveryTickCount++;
+    if (state.wireDiscoveryTickCount % WIRE_DISCOVERY_EVERY_N_TICKS !== 0) return;
+    const found = discoverKimiWirePath(state);
+    if (!found) return;
+    state.wirePath = found;
+  }
+  flushKimiWire(state);
+}
+
 function disposeKimiState(state: KimiSessionState): void {
   if (state.watcher) { try { state.watcher.close(); } catch { /* noop */ } state.watcher = null; }
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
   if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
+  // The wire tailer has no timers of its own — it's driven off the same
+  // pollTimer as the primary log (see startKimiTailer) — so clearing
+  // pollTimer above is sufficient to stop it too.
 }
 
 /** Read any bytes appended since `state.offset`, split into complete lines,
@@ -330,7 +632,10 @@ function startKimiTailer(state: KimiSessionState): Promise<number> {
   // Poll the log for appends. macOS FSEvents drops appends to a file written
   // by another process, so polling — not fs.watch — is the reliable backstop;
   // we add an fs.watch opportunistically once the file exists for low latency.
-  state.pollTimer = setInterval(() => flushKimiLog(state), POLL_MS);
+  // The wire-tailer tick is multiplexed onto the same interval (see
+  // tickKimiWire) rather than getting its own timer — it self-throttles its
+  // own discovery cadence internally.
+  state.pollTimer = setInterval(() => { flushKimiLog(state); tickKimiWire(state); }, POLL_MS);
   const tryWatch = () => {
     if (state.watcher || !existsSync(state.logPath)) return;
     try {
@@ -362,6 +667,7 @@ function startKimiTailer(state: KimiSessionState): Promise<number> {
     // (log + exit sidecar), flush, then resolve.
     setTimeout(() => {
       flushKimiLog(state);
+      tickKimiWire(state); // last chance to catch trailing thinking before dispose
       if (state.resolved) return; // e.g. a concurrent manual kill() already resolved
       const exitCode = readKimiExitCode(state.runId);
       if (exitCode === null) {
@@ -376,9 +682,12 @@ function startKimiTailer(state: KimiSessionState): Promise<number> {
         return;
       }
       if (exitCode === 75) {
-        // Moonshot's documented "retryable" exit code — surface it distinctly
-        // so the failure message doesn't read as a generic/opaque error.
-        state.onChunk("status", "kimi exited with code 75 (retryable)");
+        // Moonshot's documented "retryable" exit code — surface it via the
+        // shared sentinel prefix (matched by the orchestrator's chunk
+        // handler, same pattern as SESSION_DIED_STATUS_PREFIX) so a
+        // transient rate-limit/5xx/timeout can be auto-retried instead of
+        // dumping the task back to `ready` as a generic failure.
+        state.onChunk("status", `${KIMI_RETRYABLE_STATUS_PREFIX}kimi exited with code 75`);
       }
       resolveKimiDone(state, exitCode);
     }, DEATH_GRACE_MS);
@@ -485,6 +794,12 @@ export function spawnKimiViaTmux(opts: KimiLaunchOptions): SpawnedAgent {
   ];
   const res = spawnSync(tmux, args, { encoding: "utf8" });
 
+  // The session id is known synchronously (see KimiLaunchOptions.sessionId
+  // doc) — computed up front so it can seed both onSessionId and the wire
+  // tailer's discovery target below.
+  const sessionId = opts.sessionId ?? crypto.randomUUID();
+  const { home, kimiCodeHome } = resolveKimiHomeRoots(opts.env.HOME, opts.env.KIMI_CODE_HOME);
+
   const state: KimiSessionState = {
     taskId: opts.taskId,
     runId: opts.runId,
@@ -504,6 +819,18 @@ export function spawnKimiViaTmux(opts: KimiLaunchOptions): SpawnedAgent {
     resolved: false,
     lastCode: null,
     resolveDone: () => { /* replaced in startKimiTailer */ },
+    sessionId,
+    cwd: opts.cwd,
+    home,
+    kimiCodeHome,
+    wirePath: null,
+    wireOffset: 0,
+    wirePartial: "",
+    wireLineNo: 0,
+    wireDecoder: new StringDecoder("utf8"),
+    wireDiscoveryDeadline: Date.now() + WIRE_DISCOVERY_TIMEOUT_MS,
+    wireDisabled: wireTrackingDisabled(),
+    wireDiscoveryTickCount: 0,
   };
 
   if (res.status !== 0) {
@@ -515,9 +842,6 @@ export function spawnKimiViaTmux(opts: KimiLaunchOptions): SpawnedAgent {
     return { kill: () => { /* nothing to kill */ }, writeInput: () => false, done };
   }
 
-  // The session id is known synchronously (see KimiLaunchOptions.sessionId
-  // doc) — report it right away rather than waiting on any stream event.
-  const sessionId = opts.sessionId ?? crypto.randomUUID();
   state.sessionIdSent = true;
   opts.onSessionId?.(sessionId);
 
@@ -544,6 +868,7 @@ function killKimiState(state: KimiSessionState): void {
   killSessionByName(state.sessionName);
   setTimeout(() => {
     flushKimiLog(state);
+    tickKimiWire(state); // last chance to catch trailing thinking before dispose
     if (state.resolved) return;
     const exitCode = readKimiExitCode(state.runId);
     resolveKimiDone(state, exitCode ?? 1);
@@ -558,6 +883,28 @@ export interface KimiReattachOptions {
   /** Dedup keys already persisted for this task's runs, so re-reading the log
    *  from offset 0 doesn't double-emit events streamed before the restart. */
   seenLineUuids: Set<string>;
+  /**
+   * kimi's pre-generated `--session` uuid and the cwd the turn is running
+   * in — both needed to *discover* the wire.jsonl path (see the file
+   * header's wire-tailer section). Optional so pre-existing reattach call
+   * sites (which predate the wire tailer) keep compiling unchanged;
+   * omitting `sessionId` degrades gracefully to "no wire tailing on
+   * reattach" (the tailer disables itself) rather than throwing.
+   */
+  sessionId?: string | null;
+  cwd?: string | null;
+  /**
+   * HOME / KIMI_CODE_HOME overrides for the harness this run launched
+   * under — mirrors `harnessEnv()`'s per-harness home block in agents.ts
+   * (an aliased harness re-homes both vars to its own dedicated dir).
+   * Optional; when omitted the tailer falls back to the process's own
+   * os.homedir() / `<home>/.kimi-code` default, which is only correct for
+   * the built-in (non-aliased) kimi harness — reattaching an aliased
+   * harness without these will silently probe the wrong home and just
+   * time out (best-effort, no error surfaced).
+   */
+  homeDir?: string | null;
+  kimiCodeHome?: string | null;
 }
 
 /**
@@ -567,9 +914,15 @@ export interface KimiReattachOptions {
  * no longer alive (caller should orphan the run). Only meaningful while a
  * turn is in flight — kimi's session, like codex's, lives only for the
  * duration of one turn, so between turns there is nothing to reattach.
+ *
+ * The wire tailer also restarts from offset 0 on reattach — its dedup keys
+ * (`kimiwire:<lineNo>`, wrapped in the same `seenLineUuids` set as the
+ * primary log) make that idempotent for lines already streamed before the
+ * restart.
  */
 export function reattachKimiSession(opts: KimiReattachOptions): SpawnedAgent | null {
   if (!sessionExistsByName(opts.sessionName)) return null;
+  const { home, kimiCodeHome } = resolveKimiHomeRoots(opts.homeDir, opts.kimiCodeHome);
   const state: KimiSessionState = {
     taskId: opts.taskId,
     runId: opts.runId,
@@ -589,6 +942,20 @@ export function reattachKimiSession(opts: KimiReattachOptions): SpawnedAgent | n
     resolved: false,
     lastCode: null,
     resolveDone: () => { /* replaced in startKimiTailer */ },
+    sessionId: opts.sessionId ?? "",
+    cwd: opts.cwd ?? "",
+    home,
+    kimiCodeHome,
+    wirePath: null,
+    wireOffset: 0,
+    wirePartial: "",
+    wireLineNo: 0,
+    wireDecoder: new StringDecoder("utf8"),
+    wireDiscoveryDeadline: Date.now() + WIRE_DISCOVERY_TIMEOUT_MS,
+    // No sessionId → discovery can never find the right dir; disable
+    // outright rather than let it spin fruitlessly until the deadline.
+    wireDisabled: wireTrackingDisabled() || !opts.sessionId,
+    wireDiscoveryTickCount: 0,
   };
   const done = startKimiTailer(state);
   return {
