@@ -13,7 +13,7 @@ const ICONS: Record<AgentKind, ComponentType<IconProps>> = {
 
 /**
  * Renders the brand glyph for a CLI kind. Accepts any string so callers can
- * pass an unresolved harness id directly — anything other than the two
+ * pass an unresolved harness id directly — anything other than the three
  * known kinds renders the claude-code glyph as a neutral default, which is
  * safer than throwing on an unknown alias mid-render.
  */
