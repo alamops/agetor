@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
@@ -9,7 +9,7 @@ import type { BranchInfo, Task, TaskDiff } from "../shared/types.ts";
 
 export type { BranchInfo };
 
-const WORKTREES_DIR = path.join(dataDir, "worktrees");
+export const WORKTREES_DIR = path.join(dataDir, "worktrees");
 
 interface GitResult {
   ok: boolean;
@@ -112,6 +112,60 @@ export async function getAheadCount(dir: string, baseRef: string | null): Promis
   }
 
   return 0;
+}
+
+/**
+ * Whether `dir`'s HEAD has already landed on the source repo's default
+ * branch — i.e. is an ancestor of it, so the worktree's work is safe to
+ * throw away. `null` means "couldn't determine" and must never be presented
+ * as merged; callers should treat it as unknown, same contract as
+ * `hasUncommittedChanges`/`getAheadCount`.
+ *
+ * Default branch resolution, most to least authoritative:
+ *
+ * 1. `git rev-parse --abbrev-ref origin/HEAD` — the remote's advertised
+ *    default (e.g. resolves to `origin/main`). Used verbatim when it
+ *    succeeds and isn't the literal unresolved `origin/HEAD` (that string
+ *    comes back when the symbolic ref exists but doesn't point anywhere
+ *    useful, e.g. no remote configured).
+ * 2. No `origin/HEAD` — try local `main`, then `master`, via
+ *    `git show-ref --verify --quiet refs/heads/<b>` (exit 0 = branch exists).
+ * 3. Neither resolves: return `null` rather than guessing.
+ *
+ * Once a default branch candidate is picked, `git merge-base --is-ancestor
+ * HEAD <default>` maps exit code 0 → `true` (HEAD is an ancestor, i.e.
+ * merged), exit code 1 → `false` (diverged/not merged), and any other exit
+ * code (git error) → `null`.
+ *
+ * Runs with `cwd` = `dir`; a linked worktree shares the source repo's refs
+ * via its common git dir, so this resolves correctly without needing the
+ * source repo's own path.
+ */
+export async function isMergedIntoDefaultBranch(dir: string): Promise<boolean | null> {
+  if (!existsSync(dir)) return null;
+  if (!(await isGitRepo(dir))) return null;
+
+  let defaultBranch: string | null = null;
+
+  const originHead = await git(["rev-parse", "--abbrev-ref", "origin/HEAD"], dir);
+  if (originHead.ok && originHead.stdout.length > 0 && originHead.stdout !== "origin/HEAD") {
+    defaultBranch = originHead.stdout;
+  } else {
+    for (const candidate of ["main", "master"]) {
+      const ref = await git(["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`], dir);
+      if (ref.ok) {
+        defaultBranch = candidate;
+        break;
+      }
+    }
+  }
+
+  if (!defaultBranch || defaultBranch.startsWith("-")) return null;
+
+  const res = await git(["merge-base", "--is-ancestor", "HEAD", defaultBranch], dir);
+  if (res.exitCode === 0) return true;
+  if (res.exitCode === 1) return false;
+  return null;
 }
 
 // A directory's git top-level is stable for the lifetime of the process, so
@@ -506,6 +560,33 @@ export function worktreePath(task: Task): string {
   return path.join(WORKTREES_DIR, task.id);
 }
 
+/**
+ * Best-effort parse of a linked worktree's `.git` file — for a worktree
+ * (unlike an ordinary checkout) `.git` is a *file* containing a single line
+ * `gitdir: <repo>/.git/worktrees/<id>`, pointing back at the source repo's
+ * common dir. Used for orphaned worktree dirs (no task row to read `workdir`
+ * from) so the worktrees list can still show which repo they came from.
+ *
+ * Plain fs only — no git subprocess. Returns null when `.git` is missing,
+ * isn't a pointer file, or the path doesn't match the expected
+ * `.git/worktrees/<id>` shape.
+ */
+export function parseWorktreeGitPointer(worktreeDir: string): string | null {
+  try {
+    const gitFile = path.join(worktreeDir, ".git");
+    const contents = readFileSync(gitFile, "utf8").trim();
+    const match = /^gitdir:\s*(.+)$/.exec(contents);
+    if (!match) return null;
+    const gitdir = match[1]!;
+    const marker = `${path.sep}.git${path.sep}worktrees${path.sep}`;
+    const idx = gitdir.indexOf(marker);
+    if (idx < 0) return null;
+    return gitdir.slice(0, idx);
+  } catch {
+    return null;
+  }
+}
+
 export interface PreparedWorkdir {
   /** Where the agent should actually `spawn` from. */
   cwd: string;
@@ -775,6 +856,17 @@ export async function removeWorktree(task: Task): Promise<void> {
     try { await rm(task.worktreePath, { recursive: true, force: true }); }
     catch { /* best-effort */ }
   }
+}
+
+/**
+ * Best-effort `git worktree prune` in `root` — clears the stale
+ * `.git/worktrees/<id>` registration left behind after a worktree directory
+ * is removed outside of `git worktree remove` (e.g. `deleteOrphanWorktree`,
+ * which `rm -rf`s an orphaned dir with no task row to drive a proper
+ * removal). Never throws.
+ */
+export async function pruneWorktrees(root: string): Promise<void> {
+  await git(["worktree", "prune"], root, 10_000);
 }
 
 /**

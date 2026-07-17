@@ -74,6 +74,8 @@ import type {
   TaskType,
   TerminalTab,
   UpdateStatus,
+  WorktreeGitStatus,
+  WorktreeInfo,
 } from "../../shared/types.ts";
 import { fetchWithRecovery } from "./net-retry.ts";
 
@@ -1027,8 +1029,30 @@ export const api = {
     j<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify({ column }) }),
   deleteTask: (id: string) => j<void>(`/tasks/${id}`, { method: "DELETE" }),
   startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
-  archiveTask: (id: string) => j<Task>(`/tasks/${id}/archive`, { method: "POST" }),
+  /** `force: true` bypasses the done-column gate (still rejects an active
+   *  run) — used by the Worktrees page's "Archive & delete" flow to archive
+   *  a stale worktree's task regardless of its current column. Omitted (the
+   *  common case) sends no body, matching the original archive-from-`done`
+   *  callers unchanged. */
+  archiveTask: (id: string, opts?: { force?: boolean }) =>
+    j<Task>(`/tasks/${id}/archive`, {
+      method: "POST",
+      ...(opts?.force ? { body: JSON.stringify({ force: true }) } : {}),
+    }),
   unarchiveTask: (id: string) => j<Task>(`/tasks/${id}/unarchive`, { method: "POST" }),
+
+  /** Every git worktree materialized on disk under `dataDir/worktrees/`,
+   *  cross-referenced against the tasks table. Drives the Worktrees page. */
+  listWorktrees: () => j<WorktreeInfo[]>("/worktrees"),
+  /** Removes an orphaned worktree directory (no owning task row) — a
+   *  task-backed worktree is torn down via `archiveTask(id, { force: true })`
+   *  instead, since deleting it destroys the ticket. */
+  deleteWorktree: (id: string) => j<void>(`/worktrees/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** On-demand live dirty/ahead/merged status for a single worktree — not part
+   *  of the bulk listing above (that stays fs+DB-only to avoid a subprocess
+   *  fan-out per poll). Fetched per row by the Worktrees page. */
+  getWorktreeGitStatus: (id: string) =>
+    j<WorktreeGitStatus>(`/worktrees/${encodeURIComponent(id)}/git-status`),
 
   // Terminal tabs. State is in-memory on the bun side; the live byte stream
   // runs over the WebSocket whose URL `terminalSocketUrl` builds.
