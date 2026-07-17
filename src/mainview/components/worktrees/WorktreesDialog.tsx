@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, ArrowDown, ArrowUp, FolderGit2, Loader2, RefreshCw, Search, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
@@ -15,6 +15,7 @@ import {
   type ColumnId,
   type Project,
   type Task,
+  type WorktreeGitStatus,
   type WorktreeInfo,
   type WorktreeStaleReason,
 } from "../../../shared/types.ts";
@@ -31,6 +32,11 @@ interface Props {
 }
 
 const POLL_MS = 5_000;
+
+/** On-demand `getWorktreeGitStatus` calls are subprocess-backed on the bun
+ *  side, so the auto-fetch pool caps fan-out rather than firing one request
+ *  per row simultaneously. */
+const GIT_STATUS_CONCURRENCY = 5;
 
 const basename = (p: string) => {
   const trimmed = p.replace(/\/+$/, "");
@@ -91,6 +97,13 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
+  // Live per-worktree dirty/ahead/merged, fetched on open + Refresh (not the
+  // 5s poll — see fetchGitStatuses). "loading" is a sentinel, not the
+  // WorktreeGitStatus shape itself.
+  const [gitStatus, setGitStatus] = useState<Map<string, WorktreeGitStatus | "loading">>(new Map());
+  // Bumped on every fetch pass so a superseding Refresh (or the dialog
+  // closing) makes in-flight results from an older pass a no-op.
+  const gitStatusRunRef = useRef(0);
 
   const [query, setQuery] = useState("");
   const [projectFilter, setProjectFilter] = useState<string[]>([]);
@@ -99,27 +112,77 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
   const [sortField, setSortField] = useState<SortField>("updated");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
-  const refresh = useCallback(async (manual = false) => {
+  // Bounded-concurrency pool: fetches live git status for every row in
+  // `list`, capped at GIT_STATUS_CONCURRENCY in flight. Marks all ids
+  // "loading" up front so the spinner shows immediately, then fills in each
+  // result (or drops the id on error — no badge, no toast spam) as it
+  // resolves. `runId` lets a superseding pass (a fresh Refresh, or the
+  // dialog closing) discard stale results instead of racing the map.
+  const fetchGitStatuses = useCallback((list: WorktreeInfo[]) => {
+    const runId = ++gitStatusRunRef.current;
+    setGitStatus((cur) => {
+      const next = new Map(cur);
+      for (const w of list) next.set(w.id, "loading");
+      return next;
+    });
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        const idx = cursor++;
+        const w = list[idx];
+        if (!w) return;
+        try {
+          const status = await api.getWorktreeGitStatus(w.id);
+          if (gitStatusRunRef.current !== runId) return;
+          setGitStatus((cur) => new Map(cur).set(w.id, status));
+        } catch {
+          if (gitStatusRunRef.current !== runId) return;
+          setGitStatus((cur) => {
+            const next = new Map(cur);
+            next.delete(w.id);
+            return next;
+          });
+        }
+      }
+    };
+    void Promise.all(
+      Array.from({ length: Math.min(GIT_STATUS_CONCURRENCY, list.length) }, worker),
+    );
+  }, []);
+
+  const refresh = useCallback(async (manual = false, fetchGit = false) => {
     if (manual) setRefreshing(true);
     try {
       const list = await api.listWorktrees();
       setWorktrees(list);
       setError(null);
+      if (fetchGit) fetchGitStatuses(list);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       if (manual) setRefreshing(false);
     }
-  }, []);
+  }, [fetchGitStatuses]);
 
   // Fetch on open + poll every 5s while open; cleared on close/unmount.
+  // Git status is auto-fetched on the initial open load and on manual
+  // Refresh only — not on every 5s poll tick, to avoid a git subprocess
+  // fan-out in the background while the dialog just sits open.
   useEffect(() => {
     if (!open) return;
     setLoading(true);
-    void refresh().finally(() => setLoading(false));
+    void refresh(false, true).finally(() => setLoading(false));
     const t = setInterval(() => { void refresh(); }, POLL_MS);
     return () => clearInterval(t);
   }, [open, refresh]);
+
+  // Discard any in-flight git-status pass and drop stale badges when the
+  // dialog closes (or unmounts) — reopening re-fetches fresh regardless.
+  useEffect(() => {
+    if (open) return;
+    gitStatusRunRef.current++;
+    setGitStatus(new Map());
+  }, [open]);
 
   // Reset filters each time the dialog is reopened — a stale filter carried
   // across sessions would silently hide rows the user doesn't expect.
@@ -272,7 +335,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
             title="Refresh"
             aria-label="Refresh"
             disabled={refreshing}
-            onClick={() => { void refresh(true); }}
+            onClick={() => { void refresh(true, true); }}
           >
             {refreshing ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
           </Button>
@@ -386,6 +449,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
             {sorted.map((w) => {
               const task = w.taskId ? tasks.find((t) => t.id === w.taskId) : undefined;
               const busy = busyIds.has(w.id);
+              const status = gitStatus.get(w.id);
               return (
                 <div key={w.id} className="flex items-start gap-3 rounded-md border border-border/60 bg-card p-3">
                   <FolderGit2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
@@ -426,6 +490,35 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                       <span className="min-w-0 truncate" title={w.path}>{abbreviateHome(w.path, homeDir)}</span>
                       <span>updated {formatAge(w.taskUpdatedAt)}</span>
                       {w.runActive && <span className="text-emerald-400">running</span>}
+                      {status === "loading" && (
+                        <Loader2 className="size-3 animate-spin text-muted-foreground" aria-label="Loading git status" />
+                      )}
+                      {status && status !== "loading" && !status.ignored && (
+                        <>
+                          {status.dirty && (
+                            <span className="text-amber-400" title="Has uncommitted changes">
+                              uncommitted
+                            </span>
+                          )}
+                          {status.ahead > 0 && (
+                            <span
+                              className="inline-flex items-center gap-0.5"
+                              title={`${status.ahead} commit${status.ahead === 1 ? "" : "s"} ahead`}
+                            >
+                              <ArrowUp className="size-3" />
+                              {status.ahead}
+                            </span>
+                          )}
+                          {status.merged === true && (
+                            <span
+                              className="text-emerald-400"
+                              title="Already merged into the default branch — safe to delete"
+                            >
+                              merged
+                            </span>
+                          )}
+                        </>
+                      )}
                       {w.stale && (
                         <span className="text-rose-400/80">
                           {w.staleReasons.map((r) => STALE_REASON_LABEL[r]).join(", ")}

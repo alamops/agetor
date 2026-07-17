@@ -680,6 +680,26 @@ export interface WorktreeInfo {
   staleReasons: WorktreeStaleReason[];
 }
 
+/**
+ * On-demand live git status for a single worktree, as surfaced by
+ * `GET /worktrees/:id/git-status`. Not part of the bulk `GET /worktrees`
+ * listing — computing this spawns git subprocesses, so it's fetched per row
+ * rather than on every poll.
+ */
+export interface WorktreeGitStatus {
+  /** Working tree has uncommitted changes (staged, unstaged, or untracked). */
+  dirty: boolean;
+  /** Commits on HEAD not yet pushed / ahead of base (see getAheadCount). 0 when unknown. */
+  ahead: number;
+  /** HEAD is an ancestor of the source repo's default branch — its work already
+   *  landed, so the worktree is safe to delete. null when it can't be determined
+   *  (no resolvable default branch, or a git error) — never a false "merged". */
+  merged: boolean | null;
+  /** The dir isn't inspectable (missing, not a git repo, git failed). When true,
+   *  the other fields are not meaningful. */
+  ignored: boolean;
+}
+
 /** A live terminal tab for a task. Returned by the terminal REST endpoints;
  *  state lives only in memory in `src/bun/terminals.ts`. */
 export interface TerminalTab {

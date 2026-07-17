@@ -114,6 +114,60 @@ export async function getAheadCount(dir: string, baseRef: string | null): Promis
   return 0;
 }
 
+/**
+ * Whether `dir`'s HEAD has already landed on the source repo's default
+ * branch — i.e. is an ancestor of it, so the worktree's work is safe to
+ * throw away. `null` means "couldn't determine" and must never be presented
+ * as merged; callers should treat it as unknown, same contract as
+ * `hasUncommittedChanges`/`getAheadCount`.
+ *
+ * Default branch resolution, most to least authoritative:
+ *
+ * 1. `git rev-parse --abbrev-ref origin/HEAD` — the remote's advertised
+ *    default (e.g. resolves to `origin/main`). Used verbatim when it
+ *    succeeds and isn't the literal unresolved `origin/HEAD` (that string
+ *    comes back when the symbolic ref exists but doesn't point anywhere
+ *    useful, e.g. no remote configured).
+ * 2. No `origin/HEAD` — try local `main`, then `master`, via
+ *    `git show-ref --verify --quiet refs/heads/<b>` (exit 0 = branch exists).
+ * 3. Neither resolves: return `null` rather than guessing.
+ *
+ * Once a default branch candidate is picked, `git merge-base --is-ancestor
+ * HEAD <default>` maps exit code 0 → `true` (HEAD is an ancestor, i.e.
+ * merged), exit code 1 → `false` (diverged/not merged), and any other exit
+ * code (git error) → `null`.
+ *
+ * Runs with `cwd` = `dir`; a linked worktree shares the source repo's refs
+ * via its common git dir, so this resolves correctly without needing the
+ * source repo's own path.
+ */
+export async function isMergedIntoDefaultBranch(dir: string): Promise<boolean | null> {
+  if (!existsSync(dir)) return null;
+  if (!(await isGitRepo(dir))) return null;
+
+  let defaultBranch: string | null = null;
+
+  const originHead = await git(["rev-parse", "--abbrev-ref", "origin/HEAD"], dir);
+  if (originHead.ok && originHead.stdout.length > 0 && originHead.stdout !== "origin/HEAD") {
+    defaultBranch = originHead.stdout;
+  } else {
+    for (const candidate of ["main", "master"]) {
+      const ref = await git(["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`], dir);
+      if (ref.ok) {
+        defaultBranch = candidate;
+        break;
+      }
+    }
+  }
+
+  if (!defaultBranch || defaultBranch.startsWith("-")) return null;
+
+  const res = await git(["merge-base", "--is-ancestor", "HEAD", defaultBranch], dir);
+  if (res.exitCode === 0) return true;
+  if (res.exitCode === 1) return false;
+  return null;
+}
+
 // A directory's git top-level is stable for the lifetime of the process, so
 // resolved roots are memoized — discovery (/agent-discovery) resolves the same
 // workdir on every refresh and would otherwise spawn a `git rev-parse` for

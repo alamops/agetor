@@ -74,6 +74,7 @@ import type {
   TaskType,
   TerminalTab,
   UpdateStatus,
+  WorktreeGitStatus,
   WorktreeInfo,
 } from "../../shared/types.ts";
 import { fetchWithRecovery } from "./net-retry.ts";
@@ -1047,6 +1048,11 @@ export const api = {
    *  task-backed worktree is torn down via `archiveTask(id, { force: true })`
    *  instead, since deleting it destroys the ticket. */
   deleteWorktree: (id: string) => j<void>(`/worktrees/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** On-demand live dirty/ahead/merged status for a single worktree — not part
+   *  of the bulk listing above (that stays fs+DB-only to avoid a subprocess
+   *  fan-out per poll). Fetched per row by the Worktrees page. */
+  getWorktreeGitStatus: (id: string) =>
+    j<WorktreeGitStatus>(`/worktrees/${encodeURIComponent(id)}/git-status`),
 
   // Terminal tabs. State is in-memory on the bun side; the live byte stream
   // runs over the WebSocket whose URL `terminalSocketUrl` builds.

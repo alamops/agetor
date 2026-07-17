@@ -17,7 +17,7 @@ import {
   HarnessInUseError,
   dataDir,
 } from "./db.ts";
-import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -3157,6 +3157,18 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : new Response(null, { status: 204, headers: corsHeaders(req) });
+        }),
+      },
+
+      // On-demand live git status (dirty/ahead/merged) for a single worktree
+      // — task-backed or orphaned. Deliberately not part of `GET /worktrees`:
+      // each field spawns a git subprocess, so it's fetched per row rather
+      // than on every poll of the bulk list.
+      "/worktrees/:id/git-status": {
+        GET: authed(async (req) => {
+          const res = await worktreeGitStatus(req.params.id);
+          if ("error" in res) return json(res, { status: 400, headers: corsHeaders(req) });
+          return json(res, { headers: corsHeaders(req) });
         }),
       },
 

@@ -84,6 +84,9 @@ import {
   WORKTREES_DIR,
   parseWorktreeGitPointer,
   pruneWorktrees,
+  hasUncommittedChanges,
+  getAheadCount,
+  isMergedIntoDefaultBranch,
 } from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
@@ -93,6 +96,7 @@ import type {
   RunEvent,
   RunStatus,
   Task,
+  WorktreeGitStatus,
   WorktreeInfo,
   WorktreeStaleReason,
 } from "../shared/types.ts";
@@ -2113,6 +2117,27 @@ export function listWorktrees(): WorktreeInfo[] {
 }
 
 /**
+ * Resolve a worktree id (a directory basename under `WORKTREES_DIR`) to its
+ * absolute path, with the confinement checks shared by every worktree-id
+ * endpoint: no `/`, `\`, `..`, or empty string, and the resolved path must
+ * be a direct child of `WORKTREES_DIR`, never the directory itself (guards
+ * against ids like `"."` that pass the substring checks but normalize to
+ * `WORKTREES_DIR` — an `rm -rf` there would delete every task's worktree).
+ * Factored out of `deleteOrphanWorktree` so `worktreeGitStatus` shares the
+ * exact same guard rather than a hand-copied one that could drift.
+ */
+function resolveWorktreeDir(id: string): { dir: string } | { error: string } {
+  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
+    return { error: "invalid worktree id" };
+  }
+  const dirPath = join(WORKTREES_DIR, id);
+  if (basename(dirPath) !== id) {
+    return { error: "invalid worktree id" };
+  }
+  return { dir: dirPath };
+}
+
+/**
  * Delete an orphaned worktree directory — one with no owning task row, so
  * there's no ticket for `archiveTask` to archive. Used by the Worktrees
  * page's delete action for `WorktreeInfo` rows where `taskId` is null.
@@ -2120,8 +2145,8 @@ export function listWorktrees(): WorktreeInfo[] {
  * Refuses (rather than silently no-oping) when a task row for `id` still
  * exists — that worktree is owned, and the caller should archive the task
  * instead, which routes through the normal teardown path. `id` is validated
- * as a plain directory name (no `/`, `\`, `..`, or empty string) so the
- * resolved path can never escape `WORKTREES_DIR`.
+ * via `resolveWorktreeDir` so the resolved path can never escape
+ * `WORKTREES_DIR`.
  *
  * Awaits `pendingTeardown(id)` before touching the directory — the fleet
  * invariant every worktree-touching path follows, in case a stale teardown
@@ -2130,17 +2155,10 @@ export function listWorktrees(): WorktreeInfo[] {
  * enumerate-and-kill of `agetor-*` sessions on the shared tmux socket.
  */
 export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | { error: string }> {
-  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
-    return { error: "invalid worktree id" };
-  }
-  const dirPath = join(WORKTREES_DIR, id);
-  // Confinement backstop: the resolved path must be a direct child of
-  // WORKTREES_DIR, never the directory itself. Guards against ids like `"."`
-  // that pass the checks above but normalize to WORKTREES_DIR — deleting it
-  // would `rm -rf` every task's worktree.
-  if (basename(dirPath) !== id) {
-    return { error: "invalid worktree id" };
-  }
+  const resolved = resolveWorktreeDir(id);
+  if ("error" in resolved) return resolved;
+  const dirPath = resolved.dir;
+
   let isDir = false;
   try {
     isDir = statSync(dirPath).isDirectory();
@@ -2158,15 +2176,65 @@ export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | {
   // its stale `.git/worktrees/<id>` registration afterwards.
   const sourceRoot = parseWorktreeGitPointer(dirPath);
 
-  try {
-    await rm(dirPath, { recursive: true, force: true });
-  } catch (err) {
-    return { error: `failed to remove worktree directory: ${err instanceof Error ? err.message : String(err)}` };
+  // Run the rm + prune on the source repo's teardown FIFO (keyed by
+  // sourceRoot, same as archiveTask/deleteTask's teardown) so an orphan
+  // cleanup can't contend on git's `.git/worktrees/.lock` with a concurrent
+  // same-repo archive/delete teardown. `enqueueTeardown` swallows job errors
+  // — a single misbehaving teardown must not break the chain for every task
+  // queued behind it — so the closure-captured `result` is how we still
+  // surface a failed rm to the caller after the await. When the source repo
+  // can't be determined, key by `dirPath` instead: there's no shared lock
+  // domain to serialize against, so this degrades to a private one-entry
+  // chain, behaviorally the same as running it inline.
+  let result: { ok: true } | { error: string } = { ok: true };
+  await enqueueTeardown(id, sourceRoot ?? dirPath, async () => {
+    try {
+      await rm(dirPath, { recursive: true, force: true });
+    } catch (err) {
+      result = { error: `failed to remove worktree directory: ${err instanceof Error ? err.message : String(err)}` };
+      return; // don't prune if the removal failed
+    }
+    if (sourceRoot) await pruneWorktrees(sourceRoot);
+  });
+
+  return result;
+}
+
+/**
+ * On-demand live git status for a single worktree — dirty / ahead / merged —
+ * composing `hasUncommittedChanges`, `getAheadCount`, and
+ * `isMergedIntoDefaultBranch`. Deliberately not part of `listWorktrees` (fs +
+ * DB only, safe to poll): each of these spawns a git subprocess, so this is
+ * fetched per row on demand instead. Backs `GET /worktrees/:id/git-status`.
+ *
+ * Shares `resolveWorktreeDir`'s confinement with `deleteOrphanWorktree`, but
+ * — unlike delete — does not refuse task-owned ids: git status is useful for
+ * both orphan and task-backed worktrees, so callers can check staleness
+ * before deciding whether to archive.
+ *
+ * For a task-backed id, resolves the live worktree dir + pinned base ref
+ * from the task row (`worktreePath ?? workdir`, `baseRef`). For an orphan id
+ * (no task row), uses the `WORKTREES_DIR/id` path directly with no base ref
+ * — `getAheadCount` degrades to its unknown-but-not-blocking `0` in that
+ * case, same contract as everywhere else `baseRef` may be null.
+ */
+export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus | { error: string }> {
+  const resolved = resolveWorktreeDir(id);
+  if ("error" in resolved) return resolved;
+
+  const task = tasks.get(id);
+  const dir = task ? task.worktreePath ?? task.workdir : resolved.dir;
+  const baseRef = task ? task.baseRef ?? null : null;
+
+  const dirty0 = await hasUncommittedChanges(dir);
+  if (dirty0 === null) {
+    return { dirty: false, ahead: 0, merged: null, ignored: true };
   }
 
-  if (sourceRoot) {
-    await pruneWorktrees(sourceRoot);
-  }
+  const [aheadResult, merged] = await Promise.all([
+    getAheadCount(dir, baseRef),
+    isMergedIntoDefaultBranch(dir),
+  ]);
 
-  return { ok: true };
+  return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false };
 }
