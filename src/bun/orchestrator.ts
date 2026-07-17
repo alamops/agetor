@@ -636,6 +636,50 @@ export function reconcileOrphans(): number {
     console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
   }
 
+  // Kimi-scoped restart-during-backoff sweep. `kimiRetryState`'s pending
+  // timer is pure in-memory state — it does not survive a restart. If
+  // agetor quit (or crashed) while a retry was backed off, the task is left
+  // in `column: 'running'` with `run_id` pointing at the already-`failed`
+  // run whose retry never got to fire. The orphan loop above only scans
+  // `status = 'running'` runs, so it never sees this task — the run row
+  // itself is already terminal, nothing about it looks stale. Recover it
+  // the same way `cancelRun`'s pending-timer branch and
+  // `reconcileTaskSession`'s agent-switch branch land a task whose retry
+  // timer is gone: null `run_id`, flip to `ready`, and say so.
+  //
+  // MUST be kimi-scoped: a claude-code task can legitimately sit in
+  // `running` with a terminal (succeeded) run while background subagents
+  // are still tracked (the held-task feature, swept separately below) — an
+  // unscoped version of this sweep would wrongly release those tasks. At
+  // boot there is no in-memory `active` entry for anything yet (this runs
+  // before any spawn/reattach in this same pass populates it for a *kimi*
+  // task — reattach above only wires `active` for runs whose tmux session
+  // is still alive, which for kimi means `status = 'running'`, already
+  // excluded by the terminal-run check below), so the `active` guard is
+  // defensive rather than load-bearing here.
+  let kimiRetryStranded = 0;
+  for (const task of tasks.list()) {
+    if (task.column !== "running") continue;
+    if (resolveHarness(task.agent)?.kind !== "kimi") continue;
+    if (task.runId && active.has(task.runId)) continue;
+    const run = task.runId ? runs.get(task.runId) : null;
+    if (run && run.status === "running") continue; // genuinely in flight — not our sweep's business
+    const staleRunId = task.runId;
+    tasks.update(task.id, { runId: null });
+    // Match `cancelRun`'s pending-timer landing: the event's `runId` field
+    // is `null` here too, since the task no longer points at any run.
+    updateColumn(task.id, null, "ready");
+    const data = "kimi retry window lost across restart — task returned to ready";
+    if (staleRunId) {
+      runs.appendEvent(staleRunId, "status", data);
+      emit({ runId: staleRunId, taskId: task.id, stream: "status", data, ts: Date.now() });
+    }
+    kimiRetryStranded++;
+  }
+  if (kimiRetryStranded > 0) {
+    console.log(`[agetor] released ${kimiRetryStranded} kimi task(s) stranded mid-retry-backoff across restart`);
+  }
+
   // Held tasks — and, more generally, ANY task with a stuck `running`
   // subagents row — are invisible to the pass above: their terminal run is
   // already `succeeded`, so it never appears in the `status='running'` scan
@@ -924,7 +968,11 @@ function makeChunkHandler(
     // session-death, this isn't a user-facing failure state). The resolve
     // path in `attachDoneHandler` reads the flag to schedule an automatic
     // backoff-retry instead of bouncing the task to `ready`.
-    if (stream === "status" && data.startsWith(KIMI_RETRYABLE_STATUS_PREFIX)) {
+    if (
+      kind === "kimi"
+      && stream === "status"
+      && data.startsWith(KIMI_RETRYABLE_STATUS_PREFIX)
+    ) {
       const handle = active.get(runId);
       if (handle && !handle.retryable) {
         handle.retryable = true;
@@ -1020,10 +1068,13 @@ function attachDoneHandler(
           // the turn. No column flip: this attempt's failure isn't the
           // task's terminal state yet.
         } else {
-          // Reset the retry counter on a clean success (and on an ordinary,
-          // non-retryable failure exhausting a task's retry history — a new
-          // unrelated failure shouldn't inherit a stale attempt count).
-          if (newStatus === "succeeded") kimiRetryState.delete(taskId);
+          // Reset the retry counter on a clean success and on an ordinary,
+          // non-retryable failure (or a retry-cap exhaustion, already
+          // deleted by `scheduleKimiRetry`) — a new unrelated failure
+          // shouldn't inherit a stale attempt count. Unconditional: this
+          // whole branch is the task's terminal state for this attempt,
+          // regardless of newStatus. No-op when already cleared.
+          kimiRetryState.delete(taskId);
           // A clean success with background agents still in flight is HELD in
           // `running` rather than advanced to `review` — the run finished but the
           // task's work hasn't. `runs.update(..., "succeeded")` already landed
@@ -1141,7 +1192,28 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     // too.
     codexTurnQueue.delete(taskId);
     kimiTurnQueue.delete(taskId);
+    const hadPendingKimiRetry = beforeKind === "kimi" && kimiRetryState.get(taskId)?.timer != null;
     clearKimiRetryState(taskId);
+    // Landing check: a pending kimi retry timer was the only thing that was
+    // ever going to move this task out of `running` — the failed run it
+    // points at is already terminal (that's *why* a retry was scheduled).
+    // Clearing the timer without also landing the task would strand the
+    // card in `running` forever. Mirror `cancelRun`'s pending-timer landing
+    // exactly (including its status text), so the two sites read as one
+    // invariant: never cancel the timer without also landing the task, for
+    // the run the task actually points at. `hadPendingKimiRetry` already
+    // scopes this to kimi tasks — non-kimi `running` + terminal-run combos
+    // (e.g. a claude-code task held for background agents) are untouched.
+    if (hadPendingKimiRetry && after.runId && !active.has(after.runId)) {
+      const staleRun = runs.get(after.runId);
+      if (staleRun && staleRun.status !== "running") {
+        tasks.update(taskId, { runId: null });
+        updateColumn(taskId, null, "ready");
+        const data = "kimi retry cancelled by user";
+        runs.appendEvent(after.runId, "status", data);
+        emit({ runId: after.runId, taskId, stream: "status", data, ts: Date.now() });
+      }
+    }
     // Cross-kind switches (e.g. claude-code → codex alias) leave mode/
     // model/effort ids that belong to the old kind's option set; the
     // next spawn would error or fall through to verbatim flags. Reset
@@ -1275,13 +1347,16 @@ export function cancelRun(runId: string): boolean {
     // sit in `running` forever with nothing scheduled to move it.
     if (taskId) {
       const pending = kimiRetryState.get(taskId);
-      if (pending?.timer) {
+      const task = tasks.get(taskId);
+      // Never cancel the timer without also landing the task, for the run
+      // the task actually points at. A stale `runId` (the task has already
+      // moved on to a different run) must leave the pending retry alone —
+      // it belongs to whatever run the task currently points at, not this
+      // one — so clear + land only fire together, gated on the same check.
+      if (pending?.timer && task && task.runId === runId) {
         clearKimiRetryState(taskId);
-        const task = tasks.get(taskId);
-        if (task && task.runId === runId) {
-          tasks.update(taskId, { runId: null });
-          updateColumn(taskId, null, "ready");
-        }
+        tasks.update(taskId, { runId: null });
+        updateColumn(taskId, null, "ready");
         const data = "kimi retry cancelled by user";
         runs.appendEvent(runId, "status", data);
         emit({ runId, taskId, stream: "status", data, ts: Date.now() });
