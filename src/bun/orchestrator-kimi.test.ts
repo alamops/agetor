@@ -1,4 +1,4 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll, describe } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +16,12 @@ process.env.AGETOR_KIMI_DRIVER = "fake";
 // kimi bin at /bin/echo so `--version` succeeds on CI hosts without kimi
 // installed.
 process.env.AGETOR_KIMI_BIN = "/bin/echo";
+// Fast backoff for the exit-75 auto-retry suite below — orchestrator.ts's
+// `kimiRetryDelayMs` reads this fresh on every call, so individual tests can
+// still override it locally (and MUST restore it in a finally block) when
+// they need a wider window to mutate env vars between "failure settled" and
+// "retry timer fires".
+process.env.AGETOR_KIMI_RETRY_DELAY_MS = "10";
 
 beforeAll(async () => {
   await import("./db.ts");
@@ -23,6 +29,41 @@ beforeAll(async () => {
 
 async function settle(ms = 80) {
   await new Promise((r) => setTimeout(r, ms));
+}
+
+/** Poll `predicate` until it's true, instead of a fixed `settle()` sleep —
+ *  the exit-75 retry suite below chains multiple timers (fake-driver resolve
+ *  delay + backoff delay, repeated across up to 3 runs), so a fixed sleep
+ *  budget is either too slow (wastes wall time) or flaky under load (the
+ *  timers don't fire before the assertion runs). Throws with `label` on
+ *  timeout so a failure points at which condition never became true. */
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`waitFor timed out after ${timeoutMs}ms: ${label}`);
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+/** Temporarily override `AGETOR_KIMI_RETRY_DELAY_MS`, restoring the module's
+ *  fast default (see top of file) afterward. Used by tests that need a wider
+ *  backoff window to deterministically mutate env vars (or call
+ *  cancelRun/deleteTask) between "failure settled" and "retry timer fires".
+ *  `fn` is awaited BEFORE the restore runs (a plain try/finally around a sync
+ *  call would restore the env var immediately, before any of the test's
+ *  awaited work — including the timers this override exists to widen — ever
+ *  ran). */
+async function withRetryDelayMs<T>(ms: number, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env.AGETOR_KIMI_RETRY_DELAY_MS;
+  process.env.AGETOR_KIMI_RETRY_DELAY_MS = String(ms);
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.AGETOR_KIMI_RETRY_DELAY_MS;
+    else process.env.AGETOR_KIMI_RETRY_DELAY_MS = prev;
+  }
 }
 
 /** Write an executable fake `tmux` that always exits `code`, then point
@@ -337,4 +378,343 @@ test("reconcileOrphans: a kimi run left status='running' with a dead tmux sessio
   const task = tasks.get(taskId);
   expect(task?.column).toBe("ready");
   expect(task?.runId).toBeNull();
+});
+
+/** Create a kimi task via the real orchestrator path (createTask), enabling
+ *  the kimi harness first. Shared by every test in the exit-75 retry suite
+ *  below so each test starts from an identical, freshly-created task. */
+async function createKimiTask(title: string, prompt = "turn one"): Promise<string> {
+  const { createTask } = await import("./orchestrator.ts");
+  const { harnesses } = await import("./db.ts");
+  harnesses.setEnabled("kimi", true);
+  const created = await createTask({
+    title,
+    prompt,
+    agent: "kimi",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  return created.task.id;
+}
+
+describe("kimi exit-75 auto-retry (orchestrator.ts: kimiRetryState / scheduleKimiRetry / fireKimiRetry)", () => {
+  test("retryable exit (75) schedules a backoff retry: task stays running, retry succeeds, task lands review with the resumed session id", async () => {
+    const { startTask } = await import("./orchestrator.ts");
+    const { runs, tasks } = await import("./db.ts");
+    const taskId = await createKimiTask("kimi retry then success");
+
+    process.env.AGETOR_FAKE_KIMI_EXIT_CODE = "75";
+    try {
+      await withRetryDelayMs(150, async () => {
+        const started = await startTask(taskId);
+        if ("error" in started) throw new Error(started.error);
+        const firstRunId = "runId" in started ? started.runId : "";
+
+        // First turn resolves failed(75) at ~20ms (fake driver) — well
+        // inside the 150ms backoff window this test needs.
+        await waitFor(() => runs.get(firstRunId)?.status === "failed", "first run settles failed");
+        expect(runs.get(firstRunId)?.exitCode).toBe(75);
+        // The retry machinery deliberately skips the column flip — unlike an
+        // ordinary failure, the task stays `running`, not bounced to `ready`.
+        expect(tasks.get(taskId)?.column).toBe("running");
+        const events = runs.events(firstRunId);
+        expect(events.some((e) => e.stream === "status" && /retrying after exit 75/.test(e.data))).toBe(true);
+        // The retry hasn't fired yet — still just the one run row.
+        expect(runs.listForTask(taskId).length).toBe(1);
+
+        // Unset the fake exit code now, well inside the 150ms backoff
+        // window, so the re-spawned turn (once the timer fires) succeeds.
+        delete process.env.AGETOR_FAKE_KIMI_EXIT_CODE;
+
+        await waitFor(() => runs.listForTask(taskId).length === 2, "retry run spawns");
+        const secondRun = runs.listForTask(taskId).find((r) => r.id !== firstRunId);
+        if (!secondRun) throw new Error("retry run not found");
+        await waitFor(() => runs.get(secondRun.id)?.status === "succeeded", "retry run succeeds");
+
+        expect(tasks.get(taskId)?.column).toBe("review");
+        expect(runs.get(secondRun.id)?.kimiSessionId).toBe(runs.get(firstRunId)?.kimiSessionId);
+        expect(runs.get(secondRun.id)?.codexSessionId).toBeNull();
+        expect(runs.get(secondRun.id)?.claudeSessionId).toBeNull();
+      });
+    } finally {
+      delete process.env.AGETOR_FAKE_KIMI_EXIT_CODE;
+    }
+  });
+
+  test("cap exhaustion: retry budget (2) exhausts after the initial failure — 3 total runs, all failed, task back to ready", async () => {
+    const { startTask } = await import("./orchestrator.ts");
+    const { runs, tasks } = await import("./db.ts");
+    const taskId = await createKimiTask("kimi cap exhaustion");
+
+    process.env.AGETOR_FAKE_KIMI_EXIT_CODE = "75";
+    try {
+      await withRetryDelayMs(10, async () => {
+        const started = await startTask(taskId);
+        if ("error" in started) throw new Error(started.error);
+
+        // Initial run + 2 retries = 3 runs total, then the task lands back
+        // on `ready` once the budget (KIMI_RETRY_MAX = 2) is exhausted.
+        await waitFor(
+          () => tasks.get(taskId)?.column === "ready",
+          "task exhausts retry budget and lands ready",
+          8000,
+        );
+
+        const list = runs.listForTask(taskId);
+        expect(list.length).toBe(3);
+        for (const run of list) {
+          expect(run.status).toBe("failed");
+          expect(run.exitCode).toBe(75);
+        }
+        // Attempts are numbered 1/2 then 2/2 across the two retry-scheduling
+        // events (recorded on the initial run and the first retry's run,
+        // respectively — the third failure exhausts the budget and records
+        // no further "retrying" event).
+        const allEvents = list.flatMap((r) => runs.events(r.id));
+        expect(allEvents.some((e) => e.stream === "status" && /attempt 1\/2/.test(e.data))).toBe(true);
+        expect(allEvents.some((e) => e.stream === "status" && /attempt 2\/2/.test(e.data))).toBe(true);
+
+        // No further retry fires after the cap — wait comfortably past
+        // another backoff window and confirm the run count is stable.
+        await settle(300);
+        expect(runs.listForTask(taskId).length).toBe(3);
+      });
+    } finally {
+      delete process.env.AGETOR_FAKE_KIMI_EXIT_CODE;
+    }
+  });
+
+  test("non-retryable exit code (1) fails normally — no retry status event, no second run after waiting past the backoff window", async () => {
+    const { startTask } = await import("./orchestrator.ts");
+    const { runs, tasks } = await import("./db.ts");
+    const taskId = await createKimiTask("kimi non-retryable exit");
+
+    process.env.AGETOR_FAKE_KIMI_EXIT_CODE = "1";
+    try {
+      await withRetryDelayMs(10, async () => {
+        const started = await startTask(taskId);
+        if ("error" in started) throw new Error(started.error);
+        const firstRunId = "runId" in started ? started.runId : "";
+
+        await waitFor(() => tasks.get(taskId)?.column === "ready", "ordinary failure lands ready");
+
+        const list = runs.listForTask(taskId);
+        expect(list.length).toBe(1);
+        expect(list[0]?.status).toBe("failed");
+        expect(list[0]?.exitCode).toBe(1);
+        const events = runs.events(firstRunId);
+        expect(events.some((e) => e.stream === "status" && /retrying after exit 75/.test(e.data))).toBe(false);
+
+        // Wait well past a retry backoff window — still no second run.
+        await settle(200);
+        expect(runs.listForTask(taskId).length).toBe(1);
+      });
+    } finally {
+      delete process.env.AGETOR_FAKE_KIMI_EXIT_CODE;
+    }
+  });
+
+  test("Stop during backoff cancels the pending retry timer, lands the task ready with runId cleared, no retry run spawns", async () => {
+    const { startTask, cancelRun } = await import("./orchestrator.ts");
+    const { runs, tasks } = await import("./db.ts");
+    const taskId = await createKimiTask("kimi stop during backoff");
+
+    process.env.AGETOR_FAKE_KIMI_EXIT_CODE = "75";
+    try {
+      await withRetryDelayMs(150, async () => {
+        const started = await startTask(taskId);
+        if ("error" in started) throw new Error(started.error);
+        const firstRunId = "runId" in started ? started.runId : "";
+
+        await waitFor(() => runs.get(firstRunId)?.status === "failed", "first run settles failed");
+        expect(tasks.get(taskId)?.column).toBe("running"); // retry pending
+
+        const cancelled = cancelRun(firstRunId);
+        expect(cancelled).toBe(true);
+
+        expect(tasks.get(taskId)?.column).toBe("ready");
+        expect(tasks.get(taskId)?.runId).toBeNull();
+        const events = runs.events(firstRunId);
+        expect(events.some((e) => e.stream === "status" && e.data === "kimi retry cancelled by user")).toBe(true);
+
+        // Wait well past the 150ms backoff window — the cancelled timer must
+        // not fire, so no retry run ever spawns.
+        await settle(300);
+        expect(runs.listForTask(taskId).length).toBe(1);
+      });
+    } finally {
+      delete process.env.AGETOR_FAKE_KIMI_EXIT_CODE;
+    }
+  });
+
+  test("deleteTask during backoff clears the pending retry timer without throwing or spawning a stray run", async () => {
+    const { startTask, deleteTask } = await import("./orchestrator.ts");
+    const { runs, tasks } = await import("./db.ts");
+    const taskId = await createKimiTask("kimi delete during backoff");
+
+    process.env.AGETOR_FAKE_KIMI_EXIT_CODE = "75";
+    try {
+      await withRetryDelayMs(150, async () => {
+        const started = await startTask(taskId);
+        if ("error" in started) throw new Error(started.error);
+        const firstRunId = "runId" in started ? started.runId : "";
+
+        await waitFor(() => runs.get(firstRunId)?.status === "failed", "first run settles failed");
+        expect(tasks.get(taskId)?.column).toBe("running"); // retry pending
+
+        // Assertion is implicit: an unhandled rejection (the fleet-known
+        // post-delete FK-error race on a spawn that outlives the task row)
+        // would fail this test.
+        await deleteTask(taskId);
+        expect(tasks.get(taskId)).toBeNull();
+
+        // Wait well past the 150ms backoff window — the retry timer was
+        // cleared by deleteTask's clearKimiRetryState, so no run rows
+        // resurrect for a task that no longer exists.
+        await settle(300);
+        expect(runs.listForTask(taskId).length).toBe(0);
+      });
+    } finally {
+      delete process.env.AGETOR_FAKE_KIMI_EXIT_CODE;
+    }
+  });
+
+  test("retry counter resets on an ordinary failure — a later retryable exit on a new turn starts a fresh attempt count", async () => {
+    const { startTask, sendInput } = await import("./orchestrator.ts");
+    const { runs, tasks } = await import("./db.ts");
+    const taskId = await createKimiTask("kimi counter reset");
+
+    process.env.AGETOR_FAKE_KIMI_EXIT_CODE = "75";
+    let runAId = "";
+    try {
+      await withRetryDelayMs(150, async () => {
+        const started = await startTask(taskId);
+        if ("error" in started) throw new Error(started.error);
+        runAId = "runId" in started ? started.runId : "";
+
+        // Run A exits 75 → retry attempt 1/2 scheduled.
+        await waitFor(() => runs.get(runAId)?.status === "failed", "run A settles failed");
+        expect(runs.events(runAId).some((e) => e.stream === "status" && /attempt 1\/2/.test(e.data))).toBe(true);
+
+        // Flip the fake to an ordinary non-retryable exit before the retry
+        // fires, so run A's retry (run B) fails normally — an ordinary
+        // failure, not a retryable one — clearing the retry state (count
+        // reset) rather than scheduling attempt 2/2.
+        process.env.AGETOR_FAKE_KIMI_EXIT_CODE = "1";
+        await waitFor(() => runs.listForTask(taskId).length === 2, "run B (the retry) spawns");
+        const runB = runs.listForTask(taskId).find((r) => r.id !== runAId);
+        if (!runB) throw new Error("retry run B not found");
+        await waitFor(() => runs.get(runB.id)?.status === "failed", "run B settles failed");
+        expect(runs.get(runB.id)?.exitCode).toBe(1);
+        expect(tasks.get(taskId)?.column).toBe("ready");
+      });
+
+      // New turn, exit 75 again — must get a FRESH attempt count (1/2), not
+      // inherit run A's already-exhausted-looking streak.
+      process.env.AGETOR_FAKE_KIMI_EXIT_CODE = "75";
+      const res = await withRetryDelayMs(150, () => sendInput(runAId, "a fresh turn"));
+      expect(res.delivered).toBe(true);
+      const runCId = res.delivered ? res.runId : "";
+      expect(runCId).not.toBe(runAId);
+
+      await waitFor(() => runs.get(runCId)?.status === "failed", "run C settles failed");
+      const runCEvents = runs.events(runCId);
+      expect(runCEvents.some((e) => e.stream === "status" && /attempt 1\/2/.test(e.data))).toBe(true);
+      expect(runCEvents.some((e) => e.stream === "status" && /attempt 2\/2/.test(e.data))).toBe(false);
+    } finally {
+      delete process.env.AGETOR_FAKE_KIMI_EXIT_CODE;
+    }
+  });
+
+  test("reconcileOrphans: a kimi task stranded mid-retry-backoff across a restart flips to ready, without touching a claude-code task in the same held-running shape", async () => {
+    const { createTask, reconcileOrphans } = await import("./orchestrator.ts");
+    const { runs, tasks, harnesses } = await import("./db.ts");
+    const { sessionNameFor } = await import("./claude-tmux.ts");
+    harnesses.setEnabled("kimi", true);
+
+    // Kimi task: simulate the crash-during-backoff state directly. The
+    // pending retry timer is pure in-memory state (kimiRetryState) that does
+    // not survive a restart — on a fresh process the task is stuck in
+    // `column: 'running'` pointing at an already-`failed` run whose retry
+    // never got to fire.
+    const kimiCreated = await createTask({
+      title: "kimi strand sweep",
+      prompt: "turn one",
+      agent: "kimi",
+      workdir: process.cwd(),
+      isolation: "none",
+      taskType: "task",
+    });
+    if ("error" in kimiCreated) throw new Error(kimiCreated.error);
+    const kimiTaskId = kimiCreated.task.id;
+    const kimiRunId = randomUUID();
+    const now = Date.now();
+    tasks.update(kimiTaskId, { column: "running", runId: kimiRunId });
+    runs.insert({
+      id: kimiRunId,
+      taskId: kimiTaskId,
+      agent: "kimi",
+      status: "failed",
+      startedAt: now,
+      endedAt: now,
+      exitCode: 75,
+      tmuxSession: sessionNameFor(kimiTaskId),
+      claudeSessionId: null,
+      codexSessionId: null,
+      kimiSessionId: `fake-kimi-session-${kimiTaskId}`,
+    });
+
+    // claude-code task in the SAME held-running shape (column running,
+    // runId pointing at an already-terminal run) — the sweep is kind-scoped
+    // to kimi, so this control task must be left completely untouched.
+    const claudeCreated = await createTask({
+      title: "claude held-running shape (control)",
+      prompt: "turn one",
+      agent: "claude-code",
+      workdir: process.cwd(),
+      isolation: "none",
+      taskType: "task",
+    });
+    if ("error" in claudeCreated) throw new Error(claudeCreated.error);
+    const claudeTaskId = claudeCreated.task.id;
+    const claudeRunId = randomUUID();
+    tasks.update(claudeTaskId, { column: "running", runId: claudeRunId });
+    runs.insert({
+      id: claudeRunId,
+      taskId: claudeTaskId,
+      agent: "claude-code",
+      status: "failed",
+      startedAt: now,
+      endedAt: now,
+      exitCode: 1,
+      tmuxSession: sessionNameFor(claudeTaskId),
+      claudeSessionId: `fake-claude-session-${claudeTaskId}`,
+      codexSessionId: null,
+      kimiSessionId: null,
+    });
+
+    // HERMETICITY TRAP (same as the orphan test above): stub a report-gone
+    // tmux fake around the call.
+    const restoreTmux = fakeTmux(1, "can't find session");
+    try {
+      reconcileOrphans();
+    } finally {
+      restoreTmux();
+    }
+
+    // Kimi task: swept — flipped to ready, runId cleared, status event says so.
+    const kimiTask = tasks.get(kimiTaskId);
+    expect(kimiTask?.column).toBe("ready");
+    expect(kimiTask?.runId).toBeNull();
+    const kimiEvents = runs.events(kimiRunId);
+    expect(kimiEvents.some((e) => e.stream === "status" && /retry window lost/.test(e.data))).toBe(true);
+
+    // Claude-code control task: untouched — still parked in `running` with
+    // its runId intact.
+    const claudeTask = tasks.get(claudeTaskId);
+    expect(claudeTask?.column).toBe("running");
+    expect(claudeTask?.runId).toBe(claudeRunId);
+  });
 });

@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test, expect, describe, mock } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,7 +7,7 @@ import path from "node:path";
 // from it. Set a temp dir before importing (mirrors codex-tmux.test.ts).
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-kimi-tmux-"));
 
-const { mapKimiEvent, kimiLogPath } = await import("./kimi-tmux.ts");
+const { mapKimiEvent, kimiLogPath, mapKimiWireEvent } = await import("./kimi-tmux.ts");
 import type { RunEventStream } from "../shared/types.ts";
 
 type Chunk = { stream: RunEventStream; data: string; lineUuid?: string };
@@ -210,3 +210,182 @@ test("kimiLogPath(runId) is derivable from runId alone (so reattach can recomput
 // it's exercised end-to-end instead by the fake-driver orchestrator test
 // (T7, orchestrator-kimi.test.ts) and by the live-binary smoke test called
 // for in the plan's open questions (§8.7) before the harness ships enabled.
+
+// ─── mapKimiWireEvent (wire.jsonl thinking parity) ─────────────────────────
+//
+// Pure parser for the internal wire.jsonl artifact both kimi-cli and
+// kimi-code write. Two envelope shapes carry a `{"type":"think",...}` leaf;
+// everything else (text parts, tool records, the metadata header, malformed
+// lines) is either skipped or — for a protocol-version bump — signals the
+// caller to stop tailing via `{disable: true}`.
+describe("mapKimiWireEvent", () => {
+  test("kimi-cli envelope: ContentPart/think payload maps to a thinking chunk keyed by kimiwire:<lineNo>", () => {
+    const { chunks, onChunk } = collect();
+    const line = JSON.stringify({
+      timestamp: 1700000000000,
+      message: {
+        type: "ContentPart",
+        payload: { type: "think", think: "reasoning about the fix…", encrypted: null },
+      },
+    });
+    mapKimiWireEvent(line, onChunk, 12);
+    expect(chunks).toEqual([{ stream: "thinking", data: "reasoning about the fix…", lineUuid: "kimiwire:12" }]);
+  });
+
+  test("kimi-code envelope: content.part/think part maps to a thinking chunk", () => {
+    const { chunks, onChunk } = collect();
+    const line = JSON.stringify({
+      type: "context.append_loop_event",
+      time: 1700000000000,
+      event: {
+        type: "content.part",
+        stepUuid: "x",
+        part: { type: "think", think: "weighing two approaches…" },
+      },
+    });
+    mapKimiWireEvent(line, onChunk, 4);
+    expect(chunks).toEqual([{ stream: "thinking", data: "weighing two approaches…", lineUuid: "kimiwire:4" }]);
+  });
+
+  test("metadata header with protocol_version 1.x emits nothing and does not disable the tailer", () => {
+    const { chunks, onChunk } = collect();
+    const result = mapKimiWireEvent(JSON.stringify({ type: "metadata", protocol_version: "1.10" }), onChunk, 0);
+    expect(chunks).toHaveLength(0);
+    expect(result).toBeUndefined();
+  });
+
+  test("metadata header with a non-1.x protocol_version returns {disable: true} and emits nothing", () => {
+    const { chunks, onChunk } = collect();
+    const result = mapKimiWireEvent(JSON.stringify({ type: "metadata", protocol_version: "2.0" }), onChunk, 0);
+    expect(chunks).toHaveLength(0);
+    expect(result).toEqual({ disable: true });
+  });
+
+  test("text parts are ignored in both envelope shapes", () => {
+    const { chunks, onChunk } = collect();
+    mapKimiWireEvent(
+      JSON.stringify({ message: { type: "ContentPart", payload: { type: "text", text: "hello" } } }),
+      onChunk,
+      1,
+    );
+    mapKimiWireEvent(
+      JSON.stringify({ event: { type: "content.part", part: { type: "text", text: "hello" } } }),
+      onChunk,
+      2,
+    );
+    expect(chunks).toHaveLength(0);
+  });
+
+  test("tool-call/tool-result wire records are ignored in both envelope shapes", () => {
+    const { chunks, onChunk } = collect();
+    mapKimiWireEvent(
+      JSON.stringify({
+        message: { type: "ContentPart", payload: { type: "tool_call", name: "read_file", arguments: "{}" } },
+      }),
+      onChunk,
+      1,
+    );
+    mapKimiWireEvent(
+      JSON.stringify({ event: { type: "content.part", part: { type: "tool_result", content: "ok" } } }),
+      onChunk,
+      2,
+    );
+    expect(chunks).toHaveLength(0);
+  });
+
+  test("SubagentEvent (kimi-cli nested envelope) is skipped even when it wraps a think leaf", () => {
+    const { chunks, onChunk } = collect();
+    const line = JSON.stringify({
+      message: {
+        type: "SubagentEvent",
+        payload: {
+          message: { type: "ContentPart", payload: { type: "think", think: "nested subagent reasoning" } },
+        },
+      },
+    });
+    mapKimiWireEvent(line, onChunk, 7);
+    expect(chunks).toHaveLength(0);
+  });
+
+  test("a think leaf with an empty string think field is skipped", () => {
+    const { chunks, onChunk } = collect();
+    mapKimiWireEvent(
+      JSON.stringify({ message: { type: "ContentPart", payload: { type: "think", think: "", encrypted: null } } }),
+      onChunk,
+      3,
+    );
+    expect(chunks).toHaveLength(0);
+  });
+
+  test("an encrypted-only think leaf (no plaintext think field) is skipped", () => {
+    const { chunks, onChunk } = collect();
+    // `think` entirely absent, only `encrypted` present.
+    mapKimiWireEvent(
+      JSON.stringify({ event: { type: "content.part", part: { type: "think", encrypted: "opaque-ciphertext" } } }),
+      onChunk,
+      3,
+    );
+    expect(chunks).toHaveLength(0);
+  });
+
+  test("a malformed JSON line is completely silent — no chunk, no stderr chunk", () => {
+    // Deliberate contrast with the primary mapKimiEvent (see the "non-JSON
+    // line is emitted as a stderr chunk" test above): wire.jsonl is an
+    // internal, undocumented artifact, so a malformed line there is
+    // best-effort and must never surface as noise in the run panel.
+    const onChunk = mock((_stream: RunEventStream, _data: string, _lineUuid?: string) => {});
+    const result = mapKimiWireEvent("this is not valid json at all {{{", onChunk, 9);
+    expect(onChunk).not.toHaveBeenCalled();
+    expect(result).toBeUndefined();
+  });
+
+  test("pathological inputs do not throw: a huge line", () => {
+    const { chunks, onChunk } = collect();
+    const huge = "x".repeat(500_000);
+    const line = JSON.stringify({
+      message: { type: "ContentPart", payload: { type: "think", think: huge, encrypted: null } },
+    });
+    expect(() => mapKimiWireEvent(line, onChunk, 0)).not.toThrow();
+    expect(chunks).toEqual([{ stream: "thinking", data: huge, lineUuid: "kimiwire:0" }]);
+  });
+
+  test("pathological inputs do not throw: deeply-nested JSON", () => {
+    const { chunks, onChunk } = collect();
+    let nested: unknown = { leaf: true };
+    for (let i = 0; i < 1000; i++) nested = { nested };
+    const line = JSON.stringify({ unrelated: nested });
+    expect(() => mapKimiWireEvent(line, onChunk, 0)).not.toThrow();
+    expect(chunks).toHaveLength(0);
+  });
+
+  test('pathological inputs do not throw: non-object JSON ("42", "[1,2]", "null")', () => {
+    const { chunks, onChunk } = collect();
+    expect(() => mapKimiWireEvent("42", onChunk, 0)).not.toThrow();
+    expect(() => mapKimiWireEvent("[1,2]", onChunk, 1)).not.toThrow();
+    expect(() => mapKimiWireEvent("null", onChunk, 2)).not.toThrow();
+    expect(chunks).toHaveLength(0);
+  });
+
+  test("dedup keys are stable across a replay of the same lines with the same lineNos", () => {
+    const lines = [
+      JSON.stringify({ message: { type: "ContentPart", payload: { type: "think", think: "first" } } }),
+      JSON.stringify({ event: { type: "content.part", part: { type: "think", think: "second" } } }),
+      JSON.stringify({ type: "metadata", protocol_version: "1.10" }),
+      "not json",
+    ];
+
+    const passOne = collect();
+    lines.forEach((line, idx) => mapKimiWireEvent(line, passOne.onChunk, idx));
+
+    // Simulate a reattach: re-tail the same wire.jsonl content from offset 0,
+    // feeding the identical lineNo sequence (deterministic from file content
+    // alone, mirroring the mapKimiEvent replay test above).
+    const passTwo = collect();
+    lines.forEach((line, idx) => mapKimiWireEvent(line, passTwo.onChunk, idx));
+
+    const keysOne = passOne.chunks.map((c) => c.lineUuid);
+    const keysTwo = passTwo.chunks.map((c) => c.lineUuid);
+    expect(keysTwo).toEqual(keysOne);
+    expect(keysOne).toEqual(["kimiwire:0", "kimiwire:1"]);
+  });
+});
