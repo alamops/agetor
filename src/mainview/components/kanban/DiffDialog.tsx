@@ -199,10 +199,11 @@ export function DiffDialog({ open, task, onClose }: Props) {
 
   const kind = task ? harnessKindOf(task.agent, harnesses) : "claude-code";
   const liveRunId = task?.runId ?? null;
-  // Mirrors RunPanel.tsx's `resumableRunId`: claude-code can resume from its
-  // most recent run even once `task.runId` has been cleared (orphan-
-  // reconciled); codex has no resume mechanism.
-  const resumableRunId = liveRunId ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
+  // Mirrors RunPanel.tsx's `resumableRunId`: claude-code and kimi can resume
+  // from their most recent run even once `task.runId` has been cleared
+  // (orphan-reconciled); codex has no resume mechanism.
+  const resumableRunId = liveRunId
+    ?? ((kind === "claude-code" || kind === "kimi") && runs.length > 0 ? runs[0]!.id : null);
   const modalPending = interactions.length > 0;
   const archived = task?.archivedAt != null;
   const canSend = !!resumableRunId && !modalPending && !busy;

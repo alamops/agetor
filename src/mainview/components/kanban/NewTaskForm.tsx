@@ -249,6 +249,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   const agentCache = useRef<Record<AgentKind, { mode: string; model: string; effort: string | null }>>({
     "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"] },
     "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"] },
+    "kimi": { mode: initialMode("kimi"), model: DEFAULT_MODEL["kimi"], effort: DEFAULT_EFFORT["kimi"] },
   });
 
   // Seed mode + model + effort defaults from the last submitted picks,
@@ -720,7 +721,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
               title={
                 kind === "codex"
                   ? "Codex has no native plan mode — routed to 'ask' so nothing auto-executes."
-                  : "Plan only — agent describes what it would do without making changes."
+                  : kind === "kimi"
+                    ? "Kimi has no native plan mode — routed to '--plan', kimi's read-only tool set, so nothing auto-executes."
+                    : "Plan only — agent describes what it would do without making changes."
               }
             >
               <ClipboardList className="mr-1 size-3.5" />

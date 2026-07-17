@@ -19,6 +19,11 @@ import {
   type HarnessTemplate,
 } from "../../../shared/types.ts";
 
+/** Kinds that ship without a smoke-tested driver yet — flagged Experimental
+ *  everywhere a kind is presented (list rows, the template picker, and the
+ *  editor's kind picker) so the badge can't drift out of sync across sites. */
+const EXPERIMENTAL_KINDS = new Set<AgentKind>(["codex", "kimi"]);
+
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -538,7 +543,7 @@ function ListView({
                         disabled
                       </span>
                     )}
-                    {h.kind === "codex" && (
+                    {EXPERIMENTAL_KINDS.has(h.kind) && (
                       <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
                         experimental
                       </span>
@@ -603,7 +608,7 @@ function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
       </p>
       <div className="space-y-1.5">
         {HARNESS_TEMPLATES.map((t) => {
-          const experimental = t.kind === "codex";
+          const experimental = EXPERIMENTAL_KINDS.has(t.kind);
           return (
             <button
               key={t.id}
@@ -747,8 +752,8 @@ function Editor({
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
         <div className="grid grid-cols-2 gap-1">
-          {(["claude-code", "codex"] as AgentKind[]).map((k) => {
-            const experimental = k === "codex";
+          {(["claude-code", "codex", "kimi"] as AgentKind[]).map((k) => {
+            const experimental = EXPERIMENTAL_KINDS.has(k);
             return (
               <Button
                 key={k}
@@ -781,14 +786,19 @@ function Editor({
           onChange={(e) => setHome(e.target.value)}
           placeholder={
             dataDir
-              ? abbreviateHome(`${dataDir}/harnesses/${kind === "codex" ? "codex-2" : "claude-2"}`, homeDir)
+              ? abbreviateHome(
+                  `${dataDir}/harnesses/${kind === "codex" ? "codex-2" : kind === "kimi" ? "kimi-2" : "claude-2"}`,
+                  homeDir,
+                )
               : "~/.agetor/harnesses/claude-2"
           }
         />
         <p className="text-[11px] leading-snug text-muted-foreground">
           {kind === "claude-code"
             ? "Sets CLAUDE_CONFIG_DIR on spawn — claude stores config, sessions, and login under this path, so a separate path gives this harness its own account. Authenticate by running: CLAUDE_CONFIG_DIR=<path> claude /login."
-            : "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account."}
+            : kind === "kimi"
+              ? "Sets HOME and KIMI_CODE_HOME on spawn — kimi stores its login under $KIMI_CODE_HOME (legacy: ~/.kimi), so a separate path gives this harness its own account."
+              : "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account."}
           {" "}Leave empty to share the default account.
         </p>
       </div>

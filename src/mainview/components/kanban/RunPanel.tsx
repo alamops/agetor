@@ -728,8 +728,10 @@ function RunPanelBody({
   //     spins up a fresh tmux + `claude --resume <claudeSessionId>` so the
   //     conversation continues from the same JSONL transcript. `task.runId`
   //     is null in that orphan-reconciled state, so we fall back to the most
-  //     recent run id to identify which task → which claude session to
-  //     resume. Codex has no resume mechanism; restrict to claude-code.
+  //     recent run id to identify which task → which session to resume.
+  //     Kimi resumes the same way (`kimi --session <id>` creates-or-resumes),
+  //     so it's included alongside claude-code. Codex has no resume
+  //     mechanism; every other kind stays excluded.
   const liveRunId = task.runId;
   // Reconcile against the independently-polled runs list: if the live run has
   // already resolved (succeeded/failed/cancelled/orphaned), the task isn't
@@ -746,7 +748,7 @@ function RunPanelBody({
     && (task.column === "running" || task.column === "blocked")
     && !liveRunTerminal;
   const resumableRunId = liveRunId
-    ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
+    ?? ((kind === "claude-code" || kind === "kimi") && runs.length > 0 ? runs[0]!.id : null);
   // Send is enabled whenever the task has ever been run. While a turn is
   // in flight, the backend pastes the new prompt into the live tmux session —
   // claude queues it in its TUI input buffer and replays it as part of the

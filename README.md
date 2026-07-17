@@ -14,7 +14,7 @@ It runs entirely on your machine. No cloud relay, no remote sandbox — agents e
 
 ## Highlights
 
-- **Multi-agent, multi-account.** Built-in support for `claude-code` and `codex`. Define additional *harnesses* to run a second Claude or Codex account in parallel — each one gets a dedicated `$HOME` so logins, history, and config never collide.
+- **Multi-agent, multi-account.** Built-in support for `claude-code` and `codex`, plus `kimi` (Kimi Code CLI, Moonshot AI — ships disabled and Experimental). Define additional *harnesses* to run a second account of any of these in parallel — each one gets a dedicated `$HOME` so logins, history, and config never collide.
 - **Per-task git worktrees.** Every task runs on its own branch (`agetor/<short-id>-<slug>`) in a dedicated worktree under `~/.agetor/worktrees/`. Two agents can hammer the same repo simultaneously without stepping on each other. Base ref is pinned at create time, so re-runs always start from the same commit.
 - **Interactive Claude sessions.** Claude Code is hosted in a per-task `tmux` session that stays alive across multiple turns. Follow up on a task without losing the conversation. Output is streamed by tailing Claude's own JSONL transcript, so assistant text, thinking blocks, tool calls, and tool results all render with their own UI components.
 - **Approvals and questions, lifted out of the TUI.** Agetor watches Claude's tmux pane and JSONL transcript to detect `AskUserQuestion` / `ExitPlanMode` modals and tool-permission prompts, and surfaces them in the run panel as structured cards — radios, checkboxes, free-text. It's fully non-invasive: it registers no MCP server and installs no hook (it only strips stale entries left by older builds). Codex prompts are detected heuristically from stdout and surfaced the same way.
@@ -53,6 +53,7 @@ Some key design decisions:
 - **Localhost API, not Electrobun RPC.** The webview talks to the main process over a plain HTTP API bound to `127.0.0.1` on a configurable port. Every route (except `/health`) is gated on a per-launch random bearer token passed to the webview via a `WKUserScript` preload. A site you happen to visit can't drive an agent run even if it guesses the port.
 - **One tmux session per Claude task.** `claude` runs in interactive mode (so you draw from your normal subscription quota, not the Agent SDK credit). Prompts are delivered as keystrokes via `tmux load-buffer + paste-buffer + send-keys`. Output is read from the JSONL Claude writes to `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`.
 - **Codex stays one-shot.** Each Codex run is a fresh `codex exec` invocation; follow-ups create a new run record on the same task.
+- **Kimi mirrors Codex's one-shot pattern.** Each turn is a fresh `kimi --print` invocation hosted in a detached tmux session so a mid-turn run survives an Agetor restart; a pre-generated session id carries multi-turn continuity. Ships disabled and marked Experimental — see `CLAUDE.md` for the full driver contract.
 - **Boot reconciliation.** On startup, any tmux sessions left over from a previous Agetor process are killed, and any rows still marked `running` are flipped to `orphaned`. The kanban never shows stuck cards.
 
 The full architecture, schema, and lifecycle is documented in [`CLAUDE.md`](./CLAUDE.md).
@@ -68,6 +69,7 @@ The full architecture, schema, and lifecycle is documented in [`CLAUDE.md`](./CL
 - **At least one agent CLI on `PATH`:**
   - `claude-code`: `npm i -g @anthropic-ai/claude-code`
   - `codex`: `npm i -g @openai/codex`
+  - `kimi` (Kimi Code CLI, Moonshot AI): `npm i -g @moonshot-ai/kimi-code` (or `pip install kimi-cli`) — ships disabled and marked Experimental; enable it in Settings
 - **Git** — required for worktree isolation
 - **Platforms:** macOS (primary). Linux and Windows builds are configured in `electrobun.config.ts` but are not currently tested.
 
@@ -226,7 +228,7 @@ A **run** is a single invocation of the agent on a task. Tasks accumulate run hi
 
 ### Harnesses
 
-A **harness** is a named agent configuration. The two built-ins (`claude-code`, `codex`) wrap each CLI directly. User-defined harnesses are *aliases* that wrap the same underlying kind with extra env, an alternate binary, or — most usefully — a per-account `$HOME` override. That last knob lets you run a second Claude or Codex account in parallel without their logins overwriting each other.
+A **harness** is a named agent configuration. The three built-ins (`claude-code`, `codex`, `kimi`) wrap each CLI directly — `kimi` ships disabled by default and marked Experimental until it's been smoke-tested against a live binary. User-defined harnesses are *aliases* that wrap the same underlying kind with extra env, an alternate binary, or — most usefully — a per-account `$HOME` override. That last knob lets you run a second account of any of these in parallel without their logins overwriting each other.
 
 Add a harness from **Settings → Harnesses**. Templates pre-fill common patterns.
 
@@ -235,7 +237,7 @@ Add a harness from **Settings → Harnesses**. Templates pre-fill common pattern
 Each task picks:
 
 - a **mode** — how much permission the agent has (`auto`, `ask`, `acceptEdits`, `plan`, `bypass` — exposed per agent),
-- a **model** — Opus / Sonnet / Haiku for Claude, GPT-5 / GPT-5 Codex for Codex,
+- a **model** — Opus / Sonnet / Haiku for Claude, GPT-5 / GPT-5 Codex for Codex, Kimi K2.7 Code / K2.6 / K2.5 for Kimi,
 - an **effort** level — reasoning depth, where the model supports it.
 
 The picker filters incompatible combinations (e.g. effort is hidden on Haiku 4.5 because Anthropic's API doesn't accept it there).
@@ -403,5 +405,5 @@ This is an early-stage project. Things on the near-term list:
 ## Acknowledgements
 
 - [Electrobun](https://github.com/blackboardsh/electrobun) — the native-webview-on-Bun runtime this app is built on.
-- [Claude Code](https://github.com/anthropics/claude-code) and [OpenAI Codex CLI](https://github.com/openai/codex) — the agents Agetor was built to orchestrate.
+- [Claude Code](https://github.com/anthropics/claude-code), [OpenAI Codex CLI](https://github.com/openai/codex), and Kimi Code CLI (Moonshot AI) — the agents Agetor was built to orchestrate.
 - [dnd-kit](https://dndkit.com/), [shadcn/ui](https://ui.shadcn.com/), [Tailwind CSS](https://tailwindcss.com/), [Lucide](https://lucide.dev/), [Sonner](https://sonner.emilkowal.ski/) — the front-end stack.

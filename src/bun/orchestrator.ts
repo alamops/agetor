@@ -10,6 +10,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
+  KIMI_RETRYABLE_STATUS_PREFIX,
   MODEL_EFFORT_SUPPORT,
   SESSION_DIED_STATUS_PREFIX,
   TASK_TYPES,
@@ -65,6 +66,10 @@ import {
   reattachCodexSession,
 } from "./codex-tmux.ts";
 import {
+  dropKimiSession,
+  reattachKimiSession,
+} from "./kimi-tmux.ts";
+import {
   setSubagentEmitter,
   setSubagentSettleHook,
   setParkedDiscoveryHandler,
@@ -114,6 +119,13 @@ interface ActiveRun {
    *  handler reads this on resolution to keep it there (record the run as
    *  `failed`, not bounce to `ready`). */
   sessionDied: boolean;
+  /** Set when kimi emitted the `KIMI_RETRYABLE_STATUS_PREFIX` sentinel — a
+   *  turn that exited with Moonshot's documented *retryable* code (rate
+   *  limit / 5xx / timeout). Unlike `apiError`/`sessionDied` this does NOT
+   *  flip the column — it's not a user-facing failure state. The done
+   *  handler in `attachDoneHandler` reads this on resolution to schedule an
+   *  automatic backoff-retry instead of bouncing the task to `ready`. */
+  retryable: boolean;
 }
 const active = new Map<string, ActiveRun>(); // runId -> handle
 
@@ -467,8 +479,8 @@ export function reconcileOrphans(): number {
   // task; only the latest reflects the user's current intent. Older
   // siblings get flipped to orphaned so we never have two SessionState
   // objects fighting for the same tmux session.
-  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; agent: string }, []>(
-    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
+  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; kimi_session_id: string | null; agent: string }, []>(
+    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, kimi_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
   ).all();
 
   const reattachedTaskIds = new Set<string>();
@@ -478,21 +490,24 @@ export function reconcileOrphans(): number {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
     const kind = resolveHarness(row.agent)?.kind ?? null;
-    // Both claude-code and codex runs can be reattached when their detached
-    // tmux session is still alive. The reattach key differs by kind: claude
-    // needs its JSONL session uuid (`claude_session_id`), codex needs its
-    // thread id (`codex_session_id`) — the per-run log path is derived from
-    // the run id. Note codex's session only lives WHILE its turn is in flight,
-    // so a reattachable codex run is by definition one that was still running
+    // claude-code, codex, and kimi runs can all be reattached when their
+    // detached tmux session is still alive. The reattach key differs by kind:
+    // claude needs its JSONL session uuid (`claude_session_id`), codex needs
+    // its thread id (`codex_session_id`), kimi needs its pre-generated
+    // `--session` uuid (`kimi_session_id`) — the per-run log path is derived
+    // from the run id in every case. Note codex's and kimi's sessions only
+    // live WHILE their turn is in flight (both are one-shot-per-turn), so a
+    // reattachable codex/kimi run is by definition one that was still running
     // when agetor restarted. Also: if we already reattached a newer sibling
     // for this task, orphan the older one — only one SessionState can drive a
     // given tmux session at a time.
     const reattachKey =
       kind === "claude-code" ? row.claude_session_id
       : kind === "codex" ? row.codex_session_id
+      : kind === "kimi" ? row.kimi_session_id
       : null;
     const canTryReattach =
-      (kind === "claude-code" || kind === "codex")
+      (kind === "claude-code" || kind === "codex" || kind === "kimi")
       && task !== null
       && row.tmux_session !== null
       && reattachKey !== null
@@ -512,12 +527,32 @@ export function reconcileOrphans(): number {
             onChunk,
             seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
           })
-        : reattachCodexSession({
+        : kind === "codex"
+        ? reattachCodexSession({
             taskId: row.task_id,
             runId: row.id,
             sessionName: row.tmux_session as string,
             onChunk,
             seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+          })
+        : reattachKimiSession({
+            taskId: row.task_id,
+            runId: row.id,
+            sessionName: row.tmux_session as string,
+            onChunk,
+            seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            // Wire-tailer discovery inputs: kimi's pre-generated `--session`
+            // uuid + the cwd the turn ran in. `cwd`/`harness` are already
+            // resolved above for the spawn call. `homeDir`/`kimiCodeHome`
+            // mirror `harnessEnv()`'s kimi branch in agents.ts (HOME and
+            // KIMI_CODE_HOME both point at `harness.home` for an aliased
+            // harness; omitting them when unset falls back to the process's
+            // own os.homedir()/`<home>/.kimi-code` default, correct for the
+            // built-in harness).
+            sessionId: row.kimi_session_id,
+            cwd,
+            homeDir: harness?.home ?? null,
+            kimiCodeHome: harness?.home ?? null,
           });
       if (spawned) {
         registerActiveRun(row.id, row.task_id, task, spawned);
@@ -599,6 +634,50 @@ export function reconcileOrphans(): number {
   }
   if (orphaned.length > 0) {
     console.log(`[agetor] orphaned ${orphaned.length} run(s) with no recoverable session`);
+  }
+
+  // Kimi-scoped restart-during-backoff sweep. `kimiRetryState`'s pending
+  // timer is pure in-memory state — it does not survive a restart. If
+  // agetor quit (or crashed) while a retry was backed off, the task is left
+  // in `column: 'running'` with `run_id` pointing at the already-`failed`
+  // run whose retry never got to fire. The orphan loop above only scans
+  // `status = 'running'` runs, so it never sees this task — the run row
+  // itself is already terminal, nothing about it looks stale. Recover it
+  // the same way `cancelRun`'s pending-timer branch and
+  // `reconcileTaskSession`'s agent-switch branch land a task whose retry
+  // timer is gone: null `run_id`, flip to `ready`, and say so.
+  //
+  // MUST be kimi-scoped: a claude-code task can legitimately sit in
+  // `running` with a terminal (succeeded) run while background subagents
+  // are still tracked (the held-task feature, swept separately below) — an
+  // unscoped version of this sweep would wrongly release those tasks. At
+  // boot there is no in-memory `active` entry for anything yet (this runs
+  // before any spawn/reattach in this same pass populates it for a *kimi*
+  // task — reattach above only wires `active` for runs whose tmux session
+  // is still alive, which for kimi means `status = 'running'`, already
+  // excluded by the terminal-run check below), so the `active` guard is
+  // defensive rather than load-bearing here.
+  let kimiRetryStranded = 0;
+  for (const task of tasks.list()) {
+    if (task.column !== "running") continue;
+    if (resolveHarness(task.agent)?.kind !== "kimi") continue;
+    if (task.runId && active.has(task.runId)) continue;
+    const run = task.runId ? runs.get(task.runId) : null;
+    if (run && run.status === "running") continue; // genuinely in flight — not our sweep's business
+    const staleRunId = task.runId;
+    tasks.update(task.id, { runId: null });
+    // Match `cancelRun`'s pending-timer landing: the event's `runId` field
+    // is `null` here too, since the task no longer points at any run.
+    updateColumn(task.id, null, "ready");
+    const data = "kimi retry window lost across restart — task returned to ready";
+    if (staleRunId) {
+      runs.appendEvent(staleRunId, "status", data);
+      emit({ runId: staleRunId, taskId: task.id, stream: "status", data, ts: Date.now() });
+    }
+    kimiRetryStranded++;
+  }
+  if (kimiRetryStranded > 0) {
+    console.log(`[agetor] released ${kimiRetryStranded} kimi task(s) stranded mid-retry-backoff across restart`);
   }
 
   // Held tasks — and, more generally, ANY task with a stuck `running`
@@ -777,9 +856,11 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
       tmuxSession: sessionNameFor(taskId),
       // Filled in by spawnAgent's onSessionId callback once the session id is
       // known: claude's JSONL uuid → claudeSessionId, codex's thread_id →
-      // codexSessionId. Exactly one is non-null per run.
+      // codexSessionId, kimi's pre-generated uuid → kimiSessionId. Exactly
+      // one is non-null per run.
       claudeSessionId: null,
       codexSessionId: null,
+      kimiSessionId: null,
     });
   });
   persist();
@@ -806,9 +887,11 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     cwd: prepared.cwd,
     onChunk,
     onSessionId: (sessionId) => {
-      runs.update(runId, harness.kind === "claude-code"
-        ? { claudeSessionId: sessionId }
-        : { codexSessionId: sessionId });
+      // Explicit per-kind — a ternary here would silently write kimi's
+      // pre-generated `--session` uuid into `codexSessionId` (or vice versa).
+      if (harness.kind === "claude-code") runs.update(runId, { claudeSessionId: sessionId });
+      else if (harness.kind === "codex") runs.update(runId, { codexSessionId: sessionId });
+      else if (harness.kind === "kimi") runs.update(runId, { kimiSessionId: sessionId });
     },
     opts: { mode: task.mode, model: task.model, effort: task.effort },
   });
@@ -879,6 +962,22 @@ function makeChunkHandler(
         }
       }
     }
+    // Kimi retryable-exit path: the driver emits this sentinel when a turn
+    // exited with Moonshot's documented *retryable* code (rate limit / 5xx /
+    // timeout). Just flag the handle — no column flip (unlike api-error /
+    // session-death, this isn't a user-facing failure state). The resolve
+    // path in `attachDoneHandler` reads the flag to schedule an automatic
+    // backoff-retry instead of bouncing the task to `ready`.
+    if (
+      kind === "kimi"
+      && stream === "status"
+      && data.startsWith(KIMI_RETRYABLE_STATUS_PREFIX)
+    ) {
+      const handle = active.get(runId);
+      if (handle && !handle.retryable) {
+        handle.retryable = true;
+      }
+    }
   };
 }
 
@@ -895,6 +994,7 @@ function registerActiveRun(
     cancelled: false,
     apiError: false,
     sessionDied: false,
+    retryable: false,
     writeInput: (line) => agent.writeInput(line),
   });
 }
@@ -915,6 +1015,7 @@ function attachDoneHandler(
       const wasCancelled = handle?.cancelled ?? false;
       const wasApiError = handle?.apiError ?? false;
       const wasSessionDied = handle?.sessionDied ?? false;
+      const wasRetryable = handle?.retryable ?? false;
       active.delete(runId);
 
       // API error / session-death override the exit-code mapping: the driver
@@ -936,37 +1037,75 @@ function attachDoneHandler(
       // user has already moved past.
       const task = tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
+
+      // Kimi retryable-exit auto-retry (exit 75 — rate limit / 5xx /
+      // timeout): re-spawn with backoff instead of bouncing the task to
+      // `ready` like an ordinary failure. Cancellation / api-error /
+      // session-death always win — those are terminal states a retry must
+      // never override — and it's gated on `isTerminalRun` (+ still-kimi)
+      // so a stale/superseded run's resolution can't schedule a retry
+      // behind a newer run's back. `claude`/`codex` runs never set
+      // `retryable` (only kimi's driver emits the sentinel), so this branch
+      // is always a no-op for them — the rest of the resolve path below is
+      // byte-identical to before for those two kinds.
+      let retryScheduled = false;
+      if (
+        wasRetryable
+        && !wasCancelled
+        && !wasApiError
+        && !wasSessionDied
+        && code !== 0
+        && isTerminalRun
+        && task
+        && resolveHarness(task.agent)?.kind === "kimi"
+      ) {
+        retryScheduled = scheduleKimiRetry(task, taskId, runId);
+      }
+
       if (isTerminalRun) {
-        // A clean success with background agents still in flight is HELD in
-        // `running` rather than advanced to `review` — the run finished but the
-        // task's work hasn't. `runs.update(..., "succeeded")` already landed
-        // above, so the concurrent-settle path (`maybeReleaseHeldTask`) reads
-        // the correct terminal status; whichever of the two fires last wins and
-        // both interleavings converge on the right column, so no lock is needed.
-        const holdForSubagents =
-          newStatus === "succeeded"
-          && !wasCancelled
-          && !wasApiError
-          && !wasSessionDied
-          && subagents.hasRunning(taskId);
-        if (holdForSubagents) {
-          const runningCount = subagents.runningCountForTask(taskId);
-          emit({
-            runId,
-            taskId,
-            stream: "status",
-            data: `background agents still running (${runningCount}) — holding in running`,
-            ts: Date.now(),
-          });
+        if (retryScheduled) {
+          // Task stays `running` — the retry timer is about to re-establish
+          // the turn. No column flip: this attempt's failure isn't the
+          // task's terminal state yet.
         } else {
-          // Cancellation wins over api-error here, matching the newStatus
-          // resolution above — a user-cancelled run shouldn't land in
-          // `blocked` just because it had previously hit an API error.
-          const nextColumn: ColumnId = wasCancelled
-            ? "ready"
-            : (wasApiError || wasSessionDied) ? "blocked"
-            : newStatus === "succeeded" ? "review" : "ready";
-          updateColumn(taskId, runId, nextColumn);
+          // Reset the retry counter on a clean success and on an ordinary,
+          // non-retryable failure (or a retry-cap exhaustion, already
+          // deleted by `scheduleKimiRetry`) — a new unrelated failure
+          // shouldn't inherit a stale attempt count. Unconditional: this
+          // whole branch is the task's terminal state for this attempt,
+          // regardless of newStatus. No-op when already cleared.
+          kimiRetryState.delete(taskId);
+          // A clean success with background agents still in flight is HELD in
+          // `running` rather than advanced to `review` — the run finished but the
+          // task's work hasn't. `runs.update(..., "succeeded")` already landed
+          // above, so the concurrent-settle path (`maybeReleaseHeldTask`) reads
+          // the correct terminal status; whichever of the two fires last wins and
+          // both interleavings converge on the right column, so no lock is needed.
+          const holdForSubagents =
+            newStatus === "succeeded"
+            && !wasCancelled
+            && !wasApiError
+            && !wasSessionDied
+            && subagents.hasRunning(taskId);
+          if (holdForSubagents) {
+            const runningCount = subagents.runningCountForTask(taskId);
+            emit({
+              runId,
+              taskId,
+              stream: "status",
+              data: `background agents still running (${runningCount}) — holding in running`,
+              ts: Date.now(),
+            });
+          } else {
+            // Cancellation wins over api-error here, matching the newStatus
+            // resolution above — a user-cancelled run shouldn't land in
+            // `blocked` just because it had previously hit an API error.
+            const nextColumn: ColumnId = wasCancelled
+              ? "ready"
+              : (wasApiError || wasSessionDied) ? "blocked"
+              : newStatus === "succeeded" ? "review" : "ready";
+            updateColumn(taskId, runId, nextColumn);
+          }
         }
       }
       emit({
@@ -976,11 +1115,19 @@ function attachDoneHandler(
         data: wasCancelled ? `cancelled (exit:${code})` : `exit:${code}`,
         ts: Date.now(),
       });
-      if (isTerminalRun) {
+      // Suppressed while a retry is scheduled — this attempt isn't the
+      // task's terminal state, so the toast hook shouldn't fire a "failed"
+      // notification for a failure the task is about to transparently
+      // recover from.
+      if (isTerminalRun && !retryScheduled) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       }
-      // Spawn the next queued codex follow-up, if any (no-op otherwise).
+      // Spawn the next queued codex/kimi follow-up, if any (no-op otherwise).
+      // A scheduled kimi retry must re-establish the turn before any queued
+      // follow-up is drained — `fireKimiRetry` drains `kimiTurnQueue` itself
+      // once the retry's run row exists.
       drainCodexQueue(taskId);
+      if (!retryScheduled) drainKimiQueue(taskId);
     })
     .catch((err) => {
       const handle = active.get(runId);
@@ -1007,8 +1154,9 @@ function attachDoneHandler(
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       }
-      // Spawn the next queued codex follow-up, if any (no-op otherwise).
+      // Spawn the next queued codex/kimi follow-up, if any (no-op otherwise).
       drainCodexQueue(taskId);
+      drainKimiQueue(taskId);
     });
 }
 
@@ -1037,9 +1185,35 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   if (before.agent !== after.agent) {
     if (beforeKind === "claude-code") dropSession(taskId);
     else if (beforeKind === "codex") dropCodexSession(taskId);
-    // Any queued codex follow-ups belong to the old agent — drop them so a
-    // later drain doesn't spawn them against the new harness.
+    else if (beforeKind === "kimi") dropKimiSession(taskId);
+    // Any queued codex/kimi follow-ups belong to the old agent — drop them so
+    // a later drain doesn't spawn them against the new harness. Same for any
+    // pending kimi retry timer — a retry re-spawn belongs to the old harness
+    // too.
     codexTurnQueue.delete(taskId);
+    kimiTurnQueue.delete(taskId);
+    const hadPendingKimiRetry = beforeKind === "kimi" && kimiRetryState.get(taskId)?.timer != null;
+    clearKimiRetryState(taskId);
+    // Landing check: a pending kimi retry timer was the only thing that was
+    // ever going to move this task out of `running` — the failed run it
+    // points at is already terminal (that's *why* a retry was scheduled).
+    // Clearing the timer without also landing the task would strand the
+    // card in `running` forever. Mirror `cancelRun`'s pending-timer landing
+    // exactly (including its status text), so the two sites read as one
+    // invariant: never cancel the timer without also landing the task, for
+    // the run the task actually points at. `hadPendingKimiRetry` already
+    // scopes this to kimi tasks — non-kimi `running` + terminal-run combos
+    // (e.g. a claude-code task held for background agents) are untouched.
+    if (hadPendingKimiRetry && after.runId && !active.has(after.runId)) {
+      const staleRun = runs.get(after.runId);
+      if (staleRun && staleRun.status !== "running") {
+        tasks.update(taskId, { runId: null });
+        updateColumn(taskId, null, "ready");
+        const data = "kimi retry cancelled by user";
+        runs.appendEvent(after.runId, "status", data);
+        emit({ runId: after.runId, taskId, stream: "status", data, ts: Date.now() });
+      }
+    }
     // Cross-kind switches (e.g. claude-code → codex alias) leave mode/
     // model/effort ids that belong to the old kind's option set; the
     // next spawn would error or fall through to verbatim flags. Reset
@@ -1165,13 +1339,36 @@ function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult
 export function cancelRun(runId: string): boolean {
   const h = active.get(runId);
   if (!h) {
+    const taskId = runs.get(runId)?.taskId;
+    // Pending-timer-only state: a kimi retry is backed off (the failed run's
+    // handle is long gone from `active`, but its column never left `running`
+    // — see `scheduleKimiRetry`). Stop here must cancel the pending timer AND
+    // give the user's Stop click a coherent landing state, or the task would
+    // sit in `running` forever with nothing scheduled to move it.
+    if (taskId) {
+      const pending = kimiRetryState.get(taskId);
+      const task = tasks.get(taskId);
+      // Never cancel the timer without also landing the task, for the run
+      // the task actually points at. A stale `runId` (the task has already
+      // moved on to a different run) must leave the pending retry alone —
+      // it belongs to whatever run the task currently points at, not this
+      // one — so clear + land only fire together, gated on the same check.
+      if (pending?.timer && task && task.runId === runId) {
+        clearKimiRetryState(taskId);
+        tasks.update(taskId, { runId: null });
+        updateColumn(taskId, null, "ready");
+        const data = "kimi retry cancelled by user";
+        runs.appendEvent(runId, "status", data);
+        emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+        return true;
+      }
+    }
     // A held task (turn succeeded, background agents still running) has no
     // `active` handle — `attachDoneHandler` dropped it before parking the card
     // in `running`. Its Stop button must still do something, or a background
     // agent that wedges without dying leaves the user no way out short of a
     // restart. Interrupt the live session and release the hold; the run itself
     // already succeeded, so the card advances to `review`.
-    const taskId = runs.get(runId)?.taskId;
     if (!taskId || !isHeldByBackgroundAgents(taskId)) return false;
     cancelPendingForTask(taskId, "cancelled by user");
     interruptTaskSession(taskId);
@@ -1186,6 +1383,11 @@ export function cancelRun(runId: string): boolean {
   for (const [, handle] of active) {
     if (handle.taskId === h.taskId) handle.cancelled = true;
   }
+  // Active-run path: also clear any kimi retry bookkeeping for the task.
+  // Normally there's nothing to clear here (a retry timer only exists
+  // between attempts, not while one is active) — defensive, so Stop always
+  // fully resets retry state regardless of which path it took.
+  clearKimiRetryState(h.taskId);
   // Resolve any in-flight approval / question for this task BEFORE the
   // interrupt — otherwise the hook script's curl and the MCP server's
   // fetch would sit on a doomed HTTP response until their own timeouts.
@@ -1270,6 +1472,12 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
       ? { delivered: true, runId: result }
       : { delivered: false, reason: "internal: task lookup failed" };
   }
+  if (kind === "kimi") {
+    const result = sendKimiTurn(row.task_id, line);
+    return result
+      ? { delivered: true, runId: result }
+      : { delivered: false, reason: "internal: task lookup failed" };
+  }
   return { delivered: false, reason: `unknown agent kind for "${row.agent}"` };
 }
 
@@ -1334,6 +1542,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
     // before this run's own `thread.started` re-emits it. onSessionId below
     // re-stamps the same value (idempotent).
     codexSessionId: priorThreadId,
+    kimiSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -1413,6 +1622,273 @@ function findLastCodexSessionId(taskId: string): string | null {
      LIMIT 1`,
   ).get(taskId);
   return row?.codex_session_id ?? null;
+}
+
+/**
+ * Per-task queue of follow-up lines received while a kimi turn is in flight.
+ * kimi `--print` is one-shot per turn (not a REPL — same shape as codex
+ * `exec`), so we hold the message and spawn a fresh turn for it once the
+ * active turn resolves (`drainKimiQueue`, called from `attachDoneHandler`
+ * alongside `drainCodexQueue`). Mirrors `codexTurnQueue` exactly; kept as a
+ * separate map (rather than parameterizing one generic queue) per house
+ * precedent — grok/cursor duplicated the codex pattern rather than
+ * generalizing it, and a shared generalization was flagged as a follow-up,
+ * not something to do inline here.
+ */
+const kimiTurnQueue = new Map<string, string[]>();
+
+/**
+ * Send a follow-up to a kimi task. Each follow-up is its own run row + its
+ * own `kimi --print --session <id>` turn (sequential-turn model, same as
+ * codex). When a turn is already running, the message is queued; otherwise it
+ * spawns immediately. Returns the run id the message was attached to, or null
+ * on lookup failure.
+ */
+function sendKimiTurn(taskId: string, line: string): string | null {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  if (task.runId && active.has(task.runId)) {
+    const q = kimiTurnQueue.get(taskId) ?? [];
+    q.push(line);
+    kimiTurnQueue.set(taskId, q);
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; the queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    runs.appendEvent(runId, "user", data);
+    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    return runId;
+  }
+  return spawnKimiTurnNow(task, taskId, line);
+}
+
+/**
+ * Spawn a fresh kimi turn that resumes the task's prior conversation via
+ * `--session <id>` (kimi's flag resumes-or-creates). New run row, new tmux
+ * session (the previous turn's exited), same session id carried forward.
+ */
+function spawnKimiTurnNow(task: Task, taskId: string, line: string): string {
+  const priorSessionId = findLastKimiSessionId(taskId);
+  const cwd = task.worktreePath ?? task.workdir;
+  const harness = resolveHarness(task.agent);
+
+  const newRunId = randomUUID();
+  const now = Date.now();
+  runs.insert({
+    id: newRunId,
+    taskId,
+    agent: task.agent,
+    status: "running",
+    startedAt: now,
+    endedAt: null,
+    exitCode: null,
+    tmuxSession: sessionNameFor(taskId),
+    claudeSessionId: null,
+    codexSessionId: null,
+    // Carry the session id forward up front so a reattach mid-turn finds it
+    // even before this run's own onSessionId re-stamps it. onSessionId below
+    // re-stamps the same value (idempotent) — unlike codex's `thread.started`,
+    // kimi's id is known synchronously at spawn, not discovered from the log.
+    kimiSessionId: priorSessionId,
+  });
+  const prevColumn: ColumnId = task.column;
+  tasks.update(taskId, { column: "running", runId: newRunId });
+  if (prevColumn !== "running") {
+    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+  }
+
+  const kind: AgentKind = harness?.kind ?? "kimi";
+  const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+  onChunk("user", normalizeUserText(line));
+  onChunk(
+    "status",
+    priorSessionId
+      ? `resuming kimi session ${priorSessionId.slice(0, 8)}…`
+      : "no prior kimi session — starting fresh",
+  );
+
+  if (!harness) {
+    onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+    runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    tasks.update(taskId, { column: "ready", runId: null });
+    return newRunId;
+  }
+
+  const agent = spawnAgent({
+    taskId,
+    runId: newRunId,
+    harness,
+    prompt: line,
+    cwd,
+    onChunk,
+    onSessionId: (sessionId) => {
+      runs.update(newRunId, { kimiSessionId: sessionId });
+    },
+    opts: {
+      mode: task.mode,
+      model: task.model,
+      effort: task.effort,
+      resumeSessionId: priorSessionId,
+    },
+  });
+  registerActiveRun(newRunId, taskId, task, agent);
+  attachDoneHandler(newRunId, taskId, agent);
+  return newRunId;
+}
+
+/**
+ * After a kimi turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh turn. No-op for non-kimi tasks (their queue is always empty) and
+ * while a run is still active for the task. Mirrors `drainCodexQueue`.
+ */
+function drainKimiQueue(taskId: string): void {
+  const q = kimiTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  // Task vanished, or its agent was switched away from kimi while a turn was
+  // in flight — abandon the stale queue. Without this guard, draining after a
+  // kimi→claude/codex switch would spawn the follow-up against the new
+  // harness with a kimi session id, which that harness would reject or
+  // misinterpret.
+  if (!task || resolveHarness(task.agent)?.kind !== "kimi") {
+    kimiTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) kimiTurnQueue.delete(taskId);
+  if (next !== undefined) spawnKimiTurnNow(task, taskId, next);
+}
+
+/** Most-recent kimi session id across the task's runs (for `--session`). */
+function findLastKimiSessionId(taskId: string): string | null {
+  const row = db.query<{ kimi_session_id: string }, [string]>(
+    `SELECT kimi_session_id FROM runs
+     WHERE task_id = ? AND kimi_session_id IS NOT NULL
+     ORDER BY started_at DESC
+     LIMIT 1`,
+  ).get(taskId);
+  return row?.kimi_session_id ?? null;
+}
+
+/**
+ * Per-task kimi auto-retry bookkeeping: how many retryable-exit (75) attempts
+ * have already fired for the task's current failure streak, plus the pending
+ * backoff timer (if any). Lives beside `kimiTurnQueue` — same lifecycle, same
+ * teardown sites (agent-switch, archive, delete, Stop). `count` resets to 0
+ * (via deleting the entry) on a clean success or once the cap is exhausted.
+ */
+const kimiRetryState = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> | null }>();
+
+/** Max retryable-exit auto-retries per failure streak, before falling
+ *  through to the normal failure flow (task → `ready`). */
+const KIMI_RETRY_MAX = 2;
+
+/** Backoff delays for the 1st/2nd retry, in ms. Index by `state.count`
+ *  *before* incrementing (0 → first retry, 1 → second retry). */
+const KIMI_RETRY_DELAYS_MS = [5000, 15000];
+
+/**
+ * Resolve the backoff delay for a retry attempt, honoring
+ * `AGETOR_KIMI_RETRY_DELAY_MS` (tests set this to a small value so the retry
+ * suite doesn't sit through real 5s/15s waits). Parsed fresh on every call
+ * (not cached) so a test can flip the env var between assertions.
+ */
+function kimiRetryDelayMs(attemptIndex: number): number {
+  const override = process.env.AGETOR_KIMI_RETRY_DELAY_MS;
+  if (override) {
+    const parsed = Number(override);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return KIMI_RETRY_DELAYS_MS[attemptIndex] ?? KIMI_RETRY_DELAYS_MS[KIMI_RETRY_DELAYS_MS.length - 1] ?? 15000;
+}
+
+/** Clear a task's pending kimi retry (timer + counter), if any. Called from
+ *  every site that already clears `kimiTurnQueue` for the task (agent-switch,
+ *  archive, delete) plus `cancelRun` (Stop) — a retry must never fire after
+ *  any of those. Safe to call when no retry state exists. */
+function clearKimiRetryState(taskId: string): void {
+  const state = kimiRetryState.get(taskId);
+  if (state?.timer) clearTimeout(state.timer);
+  kimiRetryState.delete(taskId);
+}
+
+/**
+ * Schedule an automatic re-spawn of `runId`'s turn after a kimi retryable
+ * exit (75). Returns `false` (and clears the state) once the task's retry
+ * budget for this failure streak is exhausted — the caller then falls
+ * through to the normal failure flow. Returns `true` when a retry was
+ * scheduled — the caller must leave the task's column at `running`.
+ */
+function scheduleKimiRetry(task: Task, taskId: string, runId: string): boolean {
+  const state = kimiRetryState.get(taskId) ?? { count: 0, timer: null };
+  if (state.count >= KIMI_RETRY_MAX) {
+    kimiRetryState.delete(taskId);
+    return false;
+  }
+  const delayMs = kimiRetryDelayMs(state.count);
+  state.count += 1;
+  const attempt = state.count;
+  const data = `retrying after exit 75 — attempt ${attempt}/${KIMI_RETRY_MAX} in ${Math.round(delayMs / 1000)}s`;
+  runs.appendEvent(runId, "status", data);
+  emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+  state.timer = setTimeout(() => fireKimiRetry(taskId, runId), delayMs);
+  kimiRetryState.set(taskId, state);
+  return true;
+}
+
+/**
+ * Fire a scheduled kimi retry: re-validate the task is still in a state
+ * where a retry makes sense (exists, still kimi, not archived, no active run,
+ * retry state not cleared out from under us by a teardown/Stop that raced
+ * the timer), then re-spawn the failed run's prompt via `spawnKimiTurnNow` —
+ * the same path a normal follow-up uses, so `resumeSessionId`/run-row/
+ * handlers all come out consistent. This re-validation is the backstop for
+ * the fleet-known race where a spawn firing after `deleteTask` hits
+ * `runs.appendEvent` FK errors — `clearKimiRetryState` at every teardown site
+ * is the primary guard, this is the fire-time safety net.
+ */
+function fireKimiRetry(taskId: string, failedRunId: string): void {
+  const state = kimiRetryState.get(taskId);
+  if (!state) return; // cleared by a teardown/Stop while the timer was pending
+  state.timer = null;
+  const task = tasks.get(taskId);
+  if (!task || resolveHarness(task.agent)?.kind !== "kimi" || task.archivedAt != null) {
+    kimiRetryState.delete(taskId);
+    return;
+  }
+  // The failed run's id must still be the task's current run — nothing else
+  // (a new run, a manual retry-cancel) should have moved the task on while
+  // we were waiting to leave `task.runId` untouched.
+  if (task.runId !== failedRunId || active.has(failedRunId)) {
+    kimiRetryState.delete(taskId);
+    return;
+  }
+  const prompt = firstUserPromptForRun(failedRunId);
+  if (!prompt) {
+    // Can't safely retry without knowing what to resend — fall back to the
+    // normal failure flow rather than silently doing nothing.
+    kimiRetryState.delete(taskId);
+    tasks.update(taskId, { runId: null });
+    updateColumn(taskId, failedRunId, "ready");
+    return;
+  }
+  spawnKimiTurnNow(task, taskId, prompt);
+  // The retry's run row now exists (and is active) — safe to drain any
+  // follow-ups the user queued during the backoff window, preserving FIFO.
+  drainKimiQueue(taskId);
+}
+
+/** The exact text sent to kimi for a given run: every kimi turn's spawn path
+ *  (`startTask`, `spawnKimiTurnNow`) emits a `user` chunk before calling
+ *  `spawnAgent`, so it's always the earliest `user`-stream event on the run's
+ *  own row (later `user` events on an *active* run are queued-follow-up
+ *  bubbles for a *different*, not-yet-spawned run — see `sendKimiTurn`).
+ *  Used to determine what to resend on an auto-retry, since `runs` has no
+ *  dedicated prompt column. */
+function firstUserPromptForRun(runId: string): string | null {
+  const first = runs.events(runId).find((e) => e.stream === "user" && e.subagentId == null);
+  return first?.data ?? null;
 }
 
 /**
@@ -1500,6 +1976,7 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: inheritedSessionId,
     codexSessionId: null,
+    kimiSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -1567,6 +2044,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: inheritedSessionId,
     codexSessionId: null,
+    kimiSessionId: null,
     origin: "continuation",
   });
   const prevColumn: ColumnId = task.column;
@@ -1624,6 +2102,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: priorSessionId,
     codexSessionId: null,
+    kimiSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -1873,9 +2352,13 @@ export async function archiveTask(taskId: string): Promise<{ task: Task } | { er
   // Resolved up front (before enqueueing) — same as before, just no longer
   // re-read inside the deferred job.
   const archiveKind = resolveHarness(task.agent)?.kind;
-  // codexTurnQueue is cheap in-memory bookkeeping (no I/O), so it's dropped
-  // inline rather than folded into the deferred job.
+  // codexTurnQueue/kimiTurnQueue are cheap in-memory bookkeeping (no I/O), so
+  // they're dropped inline rather than folded into the deferred job. Same for
+  // a pending kimi retry timer — archiving a task must not let a stale retry
+  // resurrect it later.
   codexTurnQueue.delete(taskId);
+  kimiTurnQueue.delete(taskId);
+  clearKimiRetryState(taskId);
   // Deferred: the actual teardown (tmux kill, terminal shells, worktree
   // detach) is pushed onto this task's source-workdir teardown queue rather
   // than awaited here, so `archiveTask` can flip the DB column and return in
@@ -1892,6 +2375,7 @@ export async function archiveTask(taskId: string): Promise<{ task: Task } | { er
     // would hide a regression in claude-tmux from the next reviewer.
     if (archiveKind === "claude-code") dropSession(taskId);
     else if (archiveKind === "codex") dropCodexSession(taskId);
+    else if (archiveKind === "kimi") dropKimiSession(taskId);
     // Tear down terminal tabs before detaching the worktree — a live shell
     // cwd'd inside the worktree would block `git worktree remove`, exactly
     // like deleteTask's ordering.
@@ -1951,6 +2435,11 @@ export async function deleteTask(taskId: string): Promise<void> {
   // clears any in-memory tailer. No-op when no session exists.
   const deleteKind = resolveHarness(task.agent)?.kind;
   codexTurnQueue.delete(taskId);
+  kimiTurnQueue.delete(taskId);
+  // A pending kimi retry timer must not fire after the task row is gone —
+  // `fireKimiRetry`'s fire-time re-validation is the backstop, this is the
+  // primary guard (fleet-known FK-error race on a post-delete spawn).
+  clearKimiRetryState(taskId);
   // Routed through the same per-workdir teardown queue archiveTask uses —
   // DELETE's semantics are unchanged (still awaited before `tasks.delete`
   // below), but this serializes it behind any archive teardown already in
@@ -1960,6 +2449,7 @@ export async function deleteTask(taskId: string): Promise<void> {
   await enqueueTeardown(taskId, task.workdir, async () => {
     if (deleteKind === "claude-code") dropSession(taskId);
     else if (deleteKind === "codex") dropCodexSession(taskId);
+    else if (deleteKind === "kimi") dropKimiSession(taskId);
     // Kill any open terminal tabs before removing the worktree — a live shell
     // sitting in the worktree dir would block `git worktree remove`. Awaited
     // so the shells are actually gone before we tear the directory down.
@@ -2009,6 +2499,7 @@ export function sweepArchivedTeardowns(): number {
     enqueueTeardown(taskId, task.workdir, async () => {
       if (kind === "claude-code") dropSession(taskId);
       else if (kind === "codex") dropCodexSession(taskId);
+      else if (kind === "kimi") dropKimiSession(taskId);
       await killTerminalsForTask(taskId);
       await detachWorktree(task);
     });

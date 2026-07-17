@@ -85,6 +85,16 @@ async function discoverClaude(): Promise<DiscoveredModel[]> {
   return [];
 }
 
+/**
+ * kimi-cli has no documented model-list command either (and no local binary
+ * was available to probe at implementation time — see the harness plan doc).
+ * Empty stub, same shape as `discoverClaude`: the UI falls back to the
+ * hardcoded AGENT_OPTIONS curated list.
+ */
+async function discoverKimi(): Promise<DiscoveredModel[]> {
+  return [];
+}
+
 const cache = new Map<AgentKind, DiscoveredModel[]>();
 let inflight: Promise<void> | null = null;
 
@@ -101,9 +111,10 @@ export function getDiscoveredModels(agent: AgentKind): DiscoveredModel[] {
 export async function refreshDiscoveredModels(): Promise<void> {
   if (inflight) return inflight;
   inflight = (async () => {
-    const [codex, claude] = await Promise.all([discoverCodex(), discoverClaude()]);
+    const [codex, claude, kimi] = await Promise.all([discoverCodex(), discoverClaude(), discoverKimi()]);
     cache.set("codex", codex);
     cache.set("claude-code", claude);
+    cache.set("kimi", kimi);
   })().finally(() => { inflight = null; });
   return inflight;
 }
