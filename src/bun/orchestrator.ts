@@ -2186,6 +2186,15 @@ export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | {
   // can't be determined, key by `dirPath` instead: there's no shared lock
   // domain to serialize against, so this degrades to a private one-entry
   // chain, behaviorally the same as running it inline.
+  //
+  // Caveat: archive/delete key their chains by the raw `task.workdir` string,
+  // whereas `sourceRoot` here is the realpath'd repo root git wrote into the
+  // `.git` pointer. If those aren't byte-identical (trailing slash, a symlinked
+  // path, or a workdir that's a repo *subdir*), the orphan prune lands on a
+  // different FIFO and could still race that repo's `.git/worktrees/.lock` —
+  // the same best-effort limitation `teardownTails` already documents. Harmless
+  // (a lost lock just skips one prune; the next worktree op in that repo clears
+  // the stale registration), so not worth resolving the root to reconcile keys.
   let result: { ok: true } | { error: string } = { ok: true };
   await enqueueTeardown(id, sourceRoot ?? dirPath, async () => {
     try {

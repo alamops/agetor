@@ -512,7 +512,11 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                           {status.merged === true && (
                             <span
                               className="text-emerald-400"
-                              title="Already merged into the default branch — safe to delete"
+                              title={
+                                status.dirty
+                                  ? "Merged into the default branch — committed work is safe to delete, but uncommitted changes would be lost"
+                                  : "Already merged into the default branch — safe to delete"
+                              }
                             >
                               merged
                             </span>
