@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input";
 import { MultiSearchSelect } from "@/components/ui/multi-search-select";
 import { Select } from "@/components/ui/select";
 import { useConfirm } from "@/components/ui/confirm";
-import { abbreviateHome, cn } from "@/lib/utils";
+import { abbreviateHome } from "@/lib/utils";
 import {
   COLUMNS,
   type ColumnId,
@@ -275,6 +275,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
           <strong>archived</strong> (hidden from the board, restorable via Unarchive) and its worktree
           directory removed. The git branch and full AI history are preserved. If the worktree has
           uncommitted changes, it is left in place to protect your work.
+          {w.runActive && " An agent is still working on this task — archiving will stop it."}
         </>
       ),
       confirmLabel: "Archive & delete",
@@ -283,7 +284,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
     if (!ok) return;
     await withBusy(w.id, async () => {
       try {
-        await api.archiveTask(taskId, { force: true });
+        await api.archiveTask(taskId, { force: true, stopRun: true });
         await refresh();
       } catch (e) {
         toast.error(e instanceof Error ? e.message : String(e));
@@ -533,15 +534,19 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                   <Button
                     size="icon"
                     variant="ghost"
-                    title={w.runActive ? "Stop the run first" : "Delete worktree"}
+                    title={
+                      w.runActive
+                        ? (w.taskId ? "Stop the running agent and delete worktree" : "Stop the run first")
+                        : "Delete worktree"
+                    }
                     aria-label="Delete worktree"
-                    disabled={w.runActive || busy}
+                    disabled={(w.runActive && !w.taskId) || busy}
                     onClick={() => { void (w.taskId ? deleteTaskBacked(w) : deleteOrphan(w)); }}
                   >
                     {busy ? (
                       <Loader2 className="size-4 animate-spin" />
                     ) : (
-                      <Trash2 className={cn("size-4", !w.runActive && "text-destructive")} />
+                      <Trash2 className="size-4 text-destructive" />
                     )}
                   </Button>
                 </div>

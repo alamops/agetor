@@ -1181,6 +1181,37 @@ function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult
   }
 }
 
+/**
+ * Stop the active handle `h`'s task. `kill()` sends Ctrl+C to the tmux
+ * session, which also clears claude's queued-input buffer, so every queued
+ * run in this task is going down too. Mark each active handle as cancelled
+ * so their done handlers record "cancelled" (not "failed") when their
+ * slot's reject fires. Resolve any in-flight approval / question for this
+ * task BEFORE the interrupt — otherwise the hook script's curl and the MCP
+ * server's fetch would sit on a doomed HTTP response until their own
+ * timeouts. Shared by `cancelRun` (Stop button) and `archiveTask`
+ * (`stopRun`) so the two can't drift.
+ */
+function stopActiveHandle(h: ActiveRun, reason: string): void {
+  for (const [, handle] of active) {
+    if (handle.taskId === h.taskId) handle.cancelled = true;
+  }
+  cancelPendingForTask(h.taskId, reason);
+  h.kill();
+}
+
+/**
+ * Stop a task that's "held" (see `isHeldByBackgroundAgents`) — its terminal
+ * run already succeeded but background agents are still running, so there's
+ * no `active` handle to kill. Interrupt the live session and release the
+ * hold. Shared by `cancelRun` (Stop button) and `archiveTask` (`stopRun`).
+ */
+function stopHeldTask(taskId: string, reason: string): void {
+  cancelPendingForTask(taskId, reason);
+  interruptTaskSession(taskId);
+  orphanRunningSubagents(taskId);
+}
+
 export function cancelRun(runId: string): boolean {
   const h = active.get(runId);
   if (!h) {
@@ -1192,24 +1223,11 @@ export function cancelRun(runId: string): boolean {
     // already succeeded, so the card advances to `review`.
     const taskId = runs.get(runId)?.taskId;
     if (!taskId || !isHeldByBackgroundAgents(taskId)) return false;
-    cancelPendingForTask(taskId, "cancelled by user");
-    interruptTaskSession(taskId);
-    orphanRunningSubagents(taskId);
+    stopHeldTask(taskId, "cancelled by user");
     return true;
   }
-  // Stop targets the whole task, not just one run. `kill()` sends Ctrl+C
-  // to the tmux session, which also clears claude's queued-input buffer,
-  // so every queued run in this task is going down too. Mark each
-  // active handle as cancelled so their done handlers record "cancelled"
-  // (not "failed") when their slot's reject fires.
-  for (const [, handle] of active) {
-    if (handle.taskId === h.taskId) handle.cancelled = true;
-  }
-  // Resolve any in-flight approval / question for this task BEFORE the
-  // interrupt — otherwise the hook script's curl and the MCP server's
-  // fetch would sit on a doomed HTTP response until their own timeouts.
-  cancelPendingForTask(h.taskId, "cancelled by user");
-  h.kill();
+  // Stop targets the whole task, not just one run.
+  stopActiveHandle(h, "cancelled by user");
   return true;
 }
 
@@ -1873,10 +1891,16 @@ export async function createTask(
  * delete action, which archives a stale worktree's task regardless of where
  * it sits on the board) — the active-run rejection, `archivedAt` stamping,
  * and deferred teardown below are unchanged either way.
+ *
+ * Pass `{ stopRun: true }` to archive a task with an in-flight (or
+ * held-by-background-agents) run anyway: the run is stopped exactly the way
+ * the Stop button stops it (`stopActiveHandle`/`stopHeldTask`, shared with
+ * `cancelRun`) before the normal archive path below proceeds. Without it,
+ * the active-run guard stays in place as a backstop.
  */
 export async function archiveTask(
   taskId: string,
-  opts?: { force?: boolean },
+  opts?: { force?: boolean; stopRun?: boolean },
 ): Promise<{ task: Task } | { error: string }> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
@@ -1887,9 +1911,16 @@ export async function archiveTask(
   // freely PATCHable (drag-to-Done on a running card is allowed today). If a
   // run is still active, refuse rather than killing tmux out from under it —
   // the exit handler would then flip the now-archived task to 'ready' and
-  // leave the row in a contradictory state.
+  // leave the row in a contradictory state — UNLESS the caller explicitly
+  // asked us to stop it first (`stopRun`), in which case we do exactly what
+  // the Stop button does before proceeding.
   if (task.runId && active.has(task.runId)) {
-    return { error: "task is still running — cancel the run before archiving" };
+    if (!opts?.stopRun) {
+      return { error: "task is still running — cancel the run before archiving" };
+    }
+    stopActiveHandle(active.get(task.runId)!, "task archived");
+  } else if (opts?.stopRun && isHeldByBackgroundAgents(taskId)) {
+    stopHeldTask(taskId, "task archived");
   }
   if (task.archivedAt != null) {
     return { task };

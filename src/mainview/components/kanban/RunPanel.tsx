@@ -745,6 +745,10 @@ function RunPanelBody({
   const canControl = !!liveRunId
     && (task.column === "running" || task.column === "blocked")
     && !liveRunTerminal;
+  // Archive gate mirrors TaskCard's `active` — running/blocked, regardless of
+  // whether a live run row has been polled in yet, so Archive shows up as
+  // soon as the board would call this task "active" too.
+  const active = task.column === "running" || task.column === "blocked";
   const resumableRunId = liveRunId
     ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
   // Send is enabled whenever the task has ever been run. While a turn is
@@ -1170,8 +1174,13 @@ function RunPanelBody({
               <Square className="mr-1 size-3" /> Stop
             </Button>
           )}
-          {!archived && task.column === "done" && (
-            <Button size="sm" variant="outline" onClick={() => onArchive(task)} title="Archive task">
+          {!archived && (task.column === "done" || active) && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => onArchive(task)}
+              title={active ? "Stop the running agent and archive task" : "Archive task"}
+            >
               <Archive className="mr-1 size-3" /> Archive
             </Button>
           )}

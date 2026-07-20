@@ -179,8 +179,13 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, o
               <CheckCircle2 className="mr-1 size-3" /> Done
             </Button>
           )}
-          {!archived && task.column === "done" && (
-            <Button size="icon" variant="ghost" onClick={() => onArchive(task)} title="Archive task">
+          {!archived && (task.column === "done" || active) && (
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => onArchive(task)}
+              title={active ? "Stop the running agent and archive task" : "Archive task"}
+            >
               <Archive className="size-3" />
             </Button>
           )}

@@ -495,11 +495,22 @@ export default function App() {
     }
   };
   const archive = async (t: Task) => {
+    const active = t.column === "running" || t.column === "blocked";
+    if (active) {
+      const ok = await confirm({
+        title: `Archive "${t.title}"?`,
+        description:
+          "An agent is still working on this task. Archiving will stop it.",
+        confirmLabel: "Stop & archive",
+        variant: "destructive",
+      });
+      if (!ok) return;
+    }
     const now = Date.now();
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: now } : x)));
     try {
       setError(null);
-      await api.archiveTask(t.id);
+      await api.archiveTask(t.id, active ? { force: true, stopRun: true } : undefined);
       await refresh();
     } catch (e) {
       surfaceError(e);
