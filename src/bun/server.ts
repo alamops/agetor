@@ -3118,11 +3118,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       "/tasks/:id/archive": {
         POST: authed(async (req) => {
           server.timeout(req, 0);
-          // Optional body — no body (or a malformed one) means force: false,
-          // same as the pre-existing behaviour. Only used by the Worktrees
-          // page's delete action to bypass the done-column gate.
-          const body = (await req.json().catch(() => ({}))) as { force?: boolean };
-          const result = await archiveTask(req.params.id, { force: body.force === true });
+          // Optional body — no body (or a malformed one) means force: false
+          // and stopRun: false, same as the pre-existing behaviour. `force`
+          // bypasses the done-column gate (Worktrees page's delete action);
+          // `stopRun` additionally stops an in-flight/held run before
+          // archiving instead of erroring.
+          const body = (await req.json().catch(() => ({}))) as { force?: boolean; stopRun?: boolean };
+          const result = await archiveTask(req.params.id, { force: body.force === true, stopRun: body.stopRun === true });
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });

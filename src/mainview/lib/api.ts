@@ -1031,13 +1031,18 @@ export const api = {
   startTask: (id: string) => j<{ runId: string }>(`/tasks/${id}/start`, { method: "POST" }),
   /** `force: true` bypasses the done-column gate (still rejects an active
    *  run) — used by the Worktrees page's "Archive & delete" flow to archive
-   *  a stale worktree's task regardless of its current column. Omitted (the
-   *  common case) sends no body, matching the original archive-from-`done`
-   *  callers unchanged. */
-  archiveTask: (id: string, opts?: { force?: boolean }) =>
+   *  a stale worktree's task regardless of its current column. `stopRun:
+   *  true` additionally stops any in-flight run/background agents before
+   *  archiving — required (server-enforced) to archive a running/blocked
+   *  task at all; the caller is expected to confirm with the user first.
+   *  Omitted (the common case) sends no body, matching the original
+   *  archive-from-`done` callers unchanged. */
+  archiveTask: (id: string, opts?: { force?: boolean; stopRun?: boolean }) =>
     j<Task>(`/tasks/${id}/archive`, {
       method: "POST",
-      ...(opts?.force ? { body: JSON.stringify({ force: true }) } : {}),
+      ...(opts?.force || opts?.stopRun
+        ? { body: JSON.stringify({ force: !!opts.force, stopRun: !!opts.stopRun }) }
+        : {}),
     }),
   unarchiveTask: (id: string) => j<Task>(`/tasks/${id}/unarchive`, { method: "POST" }),
 
