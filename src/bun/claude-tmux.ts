@@ -2998,6 +2998,11 @@ function sha1(s: string): string {
  * word-boundary match on `token`: `"Unknown command: /skill-creator"` must
  * NOT match an armed token of `"/skill"` (a prefix), so the token is
  * followed by whitespace or end-of-line.
+ *
+ * Known non-matches, accepted because claude's error line is short and
+ * always "● "-prefixed: a leading glyph other than "●", trailing
+ * punctuation right after the token, and a command name tmux hard-wrapped
+ * across physical lines (`capture-pane` without `-J`).
  */
 function matchUnknownCommand(tail: string[], token: string): boolean {
   const nonBlank = tail.filter((l) => l.trim().length > 0).slice(-12);
@@ -3550,6 +3555,10 @@ function signalUnknownCommand(state: SessionState): void {
     slot.reject = null;
     resolve(0);
   } else if (state.onEndOfTurn) {
+    // Symmetry with `signalSessionDeath`; in production this branch can't
+    // fire on a genuinely reattached run — `pendingSlashToken` is in-memory
+    // and never re-armed after a restart (plan limitation L2) — so it's
+    // reachable only from synthetic test states.
     const handler = state.onEndOfTurn;
     state.onEndOfTurn = null;
     handler();
@@ -4256,6 +4265,10 @@ export function pasteFollowUp(taskId: string, prompt: string): boolean {
   state.holdUntilIdle = true;
   // Arm (or disarm) the unknown-command lookout for the folded-in prompt —
   // same rule as `sendTurn`: only a first line starting with "/" arms it.
+  // Best-effort here: the in-flight turn's own JSONL lines clear the token
+  // (`dispatchLine`), so a folded slash command is only caught when the turn
+  // has already gone JSONL-quiet before claude replays it (plan limitation
+  // L1 in docs/plans/catch-unknown-command-error.md).
   state.pendingSlashToken = slashTokenOf(prompt);
   void queuePaste(taskId, state.sessionName, prompt, 0, state, { bracketed: true });
   return true;
