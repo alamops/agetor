@@ -41,6 +41,7 @@ import {
 } from "./interactions.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
+  CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
   cycleToMode,
   type CycleResult,
   type ContinuationHooks,
@@ -133,6 +134,13 @@ interface ActiveRun {
    *  handler reads this on resolution to keep it there (record the run as
    *  `failed`, not bounce to `ready`). */
   sessionDied: boolean;
+  /** Set when claude's TUI rejected the pasted message as an unknown slash
+   *  command (the driver emitted the `CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX`
+   *  sentinel — no JSONL line was ever written for that turn). Like
+   *  `apiError`/`sessionDied`, the chunk handler flips the column to
+   *  `blocked` immediately and the done handler reads this on resolution to
+   *  keep it there (record the run as `failed`, not bounce to `ready`). */
+  unknownCommand: boolean;
 }
 const active = new Map<string, ActiveRun>(); // runId -> handle
 
@@ -300,7 +308,7 @@ function updateColumn(
   taskId: string,
   runId: string | null,
   next: ColumnId,
-  reason?: "api-error" | "approval" | "session-died",
+  reason?: "api-error" | "approval" | "session-died" | "unknown-command",
 ): void {
   const before = tasks.get(taskId);
   const prev: ColumnId | null = before?.column ?? null;
@@ -898,6 +906,26 @@ function makeChunkHandler(
         }
       }
     }
+    // Unknown-slash-command path (claude-code only): claude's TUI rejected
+    // the pasted message as an unknown slash command — no JSONL line was
+    // ever written for it, so claude-tmux's pane scraper is the only source
+    // of this sentinel. Flip to `blocked` here so the card stops sitting in
+    // `running`, and mark the handle so `attachDoneHandler` doesn't bounce
+    // it back to `ready` when the resolution lands a moment later.
+    if (
+      kind === "claude-code"
+      && stream === "status"
+      && data.startsWith(CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX)
+    ) {
+      const handle = active.get(runId);
+      if (handle && !handle.unknownCommand) {
+        handle.unknownCommand = true;
+        const task = tasks.get(taskId);
+        if (task && task.runId === runId) {
+          updateColumn(taskId, runId, "blocked", "unknown-command");
+        }
+      }
+    }
   };
 }
 
@@ -914,6 +942,7 @@ function registerActiveRun(
     cancelled: false,
     apiError: false,
     sessionDied: false,
+    unknownCommand: false,
     writeInput: (line) => agent.writeInput(line),
   });
 }
@@ -934,15 +963,16 @@ function attachDoneHandler(
       const wasCancelled = handle?.cancelled ?? false;
       const wasApiError = handle?.apiError ?? false;
       const wasSessionDied = handle?.sessionDied ?? false;
+      const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
 
-      // API error / session-death override the exit-code mapping: the driver
-      // resolves the turn with code 0 (a clean end_turn was staged), but the
-      // run really failed — record it as such so the badge and history are
-      // honest.
+      // API error / session-death / unknown-command override the exit-code
+      // mapping: the driver resolves the turn with code 0 (a clean end_turn
+      // was staged), but the run really failed — record it as such so the
+      // badge and history are honest.
       const newStatus: RunStatus = wasCancelled
         ? "cancelled"
-        : (wasApiError || wasSessionDied) ? "failed"
+        : (wasApiError || wasSessionDied || wasUnknownCommand) ? "failed"
         : code === 0 ? "succeeded" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: code });
       // Only flip the task's column when the run that just resolved is
@@ -967,6 +997,7 @@ function attachDoneHandler(
           && !wasCancelled
           && !wasApiError
           && !wasSessionDied
+          && !wasUnknownCommand
           && subagents.hasRunning(taskId);
         if (holdForSubagents) {
           const runningCount = subagents.runningCountForTask(taskId);
@@ -983,7 +1014,7 @@ function attachDoneHandler(
           // `blocked` just because it had previously hit an API error.
           const nextColumn: ColumnId = wasCancelled
             ? "ready"
-            : (wasApiError || wasSessionDied) ? "blocked"
+            : (wasApiError || wasSessionDied || wasUnknownCommand) ? "blocked"
             : newStatus === "succeeded" ? "review" : "ready";
           updateColumn(taskId, runId, nextColumn);
         }
@@ -1005,16 +1036,18 @@ function attachDoneHandler(
       const handle = active.get(runId);
       const wasCancelled = handle?.cancelled ?? false;
       const wasSessionDied = handle?.sessionDied ?? false;
+      const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
       const newStatus: RunStatus = wasCancelled ? "cancelled" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: -1 });
       const task = tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
-        // A session-death that reaches the reject path (not the case today —
-        // both drivers resolve on death — but keep the column consistent with
-        // the resolve path if a future refactor ever rejects instead).
-        updateColumn(taskId, runId, wasSessionDied ? "blocked" : "ready");
+        // A session-death / unknown-command that reaches the reject path (not
+        // the case today — both drivers resolve on these — but keep the
+        // column consistent with the resolve path if a future refactor ever
+        // rejects instead).
+        updateColumn(taskId, runId, (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready");
       }
       emit({
         runId,

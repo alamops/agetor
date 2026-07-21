@@ -20,7 +20,7 @@ import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess } from "@/lib/toasts";
+import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
 import { cn } from "@/lib/utils";
@@ -379,6 +379,8 @@ export default function App() {
           toastApiError({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.reason === "session-died") {
           toastSessionEnded({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.reason === "unknown-command") {
+          toastUnknownCommand({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else {
           toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         }

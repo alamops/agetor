@@ -113,6 +113,17 @@ export function toastSessionEnded(args: ToastArgs): void {
   showBlockingToast({ method: toast.error, heading: "Session ended" }, args);
 }
 
+/** Variant of `toastPending` for the `blocked → unknown-command` transition —
+ *  claude's TUI rejected the pasted message as an unrecognized slash command,
+ *  so the turn never started. Reads as "your message didn't go through," not
+ *  "the agent is waiting on you." */
+export function toastUnknownCommand(args: ToastArgs): void {
+  showBlockingToast(
+    { method: toast.error, heading: "Message not delivered" },
+    args,
+  );
+}
+
 /**
  * Alert the user that a question / permission prompt is waiting on them.
  * Distinct from `toastPending` (the `blocked`-column path) in one crucial way:

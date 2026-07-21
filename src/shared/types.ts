@@ -1734,7 +1734,7 @@ export type GlobalEvent =
        *  than the generic "waiting on you" used for permission prompts.
        *  Unset for transitions whose reason is fully implied by the
        *  (prev, column) pair (e.g. plain success → review). */
-      reason?: "api-error" | "approval" | "session-died";
+      reason?: "api-error" | "approval" | "session-died" | "unknown-command";
     }
   | {
       kind: "update";
