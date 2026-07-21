@@ -476,6 +476,25 @@ interface ParsedJsonlEvent {
  *  consumer (orchestrator) can't drift. */
 export const CLAUDE_API_ERROR_STATUS_PREFIX = "api error: ";
 
+/** Status-chunk prefix for the "claude's TUI rejected the message as an
+ *  unknown slash command" sentinel — mirrors `CLAUDE_API_ERROR_STATUS_PREFIX`
+ *  exactly (producer here, consumer in orchestrator.ts's `makeChunkHandler`).
+ *  See `signalUnknownCommand` for the emit site and `matchUnknownCommand` /
+ *  `slashTokenOf` for detection. */
+export const CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX = "unknown command: ";
+
+/** Returns the first whitespace-delimited token of `prompt`'s first line iff
+ *  that line starts with `/` (e.g. `"/skill-creator do the thing"` →
+ *  `"/skill-creator"`), else null. Used to arm/disarm
+ *  `SessionState.pendingSlashToken` at every prompt-delivery point — a prompt
+ *  starting with `/` is the one case claude's Ink TUI may swallow as a slash
+ *  command instead of delivering it as a message. */
+function slashTokenOf(prompt: string): string | null {
+  const firstLine = prompt.split("\n", 1)[0] ?? "";
+  if (!firstLine.startsWith("/")) return null;
+  return firstLine.match(/^(\S+)/)?.[1] ?? null;
+}
+
 /**
  * True for an assistant JSONL line that claims to end a turn. Used by
  * `dispatchLine` to decide whether to stage a pending end_turn. The claim
@@ -1596,6 +1615,20 @@ interface SessionState {
    *  been quiet for `END_TURN_IDLE_FIRE_MS`. Cleared in `popEndOfTurn` when the
    *  slot finally pops (the whole busy period is over). */
   holdUntilIdle: boolean;
+  /** First whitespace-delimited token of the current turn's prompt, iff its
+   *  FIRST line starts with `/` (e.g. `/skill-creator`) — null otherwise. Set
+   *  by every prompt-delivery point (`sendTurn`, `pasteFollowUp`, the
+   *  deferred-prompt paste and argv-prompt spawn path in
+   *  `spawnClaudeViaTmux`), which lets `scrapeOnce` arm a token-matched
+   *  lookout for claude's TUI rejecting the message with `Unknown command:
+   *  /<token>` — no JSONL is ever written for that case, so nothing else
+   *  would ever unstick the run. Cleared (a) on the next real JSONL line
+   *  (`dispatchLine` — the message was delivered/ran for real), (b) when a
+   *  turn resolves normally (`popEndOfTurn`), (c) on session death
+   *  (`signalSessionDeath`), and (d) by `signalUnknownCommand` itself, which
+   *  doubles as its one-shot re-entry guard (`scrapeOnce` only calls it while
+   *  this is non-null). */
+  pendingSlashToken: string | null;
   /** Watches `<sessionId>/subagents/` for background/sub agents this session
    *  spawns, tailing each into the task's event stream (tagged by subagent id)
    *  for the run panel's read-only tabs. Armed in `attachTailer`, released in
@@ -1716,6 +1749,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     askFirstSeenAt: null,
     pendingEndTurn: null,
     holdUntilIdle: false,
+    pendingSlashToken: null,
     subagentWatcher: null,
     continuationWatchdog: null,
   };
@@ -1825,6 +1859,9 @@ function popEndOfTurn(state: SessionState): void {
   // The busy period (the active turn plus any folded follow-ups) is ending —
   // clear the hold so the next genuinely-sequential turn resolves normally.
   state.holdUntilIdle = false;
+  // The turn resolved normally (real end_turn) — whatever was armed for the
+  // unknown-command lookout no longer applies to it.
+  state.pendingSlashToken = null;
   // A turn resolving through the normal end-turn machinery means any
   // notification-triggered continuation watchdog has nothing left to guard
   // against — cancel it. Safe unconditionally: the watchdog is only ever
@@ -2436,6 +2473,11 @@ function maybeAdoptContinuation(
 }
 
 function dispatchLine(state: SessionState, line: string): void {
+  // Any JSONL line reaching us at all is proof claude accepted the
+  // last-pasted message as a real turn (an unknown-slash-command rejection
+  // never writes one) — disarm the lookout so a later, unrelated pane match
+  // can't misfire against a stale token.
+  state.pendingSlashToken = null;
   let evt: ParsedJsonlEvent;
   try {
     evt = JSON.parse(line);
@@ -2944,6 +2986,37 @@ function sha1(s: string): string {
 }
 
 /**
+ * Recognise claude's Ink TUI rejecting a pasted message as an unknown slash
+ * command, e.g.:
+ *
+ *   ● Unknown command: /skill-creator
+ *
+ * No JSONL line is ever written for this — the message was never delivered
+ * as a turn — so this pane scrape is the only signal. Scans only the last
+ * ~12 NON-BLANK lines of the tail (a stale sighting further up the pane
+ * shouldn't false-fire on a later, unrelated turn) and requires an exact
+ * word-boundary match on `token`: `"Unknown command: /skill-creator"` must
+ * NOT match an armed token of `"/skill"` (a prefix), so the token is
+ * followed by whitespace or end-of-line.
+ *
+ * Known non-matches, accepted because claude's error line is short and
+ * always "● "-prefixed: a leading glyph other than "●", trailing
+ * punctuation right after the token, and a command name tmux hard-wrapped
+ * across physical lines (`capture-pane` without `-J`).
+ */
+function matchUnknownCommand(tail: string[], token: string): boolean {
+  const nonBlank = tail.filter((l) => l.trim().length > 0).slice(-12);
+  const escapedToken = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^Unknown command: ${escapedToken}(?:\\s|$)`);
+  return nonBlank.some((raw) => {
+    // Strip leading whitespace and an optional "●" bullet + following
+    // whitespace — claude prefixes its own status lines with "● ".
+    const stripped = raw.replace(/^\s*(?:●\s*)?/, "");
+    return re.test(stripped);
+  });
+}
+
+/**
  * One-time *startup consent* dialogs claude can draw before it ever reaches
  * the REPL. These are special because they block JSONL creation entirely:
  * the normal scraper only arms after the JSONL exists (`attachTailer`), so it
@@ -3167,7 +3240,24 @@ function scrapeOnce(state: SessionState): void {
     return;
   }
   const lines = cap.stdout.split("\n");
-  const tail = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n");
+  const tailLines = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES));
+  const tail = tailLines.join("\n");
+
+  // Armed, token-matched lookout for claude's TUI rejecting the last-pasted
+  // message as an unknown slash command. Cheap and early-guarded — only
+  // evaluated while a token is armed AND a turn is genuinely in flight — so
+  // this never runs for the (overwhelmingly common) non-slash-prompt case.
+  // No JSONL line is ever written when this fires, so this scrape is the
+  // only place that can catch it. Runs before the modal-detection block
+  // below; ordering doesn't otherwise matter (an unknown-command error never
+  // coexists with a modal) since `signalUnknownCommand` is one-shot (it
+  // clears `pendingSlashToken`, so a re-check later in the same tick — there
+  // isn't one — or the next tick can't double-fire).
+  if (state.pendingSlashToken !== null
+    && turnInFlight(state)
+    && matchUnknownCommand(tailLines, state.pendingSlashToken)) {
+    signalUnknownCommand(state);
+  }
 
   // JSONL-recency gate: claude is actively writing. The pane content
   // is mid-render, not a stable modal — defer matching until things
@@ -3371,6 +3461,9 @@ export const DEATH_JSONL_QUIET_MS = 3_000;
 function signalSessionDeath(state: SessionState): void {
   const inFlight = turnInFlight(state);
   if (!inFlight && !heldProbeSafe(state.taskId)) return;
+  // The turn (if any) is being settled by a different sentinel below — an
+  // armed slash token has nothing left to watch for.
+  state.pendingSlashToken = null;
   const slot = state.turnQueue[0];
   const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
   onChunk(
@@ -3420,6 +3513,56 @@ function signalSessionDeath(state: SessionState): void {
   // that no longer exists. Release it the same way the run itself is
   // released above.
   orphanRunningSubagents(state.taskId);
+}
+
+/**
+ * Settle an in-flight turn because claude's Ink TUI rejected the last-pasted
+ * message as an unknown slash command (`Unknown command: /<token>`). No
+ * JSONL line is ever written for this — the message was never delivered as
+ * a turn — so `scrapeOnce`'s pane scrape is the only signal, gated on
+ * `state.pendingSlashToken` being armed (see `slashTokenOf`) and a turn
+ * genuinely being in flight (checked by the caller).
+ *
+ * Mirrors `signalSessionDeath`'s settle mechanics exactly — emit the
+ * sentinel `status` chunk via the head slot's `onChunk` (or `onEndOfTurn` on
+ * the reattach path), resolve the slot with code 0 — but, UNLIKE session
+ * death, the tmux session and claude process stay alive and reusable: we do
+ * NOT stop the scrape/death/poll timers or the JSONL watcher. The next turn
+ * on this task routes through `sendTurn` exactly as if nothing happened.
+ *
+ * One-shot: clearing `state.pendingSlashToken` up front is both the disarm
+ * and the re-entry guard — a second call (or a stale timer callback) with
+ * nothing armed is a no-op.
+ */
+function signalUnknownCommand(state: SessionState): void {
+  const token = state.pendingSlashToken;
+  if (!token) return;
+  state.pendingSlashToken = null;
+  state.pendingEndTurn = null;
+  state.holdUntilIdle = false;
+  const slot = state.turnQueue[0];
+  const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
+  onChunk(
+    "status",
+    `${CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX}${token} — claude treated the message as a slash `
+      + `command; it was not delivered. Edit the message so it doesn't start with "/" and resend.`,
+  );
+  if (slot && slot.resolve) {
+    state.turnQueue.shift();
+    state.lastChunk = slot.onChunk;
+    const resolve = slot.resolve;
+    slot.resolve = null;
+    slot.reject = null;
+    resolve(0);
+  } else if (state.onEndOfTurn) {
+    // Symmetry with `signalSessionDeath`; in production this branch can't
+    // fire on a genuinely reattached run — `pendingSlashToken` is in-memory
+    // and never re-armed after a restart (plan limitation L2) — so it's
+    // reachable only from synthetic test states.
+    const handler = state.onEndOfTurn;
+    state.onEndOfTurn = null;
+    handler();
+  }
 }
 
 /** Whether a turn is currently in flight on this session — a live head slot
@@ -3644,6 +3787,22 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // the opening run's stream.
   state.lastChunk = opts.onChunk;
 
+  // Argv-prompt spawn path: the small-prompt case already embedded the
+  // opening message as the final `-- <prompt>` pair in `opts.argv`, baked
+  // into the `tmux new-session` command dispatched above — there is no
+  // separate paste call after this point to arm at, so arm right here, as
+  // soon as the SessionState exists. (Mirrors `sendTurn`/`pasteFollowUp`;
+  // the large-prompt `deferredPrompt` case arms itself right where it's
+  // actually pasted, further down.) A no-op (armed to null) when
+  // `deferredPrompt` is set — that branch below owns arming for its prompt.
+  if (!opts.deferredPrompt) {
+    const argv = opts.argv;
+    const embeddedPrompt = argv.length >= 2 && argv[argv.length - 2] === "--"
+      ? argv[argv.length - 1]
+      : undefined;
+    state.pendingSlashToken = embeddedPrompt ? slashTokenOf(embeddedPrompt) : null;
+  }
+
   // Large-prompt delivery: `buildCommand` (agents.ts) omits any prompt over
   // CLAUDE_PROMPT_ARGV_MAX_BYTES from argv — embedding it would blow tmux's
   // client-command cap and fail `new-session` outright — and hands it back
@@ -3704,6 +3863,12 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
         if (!ready) {
           opts.onChunk("status", "claude readiness never confirmed — delivering prompt anyway");
         }
+        // Arm the unknown-command lookout right at the actual delivery point
+        // — mirrors `sendTurn`/`pasteFollowUp`. (The small-prompt argv case
+        // arms right after SessionState is created instead, since its
+        // "paste" already happened via the launch argv before this function
+        // even returned.)
+        state.pendingSlashToken = slashTokenOf(deferredPrompt);
         void queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, {
           bracketed: true,
           onPasteFailure: () => {
@@ -4023,6 +4188,10 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
   // pop it immediately. After flushSync, the queue head reflects the
   // truly in-flight turn (or is empty if the previous turn just ended).
   flushSync(state);
+  // Arm (or disarm) the unknown-command lookout for THIS turn's prompt —
+  // must happen after flushSync (which may itself clear a stale token left
+  // over from the previous turn) so the new value sticks.
+  state.pendingSlashToken = slashTokenOf(prompt);
   // Keep a handle on the pushed slot (rather than only closing over
   // resolve/reject) so a paste failure below can settle *this specific*
   // slot in-process instead of leaving the run stuck `running` until the
@@ -4094,6 +4263,13 @@ export function pasteFollowUp(taskId: string, prompt: string): boolean {
   const state = sessions.get(taskId);
   if (!state) return false;
   state.holdUntilIdle = true;
+  // Arm (or disarm) the unknown-command lookout for the folded-in prompt —
+  // same rule as `sendTurn`: only a first line starting with "/" arms it.
+  // Best-effort here: the in-flight turn's own JSONL lines clear the token
+  // (`dispatchLine`), so a folded slash command is only caught when the turn
+  // has already gone JSONL-quiet before claude replays it (plan limitation
+  // L1 in docs/plans/catch-unknown-command-error.md).
+  state.pendingSlashToken = slashTokenOf(prompt);
   void queuePaste(taskId, state.sessionName, prompt, 0, state, { bracketed: true });
   return true;
 }
@@ -4541,6 +4717,11 @@ export const __forTest = {
   /** Death-watch settlement — exposed so the death test can drive it against a
    *  synthetic session without a real tmux server. */
   signalSessionDeath,
+  /** Unknown-slash-command settlement — exposed so the matcher/signal test
+   *  can drive it against a synthetic session without a real tmux server. */
+  signalUnknownCommand,
+  matchUnknownCommand,
+  slashTokenOf,
   turnInFlight,
   matchNumberedModal,
   matchYesNoModal,

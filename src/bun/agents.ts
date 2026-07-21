@@ -2,6 +2,7 @@ import path from "node:path";
 import { MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
+  CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
   spawnClaudeViaTmux,
   toClaudeModeString,
   type ChunkHandler,
@@ -518,6 +519,24 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
     const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
     setTimeout(() => {
       onChunk("status", `${SESSION_DIED_STATUS_PREFIX}tmux session agetor-fake ended unexpectedly — task blocked`);
+    }, 5);
+    setTimeout(() => { resolveDone(0); }, resolveDelayMs);
+  } else if (process.env.AGETOR_FAKE_CLAUDE_UNKNOWN_COMMAND === "1") {
+    // Test hook: simulate claude's TUI rejecting the message as an unknown
+    // slash command. Mirrors what `signalUnknownCommand` (claude-tmux.ts)
+    // emits from the pane scraper — the `CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX`
+    // sentinel status chunk that makeChunkHandler pattern-matches to flip the
+    // column to `blocked`, then resolves the turn with code 0 (the handle
+    // `unknownCommand` flag, not the exit code, drives the failed/blocked
+    // outcome). Optional resolve delay lets cancellation-precedence tests
+    // fire cancelRun between the column flip and the done resolution.
+    const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
+    setTimeout(() => {
+      onChunk(
+        "status",
+        `${CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX}/fake-command — claude treated the message as a `
+          + `slash command; it was not delivered. Edit the message so it doesn't start with "/" and resend.`,
+      );
     }, 5);
     setTimeout(() => { resolveDone(0); }, resolveDelayMs);
   } else {
