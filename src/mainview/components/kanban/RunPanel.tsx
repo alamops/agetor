@@ -1410,7 +1410,7 @@ function RunPanelBody({
                     size="sm"
                     variant="secondary"
                     onClick={() => void sendCommitPush()}
-                    title="Ask the agent to commit the working-tree changes, push the current branch to origin, and propose a PR title and description in copyable code blocks."
+                    title="Ask the agent to commit the working-tree changes, push the current branch to origin, and reply with the link to open a PR plus a PR title and description in copyable code blocks."
                   >
                     <GitCommit className="mr-1 size-3" /> Commit &amp; push
                   </Button>

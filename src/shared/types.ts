@@ -1837,7 +1837,11 @@ export interface ToolResultEventData {
  * prefix. The branch is shell-quoted because git ref names may legally contain
  * shell metacharacters; `'\''` is the POSIX escape for an embedded quote.
  *
- * After the commit/push, the prompt also asks the agent to propose a pull
+ * After the commit/push, the prompt first asks for the full link to open a
+ * pull request for the branch — as plain text above the code blocks, not
+ * fenced, so react-markdown's GFM autolinking renders it clickable (git prints
+ * the link in the push output for GitHub/GitLab/Bitbucket; otherwise it can be
+ * built from the remote URL). It then asks the agent to propose a pull
  * request title and description, each emitted in its own fenced code block so
  * agetor renders a one-click copy button per field — the user copies the title
  * into the New PR composer's Title field and the description into its
@@ -1859,7 +1863,10 @@ export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): strin
     `(prefix the subject with "${ccType}:", e.g. "${ccType}: ...") summarizing the work, ` +
     `then push the current branch to origin. ` +
     `If the branch has no upstream yet, set it with \`git push -u origin ${branchLabel}\`. ` +
-    `After pushing, propose the pull request as two fenced code blocks so each can be ` +
+    `After pushing, first print the full link to open a pull request for the branch ` +
+    `(git prints one in the push output; otherwise build it from the remote URL) as ` +
+    `plain text on its own line — not inside a code block. ` +
+    `Below the link, propose the pull request as two fenced code blocks so each can be ` +
     `copied with one click: first a "PR title:" line followed by a \`\`\` block containing ` +
     `only the concise one-line title, then a "PR description:" line followed by a ` +
     `\`\`\`\` four-backtick block containing the description in markdown (what changed and ` +
