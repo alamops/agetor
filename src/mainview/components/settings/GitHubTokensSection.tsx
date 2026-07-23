@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { Trash2 } from "lucide-react";
+import { BookOpen, Trash2 } from "lucide-react";
 import { api, type GitHubTokensResult } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { GitHubSetupDialog } from "@/components/settings/GitHubSetupDialog";
 
 const DATALIST_ID = "github-token-hosts";
 
@@ -28,6 +29,7 @@ export function GitHubTokensSection() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deletingHost, setDeletingHost] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [guideOpen, setGuideOpen] = useState(false);
 
   const refresh = async () => {
     setLoading(true);
@@ -95,12 +97,22 @@ export function GitHubTokensSection() {
 
   return (
     <section className="space-y-2">
-      <div>
-        <label className="text-xs text-muted-foreground">GitHub tokens</label>
-        <p className="text-[11px] leading-snug text-muted-foreground">
-          Repos reached through an ssh host alias (git@github-work.com:…) authenticate with the
-          token stored for that alias; github.com acts as the default.
-        </p>
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <label className="text-xs text-muted-foreground">GitHub tokens</label>
+          <p className="text-[11px] leading-snug text-muted-foreground">
+            Repos reached through an ssh host alias (git@github-work.com:…) authenticate with the
+            token stored for that alias; github.com acts as the default.
+          </p>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setGuideOpen(true)}
+          className="shrink-0"
+        >
+          <BookOpen className="mr-1 size-3.5" /> Setup guide
+        </Button>
       </div>
 
       {loadError && (
@@ -139,7 +151,16 @@ export function GitHubTokensSection() {
             </div>
           ))}
           {data.tokens.length === 0 && (
-            <p className="text-xs text-muted-foreground">No tokens stored yet.</p>
+            <p className="text-xs text-muted-foreground">
+              No tokens stored yet.{" "}
+              <button
+                type="button"
+                onClick={() => setGuideOpen(true)}
+                className="text-primary underline-offset-4 hover:underline"
+              >
+                How to create one →
+              </button>
+            </p>
           )}
           {hostsWithoutToken.map((h) => (
             <div
@@ -206,6 +227,8 @@ export function GitHubTokensSection() {
           {saving ? "Saving…" : "Save token"}
         </Button>
       </div>
+
+      <GitHubSetupDialog open={guideOpen} onClose={() => setGuideOpen(false)} />
     </section>
   );
 }
