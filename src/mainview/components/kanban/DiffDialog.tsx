@@ -287,19 +287,24 @@ export function DiffDialog({ open, task, onClose }: Props) {
             {diff?.base && <> · vs base <span className="font-mono">{diff.base}</span></>}
           </div>
         </div>
-        {diff && diff.files.length > 0 && (
-          <div className="flex shrink-0 items-center gap-3 text-xs">
-            <span className="font-mono">
-              {diff.files.length} {diff.files.length === 1 ? "file" : "files"}
-              {" "}
-              <span className="text-emerald-400">+{totals.additions}</span>{" "}
-              <span className="text-rose-400">−{totals.deletions}</span>
-            </span>
-            <Button size="sm" variant="ghost" onClick={() => setAll(!allOpen)}>
-              {allOpen ? "Collapse all" : "Expand all"}
-            </Button>
-          </div>
-        )}
+        <div className="flex items-center gap-2">
+          {diff && diff.files.length > 0 && (
+            <div className="flex shrink-0 items-center gap-3 text-xs">
+              <span className="font-mono">
+                {diff.files.length} {diff.files.length === 1 ? "file" : "files"}
+                {" "}
+                <span className="text-emerald-400">+{totals.additions}</span>{" "}
+                <span className="text-rose-400">−{totals.deletions}</span>
+              </span>
+              <Button size="sm" variant="ghost" onClick={() => setAll(!allOpen)}>
+                {allOpen ? "Collapse all" : "Expand all"}
+              </Button>
+            </div>
+          )}
+          <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close">
+            <X className="size-4" />
+          </Button>
+        </div>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
