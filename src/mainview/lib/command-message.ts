@@ -152,8 +152,15 @@ function tryParseLocalCommandStdout(text: string): string | null {
  * Recognize a user message as a slash-command invocation or local-command
  * output, trying each shape in turn. Returns `null` for an ordinary message,
  * which callers must render completely unchanged from today's behavior.
+ *
+ * Newlines are normalized to `\n` up front: the JSONL twin of a send can carry
+ * bare `\r` newlines (tmux's paste-buffer artifact — see event-dedup.ts), and
+ * `splitReferences`' blank-line paragraph split needs real `\n`s to find a
+ * trailing refs block. Rendering-only — `canonicalizeUserText` stays a strict
+ * byte identity on non-command input and must not normalize.
  */
 export function parseUserMessage(text: string): ParsedUserMessage | null {
+  text = text.replace(/\r\n?/g, "\n");
   const xml = tryParseCommandXml(text);
   if (xml) return { kind: "command", command: xml };
 

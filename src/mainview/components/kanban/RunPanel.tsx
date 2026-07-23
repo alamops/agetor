@@ -2485,11 +2485,14 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
   // is always rendered so short messages don't flash full-height first;
   // the toggle button only surfaces when scrollHeight exceeds clientHeight,
   // i.e. content actually overflows the cap. When a command has no args (no
-  // `contentRef` div rendered at all), `contentRef.current` is null and this
-  // early-returns — no toggle, which is correct since there's nothing to cap.
+  // `contentRef` div rendered at all), reset rather than early-return so a
+  // stale toggle can't survive a text change that removed the capped div.
   useEffect(() => {
     const el = contentRef.current;
-    if (!el) return;
+    if (!el) {
+      setNeedsToggle(false);
+      return;
+    }
     setNeedsToggle(el.scrollHeight > el.clientHeight + 2);
   }, [text]);
 
