@@ -287,7 +287,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
             {diff?.base && <> · vs base <span className="font-mono">{diff.base}</span></>}
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           {diff && diff.files.length > 0 && (
             <div className="flex shrink-0 items-center gap-3 text-xs">
               <span className="font-mono">
