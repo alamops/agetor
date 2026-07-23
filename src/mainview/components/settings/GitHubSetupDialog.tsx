@@ -26,7 +26,13 @@ import {
  */
 export function GitHubSetupDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   return (
-    <Dialog open={open} onClose={onClose} className="max-w-2xl" labelledBy="github-setup-dialog-title">
+    <Dialog
+      open={open}
+      onClose={onClose}
+      className="max-w-2xl"
+      labelledBy="github-setup-dialog-title"
+      describedBy="github-setup-dialog-desc"
+    >
       <div className="flex items-center justify-between border-b border-border/60 pb-3">
         <h2 id="github-setup-dialog-title" className="text-base font-semibold">
           Connect Agetor to GitHub
@@ -38,7 +44,7 @@ export function GitHubSetupDialog({ open, onClose }: { open: boolean; onClose: (
 
       <div className="max-h-[70vh] space-y-5 overflow-y-auto pt-3 text-sm">
         <section className="space-y-1">
-          <p className="text-[11px] leading-snug text-muted-foreground">
+          <p id="github-setup-dialog-desc" className="text-[11px] leading-snug text-muted-foreground">
             Agetor talks to GitHub using a personal access token (PAT) that you create and
             paste into this Settings section. The integration covers pull requests, issues,
             reviews, checks, Actions, releases, Projects, Discussions, and notifications —
@@ -82,7 +88,7 @@ export function GitHubSetupDialog({ open, onClose }: { open: boolean; onClose: (
             ))}
           </div>
           <div className="space-y-1 rounded-md border border-border/60 px-3 py-2">
-            <p className="text-[11px] font-medium uppercase tracking-wide text-amber-400">
+            <p className="text-[11px] font-medium uppercase tracking-wide text-amber-500">
               Not available with fine-grained tokens
             </p>
             <ul className="list-disc space-y-1 pl-4 text-[11px] leading-snug text-muted-foreground">
