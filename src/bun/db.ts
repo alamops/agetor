@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskDraft, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -70,6 +70,7 @@ type TaskRow = {
   mode: string | null; model: string | null; effort: string | null;
   refs: string;
   backlog: string;
+  draft: string | null;
   run_id: string | null; created_at: number; updated_at: number;
   archived_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
@@ -126,6 +127,28 @@ const parseBacklog = (raw: string): BacklogMessage[] => {
   } catch { return []; }
 };
 
+/** Parse the stored draft JSON, tolerating NULL (no draft), malformed JSON,
+ *  and legacy/bad shapes — all collapse to `null` rather than throwing.
+ *  References are sanitized through the same `sanitizeRefs` path as backlog
+ *  items. An apparently-well-formed but effectively-empty draft (blank text,
+ *  no references) also normalizes to `null` so a stray write can't leave a
+ *  zombie draft that silently reappears in the composer. Non-empty text is
+ *  otherwise preserved verbatim — no trimming of the stored value. */
+const parseDraft = (raw: unknown): TaskDraft | null => {
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const text = (parsed as { text?: unknown }).text;
+    const draft: TaskDraft = {
+      text: typeof text === "string" ? text : "",
+      references: sanitizeRefs((parsed as { references?: unknown }).references),
+    };
+    if (!draft.text.trim() && draft.references.length === 0) return null;
+    return draft;
+  } catch { return null; }
+};
+
 const toTask = (r: TaskRow): Task => ({
   id: r.id,
   title: r.title,
@@ -143,6 +166,7 @@ const toTask = (r: TaskRow): Task => ({
   effort: r.effort,
   references: parseRefs(r.refs),
   backlog: parseBacklog(r.backlog),
+  draft: parseDraft(r.draft),
   runId: r.run_id,
   // `has_openable_run` comes back as SQLite's 0/1; missing means we didn't
   // join (e.g. insert/update returning the freshly-written shape, where
@@ -185,15 +209,16 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, worktree_path, base_ref, mode, model, effort, refs, backlog,
+          branch, worktree_path, base_ref, mode, model, effort, refs, backlog, draft,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
         t.branch, t.worktreePath, t.baseRef, t.mode, t.model, t.effort,
         JSON.stringify(t.references ?? []),
         JSON.stringify(t.backlog ?? []),
+        t.draft ? JSON.stringify(t.draft) : null,
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
       ],
     );
@@ -209,7 +234,7 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?, backlog=?,
+         branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?, backlog=?, draft=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
@@ -218,6 +243,7 @@ export const tasks = {
         next.branch, next.worktreePath, next.baseRef, next.mode, next.model, next.effort,
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
+        next.draft ? JSON.stringify(next.draft) : null,
         next.runId, next.updatedAt, next.archivedAt ?? null, id,
       ],
     );
@@ -304,6 +330,16 @@ export const backlog = {
     }
     for (const m of task.backlog) if (!seen.has(m.id)) next.push(m);
     return tasks.update(taskId, { backlog: next });
+  },
+};
+
+/**
+ * The task's single composer draft — a pure wrapper over `tasks.update`, no
+ * process side effect. `null` clears it (stored as SQL NULL by `update`).
+ */
+export const drafts = {
+  set(taskId: string, draft: TaskDraft | null): Task | null {
+    return tasks.update(taskId, { draft });
   },
 };
 

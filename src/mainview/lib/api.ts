@@ -1114,6 +1114,16 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ order }),
     }),
+
+  // Composer draft — the single unsent text+refs autosaved from the task
+  // details modal. Every mutation returns the full updated Task.
+  setTaskDraft: (taskId: string, draft: { text: string; references: TaskReference[] }) =>
+    j<Task>(`/tasks/${taskId}/draft`, {
+      method: "PUT",
+      body: JSON.stringify(draft),
+    }),
+  clearTaskDraft: (taskId: string) =>
+    j<Task>(`/tasks/${taskId}/draft`, { method: "DELETE" }),
   /**
    * Open a file or directory with the OS default app. `path` may be absolute
    * or, when `taskId` is supplied, relative to the task's cwd
