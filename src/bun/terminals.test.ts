@@ -35,6 +35,7 @@ function makeTask(workdir: string, extra: Partial<Task> = {}): Task {
     isolation: "none", // no git repo needed; cwd resolves to workdir
     taskType: "task",
     branch: null,
+    branchSource: "created",
     worktreePath: null,
     baseRef: null,
     mode: null,

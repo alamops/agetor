@@ -2307,8 +2307,11 @@ function normalizeMergeability(repo: GitHubRepo, number: number, raw: unknown): 
   const obj = raw as Record<string, unknown>;
   const head = obj.head && typeof obj.head === "object" ? obj.head as Record<string, unknown> : {};
   const base = obj.base && typeof obj.base === "object" ? obj.base as Record<string, unknown> : {};
+  const headRepoObj = head.repo && typeof head.repo === "object" ? head.repo as Record<string, unknown> : null;
+  const headRepo = headRepoObj && typeof headRepoObj.full_name === "string" ? headRepoObj.full_name : null;
+  const baseSlug = repoSlug(repo);
   return {
-    repo: repoSlug(repo),
+    repo: baseSlug,
     pullNumber: number,
     mergeable: typeof obj.mergeable === "boolean" ? obj.mergeable : null,
     mergeableState: pickString(obj, "mergeable_state") || "unknown",
@@ -2320,6 +2323,11 @@ function normalizeMergeability(repo: GitHubRepo, number: number, raw: unknown): 
     headSha: pickString(head, "sha"),
     // `auto_merge` is null when disabled, else an object ({enabled_by, merge_method, ...}).
     autoMerge: !!(obj.auto_merge && typeof obj.auto_merge === "object"),
+    headRepo,
+    // Missing head.repo (e.g. the fork was deleted) can't be confirmed same-repo,
+    // so treat it as cross-repo — the "Resolve with Agetor" flow requires proof
+    // the head branch lives in this repo, not the absence of proof otherwise.
+    crossRepo: headRepo === null || headRepo !== baseSlug,
   };
 }
 

@@ -44,6 +44,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     isolation: "worktree",
     taskType: "task",
     branch: null,
+    branchSource: "created",
     worktreePath: null,
     baseRef: null,
     mode: null,

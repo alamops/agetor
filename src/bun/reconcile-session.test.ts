@@ -24,6 +24,7 @@ function baseTask(overrides: Partial<Task> = {}): Task {
     isolation: "none",
     taskType: "task",
     branch: null,
+    branchSource: "created",
     worktreePath: null,
     baseRef: null,
     mode: "auto",

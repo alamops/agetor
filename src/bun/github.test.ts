@@ -235,11 +235,31 @@ test("normalizeMergeability reads mergeable/state and refs, defaulting the unkno
     baseRef: "main",
     headSha: "abc123",
     autoMerge: false,
+    headRepo: null,
+    crossRepo: true,
   });
 
   // mergeable still computing → null; missing mergeable_state → "unknown"; missing head/base → empty strings
   const partial = normalizeMergeability(REPO, 8, { mergeable: null, merged: false });
-  expect(partial).toMatchObject({ mergeable: null, mergeableState: "unknown", rebaseable: null, headRef: "", baseRef: "", headSha: "", autoMerge: false });
+  expect(partial).toMatchObject({ mergeable: null, mergeableState: "unknown", rebaseable: null, headRef: "", baseRef: "", headSha: "", autoMerge: false, headRepo: null, crossRepo: true });
+
+  // head.repo.full_name matching the base repo → same-repo PR, not cross-repo
+  const sameRepo = normalizeMergeability(REPO, 11, {
+    mergeable: true,
+    merged: false,
+    head: { ref: "feature", sha: "abc123", repo: { full_name: "o/r" } },
+    base: { ref: "main", sha: "def456" },
+  });
+  expect(sameRepo).toMatchObject({ headRepo: "o/r", crossRepo: false });
+
+  // head.repo.full_name differing from the base repo → fork PR, cross-repo
+  const forkRepo = normalizeMergeability(REPO, 12, {
+    mergeable: true,
+    merged: false,
+    head: { ref: "feature", sha: "abc123", repo: { full_name: "someone-else/r" } },
+    base: { ref: "main", sha: "def456" },
+  });
+  expect(forkRepo).toMatchObject({ headRepo: "someone-else/r", crossRepo: true });
 
   // auto_merge is a non-null object once enabled
   const autoMergeOn = normalizeMergeability(REPO, 10, { mergeable: true, merged: false, auto_merge: { enabled_by: { login: "bob" }, merge_method: "squash" } });
