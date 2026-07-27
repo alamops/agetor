@@ -206,6 +206,16 @@ describe("commitPushPrompt", () => {
     expect(p).toContain("PR description:");
     expect(p.indexOf("PR title:")).toBeGreaterThan(p.indexOf("push the current branch"));
   });
+  test("asks for the PR-open link as plain text above the title/description blocks", () => {
+    const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task" });
+    expect(p).toContain("full link to open a pull request");
+    expect(p).toContain("not inside a code block");
+    // The link ask sits between the push instruction and the fenced blocks.
+    expect(p.indexOf("full link to open a pull request")).toBeGreaterThan(
+      p.indexOf("push the current branch"),
+    );
+    expect(p.indexOf("full link to open a pull request")).toBeLessThan(p.indexOf("PR title:"));
+  });
   test("asks for two separate fenced blocks so agetor's copy button captures each field", () => {
     const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task" });
     // Fenced blocks are what agetor's CodeBlock renders a copy button on.

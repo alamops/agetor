@@ -29,6 +29,7 @@ async function makeTaskWithCwd(id: string): Promise<string> {
     isolation: "none",
     taskType: "task",
     branch: null,
+    branchSource: "created",
     worktreePath: null,
     baseRef: null,
     mode: null,

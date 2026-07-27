@@ -546,6 +546,14 @@ export interface Task {
   taskType: TaskType;
   /** Branch name created for this task. Set after the worktree is first materialized. */
   branch: string | null;
+  /**
+   * "created" when agetor minted a fresh branch off `baseRef` (the default
+   * for every task). "existing" when the task was pinned to a pre-existing
+   * branch (e.g. a PR's head branch via `existingBranch` at create time) —
+   * teardown paths must never `git branch -D` that branch. Migration 028
+   * backfills legacy rows to "created".
+   */
+  branchSource: "created" | "existing";
   /** Absolute path to the per-task worktree. Set after the worktree is first materialized. */
   worktreePath: string | null;
   /**
@@ -795,9 +803,10 @@ export interface AgentOptions {
  * CLI happens to default to.
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
-  // Default to Opus 4.8 — Fable 5 sits above it in the picker but costs 2x the
+  // Default to Opus 5 — the most-capable Opus, priced identically to Opus 4.8
+  // ($5/$25 per MTok). Fable 5 sits above it in the picker but costs 2x the
   // usage, so the default stays on the most-capable non-premium tier.
-  "claude-code": "opus-4.8",
+  "claude-code": "opus-5",
   "codex": "gpt-5.5",
 };
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
@@ -847,7 +856,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "max", label: "Max", hint: "Absolute maximum effort. Slowest, most thorough." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Opus 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
@@ -872,7 +881,7 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  */
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
-  // effort parameter is API-supported on Fable 5 / Opus 4.8 / 4.7 / 4.6 /
+  // effort parameter is API-supported on Fable 5 / Opus 5 / 4.8 / 4.7 / 4.6 /
   // Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is Fable-5-, Opus-, and Sonnet-5-only;
   // Sonnet 4.6 has no xhigh; Haiku 4.5 doesn't support effort at all). The
   // `/effort` CLI command accepts more
@@ -881,6 +890,8 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   "claude-code": {
     // Fable 5 shares Opus 4.7/4.8's request surface (effort low→max, xhigh).
     "fable-5": ["max", "xhigh", "high", "medium", "low"],
+    // Opus 5 supports the full effort ladder incl. xhigh (per claude-api skill).
+    "opus-5": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.8": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.7": ["max", "xhigh", "high", "medium", "low"],
     "opus-4.6": ["max", "xhigh", "high", "medium", "low"],
@@ -928,6 +939,7 @@ export function supportedEfforts(agent: AgentKind, model: string | null): AgentO
 const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   "claude-code": {
     "fable-5": [],
+    "opus-5": [],
     "opus-4.8": [],
     "opus-4.7": [],
     "opus-4.6": [],
@@ -952,7 +964,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   "claude-code": {
     models: [
       { id: "fable-5", label: "Fable 5", hint: "Most powerful tier — above Opus. Uses 2x the usage of Opus." },
-      { id: "opus-4.8", label: "Opus 4.8", hint: "Most capable Opus; slower." },
+      { id: "opus-5", label: "Opus 5", hint: "Most capable Opus; same usage cost as 4.8." },
+      { id: "opus-4.8", label: "Opus 4.8", hint: "Prior Opus flagship." },
       { id: "opus-4.7", label: "Opus 4.7", hint: "Prior flagship; same effort range as 4.8." },
       { id: "opus-4.6", label: "Opus 4.6", hint: "Earlier Opus generation." },
       { id: "sonnet-5", label: "Sonnet 5", hint: "Near-Opus quality on coding/agentic work at Sonnet cost." },
@@ -1556,6 +1569,13 @@ export interface GitHubPullMergeability {
   baseRef: string;
   headSha: string;
   autoMerge: boolean;
+  /** Full `owner/name` of the repo the head branch lives in, or null when the
+   *  REST payload omitted `head.repo` (e.g. the fork was deleted). */
+  headRepo: string | null;
+  /** True when the head branch lives on a different repo than the base (a
+   *  fork PR), or when `headRepo` couldn't be determined at all — the
+   *  "Resolve with Agetor" flow only supports same-repo PRs. */
+  crossRepo: boolean;
 }
 
 export type GitHubPullReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
@@ -1861,7 +1881,11 @@ export interface ToolResultEventData {
  * prefix. The branch is shell-quoted because git ref names may legally contain
  * shell metacharacters; `'\''` is the POSIX escape for an embedded quote.
  *
- * After the commit/push, the prompt also asks the agent to propose a pull
+ * After the commit/push, the prompt first asks for the full link to open a
+ * pull request for the branch — as plain text above the code blocks, not
+ * fenced, so react-markdown's GFM autolinking renders it clickable (git prints
+ * the link in the push output for GitHub/GitLab/Bitbucket; otherwise it can be
+ * built from the remote URL). It then asks the agent to propose a pull
  * request title and description, each emitted in its own fenced code block so
  * agetor renders a one-click copy button per field — the user copies the title
  * into the New PR composer's Title field and the description into its
@@ -1883,7 +1907,10 @@ export function commitPushPrompt(task: Pick<Task, "branch" | "taskType">): strin
     `(prefix the subject with "${ccType}:", e.g. "${ccType}: ...") summarizing the work, ` +
     `then push the current branch to origin. ` +
     `If the branch has no upstream yet, set it with \`git push -u origin ${branchLabel}\`. ` +
-    `After pushing, propose the pull request as two fenced code blocks so each can be ` +
+    `After pushing, first print the full link to open a pull request for the branch ` +
+    `(git prints one in the push output; otherwise build it from the remote URL) as ` +
+    `plain text on its own line — not inside a code block. ` +
+    `Below the link, propose the pull request as two fenced code blocks so each can be ` +
     `copied with one click: first a "PR title:" line followed by a \`\`\` block containing ` +
     `only the concise one-line title, then a "PR description:" line followed by a ` +
     `\`\`\`\` four-backtick block containing the description in markdown (what changed and ` +

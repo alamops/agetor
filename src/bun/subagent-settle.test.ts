@@ -79,7 +79,7 @@ async function seedTask(opts: {
   const now = Date.now();
   tasks.insert({
     id: taskId, title: "t", prompt: "p", column: opts.column, agent: "claude-code",
-    workdir: "/tmp", isolation: "none", taskType: "task", branch: null, worktreePath: null,
+    workdir: "/tmp", isolation: "none", taskType: "task", branch: null, branchSource: "created", worktreePath: null,
     baseRef: null, mode: null, model: null, effort: null, references: [], backlog: [], draft: null, runId,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     archivedAt: null, createdAt: now, updatedAt: now,
@@ -324,7 +324,7 @@ test("runs.origin round-trips through insert/get/listForTask", async () => {
   const now = Date.now();
   tasks.insert({
     id: taskId, title: "t", prompt: "p", column: "running", agent: "claude-code",
-    workdir: "/tmp", isolation: "none", taskType: "task", branch: null, worktreePath: null,
+    workdir: "/tmp", isolation: "none", taskType: "task", branch: null, branchSource: "created", worktreePath: null,
     baseRef: null, mode: null, model: null, effort: null, references: [], backlog: [], draft: null, runId: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     archivedAt: null, createdAt: now, updatedAt: now,

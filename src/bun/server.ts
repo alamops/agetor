@@ -2954,6 +2954,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         POST: authed(async (req) => {
           const body = (await req.json()) as Partial<Task> & {
             baseRef?: string;
+            existingBranch?: string;
             references?: TaskReference[];
           };
           if (!body.title || !body.prompt) {

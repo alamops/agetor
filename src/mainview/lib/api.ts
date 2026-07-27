@@ -1018,6 +1018,9 @@ export const api = {
     /** Explicit branch name for worktree isolation. Overrides the project's
      *  nomenclature; the server validates it and makes it unique. */
     branch?: string;
+    /** Check the worktree out on this pre-existing branch (e.g. a PR's head
+     *  branch) instead of minting a fresh one. Requires worktree isolation. */
+    existingBranch?: string;
     mode?: string | null;
     model?: string | null;
     effort?: string | null;

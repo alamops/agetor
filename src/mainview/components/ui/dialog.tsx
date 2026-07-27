@@ -28,6 +28,15 @@ const FOCUSABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(",");
 
+// Dialogs can nest (Settings → GitHub setup guide, confirm.tsx overlays over
+// another Dialog): each open Dialog registers its own document-level keydown
+// listener, and listeners fire in registration order — so the OUTER dialog's
+// handler runs first on a shared Escape/Tab keypress. Track panels in
+// open-order here so onKey can bail out unless it belongs to the topmost
+// (last-registered) panel; that keeps Escape/Tab scoped to the dialog
+// actually on top instead of always resolving to the outermost one.
+const openDialogStack: HTMLElement[] = [];
+
 /**
  * Overlay dialog with proper modal manners:
  *
@@ -67,7 +76,19 @@ export function Dialog({
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
 
+    // Register this panel as the topmost open dialog. Guard for null: the
+    // ref is only populated once the panel has rendered, and this effect
+    // runs post-render (post-commit) so it's safe here.
+    const panel = panelRef.current;
+    if (panel) openDialogStack.push(panel);
+
     const onKey = (e: KeyboardEvent) => {
+      // Only the topmost dialog reacts — with dialogs nested (Settings →
+      // setup guide, confirm.tsx overlays), document listeners fire in
+      // registration order, so the OUTER dialog's handler would otherwise
+      // run first and close the wrong layer.
+      if (panelRef.current !== openDialogStack[openDialogStack.length - 1]) return;
+
       if (e.key === "Escape") {
         e.preventDefault();
         onCloseRef.current();
@@ -98,6 +119,13 @@ export function Dialog({
     return () => {
       document.removeEventListener("keydown", onKey);
       document.body.style.overflow = prevOverflow;
+      // Splice by identity — unmount order isn't guaranteed to match open
+      // order (e.g. an inner dialog can close first), so don't assume this
+      // panel is last in the stack.
+      if (panel) {
+        const idx = openDialogStack.indexOf(panel);
+        if (idx !== -1) openDialogStack.splice(idx, 1);
+      }
       // Return focus to whatever opened us. Guard against the trigger having
       // been removed from the DOM in the meantime.
       if (trigger && document.contains(trigger)) trigger.focus();

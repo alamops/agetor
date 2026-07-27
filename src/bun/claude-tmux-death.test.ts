@@ -288,6 +288,7 @@ function baseTask(id: string): Task {
     isolation: "none",
     taskType: "task",
     branch: null,
+    branchSource: "created",
     worktreePath: null,
     baseRef: null,
     mode: "auto",

@@ -90,6 +90,7 @@ export interface AgentRunOptions {
 // so it doesn't need a translation table.
 const CLAUDE_MODEL_FLAG: Record<string, string> = {
   "fable-5": "claude-fable-5",
+  "opus-5": "claude-opus-5",
   "opus-4.8": "claude-opus-4-8",
   "opus-4.7": "claude-opus-4-7",
   "opus-4.6": "claude-opus-4-6",

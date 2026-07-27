@@ -82,6 +82,7 @@ import {
   resolveRef,
   branchName,
   ensureUniqueBranch,
+  fetchBranch,
   WORKTREES_DIR,
   parseWorktreeGitPointer,
   pruneWorktrees,
@@ -1762,6 +1763,14 @@ export interface CreateTaskInput extends Partial<Task> {
   prompt: string;
   /** Optional ref name (branch / tag / sha). Defaults to "HEAD". Resolved to a sha at create time. */
   baseRef?: string;
+  /**
+   * Check the worktree out on this pre-existing branch (e.g. a PR's head
+   * branch) instead of minting a fresh one. Requires worktree isolation and
+   * a git `workdir`; sets `task.branchSource = "existing"` and pins `baseRef`
+   * to the branch's current sha rather than resolving `baseRef`/`branch`
+   * from a template.
+   */
+  existingBranch?: string;
 }
 
 /**
@@ -1783,10 +1792,43 @@ export async function createTask(
   const workdir = explicitWorkdir ?? process.cwd();
   const isolation = input.isolation ?? "worktree";
   const requestedRef = input.baseRef?.trim() || "HEAD";
+  const existingBranch = input.existingBranch?.trim() || null;
 
   let baseRef: string | null = null;
+  let plannedBranch: string | null = null;
+  let branchSource: Task["branchSource"] = "created";
   const workdirRoot = isolation === "worktree" ? await repoRoot(workdir) : null;
-  if (workdirRoot) {
+
+  if (existingBranch) {
+    if (isolation !== "worktree" || !workdirRoot) {
+      return {
+        error: `existingBranch requires worktree isolation and a git repo — "${workdir}" isn't one, or isolation is "${isolation}"`,
+      };
+    }
+    if (existingBranch.startsWith("-")) {
+      return { error: `invalid branch name: ${existingBranch}` };
+    }
+    const validated = validateBranchName(existingBranch);
+    if (!validated.ok) {
+      return { error: `invalid branch name "${existingBranch}": ${validated.reason}` };
+    }
+    const collision = tasks.list().some(
+      (t) => !t.archivedAt && t.workdir === workdir && t.branch === existingBranch,
+    );
+    if (collision) {
+      return { error: `another task already has "${existingBranch}" checked out in ${workdir}` };
+    }
+    await fetchBranch(workdir, existingBranch);
+    const sha =
+      (await resolveRef(workdir, `refs/remotes/origin/${existingBranch}`)) ??
+      (await resolveRef(workdir, `refs/heads/${existingBranch}`));
+    if (!sha) {
+      return { error: `branch not found: "${existingBranch}" (checked origin and local refs)` };
+    }
+    baseRef = sha;
+    plannedBranch = existingBranch;
+    branchSource = "existing";
+  } else if (workdirRoot) {
     const sha = await resolveRef(workdir, requestedRef);
     if (!sha) {
       if (requestedRef !== "HEAD") {
@@ -1839,9 +1881,9 @@ export async function createTask(
   // `<date>`, `<timestamp>`, `<token>`) are resolved server-side (the server is
   // authoritative for direct API callers and for `<timestamp>` at true creation
   // time) BEFORE validation, and the resolved name is made unique within the
-  // repo so two same-title/type tasks don't collide on one branch.
-  let plannedBranch: string | null = null;
-  if (workdirRoot) {
+  // repo so two same-title/type tasks don't collide on one branch. Skipped
+  // entirely when `existingBranch` already pinned `plannedBranch` above.
+  if (!existingBranch && workdirRoot) {
     const override = typeof input.branch === "string" ? input.branch.trim() : "";
     const token = id.replace(/-/g, "").slice(0, 6);
     const ctx = { title: input.title, projectName: basename(workdir), taskType, token, now: new Date() };
@@ -1879,6 +1921,7 @@ export async function createTask(
     isolation,
     taskType,
     branch: plannedBranch,
+    branchSource,
     worktreePath: null,
     baseRef,
     mode: input.mode ?? null,
