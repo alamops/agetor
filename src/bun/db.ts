@@ -67,6 +67,7 @@ type TaskRow = {
   workdir: string; isolation: string;
   task_type: string;
   branch: string | null; worktree_path: string | null; base_ref: string | null;
+  branch_source: string;
   mode: string | null; model: string | null; effort: string | null;
   refs: string;
   backlog: string;
@@ -136,6 +137,7 @@ const toTask = (r: TaskRow): Task => ({
   isolation: r.isolation as Task["isolation"],
   taskType: r.task_type as TaskType,
   branch: r.branch,
+  branchSource: r.branch_source as Task["branchSource"],
   worktreePath: r.worktree_path,
   baseRef: r.base_ref,
   mode: r.mode,
@@ -185,13 +187,13 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, worktree_path, base_ref, mode, model, effort, refs, backlog,
+          branch, branch_source, worktree_path, base_ref, mode, model, effort, refs, backlog,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
-        t.branch, t.worktreePath, t.baseRef, t.mode, t.model, t.effort,
+        t.branch, t.branchSource, t.worktreePath, t.baseRef, t.mode, t.model, t.effort,
         JSON.stringify(t.references ?? []),
         JSON.stringify(t.backlog ?? []),
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
@@ -209,13 +211,13 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?, backlog=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?, backlog=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
         next.taskType,
-        next.branch, next.worktreePath, next.baseRef, next.mode, next.model, next.effort,
+        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.mode, next.model, next.effort,
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
         next.runId, next.updatedAt, next.archivedAt ?? null, id,

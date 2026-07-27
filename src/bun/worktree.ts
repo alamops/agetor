@@ -395,6 +395,23 @@ export async function gitFetch(dir: string): Promise<{ ok: boolean; error?: stri
 }
 
 /**
+ * Fetch a single branch from `origin` into `dir`'s repo — a targeted refresh
+ * used before resolving or checking out a pre-existing branch (e.g. a PR's
+ * head branch), so `origin/<branch>` reflects the remote even if it was
+ * pushed after the last full fetch. Unlike `gitFetch` (`--all --prune`), this
+ * touches only the one ref. Callers treat this as best-effort — the ref may
+ * already exist locally, so a failure here isn't necessarily fatal.
+ */
+export async function fetchBranch(dir: string, branch: string): Promise<{ ok: boolean; error?: string }> {
+  if (branch.startsWith("-")) return { ok: false, error: `invalid branch name: ${branch}` };
+  const root = await repoRoot(dir);
+  if (!root) return { ok: false, error: "not a git repository" };
+  const res = await git(["fetch", "origin", branch], root, 120_000);
+  if (!res.ok) return { ok: false, error: res.stderr || `git fetch failed (exit ${res.exitCode})` };
+  return { ok: true };
+}
+
+/**
  * Fast-forward a single local `branch` in the repo containing `dir` to its
  * upstream. Always fast-forward-only, so a pull never creates a merge commit or
  * leaves conflicts in the user's repo — a diverged branch fails with a clear
@@ -669,6 +686,14 @@ export async function prepareWorkdir(
   // The sha makes the start state sticky across re-runs even when HEAD moves.
   const base = task.baseRef ?? "HEAD";
 
+  // For a task pinned to a pre-existing branch (e.g. a PR's head branch),
+  // refresh it from origin before deciding how to materialize the worktree —
+  // best-effort, since the branch may already be present locally with no
+  // remote at all.
+  if (task.branchSource === "existing") {
+    await fetchBranch(root, branch);
+  }
+
   // If the branch already exists (e.g. the worktree dir was manually deleted
   // but the branch survived), re-attach rather than reset — using `-B` would
   // forcibly rewind the branch back to `base`, discarding any commits the
@@ -680,7 +705,9 @@ export async function prepareWorkdir(
   await git(["worktree", "prune"], root, 10_000);
   let created = branchExists
     ? await git(["worktree", "add", wt, branch], root)
-    : await git(["worktree", "add", "-b", branch, wt, base], root);
+    : task.branchSource === "existing"
+      ? await git(["worktree", "add", "--track", "-b", branch, wt, `origin/${branch}`], root)
+      : await git(["worktree", "add", "-b", branch, wt, base], root);
 
   // Collision recovery — ONLY on a first materialization (`!task.worktreePath`).
   //
@@ -707,9 +734,15 @@ export async function prepareWorkdir(
   // has pinned but not yet started (no ref exists for those, so a ref-only search
   // would miss them). See `isBranchNameTakenError` for the exact git wordings,
   // and what it deliberately does not match (e.g. a stale worktree directory).
+  //
+  // Excluded for `branchSource === "existing"`: that branch name is the PR's
+  // real head branch, not one agetor minted — re-pinning it to a fresh variant
+  // would silently disconnect the task from the branch the user asked for. A
+  // collision there (branch checked out elsewhere) surfaces as a hard error.
   if (
     !created.ok &&
     !task.worktreePath &&
+    task.branchSource !== "existing" &&
     isBranchNameTakenError(`${created.stderr}\n${created.stdout}`)
   ) {
     const unique = await ensureUniqueBranch(root, branch, opts?.takenBranches ?? new Set());
@@ -723,8 +756,17 @@ export async function prepareWorkdir(
   }
 
   if (!created.ok) {
+    const detail = created.stderr || created.stdout;
+    if (task.branchSource === "existing") {
+      const used = /already used by worktree at '?([^'\n]+)'?/.exec(detail);
+      if (used) {
+        return {
+          error: `'${branch}' is currently checked out in ${used[1]} — switch that working tree to another branch, then start the task again`,
+        };
+      }
+    }
     return {
-      error: `worktree creation failed: ${created.stderr || created.stdout}`,
+      error: `worktree creation failed: ${detail}`,
     };
   }
 
@@ -840,7 +882,11 @@ export async function removeWorktree(task: Task): Promise<void> {
   const root = await repoRoot(task.workdir);
   if (root) {
     await git(["worktree", "remove", "--force", task.worktreePath], root);
-    if (task.branch) await git(["branch", "-D", task.branch], root);
+    // A `branchSource: "existing"` branch is the user's own (e.g. a PR's head
+    // branch) — deleting it here would destroy a branch agetor doesn't own.
+    if (task.branch && task.branchSource !== "existing") {
+      await git(["branch", "-D", task.branch], root);
+    }
     // Clean up any stale .git/worktrees/<id>/ registrations left by previous
     // partial removes (e.g. workdir was changed after the worktree was created).
     await git(["worktree", "prune"], root, 10_000);

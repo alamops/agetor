@@ -546,6 +546,14 @@ export interface Task {
   taskType: TaskType;
   /** Branch name created for this task. Set after the worktree is first materialized. */
   branch: string | null;
+  /**
+   * "created" when agetor minted a fresh branch off `baseRef` (the default
+   * for every task). "existing" when the task was pinned to a pre-existing
+   * branch (e.g. a PR's head branch via `existingBranch` at create time) —
+   * teardown paths must never `git branch -D` that branch. Migration 028
+   * backfills legacy rows to "created".
+   */
+  branchSource: "created" | "existing";
   /** Absolute path to the per-task worktree. Set after the worktree is first materialized. */
   worktreePath: string | null;
   /**
@@ -1537,6 +1545,13 @@ export interface GitHubPullMergeability {
   baseRef: string;
   headSha: string;
   autoMerge: boolean;
+  /** Full `owner/name` of the repo the head branch lives in, or null when the
+   *  REST payload omitted `head.repo` (e.g. the fork was deleted). */
+  headRepo: string | null;
+  /** True when the head branch lives on a different repo than the base (a
+   *  fork PR), or when `headRepo` couldn't be determined at all — the
+   *  "Resolve with Agetor" flow only supports same-repo PRs. */
+  crossRepo: boolean;
 }
 
 export type GitHubPullReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
