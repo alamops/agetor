@@ -34,6 +34,44 @@ async function makeRepo(): Promise<string> {
   return repo;
 }
 
+// Run git and capture stdout — used where we need the actual output (branch
+// name, upstream), unlike the fire-and-forget `git()` helper above.
+async function runCapture(args: string[], cwd: string): Promise<string> {
+  const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const out = (await new Response(proc.stdout).text()).trim();
+  await proc.exited;
+  return out;
+}
+
+// A repo with a real (bare) "origin" remote — the fixture existing-branch
+// tests need, since `branchSource: "existing"` fetches from `origin` before
+// checking a branch out.
+async function makeRepoWithOrigin(): Promise<{ repo: string; bare: string }> {
+  const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-bare-"));
+  await git(["init", "--bare", "-b", "main"], bare);
+  const repo = await makeRepo();
+  await git(["remote", "add", "origin", bare], repo);
+  await git(["push", "-u", "origin", "main"], repo);
+  return { repo, bare };
+}
+
+// Creates `pr-head` on `repo`, pushes it to origin, then deletes the local
+// branch ref (and, when `pruneRemoteTracking`, the remote-tracking ref too) so
+// the branch lives ONLY on origin — simulating a PR head branch nobody has
+// checked out locally yet.
+async function pushPrHeadOnly(repo: string, opts?: { pruneRemoteTracking?: boolean }): Promise<void> {
+  await git(["checkout", "-b", "pr-head"], repo);
+  writeFileSync(path.join(repo, "prhead.txt"), "pr work\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "pr head commit"], repo);
+  await git(["push", "origin", "pr-head"], repo);
+  await git(["checkout", "main"], repo);
+  await git(["branch", "-D", "pr-head"], repo);
+  if (opts?.pruneRemoteTracking) {
+    await git(["update-ref", "-d", "refs/remotes/origin/pr-head"], repo);
+  }
+}
+
 function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
   return {
     id: randomUUID(),
@@ -198,6 +236,45 @@ test("prepareWorkdir errors (does NOT re-pin) when a materialized task's branch 
   const rerun = { ...task, branch: r1.branch, worktreePath: r1.worktreePath };
   const r2 = await prepareWorkdir(rerun);
   expect("error" in r2).toBe(true);
+});
+
+test("prepareWorkdir on branchSource=existing checks out a branch that lives only on origin, tracking it", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { repo } = await makeRepoWithOrigin();
+  // Neither the local branch ref NOR the remote-tracking ref exist yet — the
+  // materialization must discover the branch via its own targeted fetch.
+  await pushPrHeadOnly(repo, { pruneRemoteTracking: true });
+
+  const task = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+  const r = await prepareWorkdir(task);
+  if ("error" in r) throw new Error(r.error);
+  expect(r.branch).toBe("pr-head");
+  expect(existsSync(r.cwd)).toBe(true);
+  expect(existsSync(path.join(r.cwd, "prhead.txt"))).toBe(true);
+
+  const headBranch = await runCapture(["symbolic-ref", "--short", "HEAD"], r.cwd);
+  expect(headBranch).toBe("pr-head");
+  const upstream = await runCapture(["rev-parse", "--abbrev-ref", "pr-head@{upstream}"], r.cwd);
+  expect(upstream).toBe("origin/pr-head");
+});
+
+test("prepareWorkdir on branchSource=existing uses the local branch when it already exists (no error)", async () => {
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { repo } = await makeRepoWithOrigin();
+  // Local branch is left in place this time (only the checked-out state moves
+  // back to main), so prepareWorkdir hits the branchExists/re-attach arm.
+  await pushPrHeadOnly(repo);
+  await git(["branch", "pr-head", "origin/pr-head"], repo);
+
+  const task = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+  const r = await prepareWorkdir(task);
+  if ("error" in r) throw new Error(r.error);
+  expect(r.branch).toBe("pr-head");
+  expect(existsSync(r.cwd)).toBe(true);
+  expect(existsSync(path.join(r.cwd, "prhead.txt"))).toBe(true);
+
+  const headBranch = await runCapture(["symbolic-ref", "--short", "HEAD"], r.cwd);
+  expect(headBranch).toBe("pr-head");
 });
 
 test("gitWritableRootsSync returns the source repo's .git for a linked worktree", async () => {
@@ -492,6 +569,26 @@ test("removeWorktree tears down both the worktree and the branch", async () => {
   const out = (await new Response(proc.stdout).text()).trim();
   await proc.exited;
   expect(out).toBe("");
+});
+
+test("removeWorktree removes the worktree but keeps the branch when branchSource is existing", async () => {
+  const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
+  const { repo } = await makeRepoWithOrigin();
+  await pushPrHeadOnly(repo);
+  await git(["branch", "pr-head", "origin/pr-head"], repo);
+
+  const task = fakeTask({ workdir: repo, branch: "pr-head", branchSource: "existing" });
+  const created = await prepareWorkdir(task);
+  if ("error" in created) throw new Error(created.error);
+  expect(existsSync(created.cwd)).toBe(true);
+
+  await removeWorktree({ ...task, worktreePath: created.worktreePath, branch: created.branch });
+  expect(existsSync(created.cwd)).toBe(false);
+
+  // Unlike a "created" branch, an "existing" one (e.g. a PR's head branch) is
+  // the user's own — removeWorktree must not delete it.
+  const out = await runCapture(["branch", "--list", "pr-head"], repo);
+  expect(out).toContain("pr-head");
 });
 
 test("hasUncommittedChanges returns null when the dir doesn't exist", async () => {

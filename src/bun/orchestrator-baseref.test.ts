@@ -23,6 +23,29 @@ async function makeRepo(): Promise<string> {
   return repo;
 }
 
+// A repo with a real (bare) "origin" remote — needed for existingBranch tests,
+// since createTask fetches/resolves `origin/<branch>` before pinning.
+async function makeRepoWithOrigin(): Promise<{ repo: string; bare: string }> {
+  const bare = mkdtempSync(path.join(tmpdir(), "agetor-baseref-bare-"));
+  await git(["init", "--bare", "-b", "main"], bare);
+  const repo = await makeRepo();
+  await git(["remote", "add", "origin", bare], repo);
+  await git(["push", "-u", "origin", "main"], repo);
+  return { repo, bare };
+}
+
+// Creates `pr-head` on `repo`, pushes it to origin, then deletes the local
+// branch ref — simulating a PR head branch nobody has checked out locally.
+async function pushPrHeadOnly(repo: string): Promise<void> {
+  await git(["checkout", "-b", "pr-head"], repo);
+  writeFileSync(path.join(repo, "prhead.txt"), "pr work\n");
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "pr head commit"], repo);
+  await git(["push", "origin", "pr-head"], repo);
+  await git(["checkout", "main"], repo);
+  await git(["branch", "-D", "pr-head"], repo);
+}
+
 beforeAll(async () => {
   await import("./db.ts");
 });
@@ -105,4 +128,105 @@ test("createTask honors an explicit ref (branch name) by storing its sha", async
   expect(onMain.task.baseRef).toMatch(/^[0-9a-f]{40}$/);
   expect(onStable.task.baseRef).toMatch(/^[0-9a-f]{40}$/);
   expect(onMain.task.baseRef).not.toBe(onStable.task.baseRef);
+});
+
+test("createTask with existingBranch pins branch/branchSource/baseRef to the PR head's sha", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { resolveRef } = await import("./worktree.ts");
+  const { repo } = await makeRepoWithOrigin();
+  await pushPrHeadOnly(repo);
+
+  const created = await createTask({
+    title: "resolve conflicts",
+    prompt: "x",
+    workdir: repo,
+    agent: "claude-code",
+    isolation: "worktree",
+    existingBranch: "pr-head",
+  });
+  if ("error" in created) throw new Error(created.error);
+  expect(created.task.branch).toBe("pr-head");
+  expect(created.task.branchSource).toBe("existing");
+  const sha = await resolveRef(repo, "refs/remotes/origin/pr-head");
+  expect(sha).toMatch(/^[0-9a-f]{40}$/);
+  expect(created.task.baseRef).toBe(sha);
+});
+
+test("createTask with existingBranch errors (and inserts no task row) for a nonexistent branch", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+  const { repo } = await makeRepoWithOrigin();
+  const before = tasks.list().length;
+
+  const res = await createTask({
+    title: "no such branch",
+    prompt: "x",
+    workdir: repo,
+    agent: "claude-code",
+    isolation: "worktree",
+    existingBranch: "does-not-exist",
+  });
+  expect("error" in res).toBe(true);
+  if ("error" in res) expect(res.error).toContain("does-not-exist");
+  expect(tasks.list().length).toBe(before);
+});
+
+test("createTask with existingBranch errors when isolation is none", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { repo } = await makeRepoWithOrigin();
+  await pushPrHeadOnly(repo);
+
+  const res = await createTask({
+    title: "no isolation",
+    prompt: "x",
+    workdir: repo,
+    agent: "claude-code",
+    isolation: "none",
+    existingBranch: "pr-head",
+  });
+  expect("error" in res).toBe(true);
+  if ("error" in res) expect(res.error).toContain("existingBranch requires worktree isolation");
+});
+
+test("createTask with existingBranch errors when another task already has that branch checked out in the same workdir", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { repo } = await makeRepoWithOrigin();
+  await pushPrHeadOnly(repo);
+
+  const first = await createTask({
+    title: "first pr task",
+    prompt: "x",
+    workdir: repo,
+    agent: "claude-code",
+    isolation: "worktree",
+    existingBranch: "pr-head",
+  });
+  if ("error" in first) throw new Error(first.error);
+
+  const second = await createTask({
+    title: "second pr task",
+    prompt: "x",
+    workdir: repo,
+    agent: "claude-code",
+    isolation: "worktree",
+    existingBranch: "pr-head",
+  });
+  expect("error" in second).toBe(true);
+  if ("error" in second) expect(second.error).toContain("pr-head");
+});
+
+test("createTask with existingBranch rejects a leading-dash branch name", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const { repo } = await makeRepoWithOrigin();
+
+  const res = await createTask({
+    title: "evil branch",
+    prompt: "x",
+    workdir: repo,
+    agent: "claude-code",
+    isolation: "worktree",
+    existingBranch: "-evil",
+  });
+  expect("error" in res).toBe(true);
+  if ("error" in res) expect(res.error).toContain("invalid branch name");
 });
