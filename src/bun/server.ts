@@ -8,6 +8,7 @@ import { removeCoreCreds } from "./core-creds.ts";
 import {
   tasks,
   backlog,
+  drafts,
   runs,
   subagents,
   projects,
@@ -3707,6 +3708,47 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const blocked = backlogGuard(req);
           if (blocked) return blocked;
           const updated = backlog.remove(req.params.id, req.params.itemId);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Composer draft — the single unsent text+refs currently sitting in the
+      // task details modal, autosaved by the webview so closing the modal (or
+      // restarting agetor) doesn't lose it. Unlike the backlog routes above,
+      // draft writes are intentionally allowed on an archived task: the
+      // composer stays typable there (sending auto-unarchives), and freezing
+      // draft writes would reintroduce the very data loss this feature fixes.
+      // Only a missing task 404s.
+      "/tasks/:id/draft": {
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            text?: unknown;
+            references?: unknown;
+          };
+          const text = typeof body.text === "string" ? body.text : "";
+          // The draft rides the 2s /tasks poll, so an unbounded composer paste
+          // would bloat every poll response — cap it well above any realistic
+          // prompt length.
+          const DRAFT_TEXT_MAX_LENGTH = 256 * 1024;
+          if (text.length > DRAFT_TEXT_MAX_LENGTH) {
+            return json(
+              { error: `text exceeds ${DRAFT_TEXT_MAX_LENGTH} characters` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const references = Array.isArray(body.references)
+            ? (body.references as TaskReference[])
+            : [];
+          const draft = text.trim() || references.length > 0 ? { text, references } : null;
+          const updated = drafts.set(req.params.id, draft);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const updated = drafts.set(req.params.id, null);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });

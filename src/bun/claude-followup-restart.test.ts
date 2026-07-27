@@ -114,7 +114,7 @@ test.skipIf(!HAVE_TMUX)("follow-up to a task whose session outlived the process 
       model: "claude-opus-4-7",
       effort: "medium",
       references: [],
-      backlog: [],
+      backlog: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
       pendingInteractionCount: 0,

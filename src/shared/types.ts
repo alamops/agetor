@@ -597,6 +597,17 @@ export interface Task {
    * Sending a backlog item consumes it (removes it from this list).
    */
   backlog: BacklogMessage[];
+  /**
+   * The composer's unsent draft for this task — text plus any attached
+   * references, persisted so closing and reopening the task details modal
+   * (or restarting agetor) doesn't lose in-progress typing. Null when the
+   * composer is empty. Distinct from `backlog`: the draft is implicit,
+   * autosaved state ("what's sitting in the composer right now"), while
+   * backlog items are explicit user-stashed drafts. Cleared when the draft
+   * is sent, stashed via "Save for later" (which moves it into `backlog`),
+   * or emptied by the user.
+   */
+  draft: TaskDraft | null;
   runId: string | null;
   /**
    * True when this task has at least one run whose status is
@@ -751,6 +762,19 @@ export interface BacklogMessage {
   /** Unix ms timestamp when the draft was saved. */
   createdAt: number;
 }
+
+/**
+ * The composer's single unsent draft for a task — text plus any attached
+ * references, autosaved while the user types and restored on reopen. Unlike
+ * {@link BacklogMessage}, there is at most one per task and it carries no id
+ * or timestamp: it's ephemeral working state, not an explicit stashed item.
+ */
+export type TaskDraft = {
+  /** The draft message text, preserved verbatim (never trimmed). */
+  text: string;
+  /** File/folder references currently attached in the composer. */
+  references: TaskReference[];
+};
 
 export interface AgentOption {
   /** Stored on the task and passed to `buildCommand`. */

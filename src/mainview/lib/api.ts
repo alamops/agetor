@@ -1002,6 +1002,11 @@ export const api = {
     );
   },
   listTasks: () => j<Task[]>("/tasks"),
+  /** Single task by id, fresh from the server (bypasses the 2s board poll's
+   *  staleness). Used to re-check a task's persisted draft right after the
+   *  panel seeds from a possibly-stale polled object — see RunPanel's
+   *  pristine-adopt seeding. 404s (task deleted) surface as ApiError. */
+  getTask: (id: string) => j<Task>(`/tasks/${id}`),
   createTask: (input: {
     title: string;
     prompt: string;
@@ -1117,6 +1122,16 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ order }),
     }),
+
+  // Composer draft — the single unsent text+refs autosaved from the task
+  // details modal. Every mutation returns the full updated Task.
+  setTaskDraft: (taskId: string, draft: { text: string; references: TaskReference[] }) =>
+    j<Task>(`/tasks/${taskId}/draft`, {
+      method: "PUT",
+      body: JSON.stringify(draft),
+    }),
+  clearTaskDraft: (taskId: string) =>
+    j<Task>(`/tasks/${taskId}/draft`, { method: "DELETE" }),
   /**
    * Open a file or directory with the OS default app. `path` may be absolute
    * or, when `taskId` is supplied, relative to the task's cwd
