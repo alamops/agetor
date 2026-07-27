@@ -1002,6 +1002,11 @@ export const api = {
     );
   },
   listTasks: () => j<Task[]>("/tasks"),
+  /** Single task by id, fresh from the server (bypasses the 2s board poll's
+   *  staleness). Used to re-check a task's persisted draft right after the
+   *  panel seeds from a possibly-stale polled object — see RunPanel's
+   *  pristine-adopt seeding. 404s (task deleted) surface as ApiError. */
+  getTask: (id: string) => j<Task>(`/tasks/${id}`),
   createTask: (input: {
     title: string;
     prompt: string;

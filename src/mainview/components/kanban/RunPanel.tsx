@@ -799,12 +799,44 @@ function RunPanelBody({
   const taskIdRef = useRef(task.id);
   inputRef.current = input;
   sendRefsRef.current = sendRefs;
+  // True from the moment the composer is (re)seeded for the current task
+  // until the user actually diverges from that baseline (see the autosave
+  // effect below). While true, a fresher server draft is allowed to adopt
+  // INTO the composer (stale-poll fix, code review finding #2); once false,
+  // nothing may touch `input`/`sendRefs` again until the task changes —
+  // typing must never be silently overwritten.
+  const draftPristineRef = useRef(true);
+  // Monotonic write generation. Every draft write (autosave, unmount/pagehide
+  // flush, task-switch flush) stamps the generation it was issued under and
+  // only advances `lastSavedDraftRef` in its `.then` if that generation is
+  // still current when the response lands — so a slow/late write can never
+  // clobber a newer baseline with stale data (code review finding #4).
+  // send()/saveForLater() bump this *before* firing their clear so an
+  // in-flight autosave PUT that resolves afterward is a no-op against
+  // `lastSavedDraftRef` (it can still land on the wire after the DELETE —
+  // that residual risk is accepted; the next open's fresh `getTask` +
+  // pristine-adopt below will reconcile against whatever the server has).
+  const draftGenRef = useRef(0);
 
   const cancelDraftSaveTimer = () => {
     if (draftSaveTimerRef.current) {
       clearTimeout(draftSaveTimerRef.current);
       draftSaveTimerRef.current = null;
     }
+  };
+
+  // Shared write path for every draft persistence site. Advances
+  // `lastSavedDraftRef` only on success (code review finding #3 — a failed
+  // write must stay retryable, not look "saved"), gated by the generation
+  // guard above (finding #4).
+  const writeDraft = (targetTaskId: string, next: TaskDraft | null) => {
+    const gen = ++draftGenRef.current;
+    const p = next ? api.setTaskDraft(targetTaskId, next) : api.clearTaskDraft(targetTaskId);
+    void p
+      .then(() => {
+        if (gen === draftGenRef.current) lastSavedDraftRef.current = next;
+      })
+      .catch(() => {});
   };
 
   // Seed (or reseed on task switch) the composer from the server-persisted
@@ -815,35 +847,98 @@ function RunPanelBody({
     if (seededTaskIdRef.current !== null && seededTaskIdRef.current !== task.id) {
       const pending = normalizeDraft(inputRef.current, sendRefsRef.current);
       if (!draftsEqual(pending, lastSavedDraftRef.current)) {
-        if (pending) void api.setTaskDraft(prevTaskId, pending).catch(() => {});
-        else void api.clearTaskDraft(prevTaskId).catch(() => {});
+        writeDraft(prevTaskId, pending);
       }
     }
     cancelDraftSaveTimer();
     taskIdRef.current = task.id;
-    setInput(task.draft?.text ?? "");
-    setSendRefs(task.draft?.references ?? []);
-    lastSavedDraftRef.current = task.draft ?? null;
+    const seeded = task.draft ?? null;
+    // StrictMode double-invoke lockstep (code review finding #1): the app
+    // runs under <StrictMode>, which invokes effect setup → cleanup → setup
+    // before React flushes queued state updates. If the ref mirrors below
+    // were left to update lazily (via the `inputRef.current = input` lines
+    // above, which only run on the NEXT render), the StrictMode cleanup of
+    // the unmount-flush effect could fire in between — observing the
+    // pre-seed `inputRef` ("") against the just-set `lastSavedDraftRef`
+    // (the seeded draft), which looks exactly like "the user cleared the
+    // draft" and fires a spurious `clearTaskDraft` that wipes it. Writing
+    // the mirrors here, synchronously and in lockstep with the state calls
+    // and the baseline, closes that window.
+    setInput(seeded?.text ?? "");
+    setSendRefs(seeded?.references ?? []);
+    inputRef.current = seeded?.text ?? "";
+    sendRefsRef.current = seeded?.references ?? [];
+    lastSavedDraftRef.current = seeded;
     seededTaskIdRef.current = task.id;
+    draftPristineRef.current = true;
+
+    // Stale-poll seed fix (code review finding #2): `task` here is whatever
+    // the last 2s board poll handed us — reopening the panel within that
+    // window can seed from a draft that predates a very recent flush
+    // elsewhere, and the next keystroke would then permanently overwrite the
+    // newer server draft. Re-fetch the task fresh; if we're still on the
+    // same task AND the user hasn't touched the composer since (pristine),
+    // adopt the fresher draft. Swallow errors — the polled seed above
+    // already stands as a reasonable fallback.
+    const seededForTaskId = task.id;
+    let cancelled = false;
+    void api.getTask(task.id).then((fresh) => {
+      if (cancelled) return;
+      if (taskIdRef.current !== seededForTaskId) return; // switched tasks meanwhile
+      if (!draftPristineRef.current) return; // user already typed — never clobber
+      const freshDraft = fresh.draft ?? null;
+      if (draftsEqual(freshDraft, lastSavedDraftRef.current)) return;
+      setInput(freshDraft?.text ?? "");
+      setSendRefs(freshDraft?.references ?? []);
+      inputRef.current = freshDraft?.text ?? "";
+      sendRefsRef.current = freshDraft?.references ?? [];
+      lastSavedDraftRef.current = freshDraft;
+    }).catch(() => { /* polled seed stands */ });
+    return () => { cancelled = true; };
     // Only `task.id` — deliberately NOT `task.draft` (would reseed on every
-    // 2s poll refresh) or `task` itself.
+    // 2s poll refresh) or `task` itself. The pristine-adopt effect below
+    // covers the "newer draft arrives via the poll" case instead, guarded by
+    // `draftPristineRef` so it can never stomp in-progress typing.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.id]);
+
+  // Second half of the stale-poll fix: while still pristine, also adopt
+  // `task.draft` changes that arrive via the normal 2s board poll (covers
+  // the case where the one-shot `getTask` fetch above failed or hasn't
+  // resolved yet). Once the user edits (pristine flips false, below),
+  // nothing here may touch `input`/`sendRefs` again until the task changes.
+  useEffect(() => {
+    if (seededTaskIdRef.current !== task.id) return;
+    if (!draftPristineRef.current) return;
+    const polled = task.draft ?? null;
+    if (draftsEqual(polled, lastSavedDraftRef.current)) return;
+    setInput(polled?.text ?? "");
+    setSendRefs(polled?.references ?? []);
+    inputRef.current = polled?.text ?? "";
+    sendRefsRef.current = polled?.references ?? [];
+    lastSavedDraftRef.current = polled;
+  }, [task.draft, task.id]);
 
   // Debounced autosave: 600ms after the composer settles, persist the
   // current text+refs if they differ from what's already saved. Errors are
   // swallowed — a failed autosave must never toast; the next keystroke (or
-  // the unmount flush) naturally retries.
+  // the unmount flush) naturally retries (see `writeDraft`).
   useEffect(() => {
     if (seededTaskIdRef.current !== task.id) return; // not seeded for this task yet
+    const next = normalizeDraft(input, sendRefs);
+    // The composer has diverged from the last known-saved/seeded baseline —
+    // this is a genuine user edit (typing, or a ref attached/removed), not
+    // an effect re-run caused by our own seed/adopt paths (those set
+    // `lastSavedDraftRef` in lockstep, so `next` already matches there).
+    // Once tripped, stays false until the next task switch reseeds it.
+    if (!draftsEqual(next, lastSavedDraftRef.current)) {
+      draftPristineRef.current = false;
+    }
     cancelDraftSaveTimer();
     draftSaveTimerRef.current = setTimeout(() => {
       draftSaveTimerRef.current = null;
-      const next = normalizeDraft(input, sendRefs);
       if (draftsEqual(next, lastSavedDraftRef.current)) return;
-      lastSavedDraftRef.current = next;
-      const p = next ? api.setTaskDraft(task.id, next) : api.clearTaskDraft(task.id);
-      void p.catch(() => {});
+      writeDraft(task.id, next);
     }, 600);
     return cancelDraftSaveTimer;
   }, [input, sendRefs, task.id]);
@@ -852,15 +947,21 @@ function RunPanelBody({
   // animation drops `mountedTask`) — a crash or an abrupt close shouldn't
   // lose a draft the debounce hasn't gotten to yet. Mount-scoped (empty
   // deps) so the cleanup only runs once, on actual unmount, not on every
-  // dependency change.
+  // dependency change. Also flushes on `pagehide` (code review finding #5):
+  // React effect cleanups don't run when the webview itself is torn down
+  // (app quit), so `pagehide` is the only remaining hook to persist an
+  // unsaved draft in that path. Same flush logic, fire-and-forget either way.
   useEffect(() => {
-    return () => {
+    const flush = () => {
       cancelDraftSaveTimer();
       const next = normalizeDraft(inputRef.current, sendRefsRef.current);
       if (draftsEqual(next, lastSavedDraftRef.current)) return;
-      const id = taskIdRef.current;
-      if (next) void api.setTaskDraft(id, next).catch(() => {});
-      else void api.clearTaskDraft(id).catch(() => {});
+      writeDraft(taskIdRef.current, next);
+    };
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -974,10 +1075,17 @@ function RunPanelBody({
         setInput("");
         setSendRefs([]);
         // The composer is now empty — clear the persisted draft so it can't
-        // resurrect on next open. Cancel any pending autosave first so it
-        // can't win a race and re-save the just-sent text.
+        // resurrect on next open. Cancel any pending autosave first, then
+        // bump the write generation *before* firing the clear so an
+        // in-flight autosave PUT that resolves afterward can't win the race
+        // and clobber `lastSavedDraftRef` back to the just-sent text (code
+        // review finding #4). Also drop pristine: the composer was just
+        // consumed, so nothing should reseed it from a stale poll that still
+        // shows the pre-clear draft (finding #2's adopt effects check this).
         cancelDraftSaveTimer();
+        draftGenRef.current++;
         lastSavedDraftRef.current = null;
+        draftPristineRef.current = false;
         void api.clearTaskDraft(task.id).catch(() => {});
         // Drop the frozen JSONL snapshot — the auto-rebuild effect set
         // it from the last finished run, and the live SSE stream now
@@ -1031,9 +1139,14 @@ function RunPanelBody({
       setSendRefs([]);
       // Stashed into the backlog — clear the draft slot so it doesn't also
       // resurrect in the composer on next open. Cancel any pending autosave
-      // first so it can't win a race and re-save the just-stashed text.
+      // first, then bump the write generation before firing the clear so an
+      // in-flight autosave PUT can't win the race and resurrect the
+      // just-stashed text (code review finding #4), and drop pristine so a
+      // stale poll can't reseed it either (finding #2).
       cancelDraftSaveTimer();
+      draftGenRef.current++;
       lastSavedDraftRef.current = null;
+      draftPristineRef.current = false;
       void api.clearTaskDraft(task.id).catch(() => {});
     } catch (e) {
       setSendHint(e instanceof Error ? e.message : String(e));

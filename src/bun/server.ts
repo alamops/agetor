@@ -3722,13 +3722,21 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // Only a missing task 404s.
       "/tasks/:id/draft": {
         PUT: authed(async (req) => {
-          const task = tasks.get(req.params.id);
-          if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           const body = (await req.json().catch(() => ({}))) as {
             text?: unknown;
             references?: unknown;
           };
           const text = typeof body.text === "string" ? body.text : "";
+          // The draft rides the 2s /tasks poll, so an unbounded composer paste
+          // would bloat every poll response — cap it well above any realistic
+          // prompt length.
+          const DRAFT_TEXT_MAX_LENGTH = 256 * 1024;
+          if (text.length > DRAFT_TEXT_MAX_LENGTH) {
+            return json(
+              { error: `text exceeds ${DRAFT_TEXT_MAX_LENGTH} characters` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
           const references = Array.isArray(body.references)
             ? (body.references as TaskReference[])
             : [];
@@ -3739,8 +3747,6 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
         DELETE: authed((req) => {
-          const task = tasks.get(req.params.id);
-          if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           const updated = drafts.set(req.params.id, null);
           return updated
             ? json(updated, { headers: corsHeaders(req) })

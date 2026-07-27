@@ -336,9 +336,18 @@ export const backlog = {
 /**
  * The task's single composer draft — a pure wrapper over `tasks.update`, no
  * process side effect. `null` clears it (stored as SQL NULL by `update`).
+ * References run through the same `sanitizeRefs` the read path (`parseDraft`)
+ * applies, and an effectively-empty draft (blank text, no sanitized refs)
+ * normalizes to `null` here too — otherwise a caller with junk refs could
+ * write a non-null row that reads back as `null`, a zombie draft that never
+ * shows up but never gets treated as absent either.
  */
 export const drafts = {
   set(taskId: string, draft: TaskDraft | null): Task | null {
+    if (draft) {
+      const references = sanitizeRefs(draft.references);
+      draft = draft.text.trim() || references.length > 0 ? { text: draft.text, references } : null;
+    }
     return tasks.update(taskId, { draft });
   },
 };
