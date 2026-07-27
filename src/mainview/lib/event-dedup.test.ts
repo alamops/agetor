@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createEventDeduper, eventDedupKey } from "./event-dedup.ts";
-import type { RunEvent } from "../../shared/types.ts";
+import { appendReferences } from "../../shared/refs.ts";
+import type { RunEvent, TaskReference } from "../../shared/types.ts";
 
 const ev = (e: Partial<RunEvent>): RunEvent => ({
   runId: "run-1",
@@ -90,5 +91,71 @@ describe("createEventDeduper", () => {
     }
     // The oldest user key has been evicted past the cap, so it re-accepts.
     expect(d.accept(ev({ stream: "user", data: "msg", runId: "run-0", ts: 0 }))).toBe(true);
+  });
+});
+
+const REFS: TaskReference[] = [{ path: "/a/b.png", isDirectory: false }];
+
+describe("eventDedupKey / createEventDeduper — slash-command echo/twin collapse", () => {
+  test("live echo + JSONL XML twin (with \\r newlines) share a key and collapse to one bubble", () => {
+    const baseArgs = "do this and that with the whole implementation, in detail";
+    const liveText = appendReferences(`/implement ${baseArgs}`, REFS);
+    const argsRaw = appendReferences(baseArgs, REFS).replace(/\n/g, "\r");
+    const xmlTwin = [
+      "<command-message>implement</command-message>",
+      "<command-name>/implement</command-name>",
+      `<command-args>${argsRaw}</command-args>`,
+    ].join("\r");
+
+    const live = ev({ stream: "user", data: liveText, ts: 1, runId: "run-42" });
+    const twin = ev({ stream: "user", data: xmlTwin, ts: 99999, runId: "run-42" });
+
+    expect(eventDedupKey(live)).toBe(eventDedupKey(twin));
+
+    const d = createEventDeduper();
+    expect(d.accept(live)).toBe(true);
+    expect(d.accept(twin)).toBe(false);
+  });
+
+  test("the same XML twin on a DIFFERENT runId is not treated as a duplicate", () => {
+    const baseArgs = "do the thing";
+    const argsRaw = appendReferences(baseArgs, REFS);
+    const xmlTwin = [
+      "<command-message>implement</command-message>",
+      "<command-name>/implement</command-name>",
+      `<command-args>${argsRaw}</command-args>`,
+    ].join("\n");
+
+    const d = createEventDeduper();
+    expect(d.accept(ev({ stream: "user", data: xmlTwin, ts: 1, runId: "run-a" }))).toBe(true);
+    expect(d.accept(ev({ stream: "user", data: xmlTwin, ts: 2, runId: "run-b" }))).toBe(true);
+  });
+
+  test("two different commands whose args only diverge after canonicalization get different keys", () => {
+    const xmlAlpha = [
+      "<command-message>alpha</command-message>",
+      "<command-name>/alpha</command-name>",
+      "<command-args>x</command-args>",
+    ].join("\n");
+    const xmlBeta = [
+      "<command-message>beta</command-message>",
+      "<command-name>/beta</command-name>",
+      "<command-args>x</command-args>",
+    ].join("\n");
+
+    const a = ev({ stream: "user", data: xmlAlpha, runId: "run-1", ts: 1 });
+    const b = ev({ stream: "user", data: xmlBeta, runId: "run-1", ts: 2 });
+    expect(eventDedupKey(a)).not.toBe(eventDedupKey(b));
+  });
+
+  test("an ordinary (non-command) user event's key is byte-identical to the pre-change formula", () => {
+    const text = "just a regular reply, nothing special here";
+    const runId = "run-plain";
+    const e = ev({ stream: "user", data: text, runId, ts: 12345 });
+    // Reimplements the pre-canonicalization formula inline: normalize CR
+    // newlines, slice first 200 chars — no XML involved, so canonicalization
+    // is a no-op and this must match exactly.
+    const expectedKey = `user|${runId}|${text.replace(/\r\n?/g, "\n").slice(0, 200)}`;
+    expect(eventDedupKey(e)).toBe(expectedKey);
   });
 });

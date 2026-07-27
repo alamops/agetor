@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash,
+  GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
@@ -38,6 +38,7 @@ import { createEventDeduper } from "@/lib/event-dedup";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
+import { parseUserMessage } from "@/lib/command-message";
 import { AgentIcon } from "./AgentIcon";
 import {
   ReferencesPicker,
@@ -2474,13 +2475,24 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
   // visual position after expand/collapse.
   const pendingAdjustRef = useRef<{ scroller: HTMLElement; prevHeight: number } | null>(null);
 
+  // Recognize slash-command invocations (XML expansion or plain echo) and
+  // `<local-command-stdout>` blocks so they render as structured UI instead
+  // of literal `<command-*>` tags. `null` for an ordinary message — the
+  // fallback branch below renders exactly what this component always has.
+  const parsed = useMemo(() => parseUserMessage(text), [text]);
+
   // Default to the collapsed ~3-line cap and measure once mounted. The cap
   // is always rendered so short messages don't flash full-height first;
   // the toggle button only surfaces when scrollHeight exceeds clientHeight,
-  // i.e. content actually overflows the cap.
+  // i.e. content actually overflows the cap. When a command has no args (no
+  // `contentRef` div rendered at all), reset rather than early-return so a
+  // stale toggle can't survive a text change that removed the capped div.
   useEffect(() => {
     const el = contentRef.current;
-    if (!el) return;
+    if (!el) {
+      setNeedsToggle(false);
+      return;
+    }
     setNeedsToggle(el.scrollHeight > el.clientHeight + 2);
   }, [text]);
 
@@ -2504,24 +2516,74 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
     setExpanded((v) => !v);
   };
 
+  const collapseClassName = cn(
+    "agetor-md",
+    expanded ? "max-h-[40vh] overflow-y-auto" : "max-h-[4.5rem] overflow-hidden",
+  );
+
   return (
     <div className="sticky top-0 z-10 flex justify-end">
       <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card/50 px-3 py-1.5 text-foreground shadow-sm backdrop-blur-md">
-        <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
-          you
-        </div>
-        <div
-          ref={contentRef}
-          className={cn(
-            "agetor-md",
-            expanded
-              ? "max-h-[40vh] overflow-y-auto"
-              : "max-h-[4.5rem] overflow-hidden",
-          )}>
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-            {text}
-          </ReactMarkdown>
-        </div>
+        {parsed?.kind === "command-output" ? (
+          <>
+            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
+              command output
+            </div>
+            <div ref={contentRef} className={collapseClassName}>
+              <div className="whitespace-pre-wrap font-mono text-[11px] text-muted-foreground">
+                {parsed.output || "—"}
+              </div>
+            </div>
+          </>
+        ) : parsed?.kind === "command" ? (
+          <>
+            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
+              you
+            </div>
+            <div className="mb-1">
+              <span className="inline-flex items-center gap-1 rounded-md border border-primary/40 bg-primary/15 px-1.5 py-0.5 font-mono text-[11px] font-medium text-primary">
+                <SquareSlash className="size-3" />
+                {parsed.command.name}
+              </span>
+            </div>
+            {parsed.command.args && (
+              <div ref={contentRef} className={collapseClassName}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
+                  {parsed.command.args}
+                </ReactMarkdown>
+              </div>
+            )}
+            {parsed.command.references.length > 0 && (
+              <div className="mt-1 flex flex-wrap gap-1">
+                {parsed.command.references.map((ref) => {
+                  const isDir = ref.endsWith("/");
+                  const Icon = isDir ? Folder : FileText;
+                  return (
+                    <span
+                      key={ref}
+                      title={ref}
+                      className="inline-flex max-w-full items-center gap-1 rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+                    >
+                      <Icon className="size-3 shrink-0" />
+                      <span className="truncate">{refBasename(ref)}</span>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
+              you
+            </div>
+            <div ref={contentRef} className={collapseClassName}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
+                {text}
+              </ReactMarkdown>
+            </div>
+          </>
+        )}
         {needsToggle && (
           <button
             type="button"
