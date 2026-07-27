@@ -31,9 +31,11 @@ import {
   type Subagent,
   type SubagentEvent,
   type Task,
+  type TaskDraft,
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
+import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
@@ -768,6 +770,101 @@ function RunPanelBody({
 
   const [input, setInput] = useState("");
   const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
+
+  // ── Composer draft persistence ──────────────────────────────────────────
+  // `RunPanelBody` is a single long-lived instance (no `key={task.id}` — see
+  // the reset-on-task-switch effect above), and the parent keeps a 250ms-
+  // lagged `mountedTask` for the exit animation, so seeding/flushing has to
+  // be driven off `task.id` changes and an unmount effect rather than mount
+  // lifecycle alone.
+  //
+  // Which task.id the composer was last seeded for. Guards against the 2s
+  // board poll: every poll hands this component a freshly-refreshed `task`
+  // object, and reseeding `input`/`sendRefs` from `task.draft` on every one
+  // of those would stomp in-progress typing. Only a genuine task switch
+  // reseeds.
+  const seededTaskIdRef = useRef<string | null>(null);
+  // The draft value last known to be persisted server-side (or null) —
+  // either because we just seeded from `task.draft`, or because our own
+  // autosave/flush/clear just wrote it. Used to skip redundant writes.
+  const lastSavedDraftRef = useRef<TaskDraft | null>(null);
+  // Pending debounce timer for the autosave effect below.
+  const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref mirrors of the latest composer state + task id, read by the mount-
+  // scoped flush effect's cleanup (a cleanup closes over the values from the
+  // render that registered it, not the latest ones) and by the seed effect
+  // when flushing the OUTGOING task before reseeding.
+  const inputRef = useRef(input);
+  const sendRefsRef = useRef(sendRefs);
+  const taskIdRef = useRef(task.id);
+  inputRef.current = input;
+  sendRefsRef.current = sendRefs;
+
+  const cancelDraftSaveTimer = () => {
+    if (draftSaveTimerRef.current) {
+      clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
+    }
+  };
+
+  // Seed (or reseed on task switch) the composer from the server-persisted
+  // draft. Flushes the OUTGOING task's unsaved draft first, using the id
+  // still held in `taskIdRef` from before this run updates it.
+  useEffect(() => {
+    const prevTaskId = taskIdRef.current;
+    if (seededTaskIdRef.current !== null && seededTaskIdRef.current !== task.id) {
+      const pending = normalizeDraft(inputRef.current, sendRefsRef.current);
+      if (!draftsEqual(pending, lastSavedDraftRef.current)) {
+        if (pending) void api.setTaskDraft(prevTaskId, pending).catch(() => {});
+        else void api.clearTaskDraft(prevTaskId).catch(() => {});
+      }
+    }
+    cancelDraftSaveTimer();
+    taskIdRef.current = task.id;
+    setInput(task.draft?.text ?? "");
+    setSendRefs(task.draft?.references ?? []);
+    lastSavedDraftRef.current = task.draft ?? null;
+    seededTaskIdRef.current = task.id;
+    // Only `task.id` — deliberately NOT `task.draft` (would reseed on every
+    // 2s poll refresh) or `task` itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task.id]);
+
+  // Debounced autosave: 600ms after the composer settles, persist the
+  // current text+refs if they differ from what's already saved. Errors are
+  // swallowed — a failed autosave must never toast; the next keystroke (or
+  // the unmount flush) naturally retries.
+  useEffect(() => {
+    if (seededTaskIdRef.current !== task.id) return; // not seeded for this task yet
+    cancelDraftSaveTimer();
+    draftSaveTimerRef.current = setTimeout(() => {
+      draftSaveTimerRef.current = null;
+      const next = normalizeDraft(input, sendRefs);
+      if (draftsEqual(next, lastSavedDraftRef.current)) return;
+      lastSavedDraftRef.current = next;
+      const p = next ? api.setTaskDraft(task.id, next) : api.clearTaskDraft(task.id);
+      void p.catch(() => {});
+    }, 600);
+    return cancelDraftSaveTimer;
+  }, [input, sendRefs, task.id]);
+
+  // Flush on unmount (close of the details modal, after the 250ms exit
+  // animation drops `mountedTask`) — a crash or an abrupt close shouldn't
+  // lose a draft the debounce hasn't gotten to yet. Mount-scoped (empty
+  // deps) so the cleanup only runs once, on actual unmount, not on every
+  // dependency change.
+  useEffect(() => {
+    return () => {
+      cancelDraftSaveTimer();
+      const next = normalizeDraft(inputRef.current, sendRefsRef.current);
+      if (draftsEqual(next, lastSavedDraftRef.current)) return;
+      const id = taskIdRef.current;
+      if (next) void api.setTaskDraft(id, next).catch(() => {});
+      else void api.clearTaskDraft(id).catch(() => {});
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
   // Messages backlog — saved, not-yet-sent drafts for this task. Seeded from
@@ -876,6 +973,12 @@ function RunPanelBody({
       } else {
         setInput("");
         setSendRefs([]);
+        // The composer is now empty — clear the persisted draft so it can't
+        // resurrect on next open. Cancel any pending autosave first so it
+        // can't win a race and re-save the just-sent text.
+        cancelDraftSaveTimer();
+        lastSavedDraftRef.current = null;
+        void api.clearTaskDraft(task.id).catch(() => {});
         // Drop the frozen JSONL snapshot — the auto-rebuild effect set
         // it from the last finished run, and the live SSE stream now
         // carries the new turn's events. Without this, the display
@@ -926,6 +1029,12 @@ function RunPanelBody({
       setBacklogItems(updated.backlog);
       setInput("");
       setSendRefs([]);
+      // Stashed into the backlog — clear the draft slot so it doesn't also
+      // resurrect in the composer on next open. Cancel any pending autosave
+      // first so it can't win a race and re-save the just-stashed text.
+      cancelDraftSaveTimer();
+      lastSavedDraftRef.current = null;
+      void api.clearTaskDraft(task.id).catch(() => {});
     } catch (e) {
       setSendHint(e instanceof Error ? e.message : String(e));
     } finally {
