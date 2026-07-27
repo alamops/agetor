@@ -65,6 +65,7 @@ import {
 import { cn } from "@/lib/utils";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
 import { mergeabilityView, type MergeTone } from "@/lib/mergeability";
+import { ResolveConflictsDialog, type ResolveConflictsContext } from "./ResolveConflictsDialog";
 import {
   backToList,
   openDetail,
@@ -6254,6 +6255,7 @@ function GitHubItemDetail({
             item={item}
             caps={caps}
             provider={provider}
+            itemPath={itemPath}
             reviewDraft={reviewDraft}
             closeDraft={closeDraft}
             mergeMethod={mergeMethod}
@@ -7008,6 +7010,7 @@ function PullActions({
   item,
   caps,
   provider,
+  itemPath,
   reviewDraft,
   closeDraft,
   mergeMethod,
@@ -7039,6 +7042,7 @@ function PullActions({
   // for them) — see the ProviderCaps doc comment. Gate the toggle control
   // itself on a confirmed GitHub repo; the draft badge elsewhere is ungated.
   provider: GitProvider | "mixed" | null;
+  itemPath: string;
   reviewDraft: string;
   closeDraft: string;
   mergeMethod: GitHubPullMergeMethod;
@@ -7077,6 +7081,26 @@ function PullActions({
   const reopenDisabled = !!busy || !canModifyOwn;
   // Close needs an open PR (via `disabled`) plus push-or-author.
   const closeDisabled = disabled || !canModifyOwn;
+  const canResolveConflicts =
+    provider === "github" &&
+    item.state === "open" &&
+    !!mergeability &&
+    mergeability.mergeableState === "dirty" &&
+    !mergeability.crossRepo &&
+    !mergeability.merged;
+  const [resolveOpen, setResolveOpen] = useState(false);
+  const [resolveConfirmed, setResolveConfirmed] = useState(false);
+  const resolveContext: ResolveConflictsContext | null =
+    canResolveConflicts && mergeability
+      ? {
+          path: itemPath,
+          repo: mergeability.repo,
+          number: item.number,
+          title: item.title,
+          headRef: mergeability.headRef,
+          baseRef: mergeability.baseRef,
+        }
+      : null;
   return (
     <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -7127,10 +7151,24 @@ function PullActions({
               <AlertCircle className="size-3.5" /> {mergeabilityError}
             </span>
           ) : view ? (
-            <span className={cn("inline-flex items-center gap-1.5 text-[11px]", MERGE_TONE_CLASS[view.tone])}>
-              <span className={cn("size-2 shrink-0 rounded-full bg-current")} />
-              {view.label}
-            </span>
+            <>
+              <span className={cn("inline-flex items-center gap-1.5 text-[11px]", MERGE_TONE_CLASS[view.tone])}>
+                <span className={cn("size-2 shrink-0 rounded-full bg-current")} />
+                {view.label}
+              </span>
+              {canResolveConflicts && (
+                <Button size="sm" variant="outline" onClick={() => setResolveOpen(true)}>
+                  <GitMerge className="mr-2 size-3.5" />
+                  Resolve with Agetor
+                </Button>
+              )}
+              {resolveConfirmed && (
+                <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+                  <CheckCircle2 className="size-3.5" />
+                  Task created and started — check the board
+                </span>
+              )}
+            </>
           ) : (
             <span className="text-[11px] text-muted-foreground">Mergeability unavailable.</span>
           )}
@@ -7290,6 +7328,15 @@ function PullActions({
           {pendingCount} review comment{pendingCount === 1 ? "" : "s"} queued — submit via Approve / Comment / Request; merging or closing won't post {pendingCount === 1 ? "it" : "them"}.
         </div>
       )}
+      <ResolveConflictsDialog
+        open={resolveOpen}
+        onClose={() => setResolveOpen(false)}
+        context={resolveContext}
+        onCreated={() => {
+          setResolveConfirmed(true);
+          setTimeout(() => setResolveConfirmed(false), 5_000);
+        }}
+      />
     </div>
   );
 }
