@@ -2310,6 +2310,8 @@ function normalizeMergeability(repo: GitHubRepo, number: number, raw: unknown): 
   const headRepoObj = head.repo && typeof head.repo === "object" ? head.repo as Record<string, unknown> : null;
   const headRepo = headRepoObj && typeof headRepoObj.full_name === "string" ? headRepoObj.full_name : null;
   const baseSlug = repoSlug(repo);
+  const baseRepoObj = base.repo && typeof base.repo === "object" ? base.repo as Record<string, unknown> : null;
+  const baseFullName = baseRepoObj && typeof baseRepoObj.full_name === "string" ? baseRepoObj.full_name : baseSlug;
   return {
     repo: baseSlug,
     pullNumber: number,
@@ -2327,7 +2329,7 @@ function normalizeMergeability(repo: GitHubRepo, number: number, raw: unknown): 
     // Missing head.repo (e.g. the fork was deleted) can't be confirmed same-repo,
     // so treat it as cross-repo — the "Resolve with Agetor" flow requires proof
     // the head branch lives in this repo, not the absence of proof otherwise.
-    crossRepo: headRepo === null || headRepo !== baseSlug,
+    crossRepo: headRepo === null || headRepo.toLowerCase() !== baseFullName.toLowerCase(),
   };
 }
 

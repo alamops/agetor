@@ -756,8 +756,17 @@ export async function prepareWorkdir(
   }
 
   if (!created.ok) {
+    const detail = created.stderr || created.stdout;
+    if (task.branchSource === "existing") {
+      const used = /already used by worktree at '?([^'\n]+)'?/.exec(detail);
+      if (used) {
+        return {
+          error: `'${branch}' is currently checked out in ${used[1]} — switch that working tree to another branch, then start the task again`,
+        };
+      }
+    }
     return {
-      error: `worktree creation failed: ${created.stderr || created.stdout}`,
+      error: `worktree creation failed: ${detail}`,
     };
   }
 

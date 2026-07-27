@@ -191,7 +191,19 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
         column: "ready" as const,
       };
       const created = await api.createTask(input);
-      await api.startTask(created.id);
+      try {
+        await api.startTask(created.id);
+      } catch (startErr) {
+        const detail = startErr instanceof Error ? startErr.message : String(startErr);
+        // Roll the task back so a retry doesn't trip the taken-branch guard on
+        // the row this dialog just created.
+        const rolledBack = await api.deleteTask(created.id).then(() => true, () => false);
+        throw new Error(
+          rolledBack
+            ? `couldn't start the task: ${detail}`
+            : `task was created but couldn't start (${detail}) — find it on the board and start it manually`,
+        );
+      }
       void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
       void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
       if (effort !== null) void api.setPreference(`lastEffort:${kind}`, effort).catch(() => {});
@@ -238,7 +250,14 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
           </div>
         )}
 
-        {!loadingHarnesses && !loadError && (
+        {!loadingHarnesses && !loadError && !context && (
+          <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+            <AlertCircle className="size-4" /> The PR's state changed — close and reopen this dialog if
+            you still want to resolve conflicts.
+          </div>
+        )}
+
+        {!loadingHarnesses && !loadError && !!context && (
           <div className="space-y-3">
             {context && (
               <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground">
@@ -264,7 +283,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
               <div className="grid grid-cols-2 gap-1">
                 {availableHarnesses.map((h) => {
                   const status = agents.find((s) => s.harnessId === h.id);
-                  const available = status?.available ?? true;
+                  const available = status?.available ?? false;
                   return (
                     <Button
                       key={h.id}
