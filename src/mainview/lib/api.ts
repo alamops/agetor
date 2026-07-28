@@ -76,6 +76,7 @@ import type {
   UpdateStatus,
   WorktreeGitStatus,
   WorktreeInfo,
+  WorktreeTeardownResult,
 } from "../../shared/types.ts";
 import { fetchWithRecovery } from "./net-retry.ts";
 
@@ -1043,13 +1044,31 @@ export const api = {
    *  true` additionally stops any in-flight run/background agents before
    *  archiving — required (server-enforced) to archive a running/blocked
    *  task at all; the caller is expected to confirm with the user first.
-   *  Omitted (the common case) sends no body, matching the original
-   *  archive-from-`done` callers unchanged. */
-  archiveTask: (id: string, opts?: { force?: boolean; stopRun?: boolean }) =>
-    j<Task>(`/tasks/${id}/archive`, {
+   *  `forceWorktree: true` discards uncommitted changes in the worktree's
+   *  checkout during teardown (never the branch, commits, or run/AI
+   *  history) — also part of the Worktrees page's "Archive & delete", after
+   *  the caller has warned the user. `awaitTeardown: true` makes the
+   *  request block until the worktree removal has actually finished (no
+   *  timeout is set server-side), and the response then carries a
+   *  `teardown` outcome describing whether the directory is really gone —
+   *  omit it and the archive returns immediately with teardown deferred to
+   *  a background queue, as before. Omitting all four flags sends no body,
+   *  matching the original archive-from-`done` callers unchanged. */
+  archiveTask: (
+    id: string,
+    opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean },
+  ) =>
+    j<Task & { teardown?: WorktreeTeardownResult }>(`/tasks/${id}/archive`, {
       method: "POST",
-      ...(opts?.force || opts?.stopRun
-        ? { body: JSON.stringify({ force: !!opts.force, stopRun: !!opts.stopRun }) }
+      ...(opts?.force || opts?.stopRun || opts?.forceWorktree || opts?.awaitTeardown
+        ? {
+            body: JSON.stringify({
+              force: !!opts.force,
+              stopRun: !!opts.stopRun,
+              forceWorktree: !!opts.forceWorktree,
+              awaitTeardown: !!opts.awaitTeardown,
+            }),
+          }
         : {}),
     }),
   unarchiveTask: (id: string) => j<Task>(`/tasks/${id}/unarchive`, { method: "POST" }),

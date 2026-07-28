@@ -19,6 +19,7 @@ import {
   type WorktreeInfo,
   type WorktreeStaleReason,
 } from "../../../shared/types.ts";
+import { buildDeleteConfirmCopy, triageDeleteOutcome } from "./worktree-delete-intent.ts";
 
 interface Props {
   open: boolean;
@@ -267,27 +268,68 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
   const deleteTaskBacked = async (w: WorktreeInfo) => {
     if (!w.taskId) return;
     const taskId = w.taskId;
-    const ok = await confirm({
-      title: `Delete worktree "${w.branch ?? w.id}"?`,
-      description: (
-        <>
-          The ticket "<span className="font-medium text-foreground/80">{w.taskTitle}</span>" will be{" "}
-          <strong>archived</strong> (hidden from the board, restorable via Unarchive) and its worktree
-          directory removed. The git branch and full AI history are preserved. If the worktree has
-          uncommitted changes, it is left in place to protect your work.
-          {w.runActive && " An agent is still working on this task — archiving will stop it."}
-        </>
-      ),
-      confirmLabel: "Archive & delete",
-      variant: "destructive",
-    });
-    if (!ok) return;
+    // Busy spans fetch → confirm → archive as one continuous stretch so the
+    // trash icon spins the whole time (rather than appearing frozen during
+    // the status fetch) and a second click can never double-fire while the
+    // confirm dialog is up or the archive request is in flight.
     await withBusy(w.id, async () => {
+      // The cached `gitStatus` map is only populated on open + manual
+      // Refresh — by the time the user clicks delete it's frequently
+      // "loading" or missing entirely, which would undersell what's about
+      // to be discarded. Fetch fresh; a failed check falls back to the
+      // no-warning copy rather than blocking the delete.
+      let status: WorktreeGitStatus | null = null;
       try {
-        await api.archiveTask(taskId, { force: true, stopRun: true });
+        status = await api.getWorktreeGitStatus(w.id);
+      } catch {
+        status = null;
+      }
+      const copy = buildDeleteConfirmCopy(w, status);
+      const ok = await confirm({
+        title: copy.title,
+        description: (
+          <>
+            {copy.alreadyArchived ? (
+              <>
+                The ticket "<span className="font-medium text-foreground/80">{w.taskTitle}</span>" is
+                already <strong>archived</strong>; its worktree directory will be removed. The git
+                branch and full AI history are preserved.
+              </>
+            ) : (
+              <>
+                The ticket "<span className="font-medium text-foreground/80">{w.taskTitle}</span>" will
+                be <strong>archived</strong> (hidden from the board, restorable via Unarchive) and its
+                worktree directory removed. The git branch and full AI history are preserved.
+              </>
+            )}
+            {copy.showDirtyWarning && (
+              <div className="mt-2 font-medium text-rose-400">
+                This worktree has uncommitted changes — they will be permanently discarded.
+              </div>
+            )}
+            {w.runActive && " An agent is still working on this task — archiving will stop it."}
+          </>
+        ),
+        confirmLabel: copy.confirmLabel,
+        variant: "destructive",
+      });
+      if (!ok) return;
+      try {
+        const result = await api.archiveTask(taskId, {
+          force: true,
+          stopRun: true,
+          forceWorktree: true,
+          awaitTeardown: true,
+        });
+        const outcome = triageDeleteOutcome(result.teardown, w.branch);
+        // Silent on success — the house convention for destructive list
+        // mutations (SettingsDialog.tsx) is that the row vanishing from the
+        // refreshed list IS the feedback. Only a genuine failure toasts.
+        if (outcome.kind === "error") toast.error(outcome.message);
         await refresh();
       } catch (e) {
         toast.error(e instanceof Error ? e.message : String(e));
+        await refresh();
       }
     });
   };

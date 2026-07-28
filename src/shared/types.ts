@@ -700,6 +700,32 @@ export interface WorktreeInfo {
 }
 
 /**
+ * Outcome of the worktree teardown an archive triggered, as surfaced by
+ * `POST /tasks/:id/archive` when the caller passes `awaitTeardown: true`.
+ *
+ * Archive normally defers teardown onto a per-workdir background queue and
+ * responds in milliseconds, so the response carries no outcome at all. The
+ * Worktrees page's "Archive & delete" is the one caller that needs to know
+ * whether the directory is *actually* gone before it refreshes the list — it
+ * opts in, and gets this back.
+ *
+ * `reason` is only meaningful when `removed` is false:
+ * - `"dirty"` — the checkout had uncommitted changes and `forceWorktree` was
+ *   not set, so it was deliberately left in place. (`hasUncommittedChanges`
+ *   folds git errors into this too — it returns null on a failing `git
+ *   status`, which the caller treats as "don't touch".)
+ * - `"no-worktree"` / `"already-absent"` — there was nothing to remove. Not a
+ *   failure; callers should treat these as success.
+ * - `"failed"` — removal was attempted and the directory is still there.
+ */
+export interface WorktreeTeardownResult {
+  /** True when the worktree directory is no longer on disk after the teardown. */
+  removed: boolean;
+  /** Why `removed` is false. Absent when `removed` is true. */
+  reason?: "dirty" | "no-worktree" | "already-absent" | "failed";
+}
+
+/**
  * On-demand live git status for a single worktree, as surfaced by
  * `GET /worktrees/:id/git-status`. Not part of the bulk `GET /worktrees`
  * listing — computing this spawns git subprocesses, so it's fetched per row

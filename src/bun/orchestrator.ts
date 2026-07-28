@@ -101,6 +101,7 @@ import type {
   WorktreeGitStatus,
   WorktreeInfo,
   WorktreeStaleReason,
+  WorktreeTeardownResult,
 } from "../shared/types.ts";
 import { WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
 import { appendReferences } from "../shared/refs.ts";
@@ -1952,6 +1953,44 @@ export async function createTask(
 }
 
 /**
+ * Shared teardown job for archiving a task — tmux/codex session kill, then
+ * open terminal tabs, then `detachWorktree` — in that exact order, because a
+ * live shell cwd'd inside the worktree would block `git worktree remove`.
+ * Both `archiveTask` (the fresh-archive path AND the already-archived
+ * re-enqueue path below) and the boot-time `sweepArchivedTeardowns` route
+ * through this one function so the three call sites can never drift apart.
+ *
+ * The harness kind is resolved synchronously here, before the job closure is
+ * built and handed to `enqueueTeardown` — same as the original inline code,
+ * just no longer duplicated at each call site.
+ *
+ * `enqueueTeardown` deliberately swallows job errors to keep its per-workdir
+ * FIFO chain alive for every other task queued behind this one (see its doc
+ * comment) — so it can't just return the `detachWorktree` result. Instead the
+ * result is captured in a closure variable (`result`, exposed via the
+ * returned getter) that a caller reads AFTER awaiting `promise`. This is the
+ * same idiom `deleteOrphanWorktree` already uses to get a real outcome out of
+ * a swallowed job.
+ */
+function enqueueArchiveTeardown(
+  task: Task,
+  opts?: { force?: boolean },
+): { promise: Promise<void>; result: () => WorktreeTeardownResult | undefined } {
+  const kind = resolveHarness(task.agent)?.kind;
+  let result: WorktreeTeardownResult | undefined;
+  const promise = enqueueTeardown(task.id, task.workdir, async () => {
+    // Same contract as deleteTask: dropSession is non-throwing (it
+    // best-efforts tmux teardown internally). Don't wrap — a silent catch
+    // would hide a regression in claude-tmux from the next reviewer.
+    if (kind === "claude-code") dropSession(task.id);
+    else if (kind === "codex") dropCodexSession(task.id);
+    await killTerminalsForTask(task.id);
+    result = await detachWorktree(task, { force: opts?.force });
+  });
+  return { promise, result: () => result };
+}
+
+/**
  * Archive a finished task: stamp `archivedAt`, kill its claude tmux session
  * AND any open terminal tabs (both best-effort) so no background shell outlives
  * the user's interest in the task — once archived the card is hidden, so the
@@ -1975,11 +2014,23 @@ export async function createTask(
  * the Stop button stops it (`stopActiveHandle`/`stopHeldTask`, shared with
  * `cancelRun`) before the normal archive path below proceeds. Without it,
  * the active-run guard stays in place as a backstop.
+ *
+ * Pass `{ forceWorktree: true }` to have the detach discard uncommitted
+ * changes in the checkout rather than leaving it in place (threaded straight
+ * through to `detachWorktree`'s `force` option) — an explicit, user-confirmed
+ * opt-in from the Worktrees page, since it's a destructive, unrecoverable
+ * discard of anything not committed.
+ *
+ * Pass `{ awaitTeardown: true }` to block until the deferred teardown above
+ * has actually run and get its real `WorktreeTeardownResult` back as
+ * `teardown` — the Worktrees page's delete action needs to know the
+ * directory is truly gone before it refreshes the list, unlike the kanban
+ * archive button, which stays fire-and-forget by leaving this unset.
  */
 export async function archiveTask(
   taskId: string,
-  opts?: { force?: boolean; stopRun?: boolean },
-): Promise<{ task: Task } | { error: string }> {
+  opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean },
+): Promise<{ task: Task; teardown?: WorktreeTeardownResult } | { error: string }> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.column !== "done" && !opts?.force) {
@@ -2001,13 +2052,33 @@ export async function archiveTask(
     stopHeldTask(taskId, "task archived");
   }
   if (task.archivedAt != null) {
+    // Already archived is normally a cheap no-op — repeat-archives (e.g. a
+    // double click) shouldn't re-enqueue teardown work every time. But when
+    // the worktree is STILL on disk, the previous teardown either never ran
+    // (this instance crashed before the boot sweep got to it) or never
+    // finished — and this is exactly the reported bug: the Worktrees page's
+    // "archive & delete" action calls archive on a row that's already
+    // archived, and the old bare `return { task }` here meant that row could
+    // never be cleaned up. Re-enqueue instead, gated on the same
+    // `worktreePath && existsSync(...)` condition `sweepArchivedTeardowns`
+    // already uses at boot, so an ordinary repeat-archive with nothing left
+    // to remove stays a bare return.
+    if (task.worktreePath && existsSync(task.worktreePath)) {
+      const { promise, result } = enqueueArchiveTeardown(task, { force: opts?.forceWorktree });
+      if (opts?.awaitTeardown) {
+        await promise;
+        // A requested outcome should never come back silently absent — if
+        // the job threw and enqueueTeardown swallowed it, `result()` is
+        // still undefined here, so report it as a failed removal instead of
+        // omitting `teardown` from the response.
+        return { task, teardown: result() ?? { removed: false, reason: "failed" } };
+      }
+      void promise;
+    }
     return { task };
   }
   const updated = tasks.update(taskId, { archivedAt: Date.now() });
   if (!updated) return { error: "task not found" };
-  // Resolved up front (before enqueueing) — same as before, just no longer
-  // re-read inside the deferred job.
-  const archiveKind = resolveHarness(task.agent)?.kind;
   // codexTurnQueue is cheap in-memory bookkeeping (no I/O), so it's dropped
   // inline rather than folded into the deferred job.
   codexTurnQueue.delete(taskId);
@@ -2020,19 +2091,15 @@ export async function archiveTask(
   // workdir, see `enqueueTeardown`), just off the request's critical path;
   // tasks in a different workdir proceed independently. Callers that must
   // not race a deferred teardown (unarchive, start, delete, the boot sweep)
-  // await `pendingTeardown(taskId)` first.
-  void enqueueTeardown(taskId, task.workdir, async () => {
-    // Same contract as deleteTask: dropSession is non-throwing (it
-    // best-efforts tmux teardown internally). Don't wrap — a silent catch
-    // would hide a regression in claude-tmux from the next reviewer.
-    if (archiveKind === "claude-code") dropSession(taskId);
-    else if (archiveKind === "codex") dropCodexSession(taskId);
-    // Tear down terminal tabs before detaching the worktree — a live shell
-    // cwd'd inside the worktree would block `git worktree remove`, exactly
-    // like deleteTask's ordering.
-    await killTerminalsForTask(taskId);
-    await detachWorktree(updated);
-  });
+  // await `pendingTeardown(taskId)` first. `awaitTeardown` is the one opt-in
+  // exception: the Worktrees page explicitly wants to block on this specific
+  // teardown to get a truthful result back.
+  const { promise, result } = enqueueArchiveTeardown(updated, { force: opts?.forceWorktree });
+  if (opts?.awaitTeardown) {
+    await promise;
+    return { task: updated, teardown: result() ?? { removed: false, reason: "failed" } };
+  }
+  void promise;
   return { task: updated };
 }
 
@@ -2139,14 +2206,11 @@ export function sweepArchivedTeardowns(): number {
     // refuses to archive one), but mirror that guard here too rather than
     // risk tearing down a worktree out from under an in-flight run.
     if (task.runId && active.has(task.runId)) continue;
-    const taskId = task.id;
-    const kind = resolveHarness(task.agent)?.kind;
-    enqueueTeardown(taskId, task.workdir, async () => {
-      if (kind === "claude-code") dropSession(taskId);
-      else if (kind === "codex") dropCodexSession(taskId);
-      await killTerminalsForTask(taskId);
-      await detachWorktree(task);
-    });
+    // No `force` — an explicit owner decision (see the plan doc): discarding
+    // uncommitted work with no human in the loop, unattended at boot, is not
+    // a trade worth making. A dirty worktree just stays stuck until the user
+    // forces it from the Worktrees page.
+    enqueueArchiveTeardown(task);
     enqueued++;
   }
   return enqueued;
