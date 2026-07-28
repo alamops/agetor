@@ -1102,4 +1102,66 @@ describe("detachWorktree", () => {
     await branchProc.exited;
     expect(branchOut).toContain(created.branch!);
   });
+
+  test("force: true removes a dirty worktree, and the branch plus its commits survive", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+
+    // A real commit made inside the worktree — this is what must survive on
+    // the branch after a forced detach, same as the plain (non-dirty) detach
+    // test above.
+    writeFileSync(path.join(created.cwd, "committed.txt"), "agent output\n");
+    await git(["add", "."], created.cwd);
+    await git(["commit", "-m", "committed work"], created.cwd);
+
+    // Uncommitted changes on top — without `force` this alone would block
+    // removal (see "skips removal when the worktree has uncommitted changes"
+    // above).
+    writeFileSync(path.join(created.cwd, "dirty.txt"), "uncommitted\n");
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const result = await detachWorktree(live, { force: true });
+    expect(result).toEqual({ removed: true });
+    expect(existsSync(created.cwd)).toBe(false);
+
+    // The whole point of force-detach vs `removeWorktree`: the branch (and
+    // every commit on it) survives in the source repo even though the dirty
+    // checkout was discarded.
+    const branchProc = Bun.spawn(["git", "branch", "--list", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const branchOut = (await new Response(branchProc.stdout).text()).trim();
+    await branchProc.exited;
+    expect(branchOut).toContain(created.branch!);
+
+    const logProc = Bun.spawn(["git", "log", "--oneline", created.branch!], {
+      cwd: repo,
+      stdout: "pipe",
+    });
+    const log = (await new Response(logProc.stdout).text()).trim();
+    await logProc.exited;
+    expect(log).toContain("committed work");
+  });
+
+  test("force: true does not paper over no-worktree or already-absent", async () => {
+    const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");
+    const repo = await makeRepo();
+
+    const neverMaterialized = fakeTask({ workdir: repo, worktreePath: null, branch: null });
+    const noWorktree = await detachWorktree(neverMaterialized, { force: true });
+    expect(noWorktree).toEqual({ removed: false, reason: "no-worktree" });
+
+    const task = fakeTask({ workdir: repo });
+    const created = await prepareWorkdir(task);
+    if ("error" in created) throw new Error(created.error);
+    rmSync(created.cwd, { recursive: true, force: true });
+
+    const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
+    const alreadyAbsent = await detachWorktree(live, { force: true });
+    expect(alreadyAbsent).toEqual({ removed: false, reason: "already-absent" });
+  });
 });
