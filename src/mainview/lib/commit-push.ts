@@ -1,14 +1,21 @@
 /**
- * Pure derivation logic for the run panel's "Commit & push" composer chip.
- * Kept DOM-free (like subagent-tabs.ts / event-dedup.ts) so it can be unit
- * tested with `bun test` — the repo has no jsdom/testing-library, so component
- * behaviour is validated by testing the logic the component drives.
+ * Pure derivation logic for the run panel's "Commit & push" / "Open PR"
+ * composer chips. Kept DOM-free (like subagent-tabs.ts / event-dedup.ts) so
+ * it can be unit tested with `bun test` — the repo has no jsdom/testing-
+ * library, so component behaviour is validated by testing the logic the
+ * component drives.
+ *
+ * Mirrors (rather than imports) the shared `TaskGitStatus` type: the real
+ * `GET /tasks/:id/git-status` payload always sets `hasUpstream`/
+ * `remoteSynced`, but they're optional here so existing fixtures built before
+ * "Open PR" (predating those fields) keep type-checking unchanged.
  */
-
 export interface TaskGitStatus {
   hasChanges: boolean;
   ahead: number;
   ignored: boolean;
+  hasUpstream?: boolean;
+  remoteSynced?: boolean;
 }
 
 /**
@@ -23,4 +30,13 @@ export interface TaskGitStatus {
 export function shouldOfferCommitPush(status: TaskGitStatus | null): boolean {
   if (!status || status.ignored) return false;
   return status.hasChanges || status.ahead > 0;
+}
+
+/**
+ * Whether the "Open PR" chip should be offered. Git-state-only, like its
+ * sibling above — `prUrl`/read-only gating happens at the call site (a task
+ * that already has a PR shows "View PR" instead, regardless of this result).
+ */
+export function shouldOfferOpenPr(status: TaskGitStatus | null): boolean {
+  return !!status && !status.ignored && !!status.remoteSynced;
 }

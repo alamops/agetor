@@ -4,13 +4,15 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash, SquareSlash,
+  GitCommit, GitCompare, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
-import { shouldOfferCommitPush, type TaskGitStatus } from "@/lib/commit-push";
-import { Button } from "@/components/ui/button";
+import { shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
+import { latestPrProposal } from "@/lib/pr-proposal";
+import type { GitHubPullPrefill } from "./GitHubDialog";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
@@ -90,6 +92,10 @@ interface Props {
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
+  /** Open GitHubDialog's New-PR composer prefilled for this task — see the
+   *  "Open PR" chip below. Owned by App so the dialog stays a single
+   *  App-level singleton instead of one instance per task panel. */
+  onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
 }
 
 const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" | "destructive"> = {
@@ -127,7 +133,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive }: Props) {
+export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -214,6 +220,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           onShowDiff={onShowDiff}
           onArchive={onArchive}
           onUnarchive={onUnarchive}
+          onOpenPullRequest={onOpenPullRequest}
         />
       </aside>
     </>
@@ -234,6 +241,7 @@ function RunPanelBody({
   onShowDiff,
   onArchive,
   onUnarchive,
+  onOpenPullRequest,
 }: {
   task: Task;
   agents: AgentStatus[];
@@ -244,6 +252,7 @@ function RunPanelBody({
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
+  onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
@@ -988,6 +997,11 @@ function RunPanelBody({
   // polling effect keeps this in sync with the actual git state for as
   // long as the panel is mounted.
   const [gitStatus, setGitStatus] = useState<TaskGitStatus | null>(null);
+  // Best-effort PR title/description parsed out of the agent's Commit & push
+  // reply (see `commitPushPrompt`), for prefilling the "Open PR" composer.
+  // `null` when no run yet printed a parseable proposal — the composer still
+  // opens (with empty title/body) in that case.
+  const proposal = useMemo(() => latestPrProposal(events), [events]);
   const [sendDragging, setSendDragging] = useState(false);
   // `/`-command and skill autocomplete for the send field. Same list the
   // New Task form uses — depends on (agent, workdir, branch) so a slash
@@ -1637,6 +1651,38 @@ function RunPanelBody({
                   >
                     <GitCommit className="mr-1 size-3" /> Commit &amp; push
                   </Button>
+                )}
+                {/* Once a PR exists for this task it's a durable link — never
+                    re-offered as "Open PR" again. Otherwise, offered once the
+                    branch is pushed and synced with its remote (git-state-only,
+                    same convention as Commit & push above). */}
+                {task.prUrl ? (
+                  <ExternalLink
+                    href={task.prUrl}
+                    className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "no-underline hover:no-underline")}
+                    title="Open the pull request created for this task"
+                  >
+                    <GitPullRequest className="mr-1 size-3" /> View PR
+                  </ExternalLink>
+                ) : (
+                  shouldOfferOpenPr(gitStatus) && !sending && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() =>
+                        onOpenPullRequest({
+                          projectPath: task.workdir,
+                          head: task.branch ?? "",
+                          title: proposal?.title ?? "",
+                          body: proposal?.description ?? "",
+                          taskId: task.id,
+                        })
+                      }
+                      title="Open a pull request for this task's branch — prefilled from the agent's summary when available"
+                    >
+                      <GitPullRequest className="mr-1 size-3" /> Open PR
+                    </Button>
+                  )
                 )}
               </div>
             </div>
