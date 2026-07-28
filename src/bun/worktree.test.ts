@@ -979,6 +979,82 @@ describe("getAheadCount", () => {
   });
 });
 
+describe("remoteSyncState", () => {
+  test("returns no-upstream for a non-existent dir", async () => {
+    const { remoteSyncState } = await import("./worktree.ts");
+    const missing = path.join(tmpdir(), `agetor-wt-missing-${randomUUID()}`);
+    expect(await remoteSyncState(missing)).toEqual({ hasUpstream: false, ahead: null, behind: null });
+  });
+
+  test("returns no-upstream for a non-git directory", async () => {
+    const { remoteSyncState } = await import("./worktree.ts");
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-sync-"));
+    expect(await remoteSyncState(dir)).toEqual({ hasUpstream: false, ahead: null, behind: null });
+  });
+
+  test("returns hasUpstream:false for a branch with no configured upstream", async () => {
+    const { remoteSyncState } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await remoteSyncState(repo)).toEqual({ hasUpstream: false, ahead: null, behind: null });
+  });
+
+  test("reports {hasUpstream:true, ahead:0, behind:0} right after a --set-upstream push", async () => {
+    const { remoteSyncState, gitPush } = await import("./worktree.ts");
+    const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-sync-bare-"));
+    await git(["init", "--bare", "-b", "main"], bare);
+    const repo = await makeRepo();
+    await git(["remote", "add", "origin", bare], repo);
+
+    const pushed = await gitPush(repo, "main");
+    expect(pushed.ok).toBe(true);
+
+    expect(await remoteSyncState(repo)).toEqual({ hasUpstream: true, ahead: 0, behind: 0 });
+  });
+
+  test("reports ahead:1 (remoteSynced would be false) after a local commit made following the push", async () => {
+    const { remoteSyncState, gitPush } = await import("./worktree.ts");
+    const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-sync-ahead-bare-"));
+    await git(["init", "--bare", "-b", "main"], bare);
+    const repo = await makeRepo();
+    await git(["remote", "add", "origin", bare], repo);
+    await gitPush(repo, "main");
+
+    writeFileSync(path.join(repo, "after-push.txt"), "local work\n");
+    await git(["add", "."], repo);
+    await git(["commit", "-m", "after push"], repo);
+
+    expect(await remoteSyncState(repo)).toEqual({ hasUpstream: true, ahead: 1, behind: 0 });
+  });
+
+  test("reports behind >= 1 when the remote is strictly ahead (pushed from a second clone, then fetched)", async () => {
+    const { remoteSyncState, gitPush } = await import("./worktree.ts");
+    const bare = mkdtempSync(path.join(tmpdir(), "agetor-wt-sync-behind-bare-"));
+    await git(["init", "--bare", "-b", "main"], bare);
+
+    const repo1 = await makeRepo();
+    await git(["remote", "add", "origin", bare], repo1);
+    await gitPush(repo1, "main");
+
+    // A second clone pushes a commit that repo1 hasn't seen yet.
+    const repo2 = mkdtempSync(path.join(tmpdir(), "agetor-wt-sync-clone2-"));
+    await git(["clone", bare, repo2], path.dirname(repo2));
+    await git(["config", "user.email", "test@example.com"], repo2);
+    await git(["config", "user.name", "test"], repo2);
+    writeFileSync(path.join(repo2, "remote-work.txt"), "remote work\n");
+    await git(["add", "."], repo2);
+    await git(["commit", "-m", "remote work"], repo2);
+    await git(["push", "origin", "main"], repo2);
+
+    // repo1's tracking ref only reflects the new remote commit after a fetch.
+    await git(["fetch"], repo1);
+
+    const result = await remoteSyncState(repo1);
+    expect(result.hasUpstream).toBe(true);
+    expect(result.ahead).toBe(0);
+    expect(result.behind).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe("detachWorktree", () => {
   test("removes the checkout but keeps the branch and its commits", async () => {
     const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");

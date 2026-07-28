@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { shouldOfferCommitPush, type TaskGitStatus } from "./commit-push.ts";
+import { shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "./commit-push.ts";
 
 function status(overrides: Partial<TaskGitStatus>): TaskGitStatus {
   return { hasChanges: false, ahead: 0, ignored: false, ...overrides };
@@ -28,4 +28,36 @@ test("shouldOfferCommitPush: both hasChanges and ahead offer the chip", () => {
 
 test("shouldOfferCommitPush: clean tree and nothing ahead → false", () => {
   expect(shouldOfferCommitPush(status({ hasChanges: false, ahead: 0 }))).toBe(false);
+});
+
+test("shouldOfferOpenPr: null status → false", () => {
+  expect(shouldOfferOpenPr(null)).toBe(false);
+});
+
+test("shouldOfferOpenPr: ignored → false even with remoteSynced true", () => {
+  expect(shouldOfferOpenPr(status({ ignored: true, remoteSynced: true }))).toBe(false);
+});
+
+test("shouldOfferOpenPr: remoteSynced true (and not ignored) → true", () => {
+  expect(shouldOfferOpenPr(status({ remoteSynced: true }))).toBe(true);
+});
+
+test("shouldOfferOpenPr: remoteSynced false → false", () => {
+  expect(shouldOfferOpenPr(status({ remoteSynced: false }))).toBe(false);
+});
+
+test("shouldOfferOpenPr: remoteSynced undefined (legacy fixture shape, predates Open PR) → false", () => {
+  expect(shouldOfferOpenPr(status({}))).toBe(false);
+});
+
+test("shouldOfferOpenPr: hasChanges/ahead never affect the result either way", () => {
+  expect(
+    shouldOfferOpenPr(status({ remoteSynced: true, hasChanges: true, ahead: 5 })),
+  ).toBe(true);
+  expect(
+    shouldOfferOpenPr(status({ remoteSynced: false, hasChanges: false, ahead: 0 })),
+  ).toBe(false);
+  expect(
+    shouldOfferOpenPr(status({ remoteSynced: true, hasChanges: false, ahead: 0 })),
+  ).toBe(true);
 });
