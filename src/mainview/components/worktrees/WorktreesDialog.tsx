@@ -307,6 +307,13 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                 This worktree has uncommitted changes — they will be permanently discarded.
               </div>
             )}
+            {copy.unknown && (
+              <div className="mt-2 font-medium text-rose-400">
+                agetor couldn't check this worktree for uncommitted changes — its git
+                registration may be broken. Anything uncommitted will be permanently
+                discarded.
+              </div>
+            )}
             {w.runActive && " An agent is still working on this task — archiving will stop it."}
           </>
         ),

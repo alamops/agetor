@@ -2,18 +2,38 @@ import type { WorktreeGitStatus, WorktreeInfo, WorktreeTeardownResult } from "..
 
 /**
  * What the "Archive & delete" confirm dialog should say for a given row, given
- * its freshly-fetched git status. Two independent facts change the copy —
- * whether the checkout is dirty (uncommitted work is about to be discarded)
- * and whether the task is already archived (the "will be archived" phrasing
- * is simply wrong for a row that's already in that state) — and they can
- * co-occur, so this is a small cross-product rather than a single flag.
- * `status: null` means the git-status fetch failed or hasn't resolved; we
- * fall back to the no-warning copy rather than block the delete on it.
+ * its freshly-fetched git status. The copy is driven by a three-state dirty
+ * classification crossed with whether the task is already archived (the
+ * "will be archived" phrasing is simply wrong for a row that's already in
+ * that state) — the two axes can co-occur, so this is a small cross-product
+ * rather than a single flag.
+ *
+ * The dirty classification's three states are mutually exclusive and
+ * exhaustive:
+ *  - confirmed-clean: `status` resolved and reports no uncommitted changes.
+ *    No warning.
+ *  - confirmed-dirty: `status` resolved and reports uncommitted changes.
+ *    The existing red "will be discarded" warning.
+ *  - unknown: `status` is `null` (the pre-confirm `getWorktreeGitStatus` call
+ *    threw) OR `status.ignored` is `true` (the dir wasn't inspectable — not a
+ *    git repo, or `git status` itself failed, e.g. a broken/pruned worktree
+ *    registration). Critically, `deleteTaskBacked` sends `forceWorktree: true`
+ *    unconditionally, so an unknown status still force-deletes — we just
+ *    can't tell the user whether that's discarding anything. Treating
+ *    "unknown" the same as "confirmed clean" would silently drop this
+ *    warning in exactly the case `forceWorktree` exists to unstick (a
+ *    worktree whose git registration is broken), which is how uncommitted
+ *    work gets lost with no red flag ever shown. So "unknown" gets its own,
+ *    harder-worded warning instead of falling back to silence.
  */
 export interface DeleteConfirmCopy {
   title: string;
-  /** True when the checkout has uncommitted changes worth calling out. */
+  /** True only for confirmed-dirty: `status` resolved and reports real
+   *  uncommitted changes worth calling out. */
   showDirtyWarning: boolean;
+  /** True for the unknown state: agetor could not determine whether the
+   *  checkout is dirty, but is still about to force-delete it. */
+  unknown: boolean;
   /** True when the task is already archived — the body copy must not repeat
    *  "will be archived" for a ticket that already is. */
   alreadyArchived: boolean;
@@ -25,16 +45,19 @@ export interface DeleteConfirmCopy {
  * component (which has no render tests in this app) so the branching itself
  * is unit-testable — see `github-dialog-view.ts` for the same idiom. The JSX
  * description itself still lives in the component (this module has no React
- * dependency); it reads `alreadyArchived`/`showDirtyWarning` off the result.
+ * dependency); it reads `alreadyArchived`/`showDirtyWarning`/`unknown` off the
+ * result.
  */
 export function buildDeleteConfirmCopy(w: WorktreeInfo, status: WorktreeGitStatus | null): DeleteConfirmCopy {
-  const dirty = status != null && status.dirty === true && !status.ignored;
+  const unknown = status == null || status.ignored === true;
+  const dirty = !unknown && status!.dirty === true;
   const alreadyArchived = w.archivedAt != null;
   return {
     title: `Delete worktree "${w.branch ?? w.id}"?`,
     showDirtyWarning: dirty,
+    unknown,
     alreadyArchived,
-    confirmLabel: dirty ? "Discard changes & delete" : "Archive & delete",
+    confirmLabel: dirty || unknown ? "Discard changes & delete" : "Archive & delete",
   };
 }
 

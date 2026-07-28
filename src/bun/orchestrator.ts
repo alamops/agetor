@@ -1979,13 +1979,49 @@ function enqueueArchiveTeardown(
   const kind = resolveHarness(task.agent)?.kind;
   let result: WorktreeTeardownResult | undefined;
   const promise = enqueueTeardown(task.id, task.workdir, async () => {
+    // `enqueueTeardown` only guarantees this job runs after everything already
+    // queued for `task.workdir` — it can sit behind other jobs for seconds,
+    // and `task` was captured at ENQUEUE time by every call site (fresh
+    // archive, already-archived re-enqueue, boot sweep). The
+    // `pendingTeardown(taskId)` discipline elsewhere only protects
+    // materialize-AFTER-teardown; it does nothing about the opposite
+    // interleaving: `sendInput`/`startTask` clear `archivedAt` and start
+    // `prepareWorkdir`'s multi-second `git worktree add` BEFORE a fresh
+    // `archiveTask` call (e.g. the Worktrees page's delete button) can see the
+    // half-built directory and enqueue a teardown job right behind it. By the
+    // time that job reaches the front of the queue, the task has moved on —
+    // tearing down with the stale `task` snapshot would rip out a worktree the
+    // agent is (or is about to be) running in. So re-read the row here, at job
+    // execution time, and bail if it moved: gone entirely, un-archived
+    // (`archivedAt == null` — both `sendInput` and `startTask` clear it
+    // *before* calling `prepareWorkdir`, so this check is the same signal that
+    // closes the window), or a run has since started. A bail is reported as
+    // `"failed"` (not `"no-worktree"`/`"already-absent"`, which the client
+    // reads as silent success) because the directory is still there — the
+    // caller should retry, not assume it's clean.
+    //
+    // The live-run check keys on `cancelled`, NOT on `active.has(runId)`:
+    // `archiveTask({ stopRun: true })` — what the Worktrees page's delete
+    // button always sends — stops the run via `stopActiveHandle`, which
+    // flags the handle `cancelled` and kills it, but the `active.delete`
+    // only happens later in the async exit handler. A bare `active.has`
+    // would therefore see the run we ourselves just stopped, bail, and
+    // report a bogus failure for every delete of a *running* worktree. A
+    // handle that's present and NOT cancelled is the real signal: a run
+    // that started after we enqueued, which we must not tear down under.
+    const cur = tasks.get(task.id);
+    const liveHandle = cur?.runId ? active.get(cur.runId) : undefined;
+    if (!cur || cur.archivedAt == null || (liveHandle && !liveHandle.cancelled)) {
+      result = { removed: false, reason: "failed" };
+      return;
+    }
     // Same contract as deleteTask: dropSession is non-throwing (it
     // best-efforts tmux teardown internally). Don't wrap — a silent catch
     // would hide a regression in claude-tmux from the next reviewer.
-    if (kind === "claude-code") dropSession(task.id);
-    else if (kind === "codex") dropCodexSession(task.id);
-    await killTerminalsForTask(task.id);
-    result = await detachWorktree(task, { force: opts?.force });
+    if (kind === "claude-code") dropSession(cur.id);
+    else if (kind === "codex") dropCodexSession(cur.id);
+    await killTerminalsForTask(cur.id);
+    result = await detachWorktree(cur, { force: opts?.force });
   });
   return { promise, result: () => result };
 }
@@ -2074,6 +2110,18 @@ export async function archiveTask(
         return { task, teardown: result() ?? { removed: false, reason: "failed" } };
       }
       void promise;
+    } else if (opts?.awaitTeardown) {
+      // Same "never come back silently absent" contract as the branch above,
+      // for the case where there was never anything to tear down. Both
+      // outcomes are successes for the client (nothing left to remove) — this
+      // only stops the response from omitting `teardown` when it was asked
+      // for, matching `WorktreeTeardownResult`'s documented contract.
+      return {
+        task,
+        teardown: task.worktreePath
+          ? { removed: false, reason: "already-absent" }
+          : { removed: false, reason: "no-worktree" },
+      };
     }
     return { task };
   }

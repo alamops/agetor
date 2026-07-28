@@ -1053,7 +1053,20 @@ export const api = {
    *  `teardown` outcome describing whether the directory is really gone —
    *  omit it and the archive returns immediately with teardown deferred to
    *  a background queue, as before. Omitting all four flags sends no body,
-   *  matching the original archive-from-`done` callers unchanged. */
+   *  matching the original archive-from-`done` callers unchanged.
+   *
+   *  `retry: false` only when `awaitTeardown` is set — matching
+   *  `createTask`/`sendRunInput`'s idiom above. The route sets an unbounded
+   *  server timeout and blocks on the *entire* per-workdir teardown FIFO
+   *  (every same-repo teardown queued ahead of this one), which can run well
+   *  past WKWebView's own request timeout even though the operation is
+   *  succeeding server-side. A default retry on that timeout would silently
+   *  re-issue a second, non-idempotent archive against a task the user may
+   *  have already resumed (re-running `dropSession`/`killTerminalsForTask`,
+   *  re-queuing a second worktree teardown behind the first). The
+   *  fire-and-forget archive (no `awaitTeardown`, e.g. the kanban button)
+   *  returns fast and keeps the default retry — it isn't the non-idempotent
+   *  hazard this guards against. */
   archiveTask: (
     id: string,
     opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean },
@@ -1070,7 +1083,7 @@ export const api = {
             }),
           }
         : {}),
-    }),
+    }, opts?.awaitTeardown ? { retry: false } : undefined),
   unarchiveTask: (id: string) => j<Task>(`/tasks/${id}/unarchive`, { method: "POST" }),
 
   /** Every git worktree materialized on disk under `dataDir/worktrees/`,
