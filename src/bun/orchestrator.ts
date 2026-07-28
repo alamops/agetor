@@ -1924,6 +1924,8 @@ export async function createTask(
     branchSource,
     worktreePath: null,
     baseRef,
+    // No PR exists for a brand-new task; set server-side by pull-create.
+    prUrl: null,
     mode: input.mode ?? null,
     model,
     effort,

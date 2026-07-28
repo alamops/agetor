@@ -85,6 +85,7 @@ function fakeTask(overrides: Partial<Task> & { workdir: string }): Task {
     branchSource: "created",
     worktreePath: null,
     baseRef: null,
+    prUrl: null,
     mode: null,
     model: null,
     effort: null,

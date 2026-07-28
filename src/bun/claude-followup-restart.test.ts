@@ -108,6 +108,7 @@ test.skipIf(!HAVE_TMUX)("follow-up to a task whose session outlived the process 
       branchSource: "created",
       worktreePath: null,
       baseRef: null,
+      prUrl: null,
       mode: null,
       // buildCommand requires a model + effort for claude-code; the values are
       // inert here since AGETOR_CLAUDE_BIN=/bin/echo makes the launch a no-op.

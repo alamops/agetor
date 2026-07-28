@@ -564,6 +564,15 @@ export interface Task {
    */
   baseRef: string | null;
   /**
+   * URL of the pull request opened for this task's branch, or null if none
+   * has been created yet. Set server-side, atomically with creation, by
+   * `POST /github/pull-create` when the request carries this task's id —
+   * never patchable directly (kept out of the PATCH allow-list, same
+   * treatment as `branch`/`worktreePath`/`baseRef`). Once set, the UI shows
+   * a durable "View PR" link instead of re-offering "Open PR".
+   */
+  prUrl: string | null;
+  /**
    * Friendly mode id ("auto", "ask", "acceptEdits", "plan", …). Maps to
    * agent-specific CLI flags in `src/bun/agents.ts`. NULL means "use the
    * agent's hands-off default" (back-compat: --dangerously-skip-permissions
@@ -717,6 +726,38 @@ export interface WorktreeGitStatus {
   /** The dir isn't inspectable (missing, not a git repo, git failed). When true,
    *  the other fields are not meaningful. */
   ignored: boolean;
+}
+
+/**
+ * On-demand live git status for a single *task*, as surfaced by
+ * `GET /tasks/:id/git-status`. Distinct from {@link WorktreeGitStatus} (which
+ * backs the orphan-worktree management UI) — this one drives the run panel's
+ * "Commit & push" and "Open PR" chips.
+ */
+export interface TaskGitStatus {
+  /** Working tree has uncommitted changes (staged, unstaged, or untracked). */
+  hasChanges: boolean;
+  /**
+   * Commits on HEAD not yet pushed, computed against the task's upstream if
+   * one exists, else against the pinned `baseRef` (see `getAheadCount`). `0`
+   * when unknown. This is the "commit & push" ahead count — distinct from
+   * `remoteSynced`'s own upstream-only ahead check below.
+   */
+  ahead: number;
+  /** The dir isn't inspectable (missing, not a git repo, git failed). When true,
+   *  the other fields default to their "nothing to offer" values and shouldn't
+   *  be read as meaningful. */
+  ignored: boolean;
+  /** The task's branch has a configured upstream (i.e. has been pushed at
+   *  least once) — computed locally via `remoteSyncState`, no network call. */
+  hasUpstream: boolean;
+  /**
+   * `hasUpstream && ahead(@{u}..HEAD) === 0` — the branch exists on the
+   * remote and local HEAD has nothing left to push. Gates the "Open PR"
+   * affordance. A remote strictly ahead of local (`behind > 0`) does not
+   * block this — only unpushed local commits do.
+   */
+  remoteSynced: boolean;
 }
 
 /** A live terminal tab for a task. Returned by the terminal REST endpoints;

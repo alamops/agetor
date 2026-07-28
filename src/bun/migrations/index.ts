@@ -33,6 +33,7 @@ import m028 from "./028_branch_source.sql" with { type: "text" };
 // This branch originally used 028 for task_draft; renumbered to 029 on merge
 // to avoid the clash with main's 028_branch_source (same as 026 above).
 import m029 from "./029_task_draft.sql" with { type: "text" };
+import m030 from "./030_task_pr_url.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -66,4 +67,5 @@ export const migrations: Migration[] = [
   { id: "027_subagent_tool_use_id", sql: m027 },
   { id: "028_branch_source", sql: m028 },
   { id: "029_task_draft", sql: m029 },
+  { id: "030_task_pr_url", sql: m030 },
 ];
