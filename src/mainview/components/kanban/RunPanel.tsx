@@ -20,6 +20,7 @@ import {
   AGENT_OPTIONS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  EVENTS_WINDOW_MAX,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -32,6 +33,7 @@ import {
   type SubagentEvent,
   type Task,
   type TaskDraft,
+  type TaskEventsReplayMeta,
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
@@ -73,8 +75,18 @@ function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
  * unified stream, purely so `rebuilt-mask.ts` can tell a genuinely NEW live
  * event apart from one the server re-delivers on SSE reconnect (full-history
  * replay) when deciding whether the JSONL rebuild snapshot has gone stale.
+ *
+ * `dbId`, when present, is the REAL `run_events.id` row id — only known for
+ * events fetched via `GET /tasks/:id/events/page` ("Load earlier"), since
+ * that's the one route that returns it (the SSE replay/live paths never do —
+ * see above). It's what lets the live-window trim (`EVENTS_WINDOW_MAX`) figure
+ * out a fresh `beforeId` cursor after eating into previously-loaded earlier
+ * history: if the new front-of-window event carries a `dbId`, that becomes
+ * the new `earliestId`; if it doesn't (an ordinary replay/live event with no
+ * known DB id), "Load earlier" has nothing reliable to page from and hides
+ * until the next SSE (re)connect re-seeds `earliestId` from `replay_meta`.
  */
-type StreamEvent = RunEvent & { id: number };
+type StreamEvent = RunEvent & { id: number; dbId?: number };
 
 interface Props {
   /** When null, the panel slides off-screen and unmounts after the exit animation. */
@@ -296,6 +308,30 @@ function RunPanelBody({
   // the rebuild-snapshot-invalidation check needs to be race-free. Reset to
   // 0 on task switch alongside the rest of the stream state.
   const nextEventIdRef = useRef(0);
+  // Descending id source for events PREPENDED via "Load earlier" (see
+  // `loadEarlierEvents`). Always negative and always decreasing, so a
+  // page-fetched historical event's client `id` sorts before every live/replay
+  // `StreamEvent.id` (which start at 0 and only increase) — this keeps it
+  // outside `rebuilt-mask.ts`'s "genuinely newer than the snapshot" check
+  // without needing any special-casing there. Reset to -1 on task switch.
+  const prevEventIdRef = useRef(-1);
+  // Mirrors `events` synchronously (state updates land a render later) so the
+  // SSE batch-flush callback and `loadEarlierEvents` can read/trim the
+  // "current" array without relying on React's functional-setState form —
+  // doing the window-cap trim (see EVENTS_WINDOW_MAX below) inside a
+  // setState updater would run twice under StrictMode's dev double-invoke.
+  const eventsRef = useRef<StreamEvent[]>([]);
+  /** DB id of the earliest event currently anchoring the "Load earlier"
+   *  cursor, or null when unknown (hides the button — see `StreamEvent.dbId`
+   *  and the window-trim comment in the SSE effect below). Seeded from the
+   *  SSE `replay_meta` frame on (re)connect; advanced by each successful
+   *  "Load earlier" page fetch; recomputed (possibly to null) when live
+   *  growth trims the window's front past a known anchor. */
+  const [earliestId, setEarliestId] = useState<number | null>(null);
+  /** Whether older history exists before `earliestId` — gates the "Load
+   *  earlier" button together with `earliestId !== null`. */
+  const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   // Reset on task switch (no remount because we no longer key on task.id).
   // Re-arm the auto-scroll heuristic so opening a different task pins the
@@ -303,6 +339,11 @@ function RunPanelBody({
   // task's scrolled-up position.
   useEffect(() => {
     setEvents([]);
+    eventsRef.current = [];
+    prevEventIdRef.current = -1;
+    setEarliestId(null);
+    setHasMoreEarlier(false);
+    setLoadingEarlier(false);
     setRebuilt(null);
     setRebuildNote(null);
     setInteractions([]);
@@ -359,8 +400,42 @@ function RunPanelBody({
     [],
   );
 
+  // ── Poll gating (runs + subagents) ────────────────────────────────────────
+  // Both 2s polls below share the same "is there any reason to keep looking"
+  // condition: a run in flight, a subagent running, or an interaction waiting
+  // on the user. These booleans are read by each poll's own `evaluate()`
+  // (defined inside the effect so it can start/stop that effect's own timer)
+  // — refs, not plain closures, because `latestRun`/`subagentList`/
+  // `interactions` change on every render without re-running the poll effects
+  // (whose deps are just `[task.id, task.runId]` / `[task.id]`, deliberately,
+  // so an interaction resolving doesn't reset an in-flight interval). The
+  // kick/evaluate refs let the activity-change effect and the SSE handler
+  // below reach into a poll effect that was set up earlier without needing it
+  // in their own dependency arrays.
+  const runActiveRef = useRef(false);
+  const subagentActiveRef = useRef(false);
+  const interactionPendingRef = useRef(false);
+  const runsPollKickRef = useRef<() => void>(() => {});
+  const subagentsPollKickRef = useRef<() => void>(() => {});
+  const runsPollEvaluateRef = useRef<() => void>(() => {});
+  const subagentsPollEvaluateRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    runActiveRef.current = latestRun?.status === "running";
+    subagentActiveRef.current = subagentList.some((s) => s.status === "running");
+    interactionPendingRef.current = interactions.length > 0;
+    // Re-arm (or re-suspend) both polls now that the activity picture changed
+    // — e.g. the latest run just resolved (stop) or a subagent just finished
+    // while the run was already idle (also stop; the reverse case, a run/
+    // subagent starting, is normally already covered by `task.runId`/mount
+    // effects below, but this keeps both polls honest either way).
+    runsPollEvaluateRef.current();
+    subagentsPollEvaluateRef.current();
+  }, [latestRun?.status, subagentList, interactions.length]);
+
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
     const load = async () => {
       try {
         const list = await api.listRuns(task.id);
@@ -368,17 +443,51 @@ function RunPanelBody({
         setRuns(list);
       } catch { /* task may have been deleted */ }
     };
-    void load();
-    const t = setInterval(load, 2000);
-    return () => { cancelled = true; clearInterval(t); };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // Paused while the window is hidden (nothing to repaint) or once the task
+    // has gone fully idle (terminal run, no subagent running, no pending
+    // interaction) — resumed by `kick()` below on visible/focus or a live-sign
+    // SSE event, so a change on the server side is never missed for long.
+    const evaluate = () => {
+      if (document.hidden) { stopTimer(); return; }
+      if (!runActiveRef.current && !subagentActiveRef.current && !interactionPendingRef.current) {
+        stopTimer();
+        return;
+      }
+      startTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    runsPollKickRef.current = kick;
+    runsPollEvaluateRef.current = evaluate;
+    void load(); // initial load on mount always happens, regardless of gating
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [task.id, task.runId]);
 
   // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
   // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
   // runs poll). Merge rather than replace so an in-flight SSE delta isn't
-  // clobbered by a slightly-stale poll.
+  // clobbered by a slightly-stale poll. Same visibility/idle gating as the
+  // runs poll above (own timer, shared activity refs).
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
     const load = async () => {
       try {
         const list = await api.listSubagents(task.id);
@@ -394,9 +503,37 @@ function RunPanelBody({
         });
       } catch { /* task may have been deleted */ }
     };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    const evaluate = () => {
+      if (document.hidden) { stopTimer(); return; }
+      if (!runActiveRef.current && !subagentActiveRef.current && !interactionPendingRef.current) {
+        stopTimer();
+        return;
+      }
+      startTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    subagentsPollKickRef.current = kick;
+    subagentsPollEvaluateRef.current = evaluate;
     void load();
-    const t = setInterval(load, 2000);
-    return () => { cancelled = true; clearInterval(t); };
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [task.id]);
 
   // One unified task-level stream: every event from every run, merged in
@@ -431,9 +568,36 @@ function RunPanelBody({
     // arm/flush bookkeeping (and the re-arm-after-flush invariant that fixes
     // the freeze) lives in `createEventBuffer` so it can be unit-tested.
     const FLUSH_FALLBACK_MS = 250;
+    // Flips true the moment the first batch flushes. All of the SSE replay
+    // burst's `onmessage` calls land synchronously, well before the first
+    // rAF/timeout-scheduled flush can fire (see the buffer's own doc comment)
+    // — so gating the "any onmessage is a life sign" poll-kick (below) on
+    // this flag means the replay burst itself can only ever trigger cheap
+    // `evaluate()` calls, never a fetch storm at panel-open time. Once the
+    // first flush has happened, subsequent `status`/`user` events are almost
+    // certainly genuinely live, and DO warrant an immediate poll kick.
+    const initialSettledRef = { current: false };
     const buffer = createEventBuffer<StreamEvent>(
       (batch) => {
-        setEvents((cur) => [...cur, ...batch]);
+        initialSettledRef.current = true;
+        // Trim from the front once the live window exceeds EVENTS_WINDOW_MAX
+        // (see StreamEvent's `dbId` doc comment for how the new earliestId is
+        // derived — or why it sometimes can't be). `eventsRef` mirrors
+        // `events` synchronously so this math doesn't need React's
+        // functional-setState form (which would run twice under StrictMode's
+        // dev double-invoke and could double-decrement counters/side effects
+        // if this logic lived inside it).
+        const merged = [...eventsRef.current, ...batch];
+        let next = merged;
+        if (merged.length > EVENTS_WINDOW_MAX) {
+          next = merged.slice(merged.length - EVENTS_WINDOW_MAX);
+          const front = next[0];
+          const newEarliestId = front?.dbId ?? null;
+          setEarliestId(newEarliestId);
+          setHasMoreEarlier(newEarliestId != null);
+        }
+        eventsRef.current = next;
+        setEvents(next);
         // A newer live MAIN-stream event landing for a run the rebuilt-from-
         // JSONL snapshot is currently masking means the snapshot is stale —
         // clear it so `displayedEvents` falls back to the live stream. This
@@ -475,50 +639,74 @@ function RunPanelBody({
     const onFocus = () => buffer.flushNow();
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onFocus);
-    const unsub = api.subscribeTask(task.id, (e) => {
-      if (!dedupe.accept(e)) return;
-      if (e.stream === "interaction") {
-        try {
-          const req = JSON.parse(e.data) as PendingInteraction;
-          setInteractions((cur) => cur.some((x) => x.id === req.id) ? cur : [...cur, req]);
-        } catch { /* ignore malformed */ }
-        return;
-      }
-      if (e.stream === "subagent") {
-        // Live lifecycle delta for a background/sub agent — upsert into the tab
-        // list instead of pushing to the log buffer. The agent's actual
-        // transcript rides the normal user/assistant/tool_* streams (tagged
-        // via `subagentId`) and flows through to `buffer.push` below.
-        try {
-          const { subagent } = JSON.parse(e.data) as SubagentEvent;
-          setSubagentList((cur) => {
-            const i = cur.findIndex((s) => s.id === subagent.id);
-            if (i === -1) return [...cur, subagent];
-            const next = cur.slice();
-            next[i] = subagent;
-            return next;
-          });
-        } catch { /* ignore malformed */ }
-        return;
-      }
-      if (e.stream === "interaction_resolved") {
-        // Server-side resolution (scraper auto-cancel, run cancellation,
-        // delete) — drop the matching card so the UI doesn't keep
-        // showing a stale prompt. The card's own submit handler also
-        // calls `dismissInteraction(id)` directly; both paths are
-        // idempotent under `id`-based filtering.
-        try {
-          const { id } = JSON.parse(e.data) as { id: string };
-          setInteractions((cur) => cur.filter((x) => x.id !== id));
-        } catch { /* ignore malformed */ }
-        return;
-      }
-      // Tag with the next client-assigned id (see `StreamEvent`) — the
-      // server doesn't send one over SSE, and the invalidation check above
-      // needs a monotonic ordering to distinguish a genuinely new event from
-      // one the replay burst re-delivers on reconnect.
-      buffer.push({ ...e, id: nextEventIdRef.current++ });
-    });
+    const unsub = api.subscribeTask(
+      task.id,
+      (e) => {
+        if (!dedupe.accept(e)) return;
+        if (e.stream === "interaction") {
+          try {
+            const req = JSON.parse(e.data) as PendingInteraction;
+            setInteractions((cur) => cur.some((x) => x.id === req.id) ? cur : [...cur, req]);
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        if (e.stream === "subagent") {
+          // Live lifecycle delta for a background/sub agent — upsert into the tab
+          // list instead of pushing to the log buffer. The agent's actual
+          // transcript rides the normal user/assistant/tool_* streams (tagged
+          // via `subagentId`) and flows through to `buffer.push` below.
+          try {
+            const { subagent } = JSON.parse(e.data) as SubagentEvent;
+            setSubagentList((cur) => {
+              const i = cur.findIndex((s) => s.id === subagent.id);
+              if (i === -1) return [...cur, subagent];
+              const next = cur.slice();
+              next[i] = subagent;
+              return next;
+            });
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        if (e.stream === "interaction_resolved") {
+          // Server-side resolution (scraper auto-cancel, run cancellation,
+          // delete) — drop the matching card so the UI doesn't keep
+          // showing a stale prompt. The card's own submit handler also
+          // calls `dismissInteraction(id)` directly; both paths are
+          // idempotent under `id`-based filtering.
+          try {
+            const { id } = JSON.parse(e.data) as { id: string };
+            setInteractions((cur) => cur.filter((x) => x.id !== id));
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        // "Life sign" re-arm for the runs/subagents polls (see the poll-gating
+        // block above): a `status` or `user` event is the rare, low-volume
+        // signal that a run's lifecycle actually moved (started/hibernated/
+        // ended, or a follow-up was sent) — worth an immediate poll kick.
+        // Every other stream (assistant/thinking/tool_use/tool_result/stdout/
+        // stderr) can arrive at high frequency mid-turn, so those only get the
+        // cheap no-fetch `evaluate()`. Gated on `initialSettledRef` so the
+        // open-time replay burst (which can contain many historical status/
+        // user events) never turns into a fetch storm — see that ref's doc
+        // comment above.
+        if (initialSettledRef.current && (e.stream === "status" || e.stream === "user")) {
+          runsPollKickRef.current();
+          subagentsPollKickRef.current();
+        } else {
+          runsPollEvaluateRef.current();
+          subagentsPollEvaluateRef.current();
+        }
+        // Tag with the next client-assigned id (see `StreamEvent`) — the
+        // server doesn't send one over SSE, and the invalidation check above
+        // needs a monotonic ordering to distinguish a genuinely new event from
+        // one the replay burst re-delivers on reconnect.
+        buffer.push({ ...e, id: nextEventIdRef.current++ });
+      },
+      (meta) => {
+        setEarliestId(meta.earliestId);
+        setHasMoreEarlier(meta.hasMore);
+      },
+    );
     return () => {
       buffer.dispose();
       document.removeEventListener("visibilitychange", onVisible);
@@ -526,6 +714,64 @@ function RunPanelBody({
       unsub();
     };
   }, [task.id]);
+
+  // Holds a pre-prepend `{scrollHeight, scrollTop}` snapshot for the layout
+  // effect just below to restore from — see that effect's doc comment.
+  const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+
+  /**
+   * "Load earlier messages" — fetches one older page (`beforeId = earliestId`)
+   * and prepends it to `events`. Prepended events get a descending client id
+   * from `prevEventIdRef` (see `StreamEvent`'s doc comment) and carry the
+   * real server `dbId`, which is what lets a later window-cap trim re-derive
+   * `earliestId` after eating into this history. Scroll position is
+   * preserved by capturing the log's `scrollHeight`/`scrollTop` before the
+   * prepend and restoring `scrollTop` by the height delta once the DOM has
+   * grown (see the layout effect below) — the "simple approach" from the
+   * plan rather than anchoring to a specific DOM node.
+   */
+  const loadEarlierEvents = useCallback(() => {
+    if (earliestId == null || !hasMoreEarlier || loadingEarlier) return;
+    const el = logRef.current;
+    setLoadingEarlier(true);
+    void api.fetchTaskEventsPage(task.id, earliestId)
+      .then((page) => {
+        if (page.events.length > 0) {
+          const mapped: StreamEvent[] = page.events.map((ev) => ({
+            ...ev,
+            id: prevEventIdRef.current--,
+            dbId: ev.id,
+          }));
+          if (el) {
+            scrollRestoreRef.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: el.scrollTop };
+          }
+          const next = [...mapped, ...eventsRef.current];
+          eventsRef.current = next;
+          setEvents(next);
+        }
+        setEarliestId(page.earliestId);
+        setHasMoreEarlier(page.hasMore);
+      })
+      .catch(() => { /* transient failure — button stays enabled to retry */ })
+      .finally(() => setLoadingEarlier(false));
+  }, [task.id, earliestId, hasMoreEarlier, loadingEarlier]);
+
+  // Restores scroll position after "Load earlier" prepends older events above
+  // the current viewport — without this the browser leaves `scrollTop`
+  // unchanged, which visually yanks the previously-visible content down by
+  // however tall the newly-inserted history is. Runs after every commit (the
+  // ref-guarded early return keeps that cheap) rather than being keyed to a
+  // dependency, since the meaningful trigger is "did `loadEarlierEvents` just
+  // prepend", not any particular prop.
+  useLayoutEffect(() => {
+    const pending = scrollRestoreRef.current;
+    if (!pending) return;
+    scrollRestoreRef.current = null;
+    const el = logRef.current;
+    if (!el) return;
+    const delta = el.scrollHeight - pending.prevScrollHeight;
+    el.scrollTop = pending.prevScrollTop + delta;
+  });
 
   // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
   // a user who scrolled up to read history is never yanked back down:
@@ -1470,6 +1716,23 @@ function RunPanelBody({
         // problematic spots instead.
         className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed"
       >
+        {/* "Load earlier messages" — only meaningful once we have a real DB
+            cursor to page from (see StreamEvent's `dbId` doc comment for why
+            `earliestId` can go null). Sits above everything else in the
+            scrollback, including the rebuild-from-JSONL row below. */}
+        {hasMoreEarlier && earliestId != null && (
+          <div className="mb-2 flex justify-center">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={loadEarlierEvents}
+              disabled={loadingEarlier}
+              className="h-6 px-2 text-[10px] uppercase tracking-wide text-muted-foreground"
+            >
+              {loadingEarlier ? "Loading…" : "Load earlier messages"}
+            </Button>
+          </div>
+        )}
         {runs.length === 0 ? (
           <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
         ) : displayedEvents.length === 0 ? (
