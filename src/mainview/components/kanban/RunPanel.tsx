@@ -3,15 +3,17 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
   GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
 import { shouldOfferCommitPush, type TaskGitStatus } from "@/lib/commit-push";
+import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
@@ -160,9 +162,10 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
 
   // Escape closes the panel — but only when no higher-priority dismissable
   // layer is up: a modal Dialog (confirm, edit, settings, tmux-missing —
-  // each renders `[role="dialog"][aria-modal="true"]`) or an open
-  // search-select / multi-search-select popover (marked with
-  // `[data-popover-open]`). Esc peels one layer at a time, top down.
+  // each renders `[role="dialog"][aria-modal="true"]`), an open search-select
+  // / multi-search-select popover (marked with `[data-popover-open]`), or the
+  // in-panel message search bar (marked with `[data-search-open]` — see
+  // RunPanelBody). Esc peels one layer at a time, top down.
   //
   // Note: stopPropagation/stopImmediatePropagation can't help here because
   // both the panel and the popovers attach to `document`, so DOM markers
@@ -177,7 +180,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-search-open]')) return;
       e.preventDefault();
       onCloseRef.current();
     };
@@ -282,6 +285,19 @@ function RunPanelBody({
    *  subagent id. Background-agent streams are READ-ONLY — the composer is
    *  hidden while one is active. */
   const [activeStream, setActiveStream] = useState<string>("main");
+  /** In-panel search over whichever stream is currently displayed (see
+   *  lib/event-search.ts). Read-only and deliberately NOT gated on
+   *  `activeStream === "main"` or archival state — it works identically on a
+   *  subagent tab or an archived task's frozen log. */
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  /** The selected match, as an index into `displayedEvents` (see
+   *  `searchableEvents` below) — NOT a `StreamEvent.id`. A JSONL-rebuilt event
+   *  has no client-assigned id at all (see `StreamEvent`'s doc comment
+   *  above), so `searchableEvents` assigns fresh 0..N-1 ids scoped to
+   *  whatever's currently displayed. `null` means no match is selected. */
+  const [activeMatchId, setActiveMatchId] = useState<number | null>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   // Tracks whether the log was scrolled near the bottom at the last user
   // interaction. Auto-scroll-to-bottom on new events only fires when this is
@@ -308,6 +324,9 @@ function RunPanelBody({
     setInteractions([]);
     setSubagentList([]);
     setActiveStream("main");
+    setSearchOpen(false);
+    setSearchQuery("");
+    setActiveMatchId(null);
     nearBottomRef.current = true;
   }, [task.id]);
 
@@ -675,6 +694,111 @@ function RunPanelBody({
    *  (see lib/todo-progress.ts). Memoized on `displayedEvents` alone — it is
    *  recomputed on every SSE frame, so it must stay a single O(n) pass. */
   const todoProgress = useMemo(() => deriveTodoProgress(displayedEvents), [displayedEvents]);
+
+  /** `displayedEvents` re-keyed with a fresh 0..N-1 id per position — the
+   *  input shape `event-search.ts` needs. `displayedEvents` is typed as plain
+   *  `RunEvent[]`: the "main" branch's live events happen to carry the
+   *  client-assigned `StreamEvent.id`, but a `rebuilt` (JSONL-reparsed) splice
+   *  does NOT, so a real `.id` can't be relied on here — a positional index
+   *  scoped to this exact array is the only id every entry is guaranteed to
+   *  have, and it's exactly what `data-evid` below is keyed on too. */
+  const searchableEvents = useMemo(
+    () => displayedEvents.map((e, i) => ({ id: i, stream: e.stream, data: e.data })),
+    [displayedEvents],
+  );
+  const matches = useMemo(
+    () => findMatchingEventIds(searchableEvents, searchQuery),
+    [searchableEvents, searchQuery],
+  );
+
+  // Resolve which match is active whenever the match set changes — either
+  // because the query changed, or because `displayedEvents` shifted under an
+  // open search (new streamed events, a JSONL rebuild splice, or a tab/task
+  // switch). `activeMatchId` is read directly from the render closure rather
+  // than a ref: since this effect's callback is recreated fresh every render
+  // but only *invoked* when `matches` changes, the value captured is exactly
+  // "whatever was active before this recompute" — precisely the `prevActiveId`
+  // `resolveActiveMatchIndex` wants. Deliberately excludes `activeMatchId`
+  // from deps: including it would make the effect re-fire the moment it sets
+  // it, driven by its own write instead of a genuine match-set change (the
+  // `nextId !== activeMatchId` guard would still no-op on that redundant run,
+  // but there's no reason to pay for it).
+  //
+  // A tab or task switch reuses this SAME effect rather than a separate reset:
+  // `matches` are positional indices scoped to `displayedEvents`, so an id
+  // that was active on the previous stream is a coincidence, not a carry-over,
+  // once `activeStream`/`task.id` changes the underlying array out from under
+  // it — `searchScopeRef` detects that and forces `prevActiveId` to `null` so
+  // the resolution can't accidentally "keep" an unrelated index that happens
+  // to also be a match in the new scope.
+  const searchScopeRef = useRef<string>(`${task.id}:${activeStream}`);
+  useEffect(() => {
+    const scopeKey = `${task.id}:${activeStream}`;
+    const scopeChanged = scopeKey !== searchScopeRef.current;
+    searchScopeRef.current = scopeKey;
+    const prevActiveId = scopeChanged ? null : activeMatchId;
+    const idx = resolveActiveMatchIndex(matches, prevActiveId);
+    const nextId = idx >= 0 ? matches[idx]! : null;
+    if (nextId !== activeMatchId) setActiveMatchId(nextId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matches, task.id, activeStream]);
+
+  // Scroll the active match into view. Runs after the resolve effect above
+  // (and after any tab/task switch), so by the time this fires `activeMatchId`
+  // already points at an event rendered in the CURRENT `displayedEvents`.
+  useEffect(() => {
+    if (activeMatchId === null) return;
+    const el = logRef.current?.querySelector(`[data-evid="${activeMatchId}"]`);
+    el?.scrollIntoView({ block: "center" });
+  }, [activeMatchId]);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery("");
+    setActiveMatchId(null);
+  }, []);
+
+  const stepSearch = useCallback((dir: 1 | -1) => {
+    setActiveMatchId((cur) => {
+      const idx = matches.indexOf(cur ?? -1);
+      const next = stepMatchIndex(matches.length, idx, dir);
+      return next >= 0 ? matches[next]! : null;
+    });
+  }, [matches]);
+
+  // Cmd/Ctrl+F opens the search bar and focuses its input, while the panel is
+  // mounted. Guarded the same way the panel's own Escape-to-close listener
+  // guards against a higher-priority dismissable layer (modal dialog / open
+  // search-select popover) so it doesn't hijack the browser/OS's own find
+  // behavior — or a dialog's own input — while one of those is up.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() !== "f" || !(e.metaKey || e.ctrlKey)) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      e.preventDefault();
+      setSearchOpen(true);
+      // The input isn't mounted yet on the render this triggers (the bar
+      // renders conditionally on `searchOpen`) — focus after the next paint.
+      requestAnimationFrame(() => searchInputRef.current?.focus());
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Escape closes the search bar regardless of where focus currently is
+  // within the panel (not just while the input itself is focused) — matching
+  // "Escape peels one layer at a time" from the panel's own listener. Gated
+  // on `searchOpen` so it's only attached while there's something to close.
+  useEffect(() => {
+    if (!searchOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      closeSearch();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [searchOpen, closeSearch]);
 
   /** Indicator mode for the bottom-pinned heartbeat. A follow-up sent while
    *  the agent is working is folded into the active run (the backend pastes it
@@ -1412,11 +1536,80 @@ function RunPanelBody({
               <ArchiveRestore className="mr-1 size-3" /> Unarchive
             </Button>
           )}
+          <Button
+            size="icon"
+            variant="ghost"
+            title="Search messages"
+            onClick={() => {
+              if (searchOpen) {
+                closeSearch();
+                return;
+              }
+              setSearchOpen(true);
+              // The input isn't mounted yet on the render this triggers (the
+              // bar renders conditionally on `searchOpen`) — focus after the
+              // next paint.
+              requestAnimationFrame(() => searchInputRef.current?.focus());
+            }}
+          >
+            <Search className="size-4" />
+          </Button>
           <Button size="icon" variant="ghost" onClick={onClose}>
             <X className="size-4" />
           </Button>
         </div>
       </header>
+
+      {searchOpen && (
+        <div data-search-open="" className="flex items-center gap-2 border-b border-border/60 px-3 py-2">
+          <div className="relative flex-1">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
+            <Input
+              ref={searchInputRef}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  stepSearch(e.shiftKey ? -1 : 1);
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  closeSearch();
+                }
+              }}
+              placeholder="Search messages…"
+              className="h-8 pl-8 text-xs"
+            />
+          </div>
+          <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+            {matches.length === 0 ? "0/0" : `${matches.indexOf(activeMatchId ?? -1) + 1}/${matches.length}`}
+          </span>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-7"
+            disabled={matches.length === 0}
+            title="Previous match"
+            onClick={() => stepSearch(-1)}
+          >
+            <ChevronUp className="size-3.5" />
+          </Button>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-7"
+            disabled={matches.length === 0}
+            title="Next match"
+            onClick={() => stepSearch(1)}
+          >
+            <ChevronDown className="size-3.5" />
+          </Button>
+          <Button size="icon" variant="ghost" className="size-7" title="Close search" onClick={closeSearch}>
+            <X className="size-3.5" />
+          </Button>
+        </div>
+      )}
 
       <FileMentions task={task} events={events} />
 
@@ -1502,6 +1695,7 @@ function RunPanelBody({
               onInteractionResolved={dismissInteraction}
               runStatus={activeRunStatus}
               indicatorMode={indicatorMode}
+              activeMatchId={activeMatchId}
             />
           </>
         )}
@@ -2371,12 +2565,19 @@ function RunEventList({
   onInteractionResolved,
   runStatus,
   indicatorMode = "off",
+  activeMatchId = null,
 }: {
   events: RunEvent[];
   interactions?: PendingInteraction[];
   onInteractionResolved?: (id: string) => void;
   runStatus?: Run["status"] | null;
   indicatorMode?: RunIndicatorMode;
+  /** Index (into `events`, matching `event-search.ts`'s id scheme) of the
+   *  currently-selected search match, or null when search is closed / has no
+   *  selection. Drives the `data-evid` scroll target + highlight ring below —
+   *  purely a rendering concern, so it's threaded straight through rather than
+   *  re-derived here. */
+  activeMatchId?: number | null;
 }) {
   // Index tool_results by their tool_use_id so the tool-use card can show
   // Normalise legacy `[tool: Name] {...}` / `[thinking] ...` / `[result] ...`
@@ -2438,34 +2639,50 @@ function RunEventList({
   // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`)
   // are tracked explicitly.
   const sections = useMemo(() => {
-    const renderEvent = (e: RunEvent, key: string): React.ReactNode[] => {
+    // Wrap a rendered block in the `data-evid` carrier the search bar scrolls
+    // to (`logRef.current?.querySelector('[data-evid="…"]')` in RunPanelBody)
+    // and, when it's the active match, a highlight ring. `evid` is `i` from
+    // the loop below — the position of this event within `normalised` (and so
+    // within `events`/`displayedEvents`), which is exactly the id scheme
+    // `event-search.ts` uses. The wrapper carries the key so the memoized
+    // block components underneath keep their identity/props untouched.
+    const wrap = (key: string, evid: number, node: React.ReactNode): React.ReactNode => (
+      <div
+        key={key}
+        data-evid={evid}
+        className={cn(evid === activeMatchId && "rounded-md ring-1 ring-primary/60 bg-primary/5")}
+      >
+        {node}
+      </div>
+    );
+    const renderEvent = (e: RunEvent, key: string, evid: number): React.ReactNode[] => {
       switch (e.stream) {
         case "user":
-          return [<UserMessageBlock key={key} text={e.data} />];
+          return [wrap(key, evid, <UserMessageBlock text={e.data} />)];
         case "assistant":
-          return [<AssistantBlock key={key} text={e.data} />];
+          return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
-          return [<ThinkingBlock key={key} text={e.data} />];
+          return [wrap(key, evid, <ThinkingBlock text={e.data} />)];
         case "tool_use": {
           const parsed = safeParse<ParsedToolUse>(e.data);
-          if (!parsed) return [<RawText key={key} text={e.data} muted />];
+          if (!parsed) return [wrap(key, evid, <RawText text={e.data} muted />)];
           const result = resultByToolId.get(parsed.id);
-          return [<ToolUseBlock key={key} call={parsed} result={result} />];
+          return [wrap(key, evid, <ToolUseBlock call={parsed} result={result} />)];
         }
         case "tool_result": {
           const parsed = safeParse<ParsedToolResult>(e.data);
           if (parsed && parsed.toolUseId && resultByToolId.get(parsed.toolUseId)) return [];
-          return [<ToolResultBlock key={key} result={parsed} />];
+          return [wrap(key, evid, <ToolResultBlock result={parsed} />)];
         }
         case "status":
-          return [<StatusDivider key={key} text={e.data} />];
+          return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
-          return [<ErrorBlock key={key} text={e.data} />];
+          return [wrap(key, evid, <ErrorBlock text={e.data} />)];
         case "stdout":
         case "interaction":
         default:
           if (e.stream === "interaction") return [];
-          return [<RawText key={key} text={e.data} />];
+          return [wrap(key, evid, <RawText text={e.data} />)];
       }
     };
     const renderInteraction = (it: PendingInteraction) => {
@@ -2489,17 +2706,17 @@ function RunEventList({
       const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
       if (e.stream === "user") {
         if (current.header !== null || current.body.length > 0) out.push(current);
-        current = { key, header: renderEvent(e, key)[0] ?? null, body: [...before] };
+        current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
       } else {
         if (current.key === "") current.key = key;
-        current.body.push(...before, ...renderEvent(e, key));
+        current.body.push(...before, ...renderEvent(e, key, i));
       }
     }
     const tail = (interactionByIndex.get(normalised.length) ?? []).map(renderInteraction);
     current.body.push(...tail);
     if (current.header !== null || current.body.length > 0) out.push(current);
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, activeMatchId]);
 
   return (
     <div className="flex flex-col gap-4">
