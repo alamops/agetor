@@ -104,6 +104,14 @@ const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" 
 
 export const EXIT_DURATION_MS = 250;
 
+// Computed once at module load rather than per keystroke — used by the
+// Cmd/Ctrl+F handler below to pick the platform-appropriate modifier
+// (`metaKey` on macOS, `ctrlKey` elsewhere). Agetor packages arm64-only for
+// macOS, but the dev webview (Vite) can run in any browser during
+// development, so this still branches rather than assuming Mac.
+const IS_MAC_PLATFORM =
+  typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent || "");
+
 function formatDuration(r: Run): string {
   const end = r.endedAt ?? Date.now();
   const ms = end - r.startedAt;
@@ -213,6 +221,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           harnesses={harnesses}
           agentModels={agentModels}
           homeDir={homeDir}
+          open={open}
           onClose={onClose}
           onShowDiff={onShowDiff}
           onArchive={onArchive}
@@ -233,6 +242,7 @@ function RunPanelBody({
   harnesses,
   agentModels,
   homeDir,
+  open,
   onClose,
   onShowDiff,
   onArchive,
@@ -243,6 +253,11 @@ function RunPanelBody({
   harnesses: Harness[];
   agentModels: AgentModelMap;
   homeDir: string;
+  /** Whether the panel is in its "open" (not mid-close-animation, not
+   *  pre-mount) state — mirrors `RunPanel`'s own `open` state. Gates the
+   *  Cmd/Ctrl+F listener below so it doesn't hijack the shortcut while the
+   *  panel is animating out or not actually visible. */
+  open: boolean;
   onClose: () => void;
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
@@ -291,14 +306,19 @@ function RunPanelBody({
    *  subagent tab or an archived task's frozen log. */
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  /** The selected match, as an index into `displayedEvents` (see
-   *  `searchableEvents` below) — NOT a `StreamEvent.id`. A JSONL-rebuilt event
-   *  has no client-assigned id at all (see `StreamEvent`'s doc comment
-   *  above), so `searchableEvents` assigns fresh 0..N-1 ids scoped to
-   *  whatever's currently displayed. `null` means no match is selected. */
+  /** The selected match, as an index into `displayedEvents` — NOT a
+   *  `StreamEvent.id`. A JSONL-rebuilt event has no client-assigned id at
+   *  all (see `StreamEvent`'s doc comment above), so `findMatchingEventIds`
+   *  (lib/event-search.ts) uses each event's position in `displayedEvents`
+   *  as its id, scoped to whatever's currently displayed. `null` means no
+   *  match is selected. */
   const [activeMatchId, setActiveMatchId] = useState<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
+  // The DOM element currently carrying the search-match highlight classes
+  // (imperatively toggled, not driven by a React prop/memo dep — see the
+  // effect below). `null` when nothing is highlighted.
+  const highlightedElRef = useRef<HTMLElement | null>(null);
   // Tracks whether the log was scrolled near the bottom at the last user
   // interaction. Auto-scroll-to-bottom on new events only fires when this is
   // true, so a user who scrolls up to read history isn't yanked back down on
@@ -695,21 +715,29 @@ function RunPanelBody({
    *  recomputed on every SSE frame, so it must stay a single O(n) pass. */
   const todoProgress = useMemo(() => deriveTodoProgress(displayedEvents), [displayedEvents]);
 
-  /** `displayedEvents` re-keyed with a fresh 0..N-1 id per position — the
-   *  input shape `event-search.ts` needs. `displayedEvents` is typed as plain
-   *  `RunEvent[]`: the "main" branch's live events happen to carry the
-   *  client-assigned `StreamEvent.id`, but a `rebuilt` (JSONL-reparsed) splice
-   *  does NOT, so a real `.id` can't be relied on here — a positional index
-   *  scoped to this exact array is the only id every entry is guaranteed to
-   *  have, and it's exactly what `data-evid` below is keyed on too. */
-  const searchableEvents = useMemo(
-    () => displayedEvents.map((e, i) => ({ id: i, stream: e.stream, data: e.data })),
-    [displayedEvents],
-  );
+  // `findMatchingEventIds` (lib/event-search.ts) takes `displayedEvents`
+  // straight — it derives each event's search id from its own position in
+  // the array, so there's no separate pre-mapped/id-tagged array to build
+  // or memoize here.
   const matches = useMemo(
-    () => findMatchingEventIds(searchableEvents, searchQuery),
-    [searchableEvents, searchQuery],
+    () => findMatchingEventIds(displayedEvents, searchQuery),
+    [displayedEvents, searchQuery],
   );
+
+  // Derived purely for display — no state, so there's no "0/0" flash before
+  // an effect catches up and no risk of the position silently desyncing from
+  // `activeMatchId`/`matches`. `-1` (no match) renders as "0/0" below.
+  const activeMatchPosition = resolveActiveMatchIndex(matches, activeMatchId);
+
+  // A splice/clear of the JSONL-rebuild snapshot swaps `displayedEvents` out
+  // from under the current scope exactly like a tab/task switch does (the
+  // positional ids `matches` holds no longer refer to the same events), so
+  // its identity has to be part of the scope key below. `maxLiveEventIdAtSnapshot`
+  // is set fresh every time a snapshot is (re)captured for a session, so
+  // `sessionId:maxLiveEventIdAtSnapshot` is a stable id for "this particular
+  // rebuild snapshot" — distinct from both "no snapshot" and any prior
+  // snapshot of the same session.
+  const rebuiltScopeKey = rebuilt ? `${rebuilt.sessionId}:${rebuilt.maxLiveEventIdAtSnapshot}` : "";
 
   // Resolve which match is active whenever the match set changes — either
   // because the query changed, or because `displayedEvents` shifted under an
@@ -724,16 +752,16 @@ function RunPanelBody({
   // `nextId !== activeMatchId` guard would still no-op on that redundant run,
   // but there's no reason to pay for it).
   //
-  // A tab or task switch reuses this SAME effect rather than a separate reset:
-  // `matches` are positional indices scoped to `displayedEvents`, so an id
-  // that was active on the previous stream is a coincidence, not a carry-over,
-  // once `activeStream`/`task.id` changes the underlying array out from under
-  // it — `searchScopeRef` detects that and forces `prevActiveId` to `null` so
-  // the resolution can't accidentally "keep" an unrelated index that happens
-  // to also be a match in the new scope.
-  const searchScopeRef = useRef<string>(`${task.id}:${activeStream}`);
+  // A tab/task switch OR a rebuild-snapshot splice reuses this SAME effect
+  // rather than a separate reset: `matches` are positional indices scoped to
+  // `displayedEvents`, so an id that was active before any of those changes
+  // is a coincidence, not a carry-over — `searchScopeRef` detects the change
+  // and forces `prevActiveId` to `null` so the resolution can't accidentally
+  // "keep" an unrelated index that happens to also be a match in the new
+  // scope.
+  const searchScopeRef = useRef<string>(`${task.id}:${activeStream}:${rebuiltScopeKey}`);
   useEffect(() => {
-    const scopeKey = `${task.id}:${activeStream}`;
+    const scopeKey = `${task.id}:${activeStream}:${rebuiltScopeKey}`;
     const scopeChanged = scopeKey !== searchScopeRef.current;
     searchScopeRef.current = scopeKey;
     const prevActiveId = scopeChanged ? null : activeMatchId;
@@ -741,15 +769,35 @@ function RunPanelBody({
     const nextId = idx >= 0 ? matches[idx]! : null;
     if (nextId !== activeMatchId) setActiveMatchId(nextId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [matches, task.id, activeStream]);
+  }, [matches, task.id, activeStream, rebuilt, rebuiltScopeKey]);
 
-  // Scroll the active match into view. Runs after the resolve effect above
-  // (and after any tab/task switch), so by the time this fires `activeMatchId`
-  // already points at an event rendered in the CURRENT `displayedEvents`.
+  // Highlight + scroll the active match imperatively rather than through a
+  // React prop/memo dep: `RunEventList`'s `sections` memo used to take
+  // `activeMatchId` as a dep purely so it could stamp a highlight class on
+  // one wrapper div, which meant re-deriving (and re-diffing) the ENTIRE
+  // section tree on every match navigation. Toggling classList directly on
+  // the previous/next `[data-evid]` element is O(1) instead. Runs after the
+  // resolve effect above (and after any tab/task/rebuild-scope switch), so by
+  // the time this fires `activeMatchId` already points at an event rendered
+  // in the CURRENT `displayedEvents`.
   useEffect(() => {
+    const HIGHLIGHT_CLASSES = ["ring-1", "ring-primary/60", "bg-primary/5", "rounded-md"];
+    const prev = highlightedElRef.current;
+    if (prev) {
+      prev.classList.remove(...HIGHLIGHT_CLASSES);
+      highlightedElRef.current = null;
+    }
     if (activeMatchId === null) return;
-    const el = logRef.current?.querySelector(`[data-evid="${activeMatchId}"]`);
-    el?.scrollIntoView({ block: "center" });
+    const el = logRef.current?.querySelector<HTMLElement>(`[data-evid="${activeMatchId}"]`);
+    if (!el) return;
+    el.classList.add(...HIGHLIGHT_CLASSES);
+    highlightedElRef.current = el;
+    el.scrollIntoView({ block: "center" });
+    // The scrollIntoView above can land the log outside the "near bottom"
+    // band (or an SSE flush landing in the same tick could otherwise yank
+    // the view back to the bottom before the browser paints the scroll) —
+    // clear it immediately so neither auto-scroll path fights the jump.
+    nearBottomRef.current = false;
   }, [activeMatchId]);
 
   const closeSearch = useCallback(() => {
@@ -766,33 +814,56 @@ function RunPanelBody({
     });
   }, [matches]);
 
-  // Cmd/Ctrl+F opens the search bar and focuses its input, while the panel is
-  // mounted. Guarded the same way the panel's own Escape-to-close listener
-  // guards against a higher-priority dismissable layer (modal dialog / open
-  // search-select popover) so it doesn't hijack the browser/OS's own find
-  // behavior — or a dialog's own input — while one of those is up.
+  // Cmd/Ctrl+F opens the search bar and focuses its input (or, if the bar is
+  // already open, re-selects the existing query so typing replaces it
+  // outright) while the panel is actually open — not mid-close-animation or
+  // pre-mount, matching the panel's own Escape-to-close listener's `if
+  // (!open) return;` gate. Guarded the same way that listener guards against
+  // a higher-priority dismissable layer (modal dialog / open search-select
+  // popover) so it doesn't hijack the browser/OS's own find behavior — or a
+  // dialog's own input — while one of those is up. Also bails when focus is
+  // inside a terminal pane (`.xterm` — see TerminalView.tsx, which mounts
+  // xterm.js's own container carrying that class): Cmd/Ctrl+F there should
+  // reach the shell/program running in the PTY, not this panel's search.
   useEffect(() => {
+    if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key.toLowerCase() !== "f" || !(e.metaKey || e.ctrlKey)) return;
+      if (e.key.toLowerCase() !== "f" || e.altKey) return;
+      const wantsFind = IS_MAC_PLATFORM ? (e.metaKey && !e.ctrlKey) : e.ctrlKey;
+      if (!wantsFind) return;
       if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      if ((e.target as Element | null)?.closest?.(".xterm")) return;
       e.preventDefault();
+      if (searchOpen) {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+        return;
+      }
       setSearchOpen(true);
       // The input isn't mounted yet on the render this triggers (the bar
       // renders conditionally on `searchOpen`) — focus after the next paint.
-      requestAnimationFrame(() => searchInputRef.current?.focus());
+      requestAnimationFrame(() => {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      });
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, []);
+  }, [open, searchOpen]);
 
   // Escape closes the search bar regardless of where focus currently is
   // within the panel (not just while the input itself is focused) — matching
   // "Escape peels one layer at a time" from the panel's own listener. Gated
-  // on `searchOpen` so it's only attached while there's something to close.
+  // on `searchOpen` so it's only attached while there's something to close,
+  // and bails on the same higher-priority dismissable layer (modal dialog /
+  // open search-select popover) as every other document-level listener here
+  // so Escape closes the topmost layer first instead of skipping straight to
+  // the search bar underneath it.
   useEffect(() => {
     if (!searchOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
       e.preventDefault();
       closeSearch();
     };
@@ -1566,6 +1637,7 @@ function RunPanelBody({
             <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
             <Input
               ref={searchInputRef}
+              aria-label="Search messages"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               onKeyDown={(e) => {
@@ -1582,8 +1654,8 @@ function RunPanelBody({
               className="h-8 pl-8 text-xs"
             />
           </div>
-          <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
-            {matches.length === 0 ? "0/0" : `${matches.indexOf(activeMatchId ?? -1) + 1}/${matches.length}`}
+          <span aria-live="polite" className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+            {matches.length === 0 ? "0/0" : `${activeMatchPosition + 1}/${matches.length}`}
           </span>
           <Button
             size="icon"
@@ -1695,7 +1767,6 @@ function RunPanelBody({
               onInteractionResolved={dismissInteraction}
               runStatus={activeRunStatus}
               indicatorMode={indicatorMode}
-              activeMatchId={activeMatchId}
             />
           </>
         )}
@@ -2565,19 +2636,12 @@ function RunEventList({
   onInteractionResolved,
   runStatus,
   indicatorMode = "off",
-  activeMatchId = null,
 }: {
   events: RunEvent[];
   interactions?: PendingInteraction[];
   onInteractionResolved?: (id: string) => void;
   runStatus?: Run["status"] | null;
   indicatorMode?: RunIndicatorMode;
-  /** Index (into `events`, matching `event-search.ts`'s id scheme) of the
-   *  currently-selected search match, or null when search is closed / has no
-   *  selection. Drives the `data-evid` scroll target + highlight ring below —
-   *  purely a rendering concern, so it's threaded straight through rather than
-   *  re-derived here. */
-  activeMatchId?: number | null;
 }) {
   // Index tool_results by their tool_use_id so the tool-use card can show
   // Normalise legacy `[tool: Name] {...}` / `[thinking] ...` / `[result] ...`
@@ -2640,25 +2704,46 @@ function RunEventList({
   // are tracked explicitly.
   const sections = useMemo(() => {
     // Wrap a rendered block in the `data-evid` carrier the search bar scrolls
-    // to (`logRef.current?.querySelector('[data-evid="…"]')` in RunPanelBody)
-    // and, when it's the active match, a highlight ring. `evid` is `i` from
-    // the loop below — the position of this event within `normalised` (and so
-    // within `events`/`displayedEvents`), which is exactly the id scheme
-    // `event-search.ts` uses. The wrapper carries the key so the memoized
-    // block components underneath keep their identity/props untouched.
-    const wrap = (key: string, evid: number, node: React.ReactNode): React.ReactNode => (
-      <div
-        key={key}
-        data-evid={evid}
-        className={cn(evid === activeMatchId && "rounded-md ring-1 ring-primary/60 bg-primary/5")}
-      >
-        {node}
-      </div>
-    );
+    // to and imperatively highlights (`logRef.current?.querySelector('[data-
+    // evid="…"]')` in RunPanelBody — see the highlight effect there). `evid`
+    // is `i` from the loop below — the position of this event within
+    // `normalised` (and so within `events`/`displayedEvents`), which is
+    // exactly the id scheme `event-search.ts` uses. The wrapper carries the
+    // key so the memoized block components underneath keep their
+    // identity/props untouched. Only STATIC classes belong here — the
+    // highlight ring itself is toggled by the DOM effect in RunPanelBody, not
+    // by a render-time class, so this memo doesn't need `activeMatchId` as a
+    // dep (re-deriving the whole section tree on every match navigation was
+    // the point being fixed). `extraClassName` lets a specific stream (only
+    // `user`, below) opt into a class that has to live on THIS wrapper rather
+    // than on the block's own root — sticky positioning needs to be applied
+    // to the element that's actually the flex child of the scroll container.
+    // Returns `null` (no wrapper at all) when `node` is nullish, so an event
+    // with nothing to render (e.g. an unparseable orphan tool_result — see
+    // the `tool_result` case below) doesn't still leave a phantom empty div
+    // consuming a `gap-4` slot in the section's flex column.
+    const wrap = (
+      key: string,
+      evid: number,
+      node: React.ReactNode,
+      extraClassName?: string,
+    ): React.ReactNode => {
+      if (node === null || node === undefined) return null;
+      return (
+        <div key={key} data-evid={evid} className={extraClassName}>
+          {node}
+        </div>
+      );
+    };
     const renderEvent = (e: RunEvent, key: string, evid: number): React.ReactNode[] => {
       switch (e.stream) {
         case "user":
-          return [wrap(key, evid, <UserMessageBlock text={e.data} />)];
+          // Sticky positioning lives on this wrapper, not on
+          // `UserMessageBlock`'s own root — the wrapper is the actual flex
+          // child of the scroll container (`sections.map` below renders one
+          // `<section>` per user-message group), so THIS is the element that
+          // has to pin to `top-0` for the sticky header to work at all.
+          return [wrap(key, evid, <UserMessageBlock text={e.data} />, "sticky top-0 z-10")];
         case "assistant":
           return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
@@ -2671,7 +2756,11 @@ function RunEventList({
         }
         case "tool_result": {
           const parsed = safeParse<ParsedToolResult>(e.data);
-          if (parsed && parsed.toolUseId && resultByToolId.get(parsed.toolUseId)) return [];
+          // Unparseable JSON — `ToolResultBlock` would render nothing for it
+          // anyway (its `!result` guard), so skip the wrapper entirely rather
+          // than emitting an empty `data-evid` div.
+          if (!parsed) return [];
+          if (parsed.toolUseId && resultByToolId.get(parsed.toolUseId)) return [];
           return [wrap(key, evid, <ToolResultBlock result={parsed} />)];
         }
         case "status":
@@ -2716,7 +2805,7 @@ function RunEventList({
     current.body.push(...tail);
     if (current.header !== null || current.body.length > 0) out.push(current);
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, activeMatchId]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -2961,7 +3050,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
   );
 
   return (
-    <div className="sticky top-0 z-10 flex justify-end">
+    <div className="flex justify-end">
       <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card/50 px-3 py-1.5 text-foreground shadow-sm backdrop-blur-md">
         {parsed?.kind === "command-output" ? (
           <>
