@@ -1232,10 +1232,17 @@ export const api = {
    *  structured-event refactor (the legacy mapper truncated tool inputs
    *  at 500 chars, so the in-DB copy is missing the tail bytes). Returns
    *  an empty list + `reason` when the JSONL is gone or the run had no
-   *  claude session id (e.g. codex runs). */
-  rebuildRunEvents: (runId: string) =>
-    j<{ events: RunEvent[]; source?: string; reason?: string }>(
-      `/runs/${runId}/rebuild-events`,
+   *  claude session id (e.g. codex runs).
+   *
+   *  `limit`, when passed, bounds the rebuild to the most recent `limit`
+   *  mapped events (ascending) and the response carries `hasMore` — so an
+   *  automatic/background rebuild doesn't silently replace the panel's
+   *  bounded live window with an unbounded full-history dump. Omitted
+   *  (the manual "Rebuild from session JSONL" button's case), the server
+   *  returns the legacy full array with no `hasMore` field. */
+  rebuildRunEvents: (runId: string, limit?: number) =>
+    j<{ events: RunEvent[]; hasMore?: boolean; source?: string; reason?: string }>(
+      `/runs/${runId}/rebuild-events${limit ? `?limit=${limit}` : ""}`,
     ),
 
   /** Fire a native macOS notification via the Bun process. Fire-and-forget

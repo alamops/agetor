@@ -1728,6 +1728,12 @@ export interface RunEvent {
    * per-subagent tabs. Threaded from `run_events.subagent_id`.
    */
   subagentId?: string | null;
+  /**
+   * `run_events.id`, present on replayed/paged persisted events (SSE replay
+   * window, `/tasks/:id/events/page`); absent on live-broadcast frames, which
+   * have no row yet at broadcast time.
+   */
+  id?: number;
 }
 
 /** Lifecycle state of a tracked background/sub agent. Mirrors `RunStatus` plus

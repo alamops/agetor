@@ -3797,9 +3797,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // and WebKit's fetch rejects with the unhelpful "Load failed".
       "/runs/:id/rebuild-events": { GET: authed((req) => {
         try {
+          // Optional `?limit=` caps the response to the most recent N mapped
+          // events (ascending) plus `hasMore`, so the RunPanel's auto-rebuild
+          // on opening a finished claude task doesn't defeat the SSE replay
+          // window by pulling unbounded full JSONL history. Absent `limit`,
+          // the response keeps its pre-existing shape (bare `events` array,
+          // no `hasMore`) for any other caller — additive-only change.
+          const url = new URL(req.url);
+          const limitParam = url.searchParams.get("limit");
+          const hasLimit = limitParam !== null;
+          const limitRaw = Number(limitParam);
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
+            : EVENTS_REPLAY_LIMIT;
           const run = runs.get(req.params.id);
           if (!run) return json({ error: "run not found" }, { status: 404, headers: corsHeaders(req) });
-          if (!run.claudeSessionId) return json({ events: [], reason: "run has no claude session id" }, { headers: corsHeaders(req) });
+          if (!run.claudeSessionId) {
+            return json(
+              { events: [], reason: "run has no claude session id", ...(hasLimit ? { hasMore: false } : {}) },
+              { headers: corsHeaders(req) },
+            );
+          }
           const task = tasks.get(run.taskId);
           if (!task) return json({ error: "task not found" }, { status: 404, headers: corsHeaders(req) });
           // Reconstruct the cwd claude was launched against. Worktree tasks
@@ -3811,7 +3829,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const harness = harnesses.getByIdOrKind(task.agent);
           const jsonlPath = jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null);
           if (!existsSync(jsonlPath)) {
-            return json({ events: [], reason: `JSONL not found at ${jsonlPath}` }, { headers: corsHeaders(req) });
+            return json(
+              { events: [], reason: `JSONL not found at ${jsonlPath}`, ...(hasLimit ? { hasMore: false } : {}) },
+              { headers: corsHeaders(req) },
+            );
           }
           // Drive the JSONL through the same staging pipeline live tailing
           // uses, so the rebuilt event stream contains "turn complete"
@@ -3834,6 +3855,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             });
           };
           rebuildEventsFromJsonl(readFileSync(jsonlPath, "utf8"), onChunk);
+          if (hasLimit) {
+            const hasMore = events.length > limit;
+            const windowed = hasMore ? events.slice(events.length - limit) : events;
+            return json({ events: windowed, hasMore, source: jsonlPath }, { headers: corsHeaders(req) });
+          }
           return json({ events, source: jsonlPath }, { headers: corsHeaders(req) });
         } catch (e) {
           const msg = (e as Error).message ?? String(e);
@@ -4129,15 +4155,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const url = new URL(req.url);
           const beforeIdParam = url.searchParams.get("beforeId");
           const beforeIdRaw = beforeIdParam === null ? NaN : Number(beforeIdParam);
-          if (!Number.isFinite(beforeIdRaw)) {
+          if (!Number.isInteger(beforeIdRaw) || beforeIdRaw <= 0) {
             return json(
-              { error: "beforeId (integer) required" },
+              { error: "beforeId (positive integer) required" },
               { status: 400, headers: corsHeaders(req) },
             );
           }
           const limitRaw = Number(url.searchParams.get("limit"));
           const limit = Number.isFinite(limitRaw) && limitRaw > 0
-            ? Math.min(limitRaw, 2000)
+            ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
             : EVENTS_REPLAY_LIMIT;
           const rows = runs.eventsForTask(taskId, { beforeId: beforeIdRaw, limit });
           const events = rows.map((ev) => ({
@@ -4203,6 +4229,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             sendNamed(TASK_EVENTS_REPLAY_META_EVENT, { earliestId, hasMore } satisfies TaskEventsReplayMeta);
             for (const ev of window) {
               send({
+                id: ev.id,
                 runId: ev.runId,
                 taskId,
                 stream: ev.stream as RunEvent["stream"],

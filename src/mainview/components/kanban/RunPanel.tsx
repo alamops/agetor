@@ -69,22 +69,27 @@ function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
 
 /**
  * `RunEvent` as held in the panel's local `events` state, tagged with a
- * client-assigned monotonic id. The server doesn't expose a stable event id
- * over SSE (`run_events.id` never leaves the DB layer) — `id` here is
- * assigned by `nextEventIdRef` the moment an event is accepted into the
+ * client-assigned monotonic id. `id` here is always assigned by
+ * `nextEventIdRef`/`prevEventIdRef` the moment an event is accepted into the
  * unified stream, purely so `rebuilt-mask.ts` can tell a genuinely NEW live
  * event apart from one the server re-delivers on SSE reconnect (full-history
- * replay) when deciding whether the JSONL rebuild snapshot has gone stale.
+ * replay) when deciding whether the JSONL rebuild snapshot has gone stale —
+ * it is NEVER the server's own event id, even when one is available (see
+ * `dbId` below), since `rebuilt-mask.ts`'s ordering depends on this id space
+ * being contiguous and monotonic per-connection.
  *
- * `dbId`, when present, is the REAL `run_events.id` row id — only known for
- * events fetched via `GET /tasks/:id/events/page` ("Load earlier"), since
- * that's the one route that returns it (the SSE replay/live paths never do —
- * see above). It's what lets the live-window trim (`EVENTS_WINDOW_MAX`) figure
- * out a fresh `beforeId` cursor after eating into previously-loaded earlier
- * history: if the new front-of-window event carries a `dbId`, that becomes
- * the new `earliestId`; if it doesn't (an ordinary replay/live event with no
- * known DB id), "Load earlier" has nothing reliable to page from and hides
- * until the next SSE (re)connect re-seeds `earliestId` from `replay_meta`.
+ * `dbId`, when present, is the REAL `run_events.id` row id. Historically this
+ * was only known for events fetched via `GET /tasks/:id/events/page` ("Load
+ * earlier"), but SSE replayed frames (the burst sent on connect/reconnect,
+ * before `replay_meta`'s window) now carry it too — only a genuinely NEW
+ * live event delivered after the connection has settled lacks one. It's what
+ * lets the live-window trim (`EVENTS_WINDOW_MAX`) figure out a fresh
+ * `beforeId` cursor after eating into previously-loaded earlier history: if
+ * the new front-of-window event carries a `dbId`, that becomes the new
+ * `earliestId`; if it doesn't (the rare case of a brand-new live event
+ * pushing the window over the cap before any replay/page fetch has run),
+ * "Load earlier" has nothing reliable to page from and hides until the next
+ * SSE (re)connect re-seeds `earliestId` from `replay_meta`.
  */
 type StreamEvent = RunEvent & { id: number; dbId?: number };
 
@@ -321,6 +326,16 @@ function RunPanelBody({
   // doing the window-cap trim (see EVENTS_WINDOW_MAX below) inside a
   // setState updater would run twice under StrictMode's dev double-invoke.
   const eventsRef = useRef<StreamEvent[]>([]);
+  /** Every real `run_events.id` (`StreamEvent.dbId`) currently represented in
+   *  `eventsRef.current`, whether it arrived via SSE replay, a live push, or
+   *  a "Load earlier" page fetch. Populated as events are accepted (see the
+   *  SSE subscription effect and `loadEarlierEvents` below); reset on task
+   *  switch. Lets `loadEarlierEvents` defensively drop rows it's already
+   *  holding — e.g. after an SSE reconnect moves `earliestId` backward (see
+   *  the `replay_meta` handler below) a subsequent page fetch can legitimately
+   *  overlap the tail of what a previous page fetch (or the live window)
+   *  already loaded. */
+  const loadedDbIdsRef = useRef<Set<number>>(new Set());
   /** DB id of the earliest event currently anchoring the "Load earlier"
    *  cursor, or null when unknown (hides the button — see `StreamEvent.dbId`
    *  and the window-trim comment in the SSE effect below). Seeded from the
@@ -341,6 +356,7 @@ function RunPanelBody({
     setEvents([]);
     eventsRef.current = [];
     prevEventIdRef.current = -1;
+    loadedDbIdsRef.current = new Set();
     setEarliestId(null);
     setHasMoreEarlier(false);
     setLoadingEarlier(false);
@@ -448,17 +464,23 @@ function RunPanelBody({
       if (timer) return;
       timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
     };
+    // Mirrors whether the timer is currently (supposed to be) running.
+    // `evaluate()` is called on every SSE frame during a mid-turn flood (see
+    // the subscription effect's `runsPollEvaluateRef.current()` calls) — the
+    // early return below skips the `document.hidden`/ref reads and the
+    // start/stop call entirely once the desired state already matches,
+    // rather than re-deriving and re-applying the same state on every event.
+    let armed = false;
     // Paused while the window is hidden (nothing to repaint) or once the task
     // has gone fully idle (terminal run, no subagent running, no pending
     // interaction) — resumed by `kick()` below on visible/focus or a live-sign
     // SSE event, so a change on the server side is never missed for long.
     const evaluate = () => {
-      if (document.hidden) { stopTimer(); return; }
-      if (!runActiveRef.current && !subagentActiveRef.current && !interactionPendingRef.current) {
-        stopTimer();
-        return;
-      }
-      startTimer();
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
     };
     const kick = () => {
       if (!document.hidden) void load();
@@ -508,13 +530,15 @@ function RunPanelBody({
       if (timer) return;
       timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
     };
+    // See the runs-poll effect above for why this early-returns on a no-op
+    // state transition instead of re-deriving/re-applying on every call.
+    let armed = false;
     const evaluate = () => {
-      if (document.hidden) { stopTimer(); return; }
-      if (!runActiveRef.current && !subagentActiveRef.current && !interactionPendingRef.current) {
-        stopTimer();
-        return;
-      }
-      startTimer();
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
     };
     const kick = () => {
       if (!document.hidden) void load();
@@ -568,18 +592,43 @@ function RunPanelBody({
     // arm/flush bookkeeping (and the re-arm-after-flush invariant that fixes
     // the freeze) lives in `createEventBuffer` so it can be unit-tested.
     const FLUSH_FALLBACK_MS = 250;
-    // Flips true the moment the first batch flushes. All of the SSE replay
-    // burst's `onmessage` calls land synchronously, well before the first
-    // rAF/timeout-scheduled flush can fire (see the buffer's own doc comment)
-    // — so gating the "any onmessage is a life sign" poll-kick (below) on
-    // this flag means the replay burst itself can only ever trigger cheap
-    // `evaluate()` calls, never a fetch storm at panel-open time. Once the
-    // first flush has happened, subsequent `status`/`user` events are almost
-    // certainly genuinely live, and DO warrant an immediate poll kick.
-    const initialSettledRef = { current: false };
+    // Wall-clock connect time, used below to suppress poll kicks for the
+    // first ~1s of a (re)connect. The SSE replay burst can contain many
+    // historical `status`/`user` events (a big backlog dumps its whole
+    // recent window in one go), and each used to fire an immediate
+    // `runsPollKickRef`/`subagentsPollKickRef` call — a fetch storm at
+    // panel-open time. Wall-clock time (rather than "has the first batch
+    // flushed yet") is the right gate: a slow flush doesn't shrink the
+    // window, and a burst that keeps arriving past 1s still degrades
+    // gracefully into the debounce below rather than firing on every event.
+    const CONNECT_SETTLE_MS = 1000;
+    const connectedAtRef = { current: Date.now() };
+    // Debounce for kicks that land after the settle window: at most one
+    // poll-kick per second, trailing-edge, so a burst of live `status`/`user`
+    // events (e.g. several follow-ups folding into a turn in quick
+    // succession) can't each trigger their own fetch.
+    const KICK_DEBOUNCE_MS = 1000;
+    const lastKickAtRef = { current: 0 };
+    let kickTimer: ReturnType<typeof setTimeout> | null = null;
+    const debouncedKick = () => {
+      const now = Date.now();
+      const elapsed = now - lastKickAtRef.current;
+      if (elapsed >= KICK_DEBOUNCE_MS) {
+        lastKickAtRef.current = now;
+        runsPollKickRef.current();
+        subagentsPollKickRef.current();
+        return;
+      }
+      if (kickTimer) return;
+      kickTimer = setTimeout(() => {
+        kickTimer = null;
+        lastKickAtRef.current = Date.now();
+        runsPollKickRef.current();
+        subagentsPollKickRef.current();
+      }, KICK_DEBOUNCE_MS - elapsed);
+    };
     const buffer = createEventBuffer<StreamEvent>(
       (batch) => {
-        initialSettledRef.current = true;
         // Trim from the front once the live window exceeds EVENTS_WINDOW_MAX
         // (see StreamEvent's `dbId` doc comment for how the new earliestId is
         // derived — or why it sometimes can't be). `eventsRef` mirrors
@@ -685,30 +734,63 @@ function RunPanelBody({
         // ended, or a follow-up was sent) — worth an immediate poll kick.
         // Every other stream (assistant/thinking/tool_use/tool_result/stdout/
         // stderr) can arrive at high frequency mid-turn, so those only get the
-        // cheap no-fetch `evaluate()`. Gated on `initialSettledRef` so the
-        // open-time replay burst (which can contain many historical status/
-        // user events) never turns into a fetch storm — see that ref's doc
-        // comment above.
-        if (initialSettledRef.current && (e.stream === "status" || e.stream === "user")) {
-          runsPollKickRef.current();
-          subagentsPollKickRef.current();
+        // cheap no-fetch `evaluate()`. Gated on wall-clock time since connect
+        // so the open-time replay burst (which can contain many historical
+        // status/user events) never turns into a fetch storm, and further
+        // debounced to at most one kick/second so a rapid live burst past the
+        // settle window can't do the same — see `CONNECT_SETTLE_MS`/
+        // `debouncedKick` above.
+        if (e.stream === "status" || e.stream === "user") {
+          if (Date.now() - connectedAtRef.current < CONNECT_SETTLE_MS) {
+            runsPollEvaluateRef.current();
+            subagentsPollEvaluateRef.current();
+          } else {
+            debouncedKick();
+          }
         } else {
           runsPollEvaluateRef.current();
           subagentsPollEvaluateRef.current();
         }
-        // Tag with the next client-assigned id (see `StreamEvent`) — the
-        // server doesn't send one over SSE, and the invalidation check above
-        // needs a monotonic ordering to distinguish a genuinely new event from
-        // one the replay burst re-delivers on reconnect.
-        buffer.push({ ...e, id: nextEventIdRef.current++ });
+        // Tag with the next client-assigned id (see `StreamEvent`) — this
+        // client id space is distinct from the server's own `RunEvent.id`
+        // (only present on replayed/paged frames, see its doc comment), and
+        // the invalidation check above needs a monotonic ordering to
+        // distinguish a genuinely new event from one the replay burst
+        // re-delivers on reconnect. Capture the server id as `dbId` when
+        // present so the window-cap trim above can derive an exact
+        // `earliestId` cursor from replay alone, without waiting on a
+        // "Load earlier" page fetch.
+        const dbId = e.id;
+        if (typeof dbId === "number") loadedDbIdsRef.current.add(dbId);
+        buffer.push({ ...e, id: nextEventIdRef.current++, dbId });
       },
       (meta) => {
-        setEarliestId(meta.earliestId);
-        setHasMoreEarlier(meta.hasMore);
+        // The server sends `replay_meta` as the FIRST frame of every (re)connect
+        // — including an EventSource-internal reconnect after a network blip,
+        // which reuses this same subscription/effect instance rather than
+        // re-running it. Re-arming the settle window here (not just at effect
+        // setup) is what makes the kick-storm suppression above cover BOTH the
+        // initial open and every later reconnect's replay burst.
+        connectedAtRef.current = Date.now();
+        // Never move the cursor FORWARD on a reconnect: a fresh `replay_meta`
+        // reflects only the just-replayed window, which is capped at
+        // EVENTS_REPLAY_LIMIT and so always starts later than whatever
+        // earlier history "Load earlier" may have already paged in before
+        // the reconnect. Losing that progress would silently re-show a
+        // narrower "Load earlier" cursor (or hide it) after every SSE drop —
+        // taking the min (treating null as "no bound yet") keeps whichever
+        // cursor reaches furthest back. `hasMore` only ever grows for the
+        // same reason: once we know older history exists, a later replay
+        // that (re)confirms a narrower window can't un-know that.
+        setEarliestId((prev) =>
+          prev == null ? meta.earliestId : meta.earliestId == null ? prev : Math.min(prev, meta.earliestId),
+        );
+        setHasMoreEarlier((prev) => prev || meta.hasMore);
       },
     );
     return () => {
       buffer.dispose();
+      if (kickTimer) clearTimeout(kickTimer);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onFocus);
       unsub();
@@ -736,12 +818,26 @@ function RunPanelBody({
     setLoadingEarlier(true);
     void api.fetchTaskEventsPage(task.id, earliestId)
       .then((page) => {
-        if (page.events.length > 0) {
-          const mapped: StreamEvent[] = page.events.map((ev) => ({
-            ...ev,
-            id: prevEventIdRef.current--,
-            dbId: ev.id,
-          }));
+        // Defensive dedupe: `earliestId` can point past events this panel
+        // already holds — e.g. an SSE reconnect moved it backward (see the
+        // `replay_meta` handler's "never move forward" comment above), so a
+        // page fetched from that cursor can legitimately overlap the tail of
+        // what a previous fetch (or the live/replayed window) already loaded.
+        const fresh = page.events.filter((ev) => !loadedDbIdsRef.current.has(ev.id));
+        if (fresh.length > 0) {
+          // Set BEFORE the prepend's setState, not after: the pin-to-bottom
+          // effect below reads `nearBottomRef` on every `events` change, and
+          // runs as a passive effect AFTER this component's commit — if this
+          // flag flipped after `setEvents`, that effect could still see the
+          // pre-prepend (stale) `true` and yank the viewport back to the
+          // bottom, fighting the `useLayoutEffect` scroll restore just below
+          // (which always wins the ordering race, but only for scrollTop —
+          // the pin effect would then immediately override it again).
+          nearBottomRef.current = false;
+          const mapped: StreamEvent[] = fresh.map((ev) => {
+            loadedDbIdsRef.current.add(ev.id);
+            return { ...ev, id: prevEventIdRef.current--, dbId: ev.id };
+          });
           if (el) {
             scrollRestoreRef.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: el.scrollTop };
           }
@@ -844,7 +940,12 @@ function RunPanelBody({
     if (!latestRun.claudeSessionId) return;
     const sessionId = latestRun.claudeSessionId;
     let cancelled = false;
-    void api.rebuildRunEvents(latestRun.id).then((res) => {
+    // Bounded to EVENTS_WINDOW_MAX — the same cap the live stream itself is
+    // held to (see the SSE batch-flush trim above). Without a limit here, the
+    // auto-rebuild silently replaced the panel's bounded window with an
+    // unbounded full-session dump on every run completion, defeating the
+    // whole point of capping live/replayed history (code review finding).
+    void api.rebuildRunEvents(latestRun.id, EVENTS_WINDOW_MAX).then((res) => {
       if (cancelled) return;
       if (res.events.length > 0) {
         setRebuilt({
@@ -854,6 +955,11 @@ function RunPanelBody({
           maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
         });
         setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
+        // The rebuild itself has no DB row ids to page from (JSONL events are
+        // synthesized, not persisted `run_events` rows), so this only ever
+        // grows the affordance's visibility — it never clobbers an
+        // `earliestId` cursor the live/replayed stream already established.
+        if (res.hasMore) setHasMoreEarlier(true);
       } else if (res.reason) {
         setRebuildNote(res.reason);
       }
@@ -908,12 +1014,22 @@ function RunPanelBody({
   /** Events for whichever stream the tab strip has selected. For "main", splice
    *  `rebuilt` in by dropping events from runs that share its sessionId and
    *  appending the rebuilt set (earlier sessions stay visible). A subagent tab
-   *  shows that subagent's transcript directly (no rebuild path applies). */
+   *  shows that subagent's transcript directly (no rebuild path applies).
+   *
+   *  `status` events are the one exception to "drop the rebuilt run's live
+   *  events": they're synthesized by the orchestrator (e.g. "session
+   *  hibernated after idle…"), never appear in the JSONL transcript, and so
+   *  can never duplicate against `rebuilt.events` — dropping them would just
+   *  hide legitimate lifecycle notices for as long as the rebuild snapshot is
+   *  active. Kept in original arrival order, then re-sorted by `ts` against
+   *  the appended rebuild set (whose synthetic timestamps are anchored at the
+   *  run's start, not real wall-clock time) so a status event doesn't jump to
+   *  the wrong end of the transcript. */
   const displayedEvents = useMemo(() => {
     if (activeStream !== "main") return subagentEventsById.get(activeStream) ?? [];
     if (!rebuilt || !rebuiltRunIds) return mainEvents;
-    const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId));
-    return [...others, ...rebuilt.events];
+    const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId) || e.stream === "status");
+    return [...others, ...rebuilt.events].sort((a, b) => a.ts - b.ts);
   }, [activeStream, subagentEventsById, mainEvents, rebuilt, rebuiltRunIds]);
 
   /** The current to-do list for whichever stream is selected. Claude re-emits
