@@ -256,3 +256,42 @@ test("GET /tasks/:id/git-status reports ignored+no-upstream for a non-git workdi
   const body = await res.json();
   expect(body).toEqual({ hasChanges: false, ahead: 0, ignored: true, hasUpstream: false, remoteSynced: false });
 });
+
+test("pull-create guards: archived task, mismatched workdir, and existing prUrl are never stamped", async () => {
+  const { tasks } = await import("./db.ts");
+  const repoDir = await makeGitHubRepo("o", "rg");
+  const otherDir = await makeGitHubRepo("o", "rg2");
+
+  const archived = tasks.insert(fakeTask({ workdir: repoDir, prUrl: null }));
+  tasks.update(archived.id, { archivedAt: Date.now() });
+  const elsewhere = tasks.insert(fakeTask({ workdir: otherDir, prUrl: null }));
+  const already = tasks.insert(
+    fakeTask({ workdir: repoDir, prUrl: "https://github.com/o/rg/pull/1" }),
+  );
+
+  for (const t of [archived, elsewhere, already]) {
+    fetchMock = mockPullCreateRoute("https://github.com/o/rg/pull/99");
+    try {
+      const res = await realFetch(url("/github/pull-create"), {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          path: repoDir,
+          title: "Guarded",
+          head: "feature/g",
+          base: "main",
+          taskId: t.id,
+        }),
+      });
+      // Creation itself still succeeds — persistence is silently skipped.
+      expect(res.status).toBe(200);
+    } finally {
+      fetchMock.restore();
+      fetchMock = null;
+    }
+  }
+
+  expect(tasks.get(archived.id)?.prUrl).toBeNull();
+  expect(tasks.get(elsewhere.id)?.prUrl).toBeNull();
+  expect(tasks.get(already.id)?.prUrl).toBe("https://github.com/o/rg/pull/1");
+});

@@ -2,7 +2,10 @@ import { test, expect } from "bun:test";
 import { shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "./commit-push.ts";
 
 function status(overrides: Partial<TaskGitStatus>): TaskGitStatus {
-  return { hasChanges: false, ahead: 0, ignored: false, ...overrides };
+  return {
+    hasChanges: false, ahead: 0, ignored: false, hasUpstream: false, remoteSynced: false,
+    ...overrides,
+  };
 }
 
 test("shouldOfferCommitPush: null status → false", () => {
@@ -46,7 +49,7 @@ test("shouldOfferOpenPr: remoteSynced false → false", () => {
   expect(shouldOfferOpenPr(status({ remoteSynced: false }))).toBe(false);
 });
 
-test("shouldOfferOpenPr: remoteSynced undefined (legacy fixture shape, predates Open PR) → false", () => {
+test("shouldOfferOpenPr: default status (nothing pushed yet) → false", () => {
   expect(shouldOfferOpenPr(status({}))).toBe(false);
 });
 

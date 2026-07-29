@@ -4,19 +4,10 @@
  * it can be unit tested with `bun test` — the repo has no jsdom/testing-
  * library, so component behaviour is validated by testing the logic the
  * component drives.
- *
- * Mirrors (rather than imports) the shared `TaskGitStatus` type: the real
- * `GET /tasks/:id/git-status` payload always sets `hasUpstream`/
- * `remoteSynced`, but they're optional here so existing fixtures built before
- * "Open PR" (predating those fields) keep type-checking unchanged.
  */
-export interface TaskGitStatus {
-  hasChanges: boolean;
-  ahead: number;
-  ignored: boolean;
-  hasUpstream?: boolean;
-  remoteSynced?: boolean;
-}
+import type { TaskGitStatus } from "../../shared/types.ts";
+
+export type { TaskGitStatus };
 
 /**
  * Whether the "Commit & push" chip should be offered for the given git

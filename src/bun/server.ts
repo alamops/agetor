@@ -1628,7 +1628,18 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof body.taskId === "string" && body.taskId) {
             try {
               const task = tasks.get(body.taskId);
-              if (task && result.item?.htmlUrl) {
+              // Guards: archived tasks are frozen (same contract as PATCH /
+              // backlog), a first PR is never silently overwritten, and the
+              // task must actually belong to the project the PR was created
+              // from — a stale/mistargeted taskId must not stamp an unrelated
+              // task.
+              if (
+                task &&
+                task.archivedAt == null &&
+                !task.prUrl &&
+                task.workdir === dir &&
+                result.item?.htmlUrl
+              ) {
                 tasks.update(task.id, { prUrl: result.item.htmlUrl });
               }
             } catch (err) {

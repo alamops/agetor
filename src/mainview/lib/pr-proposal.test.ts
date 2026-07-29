@@ -430,3 +430,39 @@ describe("latestPrProposal", () => {
     expect(latestPrProposal(events)).toBeNull();
   });
 });
+
+describe("review-fix regressions", () => {
+  function proposalText(title: string, desc: string): string {
+    return ["PR title:", "```", title, "```", "", "PR description:", "````", desc, "````"].join("\n");
+  }
+
+  test("two proposals in ONE run (folded follow-up commit&push) ⇒ the latest wins", () => {
+    const joined = `${proposalText("OLD title", "old desc")}\n\nsome chatter\n\n${proposalText("NEW title", "new desc")}`;
+    expect(parsePrProposal(joined)?.title).toBe("NEW title");
+    const events: RunEvent[] = [
+      ev({ runId: "r1", data: proposalText("OLD title", "old desc") }),
+      ev({ runId: "r1", data: proposalText("NEW title", "new desc") }),
+    ];
+    expect(latestPrProposal(events)?.title).toBe("NEW title");
+  });
+
+  test("a trailing incomplete proposal falls back to the earlier complete one in the same run", () => {
+    const joined = `${proposalText("GOOD", "good desc")}\n\nPR title:\n\`\`\`\nBROKEN\n\`\`\`\n(no description this time)`;
+    expect(parsePrProposal(joined)).toMatchObject({ title: "GOOD", description: "good desc" });
+  });
+
+  test("subagent assistant events never contribute to the proposal", () => {
+    const events: RunEvent[] = [
+      ev({ runId: "r1", data: proposalText("SUBAGENT hijack", "nope"), subagentId: "bg-1" }),
+      ev({ runId: "r1", data: "main agent said something unrelated" }),
+    ];
+    expect(latestPrProposal(events)).toBeNull();
+    events.push(ev({ runId: "r1", data: proposalText("MAIN", "real desc") }));
+    expect(latestPrProposal(events)?.title).toBe("MAIN");
+  });
+
+  test("markdown-heading-prefixed labels (### PR title:) parse", () => {
+    const text = ["### PR title:", "```", "Heading style", "```", "", "### PR description:", "````", "desc", "````"].join("\n");
+    expect(parsePrProposal(text)).toMatchObject({ title: "Heading style", description: "desc" });
+  });
+});

@@ -997,11 +997,6 @@ function RunPanelBody({
   // polling effect keeps this in sync with the actual git state for as
   // long as the panel is mounted.
   const [gitStatus, setGitStatus] = useState<TaskGitStatus | null>(null);
-  // Best-effort PR title/description parsed out of the agent's Commit & push
-  // reply (see `commitPushPrompt`), for prefilling the "Open PR" composer.
-  // `null` when no run yet printed a parseable proposal — the composer still
-  // opens (with empty title/body) in that case.
-  const proposal = useMemo(() => latestPrProposal(events), [events]);
   const [sendDragging, setSendDragging] = useState(false);
   // `/`-command and skill autocomplete for the send field. Same list the
   // New Task form uses — depends on (agent, workdir, branch) so a slash
@@ -1378,6 +1373,19 @@ function RunPanelBody({
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {/* Lives in the header (not the composer chip row) so the link stays
+              reachable on archived tasks and after orphan reconciliation
+              clears the resumable run — pr_url is durable, the link must be
+              too. */}
+          {task.prUrl && (
+            <ExternalLink
+              href={task.prUrl}
+              className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
+              title="Open the pull request created for this task"
+            >
+              <GitPullRequest className="mr-1 size-3" /> View PR
+            </ExternalLink>
+          )}
           <Button
             size="sm"
             variant="outline"
@@ -1652,37 +1660,32 @@ function RunPanelBody({
                     <GitCommit className="mr-1 size-3" /> Commit &amp; push
                   </Button>
                 )}
-                {/* Once a PR exists for this task it's a durable link — never
-                    re-offered as "Open PR" again. Otherwise, offered once the
-                    branch is pushed and synced with its remote (git-state-only,
-                    same convention as Commit & push above). */}
-                {task.prUrl ? (
-                  <ExternalLink
-                    href={task.prUrl}
-                    className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "no-underline hover:no-underline")}
-                    title="Open the pull request created for this task"
+                {/* Offered once the branch is pushed and synced with its
+                    remote (git-state-only, same convention as Commit & push
+                    above). Requires a real task branch — an isolation:"none"
+                    task sits on the project's own checkout (often main with a
+                    synced upstream), where "open a PR" would degenerate to
+                    base == head. Gone once a PR exists (the durable "View PR"
+                    link lives in the panel header). The proposal parse runs
+                    on click, not per event flush — the stream can be long. */}
+                {!task.prUrl && task.branch != null && shouldOfferOpenPr(gitStatus) && !sending && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      const proposal = latestPrProposal(events);
+                      onOpenPullRequest({
+                        projectPath: task.workdir,
+                        head: task.branch ?? "",
+                        title: proposal?.title ?? "",
+                        body: proposal?.description ?? "",
+                        taskId: task.id,
+                      });
+                    }}
+                    title="Open a pull request for this task's branch — prefilled from the agent's summary when available"
                   >
-                    <GitPullRequest className="mr-1 size-3" /> View PR
-                  </ExternalLink>
-                ) : (
-                  shouldOfferOpenPr(gitStatus) && !sending && (
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      onClick={() =>
-                        onOpenPullRequest({
-                          projectPath: task.workdir,
-                          head: task.branch ?? "",
-                          title: proposal?.title ?? "",
-                          body: proposal?.description ?? "",
-                          taskId: task.id,
-                        })
-                      }
-                      title="Open a pull request for this task's branch — prefilled from the agent's summary when available"
-                    >
-                      <GitPullRequest className="mr-1 size-3" /> Open PR
-                    </Button>
-                  )
+                    <GitPullRequest className="mr-1 size-3" /> Open PR
+                  </Button>
                 )}
               </div>
             </div>

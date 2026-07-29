@@ -19,11 +19,12 @@ export interface PrProposal {
   link: string | null;
 }
 
-/** Label line matchers: case-insensitive, tolerant of `**`/`*`/`__`/`_`
- *  emphasis wrapping and trailing whitespace, but nothing else on the line —
- *  the fence is expected on a following line, not inline with the label. */
-const TITLE_LABEL_RE = /^[*_]{0,2}\s*pr\s+title\s*:\s*[*_]{0,2}\s*$/i;
-const DESC_LABEL_RE = /^[*_]{0,2}\s*pr\s+description\s*:\s*[*_]{0,2}\s*$/i;
+/** Label line matchers: case-insensitive, tolerant of a markdown heading
+ *  prefix (`### PR title:`) and `**`/`*`/`__`/`_` emphasis wrapping plus
+ *  trailing whitespace, but nothing else on the line — the fence is expected
+ *  on a following line, not inline with the label. */
+const TITLE_LABEL_RE = /^#{0,6}\s*[*_]{0,2}\s*pr\s+title\s*:\s*[*_]{0,2}\s*$/i;
+const DESC_LABEL_RE = /^#{0,6}\s*[*_]{0,2}\s*pr\s+description\s*:\s*[*_]{0,2}\s*$/i;
 
 /** A line consisting of nothing but a bare http(s) URL (optionally trailing
  *  a stray sentence-punctuation character prose sometimes tacks on). */
@@ -75,9 +76,19 @@ function parsePrProposalUnsafe(text: string): PrProposal | null {
   const normalized = text.replace(/\r\n?/g, "\n");
   const lines = normalized.split("\n");
 
-  const titleLabelIdx = lines.findIndex((l) => TITLE_LABEL_RE.test(l));
-  if (titleLabelIdx === -1) return null;
+  // A run can contain several proposals (a follow-up Commit & push folds into
+  // the same run rather than opening a new one), so try title labels from the
+  // LAST occurrence backward — the newest complete proposal wins, and an
+  // incomplete trailing one falls back to an earlier complete one.
+  for (let titleLabelIdx = lines.length - 1; titleLabelIdx >= 0; titleLabelIdx--) {
+    if (!TITLE_LABEL_RE.test(lines[titleLabelIdx] ?? "")) continue;
+    const proposal = parseProposalAt(lines, titleLabelIdx);
+    if (proposal) return proposal;
+  }
+  return null;
+}
 
+function parseProposalAt(lines: string[], titleLabelIdx: number): PrProposal | null {
   const titleFence = findFenceAfter(lines, titleLabelIdx + 1);
   if (!titleFence) return null;
   const titleLine = titleFence.content.split("\n").find((l) => l.trim() !== "");
@@ -131,7 +142,10 @@ export function latestPrProposal(events: RunEvent[]): PrProposal | null {
   const textByRun = new Map<string, string[]>();
   const runOrder: string[] = [];
   for (const e of events) {
-    if (e.stream !== "assistant") continue;
+    // Background-agent (subagent) streams are read-only side channels — a
+    // subagent echoing a proposal-shaped block must not hijack the prefill
+    // from the main agent's real reply.
+    if (e.stream !== "assistant" || e.subagentId) continue;
     let chunks = textByRun.get(e.runId);
     if (!chunks) {
       chunks = [];

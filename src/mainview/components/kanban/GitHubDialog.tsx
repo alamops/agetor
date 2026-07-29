@@ -967,6 +967,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // for the edge case where project/kind already matched (no reset firing at
   // all) when a new prefill arrived.
   useEffect(() => {
+    if (!open) return;
     const pending = pendingPullPrefillRef.current;
     if (!pending || projectPath !== pending.projectPath || kind !== "pulls") return;
     setPullComposerOpen(true);
@@ -975,7 +976,25 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     setNewPullBody(pending.body);
     setPullPrefillTaskId(pending.taskId);
     pendingPullPrefillRef.current = null;
-  }, [projectPath, kind, pullPrefill]);
+  }, [open, projectPath, kind, pullPrefill]);
+
+  // Close wipes the pull composer + prefill bookkeeping. Without this, the
+  // dialog (which stays mounted) reopens later — often on the SAME project,
+  // since `initialProjectPath` falls back to the selected task's workdir, so
+  // the [projectPath, kind] reset above never fires — with the previous
+  // task's seeded composer and, worse, its `pullPrefillTaskId` still armed:
+  // a manual "New PR" would then stamp an unrelated PR's URL onto that task.
+  useEffect(() => {
+    if (open) return;
+    setPullComposerOpen(false);
+    setNewPullTitle("");
+    setNewPullBody("");
+    setNewPullHead("");
+    setNewPullBase("");
+    setPullPrefillTaskId(null);
+    pendingPullPrefillRef.current = null;
+    lastPullPrefillRef.current = null;
+  }, [open]);
 
   const availableLabels = useMemo(() => {
     // Prefer the full repo-label list; fall back to labels seen on loaded items
