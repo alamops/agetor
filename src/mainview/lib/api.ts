@@ -1164,6 +1164,15 @@ export const api = {
       method: "POST",
     }),
 
+  /** Absolute URL for an inline `<img>` thumbnail of a referenced image path.
+   *  `<img>` can't set an Authorization header any more than EventSource can,
+   *  so the token rides along as a query param exactly like
+   *  `subscribeRun`/`subscribeTask`'s `?token=`. The server (a parallel
+   *  agent's route) validates the path is an image and 404s if it's missing;
+   *  callers handle that via the `<img>` element's own `onError`. */
+  filePreviewUrl: (path: string): string =>
+    `${BASE}/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(API_TOKEN)}`,
+
   /** Persist an in-memory image (clipboard paste or macOS floating-thumbnail
    *  drag) to disk and get back its absolute path. Bypasses `j()` because the
    *  body is raw bytes, not JSON. */

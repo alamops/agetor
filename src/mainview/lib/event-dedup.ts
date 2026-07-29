@@ -9,6 +9,7 @@
 // pure helper so it can be unit-tested apart from the React effect.
 import type { RunEvent } from "../../shared/types.ts";
 import { canonicalizeUserText } from "./command-message.ts";
+import { canonicalizeAttachmentText } from "../../shared/attachments.ts";
 
 /** Normalize CR-only / CRLF newlines to `\n`. tmux's paste-buffer delivers our
  *  `\n`-separated prompt to claude as `\r`, and the JSONL stores those `\r`s
@@ -33,6 +34,16 @@ const normalizeForKey = (s: string) => s.replace(/\r\n?/g, "\n");
  * back to the plain echo shape before the key is sliced, so the existing
  * 200-char key collapses the two into one bubble instead of two.
  *
+ * An image-attached send has the same live-echo/JSONL-twin split for a
+ * different reason: claude's TUI rewrites its OWN transcript copy of the
+ * send, prepending a `[Image #N]` placeholder and blanking the image path
+ * out of the trailing "Referenced files/folders:" bullet, while the live
+ * echo agetor emits keeps the original text and the real path in the bullet.
+ * `canonicalizeAttachmentText` strips both differences (the placeholder
+ * token, and the now-bare/image bullet) from whichever copy is being keyed,
+ * so the live echo and the JSONL twin of the same image-attached send
+ * reduce to one identical string and collapse to a single bubble too.
+ *
  * Consequence of the ts-less `user` key: two genuinely-identical user sends in
  * the SAME run (e.g. folding `"continue"` twice into one in-flight turn) share
  * a key and render as a single bubble. This is intentional — there is no
@@ -43,7 +54,7 @@ const normalizeForKey = (s: string) => s.replace(/\r\n?/g, "\n");
  */
 export function eventDedupKey(e: RunEvent): string {
   return e.stream === "user"
-    ? `user|${e.runId}|${canonicalizeUserText(normalizeForKey(e.data ?? "")).slice(0, 200)}`
+    ? `user|${e.runId}|${canonicalizeAttachmentText(canonicalizeUserText(normalizeForKey(e.data ?? ""))).slice(0, 200)}`
     : `${e.ts}|${e.runId}|${e.stream}|${(e.data ?? "").slice(0, 200)}`;
 }
 

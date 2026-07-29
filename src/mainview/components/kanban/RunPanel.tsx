@@ -40,8 +40,10 @@ import { createEventDeduper } from "@/lib/event-dedup";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
-import { parseUserMessage } from "@/lib/command-message";
+import { parseUserMessage, splitReferences } from "@/lib/command-message";
+import { imageSourceMetaPath, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
+import { AttachmentChips } from "./AttachmentChips";
 import {
   ReferencesPicker,
   captureDroppedOrPastedItems,
@@ -2458,6 +2460,13 @@ function RunEventList({
           return [<ToolResultBlock key={key} result={parsed} />];
         }
         case "status":
+          // Suppress claude's synthetic "[Image: source: <path>]" breadcrumb
+          // — it's a separate (isMeta) transcript entry for the attachment
+          // itself, not a status worth showing, and the image is now
+          // rendered as a proper thumbnail chip under the user bubble
+          // instead. Applies on replay too, so historical persisted rows of
+          // this event disappear from re-renders as well.
+          if (imageSourceMetaPath(e.data) !== null) return [];
           return [<StatusDivider key={key} text={e.data} />];
         case "stderr":
           return [<ErrorBlock key={key} text={e.data} />];
@@ -2703,6 +2712,20 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
   // fallback branch below renders exactly what this component always has.
   const parsed = useMemo(() => parseUserMessage(text), [text]);
 
+  // For an ordinary (non-command) message, split off a trailing "Referenced
+  // files/folders:" block the same way the command branch already does, so
+  // an image-attached (or file/folder-attached) send renders its paths as
+  // chips instead of a literal bullet list in the markdown body. Newlines
+  // are normalized first — `splitReferences`' blank-line paragraph split
+  // needs real `\n`s, and the JSONL twin of a send can carry bare `\r`s (see
+  // event-dedup.ts). When there's no trailing refs block, `splitReferences`
+  // returns `args` unchanged and an empty `references` array, so this is a
+  // no-op split for the common case.
+  const ordinary = useMemo(
+    () => splitReferences(text.replace(/\r\n?/g, "\n")),
+    [text],
+  );
+
   // Default to the collapsed ~3-line cap and measure once mounted. The cap
   // is always rendered so short messages don't flash full-height first;
   // the toggle button only surfaces when scrollHeight exceeds clientHeight,
@@ -2775,24 +2798,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
                 </ReactMarkdown>
               </div>
             )}
-            {parsed.command.references.length > 0 && (
-              <div className="mt-1 flex flex-wrap gap-1">
-                {parsed.command.references.map((ref) => {
-                  const isDir = ref.endsWith("/");
-                  const Icon = isDir ? Folder : FileText;
-                  return (
-                    <span
-                      key={ref}
-                      title={ref}
-                      className="inline-flex max-w-full items-center gap-1 rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
-                    >
-                      <Icon className="size-3 shrink-0" />
-                      <span className="truncate">{refBasename(ref)}</span>
-                    </span>
-                  );
-                })}
-              </div>
-            )}
+            <AttachmentChips references={parsed.command.references} />
           </>
         ) : (
           <>
@@ -2801,9 +2807,10 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
             </div>
             <div ref={contentRef} className={collapseClassName}>
               <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-                {text}
+                {stripImagePlaceholders(ordinary.args)}
               </ReactMarkdown>
             </div>
+            <AttachmentChips references={ordinary.references} />
           </>
         )}
         {needsToggle && (

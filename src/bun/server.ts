@@ -162,6 +162,7 @@ import type {
 } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
+import { isImagePath } from "../shared/attachments.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -3484,6 +3485,60 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const abs = path.join(dir, basename);
           await Bun.write(abs, buf);
           return json({ path: abs, basename }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Serve the bytes of a local image file so the webview can render an
+      // `<img>` thumbnail for a referenced attachment. Same trust level as
+      // `/open-path` above — an absolute path under a token-gated,
+      // 127.0.0.1-only route can already be opened with the OS default app,
+      // so reading its bytes back adds nothing a malicious caller couldn't
+      // already get. The per-launch token + loopback bind is the actual
+      // security boundary; the `isImagePath` extension gate exists only to
+      // keep this route from doubling as a generic "read any file" endpoint.
+      "/files/preview": {
+        GET: authed((req) => {
+          const url = new URL(req.url);
+          const raw = url.searchParams.get("path") ?? "";
+          if (!raw) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!path.isAbsolute(raw)) {
+            return json(
+              { error: `path must be absolute: ${raw}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if (!isImagePath(raw)) {
+            return json(
+              { error: `not an image path: ${raw}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          let st;
+          try {
+            st = statSync(raw);
+          } catch {
+            return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
+          }
+          if (st.isDirectory()) {
+            return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
+          }
+          const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
+          const CONTENT_TYPES: Record<string, string> = {
+            jpg: "image/jpeg",
+            jpeg: "image/jpeg",
+            svg: "image/svg+xml",
+            ico: "image/x-icon",
+          };
+          const contentType = CONTENT_TYPES[ext] ?? `image/${ext}`;
+          return new Response(Bun.file(raw), {
+            headers: {
+              ...corsHeaders(req),
+              "content-type": contentType,
+              "cache-control": "private, max-age=300",
+            },
+          });
         }),
       },
 
