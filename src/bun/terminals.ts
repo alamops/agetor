@@ -226,6 +226,17 @@ export function countTerminals(taskId: string): number {
   return n;
 }
 
+/** Grouped counts of open terminals across every task in one pass over the
+ *  in-memory map — used by `tasks.list()` so the 2s `/tasks` poll does a
+ *  single scan instead of calling `countTerminals` per task row. */
+export function terminalCountsByTask(): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const e of terminals.values()) {
+    counts.set(e.taskId, (counts.get(e.taskId) ?? 0) + 1);
+  }
+  return counts;
+}
+
 export function getTerminal(id: string): TerminalTab | null {
   const e = terminals.get(id);
   return e ? toTab(e) : null;

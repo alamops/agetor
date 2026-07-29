@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
 import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
@@ -22,7 +23,7 @@ interface Props {
   onUnarchive: (t: Task) => void;
 }
 
-export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
+function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
   const archived = task.archivedAt != null;
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
@@ -205,3 +206,12 @@ export function TaskCard({ task, homeDir, onStart, onCancel, onDelete, onOpen, o
     </Card>
   );
 }
+
+// Default shallow-props comparator is correct here (unlike Column, which
+// needs a custom comparator for its array prop): `task` is a single object
+// whose identity App.tsx's `reconcileById` preserves across polls when
+// unchanged, and every other prop is either a primitive (`homeDir`) or a
+// `useCallback`-stabilized handler. dnd-kit's `useDraggable` lives inside
+// the component body, so memoizing the outer function doesn't interfere
+// with drag state — that's driven by dnd-kit's own context, not props.
+export const TaskCard = memo(TaskCardImpl);

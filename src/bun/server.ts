@@ -144,7 +144,14 @@ import {
   listPendingForTask,
   type AskQuestionsAnswer,
 } from "./interactions.ts";
-import { DEFAULT_BRANCH_CONFIG, MODEL_EFFORT_SUPPORT, TASK_TYPES, validateBranchConfig } from "../shared/types.ts";
+import {
+  DEFAULT_BRANCH_CONFIG,
+  EVENTS_REPLAY_LIMIT,
+  MODEL_EFFORT_SUPPORT,
+  TASK_EVENTS_REPLAY_META_EVENT,
+  TASK_TYPES,
+  validateBranchConfig,
+} from "../shared/types.ts";
 import type {
   AgentKind,
   AppEvent,
@@ -158,6 +165,7 @@ import type {
   GlobalEvent,
   RunEvent,
   Task,
+  TaskEventsReplayMeta,
   TaskReference,
 } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
@@ -4107,6 +4115,46 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Paged access to older events, for the "Load earlier" affordance once
+      // the SSE replay window (below) has been exhausted. `beforeId` is
+      // required — this is a backward-paging cursor, not a general listing
+      // endpoint. Ascending order, same event shape as the SSE frames (plus
+      // `id`, which is handy for chaining the next `beforeId`).
+      "/tasks/:id/events/page": {
+        GET: authed((req) => {
+          const taskId = req.params.id;
+          if (!tasks.get(taskId)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const url = new URL(req.url);
+          const beforeIdParam = url.searchParams.get("beforeId");
+          const beforeIdRaw = beforeIdParam === null ? NaN : Number(beforeIdParam);
+          if (!Number.isFinite(beforeIdRaw)) {
+            return json(
+              { error: "beforeId (integer) required" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const limitRaw = Number(url.searchParams.get("limit"));
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.min(limitRaw, 2000)
+            : EVENTS_REPLAY_LIMIT;
+          const rows = runs.eventsForTask(taskId, { beforeId: beforeIdRaw, limit });
+          const events = rows.map((ev) => ({
+            id: ev.id,
+            runId: ev.runId,
+            taskId,
+            stream: ev.stream as RunEvent["stream"],
+            data: ev.data,
+            ts: ev.ts,
+            subagentId: ev.subagentId,
+          }));
+          const earliestId = events.length > 0 ? events[0]!.id : null;
+          const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+          return json({ events, earliestId, hasMore }, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/events": authed((req) => {
         const taskId = req.params.id;
         const stream = new ReadableStream({
@@ -4125,6 +4173,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
                 // (which would then permanently block the daemon's idle-shutdown).
               }
             };
+            // Named frame — invisible to a plain `onmessage` listener (only
+            // `addEventListener(name, ...)` sees it), so old/unmodified
+            // clients keep working unchanged even though a new frame now
+            // precedes the replayed window.
+            const sendNamed = (name: string, data: unknown) => {
+              try {
+                controller.enqueue(enc.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`));
+              } catch {
+                // Same rationale as `send`'s catch above.
+              }
+            };
             // Unified task-level stream: one scrollback per task, merging
             // events across every run. Subscribe before replay (same race
             // protection as the per-run endpoint).
@@ -4134,7 +4193,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               if (buffer) buffer.push(e);
               else send(e);
             });
-            for (const ev of runs.eventsForTask(taskId)) {
+            // Cap replay to the most recent EVENTS_REPLAY_LIMIT events instead
+            // of the task's full history — a task with thousands of events
+            // used to replay every one of them on every SSE (re)connect.
+            // Older history is fetched on demand via /tasks/:id/events/page.
+            const window = runs.eventsForTask(taskId, { limit: EVENTS_REPLAY_LIMIT });
+            const earliestId = window.length > 0 ? window[0]!.id : null;
+            const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+            sendNamed(TASK_EVENTS_REPLAY_META_EVENT, { earliestId, hasMore } satisfies TaskEventsReplayMeta);
+            for (const ev of window) {
               send({
                 runId: ev.runId,
                 taskId,

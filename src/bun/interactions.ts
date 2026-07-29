@@ -394,6 +394,20 @@ export function countPendingForTask(taskId: string): number {
   return n;
 }
 
+/** Grouped counts of pending interactions across every task in one pass over
+ *  both in-memory maps — used by `tasks.list()` so the 2s `/tasks` poll does
+ *  a single scan instead of calling `countPendingForTask` per task row. */
+export function pendingCountsByTask(): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const e of askQuestions.values()) {
+    counts.set(e.req.taskId, (counts.get(e.req.taskId) ?? 0) + 1);
+  }
+  for (const e of tmuxPrompts.values()) {
+    counts.set(e.req.taskId, (counts.get(e.req.taskId) ?? 0) + 1);
+  }
+  return counts;
+}
+
 /** Test-only handle for asserting the registry state. */
 export const __testing = {
   askQuestionsSize: () => askQuestions.size,

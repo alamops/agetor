@@ -71,6 +71,18 @@ const FAST_POLL_MS = 600;
  *  completed-but-undeleted tasks shouldn't burn CPU; mirrors the main scraper's
  *  idle-throttle lesson. */
 const SLOW_POLL_MS = 4000;
+/** Deeper idle tier: once this watcher has discovered zero subagents for the
+ *  task AND seen no discovery / dir-watcher event for `DEEP_IDLE_AFTER_MS`,
+ *  back off further to this cadence. Covers the common case of a task whose
+ *  agent never spawns a sub-agent at all — most tasks — which otherwise pays
+ *  `SLOW_POLL_MS` (a `readdirSync`) forever. Any discovery or dir-watcher
+ *  event drops the task back to `FAST_POLL_MS` via the normal `tick` path (a
+ *  discovery makes `files.size > 0`, which permanently disqualifies this
+ *  tier for the watcher's lifetime). */
+const DEEP_IDLE_POLL_MS = 10_000;
+/** How long with zero discovered subagents and no dir/discovery activity
+ *  before backing off to `DEEP_IDLE_POLL_MS`. */
+const DEEP_IDLE_AFTER_MS = 60_000;
 /** After a subagent's transcript shows an end_turn and then goes quiet for this
  *  long, treat it as finished. A later append (a resumed background agent)
  *  flips it back to running. */
@@ -375,6 +387,13 @@ export function attachSubagentWatcher(opts: {
   // history on its first scan, the same "offset 0 on attach" idiom the
   // per-subagent rehydration above relies on.
   let mainOffset = 0;
+  // `Date.now()` of the last discovery or dir-watcher event — the idle clock
+  // for the deep-idle tier (`DEEP_IDLE_POLL_MS`). Only consulted while
+  // `files.size === 0` (see `tick`): once any subagent is ever discovered,
+  // `files.size` never goes back to 0 for this watcher's lifetime, so the
+  // deep-idle tier is permanently disqualified from then on — exactly the
+  // "zero subagents ever discovered for the task" gate the plan calls for.
+  let lastChangeAt = Date.now();
 
   // Reattach: rehydrate subagents this task already had so we resume their
   // tails from offset 0 (the DB-seeded `seen` set suppresses re-emission of
@@ -466,6 +485,7 @@ export function attachSubagentWatcher(opts: {
         toolUseId: meta.toolUseId,
       };
       files.set(id, fs);
+      lastChangeAt = Date.now();
       subagentsDb.insertIfAbsent(toSubagentShape(fs, taskId));
       // A new correlation key may have a tool_result the scan already read
       // past (its lines were consumed while only siblings were pending) —
@@ -607,6 +627,9 @@ export function attachSubagentWatcher(opts: {
     try {
       dirWatcher = fsWatch(subagentsDir, { persistent: false }, () => {
         if (detached) return;
+        // Any dir-watcher event is a life signal for the deep-idle tier,
+        // independent of whether it turns out to be a new subagent file.
+        lastChangeAt = Date.now();
         try { discover(); for (const fs of files.values()) tailFile(fs); } catch { /* never crash the watcher */ }
       });
     } catch { /* fs.watch unsupported on this FS — the poll backstop covers it */ }
@@ -635,9 +658,20 @@ export function attachSubagentWatcher(opts: {
 
   function tick(): void {
     if (detached) return;
-    cycle(Date.now());
+    const now = Date.now();
+    cycle(now);
     const anyRunning = [...files.values()].some((f) => f.status === "running");
-    timer = setTimeout(tick, anyRunning ? FAST_POLL_MS : SLOW_POLL_MS);
+    let delay: number;
+    if (anyRunning) {
+      delay = FAST_POLL_MS;
+    } else if (files.size === 0 && now - lastChangeAt >= DEEP_IDLE_AFTER_MS) {
+      // Never discovered a subagent and nothing's happened for a while —
+      // back off further than the ordinary idle cadence.
+      delay = DEEP_IDLE_POLL_MS;
+    } else {
+      delay = SLOW_POLL_MS;
+    }
+    timer = setTimeout(tick, delay);
   }
 
   // Kick off on the next tick (give the spawn path a beat to settle). Tests
