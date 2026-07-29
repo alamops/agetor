@@ -61,8 +61,10 @@ export function isImagePath(path: string): boolean {
 
 /** Matches claude's `[Image #<digits>]` placeholder token. `N` is a
  *  session-wide attachment counter, not a per-message index — don't attempt
- *  to correlate the number to anything positional. */
-export const IMAGE_PLACEHOLDER_RE = /\[Image #\d+\]/g;
+ *  to correlate the number to anything positional. Module-private — callers
+ *  outside this file go through `stripImagePlaceholders`; nobody else in the
+ *  repo imports this regex directly (checked at review time). */
+const IMAGE_PLACEHOLDER_RE = /\[Image #\d+\]/g;
 
 /** Remove every `[Image #N]` placeholder token from `text`, wherever it
  *  appears. Pure token removal — no whitespace collapsing beyond deleting
@@ -81,6 +83,23 @@ const IMAGE_SOURCE_META_RE = /^\[Image: source: (.+)\]$/;
 export function imageSourceMetaPath(text: string): string | null {
   const m = IMAGE_SOURCE_META_RE.exec(text.trim());
   return m ? (m[1] ?? null) : null;
+}
+
+const IMAGE_SOURCE_META_BREADCRUMB_PREFIX = "[Image: source: ";
+
+/** Lax variant of `imageSourceMetaPath`, for RENDER-TIME filtering of
+ *  persisted status breadcrumbs only — the strict `imageSourceMetaPath`
+ *  remains the emit-side check. The old bun-side status path truncated
+ *  breadcrumbs to 137 chars + `…`, which can chop off the closing `]` for a
+ *  long path; the strict regex then fails to recognize an otherwise-valid
+ *  persisted row. True iff `text`, trimmed, starts with
+ *  `[Image: source: ` followed by at least one non-whitespace character —
+ *  the closing `]` is optional and a trailing `…` is tolerated either
+ *  way. */
+export function isImageSourceMetaBreadcrumb(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith(IMAGE_SOURCE_META_BREADCRUMB_PREFIX)) return false;
+  return /\S/.test(trimmed.slice(IMAGE_SOURCE_META_BREADCRUMB_PREFIX.length));
 }
 
 type Bullet =
@@ -111,23 +130,29 @@ function classifyBullet(line: string): Bullet {
  *  2. If the (placeholder-stripped) text ends with a trailing references
  *     block — located by the same rule as `splitReferences`: split on
  *     blank-line paragraphs, the LAST paragraph's first line must be
- *     exactly `REFS_HEADING` — drop any bullet that is either bare (`-`
- *     with optional trailing whitespace, claude's rewrite of a stripped
- *     image path) or whose path is an image path (`isImagePath`). If no
- *     bullets remain, the heading and its preceding blank-line separator
- *     are removed entirely (and the result `trimEnd`-ed); if any bullets
- *     remain, the heading is kept together with them.
+ *     exactly `REFS_HEADING` (the heading/bullet lines of that last
+ *     paragraph are split on `\r\n|\r|\n`, not just `\n`, so a stray `\r`
+ *     can't silently break convergence) — NORMALIZE every bullet that is
+ *     either bare (`-` with optional trailing whitespace, claude's rewrite
+ *     of a stripped image path) or whose path is an image path
+ *     (`isImagePath`) to exactly `-`. Bullets that are neither bare nor an
+ *     image path are kept verbatim. The heading is ALWAYS kept, even when
+ *     every bullet normalizes to `-` — this function must never collapse a
+ *     references-only send to the empty string, which would otherwise
+ *     dedup-collide two distinct refs-only sends in the same run under the
+ *     shared `""` key regardless of how many references each carried.
  *
  * A malformed references block — a line that's neither a bare bullet nor a
  * `- <path>` bullet, or a last paragraph whose first line isn't exactly
  * `REFS_HEADING` — is not a references block at all: that part of the text
  * is left untouched (placeholder stripping still applies).
  *
- * Identity contract: for input with no placeholders and no bare/image
- * bullets in a trailing references block, this returns `text` completely
- * unchanged — no trimming, no reformatting. This function feeds a dedup key
- * for every user message (not just image-attached ones), so any incidental
- * normalization here would shift the key of ordinary messages.
+ * Identity contract: if no placeholder was stripped AND no bullet needed
+ * normalizing (every bullet was already exactly `-`, or already a
+ * non-image `- <path>`), this returns `text` completely unchanged — never
+ * rebuilt, no reformatting. This function feeds a dedup key for every user
+ * message (not just image-attached ones), so any incidental normalization
+ * here would shift the key of ordinary messages.
  */
 export function canonicalizeAttachmentText(text: string): string {
   const stripped = stripImagePlaceholders(text);
@@ -136,33 +161,27 @@ export function canonicalizeAttachmentText(text: string): string {
   const last = paragraphs[paragraphs.length - 1];
   if (last === undefined) return stripped; // unreachable — split() always yields >= 1 element
 
-  const lines = last.split("\n");
+  const lines = last.split(/\r\n|\r|\n/);
   if (lines[0]?.trim() !== REFS_HEADING) return stripped;
 
   const bulletLines = lines.slice(1);
   if (bulletLines.length === 0) return stripped;
 
   const kept: string[] = [];
-  let removedAny = false;
+  let normalizedAny = false;
   for (const line of bulletLines) {
     const bullet = classifyBullet(line);
     if (bullet.kind === "invalid") return stripped; // malformed → not a refs block at all
-    if (bullet.kind === "bare") {
-      removedAny = true;
+    if (bullet.kind === "path" && !isImagePath(bullet.path)) {
+      kept.push(line);
       continue;
     }
-    if (isImagePath(bullet.path)) {
-      removedAny = true;
-      continue;
-    }
-    kept.push(line);
+    // Bare bullet, or an image-path bullet: normalize to a bare "-".
+    if (line !== "-") normalizedAny = true;
+    kept.push("-");
   }
 
-  if (!removedAny) return stripped;
-
-  if (kept.length === 0) {
-    return paragraphs.slice(0, -1).join("\n\n").trimEnd();
-  }
+  if (stripped === text && !normalizedAny) return text;
 
   const rebuiltLast = [REFS_HEADING, ...kept].join("\n");
   return [...paragraphs.slice(0, -1), rebuiltLast].join("\n\n");

@@ -41,7 +41,7 @@ import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
 import { parseUserMessage, splitReferences } from "@/lib/command-message";
-import { imageSourceMetaPath, stripImagePlaceholders } from "../../../shared/attachments.ts";
+import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AttachmentChips } from "./AttachmentChips";
 import {
@@ -1504,6 +1504,7 @@ function RunPanelBody({
               onInteractionResolved={dismissInteraction}
               runStatus={activeRunStatus}
               indicatorMode={indicatorMode}
+              taskId={task.id}
             />
           </>
         )}
@@ -2373,12 +2374,17 @@ function RunEventList({
   onInteractionResolved,
   runStatus,
   indicatorMode = "off",
+  taskId,
 }: {
   events: RunEvent[];
   interactions?: PendingInteraction[];
   onInteractionResolved?: (id: string) => void;
   runStatus?: Run["status"] | null;
   indicatorMode?: RunIndicatorMode;
+  /** Threaded through to each `UserMessageBlock`'s `AttachmentChips` so a
+   *  relative attachment ref can resolve against the task's worktree/workdir
+   *  when the user clicks it. */
+  taskId?: string;
 }) {
   // Index tool_results by their tool_use_id so the tool-use card can show
   // Normalise legacy `[tool: Name] {...}` / `[thinking] ...` / `[result] ...`
@@ -2443,7 +2449,7 @@ function RunEventList({
     const renderEvent = (e: RunEvent, key: string): React.ReactNode[] => {
       switch (e.stream) {
         case "user":
-          return [<UserMessageBlock key={key} text={e.data} />];
+          return [<UserMessageBlock key={key} text={e.data} taskId={taskId} />];
         case "assistant":
           return [<AssistantBlock key={key} text={e.data} />];
         case "thinking":
@@ -2464,9 +2470,12 @@ function RunEventList({
           // — it's a separate (isMeta) transcript entry for the attachment
           // itself, not a status worth showing, and the image is now
           // rendered as a proper thumbnail chip under the user bubble
-          // instead. Applies on replay too, so historical persisted rows of
-          // this event disappear from re-renders as well.
-          if (imageSourceMetaPath(e.data) !== null) return [];
+          // instead. Uses the lax matcher (not the strict `imageSourceMetaPath`)
+          // so historical rows persisted before this event type existed —
+          // truncated at the old 140-char status cap, possibly missing the
+          // trailing `]` or ending in an ellipsis — are filtered too, on
+          // replay as well as live.
+          if (isImageSourceMetaBreadcrumb(e.data)) return [];
           return [<StatusDivider key={key} text={e.data} />];
         case "stderr":
           return [<ErrorBlock key={key} text={e.data} />];
@@ -2508,7 +2517,7 @@ function RunEventList({
     current.body.push(...tail);
     if (current.header !== null || current.body.length > 0) out.push(current);
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -2695,7 +2704,7 @@ const ASSISTANT_MD_COMPONENTS: MdComponents = {
   pre: ({ children }) => <CodeBlock bgClassName="bg-muted/40">{children}</CodeBlock>,
 };
 
-const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string }) {
+const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text: string; taskId?: string }) {
   const [expanded, setExpanded] = useState(false);
   const [needsToggle, setNeedsToggle] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -2725,6 +2734,22 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
     () => splitReferences(text.replace(/\r\n?/g, "\n")),
     [text],
   );
+
+  // Strip `[Image #N]` placeholders only when the message actually carries
+  // references — a user who literally types "[Image #1]" in a plain message
+  // with no attachments keeps their text verbatim. Computed for both the
+  // command-args and ordinary-message branches below (used for the
+  // truthiness check as well as the rendered body, so an args string that's
+  // non-empty only because of a placeholder doesn't render an empty
+  // markdown block).
+  const commandArgsText =
+    parsed?.kind === "command" && parsed.command.references.length > 0
+      ? stripImagePlaceholders(parsed.command.args)
+      : (parsed?.kind === "command" ? parsed.command.args : "");
+  const ordinaryArgsText =
+    ordinary.references.length > 0
+      ? stripImagePlaceholders(ordinary.args)
+      : ordinary.args;
 
   // Default to the collapsed ~3-line cap and measure once mounted. The cap
   // is always rendered so short messages don't flash full-height first;
@@ -2791,14 +2816,14 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
                 {parsed.command.name}
               </span>
             </div>
-            {parsed.command.args && (
+            {commandArgsText && (
               <div ref={contentRef} className={collapseClassName}>
                 <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-                  {parsed.command.args}
+                  {commandArgsText}
                 </ReactMarkdown>
               </div>
             )}
-            <AttachmentChips references={parsed.command.references} />
+            <AttachmentChips references={parsed.command.references} taskId={taskId} />
           </>
         ) : (
           <>
@@ -2807,10 +2832,10 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
             </div>
             <div ref={contentRef} className={collapseClassName}>
               <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-                {stripImagePlaceholders(ordinary.args)}
+                {ordinaryArgsText}
               </ReactMarkdown>
             </div>
-            <AttachmentChips references={ordinary.references} />
+            <AttachmentChips references={ordinary.references} taskId={taskId} />
           </>
         )}
         {needsToggle && (

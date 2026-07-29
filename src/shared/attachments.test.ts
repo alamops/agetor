@@ -3,7 +3,7 @@ import {
   canonicalizeAttachmentText,
   imageSourceMetaPath,
   isImagePath,
-  IMAGE_PLACEHOLDER_RE,
+  isImageSourceMetaBreadcrumb,
   stripImagePlaceholders,
 } from "./attachments.ts";
 
@@ -24,7 +24,9 @@ const JSONL_TWIN =
   + `-`;
 
 const EXPECTED_CANONICAL =
-  `[screenshot-2026-07-29_15-38-35-8e708eec.png] I got this`;
+  `[screenshot-2026-07-29_15-38-35-8e708eec.png] I got this\n\n`
+  + `Referenced files/folders:\n`
+  + `-`;
 
 describe("isImagePath", () => {
   test("matches every canonical extension, case-insensitively", () => {
@@ -72,7 +74,7 @@ describe("IMAGE_PLACEHOLDER_RE / stripImagePlaceholders", () => {
     const text = "[Image #1] hi";
     expect(stripImagePlaceholders(text)).toBe(" hi");
     expect(stripImagePlaceholders(text)).toBe(" hi");
-    expect(IMAGE_PLACEHOLDER_RE.test("[Image #2]")).toBe(true);
+    expect(stripImagePlaceholders("[Image #2] there")).toBe(" there");
     expect(stripImagePlaceholders(text)).toBe(" hi");
   });
 });
@@ -144,7 +146,7 @@ describe("canonicalizeAttachmentText — identity contract", () => {
 });
 
 describe("canonicalizeAttachmentText — mixed refs", () => {
-  test("image bullet is removed; directory and code-file bullets are kept, heading kept", () => {
+  test("image bullet is normalized to a bare '-'; directory and code-file bullets are kept verbatim, heading kept", () => {
     const text =
       "look at this\n\n"
       + "Referenced files/folders:\n"
@@ -154,6 +156,7 @@ describe("canonicalizeAttachmentText — mixed refs", () => {
     expect(canonicalizeAttachmentText(text)).toBe(
       "look at this\n\n"
       + "Referenced files/folders:\n"
+      + "-\n"
       + "- /src/utils/\n"
       + "- /src/index.ts",
     );
@@ -172,41 +175,105 @@ describe("canonicalizeAttachmentText — multiple images", () => {
       + "Referenced files/folders:\n"
       + "-\n"
       + "-";
-    const expected = "[shot-a.png][shot-b.png] check these out";
+    const expected =
+      "[shot-a.png][shot-b.png] check these out\n\n"
+      + "Referenced files/folders:\n"
+      + "-\n"
+      + "-";
     expect(canonicalizeAttachmentText(liveTwoImages)).toBe(expected);
     expect(canonicalizeAttachmentText(twinTwoImages)).toBe(expected);
   });
 });
 
 describe("canonicalizeAttachmentText — bare bullet variants", () => {
-  test("bare '-' with no trailing space", () => {
+  test("bare '-' with no trailing space is already canonical (identity, no rebuild)", () => {
     const text = "hi\n\nReferenced files/folders:\n-";
-    expect(canonicalizeAttachmentText(text)).toBe("hi");
+    expect(canonicalizeAttachmentText(text)).toBe(text);
   });
 
-  test("bare '- ' with trailing space", () => {
+  test("bare '- ' with trailing space normalizes to a plain '-'", () => {
     const text = "hi\n\nReferenced files/folders:\n- ";
-    expect(canonicalizeAttachmentText(text)).toBe("hi");
+    expect(canonicalizeAttachmentText(text)).toBe("hi\n\nReferenced files/folders:\n-");
   });
 });
 
-describe("canonicalizeAttachmentText — heading dropped when all bullets removed", () => {
-  test("all-image refs block drops the heading and preceding blank line entirely", () => {
+describe("canonicalizeAttachmentText — never collapses to empty (heading always kept)", () => {
+  test("all-image refs block keeps the heading, normalizing the bullet instead of dropping it", () => {
     const text =
       "just this image\n\n"
       + "Referenced files/folders:\n"
       + "- /shots/a.png";
-    expect(canonicalizeAttachmentText(text)).toBe("just this image");
+    expect(canonicalizeAttachmentText(text)).toBe(
+      "just this image\n\nReferenced files/folders:\n-",
+    );
   });
 
-  test("refs-only send (no preceding text) collapses to an empty string", () => {
-    const text = "Referenced files/folders:\n-";
-    expect(canonicalizeAttachmentText(text)).toBe("");
+  test("refs-only send (no preceding text) canonicalizes to the heading + bare bullet, never empty", () => {
+    const text = "Referenced files/folders:\n- /shots/a.png";
+    const result = canonicalizeAttachmentText(text);
+    expect(result).toBe("Referenced files/folders:\n-");
+    expect(result).not.toBe("");
+  });
+
+  test("two refs-only sends with DIFFERENT bullet counts get different canonical forms (no dedup collision)", () => {
+    const oneRef = canonicalizeAttachmentText("Referenced files/folders:\n- /shots/a.png");
+    const twoRefs = canonicalizeAttachmentText(
+      "Referenced files/folders:\n- /shots/a.png\n- /shots/b.png",
+    );
+    expect(oneRef).not.toBe("");
+    expect(twoRefs).not.toBe("");
+    expect(oneRef).not.toBe(twoRefs);
   });
 });
 
 describe("canonicalizeAttachmentText — placeholder stripping outside any refs block", () => {
   test("a placeholder with no refs block at all is still stripped", () => {
     expect(canonicalizeAttachmentText("[Image #1] hello")).toBe(" hello");
+  });
+});
+
+describe("canonicalizeAttachmentText — newline tolerance in the trailing refs block", () => {
+  test("a stray \\r before the image bullet doesn't break recognition of the refs block", () => {
+    const text = "hi\n\nReferenced files/folders:\r\n- /shots/a.png";
+    expect(canonicalizeAttachmentText(text)).toBe("hi\n\nReferenced files/folders:\n-");
+  });
+
+  test("a bare-\\r-joined refs block (no real \\n at all in the last paragraph) still normalizes", () => {
+    const text = "hi\n\nReferenced files/folders:\r- /shots/a.png";
+    expect(canonicalizeAttachmentText(text)).toBe("hi\n\nReferenced files/folders:\n-");
+  });
+});
+
+describe("isImageSourceMetaBreadcrumb", () => {
+  test("positive: exact synthetic shape", () => {
+    expect(isImageSourceMetaBreadcrumb(`[Image: source: ${IMG_PATH}]`)).toBe(true);
+  });
+
+  test("positive: truncated with a trailing ellipsis, no closing bracket", () => {
+    const longPath = `/Users/alamosaravali/really/long/path/${"segment/".repeat(20)}shot.png`;
+    const truncated = `[Image: source: ${longPath}`.slice(0, 137) + "…";
+    expect(isImageSourceMetaBreadcrumb(truncated)).toBe(true);
+  });
+
+  test("positive: truncated with no ellipsis and no closing bracket", () => {
+    const longPath = `/Users/alamosaravali/really/long/path/${"segment/".repeat(20)}shot.png`;
+    const truncated = `[Image: source: ${longPath}`.slice(0, 137);
+    expect(isImageSourceMetaBreadcrumb(truncated)).toBe(true);
+  });
+
+  test("positive: tolerates surrounding whitespace", () => {
+    expect(isImageSourceMetaBreadcrumb(`  [Image: source: ${IMG_PATH}]  \n`)).toBe(true);
+  });
+
+  test("negative: plain status text", () => {
+    expect(isImageSourceMetaBreadcrumb("Agent is working…")).toBe(false);
+  });
+
+  test("negative: an [Image #N] placeholder is not the source-meta breadcrumb shape", () => {
+    expect(isImageSourceMetaBreadcrumb("[Image #1]")).toBe(false);
+  });
+
+  test("negative: empty string", () => {
+    expect(isImageSourceMetaBreadcrumb("")).toBe(false);
   });
 });

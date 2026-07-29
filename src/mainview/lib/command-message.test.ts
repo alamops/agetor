@@ -269,6 +269,23 @@ describe("splitReferences — newline contract", () => {
   });
 });
 
+describe("splitReferences — bare bullet (claude's image-bullet rewrite)", () => {
+  test("a lone bare '-' bullet (twin shape, no real path left) is accepted and dropped: args without the block, references []", () => {
+    const text = "do the thing\n\nReferenced files/folders:\n-";
+    expect(splitReferences(text)).toEqual({ args: "do the thing", references: [] });
+  });
+
+  test("a mixed bare bullet + real-path bullet: the bare one drops, the real path is kept as the only reference", () => {
+    const text = "do the thing\n\nReferenced files/folders:\n-\n- /a/b.png";
+    expect(splitReferences(text)).toEqual({ args: "do the thing", references: ["/a/b.png"] });
+  });
+
+  test("bare bullet with trailing whitespace ('- ') is also accepted and dropped", () => {
+    const text = "do the thing\n\nReferenced files/folders:\n- ";
+    expect(splitReferences(text)).toEqual({ args: "do the thing", references: [] });
+  });
+});
+
 describe("canonicalizeUserText", () => {
   test("the XML twin of a command with a refs block canonicalizes to exactly the live echo text", () => {
     const baseArgs = "do this and that across the codebase";

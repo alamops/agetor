@@ -194,6 +194,15 @@ const json = (data: unknown, init?: ResponseInit) =>
     status: init?.status,
   });
 
+// Content-type map for GET /files/preview. Module-scope so it isn't
+// reallocated on every request.
+const PREVIEW_CONTENT_TYPES: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  svg: "image/svg+xml",
+  ico: "image/x-icon",
+};
+
 // Derived, never-persisted count of this task's still-`running` subagent
 // rows — drives the kanban card's "N background agents" badge. Single-task
 // routes are called far less often than the 2s `/tasks` poll, so a one-off
@@ -3521,22 +3530,36 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           } catch {
             return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
           }
-          if (st.isDirectory()) {
+          // Only regular files: a FIFO, device, or symlink-to-device named
+          // `*.png` would otherwise hang the response stream forever.
+          if (!st.isFile()) {
             return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
           }
           const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
-          const CONTENT_TYPES: Record<string, string> = {
-            jpg: "image/jpeg",
-            jpeg: "image/jpeg",
-            svg: "image/svg+xml",
-            ico: "image/x-icon",
-          };
-          const contentType = CONTENT_TYPES[ext] ?? `image/${ext}`;
+          const contentType = PREVIEW_CONTENT_TYPES[ext] ?? `image/${ext}`;
+          // ETag derived from size+mtime so a re-saved file at the same path
+          // (e.g. a screenshot overwritten in place) is detected as changed.
+          const etag = `"${st.size}-${st.mtimeMs}"`;
+          if (req.headers.get("if-none-match") === etag) {
+            return new Response(null, {
+              status: 304,
+              headers: { ...corsHeaders(req), etag },
+            });
+          }
           return new Response(Bun.file(raw), {
             headers: {
               ...corsHeaders(req),
               "content-type": contentType,
-              "cache-control": "private, max-age=300",
+              // This route serves agent-writable content (e.g. SVG, which can
+              // carry <script>) on the origin whose URL carries the API
+              // token; nosniff + img-only consumption keeps active-content
+              // risk down.
+              "x-content-type-options": "nosniff",
+              // Content at a given path can change (a screenshot re-saved in
+              // place), so don't let the browser serve stale bytes without
+              // asking; the ETag makes the revalidation cheap (304, no body).
+              "cache-control": "private, max-age=0, must-revalidate",
+              etag,
             },
           });
         }),
