@@ -665,6 +665,15 @@ export type WorktreeStaleReason = "orphaned" | "archived" | "inactive";
  *  `"inactive"` — 7 days. */
 export const WORKTREE_STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+/** How long a claude session must sit idle (no in-flight turn, no pending
+ *  interaction, no session activity) before the idle-session reaper kills its
+ *  tmux session to reclaim the REPL's memory. Follow-ups after a reap resume
+ *  via `claude --resume` (spawnResumedSession) instead of a live paste. */
+export const IDLE_SESSION_REAP_MS = 30 * 60 * 1000; // 30 minutes
+
+/** Cadence of the orchestrator's idle-session reap sweep. */
+export const SESSION_REAP_SWEEP_MS = 5 * 60 * 1000; // 5 minutes
+
 /**
  * A git worktree materialized on disk under `dataDir/worktrees/`, as surfaced
  * by `GET /worktrees`. One row per directory found on disk — computed live by
@@ -1681,6 +1690,30 @@ export type RunEventStream =
   | "tool_use"
   | "tool_result"
   | "subagent";
+
+/** Max number of persisted events `GET /tasks/:id/events` replays on SSE
+ *  (re)connect — the most recent window; older history is fetched on demand
+ *  via `GET /tasks/:id/events/page`. */
+export const EVENTS_REPLAY_LIMIT = 800;
+
+/** Max number of events the run panel keeps in webview memory for one task.
+ *  When live streaming pushes past this, the oldest events are trimmed and the
+ *  "Load earlier" affordance re-appears. */
+export const EVENTS_WINDOW_MAX = 3000;
+
+/** Named SSE event (`event: replay_meta`) sent as the FIRST frame of
+ *  `GET /tasks/:id/events`, before the replayed window. Unnamed `message`
+ *  listeners ignore it, so old clients are unaffected. */
+export const TASK_EVENTS_REPLAY_META_EVENT = "replay_meta";
+
+/** Payload of the {@link TASK_EVENTS_REPLAY_META_EVENT} frame. */
+export interface TaskEventsReplayMeta {
+  /** DB id of the earliest event included in the replayed window, or null when
+   *  the task has no persisted events. */
+  earliestId: number | null;
+  /** True when older events exist before `earliestId` (drives "Load earlier"). */
+  hasMore: boolean;
+}
 
 export interface RunEvent {
   runId: string;
