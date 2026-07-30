@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import {
   AlertCircle, BookmarkPlus, ChevronDown, ChevronRight, FileMinus, FilePen, FilePlus,
   FileSymlink, GitCompare, Loader2, Send, X,
@@ -9,7 +9,10 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { api, type PendingInteraction } from "@/lib/api";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
-import { composeDiffMessage, groupSelectedRows, type DiffSelectionBlock } from "@/lib/diff-selection";
+import {
+  addRangeToSelection, composeDiffMessage, groupSelectedRows, isRowInDragRange,
+  type DiffDragRange, type DiffSelectionBlock,
+} from "@/lib/diff-selection";
 import type { AgentKind, DiffFile, Harness, Run, Task, TaskDiff } from "../../../shared/types.ts";
 
 interface Props {
@@ -37,6 +40,39 @@ function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
 
 const SELECTABLE_KINDS = new Set<DiffRow["kind"]>(["ctx", "add", "del"]);
 
+// Edge auto-scroll tuning for the drag gesture below: start scrolling once
+// the pointer is within this many px of the scroll container's top/bottom,
+// at a speed proportional to how deep into that zone the pointer is (capped).
+const AUTOSCROLL_EDGE_PX = 40;
+const AUTOSCROLL_MAX_SPEED = 15;
+
+/** Resolve the `data-diff-path`/`data-diff-index` row a DOM node sits inside
+ *  (or is itself), via the nearest `[data-diff-index]` ancestor. Used by both
+ *  the mousemove handler (fed `event.target`) and the auto-scroll loop (fed
+ *  `document.elementFromPoint`, since mousemove doesn't fire while the
+ *  container scrolls out from under a stationary pointer). */
+function resolveRowFromElement(el: Element | null): { path: string; index: number } | null {
+  const rowEl = el?.closest<HTMLElement>("[data-diff-index]");
+  if (!rowEl) return null;
+  const path = rowEl.dataset.diffPath;
+  const indexStr = rowEl.dataset.diffIndex;
+  if (!path || indexStr === undefined) return null;
+  const index = Number(indexStr);
+  return Number.isNaN(index) ? null : { path, index };
+}
+
+function firstSelectableIndex(rows: DiffRow[]): number {
+  const idx = rows.findIndex((r) => SELECTABLE_KINDS.has(r.kind));
+  return idx === -1 ? 0 : idx;
+}
+
+function lastSelectableIndex(rows: DiffRow[]): number {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (SELECTABLE_KINDS.has(rows[i]!.kind)) return i;
+  }
+  return rows.length - 1;
+}
+
 /**
  * Read-only viewer for everything a task's worktree changed vs its pinned base
  * ref, plus click-to-select diff lines that compose into a message you can
@@ -60,6 +96,192 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const [busy, setBusy] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
 
+  // Click-and-drag multi-line selection. `dragRange` is the *pending* drag's
+  // React-visible state — it stays null while a drag is armed-but-not-yet-
+  // activated (a plain mousedown+mouseup on one row must fall through to the
+  // ordinary click path below untouched) and only becomes non-null once the
+  // pointer crosses onto a different row. Refs mirror what the document-level
+  // listeners and the rAF auto-scroll loop need without waiting for a render:
+  // `dragRangeRef` is the authoritative in-flight range, `didDragRef` flags
+  // "a real drag happened" (suppresses the trailing click on the anchor row),
+  // `anchorRowsRef` holds the anchor file's rows for clamping/committing, and
+  // `bodyRefs` maps file path -> that file's row-list DOM node (for the
+  // same-file clamp's bounding-rect check).
+  const [dragRange, setDragRange] = useState<DiffDragRange | null>(null);
+  const dragRangeRef = useRef<DiffDragRange | null>(null);
+  const didDragRef = useRef(false);
+  const lastClientRef = useRef({ x: 0, y: 0 });
+  const anchorRowsRef = useRef<DiffRow[]>([]);
+  const bodyRefs = useRef(new Map<string, HTMLDivElement>());
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const rafRef = useRef<number | null>(null);
+
+  const registerBody = useCallback((path: string, el: HTMLDivElement | null) => {
+    if (el) bodyRefs.current.set(path, el);
+    else bodyRefs.current.delete(path);
+  }, []);
+
+  // Resolve which row index the drag should report as `currentIndex` given a
+  // hit-tested DOM element (mousemove's `event.target`, or
+  // `document.elementFromPoint` during auto-scroll). When the hit lands on a
+  // row in the anchor file, use it directly (even a non-selectable hunk/meta
+  // row — downstream range math filters to selectable kinds). Otherwise
+  // (a different file, or dead space) clamp against the anchor file's
+  // row-list bounding rect: above it -> first selectable row, below it ->
+  // last selectable row, inside its vertical span but unresolved -> `null`
+  // (hold the previous index).
+  const resolveDragIndex = useCallback(
+    (drag: DiffDragRange, clientY: number, hitTarget: Element | null): number | null => {
+      const resolved = resolveRowFromElement(hitTarget);
+      if (resolved && resolved.path === drag.path) return resolved.index;
+      const container = bodyRefs.current.get(drag.path);
+      if (!container) return null;
+      const rect = container.getBoundingClientRect();
+      if (clientY < rect.top) return firstSelectableIndex(anchorRowsRef.current);
+      if (clientY > rect.bottom) return lastSelectableIndex(anchorRowsRef.current);
+      return null;
+    },
+    [],
+  );
+
+  // Apply a newly-resolved hovered index at row-boundary granularity only
+  // (a no-op if it matches the current index, so pixel-level mousemove churn
+  // doesn't cascade into re-renders). Crossing away from the anchor row for
+  // the first time flips `didDragRef` — the drag-activation signal that the
+  // `dragActive` effect below reacts to (clearing native selection, starting
+  // auto-scroll).
+  const applyDragIndex = useCallback((newIndex: number) => {
+    const drag = dragRangeRef.current;
+    if (!drag || newIndex === drag.currentIndex) return;
+    if (newIndex !== drag.anchorIndex) didDragRef.current = true;
+    const nextRange: DiffDragRange = { ...drag, currentIndex: newIndex };
+    dragRangeRef.current = nextRange;
+    setDragRange(nextRange);
+  }, []);
+
+  const handleDocumentMouseMove = useCallback(
+    (e: MouseEvent) => {
+      lastClientRef.current = { x: e.clientX, y: e.clientY };
+      const drag = dragRangeRef.current;
+      if (!drag) return;
+      const idx = resolveDragIndex(drag, e.clientY, e.target as Element | null);
+      if (idx !== null) applyDragIndex(idx);
+    },
+    [resolveDragIndex, applyDragIndex],
+  );
+
+  const handleDocumentMouseUp = useCallback(() => {
+    document.removeEventListener("mousemove", handleDocumentMouseMove);
+    document.removeEventListener("mouseup", handleDocumentMouseUp);
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    const drag = dragRangeRef.current;
+    // Only commit if the drag actually activated (crossed a row boundary) —
+    // a same-row mousedown+mouseup never activates, so the native `click`
+    // fires and today's toggle path handles it untouched.
+    if (drag && didDragRef.current) {
+      const rows = anchorRowsRef.current;
+      setSelected((prev) => addRangeToSelection(prev, drag.path, rows, drag.anchorIndex, drag.currentIndex));
+      setLastClicked({ path: drag.path, index: drag.currentIndex });
+    }
+    dragRangeRef.current = null;
+    anchorRowsRef.current = [];
+    setDragRange(null);
+    // `didDragRef` is deliberately left as-is here — `handleRowClick` (or the
+    // next `handleRowMouseDown`) consumes and resets it, so the trailing
+    // click on the anchor row (if any) gets suppressed.
+  }, [handleDocumentMouseMove]);
+
+  // Arm a pending drag on primary-button mousedown over a selectable row.
+  // No preventDefault here (within-row native text selection must still be
+  // able to start) — the shift-click preventDefault stays put separately in
+  // the row's onMouseDown. Document-level listeners are attached only for
+  // the lifetime of this drag (removed in handleDocumentMouseUp / cancelDrag).
+  const handleRowMouseDown = useCallback(
+    (path: string, index: number, rows: DiffRow[], e: ReactMouseEvent<HTMLDivElement>) => {
+      if (e.button !== 0) return;
+      dragRangeRef.current = { path, anchorIndex: index, currentIndex: index };
+      didDragRef.current = false;
+      anchorRowsRef.current = rows;
+      lastClientRef.current = { x: e.clientX, y: e.clientY };
+      document.addEventListener("mousemove", handleDocumentMouseMove);
+      document.addEventListener("mouseup", handleDocumentMouseUp);
+    },
+    [handleDocumentMouseMove, handleDocumentMouseUp],
+  );
+
+  // Abandon any in-flight drag without committing — used when the dialog
+  // closes/reopens or switches tasks mid-drag, and on unmount.
+  const cancelDrag = useCallback(() => {
+    document.removeEventListener("mousemove", handleDocumentMouseMove);
+    document.removeEventListener("mouseup", handleDocumentMouseUp);
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    dragRangeRef.current = null;
+    didDragRef.current = false;
+    anchorRowsRef.current = [];
+    setDragRange(null);
+  }, [handleDocumentMouseMove, handleDocumentMouseUp]);
+
+  // Derived, not stored: `dragRange` only goes non-null once a drag has
+  // activated (see applyDragIndex), so this doubles as "is a real drag in
+  // progress" for the select-none styling below.
+  const dragActive = dragRange !== null;
+
+  const autoScrollStep = useCallback(() => {
+    const container = scrollContainerRef.current;
+    const drag = dragRangeRef.current;
+    if (container && drag) {
+      const rect = container.getBoundingClientRect();
+      const { x, y } = lastClientRef.current;
+      let dy = 0;
+      if (y < rect.top + AUTOSCROLL_EDGE_PX) {
+        dy = -Math.min(AUTOSCROLL_MAX_SPEED, (rect.top + AUTOSCROLL_EDGE_PX - y) / 2);
+      } else if (y > rect.bottom - AUTOSCROLL_EDGE_PX) {
+        dy = Math.min(AUTOSCROLL_MAX_SPEED, (y - (rect.bottom - AUTOSCROLL_EDGE_PX)) / 2);
+      }
+      if (dy !== 0) {
+        container.scrollTop += dy;
+        // mousemove doesn't fire while the container scrolls under a
+        // stationary pointer, so re-resolve the hovered row from the last
+        // known pointer position after each scroll step.
+        const hit = document.elementFromPoint(x, y);
+        const idx = resolveDragIndex(drag, y, hit);
+        if (idx !== null) applyDragIndex(idx);
+      }
+    }
+    rafRef.current = requestAnimationFrame(autoScrollStep);
+  }, [resolveDragIndex, applyDragIndex]);
+
+  // Start/stop the edge auto-scroll loop exactly when a drag activates or
+  // deactivates. Effect cleanup (dragActive flipping false, or unmount) is
+  // what guarantees the rAF loop can't outlive the drag or the dialog.
+  useEffect(() => {
+    if (!dragActive) return;
+    window.getSelection()?.removeAllRanges();
+    rafRef.current = requestAnimationFrame(autoScrollStep);
+    return () => {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [dragActive, autoScrollStep]);
+
+  // Belt-and-suspenders: the document listeners above are attached
+  // imperatively from an event handler (not from an effect), so guarantee
+  // their removal on unmount even if a drag was somehow still in flight.
+  useEffect(() => {
+    return () => {
+      document.removeEventListener("mousemove", handleDocumentMouseMove);
+      document.removeEventListener("mouseup", handleDocumentMouseUp);
+    };
+  }, [handleDocumentMouseMove, handleDocumentMouseUp]);
+
   // Gating data — same shape RunPanel uses to decide whether Send is safe.
   // Fetched lazily (below) once the composer first becomes visible, rather
   // than on every dialog open, since most diff views never select a line.
@@ -69,11 +291,14 @@ export function DiffDialog({ open, task, onClose }: Props) {
 
   useEffect(() => {
     // Reset selection + composer state on every dialog close/reopen and on
-    // every diff refetch (this effect's deps mirror the fetch below).
+    // every diff refetch (this effect's deps mirror the fetch below), and
+    // abandon any drag that was still in flight (e.g. the dialog was closed
+    // mid-drag).
     setSelected(new Map());
     setLastClicked(null);
     setDraft("");
     setHint(null);
+    cancelDrag();
     if (!open || !taskId) return;
     let cancelled = false;
     setLoading(true);
@@ -98,7 +323,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
     // Key on task?.id, not `task` itself — the parent polls /tasks every 2s,
     // so a new `task` object identity arrives constantly and would otherwise
     // refetch the diff on every poll tick.
-  }, [open, taskId]);
+  }, [open, taskId, cancelDrag]);
 
   const totals = useMemo(() => {
     const files = diff?.files ?? [];
@@ -120,32 +345,34 @@ export function DiffDialog({ open, task, onClose }: Props) {
     setOpenFiles(on && diff ? new Set(diff.files.map((f) => f.path)) : new Set());
 
   // Plain click toggles a row; shift-click extends from `lastClicked` when it
-  // sits in the same file (adding the contiguous selectable range), otherwise
+  // sits in the same file (adding the contiguous selectable range, via the
+  // same `addRangeToSelection` helper the drag-commit path uses), otherwise
   // it behaves like a plain click on the clicked row. `lastClicked` updates on
   // every selecting click (both branches).
   const handleRowClick = useCallback(
     (path: string, index: number, rows: DiffRow[], shiftKey: boolean) => {
+      // A real drag just ended on (or through) this row — suppress the
+      // trailing synthetic click so the anchor row isn't toggled back off;
+      // the drag already committed its range in handleDocumentMouseUp.
+      if (didDragRef.current) {
+        didDragRef.current = false;
+        return;
+      }
       const row = rows[index];
       if (!row || !SELECTABLE_KINDS.has(row.kind)) return;
-      setSelected((prev) => {
-        const next = new Map(prev);
-        const current = new Set(next.get(path) ?? []);
-        if (shiftKey && lastClicked && lastClicked.path === path) {
-          const lo = Math.min(lastClicked.index, index);
-          const hi = Math.max(lastClicked.index, index);
-          for (let i = lo; i <= hi; i++) {
-            const kind = rows[i]?.kind;
-            if (kind && SELECTABLE_KINDS.has(kind)) current.add(i);
-          }
-        } else if (current.has(index)) {
-          current.delete(index);
-        } else {
-          current.add(index);
-        }
-        if (current.size === 0) next.delete(path);
-        else next.set(path, current);
-        return next;
-      });
+      if (shiftKey && lastClicked && lastClicked.path === path) {
+        setSelected((prev) => addRangeToSelection(prev, path, rows, lastClicked.index, index));
+      } else {
+        setSelected((prev) => {
+          const next = new Map(prev);
+          const current = new Set(next.get(path) ?? []);
+          if (current.has(index)) current.delete(index);
+          else current.add(index);
+          if (current.size === 0) next.delete(path);
+          else next.set(path, current);
+          return next;
+        });
+      }
       setLastClicked({ path, index });
     },
     [lastClicked],
@@ -307,7 +534,10 @@ export function DiffDialog({ open, task, onClose }: Props) {
         </div>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+      <div
+        ref={scrollContainerRef}
+        className={cn("min-h-0 flex-1 overflow-y-auto p-3", dragActive && "select-none")}
+      >
         {loading && (
           <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" /> Loading diff…
@@ -342,6 +572,9 @@ export function DiffDialog({ open, task, onClose }: Props) {
                 onToggle={() => toggle(f.path)}
                 selectedIndices={selected.get(f.path)}
                 onRowClick={handleRowClick}
+                onRowMouseDown={handleRowMouseDown}
+                dragRange={dragRange}
+                registerBody={registerBody}
               />
             ))}
           </div>
@@ -431,12 +664,18 @@ function FileBlock({
   onToggle,
   selectedIndices,
   onRowClick,
+  onRowMouseDown,
+  dragRange,
+  registerBody,
 }: {
   file: DiffFile;
   open: boolean;
   onToggle: () => void;
   selectedIndices: Set<number> | undefined;
   onRowClick: (path: string, index: number, rows: DiffRow[], shiftKey: boolean) => void;
+  onRowMouseDown: (path: string, index: number, rows: DiffRow[], e: ReactMouseEvent<HTMLDivElement>) => void;
+  dragRange: DiffDragRange | null;
+  registerBody: (path: string, el: HTMLDivElement | null) => void;
 }) {
   const meta = STATUS_META[file.status];
   const Icon = meta.icon;
@@ -462,7 +701,15 @@ function FileBlock({
           <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file — no textual diff.</div>
         ) : (
           <>
-            <DiffBody path={file.path} hunks={file.hunks} selectedIndices={selectedIndices} onRowClick={onRowClick} />
+            <DiffBody
+              path={file.path}
+              hunks={file.hunks}
+              selectedIndices={selectedIndices}
+              onRowClick={onRowClick}
+              onRowMouseDown={onRowMouseDown}
+              dragRange={dragRange}
+              registerBody={registerBody}
+            />
             {file.truncated && (
               <div className="border-t border-border/60 px-3 py-1.5 text-[11px] italic text-muted-foreground">
                 Diff truncated — this file's changes are too large to display in full.
@@ -480,22 +727,37 @@ function DiffBody({
   hunks,
   selectedIndices,
   onRowClick,
+  onRowMouseDown,
+  dragRange,
+  registerBody,
 }: {
   path: string;
   hunks: string;
   selectedIndices: Set<number> | undefined;
   onRowClick: (path: string, index: number, rows: DiffRow[], shiftKey: boolean) => void;
+  onRowMouseDown: (path: string, index: number, rows: DiffRow[], e: ReactMouseEvent<HTMLDivElement>) => void;
+  dragRange: DiffDragRange | null;
+  registerBody: (path: string, el: HTMLDivElement | null) => void;
 }) {
   const rows = useMemo(() => toRows(hunks), [hunks]);
+  // Stable per (path, registerBody) so the ref callback doesn't detach/
+  // reattach on every unrelated re-render (e.g. a selection change elsewhere
+  // in the same file re-renders every row).
+  const setBodyRef = useCallback((el: HTMLDivElement | null) => registerBody(path, el), [path, registerBody]);
   return (
-    <div className="overflow-x-auto bg-card font-mono text-xs leading-relaxed">
+    <div ref={setBodyRef} className="overflow-x-auto bg-card font-mono text-xs leading-relaxed">
       {rows.map((r, i) => {
         const selectable = SELECTABLE_KINDS.has(r.kind);
-        const isSelected = selectable && (selectedIndices?.has(i) ?? false);
+        const isSelected = selectable && ((selectedIndices?.has(i) ?? false) || isRowInDragRange(dragRange, path, i));
         return (
           <div
             key={i}
-            onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
+            data-diff-path={path}
+            data-diff-index={i}
+            onMouseDown={(e) => {
+              if (e.shiftKey) { e.preventDefault(); return; }
+              if (selectable) onRowMouseDown(path, i, rows, e);
+            }}
             onClick={selectable ? (e) => onRowClick(path, i, rows, e.shiftKey) : undefined}
             className={cn(
               "flex border-l-2 border-transparent",
