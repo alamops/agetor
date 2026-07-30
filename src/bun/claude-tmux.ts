@@ -47,6 +47,7 @@ import { detectAskModal, parseModalPane, type AskModalKind, type NavKey, type Pa
 
 import type { RunEventStream } from "../shared/types.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import { imageSourceMetaPath } from "../shared/attachments.ts";
 
 /**
  * Stream chunk callback. `lineUuid` is the JSONL line's `uuid` field (claude
@@ -755,6 +756,15 @@ function mapParsedEventToChunks(
             : Array.isArray(content)
               ? content.filter((b) => b?.type === "text").map((b) => b.text ?? "").join(" ")
               : "";
+        // Image attachment marker: claude injects a dedicated isMeta entry
+        // whose sole content is `[Image: source: <path>]`, twinning the
+        // thumbnail chip already rendered on the user's own message bubble.
+        // Surfacing it as a status breadcrumb too would just be a redundant
+        // uppercase caption, so suppress it entirely — same silent-drop
+        // treatment as a truly-empty synthetic entry below.
+        if (imageSourceMetaPath(text) !== null) {
+          return { endOfTurn: false, lineUuid: uuid };
+        }
         // Strip a leading wrapper tag (`<local-command-caveat>`, `<task-notification>`,
         // …) so the breadcrumb reads as prose rather than raw markup.
         // Split on any newline form — tmux/claude can leak `\r`-only
