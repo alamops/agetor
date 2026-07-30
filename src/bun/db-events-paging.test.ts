@@ -67,6 +67,7 @@ function makeTaskRow(taskId: string): Task {
     branchSource: "created",
     worktreePath: null,
     baseRef: null,
+    prUrl: null,
     mode: null,
     model: null,
     effort: null,

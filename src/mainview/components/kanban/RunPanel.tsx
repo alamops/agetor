@@ -4,14 +4,16 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash, SquareSlash,
+  GitCommit, GitCompare, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
-import { shouldOfferCommitPush, type TaskGitStatus } from "@/lib/commit-push";
+import { shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
-import { Button } from "@/components/ui/button";
+import { latestPrProposal } from "@/lib/pr-proposal";
+import type { GitHubPullPrefill } from "./GitHubDialog";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -111,6 +113,10 @@ interface Props {
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
+  /** Open GitHubDialog's New-PR composer prefilled for this task — see the
+   *  "Open PR" chip below. Owned by App so the dialog stays a single
+   *  App-level singleton instead of one instance per task panel. */
+  onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
 }
 
 const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" | "destructive"> = {
@@ -163,7 +169,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive }: Props) {
+export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -252,6 +258,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           onShowDiff={onShowDiff}
           onArchive={onArchive}
           onUnarchive={onUnarchive}
+          onOpenPullRequest={onOpenPullRequest}
         />
       </aside>
     </>
@@ -273,6 +280,7 @@ function RunPanelBody({
   onShowDiff,
   onArchive,
   onUnarchive,
+  onOpenPullRequest,
 }: {
   task: Task;
   agents: AgentStatus[];
@@ -288,6 +296,7 @@ function RunPanelBody({
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
+  onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
@@ -1995,6 +2004,19 @@ function RunPanelBody({
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {/* Lives in the header (not the composer chip row) so the link stays
+              reachable on archived tasks and after orphan reconciliation
+              clears the resumable run — pr_url is durable, the link must be
+              too. */}
+          {task.prUrl && (
+            <ExternalLink
+              href={task.prUrl}
+              className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
+              title="Open the pull request created for this task"
+            >
+              <GitPullRequest className="mr-1 size-3" /> View PR
+            </ExternalLink>
+          )}
           <Button
             size="sm"
             variant="outline"
@@ -2370,6 +2392,33 @@ function RunPanelBody({
                     title="Ask the agent to commit the working-tree changes, push the current branch to origin, and reply with the link to open a PR plus a PR title and description in copyable code blocks."
                   >
                     <GitCommit className="mr-1 size-3" /> Commit &amp; push
+                  </Button>
+                )}
+                {/* Offered once the branch is pushed and synced with its
+                    remote (git-state-only, same convention as Commit & push
+                    above). Requires a real task branch — an isolation:"none"
+                    task sits on the project's own checkout (often main with a
+                    synced upstream), where "open a PR" would degenerate to
+                    base == head. Gone once a PR exists (the durable "View PR"
+                    link lives in the panel header). The proposal parse runs
+                    on click, not per event flush — the stream can be long. */}
+                {!task.prUrl && task.branch != null && shouldOfferOpenPr(gitStatus) && !sending && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      const proposal = latestPrProposal(events);
+                      onOpenPullRequest({
+                        projectPath: task.workdir,
+                        head: task.branch ?? "",
+                        title: proposal?.title ?? "",
+                        body: proposal?.description ?? "",
+                        taskId: task.id,
+                      });
+                    }}
+                    title="Open a pull request for this task's branch — prefilled from the agent's summary when available"
+                  >
+                    <GitPullRequest className="mr-1 size-3" /> Open PR
                   </Button>
                 )}
               </div>

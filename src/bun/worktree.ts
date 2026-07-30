@@ -114,6 +114,55 @@ export async function getAheadCount(dir: string, baseRef: string | null): Promis
   return 0;
 }
 
+export interface RemoteSyncState {
+  hasUpstream: boolean;
+  ahead: number | null;
+  behind: number | null;
+}
+
+/**
+ * Whether `dir`'s current branch has a configured upstream and, if so, how
+ * many commits it is ahead/behind that upstream. Drives the "Open PR" gate —
+ * a PR only makes sense once the branch exists on the remote and local HEAD
+ * has nothing left to push.
+ *
+ * Deliberately local-only: no `fetch`/`ls-remote`, so this reflects the
+ * remote-tracking ref as of the last fetch/push rather than the literal
+ * current remote state. That's exactly right for "did my push already
+ * land" — `git push` updates the local tracking ref synchronously, so
+ * right after a push this is accurate with zero network latency.
+ *
+ * `hasUpstream: false` (both counts `null`) covers missing dir, not a git
+ * repo, or no upstream configured for HEAD — "no upstream" is itself a
+ * meaningful, definitive answer (unlike `getAheadCount`'s `null`-means-
+ * "unknown" contract, there's no fallback tier here to attempt first).
+ * A git failure on the count step (upstream resolved but `rev-list` failed)
+ * degrades to `{hasUpstream: true, ahead: null, behind: null}` rather than
+ * collapsing back to `hasUpstream: false` — the upstream unambiguously
+ * exists, only the counts are unknown.
+ */
+export async function remoteSyncState(dir: string): Promise<RemoteSyncState> {
+  const NO_UPSTREAM: RemoteSyncState = { hasUpstream: false, ahead: null, behind: null };
+  if (!existsSync(dir)) return NO_UPSTREAM;
+  if (!(await isGitRepo(dir))) return NO_UPSTREAM;
+
+  const upstream = await git(["rev-parse", "--abbrev-ref", "@{u}"], dir);
+  if (!upstream.ok || !upstream.stdout) return NO_UPSTREAM;
+
+  // `--left-right --count @{u}...HEAD` prints "<behind>\t<ahead>" — commits
+  // only reachable from @{u} (left) vs only reachable from HEAD (right).
+  const counts = await git(["rev-list", "--left-right", "--count", "@{u}...HEAD"], dir);
+  if (!counts.ok) return { hasUpstream: true, ahead: null, behind: null };
+
+  const [behindRaw, aheadRaw] = counts.stdout.split(/\s+/);
+  const behind = Number.parseInt(behindRaw ?? "", 10);
+  const ahead = Number.parseInt(aheadRaw ?? "", 10);
+  if (Number.isNaN(behind) || Number.isNaN(ahead)) {
+    return { hasUpstream: true, ahead: null, behind: null };
+  }
+  return { hasUpstream: true, ahead, behind };
+}
+
 /**
  * Whether `dir`'s HEAD has already landed on the source repo's default
  * branch — i.e. is an ancestor of it, so the worktree's work is safe to

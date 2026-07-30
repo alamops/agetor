@@ -38,6 +38,7 @@ function makeTask(workdir: string, extra: Partial<Task> = {}): Task {
     branchSource: "created",
     worktreePath: null,
     baseRef: null,
+    prUrl: null,
     mode: null,
     model: null,
     effort: null,

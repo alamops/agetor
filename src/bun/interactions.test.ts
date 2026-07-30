@@ -32,6 +32,7 @@ async function makeTaskWithCwd(id: string): Promise<string> {
     branchSource: "created",
     worktreePath: null,
     baseRef: null,
+    prUrl: null,
     mode: null,
     model: "opus-4.7",
     effort: null,

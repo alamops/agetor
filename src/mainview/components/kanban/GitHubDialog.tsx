@@ -110,10 +110,26 @@ import type {
 } from "../../../shared/types.ts";
 import { PROVIDER_CAPS } from "../../../shared/types.ts";
 
+/** One-shot prefill for the New-PR composer (T3, "Open PR" from a task's run
+ *  panel): selects the given project, switches to the pulls tab, opens the
+ *  composer, and seeds head/title/body from the agent's parsed reply. */
+export interface GitHubPullPrefill {
+  projectPath: string;
+  head: string;
+  title: string;
+  body: string;
+  taskId: string;
+}
+
 interface Props {
   open: boolean;
   projects: Project[];
   initialProjectPath?: string | null;
+  /** Consumed exactly once per distinct object (tracked by reference) — see
+   *  the two-part effect pair around `pendingPullPrefillRef` below for why a
+   *  single effect can't do this safely against the composer's own
+   *  reset-on-project/kind-change effect. */
+  pullPrefill?: GitHubPullPrefill | null;
   onClose: () => void;
 }
 
@@ -410,7 +426,7 @@ function RateLimitBadge({ rateLimit }: { rateLimit: GitHubRateLimit }) {
   );
 }
 
-export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Props) {
+export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, onClose }: Props) {
   const [projectPath, setProjectPath] = useState("");
   // "All repositories" (G8/F15) — see AGGREGATE_PROJECT_PATH.
   const isAggregate = projectPath === AGGREGATE_PROJECT_PATH;
@@ -641,6 +657,16 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
   const [newPullPushing, setNewPullPushing] = useState(false);
   const [newPullPushError, setNewPullPushError] = useState<string | null>(null);
   const [newPullPushMessage, setNewPullPushMessage] = useState<string | null>(null);
+  // Task id to tag onto the next `createPull()` call — set by prefill
+  // consumption below, cleared wherever composer state itself resets so a
+  // later manual "New PR" from the same dialog doesn't inherit it.
+  const [pullPrefillTaskId, setPullPrefillTaskId] = useState<string | null>(null);
+  // Tracks which prefill object (by reference) we've started/finished
+  // consuming, so a re-render with the same `pullPrefill` prop never re-fires.
+  const lastPullPrefillRef = useRef<GitHubPullPrefill | null>(null);
+  // Holds a prefill that part 1 (below) has pointed project/kind at but part
+  // 2 (after the composer-reset effect) hasn't applied yet.
+  const pendingPullPrefillRef = useRef<GitHubPullPrefill | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -650,6 +676,20 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       return projects[0]?.path ?? "";
     });
   }, [open, initialProjectPath, projects]);
+
+  // Prefill consumption, part 1 of 2: point project + kind at the prefill's
+  // task. Deliberately doesn't open the composer yet — the composer-reset
+  // effect below (keyed on [projectPath, kind]) would fire in the same pass
+  // this causes and wipe it right back closed. Part 2, declared *after* that
+  // reset effect, does the actual open+seed once project/kind have landed.
+  useEffect(() => {
+    if (!open || !pullPrefill) return;
+    if (lastPullPrefillRef.current === pullPrefill) return;
+    lastPullPrefillRef.current = pullPrefill;
+    pendingPullPrefillRef.current = pullPrefill;
+    setProjectPath(pullPrefill.projectPath);
+    setKind("pulls");
+  }, [open, pullPrefill]);
 
   // Stable signal of the aggregate candidate set (G8): the joined project paths
   // when "All repositories" is selected, "" otherwise. Threaded into the reload
@@ -916,7 +956,45 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
     setNewPullPushing(false);
     setNewPullPushError(null);
     setNewPullPushMessage(null);
+    setPullPrefillTaskId(null);
   }, [projectPath, kind]);
+
+  // Prefill consumption, part 2 of 2: declared *after* the reset effect above
+  // and sharing its [projectPath, kind] deps, so in the render where part 1
+  // changes them, both fire in the same pass — reset runs first (declaration
+  // order), then this one re-opens/seeds, so the prefill wins instead of
+  // being wiped back to closed/empty. Also re-checks on `pullPrefill` itself
+  // for the edge case where project/kind already matched (no reset firing at
+  // all) when a new prefill arrived.
+  useEffect(() => {
+    if (!open) return;
+    const pending = pendingPullPrefillRef.current;
+    if (!pending || projectPath !== pending.projectPath || kind !== "pulls") return;
+    setPullComposerOpen(true);
+    setNewPullHead(pending.head);
+    setNewPullTitle(pending.title);
+    setNewPullBody(pending.body);
+    setPullPrefillTaskId(pending.taskId);
+    pendingPullPrefillRef.current = null;
+  }, [open, projectPath, kind, pullPrefill]);
+
+  // Close wipes the pull composer + prefill bookkeeping. Without this, the
+  // dialog (which stays mounted) reopens later — often on the SAME project,
+  // since `initialProjectPath` falls back to the selected task's workdir, so
+  // the [projectPath, kind] reset above never fires — with the previous
+  // task's seeded composer and, worse, its `pullPrefillTaskId` still armed:
+  // a manual "New PR" would then stamp an unrelated PR's URL onto that task.
+  useEffect(() => {
+    if (open) return;
+    setPullComposerOpen(false);
+    setNewPullTitle("");
+    setNewPullBody("");
+    setNewPullHead("");
+    setNewPullBase("");
+    setPullPrefillTaskId(null);
+    pendingPullPrefillRef.current = null;
+    lastPullPrefillRef.current = null;
+  }, [open]);
 
   const availableLabels = useMemo(() => {
     // Prefer the full repo-label list; fall back to labels seen on loaded items
@@ -2610,6 +2688,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
         body: newPullBody,
         draft: newPullDraft,
         reviewers: splitLabels(newPullReviewers),
+        taskId: pullPrefillTaskId ?? undefined,
       });
       upsertListItem(result.item, true);
       setPullComposerOpen(false);
@@ -2617,6 +2696,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, onClose }: Pr
       setNewPullBody("");
       setNewPullReviewers("");
       setNewPullDraft(false);
+      setPullPrefillTaskId(null);
       setActionMessages((cur) => ({ ...cur, [result.item.number]: result.message ?? "Pull request created." }));
     } catch (e) {
       setNewPullError(e instanceof Error ? e.message : String(e));

@@ -34,6 +34,9 @@ import m028 from "./028_branch_source.sql" with { type: "text" };
 // to avoid the clash with main's 028_branch_source (same as 026 above).
 import m029 from "./029_task_draft.sql" with { type: "text" };
 import m030 from "./030_runs_task_id_index.sql" with { type: "text" };
+// This branch originally used 030 for task_pr_url; renumbered to 031 on merge
+// to avoid the clash with main's 030_runs_task_id_index (same as 026/029 above).
+import m031 from "./031_task_pr_url.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -68,4 +71,5 @@ export const migrations: Migration[] = [
   { id: "028_branch_source", sql: m028 },
   { id: "029_task_draft", sql: m029 },
   { id: "030_runs_task_id_index", sql: m030 },
+  { id: "031_task_pr_url", sql: m031 },
 ];

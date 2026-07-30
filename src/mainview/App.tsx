@@ -7,7 +7,7 @@ import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harnes
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
-import { GitHubDialog } from "@/components/kanban/GitHubDialog";
+import { GitHubDialog, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -151,6 +151,10 @@ export default function App() {
   const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [githubOpen, setGithubOpen] = useState(false);
+  // Set by RunPanel's "Open PR" chip to open GitHubDialog pre-seeded for a
+  // specific task; cleared when the dialog closes so a later plain "GitHub"
+  // open (no prefill) doesn't inherit a stale project/task.
+  const [githubPullPrefill, setGithubPullPrefill] = useState<GitHubPullPrefill | null>(null);
   const [worktreesOpen, setWorktreesOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
@@ -847,6 +851,10 @@ export default function App() {
         onShowDiff={setDiffTask}
         onArchive={archive}
         onUnarchive={unarchive}
+        onOpenPullRequest={(prefill) => {
+          setGithubPullPrefill(prefill);
+          setGithubOpen(true);
+        }}
       />
       <DiffDialog
         open={!!diffTask}
@@ -856,8 +864,12 @@ export default function App() {
       <GitHubDialog
         open={githubOpen}
         projects={projects}
-        initialProjectPath={repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
-        onClose={() => setGithubOpen(false)}
+        initialProjectPath={githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        pullPrefill={githubPullPrefill}
+        onClose={() => {
+          setGithubOpen(false);
+          setGithubPullPrefill(null);
+        }}
       />
       <WorktreesDialog
         open={worktreesOpen}

@@ -71,6 +71,7 @@ import type {
   Task,
   TaskDiff,
   TaskEventsReplayMeta,
+  TaskGitStatus,
   TaskReference,
   TaskType,
   TerminalTab,
@@ -786,6 +787,9 @@ export const api = {
     body?: string;
     draft?: boolean;
     reviewers?: string[];
+    /** When set, the server persists the created PR's URL onto this task
+     *  (`tasks.pr_url`) atomically with creation — see `Task.prUrl`. */
+    taskId?: string;
   }) =>
     j<{ ok: true; message?: string; item: GitHubListResult["items"][number] }>("/github/pull-create", {
       method: "POST",
@@ -1142,7 +1146,7 @@ export const api = {
    *  + a `note` when there's no worktree or no diff. */
   getTaskDiff: (taskId: string) => j<TaskDiff>(`/tasks/${taskId}/diff`),
   getTaskGitStatus: (taskId: string) =>
-    j<{ hasChanges: boolean; ahead: number; ignored: boolean }>(`/tasks/${taskId}/git-status`),
+    j<TaskGitStatus>(`/tasks/${taskId}/git-status`),
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
   sendRunInput: (runId: string, line: string) =>

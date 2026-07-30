@@ -58,6 +58,7 @@ import {
   gitPush,
   hasUncommittedChanges,
   listBranches,
+  remoteSyncState,
 } from "./worktree.ts";
 import {
   attachSocket,
@@ -166,6 +167,7 @@ import type {
   RunEvent,
   Task,
   TaskEventsReplayMeta,
+  TaskGitStatus,
   TaskReference,
 } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
@@ -1611,6 +1613,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             body?: string;
             draft?: boolean;
             reviewers?: string[];
+            taskId?: string;
           };
           const dir = body.path;
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
@@ -1634,6 +1637,32 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Best-effort: persist the created PR's URL onto the task so the
+          // run panel can show a durable "View PR" link across restarts.
+          // A missing/invalid taskId or an item with no htmlUrl must never
+          // fail an otherwise-successful creation — this is pure bookkeeping
+          // layered on top of a request that already succeeded.
+          if (typeof body.taskId === "string" && body.taskId) {
+            try {
+              const task = tasks.get(body.taskId);
+              // Guards: archived tasks are frozen (same contract as PATCH /
+              // backlog), a first PR is never silently overwritten, and the
+              // task must actually belong to the project the PR was created
+              // from — a stale/mistargeted taskId must not stamp an unrelated
+              // task.
+              if (
+                task &&
+                task.archivedAt == null &&
+                !task.prUrl &&
+                task.workdir === dir &&
+                result.item?.htmlUrl
+              ) {
+                tasks.update(task.id, { prUrl: result.item.htmlUrl });
+              }
+            } catch (err) {
+              console.warn(`[agetor] failed to persist pr_url for task ${body.taskId}:`, err);
+            }
           }
           return json(result, { headers: corsHeaders(req) });
         }),
@@ -3336,6 +3365,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // lookup failure (no upstream, no baseRef, or a git error) degrades to
       // `0` rather than flipping `ignored` — that flag stays keyed to
       // `hasUncommittedChanges` alone.
+      //
+      // `hasUpstream`/`remoteSynced` additionally drive the "Open PR" chip —
+      // computed via `remoteSyncState` (local tracking-ref check, no
+      // network). When an upstream exists, its ahead count IS the push-ahead
+      // count (`rev-list @{u}..HEAD` — the same first tier `getAheadCount`
+      // would run), so `ahead` reuses it and `getAheadCount` only runs as
+      // the fallback for branches with no upstream yet (or a failed count),
+      // where it degrades through `baseRef` comparisons. This route is
+      // polled every 5s per open panel — don't add git spawns here that
+      // recompute what a sibling call already knows.
       "/tasks/:id/git-status": {
         GET: authed(async (req) => {
           const t = tasks.get(req.params.id);
@@ -3343,18 +3382,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const dir = t.worktreePath ?? t.workdir;
-          const [result, aheadResult] = await Promise.all([
+          const [result, syncState] = await Promise.all([
             hasUncommittedChanges(dir),
-            getAheadCount(dir, t.baseRef ?? null),
+            remoteSyncState(dir),
           ]);
           if (result === null) {
             return json(
-              { hasChanges: false, ahead: 0, ignored: true },
+              { hasChanges: false, ahead: 0, ignored: true, hasUpstream: false, remoteSynced: false } satisfies TaskGitStatus,
               { headers: corsHeaders(req) },
             );
           }
+          const ahead = syncState.hasUpstream && syncState.ahead !== null
+            ? syncState.ahead
+            : (await getAheadCount(dir, t.baseRef ?? null)) ?? 0;
           return json(
-            { hasChanges: result, ahead: aheadResult ?? 0, ignored: false },
+            {
+              hasChanges: result,
+              ahead,
+              ignored: false,
+              hasUpstream: syncState.hasUpstream,
+              remoteSynced: syncState.hasUpstream && syncState.ahead === 0,
+            } satisfies TaskGitStatus,
             { headers: corsHeaders(req) },
           );
         }),
