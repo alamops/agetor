@@ -11,6 +11,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
+  IDLE_SESSION_REAP_MS,
   MODEL_EFFORT_SUPPORT,
   SESSION_DIED_STATUS_PREFIX,
   TASK_TYPES,
@@ -34,6 +35,7 @@ function resolveHarness(harnessId: string): Harness | null {
 }
 import {
   cancelPendingForTask,
+  countPendingForTask,
   setBroadcaster,
   setResolvedBroadcaster,
   type AnyRequest,
@@ -54,8 +56,10 @@ import {
   hasSessionState,
   sessionExists,
   sessionExistsByName,
+  sessionIdleInfo,
   sessionLiveness,
   sessionNameFor,
+  probeSessionActivity,
   jsonlPathFor,
   interruptTaskSession,
   setContinuationRunFactory,
@@ -101,6 +105,7 @@ import type {
   WorktreeGitStatus,
   WorktreeInfo,
   WorktreeStaleReason,
+  WorktreeTeardownResult,
 } from "../shared/types.ts";
 import { WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
 import { appendReferences } from "../shared/refs.ts";
@@ -144,6 +149,14 @@ interface ActiveRun {
   unknownCommand: boolean;
 }
 const active = new Map<string, ActiveRun>(); // runId -> handle
+
+// Guards `reapIdleSessions` against overlapping sweeps — the boot one-shot
+// and the recurring `setInterval` in index.ts could otherwise both be
+// in-flight if a sweep ever ran long (many candidate tasks, a slow tmux
+// probe). A simple boolean is enough: sweeps are infrequent (every
+// `SESSION_REAP_SWEEP_MS`) and idempotent, so skipping one entirely when
+// another is still running just means its candidates get picked up next tick.
+let reapInFlight = false;
 
 // Archive/delete teardown (tmux session kill, terminal teardown, worktree
 // detach/remove) is deferred onto a per-source-workdir FIFO queue so
@@ -325,12 +338,21 @@ function updateColumn(
  * `active` map) so the answer survives a restart and doesn't depend on
  * whether the subagent's settle fired before or after the run's completion
  * landed — either interleaving reads the same committed rows.
+ *
+ * Split into a pure `(task) => boolean` predicate plus a taskId-keyed
+ * wrapper so callers that already hold a freshly-fetched `Task` row (e.g.
+ * `reapIdleSessions`'s per-candidate guard) can reuse it without a second,
+ * redundant `tasks.get`.
  */
+function isTaskHeldByBackgroundAgents(task: Task): boolean {
+  if (task.column !== "running" || task.runId == null) return false;
+  if (runs.get(task.runId)?.status !== "succeeded") return false;
+  return subagents.hasRunning(task.id);
+}
+
 function isHeldByBackgroundAgents(taskId: string): boolean {
   const task = tasks.get(taskId);
-  if (!task || task.column !== "running" || task.runId == null) return false;
-  if (runs.get(task.runId)?.status !== "succeeded") return false;
-  return subagents.hasRunning(taskId);
+  return task ? isTaskHeldByBackgroundAgents(task) : false;
 }
 
 /**
@@ -1954,6 +1976,80 @@ export async function createTask(
 }
 
 /**
+ * Shared teardown job for archiving a task — tmux/codex session kill, then
+ * open terminal tabs, then `detachWorktree` — in that exact order, because a
+ * live shell cwd'd inside the worktree would block `git worktree remove`.
+ * Both `archiveTask` (the fresh-archive path AND the already-archived
+ * re-enqueue path below) and the boot-time `sweepArchivedTeardowns` route
+ * through this one function so the three call sites can never drift apart.
+ *
+ * The harness kind is resolved synchronously here, before the job closure is
+ * built and handed to `enqueueTeardown` — same as the original inline code,
+ * just no longer duplicated at each call site.
+ *
+ * `enqueueTeardown` deliberately swallows job errors to keep its per-workdir
+ * FIFO chain alive for every other task queued behind this one (see its doc
+ * comment) — so it can't just return the `detachWorktree` result. Instead the
+ * result is captured in a closure variable (`result`, exposed via the
+ * returned getter) that a caller reads AFTER awaiting `promise`. This is the
+ * same idiom `deleteOrphanWorktree` already uses to get a real outcome out of
+ * a swallowed job.
+ */
+function enqueueArchiveTeardown(
+  task: Task,
+  opts?: { force?: boolean },
+): { promise: Promise<void>; result: () => WorktreeTeardownResult | undefined } {
+  const kind = resolveHarness(task.agent)?.kind;
+  let result: WorktreeTeardownResult | undefined;
+  const promise = enqueueTeardown(task.id, task.workdir, async () => {
+    // `enqueueTeardown` only guarantees this job runs after everything already
+    // queued for `task.workdir` — it can sit behind other jobs for seconds,
+    // and `task` was captured at ENQUEUE time by every call site (fresh
+    // archive, already-archived re-enqueue, boot sweep). The
+    // `pendingTeardown(taskId)` discipline elsewhere only protects
+    // materialize-AFTER-teardown; it does nothing about the opposite
+    // interleaving: `sendInput`/`startTask` clear `archivedAt` and start
+    // `prepareWorkdir`'s multi-second `git worktree add` BEFORE a fresh
+    // `archiveTask` call (e.g. the Worktrees page's delete button) can see the
+    // half-built directory and enqueue a teardown job right behind it. By the
+    // time that job reaches the front of the queue, the task has moved on —
+    // tearing down with the stale `task` snapshot would rip out a worktree the
+    // agent is (or is about to be) running in. So re-read the row here, at job
+    // execution time, and bail if it moved: gone entirely, un-archived
+    // (`archivedAt == null` — both `sendInput` and `startTask` clear it
+    // *before* calling `prepareWorkdir`, so this check is the same signal that
+    // closes the window), or a run has since started. A bail is reported as
+    // `"failed"` (not `"no-worktree"`/`"already-absent"`, which the client
+    // reads as silent success) because the directory is still there — the
+    // caller should retry, not assume it's clean.
+    //
+    // The live-run check keys on `cancelled`, NOT on `active.has(runId)`:
+    // `archiveTask({ stopRun: true })` — what the Worktrees page's delete
+    // button always sends — stops the run via `stopActiveHandle`, which
+    // flags the handle `cancelled` and kills it, but the `active.delete`
+    // only happens later in the async exit handler. A bare `active.has`
+    // would therefore see the run we ourselves just stopped, bail, and
+    // report a bogus failure for every delete of a *running* worktree. A
+    // handle that's present and NOT cancelled is the real signal: a run
+    // that started after we enqueued, which we must not tear down under.
+    const cur = tasks.get(task.id);
+    const liveHandle = cur?.runId ? active.get(cur.runId) : undefined;
+    if (!cur || cur.archivedAt == null || (liveHandle && !liveHandle.cancelled)) {
+      result = { removed: false, reason: "failed" };
+      return;
+    }
+    // Same contract as deleteTask: dropSession is non-throwing (it
+    // best-efforts tmux teardown internally). Don't wrap — a silent catch
+    // would hide a regression in claude-tmux from the next reviewer.
+    if (kind === "claude-code") dropSession(cur.id);
+    else if (kind === "codex") dropCodexSession(cur.id);
+    await killTerminalsForTask(cur.id);
+    result = await detachWorktree(cur, { force: opts?.force });
+  });
+  return { promise, result: () => result };
+}
+
+/**
  * Archive a finished task: stamp `archivedAt`, kill its claude tmux session
  * AND any open terminal tabs (both best-effort) so no background shell outlives
  * the user's interest in the task — once archived the card is hidden, so the
@@ -1977,11 +2073,23 @@ export async function createTask(
  * the Stop button stops it (`stopActiveHandle`/`stopHeldTask`, shared with
  * `cancelRun`) before the normal archive path below proceeds. Without it,
  * the active-run guard stays in place as a backstop.
+ *
+ * Pass `{ forceWorktree: true }` to have the detach discard uncommitted
+ * changes in the checkout rather than leaving it in place (threaded straight
+ * through to `detachWorktree`'s `force` option) — an explicit, user-confirmed
+ * opt-in from the Worktrees page, since it's a destructive, unrecoverable
+ * discard of anything not committed.
+ *
+ * Pass `{ awaitTeardown: true }` to block until the deferred teardown above
+ * has actually run and get its real `WorktreeTeardownResult` back as
+ * `teardown` — the Worktrees page's delete action needs to know the
+ * directory is truly gone before it refreshes the list, unlike the kanban
+ * archive button, which stays fire-and-forget by leaving this unset.
  */
 export async function archiveTask(
   taskId: string,
-  opts?: { force?: boolean; stopRun?: boolean },
-): Promise<{ task: Task } | { error: string }> {
+  opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean },
+): Promise<{ task: Task; teardown?: WorktreeTeardownResult } | { error: string }> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.column !== "done" && !opts?.force) {
@@ -2003,13 +2111,45 @@ export async function archiveTask(
     stopHeldTask(taskId, "task archived");
   }
   if (task.archivedAt != null) {
+    // Already archived is normally a cheap no-op — repeat-archives (e.g. a
+    // double click) shouldn't re-enqueue teardown work every time. But when
+    // the worktree is STILL on disk, the previous teardown either never ran
+    // (this instance crashed before the boot sweep got to it) or never
+    // finished — and this is exactly the reported bug: the Worktrees page's
+    // "archive & delete" action calls archive on a row that's already
+    // archived, and the old bare `return { task }` here meant that row could
+    // never be cleaned up. Re-enqueue instead, gated on the same
+    // `worktreePath && existsSync(...)` condition `sweepArchivedTeardowns`
+    // already uses at boot, so an ordinary repeat-archive with nothing left
+    // to remove stays a bare return.
+    if (task.worktreePath && existsSync(task.worktreePath)) {
+      const { promise, result } = enqueueArchiveTeardown(task, { force: opts?.forceWorktree });
+      if (opts?.awaitTeardown) {
+        await promise;
+        // A requested outcome should never come back silently absent — if
+        // the job threw and enqueueTeardown swallowed it, `result()` is
+        // still undefined here, so report it as a failed removal instead of
+        // omitting `teardown` from the response.
+        return { task, teardown: result() ?? { removed: false, reason: "failed" } };
+      }
+      void promise;
+    } else if (opts?.awaitTeardown) {
+      // Same "never come back silently absent" contract as the branch above,
+      // for the case where there was never anything to tear down. Both
+      // outcomes are successes for the client (nothing left to remove) — this
+      // only stops the response from omitting `teardown` when it was asked
+      // for, matching `WorktreeTeardownResult`'s documented contract.
+      return {
+        task,
+        teardown: task.worktreePath
+          ? { removed: false, reason: "already-absent" }
+          : { removed: false, reason: "no-worktree" },
+      };
+    }
     return { task };
   }
   const updated = tasks.update(taskId, { archivedAt: Date.now() });
   if (!updated) return { error: "task not found" };
-  // Resolved up front (before enqueueing) — same as before, just no longer
-  // re-read inside the deferred job.
-  const archiveKind = resolveHarness(task.agent)?.kind;
   // codexTurnQueue is cheap in-memory bookkeeping (no I/O), so it's dropped
   // inline rather than folded into the deferred job.
   codexTurnQueue.delete(taskId);
@@ -2022,19 +2162,15 @@ export async function archiveTask(
   // workdir, see `enqueueTeardown`), just off the request's critical path;
   // tasks in a different workdir proceed independently. Callers that must
   // not race a deferred teardown (unarchive, start, delete, the boot sweep)
-  // await `pendingTeardown(taskId)` first.
-  void enqueueTeardown(taskId, task.workdir, async () => {
-    // Same contract as deleteTask: dropSession is non-throwing (it
-    // best-efforts tmux teardown internally). Don't wrap — a silent catch
-    // would hide a regression in claude-tmux from the next reviewer.
-    if (archiveKind === "claude-code") dropSession(taskId);
-    else if (archiveKind === "codex") dropCodexSession(taskId);
-    // Tear down terminal tabs before detaching the worktree — a live shell
-    // cwd'd inside the worktree would block `git worktree remove`, exactly
-    // like deleteTask's ordering.
-    await killTerminalsForTask(taskId);
-    await detachWorktree(updated);
-  });
+  // await `pendingTeardown(taskId)` first. `awaitTeardown` is the one opt-in
+  // exception: the Worktrees page explicitly wants to block on this specific
+  // teardown to get a truthful result back.
+  const { promise, result } = enqueueArchiveTeardown(updated, { force: opts?.forceWorktree });
+  if (opts?.awaitTeardown) {
+    await promise;
+    return { task: updated, teardown: result() ?? { removed: false, reason: "failed" } };
+  }
+  void promise;
   return { task: updated };
 }
 
@@ -2141,17 +2277,153 @@ export function sweepArchivedTeardowns(): number {
     // refuses to archive one), but mirror that guard here too rather than
     // risk tearing down a worktree out from under an in-flight run.
     if (task.runId && active.has(task.runId)) continue;
-    const taskId = task.id;
-    const kind = resolveHarness(task.agent)?.kind;
-    enqueueTeardown(taskId, task.workdir, async () => {
-      if (kind === "claude-code") dropSession(taskId);
-      else if (kind === "codex") dropCodexSession(taskId);
-      await killTerminalsForTask(taskId);
-      await detachWorktree(task);
-    });
+    // No `force` — an explicit owner decision (see the plan doc): discarding
+    // uncommitted work with no human in the loop, unattended at boot, is not
+    // a trade worth making. A dirty worktree just stays stuck until the user
+    // forces it from the Worktrees page.
+    enqueueArchiveTeardown(task);
     enqueued++;
   }
   return enqueued;
+}
+
+/**
+ * Idle-session reaper (T4, `docs/plans/reduce-cpu-and-memory.md` §3.1). Kills
+ * the tmux session backing a claude-code task's REPL once it's sat idle —
+ * no turn in flight, nothing waiting on the user, no session activity — for
+ * `IDLE_SESSION_REAP_MS` (30min), reclaiming the ~300–500MB "node" process
+ * and every per-session timer (`disposeSessionState`, invoked via
+ * `dropSession`). A follow-up sent afterward still works: `sendClaudeTurn`
+ * falls back to `spawnResumedSession` (`claude --resume <id>`) whenever
+ * `hasSessionState` is false, so this is invisible to the user beyond a
+ * slightly slower first reply.
+ *
+ * Candidates come ONLY from this instance's own DB — this must never
+ * enumerate-and-kill tmux sessions (the shared-socket rule documented on
+ * `reconcileOrphans` above applies here identically: a blind sweep would
+ * reap a sibling agetor instance's or a `bun test` run's sessions). Probing
+ * a specific candidate task id we already own (`probeSessionActivity`,
+ * `sessionIdleInfo`) is fine — that's a keyed lookup, not a sweep. Codex is
+ * never a candidate: its sessions are one-shot per turn and self-dispose
+ * (`codex-tmux.ts`), so there's nothing to reap.
+ *
+ * Two performance properties keep a sweep from becoming a synchronous burst
+ * that stalls the main process for the duration of the scan (previously: N
+ * non-archived claude tasks × ~5 DB queries + a blocking tmux probe each, all
+ * in one event-loop turn):
+ *  - **Cheap pre-filter.** `candidateIds` is derived entirely from the rows
+ *    `tasks.list()` already fetched (no per-candidate `tasks.get` yet) and
+ *    excludes any task that plainly can't own a session: archived, non-claude,
+ *    or — the key trim — neither holding in-memory `SessionState` nor ever
+ *    having started a run (`hasSessionState(t.id) || t.runId != null`). A
+ *    never-started task fails both and drops out before it costs anything
+ *    more than an array filter.
+ *  - **Per-candidate yield.** `await Bun.sleep(0)` at the top of every loop
+ *    iteration hands control back to the event loop between candidates, so
+ *    HTTP requests, SSE pushes, and session tailers keep running throughout a
+ *    sweep instead of queuing up behind it. This is what makes the pre-kill
+ *    re-check below load-bearing rather than defensive-only: with real
+ *    yields between iterations, a message that lands mid-sweep (starts a
+ *    turn, opens a pending interaction) MUST be caught by a guard re-read
+ *    immediately before the kill, not just the one the loop started with.
+ *
+ * Every guard is re-checked against a freshly-read task row immediately
+ * before the kill, not from the snapshot the loop started with. Guard work
+ * itself is hoisted to avoid redundant reads: `isReapable` takes the already
+ * -fetched `Task` row and calls the pure `isTaskHeldByBackgroundAgents(task)`
+ * predicate directly rather than the taskId-keyed `isHeldByBackgroundAgents`
+ * wrapper, which would otherwise re-fetch the same row internally.
+ *
+ * Called once ~30s after boot (letting boot reattach settle first) and then
+ * on a `SESSION_REAP_SWEEP_MS` interval from `src/bun/index.ts` and
+ * `src/bun/headless.ts`.
+ */
+export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
+  if (reapInFlight) return { reaped: [] };
+  reapInFlight = true;
+  try {
+    const reaped: string[] = [];
+    const candidateIds = tasks
+      .list()
+      .filter(
+        (t) =>
+          t.archivedAt == null
+          && resolveHarness(t.agent)?.kind === "claude-code"
+          && (hasSessionState(t.id) || t.runId != null),
+      )
+      .map((t) => t.id);
+
+    const isReapable = (task: Task): boolean => {
+      if (task.runId && active.has(task.runId)) return false;
+      if (isTaskHeldByBackgroundAgents(task)) return false;
+      if (countPendingForTask(task.id) > 0) return false;
+      return true;
+    };
+
+    for (const taskId of candidateIds) {
+      // Yield between candidates — see the perf-properties doc above. Safe
+      // because every guard is re-checked against a fresh row immediately
+      // before the kill below.
+      await Bun.sleep(0);
+
+      const task = tasks.get(taskId);
+      if (!task || !isReapable(task)) continue;
+
+      const idleInfo = sessionIdleInfo(taskId);
+      let idleLongEnough: boolean;
+      if (idleInfo) {
+        idleLongEnough = idleInfo.idleMs >= IDLE_SESSION_REAP_MS;
+      } else {
+        // No in-memory SessionState — e.g. a done/review task whose session
+        // survived a restart (boot reconciliation only reattaches `running`
+        // rows). Probe tmux directly for the session's own activity clock
+        // (`#{session_activity}`) instead of the previous `task.updatedAt`
+        // heuristic, which could read stale on a task nobody touched through
+        // agetor but that's still being used interactively in its terminal.
+        // `null` means the session is already gone (or unreachable) — nothing
+        // to reap. `attached === true` means a human has the pane open right
+        // now — never reap that regardless of how long it's been idle by the
+        // clock. Otherwise require BOTH tmux's activity clock AND the task
+        // row's `updatedAt` past the threshold before reaping a session we
+        // have no in-memory visibility into — the extra-conservative choice
+        // called out in the review: a session could be driven by something
+        // other than agetor (a human at the tmux client) bumping tmux's
+        // activity clock without ever updating our DB row, or vice versa.
+        const activity = probeSessionActivity(taskId);
+        if (!activity) continue;
+        if (activity.attached) continue;
+        idleLongEnough =
+          Date.now() - activity.activityAt >= IDLE_SESSION_REAP_MS
+          && Date.now() - task.updatedAt >= IDLE_SESSION_REAP_MS;
+      }
+      if (!idleLongEnough) continue;
+
+      // Re-check immediately before the kill against a fresh row — closes
+      // the window between the idle check above (which may itself have
+      // awaited a yield or a tmux probe) and the kill below.
+      const fresh = tasks.get(taskId);
+      if (!fresh || !isReapable(fresh)) continue;
+
+      dropSession(taskId);
+      reaped.push(taskId);
+
+      const recent = runs.listForTask(taskId)[0];
+      if (recent) {
+        const data = findLastClaudeSessionId(taskId)
+          ? "session hibernated after 30m idle — next message will resume it"
+          : "session hibernated after 30m idle — no saved session id, next message starts a fresh context";
+        runs.appendEvent(recent.id, "status", data);
+        emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+      }
+    }
+
+    if (reaped.length > 0) {
+      console.log(`[agetor] reaped ${reaped.length} idle claude session(s)`);
+    }
+    return { reaped };
+  } finally {
+    reapInFlight = false;
+  }
 }
 
 /**

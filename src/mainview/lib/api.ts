@@ -70,6 +70,7 @@ import type {
   Subagent,
   Task,
   TaskDiff,
+  TaskEventsReplayMeta,
   TaskGitStatus,
   TaskReference,
   TaskType,
@@ -77,7 +78,9 @@ import type {
   UpdateStatus,
   WorktreeGitStatus,
   WorktreeInfo,
+  WorktreeTeardownResult,
 } from "../../shared/types.ts";
+import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
 import { fetchWithRecovery } from "./net-retry.ts";
 
 export interface UpdateSnapshot {
@@ -296,6 +299,18 @@ async function j<T>(
 }
 
 export interface AppDefaults { home: string; cwd: string; dataDir: string }
+
+/** One page of older task events, as returned by `GET /tasks/:id/events/page`
+ *  (the "Load earlier" backward-paging cursor). Ascending order (oldest
+ *  first), same shape as the SSE stream's events plus `id` — the real
+ *  `run_events` row id, which the SSE stream never carries (see
+ *  `TaskEventsReplayMeta`) but this paging route does, since it's exactly
+ *  what the next `beforeId` needs. */
+export interface TaskEventsPage {
+  events: (RunEvent & { id: number })[];
+  earliestId: number | null;
+  hasMore: boolean;
+}
 
 export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
 export interface HarnessInput {
@@ -1047,15 +1062,46 @@ export const api = {
    *  true` additionally stops any in-flight run/background agents before
    *  archiving — required (server-enforced) to archive a running/blocked
    *  task at all; the caller is expected to confirm with the user first.
-   *  Omitted (the common case) sends no body, matching the original
-   *  archive-from-`done` callers unchanged. */
-  archiveTask: (id: string, opts?: { force?: boolean; stopRun?: boolean }) =>
-    j<Task>(`/tasks/${id}/archive`, {
+   *  `forceWorktree: true` discards uncommitted changes in the worktree's
+   *  checkout during teardown (never the branch, commits, or run/AI
+   *  history) — also part of the Worktrees page's "Archive & delete", after
+   *  the caller has warned the user. `awaitTeardown: true` makes the
+   *  request block until the worktree removal has actually finished (no
+   *  timeout is set server-side), and the response then carries a
+   *  `teardown` outcome describing whether the directory is really gone —
+   *  omit it and the archive returns immediately with teardown deferred to
+   *  a background queue, as before. Omitting all four flags sends no body,
+   *  matching the original archive-from-`done` callers unchanged.
+   *
+   *  `retry: false` only when `awaitTeardown` is set — matching
+   *  `createTask`/`sendRunInput`'s idiom above. The route sets an unbounded
+   *  server timeout and blocks on the *entire* per-workdir teardown FIFO
+   *  (every same-repo teardown queued ahead of this one), which can run well
+   *  past WKWebView's own request timeout even though the operation is
+   *  succeeding server-side. A default retry on that timeout would silently
+   *  re-issue a second, non-idempotent archive against a task the user may
+   *  have already resumed (re-running `dropSession`/`killTerminalsForTask`,
+   *  re-queuing a second worktree teardown behind the first). The
+   *  fire-and-forget archive (no `awaitTeardown`, e.g. the kanban button)
+   *  returns fast and keeps the default retry — it isn't the non-idempotent
+   *  hazard this guards against. */
+  archiveTask: (
+    id: string,
+    opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean },
+  ) =>
+    j<Task & { teardown?: WorktreeTeardownResult }>(`/tasks/${id}/archive`, {
       method: "POST",
-      ...(opts?.force || opts?.stopRun
-        ? { body: JSON.stringify({ force: !!opts.force, stopRun: !!opts.stopRun }) }
+      ...(opts?.force || opts?.stopRun || opts?.forceWorktree || opts?.awaitTeardown
+        ? {
+            body: JSON.stringify({
+              force: !!opts.force,
+              stopRun: !!opts.stopRun,
+              forceWorktree: !!opts.forceWorktree,
+              awaitTeardown: !!opts.awaitTeardown,
+            }),
+          }
         : {}),
-    }),
+    }, opts?.awaitTeardown ? { retry: false } : undefined),
   unarchiveTask: (id: string) => j<Task>(`/tasks/${id}/unarchive`, { method: "POST" }),
 
   /** Every git worktree materialized on disk under `dataDir/worktrees/`,
@@ -1082,6 +1128,16 @@ export const api = {
   terminalSocketUrl: (id: string) =>
     `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?token=${encodeURIComponent(API_TOKEN)}`,
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
+  /** Backward page of a task's persisted events, older than `beforeId`
+   *  (exclusive) — drives the run panel's "Load earlier" affordance once the
+   *  bounded SSE replay window (`EVENTS_REPLAY_LIMIT`) has been exhausted.
+   *  `beforeId` is required by the route; `limit` defaults server-side to
+   *  `EVENTS_REPLAY_LIMIT` when omitted. */
+  fetchTaskEventsPage: (taskId: string, beforeId: number, limit?: number) => {
+    const q = new URLSearchParams({ beforeId: String(beforeId) });
+    if (limit) q.set("limit", String(limit));
+    return j<TaskEventsPage>(`/tasks/${taskId}/events/page?${q.toString()}`);
+  },
   /** Background/sub agents tracked for a task — drives the run panel's
    *  read-only per-subagent tab strip. Polled like `listRuns`; live deltas
    *  also arrive on the task SSE as `stream: "subagent"` events. */
@@ -1168,6 +1224,17 @@ export const api = {
       method: "POST",
     }),
 
+  /** Absolute URL for an inline `<img>` thumbnail of a referenced image path.
+   *  `<img>` can't set an Authorization header any more than EventSource can,
+   *  so the token rides along as a query param exactly like
+   *  `subscribeRun`/`subscribeTask`'s `?token=`. `GET /files/preview`
+   *  responds 401 with a missing/bad token, 400 for a non-absolute or
+   *  non-image path, 404 when the path doesn't exist (or isn't a regular
+   *  file), and 200 with the raw image bytes otherwise; callers handle the
+   *  error cases via the `<img>` element's own `onError`. */
+  filePreviewUrl: (path: string): string =>
+    `${BASE}/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(API_TOKEN)}`,
+
   /** Persist an in-memory image (clipboard paste or macOS floating-thumbnail
    *  drag) to disk and get back its absolute path. Bypasses `j()` because the
    *  body is raw bytes, not JSON. */
@@ -1212,10 +1279,17 @@ export const api = {
    *  structured-event refactor (the legacy mapper truncated tool inputs
    *  at 500 chars, so the in-DB copy is missing the tail bytes). Returns
    *  an empty list + `reason` when the JSONL is gone or the run had no
-   *  claude session id (e.g. codex runs). */
-  rebuildRunEvents: (runId: string) =>
-    j<{ events: RunEvent[]; source?: string; reason?: string }>(
-      `/runs/${runId}/rebuild-events`,
+   *  claude session id (e.g. codex runs).
+   *
+   *  `limit`, when passed, bounds the rebuild to the most recent `limit`
+   *  mapped events (ascending) and the response carries `hasMore` — so an
+   *  automatic/background rebuild doesn't silently replace the panel's
+   *  bounded live window with an unbounded full-history dump. Omitted
+   *  (the manual "Rebuild from session JSONL" button's case), the server
+   *  returns the legacy full array with no `hasMore` field. */
+  rebuildRunEvents: (runId: string, limit?: number) =>
+    j<{ events: RunEvent[]; hasMore?: boolean; source?: string; reason?: string }>(
+      `/runs/${runId}/rebuild-events${limit ? `?limit=${limit}` : ""}`,
     ),
 
   /** Fire a native macOS notification via the Bun process. Fire-and-forget
@@ -1290,9 +1364,28 @@ export const api = {
   },
   /** Unified task-level event stream: every run's events, merged in id
    *  order. Replaces per-run subscriptions for the run panel so the user
-   *  sees the whole conversation as one scrollback. */
-  subscribeTask(taskId: string, onEvent: (e: RunEvent) => void): () => void {
+   *  sees the whole conversation as one scrollback.
+   *
+   *  `onReplayMeta`, when supplied, receives the named `replay_meta` frame the
+   *  server sends as the FIRST frame of every (re)connect — the bounded
+   *  replay window's earliest event id and whether older history exists
+   *  (drives the run panel's "Load earlier" button). It's a *named* SSE
+   *  event (`event: replay_meta`), invisible to `onmessage`, so registering
+   *  the listener only when a caller asks for it costs nothing for callers
+   *  that don't care. */
+  subscribeTask(
+    taskId: string,
+    onEvent: (e: RunEvent) => void,
+    onReplayMeta?: (meta: TaskEventsReplayMeta) => void,
+  ): () => void {
     const es = new EventSource(`${BASE}/tasks/${taskId}/events?token=${encodeURIComponent(API_TOKEN)}`);
+    if (onReplayMeta) {
+      es.addEventListener(TASK_EVENTS_REPLAY_META_EVENT, (m: MessageEvent) => {
+        try {
+          onReplayMeta(JSON.parse(m.data) as TaskEventsReplayMeta);
+        } catch { /* ignore malformed */ }
+      });
+    }
     es.onmessage = (m) => {
       try {
         const parsed = JSON.parse(m.data);

@@ -231,6 +231,11 @@ describe("commitPushPrompt", () => {
     expect(p).toContain("````");
     expect(p).toContain("four backticks");
   });
+  test("forbids AI-attribution footers in the commit message and PR fields", () => {
+    const p = commitPushPrompt({ branch: "feature/add-login", taskType: "task" });
+    expect(p).toContain("Do not include any AI attribution");
+    expect(p).toContain("Co-Authored-By");
+  });
 });
 
 describe("renderBranchTemplate", () => {

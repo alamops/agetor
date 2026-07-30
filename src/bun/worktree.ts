@@ -5,7 +5,7 @@ import path from "node:path";
 import { dataDir } from "./db.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
-import type { BranchInfo, Task, TaskDiff } from "../shared/types.ts";
+import type { BranchInfo, Task, TaskDiff, WorktreeTeardownResult } from "../shared/types.ts";
 
 export type { BranchInfo };
 
@@ -984,16 +984,28 @@ export async function pruneWorktrees(root: string): Promise<void> {
  * checks), path not a git repo, or `git status` failing on a broken/pruned
  * registration; all of those are "can't confirm clean" → skip removal.
  *
+ * Pass `{ force: true }` to skip that dirty gate entirely — the Worktrees
+ * page's delete action offers this as an explicit, user-confirmed "discard
+ * uncommitted changes" option once the ordinary path above has left a row
+ * permanently stuck (dirty checkouts, or a `git status` that keeps failing on
+ * a broken registration, would otherwise never clear). Force only ever skips
+ * the dirty check — the rest of the body, including the branch-preserving
+ * guarantee below, is unchanged: `git branch -D` is never called, forced or
+ * not, so the branch and every commit on it survive for a later re-attach.
+ *
  * Never throws — best-effort, mirroring `removeWorktree`.
  */
 export async function detachWorktree(
   task: Task,
-): Promise<{ removed: boolean; reason?: string }> {
+  opts?: { force?: boolean },
+): Promise<WorktreeTeardownResult> {
   if (!task.worktreePath) return { removed: false, reason: "no-worktree" };
   if (!existsSync(task.worktreePath)) return { removed: false, reason: "already-absent" };
 
-  const dirty = await hasUncommittedChanges(task.worktreePath);
-  if (dirty !== false) return { removed: false, reason: "dirty" };
+  if (!opts?.force) {
+    const dirty = await hasUncommittedChanges(task.worktreePath);
+    if (dirty !== false) return { removed: false, reason: "dirty" };
+  }
 
   const root = await repoRoot(task.workdir);
   if (root) {
@@ -1013,5 +1025,6 @@ export async function detachWorktree(
     try { await rm(task.worktreePath, { recursive: true, force: true }); }
     catch { /* best-effort */ }
   }
-  return { removed: !existsSync(task.worktreePath) };
+  const removed = !existsSync(task.worktreePath);
+  return removed ? { removed } : { removed, reason: "failed" };
 }

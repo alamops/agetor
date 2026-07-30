@@ -145,7 +145,14 @@ import {
   listPendingForTask,
   type AskQuestionsAnswer,
 } from "./interactions.ts";
-import { DEFAULT_BRANCH_CONFIG, MODEL_EFFORT_SUPPORT, TASK_TYPES, validateBranchConfig } from "../shared/types.ts";
+import {
+  DEFAULT_BRANCH_CONFIG,
+  EVENTS_REPLAY_LIMIT,
+  MODEL_EFFORT_SUPPORT,
+  TASK_EVENTS_REPLAY_META_EVENT,
+  TASK_TYPES,
+  validateBranchConfig,
+} from "../shared/types.ts";
 import type {
   AgentKind,
   AppEvent,
@@ -159,11 +166,13 @@ import type {
   GlobalEvent,
   RunEvent,
   Task,
+  TaskEventsReplayMeta,
   TaskGitStatus,
   TaskReference,
 } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
+import { isImagePath } from "../shared/attachments.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -194,6 +203,15 @@ const json = (data: unknown, init?: ResponseInit) =>
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
     status: init?.status,
   });
+
+// Content-type map for GET /files/preview. Module-scope so it isn't
+// reallocated on every request.
+const PREVIEW_CONTENT_TYPES: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  svg: "image/svg+xml",
+  ico: "image/x-icon",
+};
 
 // Derived, never-persisted count of this task's still-`running` subagent
 // rows — drives the kanban card's "N background agents" badge. Single-task
@@ -3148,17 +3166,42 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/archive": {
         POST: authed(async (req) => {
+          // Worktree teardown can now be awaited inline (`awaitTeardown`)
+          // behind a real `git worktree remove`, which — like DELETE
+          // /tasks/:id — can exceed the idle timeout ceiling on large repos.
           server.timeout(req, 0);
-          // Optional body — no body (or a malformed one) means force: false
-          // and stopRun: false, same as the pre-existing behaviour. `force`
+          // Optional body — no body (or a malformed one) means every flag
+          // defaults to false, same as the pre-existing behaviour. `force`
           // bypasses the done-column gate (Worktrees page's delete action);
           // `stopRun` additionally stops an in-flight/held run before
-          // archiving instead of erroring.
-          const body = (await req.json().catch(() => ({}))) as { force?: boolean; stopRun?: boolean };
-          const result = await archiveTask(req.params.id, { force: body.force === true, stopRun: body.stopRun === true });
-          return "error" in result
-            ? json(result, { status: 400, headers: corsHeaders(req) })
-            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+          // archiving instead of erroring; `forceWorktree` discards
+          // uncommitted changes in the checkout instead of leaving a dirty
+          // worktree in place; `awaitTeardown` blocks until the deferred
+          // teardown has actually run and surfaces its outcome.
+          const body = (await req.json().catch(() => ({}))) as {
+            force?: boolean;
+            stopRun?: boolean;
+            forceWorktree?: boolean;
+            awaitTeardown?: boolean;
+          };
+          const result = await archiveTask(req.params.id, {
+            force: body.force === true,
+            stopRun: body.stopRun === true,
+            forceWorktree: body.forceWorktree === true,
+            awaitTeardown: body.awaitTeardown === true,
+          });
+          if ("error" in result) {
+            return json(result, { status: 400, headers: corsHeaders(req) });
+          }
+          // Nest `teardown` as a sibling key rather than spreading its fields
+          // onto the task, so it can never collide with an actual Task
+          // column — the client only reads it when it explicitly asked for
+          // `awaitTeardown`, and it's absent (not `undefined`-valued) on the
+          // ordinary fire-and-forget path.
+          const payload: ReturnType<typeof withRunningSubagents> & { teardown?: typeof result.teardown } =
+            withRunningSubagents(result.task);
+          if (result.teardown) payload.teardown = result.teardown;
+          return json(payload, { headers: corsHeaders(req) });
         }),
       },
 
@@ -3535,6 +3578,74 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Serve the bytes of a local image file so the webview can render an
+      // `<img>` thumbnail for a referenced attachment. Same trust level as
+      // `/open-path` above — an absolute path under a token-gated,
+      // 127.0.0.1-only route can already be opened with the OS default app,
+      // so reading its bytes back adds nothing a malicious caller couldn't
+      // already get. The per-launch token + loopback bind is the actual
+      // security boundary; the `isImagePath` extension gate exists only to
+      // keep this route from doubling as a generic "read any file" endpoint.
+      "/files/preview": {
+        GET: authed((req) => {
+          const url = new URL(req.url);
+          const raw = url.searchParams.get("path") ?? "";
+          if (!raw) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!path.isAbsolute(raw)) {
+            return json(
+              { error: `path must be absolute: ${raw}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if (!isImagePath(raw)) {
+            return json(
+              { error: `not an image path: ${raw}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          let st;
+          try {
+            st = statSync(raw);
+          } catch {
+            return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
+          }
+          // Only regular files: a FIFO, device, or symlink-to-device named
+          // `*.png` would otherwise hang the response stream forever.
+          if (!st.isFile()) {
+            return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
+          }
+          const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
+          const contentType = PREVIEW_CONTENT_TYPES[ext] ?? `image/${ext}`;
+          // ETag derived from size+mtime so a re-saved file at the same path
+          // (e.g. a screenshot overwritten in place) is detected as changed.
+          const etag = `"${st.size}-${st.mtimeMs}"`;
+          if (req.headers.get("if-none-match") === etag) {
+            return new Response(null, {
+              status: 304,
+              headers: { ...corsHeaders(req), etag },
+            });
+          }
+          return new Response(Bun.file(raw), {
+            headers: {
+              ...corsHeaders(req),
+              "content-type": contentType,
+              // This route serves agent-writable content (e.g. SVG, which can
+              // carry <script>) on the origin whose URL carries the API
+              // token; nosniff + img-only consumption keeps active-content
+              // risk down.
+              "x-content-type-options": "nosniff",
+              // Content at a given path can change (a screenshot re-saved in
+              // place), so don't let the browser serve stale bytes without
+              // asking; the ETag makes the revalidation cheap (304, no body).
+              "cache-control": "private, max-age=0, must-revalidate",
+              etag,
+            },
+          });
+        }),
+      },
+
       // ─── Interactions: claude built-in AskUserQuestion (scraper-sourced) ──
       // The native modal is live on the tmux pane; there's no promise. Plan
       // the keystrokes from the user's picks and drive them into the modal
@@ -3837,9 +3948,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // and WebKit's fetch rejects with the unhelpful "Load failed".
       "/runs/:id/rebuild-events": { GET: authed((req) => {
         try {
+          // Optional `?limit=` caps the response to the most recent N mapped
+          // events (ascending) plus `hasMore`, so the RunPanel's auto-rebuild
+          // on opening a finished claude task doesn't defeat the SSE replay
+          // window by pulling unbounded full JSONL history. Absent `limit`,
+          // the response keeps its pre-existing shape (bare `events` array,
+          // no `hasMore`) for any other caller — additive-only change.
+          const url = new URL(req.url);
+          const limitParam = url.searchParams.get("limit");
+          const hasLimit = limitParam !== null;
+          const limitRaw = Number(limitParam);
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
+            : EVENTS_REPLAY_LIMIT;
           const run = runs.get(req.params.id);
           if (!run) return json({ error: "run not found" }, { status: 404, headers: corsHeaders(req) });
-          if (!run.claudeSessionId) return json({ events: [], reason: "run has no claude session id" }, { headers: corsHeaders(req) });
+          if (!run.claudeSessionId) {
+            return json(
+              { events: [], reason: "run has no claude session id", ...(hasLimit ? { hasMore: false } : {}) },
+              { headers: corsHeaders(req) },
+            );
+          }
           const task = tasks.get(run.taskId);
           if (!task) return json({ error: "task not found" }, { status: 404, headers: corsHeaders(req) });
           // Reconstruct the cwd claude was launched against. Worktree tasks
@@ -3851,7 +3980,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const harness = harnesses.getByIdOrKind(task.agent);
           const jsonlPath = jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null);
           if (!existsSync(jsonlPath)) {
-            return json({ events: [], reason: `JSONL not found at ${jsonlPath}` }, { headers: corsHeaders(req) });
+            return json(
+              { events: [], reason: `JSONL not found at ${jsonlPath}`, ...(hasLimit ? { hasMore: false } : {}) },
+              { headers: corsHeaders(req) },
+            );
           }
           // Drive the JSONL through the same staging pipeline live tailing
           // uses, so the rebuilt event stream contains "turn complete"
@@ -3874,6 +4006,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             });
           };
           rebuildEventsFromJsonl(readFileSync(jsonlPath, "utf8"), onChunk);
+          if (hasLimit) {
+            const hasMore = events.length > limit;
+            const windowed = hasMore ? events.slice(events.length - limit) : events;
+            return json({ events: windowed, hasMore, source: jsonlPath }, { headers: corsHeaders(req) });
+          }
           return json({ events, source: jsonlPath }, { headers: corsHeaders(req) });
         } catch (e) {
           const msg = (e as Error).message ?? String(e);
@@ -4155,6 +4292,46 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Paged access to older events, for the "Load earlier" affordance once
+      // the SSE replay window (below) has been exhausted. `beforeId` is
+      // required — this is a backward-paging cursor, not a general listing
+      // endpoint. Ascending order, same event shape as the SSE frames (plus
+      // `id`, which is handy for chaining the next `beforeId`).
+      "/tasks/:id/events/page": {
+        GET: authed((req) => {
+          const taskId = req.params.id;
+          if (!tasks.get(taskId)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const url = new URL(req.url);
+          const beforeIdParam = url.searchParams.get("beforeId");
+          const beforeIdRaw = beforeIdParam === null ? NaN : Number(beforeIdParam);
+          if (!Number.isInteger(beforeIdRaw) || beforeIdRaw <= 0) {
+            return json(
+              { error: "beforeId (positive integer) required" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const limitRaw = Number(url.searchParams.get("limit"));
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
+            : EVENTS_REPLAY_LIMIT;
+          const rows = runs.eventsForTask(taskId, { beforeId: beforeIdRaw, limit });
+          const events = rows.map((ev) => ({
+            id: ev.id,
+            runId: ev.runId,
+            taskId,
+            stream: ev.stream as RunEvent["stream"],
+            data: ev.data,
+            ts: ev.ts,
+            subagentId: ev.subagentId,
+          }));
+          const earliestId = events.length > 0 ? events[0]!.id : null;
+          const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+          return json({ events, earliestId, hasMore }, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/events": authed((req) => {
         const taskId = req.params.id;
         const stream = new ReadableStream({
@@ -4173,6 +4350,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
                 // (which would then permanently block the daemon's idle-shutdown).
               }
             };
+            // Named frame — invisible to a plain `onmessage` listener (only
+            // `addEventListener(name, ...)` sees it), so old/unmodified
+            // clients keep working unchanged even though a new frame now
+            // precedes the replayed window.
+            const sendNamed = (name: string, data: unknown) => {
+              try {
+                controller.enqueue(enc.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`));
+              } catch {
+                // Same rationale as `send`'s catch above.
+              }
+            };
             // Unified task-level stream: one scrollback per task, merging
             // events across every run. Subscribe before replay (same race
             // protection as the per-run endpoint).
@@ -4182,8 +4370,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               if (buffer) buffer.push(e);
               else send(e);
             });
-            for (const ev of runs.eventsForTask(taskId)) {
+            // Cap replay to the most recent EVENTS_REPLAY_LIMIT events instead
+            // of the task's full history — a task with thousands of events
+            // used to replay every one of them on every SSE (re)connect.
+            // Older history is fetched on demand via /tasks/:id/events/page.
+            const window = runs.eventsForTask(taskId, { limit: EVENTS_REPLAY_LIMIT });
+            const earliestId = window.length > 0 ? window[0]!.id : null;
+            const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+            sendNamed(TASK_EVENTS_REPLAY_META_EVENT, { earliestId, hasMore } satisfies TaskEventsReplayMeta);
+            for (const ev of window) {
               send({
+                id: ev.id,
                 runId: ev.runId,
                 taskId,
                 stream: ev.stream as RunEvent["stream"],

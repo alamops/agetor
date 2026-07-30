@@ -15,11 +15,11 @@ import { coreCredsPath } from "./core-creds.ts";
 // tasks.get(...)` at module scope in interactions.ts) — under ESM live
 // bindings the unresolved cycle becomes an undefined-binding crash at
 // import time. Keep both sides lazy.
-import { countPendingForTask } from "./interactions.ts";
+import { countPendingForTask, pendingCountsByTask } from "./interactions.ts";
 // Same lazy-cycle contract as interactions.ts above: terminals.ts imports
 // `tasks` from this module, and we call `countTerminals` only inside `toTask`
 // (a function body), never at top level. Do not hoist this call site.
-import { countTerminals } from "./terminals.ts";
+import { countTerminals, terminalCountsByTask } from "./terminals.ts";
 
 // Hard guard against test fixtures silently leaking into the user's real
 // SQLite db. `bun test` runs every *.test.ts file in one process, so the
@@ -151,7 +151,18 @@ const parseDraft = (raw: unknown): TaskDraft | null => {
   } catch { return null; }
 };
 
-const toTask = (r: TaskRow): Task => ({
+/** Optional pre-computed grouped counts, threaded in by `tasks.list()` so a
+ *  multi-row query does one pass over each in-memory registry instead of a
+ *  per-row `countPendingForTask`/`countTerminals` scan (289 tasks × 2 linear
+ *  scans on every 2s `/tasks` poll, before this). Single-task reads
+ *  (`tasks.get`, `insert`, `update`) omit this and fall back to the
+ *  per-task counters — called far less often than the poll. */
+interface TaskCounts {
+  pending?: Map<string, number>;
+  terminals?: Map<string, number>;
+}
+
+const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   id: r.id,
   title: r.title,
   prompt: r.prompt,
@@ -176,8 +187,8 @@ const toTask = (r: TaskRow): Task => ({
   // join (e.g. insert/update returning the freshly-written shape, where
   // no runs exist yet → false is the right default).
   hasOpenableRun: r.has_openable_run === 1,
-  pendingInteractionCount: countPendingForTask(r.id),
-  openTerminalCount: countTerminals(r.id),
+  pendingInteractionCount: counts?.pending ? (counts.pending.get(r.id) ?? 0) : countPendingForTask(r.id),
+  openTerminalCount: counts?.terminals ? (counts.terminals.get(r.id) ?? 0) : countTerminals(r.id),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   archivedAt: r.archived_at,
@@ -194,12 +205,18 @@ const TASKS_SELECT = `
 `;
 
 export const tasks = {
+  // Computes the pending-interaction and open-terminal grouped counts ONCE
+  // for the whole result set (two single-pass scans over their respective
+  // in-memory maps) instead of once per row via `toTask`'s per-task fallback
+  // — this is the hot path hit by the 2s `/tasks` poll.
   list(): Task[] {
-    return db.query<TaskRow, []>(
+    const rows = db.query<TaskRow, []>(
       `${TASKS_SELECT}
          GROUP BY tasks.id
          ORDER BY tasks.created_at DESC`,
-    ).all().map(toTask);
+    ).all();
+    const counts: TaskCounts = { pending: pendingCountsByTask(), terminals: terminalCountsByTask() };
+    return rows.map((r) => toTask(r, counts));
   },
   get(id: string): Task | null {
     const row = db.query<TaskRow, [string]>(
@@ -736,18 +753,62 @@ export const runs = {
    *  chronological — id is autoincrement, ts can collide when bursts of
    *  events land in the same Date.now() ms). Used by the unified
    *  task-level stream so the panel shows the whole conversation as one
-   *  scrollback instead of per-run silos. */
-  eventsForTask(taskId: string) {
-    return db.query<
-      { runId: string; stream: string; data: string; ts: number; subagentId: string | null },
-      [string]
-    >(
-      `SELECT run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
+   *  scrollback instead of per-run silos.
+   *
+   *  With no `opts` (or no `opts.limit`), returns the full unbounded
+   *  ascending history — the original behavior, kept for existing callers
+   *  (tests, `rebuildEventsFromJsonl`-adjacent tooling) that want everything.
+   *
+   *  With `opts.limit` set, returns only the MOST RECENT `limit` events:
+   *  filters `id < opts.beforeId` when given, orders by id DESC, takes
+   *  `limit`, then reverses so the caller still sees ascending order. This
+   *  is what powers the capped SSE replay window and the `/events/page`
+   *  paging route — both want "the newest N (before some cursor)", not
+   *  "the first N". */
+  eventsForTask(
+    taskId: string,
+    opts?: { beforeId?: number; limit?: number },
+  ): Array<{ id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null }> {
+    type Row = { id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null };
+    if (opts?.limit) {
+      const conditions = ["runs.task_id = ?"];
+      const params: Array<string | number> = [taskId];
+      if (opts.beforeId != null) {
+        conditions.push("run_events.id < ?");
+        params.push(opts.beforeId);
+      }
+      params.push(opts.limit);
+      const rows = db.query<Row, Array<string | number>>(
+        `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
+         FROM run_events
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY run_events.id DESC
+         LIMIT ?`,
+      ).all(...params);
+      return rows.reverse();
+    }
+    return db.query<Row, [string]>(
+      `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
        FROM run_events
        JOIN runs ON runs.id = run_events.run_id
        WHERE runs.task_id = ?
        ORDER BY run_events.id ASC`,
     ).all(taskId);
+  },
+  /** Cheap existence check — is there at least one persisted event for this
+   *  task older than `beforeId`? Backs the `hasMore` flag on both the SSE
+   *  `replay_meta` frame and the `/events/page` paging route, so the client
+   *  knows whether to keep showing "Load earlier" without fetching (and
+   *  counting) the whole remaining history. */
+  hasEventsBefore(taskId: string, beforeId: number): boolean {
+    const row = db.query<{ 1: number }, [string, number]>(
+      `SELECT 1 FROM run_events
+       JOIN runs ON runs.id = run_events.run_id
+       WHERE runs.task_id = ? AND run_events.id < ?
+       LIMIT 1`,
+    ).get(taskId, beforeId);
+    return row !== null;
   },
   appendEvent(
     runId: string,

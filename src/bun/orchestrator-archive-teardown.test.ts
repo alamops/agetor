@@ -345,6 +345,310 @@ test("FIFO ordering: pendingTeardown(b) resolving implies a's teardown (enqueued
   }
 });
 
+test("regression: repeat-archiving an already-archived task whose worktree is still on disk (crash-before-teardown) actually tears it down now — before the fix this was a total no-op", async () => {
+  const { createTask, archiveTask, pendingTeardown } = await import("./orchestrator.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const repo = await makeRepo();
+  const created = await createTask({
+    title: "already-archived, worktree still on disk",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: repo,
+    isolation: "worktree",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  try {
+    const prepared = await prepareWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
+    tasks.update(taskId, { column: "done" });
+
+    const worktreePath = prepared.worktreePath!;
+    expect(existsSync(worktreePath)).toBe(true);
+
+    // Simulate the reported bug's precondition directly: `archivedAt` is
+    // already set (e.g. from a previous instance that crashed before its
+    // deferred teardown ran, or whose teardown never finished) but the
+    // worktree directory is still on disk — bypassing `archiveTask` entirely,
+    // same as the "sweepArchivedTeardowns" stranding test above.
+    tasks.update(taskId, { archivedAt: Date.now() });
+    expect(existsSync(worktreePath)).toBe(true);
+
+    // The Worktrees page's delete button calls this exact thing: archive an
+    // already-archived row with `force: true`. Before the fix, the
+    // `task.archivedAt != null` branch bare-returned `{ task }` here with no
+    // teardown enqueued whatsoever — the row could never be cleaned up.
+    const archived = await archiveTask(taskId, { force: true });
+    expect("task" in archived).toBe(true);
+    if (!("task" in archived)) throw new Error(archived.error);
+
+    await pendingTeardown(taskId);
+    expect(existsSync(worktreePath)).toBe(false);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+test("repeat-archive when the worktree is already gone stays a cheap no-op — archivedAt doesn't change and no spurious teardown runs", async () => {
+  const { createTask, archiveTask, pendingTeardown } = await import("./orchestrator.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const repo = await makeRepo();
+  const created = await createTask({
+    title: "repeat-archive after worktree gone",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: repo,
+    isolation: "worktree",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  try {
+    const prepared = await prepareWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
+    tasks.update(taskId, { column: "done" });
+
+    const worktreePath = prepared.worktreePath!;
+
+    const first = await archiveTask(taskId);
+    if (!("task" in first)) throw new Error(first.error);
+    await pendingTeardown(taskId);
+    expect(existsSync(worktreePath)).toBe(false);
+    const archivedAtAfterFirst = first.task.archivedAt;
+    expect(archivedAtAfterFirst).not.toBeNull();
+
+    // A repeat archive (e.g. a double click) with the worktree already gone
+    // must take the bare no-op return — observable here as `archivedAt`
+    // staying byte-for-byte the same as the first archive (a fresh
+    // `tasks.update({ archivedAt: Date.now() })` would very likely produce a
+    // different timestamp).
+    const second = await archiveTask(taskId);
+    if (!("task" in second)) throw new Error(second.error);
+    expect(second.task.archivedAt).toBe(archivedAtAfterFirst);
+    expect(existsSync(worktreePath)).toBe(false);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+test("awaitTeardown: true doesn't resolve until the worktree is actually gone, and reports { removed: true }", async () => {
+  const { createTask, archiveTask } = await import("./orchestrator.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const repo = await makeRepo();
+  const created = await createTask({
+    title: "awaitTeardown removed",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: repo,
+    isolation: "worktree",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  try {
+    const prepared = await prepareWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
+    tasks.update(taskId, { column: "done" });
+
+    const worktreePath = prepared.worktreePath!;
+    expect(existsSync(worktreePath)).toBe(true);
+
+    // Contrast with the default (fire-and-forget) path tested at `:89` above,
+    // where the directory is (usually) still present the instant archiveTask
+    // resolves — with `awaitTeardown: true` it must be gone by the time this
+    // call resolves, every time, deterministically.
+    const archived = await archiveTask(taskId, { awaitTeardown: true });
+    expect("task" in archived).toBe(true);
+    if (!("task" in archived)) throw new Error(archived.error);
+    expect(archived.teardown).toEqual({ removed: true });
+    expect(existsSync(worktreePath)).toBe(false);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+test("awaitTeardown: true on a dirty worktree reports { removed: false, reason: \"dirty\" } and leaves it in place; forceWorktree clears it", async () => {
+  const { createTask, archiveTask } = await import("./orchestrator.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const repo = await makeRepo();
+  const created = await createTask({
+    title: "awaitTeardown dirty then forced",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: repo,
+    isolation: "worktree",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  try {
+    const prepared = await prepareWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
+    tasks.update(taskId, { column: "done" });
+
+    const worktreePath = prepared.worktreePath!;
+    writeFileSync(path.join(worktreePath, "dirty.txt"), "uncommitted\n");
+
+    const withoutForce = await archiveTask(taskId, { awaitTeardown: true });
+    expect("task" in withoutForce).toBe(true);
+    if (!("task" in withoutForce)) throw new Error(withoutForce.error);
+    expect(withoutForce.teardown).toEqual({ removed: false, reason: "dirty" });
+    expect(existsSync(worktreePath)).toBe(true);
+    expect(existsSync(path.join(worktreePath, "dirty.txt"))).toBe(true);
+
+    // Already archived from the call above — this exercises the
+    // already-archived re-enqueue branch with `forceWorktree` threaded
+    // through to `detachWorktree`'s `force`.
+    const withForce = await archiveTask(taskId, { forceWorktree: true, awaitTeardown: true });
+    expect("task" in withForce).toBe(true);
+    if (!("task" in withForce)) throw new Error(withForce.error);
+    expect(withForce.teardown).toEqual({ removed: true });
+    expect(existsSync(worktreePath)).toBe(false);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+test("steady-state regression: a dirty archived worktree survives every unattended boot sweep and is only cleared by an explicit forced archive", async () => {
+  const { createTask, archiveTask, pendingTeardown, sweepArchivedTeardowns } = await import("./orchestrator.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const repo = await makeRepo();
+  const created = await createTask({
+    title: "stuck-dirty steady state",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: repo,
+    isolation: "worktree",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  try {
+    const prepared = await prepareWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
+    tasks.update(taskId, { column: "done" });
+
+    const worktreePath = prepared.worktreePath!;
+    writeFileSync(path.join(worktreePath, "dirty.txt"), "uncommitted\n");
+
+    // Plain archive — detach skips the dirty checkout, exactly the reported
+    // "delete button does nothing" symptom.
+    const archived = await archiveTask(taskId);
+    if (!("task" in archived)) throw new Error(archived.error);
+    await pendingTeardown(taskId);
+    expect(existsSync(worktreePath)).toBe(true);
+
+    // The unattended boot sweep re-enqueues teardown for this row (worktree
+    // still on disk, archivedAt set) but deliberately never forces — it must
+    // fail again, every time, exactly like the reported "stuck forever,
+    // retried and failed every boot" cycle.
+    for (let i = 0; i < 2; i++) {
+      const enqueued = sweepArchivedTeardowns();
+      expect(enqueued).toBeGreaterThanOrEqual(1);
+      await pendingTeardown(taskId);
+      expect(existsSync(worktreePath)).toBe(true);
+    }
+
+    // Only an explicit, user-confirmed forced archive from the Worktrees page
+    // finally clears it.
+    const forced = await archiveTask(taskId, { force: true, forceWorktree: true, awaitTeardown: true });
+    expect("task" in forced).toBe(true);
+    if (!("task" in forced)) throw new Error(forced.error);
+    expect(forced.teardown).toEqual({ removed: true });
+    expect(existsSync(worktreePath)).toBe(false);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+test("bail on un-archive: a queued teardown job whose task's archivedAt clears before the job executes must not remove the worktree", async () => {
+  // The real `unarchiveTask` always `await pendingTeardown(taskId)` BEFORE
+  // clearing `archivedAt` (see orchestrator.ts), so it can never itself
+  // observe this race through the front door — by the time it nulls
+  // `archivedAt`, the queued job has already run. To exercise the job's
+  // defensive re-read (`cur.archivedAt == null` bail) at all, this test
+  // occupies the shared per-workdir teardown chain with a first task (A)
+  // whose real `detachWorktree` (actual `git status`/`worktree remove`/
+  // `prune` subprocess calls) takes long enough in wall-clock time that
+  // task B's job — chained right behind A's on the same workdir — is still
+  // queued when we clear B's `archivedAt` directly (bypassing
+  // `unarchiveTask`, which is the only way to land in this state at all).
+  // This is the same timing idiom the file already relies on at `:89`
+  // ("archiveTask responds before teardown runs") — if it ever flakes, the
+  // signal is that B's teardown ran before the race could land.
+  const { createTask, archiveTask, pendingTeardown } = await import("./orchestrator.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const repo = await makeRepo();
+
+  const createdA = await createTask({
+    title: "chain occupier",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: repo,
+    isolation: "worktree",
+  });
+  if ("error" in createdA) throw new Error(createdA.error);
+  const idA = createdA.task.id;
+
+  const createdB = await createTask({
+    title: "un-archived before job runs",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: repo,
+    isolation: "worktree",
+  });
+  if ("error" in createdB) throw new Error(createdB.error);
+  const idB = createdB.task.id;
+
+  try {
+    const preparedA = await prepareWorkdir(createdA.task);
+    if ("error" in preparedA) throw new Error(preparedA.error);
+    tasks.update(idA, { branch: preparedA.branch, worktreePath: preparedA.worktreePath });
+    tasks.update(idA, { column: "done" });
+
+    const preparedB = await prepareWorkdir(createdB.task);
+    if ("error" in preparedB) throw new Error(preparedB.error);
+    tasks.update(idB, { branch: preparedB.branch, worktreePath: preparedB.worktreePath });
+    tasks.update(idB, { column: "done" });
+    const worktreePathB = preparedB.worktreePath!;
+
+    await archiveTask(idA); // enqueues A's job first on the shared workdir chain
+    await archiveTask(idB); // enqueues B's job right behind A's — still queued
+
+    // Simulate "un-archived before the job runs" directly, since the public
+    // `unarchiveTask` cannot land in this state (see comment above).
+    tasks.update(idB, { archivedAt: null });
+
+    await pendingTeardown(idB);
+
+    // The job re-read the row, saw `archivedAt == null`, and bailed — B's
+    // worktree was never touched.
+    expect(existsSync(worktreePathB)).toBe(true);
+    expect(tasks.get(idB)?.worktreePath).toBe(worktreePathB);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [idA]);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [idB]);
+  }
+});
+
 test("independent workdirs: teardowns for two tasks in different source repos don't share a chain and both complete", async () => {
   // Unlike the FIFO test above (same repo → same chain), these two tasks are
   // each created against their OWN temp source repo, so they key into
