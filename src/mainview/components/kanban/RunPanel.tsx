@@ -44,8 +44,10 @@ import { createEventDeduper } from "@/lib/event-dedup";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
-import { parseUserMessage } from "@/lib/command-message";
+import { parseUserMessage, splitReferences } from "@/lib/command-message";
+import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
+import { AttachmentChips } from "./AttachmentChips";
 import {
   ReferencesPicker,
   captureDroppedOrPastedItems,
@@ -2232,6 +2234,7 @@ function RunPanelBody({
                 onInteractionResolved={dismissInteraction}
                 runStatus={activeRunStatus}
                 indicatorMode={indicatorMode}
+                taskId={task.id}
               />
             </>
           )}
@@ -3102,12 +3105,17 @@ function RunEventList({
   onInteractionResolved,
   runStatus,
   indicatorMode = "off",
+  taskId,
 }: {
   events: RunEvent[];
   interactions?: PendingInteraction[];
   onInteractionResolved?: (id: string) => void;
   runStatus?: Run["status"] | null;
   indicatorMode?: RunIndicatorMode;
+  /** Threaded through to each `UserMessageBlock`'s `AttachmentChips` so a
+   *  relative attachment ref can resolve against the task's worktree/workdir
+   *  when the user clicks it. */
+  taskId?: string;
 }) {
   // Index tool_results by their tool_use_id so the tool-use card can show
   // Normalise legacy `[tool: Name] {...}` / `[thinking] ...` / `[result] ...`
@@ -3209,7 +3217,7 @@ function RunEventList({
           // child of the scroll container (`sections.map` below renders one
           // `<section>` per user-message group), so THIS is the element that
           // has to pin to `top-0` for the sticky header to work at all.
-          return [wrap(key, evid, <UserMessageBlock text={e.data} />, "sticky top-0 z-10")];
+          return [wrap(key, evid, <UserMessageBlock text={e.data} taskId={taskId} />, "sticky top-0 z-10")];
         case "assistant":
           return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
@@ -3230,6 +3238,16 @@ function RunEventList({
           return [wrap(key, evid, <ToolResultBlock result={parsed} />)];
         }
         case "status":
+          // Suppress claude's synthetic "[Image: source: <path>]" breadcrumb
+          // — it's a separate (isMeta) transcript entry for the attachment
+          // itself, not a status worth showing, and the image is now
+          // rendered as a proper thumbnail chip under the user bubble
+          // instead. Uses the lax matcher (not the strict `imageSourceMetaPath`)
+          // so historical rows persisted before this event type existed —
+          // truncated at the old 140-char status cap, possibly missing the
+          // trailing `]` or ending in an ellipsis — are filtered too, on
+          // replay as well as live.
+          if (isImageSourceMetaBreadcrumb(e.data)) return [];
           return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
           return [wrap(key, evid, <ErrorBlock text={e.data} />)];
@@ -3271,7 +3289,7 @@ function RunEventList({
     current.body.push(...tail);
     if (current.header !== null || current.body.length > 0) out.push(current);
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -3458,7 +3476,7 @@ const ASSISTANT_MD_COMPONENTS: MdComponents = {
   pre: ({ children }) => <CodeBlock bgClassName="bg-muted/40">{children}</CodeBlock>,
 };
 
-const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string }) {
+const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text: string; taskId?: string }) {
   const [expanded, setExpanded] = useState(false);
   const [needsToggle, setNeedsToggle] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -3474,6 +3492,36 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
   // of literal `<command-*>` tags. `null` for an ordinary message — the
   // fallback branch below renders exactly what this component always has.
   const parsed = useMemo(() => parseUserMessage(text), [text]);
+
+  // For an ordinary (non-command) message, split off a trailing "Referenced
+  // files/folders:" block the same way the command branch already does, so
+  // an image-attached (or file/folder-attached) send renders its paths as
+  // chips instead of a literal bullet list in the markdown body. Newlines
+  // are normalized first — `splitReferences`' blank-line paragraph split
+  // needs real `\n`s, and the JSONL twin of a send can carry bare `\r`s (see
+  // event-dedup.ts). When there's no trailing refs block, `splitReferences`
+  // returns `args` unchanged and an empty `references` array, so this is a
+  // no-op split for the common case.
+  const ordinary = useMemo(
+    () => splitReferences(text.replace(/\r\n?/g, "\n")),
+    [text],
+  );
+
+  // Strip `[Image #N]` placeholders only when the message actually carries
+  // references — a user who literally types "[Image #1]" in a plain message
+  // with no attachments keeps their text verbatim. Computed for both the
+  // command-args and ordinary-message branches below (used for the
+  // truthiness check as well as the rendered body, so an args string that's
+  // non-empty only because of a placeholder doesn't render an empty
+  // markdown block).
+  const commandArgsText =
+    parsed?.kind === "command" && parsed.command.references.length > 0
+      ? stripImagePlaceholders(parsed.command.args)
+      : (parsed?.kind === "command" ? parsed.command.args : "");
+  const ordinaryArgsText =
+    ordinary.references.length > 0
+      ? stripImagePlaceholders(ordinary.args)
+      : ordinary.args;
 
   // Default to the collapsed ~3-line cap and measure once mounted. The cap
   // is always rendered so short messages don't flash full-height first;
@@ -3540,31 +3588,14 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
                 {parsed.command.name}
               </span>
             </div>
-            {parsed.command.args && (
+            {commandArgsText && (
               <div ref={contentRef} className={collapseClassName}>
                 <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-                  {parsed.command.args}
+                  {commandArgsText}
                 </ReactMarkdown>
               </div>
             )}
-            {parsed.command.references.length > 0 && (
-              <div className="mt-1 flex flex-wrap gap-1">
-                {parsed.command.references.map((ref) => {
-                  const isDir = ref.endsWith("/");
-                  const Icon = isDir ? Folder : FileText;
-                  return (
-                    <span
-                      key={ref}
-                      title={ref}
-                      className="inline-flex max-w-full items-center gap-1 rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
-                    >
-                      <Icon className="size-3 shrink-0" />
-                      <span className="truncate">{refBasename(ref)}</span>
-                    </span>
-                  );
-                })}
-              </div>
-            )}
+            <AttachmentChips references={parsed.command.references} taskId={taskId} />
           </>
         ) : (
           <>
@@ -3573,9 +3604,10 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
             </div>
             <div ref={contentRef} className={collapseClassName}>
               <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-                {text}
+                {ordinaryArgsText}
               </ReactMarkdown>
             </div>
+            <AttachmentChips references={ordinary.references} taskId={taskId} />
           </>
         )}
         {needsToggle && (

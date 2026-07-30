@@ -76,12 +76,17 @@ function matchCommandXml(text: string): RawCommandXml | null {
  * Split a trailing "Referenced files/folders:" block off the end of a
  * command's argument text. The block is the LAST blank-line-separated
  * paragraph, its first line must be the exact `REFS_HEADING`, and every
- * following line in that paragraph must be a `- <path>` bullet — this is
- * exactly the shape `formatReferences` (src/shared/refs.ts) produces via
- * `appendReferences`'s `"${text}\n\n${block}"` join. Any deviation (heading
- * not alone on its line, a non-bullet line mixed in, no heading at all) means
- * don't split: return `text` unchanged with no references, rather than
- * guess.
+ * following line in that paragraph must be either a `- <path>` bullet or a
+ * bare `-` (optionally followed by trailing whitespace) — this is exactly
+ * the shape `formatReferences` (src/shared/refs.ts) produces via
+ * `appendReferences`'s `"${text}\n\n${block}"` join, PLUS claude's own
+ * rewrite of an image bullet's path (see `attachments.ts`'s header comment),
+ * which blanks the path and leaves a bare `-` behind. A bare bullet is
+ * accepted and dropped — it contributes no reference, since its path was
+ * stripped by claude before we ever saw it — while a `- <path>` bullet keeps
+ * its current behavior. Any other non-bullet line still bails the whole
+ * split: don't split, return `text` unchanged with no references, rather
+ * than guess.
  */
 export function splitReferences(text: string): { args: string; references: string[] } {
   const paragraphs = text.split(/\n\s*\n/);
@@ -100,6 +105,7 @@ export function splitReferences(text: string): { args: string; references: strin
 
   const references: string[] = [];
   for (const line of bulletLines) {
+    if (/^-\s*$/.test(line)) continue; // bare bullet (claude's rewrite) — dropped, no reference
     const m = /^- (.+)$/.exec(line);
     if (!m) return { args: text, references: [] };
     references.push(m[1] ?? "");

@@ -11,6 +11,7 @@
 // displayed" is always available, and it's exactly what the log's
 // `data-evid` DOM attribute is keyed on too.
 import type { RunEventStream } from "../../shared/types.ts";
+import { isImageSourceMetaBreadcrumb } from "../../shared/attachments.ts";
 
 /** Best-effort JSON.parse that never throws — malformed/partial JSON (e.g. a
  *  tool input truncated by an older agetor mapper) falls back to `null`
@@ -71,10 +72,18 @@ export function searchableEventText(stream: RunEventStream, data: string): strin
       if (!parsed || typeof parsed !== "object" || !("content" in parsed)) return data;
       return textOf(parsed.content);
     }
+    case "status":
+      // Claude's synthetic "[Image: source: <path>]" breadcrumbs are
+      // suppressed by the log renderer (`renderEvent` in RunPanel returns no
+      // block for them — the attachment shows as a thumbnail chip on the user
+      // bubble instead), so a match here would navigate to an evid with no
+      // DOM node. Same "never rendered → never matches" rule as the streams
+      // above.
+      if (isImageSourceMetaBreadcrumb(data)) return null;
+      return data;
     case "user":
     case "assistant":
     case "thinking":
-    case "status":
     case "stderr":
     case "stdout":
     default:

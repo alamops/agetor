@@ -25,6 +25,16 @@ test("searchableEventText: passthrough streams return data verbatim", () => {
   }
 });
 
+test("searchableEventText: suppressed [Image: source: …] status breadcrumbs are never searchable", () => {
+  // The log renderer emits no block for these (the attachment renders as a
+  // thumbnail chip on the user bubble), so a match would navigate nowhere.
+  expect(searchableEventText("status", "[Image: source: /Users/x/.agetor/screenshots/shot.png]")).toBeNull();
+  // Historical rows truncated at the old 140-char status cap (lost `]`).
+  expect(searchableEventText("status", "[Image: source: /Users/x/very/long/path/screensho…")).toBeNull();
+  // Ordinary status text is unaffected.
+  expect(searchableEventText("status", "background task: done")).toBe("background task: done");
+});
+
 test("searchableEventText: passthrough streams pass an empty string through unchanged", () => {
   expect(searchableEventText("assistant", "")).toBe("");
   expect(searchableEventText("stdout", "")).toBe("");
