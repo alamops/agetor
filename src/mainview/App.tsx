@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
@@ -72,6 +72,68 @@ function ErrorToast({ error, onDismiss }: { error: string | null; onDismiss: () 
   );
 }
 
+/**
+ * Reconcile a freshly-fetched list against the previously-rendered one,
+ * preserving object identity for entries that haven't actually changed.
+ * Poll-driven fetches (`/tasks` every 2s, `/harnesses` every 15s) otherwise
+ * hand back brand-new object graphs every tick even when nothing changed
+ * server-side — that defeats `React.memo` on every downstream card/column
+ * and force-renders the selected-task sync effect. Deep-equality here is a
+ * plain `JSON.stringify` compare: cheap at this scale (hundreds of small
+ * objects, once per poll) and robust against any field changing without a
+ * corresponding `updatedAt` bump (e.g. `pendingInteractionCount`,
+ * `runningSubagents`, `openTerminalCount` are all computed server-side per
+ * request and aren't reflected in `updatedAt`).
+ *
+ * `cache`, when passed, memoizes each entry's serialized form by id so a
+ * poll where nothing changed only has to `JSON.stringify` the freshly
+ * fetched (`next`) side — the `prev` side is a cache hit as long as the
+ * cached entry's object reference still matches what's actually in `prev`
+ * (it can legitimately not: several call sites patch `tasks` state directly
+ * for optimistic updates, bypassing this function, so a stale/mismatched
+ * cache entry falls back to recomputing rather than trusting a stringified
+ * form for a different object). Entries whose id no longer appears in
+ * `next` are evicted so the cache doesn't grow unboundedly across a
+ * session's worth of deleted/archived tasks.
+ *
+ * Returns `prev` itself (same array reference) when every entry, in the
+ * same order, is unchanged — letting the caller's `setState` bail out
+ * entirely instead of triggering a render.
+ */
+function reconcileById<T>(
+  prev: T[],
+  next: T[],
+  keyOf: (item: T) => string,
+  cache?: Map<string, { obj: T; json: string }>,
+): T[] {
+  const prevByKey = new Map(prev.map((item) => [keyOf(item), item] as const));
+  const seen = new Set<string>();
+  const merged = next.map((item) => {
+    const key = keyOf(item);
+    seen.add(key);
+    const old = prevByKey.get(key);
+    const nextJson = JSON.stringify(item);
+    let unchanged = false;
+    if (old !== undefined) {
+      const cached = cache?.get(key);
+      const oldJson = cached && cached.obj === old ? cached.json : JSON.stringify(old);
+      unchanged = oldJson === nextJson;
+    }
+    const finalItem = unchanged ? old! : item;
+    if (cache) cache.set(key, { obj: finalItem, json: nextJson });
+    return finalItem;
+  });
+  if (cache) {
+    for (const key of cache.keys()) {
+      if (!seen.has(key)) cache.delete(key);
+    }
+  }
+  if (merged.length === prev.length && merged.every((item, i) => item === prev[i])) {
+    return prev;
+  }
+  return merged;
+}
+
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
@@ -116,26 +178,34 @@ export default function App() {
     return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
   }, []);
 
+  // Per-task serialized-form cache for `reconcileById` below — see that
+  // function's doc comment. A ref (not state) since it's pure bookkeeping
+  // that must survive across polls without itself triggering a render.
+  const taskReconcileCacheRef = useRef(new Map<string, { obj: Task; json: string }>());
+
   /** Re-list tasks. Returns the fetched list so callers that need to inspect a
    *  task right after a mutation don't have to issue a second GET. `null` on
    *  failure — the last good snapshot stays rendered and the poll retries. */
-  const refresh = async (): Promise<Task[] | null> => {
+  const refresh = useCallback(async (): Promise<Task[] | null> => {
     try {
       const list = await api.listTasks();
-      setTasks(list);
+      // `list` (unreconciled) is what callers get back for immediate reads
+      // (e.g. re-checking a just-created task's branch); the reconciled,
+      // identity-preserving version is what actually lands in state.
+      setTasks((prev) => reconcileById(prev, list, (t) => t.id, taskReconcileCacheRef.current));
       return list;
     } catch { return null; /* keep last good snapshot; retry next tick */ }
-  };
-  const refreshAgents = async () => {
+  }, []);
+  const refreshAgents = useCallback(async () => {
     try {
       const payload = await api.listHarnesses();
-      setHarnesses(payload.harnesses);
-      setAgents(payload.statuses);
+      setHarnesses((prev) => reconcileById(prev, payload.harnesses, (h) => h.id));
+      setAgents((prev) => reconcileById(prev, payload.statuses, (a) => a.harnessId));
     } catch { /* leave previous state */ }
-  };
-  const refreshAgentModels = async () => {
+  }, []);
+  const refreshAgentModels = useCallback(async () => {
     try { setAgentModels(await api.listAgentModels()); } catch { /* leave previous state */ }
-  };
+  }, []);
   useEffect(() => {
     void refresh();
     void refreshAgents();
@@ -165,14 +235,34 @@ export default function App() {
     // freshly-opened webview wouldn't know about an update that was already
     // downloaded by the previous main-process tick.
     api.getUpdateStatus().then(setUpdateSnapshot).catch(() => { /* fine */ });
-    const t = setInterval(refresh, 2000);
-    const a = setInterval(refreshAgents, 15_000);
+    // Skip poll ticks while the window is hidden — a backgrounded kanban
+    // board has no reason to keep re-fetching + re-rendering every 2s/15s.
+    // The intervals themselves keep running (cheap — it's just the fetch +
+    // setState that's skipped) so there's nothing to re-arm; `visible`
+    // fires an immediate refresh so returning to the window doesn't wait
+    // out a stale tick. This mirrors the existing `flushNow`-on-visible
+    // wiring in RunPanel and is mandatory, not an optimization: WKWebView
+    // suspends rAF (not setInterval) while occluded, but a naive "just
+    // gate the poll" change without an immediate on-return refresh would
+    // reintroduce the same class of "frozen until you nudge the window"
+    // bug previously fixed there.
+    const t = setInterval(() => { if (!document.hidden) void refresh(); }, 2000);
+    const a = setInterval(() => { if (!document.hidden) void refreshAgents(); }, 15_000);
+    const onVisible = () => {
+      if (document.hidden) return;
+      void refresh();
+      void refreshAgents();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
     return () => {
       clearInterval(t);
       clearInterval(a);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
       if (defaultsTimer) clearTimeout(defaultsTimer);
     };
-  }, []);
+  }, [refresh, refreshAgents, refreshAgentModels]);
 
   // Keep the selected task in sync as the list refreshes.
   useEffect(() => {
@@ -425,14 +515,26 @@ export default function App() {
     [tasks],
   );
 
-  const surfaceError = (e: unknown) =>
+  // Every handler below is wrapped in `useCallback` so it keeps a stable
+  // identity across App re-renders (poll ticks, unrelated state changes,
+  // etc.) — they're passed straight down to `Column`/`TaskCard`, both
+  // `React.memo`'d, and an unstable function prop would force every card in
+  // every column to re-render on every tick regardless of the task-list
+  // equality guard above. None of these actually need to read the current
+  // `tasks`/`selected` state (they operate on the `t` argument the caller
+  // already has), except `del`'s "is the deleted task the open one" check —
+  // that reads `selectedIdRef` (already kept in sync by the effect above)
+  // instead of `selected` directly, so `del` doesn't have to change identity
+  // every time the user opens a different task.
+  const surfaceError = useCallback((e: unknown) => {
     setError(e instanceof Error ? e.message : String(e));
+  }, []);
 
-  const onDragEnd = async (e: DragEndEvent) => {
+  const onDragEnd = useCallback(async (e: DragEndEvent) => {
     const id = String(e.active.id);
     const col = e.over?.id as ColumnId | undefined;
     if (!col) return;
-    const t = tasks.find((x) => x.id === id);
+    const t = tasksRef.current.find((x) => x.id === id);
     if (!t || t.column === col) return;
     setTasks((cur) => cur.map((x) => (x.id === id ? { ...x, column: col } : x)));
     try {
@@ -443,14 +545,14 @@ export default function App() {
       // Server didn't accept the move — re-sync the optimistic UI.
       await refresh();
     }
-  };
+  }, [refresh, surfaceError]);
 
   // `startTask` materializes the worktree, which can re-pin the branch when a
   // create-time uniqueness race is only detectable once the branch actually
   // exists. Surface the change so the user isn't left believing the name they
   // saw. Reads the new branch out of the refresh we already do — no extra GET.
   // Best-effort: if the refresh failed, the 2s poll still shows the real branch.
-  const startAndNotifyBranch = async (taskId: string, branchBefore: string | null) => {
+  const startAndNotifyBranch = useCallback(async (taskId: string, branchBefore: string | null) => {
     await api.startTask(taskId);
     const list = await refresh();
     if (!branchBefore || !list) return;
@@ -458,9 +560,9 @@ export default function App() {
     if (after?.branch && after.branch !== branchBefore) {
       toast(`Branch changed to “${after.branch}” — “${branchBefore}” was already taken.`);
     }
-  };
+  }, [refresh]);
 
-  const start = async (t: Task) => {
+  const start = useCallback(async (t: Task) => {
     try {
       setError(null);
       await startAndNotifyBranch(t.id, t.branch);
@@ -475,8 +577,8 @@ export default function App() {
       }
       void refreshAgents();
     }
-  };
-  const cancel = async (t: Task) => {
+  }, [startAndNotifyBranch, surfaceError, refreshAgents]);
+  const cancel = useCallback(async (t: Task) => {
     if (!t.runId) return;
     try {
       setError(null);
@@ -484,8 +586,8 @@ export default function App() {
     } catch (e) {
       surfaceError(e);
     }
-  };
-  const markDone = async (t: Task) => {
+  }, [surfaceError]);
+  const markDone = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, column: "done" } : x)));
     try {
       setError(null);
@@ -495,8 +597,8 @@ export default function App() {
       surfaceError(e);
       await refresh();
     }
-  };
-  const archive = async (t: Task) => {
+  }, [refresh, surfaceError]);
+  const archive = useCallback(async (t: Task) => {
     const active = t.column === "running" || t.column === "blocked";
     if (active) {
       const ok = await confirm({
@@ -518,8 +620,8 @@ export default function App() {
       surfaceError(e);
       await refresh();
     }
-  };
-  const unarchive = async (t: Task) => {
+  }, [confirm, refresh, surfaceError]);
+  const unarchive = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: null } : x)));
     try {
       setError(null);
@@ -529,8 +631,8 @@ export default function App() {
       surfaceError(e);
       await refresh();
     }
-  };
-  const del = async (t: Task) => {
+  }, [refresh, surfaceError]);
+  const del = useCallback(async (t: Task) => {
     const ok = await confirm({
       title: `Delete "${t.title}"?`,
       description: (
@@ -552,14 +654,14 @@ export default function App() {
     try {
       setError(null);
       await api.deleteTask(t.id);
-      if (selected?.id === t.id) setSelected(null);
+      if (selectedIdRef.current === t.id) setSelected(null);
       await refresh();
     } catch (e) {
       surfaceError(e);
       // Refresh anyway so the UI matches the server.
       await refresh();
     }
-  };
+  }, [confirm, refresh, surfaceError]);
 
   return (
     <div className="flex h-screen w-screen flex-col bg-background text-foreground">

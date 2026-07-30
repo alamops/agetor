@@ -1005,11 +1005,57 @@ export function hasSessionState(taskId: string): boolean {
   return sessions.has(taskId);
 }
 
+/**
+ * Idle metadata for the reaper (T4, orchestrator.ts imports this by exact
+ * name/signature). Returns `null` when we hold no in-memory `SessionState`
+ * for the task — the reaper falls back to `task.updatedAt` in that case (a
+ * post-restart done/review task has no live driver state to ask). Otherwise
+ * returns how long it's been since the session last showed life — see the
+ * `lastActivityAt` field doc on `SessionState` for the full list of triggers.
+ */
+export function sessionIdleInfo(taskId: string): { idleMs: number } | null {
+  const state = sessions.get(taskId);
+  if (!state) return null;
+  return { idleMs: Date.now() - state.lastActivityAt };
+}
+
 /** Name-keyed variant for callers that hold a persisted session name (e.g.
  *  `runs.tmux_session`) and don't want to recompute it from a task id.
  *  Exact-match `=` prefix — see `sessionExists`. */
 export function sessionExistsByName(name: string): boolean {
   return tmux(["has-session", "-t", "=" + name]).ok;
+}
+
+/**
+ * Keyed, single-round-trip liveness + activity probe for a task's tmux
+ * session, with no dependency on in-memory `SessionState`. This is what the
+ * reaper falls back to for a task it holds no `SessionState` for (e.g. after
+ * a restart, before boot reconciliation reattaches it) instead of a bare
+ * `has-session` check that can't tell whether the session is still doing
+ * anything. One `tmux display-message` round-trip pulls both
+ * `#{session_attached}` (nonzero while a real `tmux attach` is live) and
+ * `#{session_activity}` (tmux's own last-activity timestamp for the session —
+ * updated on any pane output, independent of whether we're the ones tailing
+ * it) in a single call. `-t '=<name>'` forces an exact-match target, matching
+ * every other tmux() call in this file — see `sessionExists`'s comment for
+ * why an unanchored name prefix-matches a sibling `agetor-<id>` session and
+ * would misreport a live, unrelated session as this task's. Returns null
+ * when the command fails or the session doesn't exist; the caller treats
+ * that as "can't tell," not "definitely dead."
+ */
+export function probeSessionActivity(taskId: string): { attached: boolean; activityAt: number } | null {
+  const r = tmux([
+    "display-message", "-p", "-t", "=" + sessionNameFor(taskId),
+    "#{session_attached}:#{session_activity}",
+  ]);
+  if (!r.ok) return null;
+  const [attachedRaw, activityRaw] = r.stdout.trim().split(":");
+  const attachedNum = Number(attachedRaw);
+  const activitySec = Number(activityRaw);
+  if (!Number.isFinite(attachedNum) || !Number.isFinite(activitySec)) return null;
+  // tmux reports session_activity in epoch SECONDS; callers (idle-clock math
+  // against `Date.now()`) expect milliseconds.
+  return { attached: attachedNum > 0, activityAt: activitySec * 1000 };
 }
 
 /** Tri-state liveness of a tmux session — the safe signal for the death watch. */
@@ -1469,8 +1515,30 @@ interface SessionState {
   watcher: FSWatcher | null;
   /** Periodic poll timer that flushes appended JSONL bytes — backstop for
    *  fs.watch on macOS, which silently drops notifications on slow append
-   *  streams. Without this, after the first event we'd never see the rest. */
-  pollTimer: ReturnType<typeof setInterval> | null;
+   *  streams. Without this, after the first event we'd never see the rest.
+   *  Self-rescheduling `setTimeout` (see `armPollTimer`) rather than a fixed
+   *  `setInterval` — the cadence backs off from `POLL_FAST_MS` to
+   *  `POLL_SLOW_MS` once `lastActivityAt` has been quiet for
+   *  `POLL_IDLE_AFTER_MS`, and snaps back on the next activity. */
+  pollTimer: ReturnType<typeof setTimeout> | null;
+  /** `Date.now()` stamp of the last time this session "showed life": JSONL
+   *  bytes appended (`flush`), a scraped tmux pane change (`scrapeOnce`), a
+   *  turn starting (`sendTurn` / the deferred-prompt paste in
+   *  `spawnClaudeViaTmux`), a turn settling (`popEndOfTurn`), or a folded-in
+   *  follow-up paste (`pasteFollowUp`). Initialized to the construction time
+   *  in `makeSessionState`, so a freshly spawned or reattached session starts
+   *  its idle clock at "now" rather than epoch 0. Two consumers: the exported
+   *  `sessionIdleInfo` (the reaper's idle signal, T4/orchestrator.ts) and the
+   *  `pollTimer`'s own self-throttle just above. */
+  lastActivityAt: number;
+  /** Last full tmux pane capture `scrapeOnce` took (the same trimmed tail
+   *  text used for modal matching), kept purely to detect "the pane changed
+   *  since last capture" as an activity signal independent of JSONL writes —
+   *  covers a native AskUserQuestion modal or a user driving the session via
+   *  `tmux attach`, neither of which necessarily appends to the JSONL. Null
+   *  until the first capture (so the very first tick never counts as a
+   *  "change"). */
+  scrapeLastPaneText: string | null;
   /** FIFO of turns waiting for end_turn. The head is the active turn —
    *  events flowing through the JSONL belong to it until end_turn fires,
    *  at which point we shift it off and the next turn becomes active.
@@ -1740,6 +1808,11 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     pollTimer: null,
     scrapeTimer: null,
     deathTimer: null,
+    // "Initialize at spawn/reattach" — every construction site (fresh spawn,
+    // reattach, rebuild, the test helper) routes through here, so stamping
+    // "now" here covers all of them uniformly.
+    lastActivityAt: Date.now(),
+    scrapeLastPaneText: null,
     scrapeLastFingerprint: null,
     lastJsonlAppendAt: 0,
     lastIdleScrapeAt: 0,
@@ -1753,6 +1826,15 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     subagentWatcher: null,
     continuationWatchdog: null,
   };
+}
+
+/** Stamp `lastActivityAt` to "now" — the single write site for the idle
+ *  clock, called from every place a session "shows life" (see the field's
+ *  doc comment on `SessionState`). Kept as a named helper (rather than
+ *  inlining `Date.now()` at each call site) so the exact set of triggers is
+ *  grep-able and can't silently drift out of sync with the doc comment. */
+function bumpActivity(state: SessionState): void {
+  state.lastActivityAt = Date.now();
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -1856,6 +1938,11 @@ const END_TURN_IDLE_FIRE_MS = 800;
  *  one-shot `onEndOfTurn` listener (reattach path, where there's no slot
  *  but the orchestrator still needs to know the run completed). */
 function popEndOfTurn(state: SessionState): void {
+  // A turn settling is itself a life signal — reset the idle clock even
+  // though `flush`'s JSONL-append bump already fired for the line that
+  // triggered this (the reattach path fires `onEndOfTurn` with no fresh
+  // append behind it, so this can't be dropped as redundant).
+  bumpActivity(state);
   // The busy period (the active turn plus any folded follow-ups) is ending —
   // clear the hold so the next genuinely-sequential turn resolves normally.
   state.holdUntilIdle = false;
@@ -2774,6 +2861,10 @@ async function flush(state: SessionState): Promise<void> {
   // turn (and that one-tick-stable list-printing wouldn't normally
   // beat the two-tick stability requirement).
   state.lastJsonlAppendAt = Date.now();
+  // JSONL bytes appended is the primary "session is alive" signal — feeds
+  // the reaper's idle clock (`sessionIdleInfo`) and the pollTimer's own
+  // idle backoff below.
+  bumpActivity(state);
   for (const line of lines) {
     if (!line) continue;
     dispatchLine(state, line);
@@ -3214,6 +3305,33 @@ function decideScrapeTick(p: {
   return { run: true, stampIdle: true };
 }
 
+/** Pane chrome that repaints on a fixed cadence independent of anything
+ *  meaningful happening — claude's "esc to interrupt" spinner/status footer
+ *  (its elapsed-time-and-token-count portion ticks every render) and its
+ *  rotating "Tip: …" hint banner. Matched against a line AFTER trailing
+ *  whitespace has already been trimmed off (see `normalizePaneForActivity`). */
+const VOLATILE_PANE_LINE_RE = /esc to interrupt|^\s*Tip:/i;
+
+/**
+ * Normalize a captured pane tail into the form used for the "did the pane
+ * meaningfully change" activity signal in `scrapeOnce`. Mirrors the
+ * normalization the modal matchers (`matchNumberedModal`, `detectAskModal`)
+ * already apply when fingerprinting a pane — right-trim each line, since
+ * `tmux capture-pane` pads rows with trailing spaces that vary run to run —
+ * and additionally drops lines that are pure volatile chrome (see
+ * `VOLATILE_PANE_LINE_RE`). Without this, a session idling at the REPL can
+ * keep resetting the reaper's 30-minute idle clock (`lastActivityAt`)
+ * forever purely from chrome redraws that never touch real transcript
+ * content, neutering the reaper. Only affects the activity-diff comparison —
+ * modal matching still runs against the raw, unnormalized tail. */
+function normalizePaneForActivity(tail: string): string {
+  return tail
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => !VOLATILE_PANE_LINE_RE.test(line))
+    .join("\n");
+}
+
 /** Run a single scrape tick. Idempotent: registers at most one new
  *  TmuxPromptRequest per call, auto-cancels any pending one whose
  *  fingerprint no longer matches the pane. */
@@ -3242,6 +3360,21 @@ function scrapeOnce(state: SessionState): void {
   const lines = cap.stdout.split("\n");
   const tailLines = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES));
   const tail = tailLines.join("\n");
+
+  // The pane changing is a life signal independent of the JSONL — a native
+  // AskUserQuestion modal, or the user driving the session directly via
+  // `tmux attach`, can both change what's on screen without ever writing to
+  // the JSONL. Compare the NORMALIZED tail (see `normalizePaneForActivity`),
+  // not the raw capture — volatile chrome (the "esc to interrupt" spinner's
+  // elapsed-time/token counter, a rotating "Tip: …" line, trailing
+  // whitespace) would otherwise diff on nearly every tick and pin
+  // `lastActivityAt` at "now" forever, neutering the reaper's idle clock.
+  // Skip the very first capture (nothing to compare against yet).
+  const normalizedTail = normalizePaneForActivity(tail);
+  if (state.scrapeLastPaneText !== null && state.scrapeLastPaneText !== normalizedTail) {
+    bumpActivity(state);
+  }
+  state.scrapeLastPaneText = normalizedTail;
 
   // Armed, token-matched lookout for claude's TUI rejecting the last-pasted
   // message as an unknown slash command. Cheap and early-guarded — only
@@ -3497,7 +3630,7 @@ function signalSessionDeath(state: SessionState): void {
   // killed" rejection would double-settle the run.
   state.watcher?.close();
   state.watcher = null;
-  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
   if (state.scrapeTimer) { clearInterval(state.scrapeTimer); state.scrapeTimer = null; }
   // The session is gone, so a notification-triggered watchdog waiting on it
   // will never see content or a normal end-turn either way — cancel rather
@@ -3619,19 +3752,85 @@ function startDeathWatch(state: SessionState): void {
   }, DEATH_POLL_MS);
 }
 
+/** Backstop poll cadence while the session has shown life within the last
+ *  `POLL_IDLE_AFTER_MS` — matches the original fixed `setInterval` rate. */
+const POLL_FAST_MS = 400;
+/** Backstop poll cadence once `lastActivityAt` has been quiet for
+ *  `POLL_IDLE_AFTER_MS` or longer. fs.watch stays the primary signal (its own
+ *  callback flushes immediately, independent of this timer) — this only
+ *  changes how often the cheap "did fs.watch miss anything" stat-and-read
+ *  backstop runs for a session nobody is doing anything with. Never fully
+ *  stops (see the scraper's own idle-throttle comment for why a hard stop
+ *  would be wrong here too: a native AskUserQuestion modal writes no JSONL,
+ *  so something must keep noticing when the session goes busy again). */
+const POLL_SLOW_MS = 5_000;
+/** How long the session must be quiet before the backstop poll backs off
+ *  from `POLL_FAST_MS` to `POLL_SLOW_MS`. */
+const POLL_IDLE_AFTER_MS = 30_000;
+
+/**
+ * Arm (or re-arm) the JSONL backstop poll. Self-rescheduling `setTimeout`
+ * rather than a fixed `setInterval`: each tick decides the NEXT tick's delay
+ * from how long the session has been quiet, so the cadence backs off to
+ * `POLL_SLOW_MS` on its own once idle, and — because `rearmPollTimerFast`
+ * below cancels and reschedules on any fresh activity — snaps back to
+ * `POLL_FAST_MS` immediately rather than waiting out a stale long wait.
+ * Chained after `flush` settles (not fire-and-forget) so a slow flush can't
+ * pile up overlapping poll ticks against the same session.
+ */
+function armPollTimer(state: SessionState, delayMs: number = POLL_FAST_MS): void {
+  // Capture the handle by identity rather than relying on `state.pollTimer`'s
+  // truthiness: `rearmPollTimerFast` (fs.watch callback) can fire *while*
+  // this tick's `flush` is still awaiting, clear+replace `state.pollTimer`
+  // with a brand-new chain, and then this tick's `.finally` would see a
+  // truthy-but-different pollTimer and reschedule anyway — spawning a second
+  // independent self-rescheduling chain that multiplies every time that
+  // race repeats. Comparing against the exact handle this closure owns means
+  // only the chain `state.pollTimer` still actually points at may continue.
+  const handle: ReturnType<typeof setTimeout> = setTimeout(() => {
+    // `disposeSessionState` / `signalSessionDeath` null `pollTimer`
+    // synchronously on teardown; a superseding `armPollTimer` call (via
+    // `rearmPollTimerFast`) overwrites it with a different handle. Either
+    // way, if `state.pollTimer` isn't this handle anymore, this chain is
+    // stale — don't run its flush.
+    if (state.pollTimer !== handle) return;
+    void flush(state).finally(() => {
+      if (state.pollTimer !== handle) return;
+      const idleMs = Date.now() - state.lastActivityAt;
+      armPollTimer(state, idleMs >= POLL_IDLE_AFTER_MS ? POLL_SLOW_MS : POLL_FAST_MS);
+    });
+  }, delayMs);
+  state.pollTimer = handle;
+}
+
+/** Cancel whatever poll tick is pending and re-arm at `POLL_FAST_MS`
+ *  immediately. Called from every place that counts as "fresh activity" for
+ *  the poll cadence specifically (fs.watch events, a turn starting, a folded
+ *  follow-up paste) so a session that's been backed off to `POLL_SLOW_MS`
+ *  doesn't wait out a stale long tick before resuming full-rate backstop
+ *  polling. No-op when no poll timer is armed yet (pre-`attachTailer`, or an
+ *  already-disposed session) — nothing to snap back to. */
+function rearmPollTimerFast(state: SessionState): void {
+  if (!state.pollTimer) return;
+  clearTimeout(state.pollTimer);
+  armPollTimer(state, POLL_FAST_MS);
+}
+
 function attachTailer(state: SessionState): void {
   // Drain whatever's already in the file (claude may have written events
   // before our watcher attached).
   void flush(state);
   state.watcher = fsWatch(state.jsonlPath, { persistent: false }, () => {
     void flush(state);
+    rearmPollTimerFast(state);
   });
   // Backstop poll. macOS fs.watch (FSEvents/kqueue) coalesces rapid appends
   // and drops notifications on slow append-only streams — we saw a real run
   // where the first event came through fine and then 16 more events silently
   // accumulated in the JSONL without firing the watcher. A 400ms tick is
-  // cheap (one stat + read-if-grew) and bulletproof.
-  state.pollTimer = setInterval(() => { void flush(state); }, 400);
+  // cheap (one stat + read-if-grew) and bulletproof; it backs off to
+  // `POLL_SLOW_MS` after `POLL_IDLE_AFTER_MS` of quiet (see `armPollTimer`).
+  armPollTimer(state);
   startScraper(state);
   startDeathWatch(state);
   // Track any background/sub agents this session spawns. Idempotent re-arm:
@@ -3869,6 +4068,13 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
         // "paste" already happened via the launch argv before this function
         // even returned.)
         state.pendingSlashToken = slashTokenOf(deferredPrompt);
+        // Prompt paste is a life signal — matters here specifically because
+        // boot (and the readiness wait above) can take up to
+        // DEFERRED_PROMPT_TIMEOUT_MS, well past the construction-time stamp
+        // `makeSessionState` set. `attachTailer` (and its pollTimer) hasn't
+        // run yet at this point — `rearmPollTimerFast` would no-op — so only
+        // the idle-clock bump applies here.
+        bumpActivity(state);
         void queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, {
           bracketed: true,
           onPasteFailure: () => {
@@ -4182,6 +4388,11 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
     onChunk("stderr", err.message);
     return rejectedAgent(taskId, err);
   }
+  // A turn starting is a life signal — reset the idle clock and snap the
+  // backstop poll back to full rate immediately (relevant when this session
+  // had backed off to POLL_SLOW_MS while idle).
+  bumpActivity(state);
+  rearmPollTimerFast(state);
   // Drain any unprocessed JSONL content under whatever turn is currently
   // active BEFORE pushing the new slot — otherwise a trailing end_turn
   // already in the file would be dispatched against the new slot and
@@ -4262,6 +4473,10 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
 export function pasteFollowUp(taskId: string, prompt: string): boolean {
   const state = sessions.get(taskId);
   if (!state) return false;
+  // A folded-in follow-up paste is a life signal — reset the idle clock and
+  // snap the backstop poll back to full rate immediately.
+  bumpActivity(state);
+  rearmPollTimerFast(state);
   state.holdUntilIdle = true;
   // Arm (or disarm) the unknown-command lookout for the folded-in prompt —
   // same rule as `sendTurn`: only a first line starting with "/" arms it.
@@ -4629,7 +4844,7 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   if (!state) return;
   state.watcher?.close();
   state.watcher = null;
-  if (state.pollTimer) clearInterval(state.pollTimer);
+  if (state.pollTimer) clearTimeout(state.pollTimer);
   state.pollTimer = null;
   if (state.scrapeTimer) clearInterval(state.scrapeTimer);
   state.scrapeTimer = null;

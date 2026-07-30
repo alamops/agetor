@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -19,7 +20,19 @@ interface Props {
   onUnarchive: (t: Task) => void;
 }
 
-export function Column({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
+/** Array is considered unchanged when same length and every element is the
+ *  same object reference at the same index. Relies on the caller (App.tsx's
+ *  `reconcileById`) preserving task identity across polls for tasks that
+ *  didn't actually change — that's what lets an unaffected column bail out
+ *  below even though `visibleTasks.filter(...)` in App.tsx produces a new
+ *  array reference on every render. */
+function sameTasks(a: Task[], b: Task[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  return a.every((t, i) => t === b[i]);
+}
+
+function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -55,3 +68,27 @@ export function Column({ id, label, tasks, homeDir, onStart, onCancel, onDelete,
     </div>
   );
 }
+
+/** Custom comparator instead of the default shallow-props compare: `tasks`
+ *  is an array, so the default `Object.is` per-prop check would see a new
+ *  reference on every render (App.tsx's `visibleTasks.filter(...)` always
+ *  allocates a fresh array) and re-render every column on every tick. With
+ *  `sameTasks` doing an element-wise identity check instead, a column whose
+ *  member tasks are all reference-unchanged bails out — so a single task
+ *  update (which only changes that one task's object identity, per
+ *  App.tsx's `reconcileById`) only re-renders the column(s) that actually
+ *  contain the changed task. */
+export const Column = memo(ColumnImpl, (prev, next) => (
+  prev.id === next.id &&
+  prev.label === next.label &&
+  prev.homeDir === next.homeDir &&
+  prev.onStart === next.onStart &&
+  prev.onCancel === next.onCancel &&
+  prev.onDelete === next.onDelete &&
+  prev.onOpen === next.onOpen &&
+  prev.onDiff === next.onDiff &&
+  prev.onMarkDone === next.onMarkDone &&
+  prev.onArchive === next.onArchive &&
+  prev.onUnarchive === next.onUnarchive &&
+  sameTasks(prev.tasks, next.tasks)
+));

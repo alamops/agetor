@@ -665,6 +665,15 @@ export type WorktreeStaleReason = "orphaned" | "archived" | "inactive";
  *  `"inactive"` — 7 days. */
 export const WORKTREE_STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
+/** How long a claude session must sit idle (no in-flight turn, no pending
+ *  interaction, no session activity) before the idle-session reaper kills its
+ *  tmux session to reclaim the REPL's memory. Follow-ups after a reap resume
+ *  via `claude --resume` (spawnResumedSession) instead of a live paste. */
+export const IDLE_SESSION_REAP_MS = 30 * 60 * 1000; // 30 minutes
+
+/** Cadence of the orchestrator's idle-session reap sweep. */
+export const SESSION_REAP_SWEEP_MS = 5 * 60 * 1000; // 5 minutes
+
 /**
  * A git worktree materialized on disk under `dataDir/worktrees/`, as surfaced
  * by `GET /worktrees`. One row per directory found on disk — computed live by
@@ -697,6 +706,32 @@ export interface WorktreeInfo {
   stale: boolean;
   /** Every reason this worktree is considered stale; empty when not stale. */
   staleReasons: WorktreeStaleReason[];
+}
+
+/**
+ * Outcome of the worktree teardown an archive triggered, as surfaced by
+ * `POST /tasks/:id/archive` when the caller passes `awaitTeardown: true`.
+ *
+ * Archive normally defers teardown onto a per-workdir background queue and
+ * responds in milliseconds, so the response carries no outcome at all. The
+ * Worktrees page's "Archive & delete" is the one caller that needs to know
+ * whether the directory is *actually* gone before it refreshes the list — it
+ * opts in, and gets this back.
+ *
+ * `reason` is only meaningful when `removed` is false:
+ * - `"dirty"` — the checkout had uncommitted changes and `forceWorktree` was
+ *   not set, so it was deliberately left in place. (`hasUncommittedChanges`
+ *   folds git errors into this too — it returns null on a failing `git
+ *   status`, which the caller treats as "don't touch".)
+ * - `"no-worktree"` / `"already-absent"` — there was nothing to remove. Not a
+ *   failure; callers should treat these as success.
+ * - `"failed"` — removal was attempted and the directory is still there.
+ */
+export interface WorktreeTeardownResult {
+  /** True when the worktree directory is no longer on disk after the teardown. */
+  removed: boolean;
+  /** Why `removed` is false. Absent when `removed` is true. */
+  reason?: "dirty" | "no-worktree" | "already-absent" | "failed";
 }
 
 /**
@@ -1682,6 +1717,30 @@ export type RunEventStream =
   | "tool_result"
   | "subagent";
 
+/** Max number of persisted events `GET /tasks/:id/events` replays on SSE
+ *  (re)connect — the most recent window; older history is fetched on demand
+ *  via `GET /tasks/:id/events/page`. */
+export const EVENTS_REPLAY_LIMIT = 800;
+
+/** Max number of events the run panel keeps in webview memory for one task.
+ *  When live streaming pushes past this, the oldest events are trimmed and the
+ *  "Load earlier" affordance re-appears. */
+export const EVENTS_WINDOW_MAX = 3000;
+
+/** Named SSE event (`event: replay_meta`) sent as the FIRST frame of
+ *  `GET /tasks/:id/events`, before the replayed window. Unnamed `message`
+ *  listeners ignore it, so old clients are unaffected. */
+export const TASK_EVENTS_REPLAY_META_EVENT = "replay_meta";
+
+/** Payload of the {@link TASK_EVENTS_REPLAY_META_EVENT} frame. */
+export interface TaskEventsReplayMeta {
+  /** DB id of the earliest event included in the replayed window, or null when
+   *  the task has no persisted events. */
+  earliestId: number | null;
+  /** True when older events exist before `earliestId` (drives "Load earlier"). */
+  hasMore: boolean;
+}
+
 export interface RunEvent {
   runId: string;
   taskId: string;
@@ -1695,6 +1754,12 @@ export interface RunEvent {
    * per-subagent tabs. Threaded from `run_events.subagent_id`.
    */
   subagentId?: string | null;
+  /**
+   * `run_events.id`, present on replayed/paged persisted events (SSE replay
+   * window, `/tasks/:id/events/page`); absent on live-broadcast frames, which
+   * have no row yet at broadcast time.
+   */
+  id?: number;
 }
 
 /** Lifecycle state of a tracked background/sub agent. Mirrors `RunStatus` plus

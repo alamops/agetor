@@ -3,15 +3,17 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
   GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
 import { shouldOfferCommitPush, type TaskGitStatus } from "@/lib/commit-push";
+import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
@@ -20,6 +22,7 @@ import {
   AGENT_OPTIONS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  EVENTS_WINDOW_MAX,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -32,6 +35,7 @@ import {
   type SubagentEvent,
   type Task,
   type TaskDraft,
+  type TaskEventsReplayMeta,
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
@@ -67,14 +71,29 @@ function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
 
 /**
  * `RunEvent` as held in the panel's local `events` state, tagged with a
- * client-assigned monotonic id. The server doesn't expose a stable event id
- * over SSE (`run_events.id` never leaves the DB layer) — `id` here is
- * assigned by `nextEventIdRef` the moment an event is accepted into the
+ * client-assigned monotonic id. `id` here is always assigned by
+ * `nextEventIdRef`/`prevEventIdRef` the moment an event is accepted into the
  * unified stream, purely so `rebuilt-mask.ts` can tell a genuinely NEW live
  * event apart from one the server re-delivers on SSE reconnect (full-history
- * replay) when deciding whether the JSONL rebuild snapshot has gone stale.
+ * replay) when deciding whether the JSONL rebuild snapshot has gone stale —
+ * it is NEVER the server's own event id, even when one is available (see
+ * `dbId` below), since `rebuilt-mask.ts`'s ordering depends on this id space
+ * being contiguous and monotonic per-connection.
+ *
+ * `dbId`, when present, is the REAL `run_events.id` row id. Historically this
+ * was only known for events fetched via `GET /tasks/:id/events/page` ("Load
+ * earlier"), but SSE replayed frames (the burst sent on connect/reconnect,
+ * before `replay_meta`'s window) now carry it too — only a genuinely NEW
+ * live event delivered after the connection has settled lacks one. It's what
+ * lets the live-window trim (`EVENTS_WINDOW_MAX`) figure out a fresh
+ * `beforeId` cursor after eating into previously-loaded earlier history: if
+ * the new front-of-window event carries a `dbId`, that becomes the new
+ * `earliestId`; if it doesn't (the rare case of a brand-new live event
+ * pushing the window over the cap before any replay/page fetch has run),
+ * "Load earlier" has nothing reliable to page from and hides until the next
+ * SSE (re)connect re-seeds `earliestId` from `replay_meta`.
  */
-type StreamEvent = RunEvent & { id: number };
+type StreamEvent = RunEvent & { id: number; dbId?: number };
 
 interface Props {
   /** When null, the panel slides off-screen and unmounts after the exit animation. */
@@ -108,6 +127,14 @@ export const EXIT_DURATION_MS = 250;
 // parked just past one threshold but within the other would see the pin
 // fire inconsistently depending on which path last updated `nearBottomRef`.
 const NEAR_BOTTOM_PX = 80;
+
+// Computed once at module load rather than per keystroke — used by the
+// Cmd/Ctrl+F handler below to pick the platform-appropriate modifier
+// (`metaKey` on macOS, `ctrlKey` elsewhere). Agetor packages arm64-only for
+// macOS, but the dev webview (Vite) can run in any browser during
+// development, so this still branches rather than assuming Mac.
+const IS_MAC_PLATFORM =
+  typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent || "");
 
 function formatDuration(r: Run): string {
   const end = r.endedAt ?? Date.now();
@@ -167,9 +194,10 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
 
   // Escape closes the panel — but only when no higher-priority dismissable
   // layer is up: a modal Dialog (confirm, edit, settings, tmux-missing —
-  // each renders `[role="dialog"][aria-modal="true"]`) or an open
-  // search-select / multi-search-select popover (marked with
-  // `[data-popover-open]`). Esc peels one layer at a time, top down.
+  // each renders `[role="dialog"][aria-modal="true"]`), an open search-select
+  // / multi-search-select popover (marked with `[data-popover-open]`), or the
+  // in-panel message search bar (marked with `[data-search-open]` — see
+  // RunPanelBody). Esc peels one layer at a time, top down.
   //
   // Note: stopPropagation/stopImmediatePropagation can't help here because
   // both the panel and the popovers attach to `document`, so DOM markers
@@ -184,7 +212,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-search-open]')) return;
       e.preventDefault();
       onCloseRef.current();
     };
@@ -217,6 +245,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           harnesses={harnesses}
           agentModels={agentModels}
           homeDir={homeDir}
+          open={open}
           onClose={onClose}
           onShowDiff={onShowDiff}
           onArchive={onArchive}
@@ -237,6 +266,7 @@ function RunPanelBody({
   harnesses,
   agentModels,
   homeDir,
+  open,
   onClose,
   onShowDiff,
   onArchive,
@@ -247,6 +277,11 @@ function RunPanelBody({
   harnesses: Harness[];
   agentModels: AgentModelMap;
   homeDir: string;
+  /** Whether the panel is in its "open" (not mid-close-animation, not
+   *  pre-mount) state — mirrors `RunPanel`'s own `open` state. Gates the
+   *  Cmd/Ctrl+F listener below so it doesn't hijack the shortcut while the
+   *  panel is animating out or not actually visible. */
+  open: boolean;
   onClose: () => void;
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
@@ -289,11 +324,29 @@ function RunPanelBody({
    *  subagent id. Background-agent streams are READ-ONLY — the composer is
    *  hidden while one is active. */
   const [activeStream, setActiveStream] = useState<string>("main");
+  /** In-panel search over whichever stream is currently displayed (see
+   *  lib/event-search.ts). Read-only and deliberately NOT gated on
+   *  `activeStream === "main"` or archival state — it works identically on a
+   *  subagent tab or an archived task's frozen log. */
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  /** The selected match, as an index into `displayedEvents` — NOT a
+   *  `StreamEvent.id`. A JSONL-rebuilt event has no client-assigned id at
+   *  all (see `StreamEvent`'s doc comment above), so `findMatchingEventIds`
+   *  (lib/event-search.ts) uses each event's position in `displayedEvents`
+   *  as its id, scoped to whatever's currently displayed. `null` means no
+   *  match is selected. */
+  const [activeMatchId, setActiveMatchId] = useState<number | null>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
   // Wraps the log's conditional content (empty states + the event list) so a
   // ResizeObserver can watch content height growth independent of the scroll
   // container's own box — see the pin-to-bottom effects below.
   const logContentRef = useRef<HTMLDivElement>(null);
+  // The DOM element currently carrying the search-match highlight classes
+  // (imperatively toggled, not driven by a React prop/memo dep — see the
+  // effect below). `null` when nothing is highlighted.
+  const highlightedElRef = useRef<HTMLElement | null>(null);
   // Tracks whether the log was scrolled near the bottom at the last user
   // interaction. Auto-scroll-to-bottom on new events only fires when this is
   // true, so a user who scrolls up to read history isn't yanked back down on
@@ -320,6 +373,40 @@ function RunPanelBody({
   // the rebuild-snapshot-invalidation check needs to be race-free. Reset to
   // 0 on task switch alongside the rest of the stream state.
   const nextEventIdRef = useRef(0);
+  // Descending id source for events PREPENDED via "Load earlier" (see
+  // `loadEarlierEvents`). Always negative and always decreasing, so a
+  // page-fetched historical event's client `id` sorts before every live/replay
+  // `StreamEvent.id` (which start at 0 and only increase) — this keeps it
+  // outside `rebuilt-mask.ts`'s "genuinely newer than the snapshot" check
+  // without needing any special-casing there. Reset to -1 on task switch.
+  const prevEventIdRef = useRef(-1);
+  // Mirrors `events` synchronously (state updates land a render later) so the
+  // SSE batch-flush callback and `loadEarlierEvents` can read/trim the
+  // "current" array without relying on React's functional-setState form —
+  // doing the window-cap trim (see EVENTS_WINDOW_MAX below) inside a
+  // setState updater would run twice under StrictMode's dev double-invoke.
+  const eventsRef = useRef<StreamEvent[]>([]);
+  /** Every real `run_events.id` (`StreamEvent.dbId`) currently represented in
+   *  `eventsRef.current`, whether it arrived via SSE replay, a live push, or
+   *  a "Load earlier" page fetch. Populated as events are accepted (see the
+   *  SSE subscription effect and `loadEarlierEvents` below); reset on task
+   *  switch. Lets `loadEarlierEvents` defensively drop rows it's already
+   *  holding — e.g. after an SSE reconnect moves `earliestId` backward (see
+   *  the `replay_meta` handler below) a subsequent page fetch can legitimately
+   *  overlap the tail of what a previous page fetch (or the live window)
+   *  already loaded. */
+  const loadedDbIdsRef = useRef<Set<number>>(new Set());
+  /** DB id of the earliest event currently anchoring the "Load earlier"
+   *  cursor, or null when unknown (hides the button — see `StreamEvent.dbId`
+   *  and the window-trim comment in the SSE effect below). Seeded from the
+   *  SSE `replay_meta` frame on (re)connect; advanced by each successful
+   *  "Load earlier" page fetch; recomputed (possibly to null) when live
+   *  growth trims the window's front past a known anchor. */
+  const [earliestId, setEarliestId] = useState<number | null>(null);
+  /** Whether older history exists before `earliestId` — gates the "Load
+   *  earlier" button together with `earliestId !== null`. */
+  const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   // Reset on task switch (no remount because we no longer key on task.id).
   // Re-arm the auto-scroll heuristic so opening a different task pins the
@@ -327,11 +414,20 @@ function RunPanelBody({
   // task's scrolled-up position.
   useEffect(() => {
     setEvents([]);
+    eventsRef.current = [];
+    prevEventIdRef.current = -1;
+    loadedDbIdsRef.current = new Set();
+    setEarliestId(null);
+    setHasMoreEarlier(false);
+    setLoadingEarlier(false);
     setRebuilt(null);
     setRebuildNote(null);
     setInteractions([]);
     setSubagentList([]);
     setActiveStream("main");
+    setSearchOpen(false);
+    setSearchQuery("");
+    setActiveMatchId(null);
     nearBottomRef.current = true;
   }, [task.id]);
 
@@ -383,8 +479,42 @@ function RunPanelBody({
     [],
   );
 
+  // ── Poll gating (runs + subagents) ────────────────────────────────────────
+  // Both 2s polls below share the same "is there any reason to keep looking"
+  // condition: a run in flight, a subagent running, or an interaction waiting
+  // on the user. These booleans are read by each poll's own `evaluate()`
+  // (defined inside the effect so it can start/stop that effect's own timer)
+  // — refs, not plain closures, because `latestRun`/`subagentList`/
+  // `interactions` change on every render without re-running the poll effects
+  // (whose deps are just `[task.id, task.runId]` / `[task.id]`, deliberately,
+  // so an interaction resolving doesn't reset an in-flight interval). The
+  // kick/evaluate refs let the activity-change effect and the SSE handler
+  // below reach into a poll effect that was set up earlier without needing it
+  // in their own dependency arrays.
+  const runActiveRef = useRef(false);
+  const subagentActiveRef = useRef(false);
+  const interactionPendingRef = useRef(false);
+  const runsPollKickRef = useRef<() => void>(() => {});
+  const subagentsPollKickRef = useRef<() => void>(() => {});
+  const runsPollEvaluateRef = useRef<() => void>(() => {});
+  const subagentsPollEvaluateRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    runActiveRef.current = latestRun?.status === "running";
+    subagentActiveRef.current = subagentList.some((s) => s.status === "running");
+    interactionPendingRef.current = interactions.length > 0;
+    // Re-arm (or re-suspend) both polls now that the activity picture changed
+    // — e.g. the latest run just resolved (stop) or a subagent just finished
+    // while the run was already idle (also stop; the reverse case, a run/
+    // subagent starting, is normally already covered by `task.runId`/mount
+    // effects below, but this keeps both polls honest either way).
+    runsPollEvaluateRef.current();
+    subagentsPollEvaluateRef.current();
+  }, [latestRun?.status, subagentList, interactions.length]);
+
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
     const load = async () => {
       try {
         const list = await api.listRuns(task.id);
@@ -392,17 +522,57 @@ function RunPanelBody({
         setRuns(list);
       } catch { /* task may have been deleted */ }
     };
-    void load();
-    const t = setInterval(load, 2000);
-    return () => { cancelled = true; clearInterval(t); };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // Mirrors whether the timer is currently (supposed to be) running.
+    // `evaluate()` is called on every SSE frame during a mid-turn flood (see
+    // the subscription effect's `runsPollEvaluateRef.current()` calls) — the
+    // early return below skips the `document.hidden`/ref reads and the
+    // start/stop call entirely once the desired state already matches,
+    // rather than re-deriving and re-applying the same state on every event.
+    let armed = false;
+    // Paused while the window is hidden (nothing to repaint) or once the task
+    // has gone fully idle (terminal run, no subagent running, no pending
+    // interaction) — resumed by `kick()` below on visible/focus or a live-sign
+    // SSE event, so a change on the server side is never missed for long.
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    runsPollKickRef.current = kick;
+    runsPollEvaluateRef.current = evaluate;
+    void load(); // initial load on mount always happens, regardless of gating
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [task.id, task.runId]);
 
   // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
   // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
   // runs poll). Merge rather than replace so an in-flight SSE delta isn't
-  // clobbered by a slightly-stale poll.
+  // clobbered by a slightly-stale poll. Same visibility/idle gating as the
+  // runs poll above (own timer, shared activity refs).
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
     const load = async () => {
       try {
         const list = await api.listSubagents(task.id);
@@ -418,9 +588,39 @@ function RunPanelBody({
         });
       } catch { /* task may have been deleted */ }
     };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // See the runs-poll effect above for why this early-returns on a no-op
+    // state transition instead of re-deriving/re-applying on every call.
+    let armed = false;
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    subagentsPollKickRef.current = kick;
+    subagentsPollEvaluateRef.current = evaluate;
     void load();
-    const t = setInterval(load, 2000);
-    return () => { cancelled = true; clearInterval(t); };
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [task.id]);
 
   // One unified task-level stream: every event from every run, merged in
@@ -455,9 +655,61 @@ function RunPanelBody({
     // arm/flush bookkeeping (and the re-arm-after-flush invariant that fixes
     // the freeze) lives in `createEventBuffer` so it can be unit-tested.
     const FLUSH_FALLBACK_MS = 250;
+    // Wall-clock connect time, used below to suppress poll kicks for the
+    // first ~1s of a (re)connect. The SSE replay burst can contain many
+    // historical `status`/`user` events (a big backlog dumps its whole
+    // recent window in one go), and each used to fire an immediate
+    // `runsPollKickRef`/`subagentsPollKickRef` call — a fetch storm at
+    // panel-open time. Wall-clock time (rather than "has the first batch
+    // flushed yet") is the right gate: a slow flush doesn't shrink the
+    // window, and a burst that keeps arriving past 1s still degrades
+    // gracefully into the debounce below rather than firing on every event.
+    const CONNECT_SETTLE_MS = 1000;
+    const connectedAtRef = { current: Date.now() };
+    // Debounce for kicks that land after the settle window: at most one
+    // poll-kick per second, trailing-edge, so a burst of live `status`/`user`
+    // events (e.g. several follow-ups folding into a turn in quick
+    // succession) can't each trigger their own fetch.
+    const KICK_DEBOUNCE_MS = 1000;
+    const lastKickAtRef = { current: 0 };
+    let kickTimer: ReturnType<typeof setTimeout> | null = null;
+    const debouncedKick = () => {
+      const now = Date.now();
+      const elapsed = now - lastKickAtRef.current;
+      if (elapsed >= KICK_DEBOUNCE_MS) {
+        lastKickAtRef.current = now;
+        runsPollKickRef.current();
+        subagentsPollKickRef.current();
+        return;
+      }
+      if (kickTimer) return;
+      kickTimer = setTimeout(() => {
+        kickTimer = null;
+        lastKickAtRef.current = Date.now();
+        runsPollKickRef.current();
+        subagentsPollKickRef.current();
+      }, KICK_DEBOUNCE_MS - elapsed);
+    };
     const buffer = createEventBuffer<StreamEvent>(
       (batch) => {
-        setEvents((cur) => [...cur, ...batch]);
+        // Trim from the front once the live window exceeds EVENTS_WINDOW_MAX
+        // (see StreamEvent's `dbId` doc comment for how the new earliestId is
+        // derived — or why it sometimes can't be). `eventsRef` mirrors
+        // `events` synchronously so this math doesn't need React's
+        // functional-setState form (which would run twice under StrictMode's
+        // dev double-invoke and could double-decrement counters/side effects
+        // if this logic lived inside it).
+        const merged = [...eventsRef.current, ...batch];
+        let next = merged;
+        if (merged.length > EVENTS_WINDOW_MAX) {
+          next = merged.slice(merged.length - EVENTS_WINDOW_MAX);
+          const front = next[0];
+          const newEarliestId = front?.dbId ?? null;
+          setEarliestId(newEarliestId);
+          setHasMoreEarlier(newEarliestId != null);
+        }
+        eventsRef.current = next;
+        setEvents(next);
         // A newer live MAIN-stream event landing for a run the rebuilt-from-
         // JSONL snapshot is currently masking means the snapshot is stale —
         // clear it so `displayedEvents` falls back to the live stream. This
@@ -499,57 +751,186 @@ function RunPanelBody({
     const onFocus = () => buffer.flushNow();
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onFocus);
-    const unsub = api.subscribeTask(task.id, (e) => {
-      if (!dedupe.accept(e)) return;
-      if (e.stream === "interaction") {
-        try {
-          const req = JSON.parse(e.data) as PendingInteraction;
-          setInteractions((cur) => cur.some((x) => x.id === req.id) ? cur : [...cur, req]);
-        } catch { /* ignore malformed */ }
-        return;
-      }
-      if (e.stream === "subagent") {
-        // Live lifecycle delta for a background/sub agent — upsert into the tab
-        // list instead of pushing to the log buffer. The agent's actual
-        // transcript rides the normal user/assistant/tool_* streams (tagged
-        // via `subagentId`) and flows through to `buffer.push` below.
-        try {
-          const { subagent } = JSON.parse(e.data) as SubagentEvent;
-          setSubagentList((cur) => {
-            const i = cur.findIndex((s) => s.id === subagent.id);
-            if (i === -1) return [...cur, subagent];
-            const next = cur.slice();
-            next[i] = subagent;
-            return next;
-          });
-        } catch { /* ignore malformed */ }
-        return;
-      }
-      if (e.stream === "interaction_resolved") {
-        // Server-side resolution (scraper auto-cancel, run cancellation,
-        // delete) — drop the matching card so the UI doesn't keep
-        // showing a stale prompt. The card's own submit handler also
-        // calls `dismissInteraction(id)` directly; both paths are
-        // idempotent under `id`-based filtering.
-        try {
-          const { id } = JSON.parse(e.data) as { id: string };
-          setInteractions((cur) => cur.filter((x) => x.id !== id));
-        } catch { /* ignore malformed */ }
-        return;
-      }
-      // Tag with the next client-assigned id (see `StreamEvent`) — the
-      // server doesn't send one over SSE, and the invalidation check above
-      // needs a monotonic ordering to distinguish a genuinely new event from
-      // one the replay burst re-delivers on reconnect.
-      buffer.push({ ...e, id: nextEventIdRef.current++ });
-    });
+    const unsub = api.subscribeTask(
+      task.id,
+      (e) => {
+        if (!dedupe.accept(e)) return;
+        if (e.stream === "interaction") {
+          try {
+            const req = JSON.parse(e.data) as PendingInteraction;
+            setInteractions((cur) => cur.some((x) => x.id === req.id) ? cur : [...cur, req]);
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        if (e.stream === "subagent") {
+          // Live lifecycle delta for a background/sub agent — upsert into the tab
+          // list instead of pushing to the log buffer. The agent's actual
+          // transcript rides the normal user/assistant/tool_* streams (tagged
+          // via `subagentId`) and flows through to `buffer.push` below.
+          try {
+            const { subagent } = JSON.parse(e.data) as SubagentEvent;
+            setSubagentList((cur) => {
+              const i = cur.findIndex((s) => s.id === subagent.id);
+              if (i === -1) return [...cur, subagent];
+              const next = cur.slice();
+              next[i] = subagent;
+              return next;
+            });
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        if (e.stream === "interaction_resolved") {
+          // Server-side resolution (scraper auto-cancel, run cancellation,
+          // delete) — drop the matching card so the UI doesn't keep
+          // showing a stale prompt. The card's own submit handler also
+          // calls `dismissInteraction(id)` directly; both paths are
+          // idempotent under `id`-based filtering.
+          try {
+            const { id } = JSON.parse(e.data) as { id: string };
+            setInteractions((cur) => cur.filter((x) => x.id !== id));
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        // "Life sign" re-arm for the runs/subagents polls (see the poll-gating
+        // block above): a `status` or `user` event is the rare, low-volume
+        // signal that a run's lifecycle actually moved (started/hibernated/
+        // ended, or a follow-up was sent) — worth an immediate poll kick.
+        // Every other stream (assistant/thinking/tool_use/tool_result/stdout/
+        // stderr) can arrive at high frequency mid-turn, so those only get the
+        // cheap no-fetch `evaluate()`. Gated on wall-clock time since connect
+        // so the open-time replay burst (which can contain many historical
+        // status/user events) never turns into a fetch storm, and further
+        // debounced to at most one kick/second so a rapid live burst past the
+        // settle window can't do the same — see `CONNECT_SETTLE_MS`/
+        // `debouncedKick` above.
+        if (e.stream === "status" || e.stream === "user") {
+          if (Date.now() - connectedAtRef.current < CONNECT_SETTLE_MS) {
+            runsPollEvaluateRef.current();
+            subagentsPollEvaluateRef.current();
+          } else {
+            debouncedKick();
+          }
+        } else {
+          runsPollEvaluateRef.current();
+          subagentsPollEvaluateRef.current();
+        }
+        // Tag with the next client-assigned id (see `StreamEvent`) — this
+        // client id space is distinct from the server's own `RunEvent.id`
+        // (only present on replayed/paged frames, see its doc comment), and
+        // the invalidation check above needs a monotonic ordering to
+        // distinguish a genuinely new event from one the replay burst
+        // re-delivers on reconnect. Capture the server id as `dbId` when
+        // present so the window-cap trim above can derive an exact
+        // `earliestId` cursor from replay alone, without waiting on a
+        // "Load earlier" page fetch.
+        const dbId = e.id;
+        if (typeof dbId === "number") loadedDbIdsRef.current.add(dbId);
+        buffer.push({ ...e, id: nextEventIdRef.current++, dbId });
+      },
+      (meta) => {
+        // The server sends `replay_meta` as the FIRST frame of every (re)connect
+        // — including an EventSource-internal reconnect after a network blip,
+        // which reuses this same subscription/effect instance rather than
+        // re-running it. Re-arming the settle window here (not just at effect
+        // setup) is what makes the kick-storm suppression above cover BOTH the
+        // initial open and every later reconnect's replay burst.
+        connectedAtRef.current = Date.now();
+        // Never move the cursor FORWARD on a reconnect: a fresh `replay_meta`
+        // reflects only the just-replayed window, which is capped at
+        // EVENTS_REPLAY_LIMIT and so always starts later than whatever
+        // earlier history "Load earlier" may have already paged in before
+        // the reconnect. Losing that progress would silently re-show a
+        // narrower "Load earlier" cursor (or hide it) after every SSE drop —
+        // taking the min (treating null as "no bound yet") keeps whichever
+        // cursor reaches furthest back. `hasMore` only ever grows for the
+        // same reason: once we know older history exists, a later replay
+        // that (re)confirms a narrower window can't un-know that.
+        setEarliestId((prev) =>
+          prev == null ? meta.earliestId : meta.earliestId == null ? prev : Math.min(prev, meta.earliestId),
+        );
+        setHasMoreEarlier((prev) => prev || meta.hasMore);
+      },
+    );
     return () => {
       buffer.dispose();
+      if (kickTimer) clearTimeout(kickTimer);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onFocus);
       unsub();
     };
   }, [task.id]);
+
+  // Holds a pre-prepend `{scrollHeight, scrollTop}` snapshot for the layout
+  // effect just below to restore from — see that effect's doc comment.
+  const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+
+  /**
+   * "Load earlier messages" — fetches one older page (`beforeId = earliestId`)
+   * and prepends it to `events`. Prepended events get a descending client id
+   * from `prevEventIdRef` (see `StreamEvent`'s doc comment) and carry the
+   * real server `dbId`, which is what lets a later window-cap trim re-derive
+   * `earliestId` after eating into this history. Scroll position is
+   * preserved by capturing the log's `scrollHeight`/`scrollTop` before the
+   * prepend and restoring `scrollTop` by the height delta once the DOM has
+   * grown (see the layout effect below) — the "simple approach" from the
+   * plan rather than anchoring to a specific DOM node.
+   */
+  const loadEarlierEvents = useCallback(() => {
+    if (earliestId == null || !hasMoreEarlier || loadingEarlier) return;
+    const el = logRef.current;
+    setLoadingEarlier(true);
+    void api.fetchTaskEventsPage(task.id, earliestId)
+      .then((page) => {
+        // Defensive dedupe: `earliestId` can point past events this panel
+        // already holds — e.g. an SSE reconnect moved it backward (see the
+        // `replay_meta` handler's "never move forward" comment above), so a
+        // page fetched from that cursor can legitimately overlap the tail of
+        // what a previous fetch (or the live/replayed window) already loaded.
+        const fresh = page.events.filter((ev) => !loadedDbIdsRef.current.has(ev.id));
+        if (fresh.length > 0) {
+          // Set BEFORE the prepend's setState, not after: the pin-to-bottom
+          // effect below reads `nearBottomRef` on every `events` change, and
+          // runs as a passive effect AFTER this component's commit — if this
+          // flag flipped after `setEvents`, that effect could still see the
+          // pre-prepend (stale) `true` and yank the viewport back to the
+          // bottom, fighting the `useLayoutEffect` scroll restore just below
+          // (which always wins the ordering race, but only for scrollTop —
+          // the pin effect would then immediately override it again).
+          nearBottomRef.current = false;
+          const mapped: StreamEvent[] = fresh.map((ev) => {
+            loadedDbIdsRef.current.add(ev.id);
+            return { ...ev, id: prevEventIdRef.current--, dbId: ev.id };
+          });
+          if (el) {
+            scrollRestoreRef.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: el.scrollTop };
+          }
+          const next = [...mapped, ...eventsRef.current];
+          eventsRef.current = next;
+          setEvents(next);
+        }
+        setEarliestId(page.earliestId);
+        setHasMoreEarlier(page.hasMore);
+      })
+      .catch(() => { /* transient failure — button stays enabled to retry */ })
+      .finally(() => setLoadingEarlier(false));
+  }, [task.id, earliestId, hasMoreEarlier, loadingEarlier]);
+
+  // Restores scroll position after "Load earlier" prepends older events above
+  // the current viewport — without this the browser leaves `scrollTop`
+  // unchanged, which visually yanks the previously-visible content down by
+  // however tall the newly-inserted history is. Runs after every commit (the
+  // ref-guarded early return keeps that cheap) rather than being keyed to a
+  // dependency, since the meaningful trigger is "did `loadEarlierEvents` just
+  // prepend", not any particular prop.
+  useLayoutEffect(() => {
+    const pending = scrollRestoreRef.current;
+    if (!pending) return;
+    scrollRestoreRef.current = null;
+    const el = logRef.current;
+    if (!el) return;
+    const delta = el.scrollHeight - pending.prevScrollHeight;
+    el.scrollTop = pending.prevScrollTop + delta;
+  });
 
   // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
   // a user who scrolled up to read history is never yanked back down:
@@ -670,7 +1051,12 @@ function RunPanelBody({
     if (!latestRun.claudeSessionId) return;
     const sessionId = latestRun.claudeSessionId;
     let cancelled = false;
-    void api.rebuildRunEvents(latestRun.id).then((res) => {
+    // Bounded to EVENTS_WINDOW_MAX — the same cap the live stream itself is
+    // held to (see the SSE batch-flush trim above). Without a limit here, the
+    // auto-rebuild silently replaced the panel's bounded window with an
+    // unbounded full-session dump on every run completion, defeating the
+    // whole point of capping live/replayed history (code review finding).
+    void api.rebuildRunEvents(latestRun.id, EVENTS_WINDOW_MAX).then((res) => {
       if (cancelled) return;
       if (res.events.length > 0) {
         setRebuilt({
@@ -680,6 +1066,11 @@ function RunPanelBody({
           maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
         });
         setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
+        // The rebuild itself has no DB row ids to page from (JSONL events are
+        // synthesized, not persisted `run_events` rows), so this only ever
+        // grows the affordance's visibility — it never clobbers an
+        // `earliestId` cursor the live/replayed stream already established.
+        if (res.hasMore) setHasMoreEarlier(true);
       } else if (res.reason) {
         setRebuildNote(res.reason);
       }
@@ -734,12 +1125,22 @@ function RunPanelBody({
   /** Events for whichever stream the tab strip has selected. For "main", splice
    *  `rebuilt` in by dropping events from runs that share its sessionId and
    *  appending the rebuilt set (earlier sessions stay visible). A subagent tab
-   *  shows that subagent's transcript directly (no rebuild path applies). */
+   *  shows that subagent's transcript directly (no rebuild path applies).
+   *
+   *  `status` events are the one exception to "drop the rebuilt run's live
+   *  events": they're synthesized by the orchestrator (e.g. "session
+   *  hibernated after idle…"), never appear in the JSONL transcript, and so
+   *  can never duplicate against `rebuilt.events` — dropping them would just
+   *  hide legitimate lifecycle notices for as long as the rebuild snapshot is
+   *  active. Kept in original arrival order, then re-sorted by `ts` against
+   *  the appended rebuild set (whose synthetic timestamps are anchored at the
+   *  run's start, not real wall-clock time) so a status event doesn't jump to
+   *  the wrong end of the transcript. */
   const displayedEvents = useMemo(() => {
     if (activeStream !== "main") return subagentEventsById.get(activeStream) ?? [];
     if (!rebuilt || !rebuiltRunIds) return mainEvents;
-    const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId));
-    return [...others, ...rebuilt.events];
+    const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId) || e.stream === "status");
+    return [...others, ...rebuilt.events].sort((a, b) => a.ts - b.ts);
   }, [activeStream, subagentEventsById, mainEvents, rebuilt, rebuiltRunIds]);
 
   /** The current to-do list for whichever stream is selected. Claude re-emits
@@ -747,6 +1148,162 @@ function RunPanelBody({
    *  (see lib/todo-progress.ts). Memoized on `displayedEvents` alone — it is
    *  recomputed on every SSE frame, so it must stay a single O(n) pass. */
   const todoProgress = useMemo(() => deriveTodoProgress(displayedEvents), [displayedEvents]);
+
+  // `findMatchingEventIds` (lib/event-search.ts) takes `displayedEvents`
+  // straight — it derives each event's search id from its own position in
+  // the array, so there's no separate pre-mapped/id-tagged array to build
+  // or memoize here.
+  const matches = useMemo(
+    () => findMatchingEventIds(displayedEvents, searchQuery),
+    [displayedEvents, searchQuery],
+  );
+
+  // Derived purely for display — no state, so there's no "0/0" flash before
+  // an effect catches up and no risk of the position silently desyncing from
+  // `activeMatchId`/`matches`. `-1` (no match) renders as "0/0" below.
+  const activeMatchPosition = resolveActiveMatchIndex(matches, activeMatchId);
+
+  // A splice/clear of the JSONL-rebuild snapshot swaps `displayedEvents` out
+  // from under the current scope exactly like a tab/task switch does (the
+  // positional ids `matches` holds no longer refer to the same events), so
+  // its identity has to be part of the scope key below. `maxLiveEventIdAtSnapshot`
+  // is set fresh every time a snapshot is (re)captured for a session, so
+  // `sessionId:maxLiveEventIdAtSnapshot` is a stable id for "this particular
+  // rebuild snapshot" — distinct from both "no snapshot" and any prior
+  // snapshot of the same session.
+  const rebuiltScopeKey = rebuilt ? `${rebuilt.sessionId}:${rebuilt.maxLiveEventIdAtSnapshot}` : "";
+
+  // Resolve which match is active whenever the match set changes — either
+  // because the query changed, or because `displayedEvents` shifted under an
+  // open search (new streamed events, a JSONL rebuild splice, or a tab/task
+  // switch). `activeMatchId` is read directly from the render closure rather
+  // than a ref: since this effect's callback is recreated fresh every render
+  // but only *invoked* when `matches` changes, the value captured is exactly
+  // "whatever was active before this recompute" — precisely the `prevActiveId`
+  // `resolveActiveMatchIndex` wants. Deliberately excludes `activeMatchId`
+  // from deps: including it would make the effect re-fire the moment it sets
+  // it, driven by its own write instead of a genuine match-set change (the
+  // `nextId !== activeMatchId` guard would still no-op on that redundant run,
+  // but there's no reason to pay for it).
+  //
+  // A tab/task switch OR a rebuild-snapshot splice reuses this SAME effect
+  // rather than a separate reset: `matches` are positional indices scoped to
+  // `displayedEvents`, so an id that was active before any of those changes
+  // is a coincidence, not a carry-over — `searchScopeRef` detects the change
+  // and forces `prevActiveId` to `null` so the resolution can't accidentally
+  // "keep" an unrelated index that happens to also be a match in the new
+  // scope.
+  const searchScopeRef = useRef<string>(`${task.id}:${activeStream}:${rebuiltScopeKey}`);
+  useEffect(() => {
+    const scopeKey = `${task.id}:${activeStream}:${rebuiltScopeKey}`;
+    const scopeChanged = scopeKey !== searchScopeRef.current;
+    searchScopeRef.current = scopeKey;
+    const prevActiveId = scopeChanged ? null : activeMatchId;
+    const idx = resolveActiveMatchIndex(matches, prevActiveId);
+    const nextId = idx >= 0 ? matches[idx]! : null;
+    if (nextId !== activeMatchId) setActiveMatchId(nextId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matches, task.id, activeStream, rebuilt, rebuiltScopeKey]);
+
+  // Highlight + scroll the active match imperatively rather than through a
+  // React prop/memo dep: `RunEventList`'s `sections` memo used to take
+  // `activeMatchId` as a dep purely so it could stamp a highlight class on
+  // one wrapper div, which meant re-deriving (and re-diffing) the ENTIRE
+  // section tree on every match navigation. Toggling classList directly on
+  // the previous/next `[data-evid]` element is O(1) instead. Runs after the
+  // resolve effect above (and after any tab/task/rebuild-scope switch), so by
+  // the time this fires `activeMatchId` already points at an event rendered
+  // in the CURRENT `displayedEvents`.
+  useEffect(() => {
+    const HIGHLIGHT_CLASSES = ["ring-1", "ring-primary/60", "bg-primary/5", "rounded-md"];
+    const prev = highlightedElRef.current;
+    if (prev) {
+      prev.classList.remove(...HIGHLIGHT_CLASSES);
+      highlightedElRef.current = null;
+    }
+    if (activeMatchId === null) return;
+    const el = logRef.current?.querySelector<HTMLElement>(`[data-evid="${activeMatchId}"]`);
+    if (!el) return;
+    el.classList.add(...HIGHLIGHT_CLASSES);
+    highlightedElRef.current = el;
+    el.scrollIntoView({ block: "center" });
+    // The scrollIntoView above can land the log outside the "near bottom"
+    // band (or an SSE flush landing in the same tick could otherwise yank
+    // the view back to the bottom before the browser paints the scroll) —
+    // clear it immediately so neither auto-scroll path fights the jump.
+    nearBottomRef.current = false;
+  }, [activeMatchId]);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery("");
+    setActiveMatchId(null);
+  }, []);
+
+  const stepSearch = useCallback((dir: 1 | -1) => {
+    setActiveMatchId((cur) => {
+      const idx = matches.indexOf(cur ?? -1);
+      const next = stepMatchIndex(matches.length, idx, dir);
+      return next >= 0 ? matches[next]! : null;
+    });
+  }, [matches]);
+
+  // Cmd/Ctrl+F opens the search bar and focuses its input (or, if the bar is
+  // already open, re-selects the existing query so typing replaces it
+  // outright) while the panel is actually open — not mid-close-animation or
+  // pre-mount, matching the panel's own Escape-to-close listener's `if
+  // (!open) return;` gate. Guarded the same way that listener guards against
+  // a higher-priority dismissable layer (modal dialog / open search-select
+  // popover) so it doesn't hijack the browser/OS's own find behavior — or a
+  // dialog's own input — while one of those is up. Also bails when focus is
+  // inside a terminal pane (`.xterm` — see TerminalView.tsx, which mounts
+  // xterm.js's own container carrying that class): Cmd/Ctrl+F there should
+  // reach the shell/program running in the PTY, not this panel's search.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() !== "f" || e.altKey) return;
+      const wantsFind = IS_MAC_PLATFORM ? (e.metaKey && !e.ctrlKey) : e.ctrlKey;
+      if (!wantsFind) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      if ((e.target as Element | null)?.closest?.(".xterm")) return;
+      e.preventDefault();
+      if (searchOpen) {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+        return;
+      }
+      setSearchOpen(true);
+      // The input isn't mounted yet on the render this triggers (the bar
+      // renders conditionally on `searchOpen`) — focus after the next paint.
+      requestAnimationFrame(() => {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      });
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, searchOpen]);
+
+  // Escape closes the search bar regardless of where focus currently is
+  // within the panel (not just while the input itself is focused) — matching
+  // "Escape peels one layer at a time" from the panel's own listener. Gated
+  // on `searchOpen` so it's only attached while there's something to close,
+  // and bails on the same higher-priority dismissable layer (modal dialog /
+  // open search-select popover) as every other document-level listener here
+  // so Escape closes the topmost layer first instead of skipping straight to
+  // the search bar underneath it.
+  useEffect(() => {
+    if (!searchOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      e.preventDefault();
+      closeSearch();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [searchOpen, closeSearch]);
 
   /** Indicator mode for the bottom-pinned heartbeat. A follow-up sent while
    *  the agent is working is folded into the active run (the backend pastes it
@@ -1484,11 +2041,81 @@ function RunPanelBody({
               <ArchiveRestore className="mr-1 size-3" /> Unarchive
             </Button>
           )}
+          <Button
+            size="icon"
+            variant="ghost"
+            title="Search messages"
+            onClick={() => {
+              if (searchOpen) {
+                closeSearch();
+                return;
+              }
+              setSearchOpen(true);
+              // The input isn't mounted yet on the render this triggers (the
+              // bar renders conditionally on `searchOpen`) — focus after the
+              // next paint.
+              requestAnimationFrame(() => searchInputRef.current?.focus());
+            }}
+          >
+            <Search className="size-4" />
+          </Button>
           <Button size="icon" variant="ghost" onClick={onClose}>
             <X className="size-4" />
           </Button>
         </div>
       </header>
+
+      {searchOpen && (
+        <div data-search-open="" className="flex items-center gap-2 border-b border-border/60 px-3 py-2">
+          <div className="relative flex-1">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
+            <Input
+              ref={searchInputRef}
+              aria-label="Search messages"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  stepSearch(e.shiftKey ? -1 : 1);
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  closeSearch();
+                }
+              }}
+              placeholder="Search messages…"
+              className="h-8 pl-8 text-xs"
+            />
+          </div>
+          <span aria-live="polite" className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+            {matches.length === 0 ? "0/0" : `${activeMatchPosition + 1}/${matches.length}`}
+          </span>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-7"
+            disabled={matches.length === 0}
+            title="Previous match"
+            onClick={() => stepSearch(-1)}
+          >
+            <ChevronUp className="size-3.5" />
+          </Button>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-7"
+            disabled={matches.length === 0}
+            title="Next match"
+            onClick={() => stepSearch(1)}
+          >
+            <ChevronDown className="size-3.5" />
+          </Button>
+          <Button size="icon" variant="ghost" className="size-7" title="Close search" onClick={closeSearch}>
+            <X className="size-3.5" />
+          </Button>
+        </div>
+      )}
 
       <FileMentions task={task} events={events} />
 
@@ -1551,6 +2178,28 @@ function RunPanelBody({
         className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed"
       >
         <div ref={logContentRef}>
+          {/* "Load earlier messages" — only meaningful once we have a real DB
+              cursor to page from (see StreamEvent's `dbId` doc comment for why
+              `earliestId` can go null). Sits above everything else in the
+              scrollback, including the rebuild-from-JSONL row below. Lives
+              inside the `logContentRef` wrapper so its appearance/removal is
+              a content-size change the ResizeObserver pin effect can see —
+              though a pin never actually fires from it: the button is only
+              reachable at the top of the scrollback (nearBottomRef false),
+              and clicking it arms the pointerdown suppression window anyway. */}
+          {hasMoreEarlier && earliestId != null && (
+            <div className="mb-2 flex justify-center">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={loadEarlierEvents}
+                disabled={loadingEarlier}
+                className="h-6 px-2 text-[10px] uppercase tracking-wide text-muted-foreground"
+              >
+                {loadingEarlier ? "Loading…" : "Load earlier messages"}
+              </Button>
+            </div>
+          )}
           {runs.length === 0 ? (
             <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
           ) : displayedEvents.length === 0 ? (
@@ -2520,34 +3169,75 @@ function RunEventList({
   // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`)
   // are tracked explicitly.
   const sections = useMemo(() => {
-    const renderEvent = (e: RunEvent, key: string): React.ReactNode[] => {
+    // Wrap a rendered block in the `data-evid` carrier the search bar scrolls
+    // to and imperatively highlights (`logRef.current?.querySelector('[data-
+    // evid="…"]')` in RunPanelBody — see the highlight effect there). `evid`
+    // is `i` from the loop below — the position of this event within
+    // `normalised` (and so within `events`/`displayedEvents`), which is
+    // exactly the id scheme `event-search.ts` uses. The wrapper carries the
+    // key so the memoized block components underneath keep their
+    // identity/props untouched. Only STATIC classes belong here — the
+    // highlight ring itself is toggled by the DOM effect in RunPanelBody, not
+    // by a render-time class, so this memo doesn't need `activeMatchId` as a
+    // dep (re-deriving the whole section tree on every match navigation was
+    // the point being fixed). `extraClassName` lets a specific stream (only
+    // `user`, below) opt into a class that has to live on THIS wrapper rather
+    // than on the block's own root — sticky positioning needs to be applied
+    // to the element that's actually the flex child of the scroll container.
+    // Returns `null` (no wrapper at all) when `node` is nullish, so an event
+    // with nothing to render (e.g. an unparseable orphan tool_result — see
+    // the `tool_result` case below) doesn't still leave a phantom empty div
+    // consuming a `gap-4` slot in the section's flex column.
+    const wrap = (
+      key: string,
+      evid: number,
+      node: React.ReactNode,
+      extraClassName?: string,
+    ): React.ReactNode => {
+      if (node === null || node === undefined) return null;
+      return (
+        <div key={key} data-evid={evid} className={extraClassName}>
+          {node}
+        </div>
+      );
+    };
+    const renderEvent = (e: RunEvent, key: string, evid: number): React.ReactNode[] => {
       switch (e.stream) {
         case "user":
-          return [<UserMessageBlock key={key} text={e.data} />];
+          // Sticky positioning lives on this wrapper, not on
+          // `UserMessageBlock`'s own root — the wrapper is the actual flex
+          // child of the scroll container (`sections.map` below renders one
+          // `<section>` per user-message group), so THIS is the element that
+          // has to pin to `top-0` for the sticky header to work at all.
+          return [wrap(key, evid, <UserMessageBlock text={e.data} />, "sticky top-0 z-10")];
         case "assistant":
-          return [<AssistantBlock key={key} text={e.data} />];
+          return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
-          return [<ThinkingBlock key={key} text={e.data} />];
+          return [wrap(key, evid, <ThinkingBlock text={e.data} />)];
         case "tool_use": {
           const parsed = safeParse<ParsedToolUse>(e.data);
-          if (!parsed) return [<RawText key={key} text={e.data} muted />];
+          if (!parsed) return [wrap(key, evid, <RawText text={e.data} muted />)];
           const result = resultByToolId.get(parsed.id);
-          return [<ToolUseBlock key={key} call={parsed} result={result} />];
+          return [wrap(key, evid, <ToolUseBlock call={parsed} result={result} />)];
         }
         case "tool_result": {
           const parsed = safeParse<ParsedToolResult>(e.data);
-          if (parsed && parsed.toolUseId && resultByToolId.get(parsed.toolUseId)) return [];
-          return [<ToolResultBlock key={key} result={parsed} />];
+          // Unparseable JSON — `ToolResultBlock` would render nothing for it
+          // anyway (its `!result` guard), so skip the wrapper entirely rather
+          // than emitting an empty `data-evid` div.
+          if (!parsed) return [];
+          if (parsed.toolUseId && resultByToolId.get(parsed.toolUseId)) return [];
+          return [wrap(key, evid, <ToolResultBlock result={parsed} />)];
         }
         case "status":
-          return [<StatusDivider key={key} text={e.data} />];
+          return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
-          return [<ErrorBlock key={key} text={e.data} />];
+          return [wrap(key, evid, <ErrorBlock text={e.data} />)];
         case "stdout":
         case "interaction":
         default:
           if (e.stream === "interaction") return [];
-          return [<RawText key={key} text={e.data} />];
+          return [wrap(key, evid, <RawText text={e.data} />)];
       }
     };
     const renderInteraction = (it: PendingInteraction) => {
@@ -2571,10 +3261,10 @@ function RunEventList({
       const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
       if (e.stream === "user") {
         if (current.header !== null || current.body.length > 0) out.push(current);
-        current = { key, header: renderEvent(e, key)[0] ?? null, body: [...before] };
+        current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
       } else {
         if (current.key === "") current.key = key;
-        current.body.push(...before, ...renderEvent(e, key));
+        current.body.push(...before, ...renderEvent(e, key, i));
       }
     }
     const tail = (interactionByIndex.get(normalised.length) ?? []).map(renderInteraction);
@@ -2826,7 +3516,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
   );
 
   return (
-    <div className="sticky top-0 z-10 flex justify-end">
+    <div className="flex justify-end">
       <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card/50 px-3 py-1.5 text-foreground shadow-sm backdrop-blur-md">
         {parsed?.kind === "command-output" ? (
           <>
