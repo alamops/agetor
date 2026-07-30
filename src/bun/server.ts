@@ -3325,10 +3325,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       //
       // `hasUpstream`/`remoteSynced` additionally drive the "Open PR" chip —
       // computed via `remoteSyncState` (local tracking-ref check, no
-      // network). `remoteSynced` uses its own upstream-only ahead count, not
-      // the `ahead` field above (which falls back to `baseRef` comparisons
-      // for branches with no upstream yet) — the two fields answer different
-      // questions and must not be conflated.
+      // network). When an upstream exists, its ahead count IS the push-ahead
+      // count (`rev-list @{u}..HEAD` — the same first tier `getAheadCount`
+      // would run), so `ahead` reuses it and `getAheadCount` only runs as
+      // the fallback for branches with no upstream yet (or a failed count),
+      // where it degrades through `baseRef` comparisons. This route is
+      // polled every 5s per open panel — don't add git spawns here that
+      // recompute what a sibling call already knows.
       "/tasks/:id/git-status": {
         GET: authed(async (req) => {
           const t = tasks.get(req.params.id);
@@ -3336,9 +3339,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const dir = t.worktreePath ?? t.workdir;
-          const [result, aheadResult, syncState] = await Promise.all([
+          const [result, syncState] = await Promise.all([
             hasUncommittedChanges(dir),
-            getAheadCount(dir, t.baseRef ?? null),
             remoteSyncState(dir),
           ]);
           if (result === null) {
@@ -3347,10 +3349,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { headers: corsHeaders(req) },
             );
           }
+          const ahead = syncState.hasUpstream && syncState.ahead !== null
+            ? syncState.ahead
+            : (await getAheadCount(dir, t.baseRef ?? null)) ?? 0;
           return json(
             {
               hasChanges: result,
-              ahead: aheadResult ?? 0,
+              ahead,
               ignored: false,
               hasUpstream: syncState.hasUpstream,
               remoteSynced: syncState.hasUpstream && syncState.ahead === 0,
