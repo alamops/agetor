@@ -283,6 +283,10 @@ function RunPanelBody({
    *  hidden while one is active. */
   const [activeStream, setActiveStream] = useState<string>("main");
   const logRef = useRef<HTMLDivElement>(null);
+  // Wraps the log's conditional content (empty states + the event list) so a
+  // ResizeObserver can watch content height growth independent of the scroll
+  // container's own box — see the pin-to-bottom effects below.
+  const logContentRef = useRef<HTMLDivElement>(null);
   // Tracks whether the log was scrolled near the bottom at the last user
   // interaction. Auto-scroll-to-bottom on new events only fires when this is
   // true, so a user who scrolls up to read history isn't yanked back down on
@@ -530,12 +534,26 @@ function RunPanelBody({
   // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
   // a user who scrolled up to read history is never yanked back down:
   //   1. On every event / rebuild / interaction change, scroll once after
-  //      the React commit. Handles the steady-state streaming case.
-  //   2. On task switch, additionally loop on rAF for a short window. Events
-  //      stream in over multiple frames and rendered children (markdown,
-  //      code, tool results) keep growing scrollHeight after their initial
-  //      mount, so a single post-commit scroll can leave us short. The loop
-  //      bails the moment the user scrolls (nearBottomRef flips to false).
+  //      the React commit. Handles the steady-state streaming case with no
+  //      one-frame lag while events are actively arriving.
+  //   2. A ResizeObserver on both the scroll container (`logRef`) and the
+  //      content wrapper (`logContentRef`) below. The container's own box
+  //      shrinks when something mounts above it in the flex column —
+  //      `SubagentTabs` or a terminal tab strip resolving from an async
+  //      list fetch — which otherwise leaves the log short with no event to
+  //      hook. The content wrapper's height grows asynchronously for
+  //      reasons invisible to path 1's dependency list: replay-buffer
+  //      flushes landing on their own timer, markdown/code block layout
+  //      settling after mount, and a `UserMessageBlock`'s "Show more"
+  //      toggle appearing once it measures itself. Observing both, rather
+  //      than enumerating every async cause as a dependency, makes the pin
+  //      self-healing against future async widgets. Assigning `scrollTop`
+  //      does not change either observed element's size, so the pin can't
+  //      feed back into its own observer; the resulting scroll event just
+  //      re-confirms `nearBottomRef` as true. Mount-scoped (`[]`) is
+  //      correct — `RunPanelBody` doesn't remount on task switch, so both
+  //      refs stay attached to the same DOM nodes across tasks and a fresh
+  //      `observe()` isn't needed per task.
   useEffect(() => {
     if (!nearBottomRef.current) return;
     const el = logRef.current;
@@ -543,17 +561,17 @@ function RunPanelBody({
   }, [events, rebuilt, interactions.length, activeStream]);
 
   useEffect(() => {
-    let cancelled = false;
-    const deadline = performance.now() + 600;
-    const pin = () => {
-      if (cancelled || !nearBottomRef.current) return;
-      const el = logRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-      if (performance.now() < deadline) requestAnimationFrame(pin);
-    };
-    requestAnimationFrame(pin);
-    return () => { cancelled = true; };
-  }, [task.id]);
+    const el = logRef.current;
+    const content = logContentRef.current;
+    if (!el || !content) return;
+    const ro = new ResizeObserver(() => {
+      if (!nearBottomRef.current) return;
+      el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(el);      // viewport shrink: SubagentTabs / terminals mounting above
+    ro.observe(content); // content growth: replay flushes, markdown, "Show more" toggles
+    return () => ro.disconnect();
+  }, []);
 
   // Auto-rebuild from the latest run's on-disk JSONL when the run is
   // finished and has a claude session id. The persisted `run_events`
@@ -1470,41 +1488,43 @@ function RunPanelBody({
         // problematic spots instead.
         className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed"
       >
-        {runs.length === 0 ? (
-          <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
-        ) : displayedEvents.length === 0 ? (
-          <div className="text-muted-foreground">Waiting for the first event…</div>
-        ) : (
-          <>
-            <div className="mb-2 flex items-center justify-between gap-2">
-              {activeStream === "main" && latestRun?.claudeSessionId ? (
-                <button
-                  type="button"
-                  onClick={() => void rebuildFromJsonl()}
-                  disabled={rebuildBusy}
-                  className="rounded-md border border-border/60 bg-card px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground hover:bg-accent/40 disabled:opacity-50"
-                  title="Re-parse the latest run's events from claude's on-disk session JSONL. Useful when the stored events were truncated by an older agetor version."
-                >
-                  {rebuildBusy
-                    ? "Reloading…"
-                    : rebuilt
-                      ? `Reload from JSONL (${rebuilt.events.length} events)`
-                      : "Load from session JSONL"}
-                </button>
-              ) : <span />}
-              {rebuildNote && (
-                <span className="text-[10px] text-muted-foreground">{rebuildNote}</span>
-              )}
-            </div>
-            <RunEventList
-              events={displayedEvents}
-              interactions={interactions}
-              onInteractionResolved={dismissInteraction}
-              runStatus={activeRunStatus}
-              indicatorMode={indicatorMode}
-            />
-          </>
-        )}
+        <div ref={logContentRef}>
+          {runs.length === 0 ? (
+            <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
+          ) : displayedEvents.length === 0 ? (
+            <div className="text-muted-foreground">Waiting for the first event…</div>
+          ) : (
+            <>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                {activeStream === "main" && latestRun?.claudeSessionId ? (
+                  <button
+                    type="button"
+                    onClick={() => void rebuildFromJsonl()}
+                    disabled={rebuildBusy}
+                    className="rounded-md border border-border/60 bg-card px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground hover:bg-accent/40 disabled:opacity-50"
+                    title="Re-parse the latest run's events from claude's on-disk session JSONL. Useful when the stored events were truncated by an older agetor version."
+                  >
+                    {rebuildBusy
+                      ? "Reloading…"
+                      : rebuilt
+                        ? `Reload from JSONL (${rebuilt.events.length} events)`
+                        : "Load from session JSONL"}
+                  </button>
+                ) : <span />}
+                {rebuildNote && (
+                  <span className="text-[10px] text-muted-foreground">{rebuildNote}</span>
+                )}
+              </div>
+              <RunEventList
+                events={displayedEvents}
+                interactions={interactions}
+                onInteractionResolved={dismissInteraction}
+                runStatus={activeRunStatus}
+                indicatorMode={indicatorMode}
+              />
+            </>
+          )}
+        </div>
       </div>
 
       {/* Messages backlog — saved drafts to send later. Sits just above the
