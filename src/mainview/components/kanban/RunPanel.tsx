@@ -102,6 +102,13 @@ const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" 
 
 export const EXIT_DURATION_MS = 250;
 
+// Distance-from-bottom (px) below which the log counts as "near bottom" for
+// auto-scroll purposes. Shared by the onScroll handler and the ResizeObserver
+// pin effect below — the two heuristics must not drift apart, or a user
+// parked just past one threshold but within the other would see the pin
+// fire inconsistently depending on which path last updated `nearBottomRef`.
+const NEAR_BOTTOM_PX = 80;
+
 function formatDuration(r: Run): string {
   const end = r.endedAt ?? Date.now();
   const ms = end - r.startedAt;
@@ -292,6 +299,19 @@ function RunPanelBody({
   // true, so a user who scrolls up to read history isn't yanked back down on
   // every streamed chunk.
   const nearBottomRef = useRef(true);
+  // Timestamp (performance.now()) until which the ResizeObserver pin effect
+  // below must not force-scroll. Armed on every pointerdown inside the log
+  // (capture phase, see `onPointerDownCapture` on the scroll container) so a
+  // user expanding/collapsing an `ExpandableBlock`, a `UserMessageBlock`, or
+  // any other in-log toggle isn't yanked back to the bottom mid-interaction.
+  // Every user-initiated content-size change starts with a pointerdown
+  // inside the log; async growth (replay-buffer flushes, markdown settling,
+  // a tab strip mounting) never does — so this single timestamp is enough
+  // to distinguish the two without threading a suppression ref through every
+  // collapsible in the tree. A pin skipped because unrelated async content
+  // happened to land inside the window is recovered on the next growth event
+  // or by the post-commit pin effect (path 1 below).
+  const pinSuppressUntilRef = useRef(0);
   // Monotonic id source for `StreamEvent.id`, incremented once per event as
   // it's accepted into the unified stream (see the SSE subscription effect
   // below). Assigning synchronously at push time — rather than deriving from
@@ -534,8 +554,12 @@ function RunPanelBody({
   // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
   // a user who scrolled up to read history is never yanked back down:
   //   1. On every event / rebuild / interaction change, scroll once after
-  //      the React commit. Handles the steady-state streaming case with no
-  //      one-frame lag while events are actively arriving.
+  //      the React commit. This is the cheap backstop: it only fires on
+  //      the dependencies listed below, so it covers commits that change
+  //      content without changing either box the ResizeObserver watches,
+  //      and it also recovers any pin that path 2 skipped under the
+  //      suppression window (see below) once the next real growth or a
+  //      dependency change comes through.
   //   2. A ResizeObserver on both the scroll container (`logRef`) and the
   //      content wrapper (`logContentRef`) below. The container's own box
   //      shrinks when something mounts above it in the flex column —
@@ -547,13 +571,33 @@ function RunPanelBody({
   //      settling after mount, and a `UserMessageBlock`'s "Show more"
   //      toggle appearing once it measures itself. Observing both, rather
   //      than enumerating every async cause as a dependency, makes the pin
-  //      self-healing against future async widgets. Assigning `scrollTop`
-  //      does not change either observed element's size, so the pin can't
-  //      feed back into its own observer; the resulting scroll event just
-  //      re-confirms `nearBottomRef` as true. Mount-scoped (`[]`) is
-  //      correct — `RunPanelBody` doesn't remount on task switch, so both
-  //      refs stay attached to the same DOM nodes across tasks and a fresh
-  //      `observe()` isn't needed per task.
+  //      self-healing against future async widgets, and this is the
+  //      lower-latency path of the two: ResizeObserver callbacks are
+  //      delivered pre-paint in the same rendering opportunity as the
+  //      resize, ahead of path 1's passive effect (which only flushes after
+  //      paint). Assigning `scrollTop` does not change either observed
+  //      element's size, so the pin can't feed back into its own observer;
+  //      the resulting scroll event just re-confirms `nearBottomRef` as
+  //      true. Mount-scoped (`[]`) is correct — `RunPanelBody` doesn't
+  //      remount on task switch, so both refs stay attached to the same DOM
+  //      nodes across tasks and a fresh `observe()` isn't needed per task.
+  //
+  //      Two additional guards keep path 2 from hijacking a user-initiated
+  //      resize (e.g. expanding/collapsing a "Show more" toggle while
+  //      parked near the bottom):
+  //        - `pinSuppressUntilRef`, armed for a short window by any
+  //          pointerdown inside the log (see `onPointerDownCapture` below),
+  //          skips the pin entirely so it doesn't fight a deliberate toggle
+  //          or the `pendingAdjustRef` scroll compensation in
+  //          `UserMessageBlock`.
+  //        - `prevDist`, the distance-from-bottom computed from box sizes
+  //          tracked across deliveries, re-checks bottom-proximity against
+  //          the pre-resize layout rather than trusting `nearBottomRef`
+  //          alone — that ref is latched by scroll events, which WebKit can
+  //          throttle during momentum scrolling, so it can still read stale
+  //          `true` mid-fling. `el.scrollTop` read synchronously is always
+  //          current even when scroll events lag, so the pre-resize
+  //          distance is trustworthy where the latched ref may not be.
   useEffect(() => {
     if (!nearBottomRef.current) return;
     const el = logRef.current;
@@ -564,8 +608,18 @@ function RunPanelBody({
     const el = logRef.current;
     const content = logContentRef.current;
     if (!el || !content) return;
+    let lastScrollHeight = el.scrollHeight;
+    let lastClientHeight = el.clientHeight;
     const ro = new ResizeObserver(() => {
+      const prevDist = lastScrollHeight - el.scrollTop - lastClientHeight;
+      // Update tracked sizes from the current element before any early
+      // return, so the next delivery's `prevDist` stays correct even on a
+      // delivery that itself skips the pin (suppressed, or not near bottom).
+      lastScrollHeight = el.scrollHeight;
+      lastClientHeight = el.clientHeight;
+      if (performance.now() < pinSuppressUntilRef.current) return;
       if (!nearBottomRef.current) return;
+      if (prevDist >= NEAR_BOTTOM_PX) return;
       el.scrollTop = el.scrollHeight;
     });
     ro.observe(el);      // viewport shrink: SubagentTabs / terminals mounting above
@@ -1479,7 +1533,15 @@ function RunPanelBody({
         ref={logRef}
         onScroll={(e) => {
           const el = e.currentTarget;
-          nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+        }}
+        // Capture-phase so it fires before any in-log click handler (a
+        // collapsible's "Show more" toggle, a card's own setOpen, etc.).
+        // Arms `pinSuppressUntilRef` for a short window so the ResizeObserver
+        // pin effect doesn't hijack the resize that toggle causes — see the
+        // comment above that effect for the full rationale.
+        onPointerDownCapture={() => {
+          pinSuppressUntilRef.current = performance.now() + 400;
         }}
         // `min-w-0` lets the inner content actually shrink when long
         // unbreakable strings (paths, URLs) try to exceed the panel
