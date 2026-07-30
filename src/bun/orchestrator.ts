@@ -11,6 +11,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
+  IDLE_SESSION_REAP_MS,
   MODEL_EFFORT_SUPPORT,
   SESSION_DIED_STATUS_PREFIX,
   TASK_TYPES,
@@ -34,6 +35,7 @@ function resolveHarness(harnessId: string): Harness | null {
 }
 import {
   cancelPendingForTask,
+  countPendingForTask,
   setBroadcaster,
   setResolvedBroadcaster,
   type AnyRequest,
@@ -54,8 +56,10 @@ import {
   hasSessionState,
   sessionExists,
   sessionExistsByName,
+  sessionIdleInfo,
   sessionLiveness,
   sessionNameFor,
+  probeSessionActivity,
   jsonlPathFor,
   interruptTaskSession,
   setContinuationRunFactory,
@@ -145,6 +149,14 @@ interface ActiveRun {
   unknownCommand: boolean;
 }
 const active = new Map<string, ActiveRun>(); // runId -> handle
+
+// Guards `reapIdleSessions` against overlapping sweeps — the boot one-shot
+// and the recurring `setInterval` in index.ts could otherwise both be
+// in-flight if a sweep ever ran long (many candidate tasks, a slow tmux
+// probe). A simple boolean is enough: sweeps are infrequent (every
+// `SESSION_REAP_SWEEP_MS`) and idempotent, so skipping one entirely when
+// another is still running just means its candidates get picked up next tick.
+let reapInFlight = false;
 
 // Archive/delete teardown (tmux session kill, terminal teardown, worktree
 // detach/remove) is deferred onto a per-source-workdir FIFO queue so
@@ -326,12 +338,21 @@ function updateColumn(
  * `active` map) so the answer survives a restart and doesn't depend on
  * whether the subagent's settle fired before or after the run's completion
  * landed — either interleaving reads the same committed rows.
+ *
+ * Split into a pure `(task) => boolean` predicate plus a taskId-keyed
+ * wrapper so callers that already hold a freshly-fetched `Task` row (e.g.
+ * `reapIdleSessions`'s per-candidate guard) can reuse it without a second,
+ * redundant `tasks.get`.
  */
+function isTaskHeldByBackgroundAgents(task: Task): boolean {
+  if (task.column !== "running" || task.runId == null) return false;
+  if (runs.get(task.runId)?.status !== "succeeded") return false;
+  return subagents.hasRunning(task.id);
+}
+
 function isHeldByBackgroundAgents(taskId: string): boolean {
   const task = tasks.get(taskId);
-  if (!task || task.column !== "running" || task.runId == null) return false;
-  if (runs.get(task.runId)?.status !== "succeeded") return false;
-  return subagents.hasRunning(taskId);
+  return task ? isTaskHeldByBackgroundAgents(task) : false;
 }
 
 /**
@@ -2262,6 +2283,145 @@ export function sweepArchivedTeardowns(): number {
     enqueued++;
   }
   return enqueued;
+}
+
+/**
+ * Idle-session reaper (T4, `docs/plans/reduce-cpu-and-memory.md` §3.1). Kills
+ * the tmux session backing a claude-code task's REPL once it's sat idle —
+ * no turn in flight, nothing waiting on the user, no session activity — for
+ * `IDLE_SESSION_REAP_MS` (30min), reclaiming the ~300–500MB "node" process
+ * and every per-session timer (`disposeSessionState`, invoked via
+ * `dropSession`). A follow-up sent afterward still works: `sendClaudeTurn`
+ * falls back to `spawnResumedSession` (`claude --resume <id>`) whenever
+ * `hasSessionState` is false, so this is invisible to the user beyond a
+ * slightly slower first reply.
+ *
+ * Candidates come ONLY from this instance's own DB — this must never
+ * enumerate-and-kill tmux sessions (the shared-socket rule documented on
+ * `reconcileOrphans` above applies here identically: a blind sweep would
+ * reap a sibling agetor instance's or a `bun test` run's sessions). Probing
+ * a specific candidate task id we already own (`probeSessionActivity`,
+ * `sessionIdleInfo`) is fine — that's a keyed lookup, not a sweep. Codex is
+ * never a candidate: its sessions are one-shot per turn and self-dispose
+ * (`codex-tmux.ts`), so there's nothing to reap.
+ *
+ * Two performance properties keep a sweep from becoming a synchronous burst
+ * that stalls the main process for the duration of the scan (previously: N
+ * non-archived claude tasks × ~5 DB queries + a blocking tmux probe each, all
+ * in one event-loop turn):
+ *  - **Cheap pre-filter.** `candidateIds` is derived entirely from the rows
+ *    `tasks.list()` already fetched (no per-candidate `tasks.get` yet) and
+ *    excludes any task that plainly can't own a session: archived, non-claude,
+ *    or — the key trim — neither holding in-memory `SessionState` nor ever
+ *    having started a run (`hasSessionState(t.id) || t.runId != null`). A
+ *    never-started task fails both and drops out before it costs anything
+ *    more than an array filter.
+ *  - **Per-candidate yield.** `await Bun.sleep(0)` at the top of every loop
+ *    iteration hands control back to the event loop between candidates, so
+ *    HTTP requests, SSE pushes, and session tailers keep running throughout a
+ *    sweep instead of queuing up behind it. This is what makes the pre-kill
+ *    re-check below load-bearing rather than defensive-only: with real
+ *    yields between iterations, a message that lands mid-sweep (starts a
+ *    turn, opens a pending interaction) MUST be caught by a guard re-read
+ *    immediately before the kill, not just the one the loop started with.
+ *
+ * Every guard is re-checked against a freshly-read task row immediately
+ * before the kill, not from the snapshot the loop started with. Guard work
+ * itself is hoisted to avoid redundant reads: `isReapable` takes the already
+ * -fetched `Task` row and calls the pure `isTaskHeldByBackgroundAgents(task)`
+ * predicate directly rather than the taskId-keyed `isHeldByBackgroundAgents`
+ * wrapper, which would otherwise re-fetch the same row internally.
+ *
+ * Called once ~30s after boot (letting boot reattach settle first) and then
+ * on a `SESSION_REAP_SWEEP_MS` interval from `src/bun/index.ts` and
+ * `src/bun/headless.ts`.
+ */
+export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
+  if (reapInFlight) return { reaped: [] };
+  reapInFlight = true;
+  try {
+    const reaped: string[] = [];
+    const candidateIds = tasks
+      .list()
+      .filter(
+        (t) =>
+          t.archivedAt == null
+          && resolveHarness(t.agent)?.kind === "claude-code"
+          && (hasSessionState(t.id) || t.runId != null),
+      )
+      .map((t) => t.id);
+
+    const isReapable = (task: Task): boolean => {
+      if (task.runId && active.has(task.runId)) return false;
+      if (isTaskHeldByBackgroundAgents(task)) return false;
+      if (countPendingForTask(task.id) > 0) return false;
+      return true;
+    };
+
+    for (const taskId of candidateIds) {
+      // Yield between candidates — see the perf-properties doc above. Safe
+      // because every guard is re-checked against a fresh row immediately
+      // before the kill below.
+      await Bun.sleep(0);
+
+      const task = tasks.get(taskId);
+      if (!task || !isReapable(task)) continue;
+
+      const idleInfo = sessionIdleInfo(taskId);
+      let idleLongEnough: boolean;
+      if (idleInfo) {
+        idleLongEnough = idleInfo.idleMs >= IDLE_SESSION_REAP_MS;
+      } else {
+        // No in-memory SessionState — e.g. a done/review task whose session
+        // survived a restart (boot reconciliation only reattaches `running`
+        // rows). Probe tmux directly for the session's own activity clock
+        // (`#{session_activity}`) instead of the previous `task.updatedAt`
+        // heuristic, which could read stale on a task nobody touched through
+        // agetor but that's still being used interactively in its terminal.
+        // `null` means the session is already gone (or unreachable) — nothing
+        // to reap. `attached === true` means a human has the pane open right
+        // now — never reap that regardless of how long it's been idle by the
+        // clock. Otherwise require BOTH tmux's activity clock AND the task
+        // row's `updatedAt` past the threshold before reaping a session we
+        // have no in-memory visibility into — the extra-conservative choice
+        // called out in the review: a session could be driven by something
+        // other than agetor (a human at the tmux client) bumping tmux's
+        // activity clock without ever updating our DB row, or vice versa.
+        const activity = probeSessionActivity(taskId);
+        if (!activity) continue;
+        if (activity.attached) continue;
+        idleLongEnough =
+          Date.now() - activity.activityAt >= IDLE_SESSION_REAP_MS
+          && Date.now() - task.updatedAt >= IDLE_SESSION_REAP_MS;
+      }
+      if (!idleLongEnough) continue;
+
+      // Re-check immediately before the kill against a fresh row — closes
+      // the window between the idle check above (which may itself have
+      // awaited a yield or a tmux probe) and the kill below.
+      const fresh = tasks.get(taskId);
+      if (!fresh || !isReapable(fresh)) continue;
+
+      dropSession(taskId);
+      reaped.push(taskId);
+
+      const recent = runs.listForTask(taskId)[0];
+      if (recent) {
+        const data = findLastClaudeSessionId(taskId)
+          ? "session hibernated after 30m idle — next message will resume it"
+          : "session hibernated after 30m idle — no saved session id, next message starts a fresh context";
+        runs.appendEvent(recent.id, "status", data);
+        emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+      }
+    }
+
+    if (reaped.length > 0) {
+      console.log(`[agetor] reaped ${reaped.length} idle claude session(s)`);
+    }
+    return { reaped };
+  } finally {
+    reapInFlight = false;
+  }
 }
 
 /**

@@ -70,6 +70,7 @@ import type {
   Subagent,
   Task,
   TaskDiff,
+  TaskEventsReplayMeta,
   TaskReference,
   TaskType,
   TerminalTab,
@@ -78,6 +79,7 @@ import type {
   WorktreeInfo,
   WorktreeTeardownResult,
 } from "../../shared/types.ts";
+import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
 import { fetchWithRecovery } from "./net-retry.ts";
 
 export interface UpdateSnapshot {
@@ -296,6 +298,18 @@ async function j<T>(
 }
 
 export interface AppDefaults { home: string; cwd: string; dataDir: string }
+
+/** One page of older task events, as returned by `GET /tasks/:id/events/page`
+ *  (the "Load earlier" backward-paging cursor). Ascending order (oldest
+ *  first), same shape as the SSE stream's events plus `id` — the real
+ *  `run_events` row id, which the SSE stream never carries (see
+ *  `TaskEventsReplayMeta`) but this paging route does, since it's exactly
+ *  what the next `beforeId` needs. */
+export interface TaskEventsPage {
+  events: (RunEvent & { id: number })[];
+  earliestId: number | null;
+  hasMore: boolean;
+}
 
 export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
 export interface HarnessInput {
@@ -1110,6 +1124,16 @@ export const api = {
   terminalSocketUrl: (id: string) =>
     `ws://127.0.0.1:${API_PORT}/terminals/${encodeURIComponent(id)}/ws?token=${encodeURIComponent(API_TOKEN)}`,
   listRuns: (taskId: string) => j<Run[]>(`/tasks/${taskId}/runs`),
+  /** Backward page of a task's persisted events, older than `beforeId`
+   *  (exclusive) — drives the run panel's "Load earlier" affordance once the
+   *  bounded SSE replay window (`EVENTS_REPLAY_LIMIT`) has been exhausted.
+   *  `beforeId` is required by the route; `limit` defaults server-side to
+   *  `EVENTS_REPLAY_LIMIT` when omitted. */
+  fetchTaskEventsPage: (taskId: string, beforeId: number, limit?: number) => {
+    const q = new URLSearchParams({ beforeId: String(beforeId) });
+    if (limit) q.set("limit", String(limit));
+    return j<TaskEventsPage>(`/tasks/${taskId}/events/page?${q.toString()}`);
+  },
   /** Background/sub agents tracked for a task — drives the run panel's
    *  read-only per-subagent tab strip. Polled like `listRuns`; live deltas
    *  also arrive on the task SSE as `stream: "subagent"` events. */
@@ -1240,10 +1264,17 @@ export const api = {
    *  structured-event refactor (the legacy mapper truncated tool inputs
    *  at 500 chars, so the in-DB copy is missing the tail bytes). Returns
    *  an empty list + `reason` when the JSONL is gone or the run had no
-   *  claude session id (e.g. codex runs). */
-  rebuildRunEvents: (runId: string) =>
-    j<{ events: RunEvent[]; source?: string; reason?: string }>(
-      `/runs/${runId}/rebuild-events`,
+   *  claude session id (e.g. codex runs).
+   *
+   *  `limit`, when passed, bounds the rebuild to the most recent `limit`
+   *  mapped events (ascending) and the response carries `hasMore` — so an
+   *  automatic/background rebuild doesn't silently replace the panel's
+   *  bounded live window with an unbounded full-history dump. Omitted
+   *  (the manual "Rebuild from session JSONL" button's case), the server
+   *  returns the legacy full array with no `hasMore` field. */
+  rebuildRunEvents: (runId: string, limit?: number) =>
+    j<{ events: RunEvent[]; hasMore?: boolean; source?: string; reason?: string }>(
+      `/runs/${runId}/rebuild-events${limit ? `?limit=${limit}` : ""}`,
     ),
 
   /** Fire a native macOS notification via the Bun process. Fire-and-forget
@@ -1318,9 +1349,28 @@ export const api = {
   },
   /** Unified task-level event stream: every run's events, merged in id
    *  order. Replaces per-run subscriptions for the run panel so the user
-   *  sees the whole conversation as one scrollback. */
-  subscribeTask(taskId: string, onEvent: (e: RunEvent) => void): () => void {
+   *  sees the whole conversation as one scrollback.
+   *
+   *  `onReplayMeta`, when supplied, receives the named `replay_meta` frame the
+   *  server sends as the FIRST frame of every (re)connect — the bounded
+   *  replay window's earliest event id and whether older history exists
+   *  (drives the run panel's "Load earlier" button). It's a *named* SSE
+   *  event (`event: replay_meta`), invisible to `onmessage`, so registering
+   *  the listener only when a caller asks for it costs nothing for callers
+   *  that don't care. */
+  subscribeTask(
+    taskId: string,
+    onEvent: (e: RunEvent) => void,
+    onReplayMeta?: (meta: TaskEventsReplayMeta) => void,
+  ): () => void {
     const es = new EventSource(`${BASE}/tasks/${taskId}/events?token=${encodeURIComponent(API_TOKEN)}`);
+    if (onReplayMeta) {
+      es.addEventListener(TASK_EVENTS_REPLAY_META_EVENT, (m: MessageEvent) => {
+        try {
+          onReplayMeta(JSON.parse(m.data) as TaskEventsReplayMeta);
+        } catch { /* ignore malformed */ }
+      });
+    }
     es.onmessage = (m) => {
       try {
         const parsed = JSON.parse(m.data);
