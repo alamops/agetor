@@ -17,6 +17,15 @@ export const DIFF_SELECTION_HEADING = "Selected lines from the current diff:";
 
 const SELECTABLE_KINDS = new Set<DiffRow["kind"]>(["ctx", "add", "del"]);
 
+/** Whether a diff row's kind participates in selection — click, shift-click
+ *  range extension, and drag-to-select all filter through this. Exported so
+ *  DiffDialog.tsx doesn't keep its own duplicate `SELECTABLE_KINDS` copy
+ *  (that duplication was a drift surface once the component grew more
+ *  consumers of the same set). */
+export function isSelectableKind(kind: DiffRow["kind"]): boolean {
+  return SELECTABLE_KINDS.has(kind);
+}
+
 const KIND_PREFIX: Record<"ctx" | "add" | "del", string> = {
   ctx: " ",
   add: "+",
