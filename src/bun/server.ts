@@ -3129,17 +3129,42 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/archive": {
         POST: authed(async (req) => {
+          // Worktree teardown can now be awaited inline (`awaitTeardown`)
+          // behind a real `git worktree remove`, which — like DELETE
+          // /tasks/:id — can exceed the idle timeout ceiling on large repos.
           server.timeout(req, 0);
-          // Optional body — no body (or a malformed one) means force: false
-          // and stopRun: false, same as the pre-existing behaviour. `force`
+          // Optional body — no body (or a malformed one) means every flag
+          // defaults to false, same as the pre-existing behaviour. `force`
           // bypasses the done-column gate (Worktrees page's delete action);
           // `stopRun` additionally stops an in-flight/held run before
-          // archiving instead of erroring.
-          const body = (await req.json().catch(() => ({}))) as { force?: boolean; stopRun?: boolean };
-          const result = await archiveTask(req.params.id, { force: body.force === true, stopRun: body.stopRun === true });
-          return "error" in result
-            ? json(result, { status: 400, headers: corsHeaders(req) })
-            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+          // archiving instead of erroring; `forceWorktree` discards
+          // uncommitted changes in the checkout instead of leaving a dirty
+          // worktree in place; `awaitTeardown` blocks until the deferred
+          // teardown has actually run and surfaces its outcome.
+          const body = (await req.json().catch(() => ({}))) as {
+            force?: boolean;
+            stopRun?: boolean;
+            forceWorktree?: boolean;
+            awaitTeardown?: boolean;
+          };
+          const result = await archiveTask(req.params.id, {
+            force: body.force === true,
+            stopRun: body.stopRun === true,
+            forceWorktree: body.forceWorktree === true,
+            awaitTeardown: body.awaitTeardown === true,
+          });
+          if ("error" in result) {
+            return json(result, { status: 400, headers: corsHeaders(req) });
+          }
+          // Nest `teardown` as a sibling key rather than spreading its fields
+          // onto the task, so it can never collide with an actual Task
+          // column — the client only reads it when it explicitly asked for
+          // `awaitTeardown`, and it's absent (not `undefined`-valued) on the
+          // ordinary fire-and-forget path.
+          const payload: ReturnType<typeof withRunningSubagents> & { teardown?: typeof result.teardown } =
+            withRunningSubagents(result.task);
+          if (result.teardown) payload.teardown = result.teardown;
+          return json(payload, { headers: corsHeaders(req) });
         }),
       },
 
