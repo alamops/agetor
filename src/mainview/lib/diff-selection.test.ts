@@ -2,9 +2,13 @@ import { expect, test } from "bun:test";
 import type { DiffRow } from "./diff-rows.ts";
 import {
   DIFF_SELECTION_HEADING,
+  addRangeToSelection,
   composeDiffMessage,
   formatDiffSelection,
   groupSelectedRows,
+  isRowInDragRange,
+  selectableIndicesInRange,
+  type DiffDragRange,
   type DiffSelectionBlock,
 } from "./diff-selection.ts";
 
@@ -227,4 +231,127 @@ test("composeDiffMessage joins text and formatted block with a blank line", () =
   const blocks: DiffSelectionBlock[] = [{ path: "f.ts", lines: [{ old: 1, neu: 1, kind: "ctx", text: "hi" }] }];
   const out = composeDiffMessage("look at this", blocks);
   expect(out).toBe(`look at this\n\n${formatDiffSelection(blocks)}`);
+});
+
+// --- selectableIndicesInRange -------------------------------------------
+
+test("selectableIndicesInRange keeps ctx/add/del and skips hunk/meta rows within the range", () => {
+  const r = rows(
+    ["hunk", null, null, "@@ -1,3 +1,3 @@"],
+    ["ctx", 1, 1, "a"],
+    ["del", 2, null, "b"],
+    ["add", null, 2, "c"],
+    ["meta", null, null, "\\ No newline at end of file"],
+    ["ctx", 3, 3, "d"],
+  );
+  expect(selectableIndicesInRange(r, 0, 5)).toEqual([1, 2, 3, 5]);
+});
+
+test("selectableIndicesInRange normalizes reversed bounds (a > b) to the same result", () => {
+  const r = rows(["ctx", 1, 1, "a"], ["del", 2, null, "b"], ["add", null, 2, "c"]);
+  expect(selectableIndicesInRange(r, 2, 0)).toEqual(selectableIndicesInRange(r, 0, 2));
+  expect(selectableIndicesInRange(r, 2, 0)).toEqual([0, 1, 2]);
+});
+
+test("selectableIndicesInRange with a === b returns a single index for a selectable row", () => {
+  const r = rows(["ctx", 1, 1, "a"]);
+  expect(selectableIndicesInRange(r, 0, 0)).toEqual([0]);
+});
+
+test("selectableIndicesInRange with a === b returns [] for a non-selectable row", () => {
+  const r = rows(["hunk", null, null, "@@ -1,1 +1,1 @@"]);
+  expect(selectableIndicesInRange(r, 0, 0)).toEqual([]);
+});
+
+test("selectableIndicesInRange returns [] when the whole range is non-selectable rows", () => {
+  const r = rows(
+    ["hunk", null, null, "@@ -1,2 +1,2 @@"],
+    ["meta", null, null, "\\ No newline at end of file"],
+  );
+  expect(selectableIndicesInRange(r, 0, 1)).toEqual([]);
+});
+
+test("selectableIndicesInRange handles bounds at the array edges", () => {
+  const r = rows(["ctx", 1, 1, "a"], ["del", 2, null, "b"], ["add", null, 2, "c"]);
+  expect(selectableIndicesInRange(r, 0, 2)).toEqual([0, 1, 2]);
+});
+
+test("selectableIndicesInRange skips out-of-range indices past the array end", () => {
+  const r = rows(["ctx", 1, 1, "a"], ["ctx", 2, 2, "b"]);
+  expect(selectableIndicesInRange(r, 0, 5)).toEqual([0, 1]);
+});
+
+// --- addRangeToSelection --------------------------------------------------
+
+test("addRangeToSelection unions into an existing set for the path, preserving pre-selected indices", () => {
+  const r = rows(["ctx", 1, 1, "a"], ["del", 2, null, "b"], ["add", null, 2, "c"]);
+  const selected = new Map([["f.ts", new Set([0])]]);
+  const next = addRangeToSelection(selected, "f.ts", r, 1, 2);
+  expect([...next.get("f.ts")!].sort()).toEqual([0, 1, 2]);
+});
+
+test("addRangeToSelection creates the set when the path is absent", () => {
+  const r = rows(["ctx", 1, 1, "a"], ["del", 2, null, "b"]);
+  const next = addRangeToSelection(new Map(), "f.ts", r, 0, 1);
+  expect([...next.get("f.ts")!].sort()).toEqual([0, 1]);
+});
+
+test("addRangeToSelection does not insert an empty set when the range has zero selectable rows on an absent path", () => {
+  const r = rows(["hunk", null, null, "@@ -1,1 +1,1 @@"], ["meta", null, null, "\\ No newline at end of file"]);
+  const next = addRangeToSelection(new Map(), "f.ts", r, 0, 1);
+  expect(next.has("f.ts")).toBe(false);
+});
+
+test("addRangeToSelection does not mutate the input Map or its Sets, and returns a new Map", () => {
+  const r = rows(["ctx", 1, 1, "a"], ["del", 2, null, "b"]);
+  const originalSet = new Set([0]);
+  const selected = new Map([["f.ts", originalSet]]);
+  const next = addRangeToSelection(selected, "f.ts", r, 0, 1);
+
+  expect(next).not.toBe(selected);
+  expect(selected.get("f.ts")).toBe(originalSet);
+  expect([...originalSet]).toEqual([0]);
+  expect(next.get("f.ts")).not.toBe(originalSet);
+  expect([...next.get("f.ts")!].sort()).toEqual([0, 1]);
+});
+
+test("addRangeToSelection carries over other paths' sets unchanged", () => {
+  const r = rows(["ctx", 1, 1, "a"], ["del", 2, null, "b"]);
+  const otherSet = new Set([5]);
+  const selected = new Map([["other.ts", otherSet]]);
+  const next = addRangeToSelection(selected, "f.ts", r, 0, 1);
+
+  expect(next.get("other.ts")).toBe(otherSet);
+  expect([...next.get("f.ts")!].sort()).toEqual([0, 1]);
+});
+
+// --- isRowInDragRange ------------------------------------------------------
+
+test("isRowInDragRange returns false when there is no drag", () => {
+  expect(isRowInDragRange(null, "f.ts", 0)).toBe(false);
+});
+
+test("isRowInDragRange returns false when the drag anchors a different file", () => {
+  const drag: DiffDragRange = { path: "other.ts", anchorIndex: 0, currentIndex: 5 };
+  expect(isRowInDragRange(drag, "f.ts", 2)).toBe(false);
+});
+
+test("isRowInDragRange is inclusive at both bounds", () => {
+  const drag: DiffDragRange = { path: "f.ts", anchorIndex: 2, currentIndex: 5 };
+  expect(isRowInDragRange(drag, "f.ts", 2)).toBe(true);
+  expect(isRowInDragRange(drag, "f.ts", 5)).toBe(true);
+  expect(isRowInDragRange(drag, "f.ts", 3)).toBe(true);
+});
+
+test("isRowInDragRange is inclusive when anchor/current are reversed (currentIndex < anchorIndex)", () => {
+  const drag: DiffDragRange = { path: "f.ts", anchorIndex: 5, currentIndex: 2 };
+  expect(isRowInDragRange(drag, "f.ts", 2)).toBe(true);
+  expect(isRowInDragRange(drag, "f.ts", 5)).toBe(true);
+  expect(isRowInDragRange(drag, "f.ts", 3)).toBe(true);
+});
+
+test("isRowInDragRange returns false for an index just outside either bound", () => {
+  const drag: DiffDragRange = { path: "f.ts", anchorIndex: 2, currentIndex: 5 };
+  expect(isRowInDragRange(drag, "f.ts", 1)).toBe(false);
+  expect(isRowInDragRange(drag, "f.ts", 6)).toBe(false);
 });
