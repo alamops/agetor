@@ -124,3 +124,14 @@ When a claude-code task launches a **Workflow** (the `/workflow` multi-agent orc
 - **A5 (kill switch):** `AGETOR_TRACK_WORKFLOWS`, default on, nested under `AGETOR_TRACK_SUBAGENTS` — follows `AGETOR_TRACK_<THING>` convention.
 - **A6 (nested workflows):** `workflow()`-in-workflow children share the parent's transcript dir per the harness contract (one level only); the dir scan handles whatever appears, no special casing.
 - **A7:** no real-app smoke test in this run (unit/integration suite only), matching the predecessor feature's verification bar.
+
+## 9. What actually shipped — deviations from this plan
+
+1. **db.ts was touched after all** (plan preferred zero changes): the pre-existing `toSubagent` read-coercion (`parent_kind === "bg_session" ? … : "subagent"`) silently collapsed unknown kinds to `"subagent"`, which would have neutered every workflow branch on rows read back from SQLite. Replaced with a `PARENT_KINDS` allow-list.
+2. **orchestrator.ts was touched** (plan said no changes needed): review found the hold race — the container row is created by a watcher poll (4–10 s tiers) while `attachDoneHandler` evaluates the hold ~800 ms after end_turn, so the card bounced `running → review → running` on nearly every launch. Fixed by `pumpWatcherForHoldCheck(taskId)` called right before the hold predicate; this also closes the same pre-existing race for async `Agent` subagents launched at the end of a turn.
+3. **Attach-time main-JSONL replay is clamped** to `REPLAY_WINDOW_BYTES` (4 MB) when no toolUseId correlation is pending — without it, boot reconciliation sync-read entire multi-MB transcripts per watcher.
+4. **`workflow_agent` files are tailed past settle** while their container runs, so a journal-receipt settle can't permanently truncate a tab whose terminal lines flush late.
+5. **Notification matching is anchored** on the literal `<task-notification>` substring + `matchAll` (a quoted `<task-id>` in ordinary content must never false-settle a container — that would be unrecoverable).
+6. **The cascade fires the settle hook once, at depth 0**, after all agent rows settle, making the "release sees the whole workflow at once" invariant actually true.
+7. RunPanel.tsx needed no changes — all tab derivation flows through the pure helpers in `subagent-tabs.ts`.
+8. Deferred from review (accepted): a `pendingReceipts` buffer for journal receipts arriving before agent-file discovery (container-settle cascade is the backstop), and deep-idle-tier retention for workflow state (matches existing `files.size` behavior).
