@@ -749,6 +749,22 @@ export const runs = {
        ORDER BY id ASC`,
     ).all(runId);
   },
+  /** The most recently persisted MAIN-stream event's raw `data` for a run
+   *  (`subagent_id IS NULL`, like `seenLineUuidsForTask`), or `null` if the
+   *  run has none yet.
+   *
+   *  Backs `reapIdleSessions`'s idempotence guard: a re-reap regression
+   *  would try to append the identical hibernate breadcrumb to the same run
+   *  again, and comparing against the last persisted event's exact text is
+   *  enough to catch that without a full row fetch. The breadcrumb itself is
+   *  a main-stream row, so a subagent row landing afterwards must not
+   *  re-arm the guard — hence the filter. */
+  lastEventData(runId: string): string | null {
+    const row = db.query<{ data: string }, [string]>(
+      `SELECT data FROM run_events WHERE run_id = ? AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
+    ).get(runId);
+    return row ? row.data : null;
+  },
   /** All events across every run of a task, in event-id order (which is
    *  chronological — id is autoincrement, ts can collide when bursts of
    *  events land in the same Date.now() ms). Used by the unified

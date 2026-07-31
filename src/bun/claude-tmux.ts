@@ -759,11 +759,15 @@ function formatTurnDuration(ms: number): string {
  * ONLY external caller of this raw-line entry point (`dispatchLine`, the
  * main stream, parses up front and calls `mapParsedEventToChunks` directly)
  * — passes `true`.
+ * @param lastPermissionMode See `mapParsedEventToChunks`'s param of the same
+ * name. Threaded straight through so the subagent tailer gets the same
+ * emit-on-change suppression as the main stream.
  */
 export function mapJsonlEventToChunks(
   line: string,
   onChunk: ChunkHandler,
   includeUuidForApiError = false,
+  lastPermissionMode?: string | null,
 ): { endOfTurn: boolean; lineUuid?: string } {
   let evt: ParsedJsonlEvent;
   try {
@@ -772,7 +776,7 @@ export function mapJsonlEventToChunks(
     onChunk("stderr", `jsonl parse error: ${(e as Error).message}`);
     return { endOfTurn: false };
   }
-  return mapParsedEventToChunks(evt, onChunk, includeUuidForApiError);
+  return mapParsedEventToChunks(evt, onChunk, includeUuidForApiError, lastPermissionMode);
 }
 
 /** String-variant entry point delegates to this once the JSON has been
@@ -797,11 +801,21 @@ export function mapJsonlEventToChunks(
  * that point. When a text block IS present (the common case), the
  * duplicate write is a harmless no-op — INSERT OR IGNORE silently keeps
  * the first (assistant) row, which already carries the same uuid.
+ * @param lastPermissionMode The mode `SessionState.permissionMode` held
+ * BEFORE this event (undefined = caller has no tracking — e.g. a test that
+ * predates this param, or a one-off call site that doesn't care — always
+ * emit, matching pre-existing behavior). Claude journals a mode-bearing
+ * event at every turn start, not just on an actual mode change, so without
+ * this the `system`/`permission-mode` case below would emit an identical
+ * `permission-mode: <mode>` status chip after every single turn. Passing
+ * the previous value lets that case suppress the chunk when nothing
+ * actually changed.
  */
 function mapParsedEventToChunks(
   evt: ParsedJsonlEvent,
   onChunk: ChunkHandler,
   includeUuidForApiError = false,
+  lastPermissionMode?: string | null,
 ): { endOfTurn: boolean; lineUuid?: string } {
   // Claude stamps a uuid on every event line. Forward it as the third arg
   // to onChunk so the orchestrator can persist it as the run_events row's
@@ -998,9 +1012,20 @@ function mapParsedEventToChunks(
 
     case "system":
     case "permission-mode":
-      if (evt.permissionMode) {
+      // Claude journals a mode-bearing event at the start of every turn, not
+      // just when the mode actually changes — emit the chip only when it
+      // differs from what the caller already knows, so identical
+      // "permission-mode: auto" chips don't spam the stream after every turn.
+      if (evt.permissionMode && evt.permissionMode !== lastPermissionMode) {
         onChunk("status", `permission-mode: ${evt.permissionMode}`, uuid);
-      } else if (evt.subtype === "turn_duration" && typeof evt.durationMs === "number") {
+      }
+      // Independent `if` (not `else if`): a mode-bearing event and a
+      // turn-duration event are conceptually unrelated fields on the same
+      // envelope. Coupling them would mean a future claude build that
+      // stamps `permissionMode` onto a `subtype:"turn_duration"` line
+      // silently swaps the mode-change chip for the duration chip instead
+      // of emitting both.
+      if (evt.subtype === "turn_duration" && typeof evt.durationMs === "number") {
         // Emitted right after the assistant end_turn. The end_turn itself
         // already produced a "turn complete" status; this just adds the
         // duration so the user can see at a glance whether the turn was
@@ -1130,35 +1155,98 @@ export function sessionExistsByName(name: string): boolean {
 }
 
 /**
+ * Pure parser for one `#{session_attached}:#{session_activity}` line as
+ * produced by `probeSessionActivity`'s `list-sessions -F` call. Exported so
+ * the tmux-version quirk below is unit-testable without a real tmux binary.
+ *
+ * Both fields must be non-empty, all-digit strings BEFORE we hand them to
+ * `Number()` — `Number("")` is `0`, which is a finite number, so a naive
+ * `Number.isFinite` guard silently accepts an empty field as "zero" instead
+ * of rejecting it as malformed. That footgun is exactly what let a tmux 3.6a
+ * quirk (see `probeSessionActivity`'s doc comment) turn "session not found"
+ * into "activity at epoch 0" instead of `null`.
+ */
+export function parseSessionActivityLine(line: string): { attached: boolean; activityAt: number } | null {
+  const trimmed = line.trim();
+  if (trimmed === "") return null;
+  const parts = trimmed.split(":");
+  if (parts.length !== 2) return null;
+  const attachedRaw = parts[0] ?? "";
+  const activityRaw = parts[1] ?? "";
+  const digitsOnly = /^[0-9]+$/;
+  if (!digitsOnly.test(attachedRaw) || !digitsOnly.test(activityRaw)) return null;
+  const attachedNum = Number(attachedRaw);
+  const activitySec = Number(activityRaw);
+  // tmux reports session_activity in epoch SECONDS; callers (idle-clock math
+  // against `Date.now()`) expect milliseconds.
+  return { attached: attachedNum > 0, activityAt: activitySec * 1000 };
+}
+
+/**
  * Keyed, single-round-trip liveness + activity probe for a task's tmux
  * session, with no dependency on in-memory `SessionState`. This is what the
  * reaper falls back to for a task it holds no `SessionState` for (e.g. after
  * a restart, before boot reconciliation reattaches it) instead of a bare
  * `has-session` check that can't tell whether the session is still doing
- * anything. One `tmux display-message` round-trip pulls both
- * `#{session_attached}` (nonzero while a real `tmux attach` is live) and
- * `#{session_activity}` (tmux's own last-activity timestamp for the session —
- * updated on any pane output, independent of whether we're the ones tailing
- * it) in a single call. `-t '=<name>'` forces an exact-match target, matching
- * every other tmux() call in this file — see `sessionExists`'s comment for
- * why an unanchored name prefix-matches a sibling `agetor-<id>` session and
- * would misreport a live, unrelated session as this task's. Returns null
- * when the command fails or the session doesn't exist; the caller treats
- * that as "can't tell," not "definitely dead."
+ * anything. Pulls both `#{session_attached}` (nonzero while a real `tmux
+ * attach` is live) and `#{session_activity}` (tmux's own last-activity
+ * timestamp for the session — updated on any pane output, independent of
+ * whether we're the ones tailing it) in a single round-trip, with no
+ * dependency on `SessionState`.
+ *
+ * Uses `list-sessions -F '#{session_attached}:#{session_activity}' -f
+ * '#{==:#{session_name},<name>}'` rather than `display-message -p -t
+ * '=<name>'`. We used to use `display-message`, but on tmux 3.6a it does NOT
+ * resolve an `=`-prefixed exact-match TARGET the way `has-session` and
+ * `kill-session` do: instead of failing for a nonexistent session, it prints
+ * the requested format with every variable expanded to empty (stdout `:`)
+ * and exits 0 — identically for a live session and a dead one. Parsed the
+ * old way (`Number("") === 0` sailing through `Number.isFinite`), that
+ * turned into `{attached: false, activityAt: 0}` for EVERY task, live or
+ * dead — "idle since epoch 1970" — which made the idle-session reaper
+ * re-reap every candidate task on every sweep. `list-sessions -f
+ * '#{==:...}'` uses a session FILTER, not a resolved target, so it isn't
+ * subject to that `=`-target quirk: verified on tmux 3.6a to return e.g.
+ * `0:1785511908` for a live session and empty stdout (exit 0, server up)
+ * for a dead one.
+ *
+ * `-f '#{==:#{session_name},<name>}'` is an exact-match filter, matching the
+ * `-t '=<name>'` exact-match target used by every other tmux() call in this
+ * file — see `sessionExists`'s comment for why an unanchored name
+ * prefix-matches a sibling `agetor-<id>` session and would misreport a live,
+ * unrelated session as this task's. Since the name is unique, the filter
+ * should never yield more than one line; if it somehow does, we treat that
+ * as ambiguous and return null rather than guess which line is "ours."
+ *
+ * Returns null when the command fails (no tmux server), stdout is empty or
+ * whitespace-only (session doesn't exist), or the output doesn't parse —
+ * the caller treats that as "can't tell," not "definitely dead."
  */
+let probeFailureWarned = false;
 export function probeSessionActivity(taskId: string): { attached: boolean; activityAt: number } | null {
   const r = tmux([
-    "display-message", "-p", "-t", "=" + sessionNameFor(taskId),
-    "#{session_attached}:#{session_activity}",
+    "list-sessions", "-F", "#{session_attached}:#{session_activity}",
+    "-f", "#{==:#{session_name}," + sessionNameFor(taskId) + "}",
   ]);
-  if (!r.ok) return null;
-  const [attachedRaw, activityRaw] = r.stdout.trim().split(":");
-  const attachedNum = Number(attachedRaw);
-  const activitySec = Number(activityRaw);
-  if (!Number.isFinite(attachedNum) || !Number.isFinite(activitySec)) return null;
-  // tmux reports session_activity in epoch SECONDS; callers (idle-clock math
-  // against `Date.now()`) expect milliseconds.
-  return { attached: attachedNum > 0, activityAt: activitySec * 1000 };
+  if (!r.ok) {
+    // A missing server is the routine failure (nothing running → nothing to
+    // probe) — stay silent for that. Anything else gets one warn per
+    // process: `-f` + the `#{==:}` comparison are a newer tmux surface than
+    // the has-session/kill-session calls elsewhere in this file, and a tmux
+    // build that rejects them would otherwise silently disable reaping for
+    // every session with no in-memory SessionState — the same *class* of
+    // invisible misread the display-message quirk this function replaced.
+    if (!probeFailureWarned && !/no server running|error connecting/i.test(r.stderr)) {
+      probeFailureWarned = true;
+      console.warn(`[agetor] probeSessionActivity: tmux list-sessions failed: ${r.stderr.trim()}`);
+    }
+    return null;
+  }
+  const trimmed = r.stdout.trim();
+  if (trimmed === "") return null;
+  const lines = trimmed.split("\n");
+  if (lines.length !== 1) return null;
+  return parseSessionActivityLine(lines[0] ?? "");
 }
 
 /** Tri-state liveness of a tmux session — the safe signal for the death watch. */
@@ -1685,6 +1773,19 @@ interface SessionState {
    */
   permissionMode: string | null;
   /**
+   * The mode value of the last mode-bearing JSONL line `dispatchLine`
+   * processed (or the launch/reattach seed) — the baseline handed to
+   * `mapParsedEventToChunks` as `lastPermissionMode` for chip-suppression
+   * purposes. Unlike `permissionMode`, this field is NEVER written from a
+   * pane scrape (`cycleToModeInner`'s Shift+Tab verification writes only
+   * `permissionMode`) — so when the user switches modes via the UI, this
+   * field still lags the live mode until claude journals the corresponding
+   * JSONL line at the next turn start, and the confirmation chip for that
+   * genuinely user-initiated change is not wrongly suppressed as a "no-op"
+   * repeat.
+   */
+  lastAnnouncedPermissionMode: string | null;
+  /**
    * Whether `bypassPermissions` is in this session's Shift+Tab cycle. True
    * iff the session was launched with `--dangerously-skip-permissions` (the
    * agetor `bypass` mode emits exactly that). Reattached sessions default
@@ -1890,6 +1991,12 @@ interface MakeSessionStateOpts {
   seenLineUuids?: Set<string>;
   onEndOfTurn?: (() => void) | null;
   permissionMode?: string | null;
+  /** Defaults to `permissionMode` (or its own default of `null`) when
+   *  omitted — the common case where the caller has no reason for the two
+   *  fields to start out of sync. See `SessionState.lastAnnouncedPermissionMode`
+   *  for what it means to pass something different (used by `reattachSession`
+   *  to seed the suppression baseline without also seeding `permissionMode`). */
+  lastAnnouncedPermissionMode?: string | null;
   bypassEnabled?: boolean;
 }
 
@@ -1905,6 +2012,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     seenLineUuids: o.seenLineUuids ?? new Set(),
     onEndOfTurn: o.onEndOfTurn ?? null,
     permissionMode: o.permissionMode ?? null,
+    lastAnnouncedPermissionMode: o.lastAnnouncedPermissionMode ?? o.permissionMode ?? null,
     bypassEnabled: o.bypassEnabled ?? false,
     // Defaults shared by every site — timers, scrape state, staging buffers.
     watcher: null,
@@ -2699,9 +2807,25 @@ function dispatchLine(state: SessionState, line: string): void {
   // On reattach the dedup set is pre-seeded from run_events, so every
   // replayed line — including mode events the prior process recorded — would
   // otherwise be silently skipped and state.permissionMode would stay null.
+  //
+  // Captured BEFORE the mirror writes the new value so the mapper call below
+  // can compare "what the event says" against "what we last announced" and
+  // suppress a same-mode repeat (see `mapParsedEventToChunks`'s
+  // `lastPermissionMode` param). Deliberately read from
+  // `lastAnnouncedPermissionMode`, NOT `permissionMode`: `permissionMode` can
+  // also be written by `cycleToModeInner`'s pane-scrape verification when the
+  // USER switches modes via Shift+Tab, which happens before claude journals
+  // the corresponding JSONL line. Using `permissionMode` here would make that
+  // pane-scrape write look like "already announced" and suppress the
+  // legitimate confirmation chip once the JSONL line does arrive.
+  // `lastAnnouncedPermissionMode` is written only from JSONL lines (below and
+  // at the launch/reattach seed), so it always tracks what was actually
+  // announced.
+  const prevAnnouncedPermissionMode = state.lastAnnouncedPermissionMode;
   if ((evt.type === "system" || evt.type === "permission-mode")
     && typeof evt.permissionMode === "string") {
     state.permissionMode = evt.permissionMode;
+    state.lastAnnouncedPermissionMode = evt.permissionMode;
   }
 
   // Staging step: the new line either confirms or cancels the pending end_turn.
@@ -2797,7 +2921,7 @@ function dispatchLine(state: SessionState, line: string): void {
   // recently popped slot's handler so trailing metadata still reaches the
   // correct run. If neither exists it's safe to drop.
   const onChunk: ChunkHandler = slot?.onChunk ?? state.lastChunk ?? (() => {});
-  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk);
+  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk, false, prevAnnouncedPermissionMode);
   if (uuid) state.seenLineUuids.add(uuid);
   if (endOfTurn) {
     // Stage: don't resolve the turn yet. The banner and slot-pop happen in
@@ -4501,6 +4625,14 @@ export interface ReattachOptions {
    *  `onEndOfTurn` on end_turn lines belonging to long-completed prior
    *  turns. */
   seenLineUuids: Set<string>;
+  /** The task's agetor mode at reattach time (`task.mode`), used to seed
+   *  `SessionState.lastAnnouncedPermissionMode` so the offset-0 JSONL replay
+   *  doesn't re-emit a "permission-mode: <mode>" chip for a mode-bearing line
+   *  the prior process already announced (those lines carry no uuid, so the
+   *  usual seenLineUuids dedup can't catch them). Optional/nullable because
+   *  a task can have `mode: null` (defaults to `auto`/`workspace-write`
+   *  elsewhere) or reattach can be invoked without task context in tests. */
+  mode?: string | null;
 }
 
 /**
@@ -4550,6 +4682,16 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
     lastChunk: opts.onChunk,
     seenLineUuids: opts.seenLineUuids,
     onEndOfTurn: () => resolveDone?.(0),
+    // Seed the chip-suppression baseline from the task's mode so the
+    // offset-0 JSONL replay doesn't re-announce a mode the prior process
+    // already announced (permission-mode lines carry no uuid, so
+    // seenLineUuids can't dedup them). Deliberately NOT passed as
+    // `permissionMode` — that field feeds `cycleToModeInner`'s "current mode
+    // unknown" guard and Shift+Tab cycle math, and seeding it here (rather
+    // than leaving it null until the JSONL replay re-hydrates it) would
+    // change that guard's semantics on a reattach where the true live mode
+    // might differ from the task's last-saved mode.
+    lastAnnouncedPermissionMode: opts.mode ? toClaudeModeString(opts.mode) : null,
   });
   // Belt to reconcileOrphans's sort-and-dedup suspender: if some prior
   // reattach (or other code path) already left a SessionState in the map

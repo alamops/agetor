@@ -44,6 +44,7 @@ import {
 import { appendReferences } from "../../../shared/refs.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
+import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
@@ -1155,11 +1156,21 @@ function RunPanelBody({
    *  the appended rebuild set (whose synthetic timestamps are anchored at the
    *  run's start, not real wall-clock time) so a status event doesn't jump to
    *  the wrong end of the transcript. */
+  // `collapseRepeatedStatusChips` MUST run here — not inside `RunEventList`'s
+  // `normalised` memo — because `findMatchingEventIds` below derives each
+  // match's id from an event's own position in `displayedEvents`, and that
+  // same array (uncollapsed) is what supplied the `data-evid` index at render
+  // time. Collapsing downstream of this memo would shorten the rendered
+  // array while search still matched against the longer, uncollapsed one,
+  // scrolling/highlighting the wrong block whenever history has duplicate
+  // permission-mode chips (review-caught bug). Doing it here keeps search,
+  // todo-progress, and rendering all reading from one shared index space.
   const displayedEvents = useMemo(() => {
-    if (activeStream !== "main") return subagentEventsById.get(activeStream) ?? [];
-    if (!rebuilt || !rebuiltRunIds) return mainEvents;
+    if (activeStream !== "main")
+      return collapseRepeatedStatusChips(subagentEventsById.get(activeStream) ?? []);
+    if (!rebuilt || !rebuiltRunIds) return collapseRepeatedStatusChips(mainEvents);
     const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId) || e.stream === "status");
-    return [...others, ...rebuilt.events].sort((a, b) => a.ts - b.ts);
+    return collapseRepeatedStatusChips([...others, ...rebuilt.events].sort((a, b) => a.ts - b.ts));
   }, [activeStream, subagentEventsById, mainEvents, rebuilt, rebuiltRunIds]);
 
   /** The current to-do list for whichever stream is selected. Claude re-emits
