@@ -660,6 +660,37 @@ test("mapJsonlEventToChunks: top-level permission-mode (claude variant) surfaces
   expect(out[0]).toEqual({ stream: "status", data: "permission-mode: plan" });
 });
 
+test("mapJsonlEventToChunks: lastPermissionMode matching the event's mode suppresses the status chunk", () => {
+  // Emit-on-change: claude journals a mode-bearing event at the start of
+  // every turn, not just on an actual change. When the caller's 4th arg
+  // already equals the event's mode, no status chunk should be emitted at
+  // all (and nothing else fires for a bare system/permission-mode event).
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "system", permissionMode: "auto" });
+  const res = mapJsonlEventToChunks(line, onChunk, false, "auto");
+  expect(out).toEqual([]);
+  expect(res.endOfTurn).toBe(false);
+});
+
+test("mapJsonlEventToChunks: lastPermissionMode differing from the event's mode still emits", () => {
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "permission-mode", permissionMode: "auto" });
+  mapJsonlEventToChunks(line, onChunk, false, "plan");
+  expect(out[0]).toEqual({ stream: "status", data: "permission-mode: auto" });
+});
+
+test("mapJsonlEventToChunks: omitting lastPermissionMode preserves always-emit default", () => {
+  // Cheap explicit check of the `undefined` default (the two tests above at
+  // :649-661 already cover this implicitly by calling with no 4th arg at
+  // all) — passing `undefined` explicitly must behave identically to
+  // omitting it, since real call sites without tracking (e.g. a caller that
+  // predates this param) pass nothing.
+  const { out, onChunk } = recorder();
+  const line = JSON.stringify({ type: "system", permissionMode: "auto" });
+  mapJsonlEventToChunks(line, onChunk, false, undefined);
+  expect(out[0]).toEqual({ stream: "status", data: "permission-mode: auto" });
+});
+
 test("mapJsonlEventToChunks: summary checkpoints surface as a status breadcrumb", () => {
   const { out, onChunk } = recorder();
   const line = JSON.stringify({ type: "summary", summary: "Earlier turns compacted" });
@@ -779,6 +810,67 @@ test("system event updates state.permissionMode (dispatchLine path)", async () =
     JSON.stringify({ type: "permission-mode", permissionMode: "auto" }),
   );
   expect(state.permissionMode).toBe("auto");
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: repeated same-mode events emit one status chunk; a mode change emits a second", async () => {
+  // End-to-end emit-on-change through the real dispatch path (mirrors the
+  // spam scenario: claude journals a mode-bearing event at the start of
+  // every turn). Three mode-bearing lines with distinct uuids so dedup
+  // can't suppress them on its own — only the emit-on-change comparison
+  // against SessionState.permissionMode should.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-mode-emit-on-change";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const emitted: { stream: string; data: string }[] = [];
+  state.lastChunk = (stream, data) => emitted.push({ stream, data });
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "mode-uuid-1", permissionMode: "auto",
+  }));
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "mode-uuid-2", permissionMode: "auto",
+  }));
+  const statusChunks = () => emitted.filter((e) => e.stream === "status" && e.data.startsWith("permission-mode: "));
+  expect(statusChunks()).toEqual([{ stream: "status", data: "permission-mode: auto" }]);
+
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "mode-uuid-3", permissionMode: "plan",
+  }));
+  expect(statusChunks()).toEqual([
+    { stream: "status", data: "permission-mode: auto" },
+    { stream: "status", data: "permission-mode: plan" },
+  ]);
+  __forTest.uninstallSession(taskId);
+});
+
+test("dispatchLine: replayed mode-bearing line rehydrates state without emitting, so the next genuinely-new same-mode line stays suppressed", async () => {
+  // Guards the mirror-above-dedup invariant: on reattach, `seenLineUuids` is
+  // pre-seeded from `run_events`, so the replayed line takes the dedup
+  // early-return (no chunk emission) — but the permissionMode mirror runs
+  // BEFORE that early-return, so state.permissionMode is still rehydrated.
+  // A later, genuinely-new line carrying the SAME mode must therefore also
+  // stay suppressed, not spuriously re-emit because the tracker looked empty.
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-mode-reattach-replay";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const emitted: { stream: string; data: string }[] = [];
+  state.lastChunk = (stream, data) => emitted.push({ stream, data });
+
+  // Pre-seed the dedup set as boot reconciliation does for an already-persisted line.
+  state.seenLineUuids.add("mode-uuid-replayed");
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "mode-uuid-replayed", permissionMode: "auto",
+  }));
+  const statusChunks = () => emitted.filter((e) => e.stream === "status" && e.data.startsWith("permission-mode: "));
+  expect(statusChunks()).toEqual([]);
+  expect(state.permissionMode).toBe("auto");
+
+  // A brand-new line (not deduped) with the SAME mode must still be suppressed.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "mode-uuid-fresh", permissionMode: "auto",
+  }));
+  expect(statusChunks()).toEqual([]);
   __forTest.uninstallSession(taskId);
 });
 
@@ -1233,6 +1325,32 @@ test("rebuildEventsFromJsonl: fires staged end_turn at EOF (last line is the tur
   rebuildEventsFromJsonl(lines, (stream, data) => out.push({ stream, data }));
   expect(out.some((r) => r.stream === "assistant" && r.data === "all done")).toBe(true);
   expect(out.some((r) => r.stream === "status" && r.data === "turn complete")).toBe(true);
+});
+
+test("rebuildEventsFromJsonl: emits exactly one permission-mode status entry per mode CHANGE, not per event", () => {
+  // rebuildEventsFromJsonl drives dispatchLine against a synthetic state, so
+  // it inherits the same emit-on-change suppression — this is the "already
+  // persisted spam renders collapsed" acceptance criterion from the plan,
+  // exercised directly against a spammy JSONL: repeated same-mode events
+  // interleaved with unrelated (non-mode) events must collapse to one chip
+  // per actual change (auto -> plan -> auto = 3 chips, not 6).
+  const lines = [
+    JSON.stringify({ type: "system", uuid: "r1", permissionMode: "auto" }),
+    JSON.stringify({ type: "assistant", uuid: "r2",
+      message: { id: "msg-A", role: "assistant", content: [{ type: "text", text: "hi" }], stop_reason: "tool_use" } }),
+    JSON.stringify({ type: "system", uuid: "r3", permissionMode: "auto" }),
+    JSON.stringify({ type: "permission-mode", uuid: "r4", permissionMode: "plan" }),
+    JSON.stringify({ type: "system", uuid: "r5", permissionMode: "plan" }),
+    JSON.stringify({ type: "system", uuid: "r6", permissionMode: "auto" }),
+  ].join("\n");
+  const out: { stream: string; data: string }[] = [];
+  rebuildEventsFromJsonl(lines, (stream, data) => out.push({ stream, data }));
+  const modeChips = out.filter((r) => r.stream === "status" && r.data.startsWith("permission-mode: "));
+  expect(modeChips.map((r) => r.data)).toEqual([
+    "permission-mode: auto",
+    "permission-mode: plan",
+    "permission-mode: auto",
+  ]);
 });
 
 test("dispatchLine: permissionMode still updates when the event's uuid is already in seenLineUuids (reattach path)", async () => {

@@ -577,6 +577,7 @@ export function reconcileOrphans(): number {
             configDir: harness?.home ?? null,
             onChunk,
             seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            mode: task.mode,
           })
         : reattachCodexSession({
             taskId: row.task_id,

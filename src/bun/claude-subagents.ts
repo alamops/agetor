@@ -605,14 +605,18 @@ export function attachSubagentWatcher(opts: {
       } catch { /* fall through; mapper will surface the parse error */ }
 
       // Mirror the mode into `fs.lastPermissionMode` BEFORE the dedup-skip
-      // continue below — same reasoning as `dispatchLine`'s mirror on the
-      // main stream: a boot reattach replays already-persisted lines through
-      // this loop too (dedup skips re-emission, not re-parsing), and without
-      // updating here first, a reattach would leave `lastPermissionMode`
-      // stuck at `null` and re-emit a redundant chip on this subagent's next
-      // genuinely-new mode-bearing line. `prevPermissionMode` is captured
-      // first so the mapper call below (for lines that ARE new) compares
-      // against what we knew before this line, not this line's own value.
+      // continue below. Defensive ordering rather than a currently-exercised
+      // path: real permission-mode JSONL lines carry no uuid, so they never
+      // hit the `fs.seen` continue in the first place — they re-emit once
+      // per reattach (the offset-0 replay has no dedup key for them), and
+      // the UI's render-time collapse (`collapseRepeatedModeStatus`) is what
+      // masks that residual repeat today. Keeping the mirror above the
+      // continue means that if claude ever ships a uuid-bearing variant of
+      // this line, it still rehydrates `fs.lastPermissionMode` correctly on
+      // replay without re-emitting a chip, with no code change needed here.
+      // `prevPermissionMode` is captured first so the mapper call below (for
+      // lines that ARE new) compares against what we knew before this line,
+      // not this line's own value.
       const prevPermissionMode = fs.lastPermissionMode;
       if (linePermissionMode !== undefined) fs.lastPermissionMode = linePermissionMode;
 

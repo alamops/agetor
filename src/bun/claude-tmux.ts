@@ -1018,7 +1018,14 @@ function mapParsedEventToChunks(
       // "permission-mode: auto" chips don't spam the stream after every turn.
       if (evt.permissionMode && evt.permissionMode !== lastPermissionMode) {
         onChunk("status", `permission-mode: ${evt.permissionMode}`, uuid);
-      } else if (evt.subtype === "turn_duration" && typeof evt.durationMs === "number") {
+      }
+      // Independent `if` (not `else if`): a mode-bearing event and a
+      // turn-duration event are conceptually unrelated fields on the same
+      // envelope. Coupling them would mean a future claude build that
+      // stamps `permissionMode` onto a `subtype:"turn_duration"` line
+      // silently swaps the mode-change chip for the duration chip instead
+      // of emitting both.
+      if (evt.subtype === "turn_duration" && typeof evt.durationMs === "number") {
         // Emitted right after the assistant end_turn. The end_turn itself
         // already produced a "turn complete" status; this just adds the
         // duration so the user can see at a glance whether the turn was
@@ -1703,6 +1710,19 @@ interface SessionState {
    */
   permissionMode: string | null;
   /**
+   * The mode value of the last mode-bearing JSONL line `dispatchLine`
+   * processed (or the launch/reattach seed) — the baseline handed to
+   * `mapParsedEventToChunks` as `lastPermissionMode` for chip-suppression
+   * purposes. Unlike `permissionMode`, this field is NEVER written from a
+   * pane scrape (`cycleToModeInner`'s Shift+Tab verification writes only
+   * `permissionMode`) — so when the user switches modes via the UI, this
+   * field still lags the live mode until claude journals the corresponding
+   * JSONL line at the next turn start, and the confirmation chip for that
+   * genuinely user-initiated change is not wrongly suppressed as a "no-op"
+   * repeat.
+   */
+  lastAnnouncedPermissionMode: string | null;
+  /**
    * Whether `bypassPermissions` is in this session's Shift+Tab cycle. True
    * iff the session was launched with `--dangerously-skip-permissions` (the
    * agetor `bypass` mode emits exactly that). Reattached sessions default
@@ -1908,6 +1928,12 @@ interface MakeSessionStateOpts {
   seenLineUuids?: Set<string>;
   onEndOfTurn?: (() => void) | null;
   permissionMode?: string | null;
+  /** Defaults to `permissionMode` (or its own default of `null`) when
+   *  omitted — the common case where the caller has no reason for the two
+   *  fields to start out of sync. See `SessionState.lastAnnouncedPermissionMode`
+   *  for what it means to pass something different (used by `reattachSession`
+   *  to seed the suppression baseline without also seeding `permissionMode`). */
+  lastAnnouncedPermissionMode?: string | null;
   bypassEnabled?: boolean;
 }
 
@@ -1923,6 +1949,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     seenLineUuids: o.seenLineUuids ?? new Set(),
     onEndOfTurn: o.onEndOfTurn ?? null,
     permissionMode: o.permissionMode ?? null,
+    lastAnnouncedPermissionMode: o.lastAnnouncedPermissionMode ?? o.permissionMode ?? null,
     bypassEnabled: o.bypassEnabled ?? false,
     // Defaults shared by every site — timers, scrape state, staging buffers.
     watcher: null,
@@ -2719,13 +2746,23 @@ function dispatchLine(state: SessionState, line: string): void {
   // otherwise be silently skipped and state.permissionMode would stay null.
   //
   // Captured BEFORE the mirror writes the new value so the mapper call below
-  // can compare "what the event says" against "what we knew a moment ago"
-  // and suppress a same-mode repeat (see `mapParsedEventToChunks`'s
-  // `lastPermissionMode` param).
-  const prevPermissionMode = state.permissionMode;
+  // can compare "what the event says" against "what we last announced" and
+  // suppress a same-mode repeat (see `mapParsedEventToChunks`'s
+  // `lastPermissionMode` param). Deliberately read from
+  // `lastAnnouncedPermissionMode`, NOT `permissionMode`: `permissionMode` can
+  // also be written by `cycleToModeInner`'s pane-scrape verification when the
+  // USER switches modes via Shift+Tab, which happens before claude journals
+  // the corresponding JSONL line. Using `permissionMode` here would make that
+  // pane-scrape write look like "already announced" and suppress the
+  // legitimate confirmation chip once the JSONL line does arrive.
+  // `lastAnnouncedPermissionMode` is written only from JSONL lines (below and
+  // at the launch/reattach seed), so it always tracks what was actually
+  // announced.
+  const prevAnnouncedPermissionMode = state.lastAnnouncedPermissionMode;
   if ((evt.type === "system" || evt.type === "permission-mode")
     && typeof evt.permissionMode === "string") {
     state.permissionMode = evt.permissionMode;
+    state.lastAnnouncedPermissionMode = evt.permissionMode;
   }
 
   // Staging step: the new line either confirms or cancels the pending end_turn.
@@ -2821,7 +2858,7 @@ function dispatchLine(state: SessionState, line: string): void {
   // recently popped slot's handler so trailing metadata still reaches the
   // correct run. If neither exists it's safe to drop.
   const onChunk: ChunkHandler = slot?.onChunk ?? state.lastChunk ?? (() => {});
-  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk, false, prevPermissionMode);
+  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk, false, prevAnnouncedPermissionMode);
   if (uuid) state.seenLineUuids.add(uuid);
   if (endOfTurn) {
     // Stage: don't resolve the turn yet. The banner and slot-pop happen in
@@ -4525,6 +4562,14 @@ export interface ReattachOptions {
    *  `onEndOfTurn` on end_turn lines belonging to long-completed prior
    *  turns. */
   seenLineUuids: Set<string>;
+  /** The task's agetor mode at reattach time (`task.mode`), used to seed
+   *  `SessionState.lastAnnouncedPermissionMode` so the offset-0 JSONL replay
+   *  doesn't re-emit a "permission-mode: <mode>" chip for a mode-bearing line
+   *  the prior process already announced (those lines carry no uuid, so the
+   *  usual seenLineUuids dedup can't catch them). Optional/nullable because
+   *  a task can have `mode: null` (defaults to `auto`/`workspace-write`
+   *  elsewhere) or reattach can be invoked without task context in tests. */
+  mode?: string | null;
 }
 
 /**
@@ -4574,6 +4619,16 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
     lastChunk: opts.onChunk,
     seenLineUuids: opts.seenLineUuids,
     onEndOfTurn: () => resolveDone?.(0),
+    // Seed the chip-suppression baseline from the task's mode so the
+    // offset-0 JSONL replay doesn't re-announce a mode the prior process
+    // already announced (permission-mode lines carry no uuid, so
+    // seenLineUuids can't dedup them). Deliberately NOT passed as
+    // `permissionMode` — that field feeds `cycleToModeInner`'s "current mode
+    // unknown" guard and Shift+Tab cycle math, and seeding it here (rather
+    // than leaving it null until the JSONL replay re-hydrates it) would
+    // change that guard's semantics on a reattach where the true live mode
+    // might differ from the task's last-saved mode.
+    lastAnnouncedPermissionMode: opts.mode ? toClaudeModeString(opts.mode) : null,
   });
   // Belt to reconcileOrphans's sort-and-dedup suspender: if some prior
   // reattach (or other code path) already left a SessionState in the map

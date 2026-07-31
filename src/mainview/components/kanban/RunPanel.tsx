@@ -1148,11 +1148,21 @@ function RunPanelBody({
    *  the appended rebuild set (whose synthetic timestamps are anchored at the
    *  run's start, not real wall-clock time) so a status event doesn't jump to
    *  the wrong end of the transcript. */
+  // `collapseRepeatedModeStatus` MUST run here — not inside `RunEventList`'s
+  // `normalised` memo — because `findMatchingEventIds` below derives each
+  // match's id from an event's own position in `displayedEvents`, and that
+  // same array (uncollapsed) is what supplied the `data-evid` index at render
+  // time. Collapsing downstream of this memo would shorten the rendered
+  // array while search still matched against the longer, uncollapsed one,
+  // scrolling/highlighting the wrong block whenever history has duplicate
+  // permission-mode chips (review-caught bug). Doing it here keeps search,
+  // todo-progress, and rendering all reading from one shared index space.
   const displayedEvents = useMemo(() => {
-    if (activeStream !== "main") return subagentEventsById.get(activeStream) ?? [];
-    if (!rebuilt || !rebuiltRunIds) return mainEvents;
+    if (activeStream !== "main")
+      return collapseRepeatedModeStatus(subagentEventsById.get(activeStream) ?? []);
+    if (!rebuilt || !rebuiltRunIds) return collapseRepeatedModeStatus(mainEvents);
     const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId) || e.stream === "status");
-    return [...others, ...rebuilt.events].sort((a, b) => a.ts - b.ts);
+    return collapseRepeatedModeStatus([...others, ...rebuilt.events].sort((a, b) => a.ts - b.ts));
   }, [activeStream, subagentEventsById, mainEvents, rebuilt, rebuiltRunIds]);
 
   /** The current to-do list for whichever stream is selected. Claude re-emits
@@ -3173,10 +3183,7 @@ function RunEventList({
   // same shape live events use. Without this, replayed history from older
   // runs renders as ugly prefixed text while only the in-flight events get
   // proper cards.
-  const normalised = useMemo(
-    () => collapseRepeatedModeStatus(events).map(normalizeLegacyEvent),
-    [events],
-  );
+  const normalised = useMemo(() => events.map(normalizeLegacyEvent), [events]);
 
   // Index tool_results by their tool_use_id so the tool-use card can show
   // the result inline beneath it. Falls back to a standalone tool-result
