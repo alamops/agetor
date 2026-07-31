@@ -43,6 +43,7 @@ import {
 import { appendReferences } from "../../../shared/refs.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
+import { collapseRepeatedModeStatus } from "@/lib/status-collapse";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
@@ -3172,7 +3173,10 @@ function RunEventList({
   // same shape live events use. Without this, replayed history from older
   // runs renders as ugly prefixed text while only the in-flight events get
   // proper cards.
-  const normalised = useMemo(() => events.map(normalizeLegacyEvent), [events]);
+  const normalised = useMemo(
+    () => collapseRepeatedModeStatus(events).map(normalizeLegacyEvent),
+    [events],
+  );
 
   // Index tool_results by their tool_use_id so the tool-use card can show
   // the result inline beneath it. Falls back to a standalone tool-result

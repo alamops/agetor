@@ -251,6 +251,14 @@ interface FileState {
    *  running" block, which otherwise retires `toolUseId` unconditionally —
    *  see that block for why an api-errored row must NOT lose it. */
   apiErrored: boolean;
+  /** Latest mode-bearing (`system`/`permission-mode`) event seen for this
+   *  subagent, passed to `mapJsonlEventToChunks` so it can suppress a
+   *  same-mode repeat — same emit-on-change scheme as the main stream's
+   *  `SessionState.permissionMode`. Always starts `null` (never rehydrated
+   *  from the DB — nothing persists it), so reattach may re-emit one
+   *  redundant chip for an already-known mode; that's a one-time echo, not
+   *  the per-turn spam this exists to fix. */
+  lastPermissionMode: string | null;
 }
 
 export interface SubagentWatcherHandle {
@@ -459,6 +467,7 @@ export function attachSubagentWatcher(opts: {
         // api-error, followed by the same background agent resuming, must
         // still preserve `toolUseId` in the flip-back block below.
         apiErrored: row.status === "failed",
+        lastPermissionMode: null,
       });
     }
   } catch (e) {
@@ -525,6 +534,7 @@ export function attachSubagentWatcher(opts: {
         endedAt: null,
         toolUseId: meta.toolUseId,
         apiErrored: false,
+        lastPermissionMode: null,
       };
       files.set(id, fs);
       lastChangeAt = Date.now();
@@ -562,6 +572,9 @@ export function attachSubagentWatcher(opts: {
       // `isApiErrorMessage`/`apiErrorStatus` straight off the JSONL line
       // sidesteps both.
       let apiErrorInfo: { detail: string } | null = null;
+      // Peeked but not yet applied to `fs.lastPermissionMode` — see below for
+      // why the apply is deferred past the dedup-skip continue.
+      let linePermissionMode: string | undefined;
       try {
         const o = JSON.parse(line) as {
           uuid?: unknown;
@@ -569,6 +582,7 @@ export function attachSubagentWatcher(opts: {
           message?: { stop_reason?: unknown };
           isApiErrorMessage?: unknown;
           apiErrorStatus?: unknown;
+          permissionMode?: unknown;
         };
         uuid = typeof o.uuid === "string" ? o.uuid : undefined;
         endTurnHint = o.type === "assistant" && o.message?.stop_reason === "end_turn";
@@ -585,7 +599,22 @@ export function attachSubagentWatcher(opts: {
             detail: formatApiErrorDetail(typeof o.apiErrorStatus === "number" ? o.apiErrorStatus : undefined),
           };
         }
+        if ((o.type === "system" || o.type === "permission-mode") && typeof o.permissionMode === "string") {
+          linePermissionMode = o.permissionMode;
+        }
       } catch { /* fall through; mapper will surface the parse error */ }
+
+      // Mirror the mode into `fs.lastPermissionMode` BEFORE the dedup-skip
+      // continue below — same reasoning as `dispatchLine`'s mirror on the
+      // main stream: a boot reattach replays already-persisted lines through
+      // this loop too (dedup skips re-emission, not re-parsing), and without
+      // updating here first, a reattach would leave `lastPermissionMode`
+      // stuck at `null` and re-emit a redundant chip on this subagent's next
+      // genuinely-new mode-bearing line. `prevPermissionMode` is captured
+      // first so the mapper call below (for lines that ARE new) compares
+      // against what we knew before this line, not this line's own value.
+      const prevPermissionMode = fs.lastPermissionMode;
+      if (linePermissionMode !== undefined) fs.lastPermissionMode = linePermissionMode;
 
       if (uuid && fs.seen.has(uuid)) {
         if (endTurnHint) fs.sawEndOfTurn = true;
@@ -645,6 +674,7 @@ export function attachSubagentWatcher(opts: {
         // line. A harmless no-op write when a text block IS present (the
         // common case) — INSERT OR IGNORE just keeps that first row.
         true,
+        prevPermissionMode,
       );
       if (uuid) fs.seen.add(uuid);
       if (endOfTurn) fs.sawEndOfTurn = true;

@@ -759,11 +759,15 @@ function formatTurnDuration(ms: number): string {
  * ONLY external caller of this raw-line entry point (`dispatchLine`, the
  * main stream, parses up front and calls `mapParsedEventToChunks` directly)
  * — passes `true`.
+ * @param lastPermissionMode See `mapParsedEventToChunks`'s param of the same
+ * name. Threaded straight through so the subagent tailer gets the same
+ * emit-on-change suppression as the main stream.
  */
 export function mapJsonlEventToChunks(
   line: string,
   onChunk: ChunkHandler,
   includeUuidForApiError = false,
+  lastPermissionMode?: string | null,
 ): { endOfTurn: boolean; lineUuid?: string } {
   let evt: ParsedJsonlEvent;
   try {
@@ -772,7 +776,7 @@ export function mapJsonlEventToChunks(
     onChunk("stderr", `jsonl parse error: ${(e as Error).message}`);
     return { endOfTurn: false };
   }
-  return mapParsedEventToChunks(evt, onChunk, includeUuidForApiError);
+  return mapParsedEventToChunks(evt, onChunk, includeUuidForApiError, lastPermissionMode);
 }
 
 /** String-variant entry point delegates to this once the JSON has been
@@ -797,11 +801,21 @@ export function mapJsonlEventToChunks(
  * that point. When a text block IS present (the common case), the
  * duplicate write is a harmless no-op — INSERT OR IGNORE silently keeps
  * the first (assistant) row, which already carries the same uuid.
+ * @param lastPermissionMode The mode `SessionState.permissionMode` held
+ * BEFORE this event (undefined = caller has no tracking — e.g. a test that
+ * predates this param, or a one-off call site that doesn't care — always
+ * emit, matching pre-existing behavior). Claude journals a mode-bearing
+ * event at every turn start, not just on an actual mode change, so without
+ * this the `system`/`permission-mode` case below would emit an identical
+ * `permission-mode: <mode>` status chip after every single turn. Passing
+ * the previous value lets that case suppress the chunk when nothing
+ * actually changed.
  */
 function mapParsedEventToChunks(
   evt: ParsedJsonlEvent,
   onChunk: ChunkHandler,
   includeUuidForApiError = false,
+  lastPermissionMode?: string | null,
 ): { endOfTurn: boolean; lineUuid?: string } {
   // Claude stamps a uuid on every event line. Forward it as the third arg
   // to onChunk so the orchestrator can persist it as the run_events row's
@@ -998,7 +1012,11 @@ function mapParsedEventToChunks(
 
     case "system":
     case "permission-mode":
-      if (evt.permissionMode) {
+      // Claude journals a mode-bearing event at the start of every turn, not
+      // just when the mode actually changes — emit the chip only when it
+      // differs from what the caller already knows, so identical
+      // "permission-mode: auto" chips don't spam the stream after every turn.
+      if (evt.permissionMode && evt.permissionMode !== lastPermissionMode) {
         onChunk("status", `permission-mode: ${evt.permissionMode}`, uuid);
       } else if (evt.subtype === "turn_duration" && typeof evt.durationMs === "number") {
         // Emitted right after the assistant end_turn. The end_turn itself
@@ -2699,6 +2717,12 @@ function dispatchLine(state: SessionState, line: string): void {
   // On reattach the dedup set is pre-seeded from run_events, so every
   // replayed line — including mode events the prior process recorded — would
   // otherwise be silently skipped and state.permissionMode would stay null.
+  //
+  // Captured BEFORE the mirror writes the new value so the mapper call below
+  // can compare "what the event says" against "what we knew a moment ago"
+  // and suppress a same-mode repeat (see `mapParsedEventToChunks`'s
+  // `lastPermissionMode` param).
+  const prevPermissionMode = state.permissionMode;
   if ((evt.type === "system" || evt.type === "permission-mode")
     && typeof evt.permissionMode === "string") {
     state.permissionMode = evt.permissionMode;
@@ -2797,7 +2821,7 @@ function dispatchLine(state: SessionState, line: string): void {
   // recently popped slot's handler so trailing metadata still reaches the
   // correct run. If neither exists it's safe to drop.
   const onChunk: ChunkHandler = slot?.onChunk ?? state.lastChunk ?? (() => {});
-  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk);
+  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk, false, prevPermissionMode);
   if (uuid) state.seenLineUuids.add(uuid);
   if (endOfTurn) {
     // Stage: don't resolve the turn yet. The banner and slot-pop happen in
