@@ -12,6 +12,7 @@ import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sort
 import { shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { latestPrProposal } from "@/lib/pr-proposal";
+import { parsePullNumber } from "@/lib/pr-url";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -117,6 +118,10 @@ interface Props {
    *  "Open PR" chip below. Owned by App so the dialog stays a single
    *  App-level singleton instead of one instance per task panel. */
   onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
+  /** Open GitHubDialog directly on the PR detail subpage for this task's
+   *  `prUrl` — see the header "View PR" affordance below. Same App-level-
+   *  singleton ownership rationale as `onOpenPullRequest`. */
+  onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
 }
 
 const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" | "destructive"> = {
@@ -169,7 +174,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest }: Props) {
+export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -259,6 +264,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           onArchive={onArchive}
           onUnarchive={onUnarchive}
           onOpenPullRequest={onOpenPullRequest}
+          onViewPullRequest={onViewPullRequest}
         />
       </aside>
     </>
@@ -281,6 +287,7 @@ function RunPanelBody({
   onArchive,
   onUnarchive,
   onOpenPullRequest,
+  onViewPullRequest,
 }: {
   task: Task;
   agents: AgentStatus[];
@@ -297,6 +304,7 @@ function RunPanelBody({
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
   onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
+  onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
@@ -1990,6 +1998,12 @@ function RunPanelBody({
     applySendCaptured(result.items);
   };
 
+  // Captured as a local const (not read via `task.prUrl` inline) so its
+  // narrowing to non-null survives into the onClick closure below — TS
+  // drops narrowing on a mutable property access once it's referenced
+  // inside a nested function expression.
+  const prUrl = task.prUrl;
+
   return (
     <>
       <header className="flex items-start justify-between gap-2 border-b border-border/60 p-3">
@@ -2007,15 +2021,28 @@ function RunPanelBody({
           {/* Lives in the header (not the composer chip row) so the link stays
               reachable on archived tasks and after orphan reconciliation
               clears the resumable run — pr_url is durable, the link must be
-              too. */}
-          {task.prUrl && (
-            <ExternalLink
-              href={task.prUrl}
-              className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
-              title="Open the pull request created for this task"
-            >
-              <GitPullRequest className="mr-1 size-3" /> View PR
-            </ExternalLink>
+              too. When the URL parses to a PR number, open the in-app detail
+              subpage directly; otherwise (an unrecognized provider URL
+              shape) fall back to the plain external link, as before. */}
+          {prUrl && (
+            parsePullNumber(prUrl) != null ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
+                title="Open the pull request created for this task"
+              >
+                <GitPullRequest className="mr-1 size-3" /> View PR
+              </Button>
+            ) : (
+              <ExternalLink
+                href={prUrl}
+                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
+                title="Open the pull request created for this task"
+              >
+                <GitPullRequest className="mr-1 size-3" /> View PR
+              </ExternalLink>
+            )
           )}
           <Button
             size="sm"

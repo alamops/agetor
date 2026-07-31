@@ -25,6 +25,7 @@ import {
   createGitHubPullLineComment,
   getGitHubPullChecks,
   getGitHubPullDefaults,
+  getGitHubPullDetail,
   getGitHubPullDiff,
   getGitHubViewer,
   listGitHubComments,
@@ -48,6 +49,7 @@ import {
   createGitLabPullLineComment,
   getGitLabPullChecks,
   getGitLabPullDefaults,
+  getGitLabPullDetail,
   getGitLabPullDiff,
   getGitLabViewer,
   listGitLabComments,
@@ -68,6 +70,7 @@ import {
   createBitbucketPullLineComment,
   getBitbucketPullChecks,
   getBitbucketPullDefaults,
+  getBitbucketPullDetail,
   getBitbucketPullDiff,
   getBitbucketViewer,
   listBitbucketComments,
@@ -376,6 +379,25 @@ export async function pullDiff(input: { dir: string; number: number }): Promise<
   if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
   if (repoInfo.provider === "github") return getGitHubPullDiff(input);
   return repoInfo.provider === "gitlab" ? getGitLabPullDiff(repoInfo, input.number) : getBitbucketPullDiff(repoInfo, input.number);
+}
+
+/**
+ * Fetches a single pull request by number — powers the Git Integration
+ * modal's future PR detail subpage (opening directly on a task's stored PR
+ * URL instead of landing on the list). All three providers are fully wired:
+ * GitHub via `getGitHubPullDetail`, GitLab via `getGitLabPullDetail`,
+ * Bitbucket via `getBitbucketPullDetail` — each a plain single-item GET
+ * normalized through the same mapper its provider's list/mutation paths use.
+ */
+export async function pullDetail(input: { dir: string; number: number }): Promise<IssueResponse> {
+  const repoInfo = await providerRepoForDir(input.dir);
+  if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
+  if (repoInfo.provider === "github") return getGitHubPullDetail(input);
+  const res = repoInfo.provider === "gitlab"
+    ? await getGitLabPullDetail(repoInfo, input.number)
+    : await getBitbucketPullDetail(repoInfo, input.number);
+  if (!res.ok) return res;
+  return { ...res, item: withSourcePath(res.item, input.dir) };
 }
 
 export interface ListCommentsInput {

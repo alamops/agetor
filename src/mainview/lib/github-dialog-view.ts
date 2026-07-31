@@ -21,12 +21,16 @@ export type GitHubPanelKind =
  * PR/issue browser, "detail" is the full-panel subpage for a single item
  * (replaces the old inline accordion expansion), "panel" is one of the 7
  * manager panels (labels, milestones, releases, notifications, actions,
- * projects, discussions).
+ * projects, discussions), "compose" is the New-PR / New-issue subpage
+ * (replaces the old inline composer accordion) — no payload, since which
+ * composer renders follows the dialog's existing pulls/issues `kind` state,
+ * exactly like the list body already does.
  */
 export type GitHubDialogView =
   | { kind: "list" }
   | { kind: "detail"; item: GitHubListItem }
-  | { kind: "panel"; panel: GitHubPanelKind };
+  | { kind: "panel"; panel: GitHubPanelKind }
+  | { kind: "compose" };
 
 /** Navigate to the detail subpage for `item`. */
 export function openDetail(item: GitHubListItem): GitHubDialogView {
@@ -36,6 +40,11 @@ export function openDetail(item: GitHubListItem): GitHubDialogView {
 /** Navigate to a manager panel. */
 export function openPanel(panel: GitHubPanelKind): GitHubDialogView {
   return { kind: "panel", panel };
+}
+
+/** Navigate to the New-PR / New-issue compose subpage. */
+export function openCompose(): GitHubDialogView {
+  return { kind: "compose" };
 }
 
 /** Navigate back to the list view. */
@@ -56,8 +65,8 @@ export function togglePanel(view: GitHubDialogView, panel: GitHubPanelKind): Git
 /**
  * Resolve what Escape (or a backdrop click) should do given the current view:
  * pop the subpage back to the list, or close the modal outright. Only the
- * list view closes the modal — any other view (detail or panel) pops to the
- * list first.
+ * list view closes the modal — any other view (detail, panel, or compose)
+ * pops to the list first.
  */
 export function resolveEscape(view: GitHubDialogView): "pop" | "close" {
   return view.kind === "list" ? "close" : "pop";

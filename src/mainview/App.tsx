@@ -7,7 +7,7 @@ import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harnes
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
-import { GitHubDialog, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
+import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -23,6 +23,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
+import { parsePullNumber } from "@/lib/pr-url";
 import { cn } from "@/lib/utils";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
@@ -155,6 +156,11 @@ export default function App() {
   // specific task; cleared when the dialog closes so a later plain "GitHub"
   // open (no prefill) doesn't inherit a stale project/task.
   const [githubPullPrefill, setGithubPullPrefill] = useState<GitHubPullPrefill | null>(null);
+  // Set by RunPanel's "View PR" header affordance to open GitHubDialog
+  // straight on that PR's detail subpage; cleared alongside `githubPullPrefill`
+  // above (dialog close, or the other prefill kind winning a race) so only
+  // one prefill kind is ever live at a time.
+  const [githubPullDetailPrefill, setGithubPullDetailPrefill] = useState<GitHubPullDetailPrefill | null>(null);
   const [worktreesOpen, setWorktreesOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
@@ -853,6 +859,22 @@ export default function App() {
         onUnarchive={unarchive}
         onOpenPullRequest={(prefill) => {
           setGithubPullPrefill(prefill);
+          setGithubPullDetailPrefill(null);
+          setGithubOpen(true);
+        }}
+        onViewPullRequest={({ projectPath, prUrl }) => {
+          const number = parsePullNumber(prUrl);
+          if (number == null) {
+            // Can't drive the in-app detail subpage without a parsed PR
+            // number — fall back to the plain external link rather than
+            // silently doing nothing.
+            void api.openExternal(prUrl).catch((err: unknown) => {
+              toast.error(err instanceof Error ? err.message : "Could not open link");
+            });
+            return;
+          }
+          setGithubPullDetailPrefill({ projectPath, number, prUrl });
+          setGithubPullPrefill(null);
           setGithubOpen(true);
         }}
       />
@@ -864,11 +886,13 @@ export default function App() {
       <GitHubDialog
         open={githubOpen}
         projects={projects}
-        initialProjectPath={githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        initialProjectPath={githubPullDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
         pullPrefill={githubPullPrefill}
+        pullDetailPrefill={githubPullDetailPrefill}
         onClose={() => {
           setGithubOpen(false);
           setGithubPullPrefill(null);
+          setGithubPullDetailPrefill(null);
         }}
       />
       <WorktreesDialog

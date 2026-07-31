@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   backToList,
+  openCompose,
   openDetail,
   openPanel,
   resolveEscape,
@@ -59,6 +60,18 @@ test("backToList returns the list view", () => {
   expect(backToList()).toEqual({ kind: "list" });
 });
 
+test("backToList returns the list view from a compose view", () => {
+  const view = openCompose();
+  expect(view).toEqual({ kind: "compose" });
+  expect(backToList()).toEqual({ kind: "list" });
+});
+
+describe("openCompose", () => {
+  test("opens the compose view", () => {
+    expect(openCompose()).toEqual({ kind: "compose" });
+  });
+});
+
 describe("openPanel", () => {
   for (const panel of PANEL_KINDS) {
     test(`opens the ${panel} panel`, () => {
@@ -86,6 +99,11 @@ describe("togglePanel", () => {
     const view = openDetail(item({ kind: "pulls", number: 3 }));
     expect(togglePanel(view, "actions")).toEqual({ kind: "panel", panel: "actions" });
   });
+
+  test("from a compose view, opens the requested panel (current implementation replaces compose; it does not restore the underlying list/compose on toggle-off)", () => {
+    const view = openCompose();
+    expect(togglePanel(view, "actions")).toEqual({ kind: "panel", panel: "actions" });
+  });
 });
 
 describe("resolveEscape", () => {
@@ -99,5 +117,9 @@ describe("resolveEscape", () => {
 
   test("pops to the list from a panel view", () => {
     expect(resolveEscape(openPanel("discussions"))).toBe("pop");
+  });
+
+  test("pops to the list from a compose view", () => {
+    expect(resolveEscape(openCompose())).toBe("pop");
   });
 });
