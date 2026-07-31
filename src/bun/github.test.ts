@@ -231,6 +231,7 @@ test("normalizeMergeability reads mergeable/state and refs, defaulting the unkno
     rebaseable: true,
     merged: false,
     draft: false,
+    state: "unknown",
     headRef: "feature",
     baseRef: "main",
     headSha: "abc123",

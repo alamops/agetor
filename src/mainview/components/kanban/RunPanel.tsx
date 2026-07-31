@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash, SquareSlash,
+  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, RefreshCw, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
@@ -12,7 +12,8 @@ import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sort
 import { shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { latestPrProposal } from "@/lib/pr-proposal";
-import { parsePullNumber } from "@/lib/pr-url";
+import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
+import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -32,6 +33,7 @@ import {
   type AgentStatus,
   type Harness,
   type BacklogMessage,
+  type GitHubPullMergeability,
   type Run,
   type RunEvent,
   type Subagent,
@@ -449,6 +451,22 @@ function RunPanelBody({
     setSearchQuery("");
     setActiveMatchId(null);
     nearBottomRef.current = true;
+    // Old task's PR mergeability (and "Resolve Conflicts" send confirmation)
+    // must not survive into the new task: RunPanelBody isn't remounted on
+    // task switch, so without this a stale `prStatus` from task A could sit
+    // around and let the button send task A's PR prompt into task B's agent
+    // before the `[task.id, task.prUrl]` fetch effect below resolves. These
+    // setters/refs are declared further down this component (with the rest
+    // of the PR-status state) — safe to reference here since this closure
+    // only runs after the full component body (and their declarations) has
+    // executed at least once.
+    setPrStatus(null);
+    setPrStatusError(null);
+    setResolveConflictsSent(false);
+    if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
+    prStatusRetryTimerRef.current = null;
+    if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+    resolveConflictsSentTimerRef.current = null;
   }, [task.id]);
 
   // Latest run for this task — drives the send button, indicator, and
@@ -1709,6 +1727,118 @@ function RunPanelBody({
     return () => { cancelled = true; };
   }, [task.id]);
 
+  // PR mergeability for the header "Resolve Conflicts" button. `parsedPrUrl`
+  // is derived once per `task.prUrl` change and reused for both the fetch
+  // effect and the render-time gate (`canOfferResolveConflicts`).
+  const parsedPrUrl = useMemo(() => parsePrUrl(task.prUrl), [task.prUrl]);
+  const [prStatus, setPrStatus] = useState<GitHubPullMergeability | null>(null);
+  const [prStatusLoading, setPrStatusLoading] = useState(false);
+  const [prStatusError, setPrStatusError] = useState<string | null>(null);
+  // Invalidates an in-flight fetch (including a pending self-heal retry)
+  // when a newer one starts — manual refresh, turn-end retrigger, or the
+  // task switching to a different PR before the previous fetch settled.
+  const prStatusSeqRef = useRef(0);
+  // Self-heal retry budget: GitHub's `mergeable` field is null while it's
+  // still computing in the background. One delayed re-poll (mirrors
+  // GitHubDialog's mergeability self-heal) before giving up; reset to 0
+  // whenever a fresh fetch starts (manual refresh or turn-end retrigger).
+  const prStatusRetriesRef = useRef(0);
+  // Holds the self-heal retry's `setTimeout` id so it can be cancelled on
+  // unmount (or superseded by a fresh fetch) instead of firing later against
+  // an unmounted tree — see the mount-scoped cleanup effect below.
+  const prStatusRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchPrStatus = useCallback((path: string, number: number) => {
+    const requestId = ++prStatusSeqRef.current;
+    if (prStatusRetryTimerRef.current) {
+      clearTimeout(prStatusRetryTimerRef.current);
+      prStatusRetryTimerRef.current = null;
+    }
+    // Clear stale data at fetch start (not just on completion) so a task
+    // switch never leaves the previous task's mergeability visible — and
+    // therefore actionable via "Resolve Conflicts" — while this fetch is
+    // still in flight.
+    setPrStatus(null);
+    setPrStatusError(null);
+    setPrStatusLoading(true);
+    api.getGitHubPullMergeability({ path, number })
+      .then((payload) => {
+        if (requestId !== prStatusSeqRef.current) return;
+        setPrStatus(payload);
+        if (payload.mergeable === null && !payload.merged && prStatusRetriesRef.current < 1) {
+          prStatusRetriesRef.current += 1;
+          prStatusRetryTimerRef.current = setTimeout(() => {
+            prStatusRetryTimerRef.current = null;
+            if (requestId !== prStatusSeqRef.current) return;
+            fetchPrStatus(path, number);
+          }, 2_500);
+        }
+      })
+      .catch((e: unknown) => {
+        if (requestId !== prStatusSeqRef.current) return;
+        setPrStatus(null);
+        setPrStatusError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (requestId !== prStatusSeqRef.current) return;
+        setPrStatusLoading(false);
+      });
+  }, []);
+  // Mount-scoped cleanup: drop any in-flight fetch/self-heal retry and clear
+  // its timer on unmount, so a late response never calls setState on an
+  // unmounted tree (RunPanelBody isn't remounted on task switch, but it *is*
+  // unmounted when the run panel itself closes).
+  useEffect(() => {
+    return () => {
+      prStatusSeqRef.current++;
+      if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
+    };
+  }, []);
+
+  // Deps are `[task.id, task.prUrl]` ONLY — not `[task]` — for the same
+  // reason as the git-status poll effect above: App.tsx's 2s /tasks poll
+  // rebuilds the task object every tick, and depending on the whole object
+  // (or on `task.workdir`, read via closure below) would refetch on every
+  // poll tick instead of only on an actual task/PR change.
+  useEffect(() => {
+    const parsed = parsePrUrl(task.prUrl);
+    if (!parsed) {
+      prStatusSeqRef.current++; // invalidate any in-flight fetch/retry
+      prStatusRetriesRef.current = 0;
+      setPrStatus(null);
+      setPrStatusLoading(false);
+      setPrStatusError(null);
+      return;
+    }
+    prStatusRetriesRef.current = 0;
+    fetchPrStatus(task.workdir, parsed.number);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task.id, task.prUrl]);
+
+  // Re-check mergeability at turn-end: track whether the task was "running"
+  // on the previous render and refetch once it transitions away from
+  // "running" (succeeded, failed, blocked, …) — the agent may have pushed
+  // commits that resolve, or newly introduce, a conflict. `task.runId` is
+  // NOT a usable signal for this: it's never nulled on normal turn
+  // completion (only the orphan-reconciliation/error paths null it — see
+  // the comment at `liveRunTerminal` above), so a non-null → null transition
+  // never fires in the common case. `task.column` is authoritative instead.
+  const wasRunningForPrStatusRef = useRef(task.column === "running");
+  useEffect(() => {
+    const wasRunning = wasRunningForPrStatusRef.current;
+    wasRunningForPrStatusRef.current = task.column === "running";
+    if (!wasRunning || task.column === "running") return;
+    const parsed = parsePrUrl(task.prUrl);
+    if (!parsed) return;
+    prStatusRetriesRef.current = 0;
+    fetchPrStatus(task.workdir, parsed.number);
+  }, [task.column, task.prUrl, task.workdir, fetchPrStatus]);
+
+  const refreshPrStatus = () => {
+    if (!parsedPrUrl) return;
+    prStatusRetriesRef.current = 0;
+    fetchPrStatus(task.workdir, parsedPrUrl.number);
+  };
+
   const send = async () => {
     const line = input.trim();
     if (!line && !sendRefs.length) return;
@@ -1946,6 +2076,67 @@ function RunPanelBody({
     }
   };
 
+  // One-click follow-up: ask the agent to merge the base branch and resolve
+  // the conflicts blocking this task's PR. Reuses the same `sendRunInput`
+  // plumbing as `sendCommitPush`. `resolvingConflicts` is its own in-flight
+  // flag (rather than reusing `sending`) so the button's own disabled state
+  // and "Sent to agent" confirmation don't get tangled up with the composer's.
+  const [resolvingConflicts, setResolvingConflicts] = useState(false);
+  const [resolveConflictsSent, setResolveConflictsSent] = useState(false);
+  const resolveConflictsSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+  }, []);
+  const sendResolveConflicts = async () => {
+    // `resolveConflictsSent` in the guard turns the 5s "Sent to agent"
+    // confirmation window into a lockout, not just a label — otherwise the
+    // button re-enables the instant `resolvingConflicts` resets in `finally`
+    // and a second click pastes a duplicate merge prompt into the live tmux
+    // session (`sendRunInput` is deliberately retry:false).
+    if (!resumableRunId || modalPending || sending || backlogBusy || resolvingConflicts || resolveConflictsSent) return;
+    // Belt-and-braces against the stale-`prStatus` case: even though the
+    // reset effect and fetch-start clear above should keep `prStatus` in
+    // sync with the current task's PR, refuse to send unless it still
+    // matches the PR the button is currently showing.
+    if (!parsedPrUrl || !prStatus || prStatus.pullNumber !== parsedPrUrl.number) return;
+    const prompt = buildResolveConflictsPrompt({
+      repo: prStatus.repo,
+      number: prStatus.pullNumber,
+      title: null,
+      headRef: prStatus.headRef,
+      baseRef: prStatus.baseRef,
+    });
+    setResolvingConflicts(true);
+    setSendHint(null);
+    try {
+      const res = await api.sendRunInput(resumableRunId, prompt);
+      if (!res.delivered) {
+        setSendHint(res.reason);
+        // The button can be hidden (archived, subagent tab) by the time this
+        // resolves, which would make `sendHint` invisible — toast so the
+        // failure is surfaced regardless.
+        toast.error(res.reason);
+      } else {
+        setRebuilt(null);
+        setRebuildNote(null);
+        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        nearBottomRef.current = true;
+        requestAnimationFrame(() => {
+          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+        });
+        if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+        setResolveConflictsSent(true);
+        resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setSendHint(msg);
+      toast.error(msg);
+    } finally {
+      setResolvingConflicts(false);
+    }
+  };
+
   // Drag/drop + paste capture for the message textarea. Mirrors the
   // NewTaskForm sidebar flow: pathful files come straight through, blob
   // screenshots (macOS floating thumbnail, clipboard paste) get uploaded
@@ -2054,6 +2245,46 @@ function RunPanelBody({
                 <GitPullRequest className="mr-1 size-3" /> View PR
               </ExternalLink>
             )
+          )}
+          {/* Manual re-check — only once a first fetch has settled, so it
+              doesn't appear (and immediately duplicate) the initial load. */}
+          {parsedPrUrl && (prStatus != null || prStatusError != null) && (
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={refreshPrStatus}
+              disabled={prStatusLoading}
+              title={prStatusError ?? "Re-check PR mergeability"}
+            >
+              <RefreshCw className="size-3.5" />
+            </Button>
+          )}
+          {/* Gated on `!archived` (the server silently auto-unarchives on
+              other mutations, but this button must not act as though it
+              were live on a frozen task) and on `activeStream === "main"`
+              (mirrors Stop below — a read-only subagent stream tab has no
+              `sendHint` rendered, so a failure here would be invisible;
+              `sendResolveConflicts` also toasts for the same reason). */}
+          {!archived && activeStream === "main" && canOfferResolveConflicts(parsedPrUrl, prStatus) && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void sendResolveConflicts()}
+              disabled={!canSend || modalPending || sending || backlogBusy || resolvingConflicts || resolveConflictsSent}
+              title={
+                !canSend
+                  ? "Start the task before asking the agent to resolve conflicts"
+                  : modalPending
+                    ? "Answer the pending prompt before sending another message"
+                    : resolveConflictsSent
+                      ? "Already sent — waiting for the agent to pick it up"
+                      : sending || backlogBusy || resolvingConflicts
+                        ? "A message is already being sent"
+                        : "Ask the agent to merge the base branch and resolve the reported conflicts"
+              }
+            >
+              <GitMerge className="mr-1 size-3" /> {resolveConflictsSent ? "Sent to agent" : "Resolve Conflicts"}
+            </Button>
           )}
           <Button
             size="sm"

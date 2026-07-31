@@ -8,6 +8,7 @@ import type {
   GitHubListItem,
   GitHubListResult,
   GitHubPullDefaultsResult,
+  GitHubPullMergeability,
   GitHubPullLineComment,
   GitHubPullMergeMethod,
   GitHubPullMergeResult,
@@ -100,9 +101,38 @@ function repoBasePath(repo: ProviderRepoInfo): string {
 
 /** Absolute-URL passthrough: a `next` pagination link (or any other
  *  already-absolute URL a caller builds via `new URL(...)`) is used as-is;
- *  anything else is treated as a path relative to the Bitbucket API base. */
+ *  anything else is treated as a path relative to the Bitbucket API base.
+ *  Every absolute URL that reaches this function today is built internally
+ *  from `BITBUCKET_API_BASE` (e.g. `new URL(\`${BITBUCKET_API_BASE}...\`)`),
+ *  so passthrough is safe here — but a `next` link taken verbatim from a
+ *  Bitbucket response body is NOT internally-constructed, and paging call
+ *  sites must validate it with `sanitizeNextUrl` (below) before ever handing
+ *  it to `fetchBitbucket`/`resolveUrl`, since `fetchBitbucket` attaches the
+ *  user's credentials to whatever host it's given. */
 function resolveUrl(pathOrUrl: string): string {
   return /^https?:\/\//i.test(pathOrUrl) ? pathOrUrl : `${BITBUCKET_API_BASE}${pathOrUrl}`;
+}
+
+const BITBUCKET_API_ORIGIN = new URL(BITBUCKET_API_BASE).origin;
+
+/**
+ * Validates a pagination `next` URL pulled out of a Bitbucket response body
+ * before it's ever fetched. Bitbucket puts `next` directly in the JSON body
+ * (not a header), so a malicious/compromised response — or credentials
+ * reused against a lookalike host — could point `next` at an arbitrary
+ * origin; `fetchBitbucket` would otherwise attach the same Authorization
+ * header to that request via `resolveUrl`'s absolute-URL passthrough. Only a
+ * same-origin-as-`BITBUCKET_API_BASE` absolute URL is accepted; anything
+ * else (wrong origin, unparseable, missing) returns null so paging call
+ * sites can treat it as end-of-pages rather than as a page to fetch.
+ */
+function sanitizeNextUrl(next: unknown): string | null {
+  if (typeof next !== "string" || !next) return null;
+  try {
+    return new URL(next).origin === BITBUCKET_API_ORIGIN ? next : null;
+  } catch {
+    return null;
+  }
 }
 
 /** How many extra pages a comment listing follows beyond the first — 5 pages
@@ -115,12 +145,14 @@ const BITBUCKET_MAX_EXTRA_PAGES = 4;
  * `values`. `firstBody` is the already-fetched, already-error-checked page-1
  * body. A fetch/parse failure mid-pagination stops the walk and returns what
  * has accumulated so far — partial results beat failing a listing whose first
- * page already succeeded.
+ * page already succeeded. Each `next` is validated by `sanitizeNextUrl`
+ * before being fetched, so a hostile/off-origin `next` just ends the walk
+ * rather than leaking credentials to it.
  */
 async function collectRemainingValues(firstBody: unknown, creds: BitbucketCreds | null): Promise<unknown[]> {
   const extra: unknown[] = [];
-  let next = firstBody && typeof firstBody === "object" ? (firstBody as { next?: unknown }).next : null;
-  for (let i = 0; i < BITBUCKET_MAX_EXTRA_PAGES && typeof next === "string" && next; i++) {
+  let next = sanitizeNextUrl(firstBody && typeof firstBody === "object" ? (firstBody as { next?: unknown }).next : null);
+  for (let i = 0; i < BITBUCKET_MAX_EXTRA_PAGES && next; i++) {
     const res = await fetchBitbucket(next, creds, "application/json");
     if (!("status" in res) || !res.ok) break;
     const body = await res.json().catch(() => null);
@@ -129,7 +161,7 @@ async function collectRemainingValues(firstBody: unknown, creds: BitbucketCreds 
       : null;
     if (!values) break;
     extra.push(...values);
-    next = (body as { next?: unknown }).next;
+    next = sanitizeNextUrl((body as { next?: unknown }).next);
   }
   return extra;
 }
@@ -874,6 +906,171 @@ export async function getBitbucketPullChecks(repo: ProviderRepoInfo, number: num
   return { ok: true, repo: `${repo.owner}/${repo.name}`, pullNumber: number, sha, checkRuns };
 }
 
+type BitbucketMergeabilityResponse = ({ ok: true } & GitHubPullMergeability) | BitbucketError;
+
+/** How many diffstat pages `scanBitbucketDiffstatConflicts` will follow before
+ *  giving up and reporting "unknown" rather than risk a false "clean" on
+ *  partial data — 10 pages of `pagelen=100` covers 1000 changed files. */
+const BITBUCKET_DIFFSTAT_PAGE_CAP = 10;
+
+/**
+ * Scans a pull request's diffstat for Bitbucket's per-file `status: "merge
+ * conflict"` marker — Bitbucket Cloud's PR resource has no top-level
+ * mergeable field (unlike GitHub's `mergeable`/`mergeable_state`), so the
+ * diffstat listing is the only conflict signal available. Stops as soon as a
+ * conflicted entry is found. Returns:
+ *  - "dirty" as soon as any page yields a conflicted entry.
+ *  - "clean" only once every page has been walked (no `next` remains) with
+ *    no conflicted entry seen.
+ *  - "unknown" on any fetch/parse failure, when the page cap is exhausted
+ *    while a `next` link still remains, or when a `next` link is rejected by
+ *    `sanitizeNextUrl` (off-origin/malformed) — reporting "clean" on partial
+ *    data would be worse than reporting "unknown".
+ */
+async function scanBitbucketDiffstatConflicts(
+  repo: ProviderRepoInfo,
+  number: number,
+  creds: BitbucketCreds | null,
+): Promise<"dirty" | "clean" | "unknown"> {
+  const firstUrl = new URL(`${BITBUCKET_API_BASE}${repoBasePath(repo)}/pullrequests/${number}/diffstat`);
+  firstUrl.searchParams.set("pagelen", "100");
+  let url: string | null = firstUrl.toString();
+
+  for (let page = 0; page < BITBUCKET_DIFFSTAT_PAGE_CAP && url; page++) {
+    const res = await fetchBitbucket(url, creds, "application/json");
+    if (!("status" in res) || !res.ok) return "unknown";
+    const body = await res.json().catch(() => null);
+    const values = body && typeof body === "object" && Array.isArray((body as { values?: unknown }).values)
+      ? (body as { values: unknown[] }).values
+      : null;
+    if (!values) return "unknown";
+    for (const raw of values) {
+      const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : null;
+      const status = obj && typeof obj.status === "string" ? obj.status : "";
+      // "merge conflict" covers a modify/modify conflict; a delete/modify
+      // conflict instead surfaces as a per-side "local deleted"/"remote
+      // deleted" status with no "conflict" substring of its own — without
+      // this, a deleted-vs-modified file would walk through as clean.
+      if (status.includes("conflict") || status === "local deleted" || status === "remote deleted") return "dirty";
+    }
+    const rawNext = (body as { next?: unknown }).next;
+    // A `next` link present but rejected by `sanitizeNextUrl` (off-origin,
+    // malformed) is NOT the same as no `next` at all — there may be more
+    // pages this scan is refusing to follow, so it must not fall through to
+    // "clean" below. Distinguish "no next" (natural end) from "next present
+    // but untrusted" (unresolved end) explicitly.
+    if (typeof rawNext === "string" && rawNext) {
+      const sanitized = sanitizeNextUrl(rawNext);
+      if (!sanitized) return "unknown";
+      url = sanitized;
+    } else {
+      url = null;
+    }
+  }
+  return url ? "unknown" : "clean";
+}
+
+/**
+ * Pure field mapping from a Bitbucket PR detail JSON plus a pre-computed
+ * `conflictScan` verdict (from `scanBitbucketDiffstatConflicts`) into the
+ * shared `GitHubPullMergeability` shape. Kept separate from the network walk
+ * so the mapping is test-friendly without mocking fetch. `mergeable`/
+ * `mergeableState` only reflect `conflictScan` when the PR is OPEN — a
+ * merged/declined/superseded PR has nothing left to conflict against, so it
+ * always reports "unknown"/null there, matching `getBitbucketPullMergeability`
+ * (which skips the diffstat scan entirely for non-OPEN state).
+ */
+export function normalizeBitbucketMergeability(
+  repo: ProviderRepoInfo,
+  number: number,
+  pr: unknown,
+  conflictScan: "dirty" | "clean" | "unknown",
+): GitHubPullMergeability {
+  const obj = pr && typeof pr === "object" ? pr as Record<string, unknown> : {};
+  const source = obj.source && typeof obj.source === "object" ? obj.source as Record<string, unknown> : {};
+  const destination = obj.destination && typeof obj.destination === "object"
+    ? obj.destination as Record<string, unknown>
+    : {};
+  const sourceBranch = source.branch && typeof source.branch === "object" ? source.branch as Record<string, unknown> : {};
+  const destBranch = destination.branch && typeof destination.branch === "object"
+    ? destination.branch as Record<string, unknown>
+    : {};
+  const sourceCommit = source.commit && typeof source.commit === "object" ? source.commit as Record<string, unknown> : {};
+  const sourceRepo = source.repository && typeof source.repository === "object"
+    ? source.repository as Record<string, unknown>
+    : {};
+  const destRepo = destination.repository && typeof destination.repository === "object"
+    ? destination.repository as Record<string, unknown>
+    : {};
+
+  const headRepo = typeof sourceRepo.full_name === "string" ? sourceRepo.full_name : null;
+  const baseRepo = typeof destRepo.full_name === "string" ? destRepo.full_name : null;
+  const state = typeof obj.state === "string" ? obj.state : "";
+
+  const { mergeable, mergeableState } = state === "OPEN"
+    ? conflictScan === "dirty"
+      ? { mergeable: false, mergeableState: "dirty" }
+      : conflictScan === "clean"
+        ? { mergeable: true, mergeableState: "clean" }
+        : { mergeable: null, mergeableState: "unknown" }
+    : { mergeable: null, mergeableState: "unknown" };
+
+  const normalizedState = state === "OPEN" ? "open" : state === "MERGED" ? "merged" : (state === "DECLINED" || state === "SUPERSEDED") ? "closed" : "unknown";
+
+  return {
+    repo: `${repo.owner}/${repo.name}`,
+    pullNumber: number,
+    mergeable,
+    mergeableState,
+    rebaseable: null,
+    merged: state === "MERGED",
+    draft: obj.draft === true,
+    state: normalizedState,
+    headRef: typeof sourceBranch.name === "string" ? sourceBranch.name : "",
+    baseRef: typeof destBranch.name === "string" ? destBranch.name : "",
+    headSha: typeof sourceCommit.hash === "string" ? sourceCommit.hash : "",
+    autoMerge: false,
+    headRepo,
+    // Fail closed: only a confirmed same-full_name match is same-repo. A
+    // missing head or base repo (can't confirm) is treated as cross-repo,
+    // matching github.ts's normalizeMergeability contract.
+    crossRepo: headRepo === null || baseRepo === null || headRepo !== baseRepo,
+  };
+}
+
+/**
+ * Bitbucket's PR resource carries no `mergeable`/`mergeable_state` fields
+ * (unlike GitHub), so this fetches the PR detail for the head/base/state
+ * fields and — only when the PR is OPEN — follows up with a diffstat scan
+ * (`scanBitbucketDiffstatConflicts`) for the actual conflict signal. Non-OPEN
+ * PRs (merged/declined/superseded) skip the scan entirely, matching
+ * `normalizeBitbucketMergeability`'s non-OPEN "unknown" mapping. Unlike
+ * `getGitHubPullMergeability`, there's no retry/poll loop — Bitbucket's
+ * diffstat is computed synchronously, not in the background.
+ */
+export async function getBitbucketPullMergeability(
+  repo: ProviderRepoInfo,
+  number: number,
+): Promise<BitbucketMergeabilityResponse> {
+  if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
+  const creds = await bitbucketCreds(repo.remoteHost);
+
+  const res = await fetchBitbucket(`${repoBasePath(repo)}/pullrequests/${number}`, creds, "application/json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!json || typeof json !== "object") {
+    return { ok: false, error: "Bitbucket returned an unexpected pull request response" };
+  }
+
+  const state = typeof (json as Record<string, unknown>).state === "string"
+    ? (json as Record<string, unknown>).state as string
+    : "";
+  const conflictScan = state === "OPEN" ? await scanBitbucketDiffstatConflicts(repo, number, creds) : "unknown";
+
+  return { ok: true, ...normalizeBitbucketMergeability(repo, number, json, conflictScan) };
+}
+
 /** Matches `getGitHubPullDetail`'s shape — a single pull request by number,
  *  normalized through the same `normalizeBitbucketPull` mapper
  *  `closeBitbucketPull` uses. `sourcePath` is left `null` here, same as every
@@ -1136,6 +1333,8 @@ export const __bitbucketInternals = {
   normalizeBitbucketComment,
   normalizeBitbucketLineComment,
   normalizeBitbucketCheckRun,
+  normalizeBitbucketMergeability,
+  scanBitbucketDiffstatConflicts,
   escapeBBQLString,
   prStateParams,
   issueStateBBQL,

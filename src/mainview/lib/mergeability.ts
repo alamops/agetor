@@ -14,10 +14,16 @@ export interface MergeabilityView {
  *  Pure — drives whether a PR can be merged from the UI, so it's unit-tested. */
 export function mergeabilityView(m: GitHubPullMergeability): MergeabilityView {
   if (m.mergeable === null) {
+    // `mergeable === null` can be a transient "still computing" state
+    // (GitHub) or a PERMANENT unknown (Bitbucket, when the diffstat scan
+    // fails or hits its page cap) — there's no way to tell them apart from
+    // this shape alone. Keeping the merge button enabled here matches the
+    // pre-mergeability-feature baseline (no verdict meant merge stayed
+    // enabled) rather than regressing Bitbucket to a permanently dead button.
     return {
-      label: "GitHub is still checking mergeability…",
+      label: "Mergeability hasn't been verified — merging will be attempted as-is",
       tone: "muted",
-      canMerge: false,
+      canMerge: true,
       showUpdateBranch: m.mergeableState === "behind",
     };
   }

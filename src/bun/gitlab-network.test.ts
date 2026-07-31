@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mockGitLabFetch, sampleRepo } from "./gitlab-test-util.ts";
+import { gitlabMergeRequest, mockGitLabFetch, sampleRepo } from "./gitlab-test-util.ts";
 import {
   closeGitLabPull,
   createGitLabComment,
@@ -16,11 +16,13 @@ import {
   getGitLabPullChecks,
   getGitLabPullDefaults,
   getGitLabPullDiff,
+  getGitLabPullMergeability,
   getGitLabViewer,
   listGitLabComments,
   listGitLabItems,
   listGitLabLabels,
   mergeGitLabPull,
+  normalizeGitLabMergeability,
   replyGitLabLineComment,
   reopenGitLabPull,
   reviewGitLabPull,
@@ -681,6 +683,235 @@ test("a 401 response surfaces the authHint wording pointing at Settings", async 
   } finally {
     mock.restore();
   }
+});
+
+// ---------------------------------------------------------------------------
+// getGitLabPullMergeability / normalizeGitLabMergeability
+// ---------------------------------------------------------------------------
+
+test("getGitLabPullMergeability: detailed_merge_status:conflict -> dirty/mergeable:false, headRef/baseRef from branches, state:open", async () => {
+  const mock = mockGitLabFetch([
+    {
+      match: "/merge_requests/5",
+      json: gitlabMergeRequest({
+        iid: 5,
+        state: "opened",
+        detailed_merge_status: "conflict",
+        source_branch: "feature",
+        target_branch: "main",
+        source_project_id: 1,
+        target_project_id: 1,
+      }),
+    },
+  ]);
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeableState).toBe("dirty");
+    expect(res.mergeable).toBe(false);
+    expect(res.headRef).toBe("feature");
+    expect(res.baseRef).toBe("main");
+    expect(res.state).toBe("open");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullMergeability: detailed_merge_status:mergeable -> clean/mergeable:true", async () => {
+  const mock = mockGitLabFetch([
+    { match: "/merge_requests/5", json: gitlabMergeRequest({ detailed_merge_status: "mergeable" }) },
+  ]);
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeableState).toBe("clean");
+    expect(res.mergeable).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullMergeability: detailed_merge_status:unchecked retries (1.2s apart) until the verdict settles", async () => {
+  // mockGitLabFetch's route table always returns the first matching route's
+  // fixed response, so it can't express "different body on the 2nd call" —
+  // stub globalThis.fetch directly here instead, call-count keyed.
+  let calls = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (_input: string | URL | Request, _init?: RequestInit) => {
+    calls++;
+    const detailed = calls === 1 ? "unchecked" : "conflict";
+    return new Response(JSON.stringify(gitlabMergeRequest({ detailed_merge_status: detailed })), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(calls).toBe(2);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeableState).toBe("dirty");
+  } finally {
+    globalThis.fetch = original;
+  }
+}, 10_000);
+
+test("getGitLabPullMergeability: falls back to has_conflicts:true -> dirty when detailed_merge_status is absent", async () => {
+  const mock = mockGitLabFetch([
+    { match: "/merge_requests/5", json: gitlabMergeRequest({ has_conflicts: true }) },
+  ]);
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeableState).toBe("dirty");
+    expect(res.mergeable).toBe(false);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullMergeability: falls back to merge_status:can_be_merged -> clean when neither detailed_merge_status nor has_conflicts is present", async () => {
+  const mock = mockGitLabFetch([
+    { match: "/merge_requests/5", json: gitlabMergeRequest({ merge_status: "can_be_merged" }) },
+  ]);
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeableState).toBe("clean");
+    expect(res.mergeable).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullMergeability: ci_must_pass (an explicit blocking reason) maps to blocked", async () => {
+  const mock = mockGitLabFetch([
+    { match: "/merge_requests/5", json: gitlabMergeRequest({ detailed_merge_status: "ci_must_pass", merge_status: "can_be_merged" }) },
+  ]);
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeableState).toBe("blocked");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullMergeability: a genuinely unrecognized detailed_merge_status fails safe to blocked, NOT falling back to merge_status", async () => {
+  const mock = mockGitLabFetch([
+    {
+      match: "/merge_requests/5",
+      json: gitlabMergeRequest({ detailed_merge_status: "future_status", merge_status: "can_be_merged", has_conflicts: false }),
+    },
+  ]);
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeableState).toBe("blocked");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullMergeability: source_project_id !== target_project_id -> crossRepo:true, headRepo:null", async () => {
+  const mock = mockGitLabFetch([
+    {
+      match: "/merge_requests/5",
+      json: gitlabMergeRequest({ detailed_merge_status: "mergeable", source_project_id: 1, target_project_id: 2 }),
+    },
+  ]);
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.crossRepo).toBe(true);
+    expect(res.headRepo).toBe(null);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullMergeability: missing source_project_id/target_project_id fails closed to crossRepo:true", async () => {
+  const mock = mockGitLabFetch([
+    { match: "/merge_requests/5", json: gitlabMergeRequest({ detailed_merge_status: "mergeable" }) },
+  ]);
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.crossRepo).toBe(true);
+    expect(res.headRepo).toBe(null);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullMergeability: state:merged -> merged:true, state:'merged'", async () => {
+  const mock = mockGitLabFetch([
+    { match: "/merge_requests/5", json: gitlabMergeRequest({ state: "merged", detailed_merge_status: "mergeable" }) },
+  ]);
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.merged).toBe(true);
+    expect(res.state).toBe("merged");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullMergeability: a malformed (non-object) response body fails with the unexpected-response error", async () => {
+  const mock = mockGitLabFetch([
+    { match: "/merge_requests/5", json: null },
+  ]);
+  try {
+    const res = await getGitLabPullMergeability(REPO, 5);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("unexpected merge request response");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("normalizeGitLabMergeability: draft:true via the `draft` field", () => {
+  const result = normalizeGitLabMergeability(REPO, 5, gitlabMergeRequest({ draft: true, detailed_merge_status: "mergeable" }));
+  expect(result?.draft).toBe(true);
+});
+
+test("normalizeGitLabMergeability: draft:true via `work_in_progress` when `draft` is false", () => {
+  const result = normalizeGitLabMergeability(
+    REPO,
+    5,
+    gitlabMergeRequest({ draft: false, work_in_progress: true, detailed_merge_status: "mergeable" }),
+  );
+  expect(result?.draft).toBe(true);
+});
+
+test("normalizeGitLabMergeability: headSha prefers diff_refs.head_sha over the top-level sha", () => {
+  const result = normalizeGitLabMergeability(
+    REPO,
+    5,
+    gitlabMergeRequest({ sha: "sha-fallback", diff_refs: { head_sha: "diff-refs-head" } }),
+  );
+  expect(result?.headSha).toBe("diff-refs-head");
+});
+
+test("normalizeGitLabMergeability: headSha falls back to the top-level sha when diff_refs is absent", () => {
+  const result = normalizeGitLabMergeability(REPO, 5, gitlabMergeRequest({ sha: "sha-fallback" }));
+  expect(result?.headSha).toBe("sha-fallback");
+});
+
+test("normalizeGitLabMergeability: autoMerge:true from merge_when_pipeline_succeeds", () => {
+  const result = normalizeGitLabMergeability(REPO, 5, gitlabMergeRequest({ merge_when_pipeline_succeeds: true }));
+  expect(result?.autoMerge).toBe(true);
 });
 
 // ---------------------------------------------------------------------------

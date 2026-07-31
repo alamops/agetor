@@ -81,3 +81,18 @@ test("special characters in title don't break the prompt and core instructions s
   expect(prompt).toContain("Do not push");
   expect(prompt).toContain("Commit the merge locally");
 });
+
+test("null title drops the dash/quotes clause but keeps the rest of the template intact", () => {
+  const prompt = buildResolveConflictsPrompt(input({ title: null }));
+  const firstLine = prompt.split("\n")[0];
+
+  expect(firstLine).toBe("Resolve the merge conflicts blocking acme/widgets PR #42.");
+  expect(firstLine).not.toContain("—");
+  expect(firstLine).not.toContain('"');
+  expect(prompt).toContain("`feature/resize`");
+  expect(prompt).toContain("origin/main");
+  expect(prompt).toContain("Both branches' changes matter here");
+  expect(prompt).toContain("Do not push");
+  expect(prompt).toContain("Commit the merge locally");
+  expect(prompt).toContain("references PR #42");
+});

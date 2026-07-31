@@ -11,6 +11,7 @@ function m(overrides: Partial<GitHubPullMergeability>): GitHubPullMergeability {
     rebaseable: true,
     merged: false,
     draft: false,
+    state: "open",
     headRef: "feature",
     baseRef: "main",
     headSha: "abc",
@@ -41,11 +42,11 @@ test("dirty, blocked, and draft all block the merge button", () => {
   expect(mergeabilityView(m({ mergeableState: "draft" }))).toMatchObject({ canMerge: false, showUpdateBranch: false, tone: "muted" });
 });
 
-test("mergeable === null (still computing) blocks merge; offers Update branch only when behind", () => {
+test("mergeable === null (still computing, or a permanent unknown) keeps merge enabled; offers Update branch only when behind", () => {
   expect(mergeabilityView(m({ mergeable: null, mergeableState: "unknown" })))
-    .toMatchObject({ canMerge: false, showUpdateBranch: false, tone: "muted" });
+    .toMatchObject({ canMerge: true, showUpdateBranch: false, tone: "muted" });
   expect(mergeabilityView(m({ mergeable: null, mergeableState: "behind" })))
-    .toMatchObject({ canMerge: false, showUpdateBranch: true });
+    .toMatchObject({ canMerge: true, showUpdateBranch: true });
 });
 
 test("an unknown state falls back to the computed mergeable flag", () => {
