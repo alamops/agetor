@@ -40,3 +40,49 @@ export function makeBitbucketRepo(
     name,
   };
 }
+
+/**
+ * A minimal Bitbucket pull-request detail JSON body — the shape
+ * `normalizeBitbucketMergeability` reads (`source`/`destination`
+ * branch+commit+repository, `state`, `draft`). Defaults describe an OPEN,
+ * same-repo PR (`acme/app` on both sides) so most mergeability tests only
+ * need to override `state` or layer diffstat-page fixtures on top. Pass
+ * `sourceRepoFullName: null` (or `destRepoFullName: null`) to omit that
+ * side's `repository` key entirely, exercising the fails-closed cross-repo
+ * path.
+ */
+export function makeBitbucketPrJson(overrides: {
+  id?: number;
+  state?: string;
+  draft?: boolean;
+  sourceBranch?: string;
+  destBranch?: string;
+  sourceSha?: string;
+  sourceRepoFullName?: string | null;
+  destRepoFullName?: string | null;
+} = {}): Record<string, unknown> {
+  const {
+    id = 7,
+    state = "OPEN",
+    draft = false,
+    sourceBranch = "feature",
+    destBranch = "main",
+    sourceSha = "abc123",
+    sourceRepoFullName = "acme/app",
+    destRepoFullName = "acme/app",
+  } = overrides;
+  return {
+    id,
+    state,
+    draft,
+    source: {
+      branch: { name: sourceBranch },
+      commit: { hash: sourceSha },
+      ...(sourceRepoFullName !== null ? { repository: { full_name: sourceRepoFullName } } : {}),
+    },
+    destination: {
+      branch: { name: destBranch },
+      ...(destRepoFullName !== null ? { repository: { full_name: destRepoFullName } } : {}),
+    },
+  };
+}

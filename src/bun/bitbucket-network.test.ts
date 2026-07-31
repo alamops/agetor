@@ -6,7 +6,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { makeBitbucketRepo, mockGitHubFetch } from "./bitbucket-test-util.ts";
+import { makeBitbucketPrJson, makeBitbucketRepo, mockGitHubFetch } from "./bitbucket-test-util.ts";
+import type { MockRoute } from "./bitbucket-test-util.ts";
 import {
   closeBitbucketPull,
   createBitbucketComment,
@@ -15,11 +16,13 @@ import {
   createBitbucketPullLineComment,
   getBitbucketPullDefaults,
   getBitbucketPullDiff,
+  getBitbucketPullMergeability,
   getBitbucketViewer,
   listBitbucketComments,
   listBitbucketItems,
   listBitbucketPullReviewComments,
   mergeBitbucketPull,
+  normalizeBitbucketMergeability,
   replyBitbucketLineComment,
   reopenBitbucketPull,
   reviewBitbucketPull,
@@ -492,6 +495,257 @@ test("reviewBitbucketPull REQUEST_CHANGES POSTs /request-changes", async () => {
   try {
     const res = await reviewBitbucketPull(REPO, 7, "REQUEST_CHANGES");
     expect(res).toEqual({ ok: true, message: "Changes requested." });
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// normalizeBitbucketMergeability — pure field mapping (no network)
+// ---------------------------------------------------------------------------
+
+test("normalizeBitbucketMergeability: non-OPEN state ignores conflictScan and always reports mergeable:null/unknown", () => {
+  const res = normalizeBitbucketMergeability(REPO, 7, makeBitbucketPrJson({ state: "MERGED" }), "dirty");
+  expect(res.mergeable).toBeNull();
+  expect(res.mergeableState).toBe("unknown");
+  expect(res.merged).toBe(true);
+  expect(res.state).toBe("merged");
+});
+
+test("normalizeBitbucketMergeability: DECLINED and SUPERSEDED both normalize state to 'closed'", () => {
+  expect(normalizeBitbucketMergeability(REPO, 7, makeBitbucketPrJson({ state: "DECLINED" }), "unknown").state).toBe("closed");
+  expect(normalizeBitbucketMergeability(REPO, 7, makeBitbucketPrJson({ state: "SUPERSEDED" }), "unknown").state).toBe("closed");
+});
+
+// ---------------------------------------------------------------------------
+// getBitbucketPullMergeability / diffstat conflict scan
+// ---------------------------------------------------------------------------
+
+test("getBitbucketPullMergeability: a merge-conflict entry on diffstat page 1 short-circuits — no page 2 fetch — and reports dirty", async () => {
+  const prJson = makeBitbucketPrJson({ state: "OPEN" });
+  const base = "https://api.bitbucket.org/2.0/repositories/acme/app/pullrequests/7/diffstat";
+  const mock = mockGitHubFetch([
+    { match: /\/pullrequests\/7$/, json: prJson },
+    {
+      match: /\/diffstat\?pagelen=100$/,
+      json: { values: [{ status: "merge conflict" }], next: `${base}?pagelen=100&page=2` },
+    },
+    // Deliberately no route for page=2 — if the scan didn't short-circuit on
+    // finding the conflict, this would throw "no route for ..." and fail loudly.
+  ]);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeable).toBe(false);
+    expect(res.mergeableState).toBe("dirty");
+    expect(res.state).toBe("open");
+    expect(mock.calls).toHaveLength(2); // PR detail + diffstat page 1 only
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullMergeability: OPEN PR + all-clean single diffstat page (no next) → clean, with headRef/baseRef from source/destination", async () => {
+  const prJson = makeBitbucketPrJson({ state: "OPEN", sourceBranch: "feature-x", destBranch: "develop" });
+  const mock = mockGitHubFetch([
+    { match: /\/pullrequests\/7$/, json: prJson },
+    { match: /\/diffstat\?pagelen=100$/, json: { values: [{ status: "modified" }] } },
+  ]);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeable).toBe(true);
+    expect(res.mergeableState).toBe("clean");
+    expect(res.state).toBe("open");
+    expect(res.headRef).toBe("feature-x");
+    expect(res.baseRef).toBe("develop");
+    expect(mock.calls).toHaveLength(2);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullMergeability: page 1 clean + next, page 2 has the conflict → dirty, both pages fetched", async () => {
+  const prJson = makeBitbucketPrJson({ state: "OPEN" });
+  const base = "https://api.bitbucket.org/2.0/repositories/acme/app/pullrequests/7/diffstat";
+  const mock = mockGitHubFetch([
+    { match: /\/pullrequests\/7$/, json: prJson },
+    {
+      match: /\/diffstat\?pagelen=100$/,
+      json: { values: [{ status: "modified" }], next: `${base}?pagelen=100&page=2` },
+    },
+    { match: /page=2$/, json: { values: [{ status: "merge conflict" }] } },
+  ]);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeable).toBe(false);
+    expect(res.mergeableState).toBe("dirty");
+    expect(mock.calls).toHaveLength(3); // PR + diffstat page 1 + diffstat page 2
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullMergeability: diffstat entry status 'local deleted' → dirty (delete/modify conflict)", async () => {
+  const prJson = makeBitbucketPrJson({ state: "OPEN" });
+  const mock = mockGitHubFetch([
+    { match: /\/pullrequests\/7$/, json: prJson },
+    { match: /\/diffstat\?pagelen=100$/, json: { values: [{ status: "local deleted" }] } },
+  ]);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeable).toBe(false);
+    expect(res.mergeableState).toBe("dirty");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullMergeability: diffstat entry status 'remote deleted' → dirty (delete/modify conflict)", async () => {
+  const prJson = makeBitbucketPrJson({ state: "OPEN" });
+  const mock = mockGitHubFetch([
+    { match: /\/pullrequests\/7$/, json: prJson },
+    { match: /\/diffstat\?pagelen=100$/, json: { values: [{ status: "remote deleted" }] } },
+  ]);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeable).toBe(false);
+    expect(res.mergeableState).toBe("dirty");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullMergeability: diffstat page cap exhausted while pages keep returning next → unknown, never clean on partial data", async () => {
+  const prJson = makeBitbucketPrJson({ state: "OPEN" });
+  const base = "https://api.bitbucket.org/2.0/repositories/acme/app/pullrequests/7/diffstat";
+  // BITBUCKET_DIFFSTAT_PAGE_CAP is 10 — mock exactly that many diffstat pages
+  // (the first, unparameterized page plus page=2..page=10), every one clean
+  // but still carrying a further `next`, so the scan hits the cap with pages
+  // still outstanding instead of reaching a natural end (page 11 is never
+  // fetched — no route is registered for it).
+  const routes: MockRoute[] = [
+    { match: /\/pullrequests\/7$/, json: prJson },
+    { match: /\/diffstat\?pagelen=100$/, json: { values: [{ status: "modified" }], next: `${base}?pagelen=100&page=2` } },
+  ];
+  for (let page = 2; page <= 10; page++) {
+    routes.push({
+      match: new RegExp(`page=${page}$`),
+      json: { values: [{ status: "modified" }], next: `${base}?pagelen=100&page=${page + 1}` },
+    });
+  }
+  const mock = mockGitHubFetch(routes);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeable).toBeNull();
+    expect(res.mergeableState).toBe("unknown");
+    expect(mock.calls).toHaveLength(11); // PR + 10 diffstat pages (the cap)
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullMergeability: diffstat fetch failure (500) → unknown, but still ok:true with PR fields mapped", async () => {
+  const prJson = makeBitbucketPrJson({ state: "OPEN", sourceBranch: "feature-y" });
+  const mock = mockGitHubFetch([
+    { match: /\/pullrequests\/7$/, json: prJson },
+    { match: /\/diffstat\?pagelen=100$/, status: 500, json: { error: { message: "Internal Server Error" } } },
+  ]);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeable).toBeNull();
+    expect(res.mergeableState).toBe("unknown");
+    expect(res.state).toBe("open");
+    expect(res.headRef).toBe("feature-y");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullMergeability: hostile off-origin `next` stops paging — unknown, not clean — and the hostile origin is never fetched", async () => {
+  const prJson = makeBitbucketPrJson({ state: "OPEN" });
+  const mock = mockGitHubFetch([
+    { match: /\/pullrequests\/7$/, json: prJson },
+    {
+      match: /\/diffstat\?pagelen=100$/,
+      json: { values: [{ status: "modified" }], next: "http://attacker.example/x" },
+    },
+  ]);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.mergeable).toBeNull();
+    expect(res.mergeableState).toBe("unknown");
+    expect(mock.calls.some((c) => c.url.includes("attacker.example"))).toBe(false);
+    expect(mock.calls).toHaveLength(2); // PR + diffstat page 1 only
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullMergeability: MERGED PR → merged:true, state:'merged', mergeable unknown, no diffstat fetch at all", async () => {
+  const prJson = makeBitbucketPrJson({ state: "MERGED" });
+  const mock = mockGitHubFetch([
+    { match: /\/pullrequests\/7$/, json: prJson },
+    // Deliberately no diffstat route — a merged PR has nothing left to
+    // conflict against, so fetching diffstat here would throw "no route" and
+    // fail this test loudly.
+  ]);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.merged).toBe(true);
+    expect(res.state).toBe("merged");
+    expect(res.mergeable).toBeNull();
+    expect(res.mergeableState).toBe("unknown");
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullMergeability: fork PR (source.repository differs from destination) → crossRepo:true", async () => {
+  const prJson = makeBitbucketPrJson({ state: "OPEN", sourceRepoFullName: "someone-else/app", destRepoFullName: "acme/app" });
+  const mock = mockGitHubFetch([
+    { match: /\/pullrequests\/7$/, json: prJson },
+    { match: /\/diffstat\?pagelen=100$/, json: { values: [] } },
+  ]);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.crossRepo).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullMergeability: missing source.repository → crossRepo:true (fails closed)", async () => {
+  const prJson = makeBitbucketPrJson({ state: "OPEN", sourceRepoFullName: null });
+  const mock = mockGitHubFetch([
+    { match: /\/pullrequests\/7$/, json: prJson },
+    { match: /\/diffstat\?pagelen=100$/, json: { values: [] } },
+  ]);
+  try {
+    const res = await getBitbucketPullMergeability(REPO, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.crossRepo).toBe(true);
+    expect(res.headRepo).toBeNull();
   } finally {
     mock.restore();
   }
