@@ -909,12 +909,22 @@ interface SubagentRow {
   tool_use_id: string | null;
 }
 
+/** Every `parent_kind` the app understands. The column is plain TEXT with no
+ *  CHECK constraint (see `022_subagents.sql`) precisely so new kinds need no
+ *  migration — but an unknown value read back from a future/foreign build must
+ *  still land on a member of the union, so `toSubagent` falls back to
+ *  `"subagent"` for anything not listed here. Keep in sync with
+ *  `Subagent.parentKind` in shared/types.ts. */
+const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent"]);
+
 function toSubagent(r: SubagentRow): Subagent {
   return {
     id: r.id,
     taskId: r.task_id,
     runId: r.run_id,
-    parentKind: r.parent_kind === "bg_session" ? "bg_session" : "subagent",
+    parentKind: PARENT_KINDS.has(r.parent_kind)
+      ? (r.parent_kind as Subagent["parentKind"])
+      : "subagent",
     agentType: r.agent_type,
     description: r.description,
     spawnDepth: r.spawn_depth,
