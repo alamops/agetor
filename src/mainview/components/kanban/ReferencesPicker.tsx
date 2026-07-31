@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FilePlus, FolderPlus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { InfoTip } from "@/components/ui/info-tip";
 import { cn } from "@/lib/utils";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import { captureDroppedOrPastedItems } from "@/lib/capture-refs";
@@ -210,16 +211,21 @@ export function ReferencesPicker({
       onDrop={onDrop}
     >
       <summary className="flex cursor-pointer items-center justify-between gap-2 text-[11px] text-muted-foreground">
-        <span>
+        <span className="inline-flex items-center gap-1">
           {label}{" "}
           {refs.length > 0 && <span className="font-mono">({refs.length})</span>}
+          <InfoTip
+            text="Attach files or folders with the buttons or drag from Finder. Absolute paths are inlined into the prompt as text."
+            label="About files and folders"
+            align="left"
+          />
         </span>
         {buttons}
       </summary>
       <div className="mt-1.5 space-y-1">
         {refs.length > 0
           ? chips
-          : <p className="text-[10px] text-muted-foreground">No files attached yet — use the buttons or drag from Finder. Absolute paths are inlined into the prompt as text.</p>}
+          : <p className="text-[10px] text-muted-foreground">No files attached yet.</p>}
         {hint && <p className="text-[10px] text-muted-foreground">{hint}</p>}
       </div>
       {dropOverlay}
