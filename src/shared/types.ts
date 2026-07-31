@@ -1641,6 +1641,10 @@ export interface GitHubPullMergeability {
   rebaseable: boolean | null;
   merged: boolean;
   draft: boolean;
+  /** Normalized to `"open" | "closed" | "merged" | "unknown"` — provider
+   *  state vocabularies collapsed onto one small set so callers don't need
+   *  provider-specific branching. */
+  state: string;
   headRef: string;
   baseRef: string;
   headSha: string;

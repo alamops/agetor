@@ -2312,14 +2312,17 @@ function normalizeMergeability(repo: GitHubRepo, number: number, raw: unknown): 
   const baseSlug = repoSlug(repo);
   const baseRepoObj = base.repo && typeof base.repo === "object" ? base.repo as Record<string, unknown> : null;
   const baseFullName = baseRepoObj && typeof baseRepoObj.full_name === "string" ? baseRepoObj.full_name : baseSlug;
+  const merged = obj.merged === true;
+  const state = obj.state === "open" ? "open" : obj.state === "closed" ? (merged ? "merged" : "closed") : "unknown";
   return {
     repo: baseSlug,
     pullNumber: number,
     mergeable: typeof obj.mergeable === "boolean" ? obj.mergeable : null,
     mergeableState: pickString(obj, "mergeable_state") || "unknown",
     rebaseable: typeof obj.rebaseable === "boolean" ? obj.rebaseable : null,
-    merged: obj.merged === true,
+    merged,
     draft: obj.draft === true,
+    state,
     headRef: pickString(head, "ref"),
     baseRef: pickString(base, "ref"),
     headSha: pickString(head, "sha"),

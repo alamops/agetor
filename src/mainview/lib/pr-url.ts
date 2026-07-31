@@ -53,12 +53,17 @@ export function parsePrUrl(url: string | null | undefined): ParsedPrUrl | null {
  * Whether the "Resolve Conflicts" button should be offered: the task's
  * `prUrl` parsed to a recognized PR/MR, its mergeability was fetched, and
  * that mergeability describes an open, same-repo PR that's actually
- * conflicted (`mergeableState === "dirty"`). Mirrors the "Resolve with
- * Agetor" gating already applied to `crossRepo` in `ResolveConflictsDialog`.
+ * conflicted (`mergeableState === "dirty"`), with non-empty head/base refs.
+ * Mirrors the "Resolve with Agetor" gating already applied to `crossRepo` in
+ * `ResolveConflictsDialog`. The `state === "open"` check guards against a
+ * stale/closed PR still reporting a conflicted `mergeableState`; the ref
+ * checks guard against building a resolve-conflicts prompt from an empty
+ * `origin/` ref (a malformed or partially-normalized mergeability payload).
  */
 export function canOfferResolveConflicts(
   parsed: ReturnType<typeof parsePrUrl>,
   m: GitHubPullMergeability | null,
 ): boolean {
-  return parsed != null && m != null && m.mergeableState === "dirty" && !m.merged && !m.crossRepo;
+  return parsed != null && m != null && m.mergeableState === "dirty" && !m.merged && !m.crossRepo
+    && m.state === "open" && m.headRef !== "" && m.baseRef !== "";
 }

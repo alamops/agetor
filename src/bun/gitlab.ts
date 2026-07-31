@@ -850,7 +850,8 @@ function pickString(obj: Record<string, unknown>, key: string): string {
  *  older instances or an unrecognized/missing `detailed_merge_status`. Pure —
  *  unit-tested via `__gitlabInternals`. */
 function mapMergeableState(obj: Record<string, unknown>): string {
-  switch (typeof obj.detailed_merge_status === "string" ? obj.detailed_merge_status : "") {
+  const detailed = typeof obj.detailed_merge_status === "string" ? obj.detailed_merge_status : "";
+  switch (detailed) {
     case "conflict": return "dirty";
     case "mergeable": return "clean";
     case "need_rebase": return "behind";
@@ -860,11 +861,25 @@ function mapMergeableState(obj: Record<string, unknown>): string {
     case "discussions_not_resolved":
     case "not_approved":
     case "external_status_checks":
+    case "ci_must_pass":
+    case "status_checks_must_pass":
+    case "requested_changes":
+    case "jira_association_missing":
+    case "security_policy_violations":
+    case "locked_paths":
+    case "broken_status":
       return "blocked";
     case "unchecked":
     case "checking":
+    case "preparing":
+    case "approvals_syncing":
+    case "not_open":
       return "unknown";
   }
+  // A present-but-unrecognized `detailed_merge_status` is fail-safe: don't
+  // fall through to the coarser `merge_status`/`has_conflicts` pair, which
+  // could report "clean" on a status this code doesn't understand yet.
+  if (detailed !== "") return "blocked";
   if (obj.has_conflicts === true) return "dirty";
   const mergeStatus = typeof obj.merge_status === "string" ? obj.merge_status : "";
   if (mergeStatus === "can_be_merged") return "clean";
@@ -891,23 +906,30 @@ function computeMergeable(mergeableState: string, obj: Record<string, unknown>):
  *  no owner/name to report in the fork case. Exported (rather than folded
  *  into `__gitlabInternals` like the other pure normalizers) so tests can
  *  exercise it directly. */
-export function normalizeGitLabMergeability(repo: ProviderRepoInfo, number: number, mr: unknown): GitHubPullMergeability {
-  const obj = mr && typeof mr === "object" ? mr as Record<string, unknown> : {};
+export function normalizeGitLabMergeability(repo: ProviderRepoInfo, number: number, mr: unknown): GitHubPullMergeability | null {
+  if (!mr || typeof mr !== "object") return null;
+  const obj = mr as Record<string, unknown>;
   const mergeableState = mapMergeableState(obj);
   const diffRefs = obj.diff_refs && typeof obj.diff_refs === "object" ? obj.diff_refs as Record<string, unknown> : null;
   const headSha = (diffRefs ? pickString(diffRefs, "head_sha") : "") || pickString(obj, "sha");
   const sourceProjectId = obj.source_project_id;
   const targetProjectId = obj.target_project_id;
-  const crossRepo = typeof sourceProjectId === "number" && typeof targetProjectId === "number" && sourceProjectId !== targetProjectId;
+  // Fail closed: only a confirmed same-numeric-id match is same-repo. Missing
+  // or non-numeric ids (can't confirm) are treated as cross-repo, matching
+  // github.ts's normalizeMergeability contract.
+  const crossRepo = typeof sourceProjectId !== "number" || typeof targetProjectId !== "number" || sourceProjectId !== targetProjectId;
   const repoSlug = `${repo.owner}/${repo.name}`;
+  const merged = obj.state === "merged";
+  const state = obj.state === "opened" ? "open" : merged ? "merged" : (obj.state === "closed" || obj.state === "locked") ? "closed" : "unknown";
   return {
     repo: repoSlug,
     pullNumber: number,
     mergeable: computeMergeable(mergeableState, obj),
     mergeableState,
     rebaseable: null,
-    merged: obj.state === "merged",
+    merged,
     draft: obj.draft === true || obj.work_in_progress === true,
+    state,
     headRef: pickString(obj, "source_branch"),
     baseRef: pickString(obj, "target_branch"),
     headSha,
@@ -940,6 +962,7 @@ export async function getGitLabPullMergeability(repo: ProviderRepoInfo, number: 
     const json = await res.json().catch(() => null);
     if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
     const parsed = normalizeGitLabMergeability(repo, number, json);
+    if (!parsed) return { ok: false, error: "GitLab returned an unexpected merge request response" };
     last = parsed;
     if (parsed.merged || parsed.mergeable !== null || parsed.mergeableState !== "unknown") break;
   }

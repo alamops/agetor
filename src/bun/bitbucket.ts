@@ -101,9 +101,38 @@ function repoBasePath(repo: ProviderRepoInfo): string {
 
 /** Absolute-URL passthrough: a `next` pagination link (or any other
  *  already-absolute URL a caller builds via `new URL(...)`) is used as-is;
- *  anything else is treated as a path relative to the Bitbucket API base. */
+ *  anything else is treated as a path relative to the Bitbucket API base.
+ *  Every absolute URL that reaches this function today is built internally
+ *  from `BITBUCKET_API_BASE` (e.g. `new URL(\`${BITBUCKET_API_BASE}...\`)`),
+ *  so passthrough is safe here — but a `next` link taken verbatim from a
+ *  Bitbucket response body is NOT internally-constructed, and paging call
+ *  sites must validate it with `sanitizeNextUrl` (below) before ever handing
+ *  it to `fetchBitbucket`/`resolveUrl`, since `fetchBitbucket` attaches the
+ *  user's credentials to whatever host it's given. */
 function resolveUrl(pathOrUrl: string): string {
   return /^https?:\/\//i.test(pathOrUrl) ? pathOrUrl : `${BITBUCKET_API_BASE}${pathOrUrl}`;
+}
+
+const BITBUCKET_API_ORIGIN = new URL(BITBUCKET_API_BASE).origin;
+
+/**
+ * Validates a pagination `next` URL pulled out of a Bitbucket response body
+ * before it's ever fetched. Bitbucket puts `next` directly in the JSON body
+ * (not a header), so a malicious/compromised response — or credentials
+ * reused against a lookalike host — could point `next` at an arbitrary
+ * origin; `fetchBitbucket` would otherwise attach the same Authorization
+ * header to that request via `resolveUrl`'s absolute-URL passthrough. Only a
+ * same-origin-as-`BITBUCKET_API_BASE` absolute URL is accepted; anything
+ * else (wrong origin, unparseable, missing) returns null so paging call
+ * sites can treat it as end-of-pages rather than as a page to fetch.
+ */
+function sanitizeNextUrl(next: unknown): string | null {
+  if (typeof next !== "string" || !next) return null;
+  try {
+    return new URL(next).origin === BITBUCKET_API_ORIGIN ? next : null;
+  } catch {
+    return null;
+  }
 }
 
 /** How many extra pages a comment listing follows beyond the first — 5 pages
@@ -116,12 +145,14 @@ const BITBUCKET_MAX_EXTRA_PAGES = 4;
  * `values`. `firstBody` is the already-fetched, already-error-checked page-1
  * body. A fetch/parse failure mid-pagination stops the walk and returns what
  * has accumulated so far — partial results beat failing a listing whose first
- * page already succeeded.
+ * page already succeeded. Each `next` is validated by `sanitizeNextUrl`
+ * before being fetched, so a hostile/off-origin `next` just ends the walk
+ * rather than leaking credentials to it.
  */
 async function collectRemainingValues(firstBody: unknown, creds: BitbucketCreds | null): Promise<unknown[]> {
   const extra: unknown[] = [];
-  let next = firstBody && typeof firstBody === "object" ? (firstBody as { next?: unknown }).next : null;
-  for (let i = 0; i < BITBUCKET_MAX_EXTRA_PAGES && typeof next === "string" && next; i++) {
+  let next = sanitizeNextUrl(firstBody && typeof firstBody === "object" ? (firstBody as { next?: unknown }).next : null);
+  for (let i = 0; i < BITBUCKET_MAX_EXTRA_PAGES && next; i++) {
     const res = await fetchBitbucket(next, creds, "application/json");
     if (!("status" in res) || !res.ok) break;
     const body = await res.json().catch(() => null);
@@ -130,7 +161,7 @@ async function collectRemainingValues(firstBody: unknown, creds: BitbucketCreds 
       : null;
     if (!values) break;
     extra.push(...values);
-    next = (body as { next?: unknown }).next;
+    next = sanitizeNextUrl((body as { next?: unknown }).next);
   }
   return extra;
 }
@@ -891,9 +922,10 @@ const BITBUCKET_DIFFSTAT_PAGE_CAP = 10;
  *  - "dirty" as soon as any page yields a conflicted entry.
  *  - "clean" only once every page has been walked (no `next` remains) with
  *    no conflicted entry seen.
- *  - "unknown" on any fetch/parse failure, or when the page cap is exhausted
- *    while a `next` link still remains — reporting "clean" on partial data
- *    would be worse than reporting "unknown".
+ *  - "unknown" on any fetch/parse failure, when the page cap is exhausted
+ *    while a `next` link still remains, or when a `next` link is rejected by
+ *    `sanitizeNextUrl` (off-origin/malformed) — reporting "clean" on partial
+ *    data would be worse than reporting "unknown".
  */
 async function scanBitbucketDiffstatConflicts(
   repo: ProviderRepoInfo,
@@ -914,10 +946,26 @@ async function scanBitbucketDiffstatConflicts(
     if (!values) return "unknown";
     for (const raw of values) {
       const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : null;
-      if (obj && obj.status === "merge conflict") return "dirty";
+      const status = obj && typeof obj.status === "string" ? obj.status : "";
+      // "merge conflict" covers a modify/modify conflict; a delete/modify
+      // conflict instead surfaces as a per-side "local deleted"/"remote
+      // deleted" status with no "conflict" substring of its own — without
+      // this, a deleted-vs-modified file would walk through as clean.
+      if (status.includes("conflict") || status === "local deleted" || status === "remote deleted") return "dirty";
     }
-    const next = (body as { next?: unknown }).next;
-    url = typeof next === "string" && next ? next : null;
+    const rawNext = (body as { next?: unknown }).next;
+    // A `next` link present but rejected by `sanitizeNextUrl` (off-origin,
+    // malformed) is NOT the same as no `next` at all — there may be more
+    // pages this scan is refusing to follow, so it must not fall through to
+    // "clean" below. Distinguish "no next" (natural end) from "next present
+    // but untrusted" (unresolved end) explicitly.
+    if (typeof rawNext === "string" && rawNext) {
+      const sanitized = sanitizeNextUrl(rawNext);
+      if (!sanitized) return "unknown";
+      url = sanitized;
+    } else {
+      url = null;
+    }
   }
   return url ? "unknown" : "clean";
 }
@@ -967,6 +1015,8 @@ export function normalizeBitbucketMergeability(
         : { mergeable: null, mergeableState: "unknown" }
     : { mergeable: null, mergeableState: "unknown" };
 
+  const normalizedState = state === "OPEN" ? "open" : state === "MERGED" ? "merged" : (state === "DECLINED" || state === "SUPERSEDED") ? "closed" : "unknown";
+
   return {
     repo: `${repo.owner}/${repo.name}`,
     pullNumber: number,
@@ -975,12 +1025,16 @@ export function normalizeBitbucketMergeability(
     rebaseable: null,
     merged: state === "MERGED",
     draft: obj.draft === true,
+    state: normalizedState,
     headRef: typeof sourceBranch.name === "string" ? sourceBranch.name : "",
     baseRef: typeof destBranch.name === "string" ? destBranch.name : "",
     headSha: typeof sourceCommit.hash === "string" ? sourceCommit.hash : "",
     autoMerge: false,
     headRepo,
-    crossRepo: headRepo !== null && baseRepo !== null && headRepo !== baseRepo,
+    // Fail closed: only a confirmed same-full_name match is same-repo. A
+    // missing head or base repo (can't confirm) is treated as cross-repo,
+    // matching github.ts's normalizeMergeability contract.
+    crossRepo: headRepo === null || baseRepo === null || headRepo !== baseRepo,
   };
 }
 

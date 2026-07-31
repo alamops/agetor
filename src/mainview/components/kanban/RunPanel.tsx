@@ -443,6 +443,22 @@ function RunPanelBody({
     setSearchQuery("");
     setActiveMatchId(null);
     nearBottomRef.current = true;
+    // Old task's PR mergeability (and "Resolve Conflicts" send confirmation)
+    // must not survive into the new task: RunPanelBody isn't remounted on
+    // task switch, so without this a stale `prStatus` from task A could sit
+    // around and let the button send task A's PR prompt into task B's agent
+    // before the `[task.id, task.prUrl]` fetch effect below resolves. These
+    // setters/refs are declared further down this component (with the rest
+    // of the PR-status state) — safe to reference here since this closure
+    // only runs after the full component body (and their declarations) has
+    // executed at least once.
+    setPrStatus(null);
+    setPrStatusError(null);
+    setResolveConflictsSent(false);
+    if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
+    prStatusRetryTimerRef.current = null;
+    if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+    resolveConflictsSentTimerRef.current = null;
   }, [task.id]);
 
   // Latest run for this task — drives the send button, indicator, and
@@ -1709,17 +1725,31 @@ function RunPanelBody({
   // GitHubDialog's mergeability self-heal) before giving up; reset to 0
   // whenever a fresh fetch starts (manual refresh or turn-end retrigger).
   const prStatusRetriesRef = useRef(0);
+  // Holds the self-heal retry's `setTimeout` id so it can be cancelled on
+  // unmount (or superseded by a fresh fetch) instead of firing later against
+  // an unmounted tree — see the mount-scoped cleanup effect below.
+  const prStatusRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchPrStatus = useCallback((path: string, number: number) => {
     const requestId = ++prStatusSeqRef.current;
-    setPrStatusLoading(true);
+    if (prStatusRetryTimerRef.current) {
+      clearTimeout(prStatusRetryTimerRef.current);
+      prStatusRetryTimerRef.current = null;
+    }
+    // Clear stale data at fetch start (not just on completion) so a task
+    // switch never leaves the previous task's mergeability visible — and
+    // therefore actionable via "Resolve Conflicts" — while this fetch is
+    // still in flight.
+    setPrStatus(null);
     setPrStatusError(null);
+    setPrStatusLoading(true);
     api.getGitHubPullMergeability({ path, number })
       .then((payload) => {
         if (requestId !== prStatusSeqRef.current) return;
         setPrStatus(payload);
         if (payload.mergeable === null && !payload.merged && prStatusRetriesRef.current < 1) {
           prStatusRetriesRef.current += 1;
-          setTimeout(() => {
+          prStatusRetryTimerRef.current = setTimeout(() => {
+            prStatusRetryTimerRef.current = null;
             if (requestId !== prStatusSeqRef.current) return;
             fetchPrStatus(path, number);
           }, 2_500);
@@ -1734,6 +1764,16 @@ function RunPanelBody({
         if (requestId !== prStatusSeqRef.current) return;
         setPrStatusLoading(false);
       });
+  }, []);
+  // Mount-scoped cleanup: drop any in-flight fetch/self-heal retry and clear
+  // its timer on unmount, so a late response never calls setState on an
+  // unmounted tree (RunPanelBody isn't remounted on task switch, but it *is*
+  // unmounted when the run panel itself closes).
+  useEffect(() => {
+    return () => {
+      prStatusSeqRef.current++;
+      if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
+    };
   }, []);
 
   // Deps are `[task.id, task.prUrl]` ONLY — not `[task]` — for the same
@@ -1756,21 +1796,24 @@ function RunPanelBody({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task.id, task.prUrl]);
 
-  // Re-check mergeability at turn-end: track the previous `task.runId` and
-  // refetch when it transitions non-null → null (a turn just finished) —
-  // the agent may have pushed commits that resolve, or newly introduce, a
-  // conflict. `task.runId` only changes value on a genuine transition, so
-  // (unlike the effects above) this is safe to depend on directly.
-  const prevRunIdForPrStatusRef = useRef<string | null>(task.runId);
+  // Re-check mergeability at turn-end: track whether the task was "running"
+  // on the previous render and refetch once it transitions away from
+  // "running" (succeeded, failed, blocked, …) — the agent may have pushed
+  // commits that resolve, or newly introduce, a conflict. `task.runId` is
+  // NOT a usable signal for this: it's never nulled on normal turn
+  // completion (only the orphan-reconciliation/error paths null it — see
+  // the comment at `liveRunTerminal` above), so a non-null → null transition
+  // never fires in the common case. `task.column` is authoritative instead.
+  const wasRunningForPrStatusRef = useRef(task.column === "running");
   useEffect(() => {
-    const prevRunId = prevRunIdForPrStatusRef.current;
-    prevRunIdForPrStatusRef.current = task.runId;
-    if (prevRunId == null || task.runId != null) return;
+    const wasRunning = wasRunningForPrStatusRef.current;
+    wasRunningForPrStatusRef.current = task.column === "running";
+    if (!wasRunning || task.column === "running") return;
     const parsed = parsePrUrl(task.prUrl);
     if (!parsed) return;
     prStatusRetriesRef.current = 0;
     fetchPrStatus(task.workdir, parsed.number);
-  }, [task.runId, task.prUrl, task.workdir, fetchPrStatus]);
+  }, [task.column, task.prUrl, task.workdir, fetchPrStatus]);
 
   const refreshPrStatus = () => {
     if (!parsedPrUrl) return;
@@ -2027,8 +2070,17 @@ function RunPanelBody({
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
   }, []);
   const sendResolveConflicts = async () => {
-    if (!resumableRunId || modalPending || sending || backlogBusy || resolvingConflicts) return;
-    if (!prStatus) return;
+    // `resolveConflictsSent` in the guard turns the 5s "Sent to agent"
+    // confirmation window into a lockout, not just a label — otherwise the
+    // button re-enables the instant `resolvingConflicts` resets in `finally`
+    // and a second click pastes a duplicate merge prompt into the live tmux
+    // session (`sendRunInput` is deliberately retry:false).
+    if (!resumableRunId || modalPending || sending || backlogBusy || resolvingConflicts || resolveConflictsSent) return;
+    // Belt-and-braces against the stale-`prStatus` case: even though the
+    // reset effect and fetch-start clear above should keep `prStatus` in
+    // sync with the current task's PR, refuse to send unless it still
+    // matches the PR the button is currently showing.
+    if (!parsedPrUrl || !prStatus || prStatus.pullNumber !== parsedPrUrl.number) return;
     const prompt = buildResolveConflictsPrompt({
       repo: prStatus.repo,
       number: prStatus.pullNumber,
@@ -2042,6 +2094,10 @@ function RunPanelBody({
       const res = await api.sendRunInput(resumableRunId, prompt);
       if (!res.delivered) {
         setSendHint(res.reason);
+        // The button can be hidden (archived, subagent tab) by the time this
+        // resolves, which would make `sendHint` invisible — toast so the
+        // failure is surfaced regardless.
+        toast.error(res.reason);
       } else {
         setRebuilt(null);
         setRebuildNote(null);
@@ -2055,7 +2111,9 @@ function RunPanelBody({
         resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
       }
     } catch (e) {
-      setSendHint(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setSendHint(msg);
+      toast.error(msg);
     } finally {
       setResolvingConflicts(false);
     }
@@ -2159,25 +2217,33 @@ function RunPanelBody({
               variant="ghost"
               onClick={refreshPrStatus}
               disabled={prStatusLoading}
-              title="Re-check PR mergeability"
+              title={prStatusError ?? "Re-check PR mergeability"}
             >
               <RefreshCw className="size-3.5" />
             </Button>
           )}
-          {canOfferResolveConflicts(parsedPrUrl, prStatus) && (
+          {/* Gated on `!archived` (the server silently auto-unarchives on
+              other mutations, but this button must not act as though it
+              were live on a frozen task) and on `activeStream === "main"`
+              (mirrors Stop below — a read-only subagent stream tab has no
+              `sendHint` rendered, so a failure here would be invisible;
+              `sendResolveConflicts` also toasts for the same reason). */}
+          {!archived && activeStream === "main" && canOfferResolveConflicts(parsedPrUrl, prStatus) && (
             <Button
               size="sm"
               variant="outline"
               onClick={() => void sendResolveConflicts()}
-              disabled={!canSend || modalPending || sending || backlogBusy || resolvingConflicts}
+              disabled={!canSend || modalPending || sending || backlogBusy || resolvingConflicts || resolveConflictsSent}
               title={
                 !canSend
                   ? "Start the task before asking the agent to resolve conflicts"
                   : modalPending
                     ? "Answer the pending prompt before sending another message"
-                    : sending || backlogBusy || resolvingConflicts
-                      ? "A message is already being sent"
-                      : "Ask the agent to merge the base branch and resolve the reported conflicts"
+                    : resolveConflictsSent
+                      ? "Already sent — waiting for the agent to pick it up"
+                      : sending || backlogBusy || resolvingConflicts
+                        ? "A message is already being sent"
+                        : "Ask the agent to merge the base branch and resolve the reported conflicts"
               }
             >
               <GitMerge className="mr-1 size-3" /> {resolveConflictsSent ? "Sent to agent" : "Resolve Conflicts"}
