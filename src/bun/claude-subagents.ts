@@ -123,6 +123,16 @@ const WORKFLOWS_SUBDIR = "workflows";
  *  per lifecycle transition, inside each workflow transcript dir. */
 const JOURNAL_FILE = "journal.jsonl";
 
+/** How far back from the end of the MAIN session JSONL a freshly-attached
+ *  watcher starts scanning for workflow signals (see the clamp in
+ *  `attachSubagentWatcher`). Sized to comfortably span the last few turns of a
+ *  session — a workflow launch line is a few hundred bytes and what matters is
+ *  catching one issued shortly before agetor stopped — while keeping the
+ *  synchronous read at attach bounded no matter how long the session has run
+ *  (real transcripts reach tens of MB, and boot reconciliation attaches
+ *  several watchers in one window). */
+const REPLAY_WINDOW_BYTES = 4 * 1024 * 1024;
+
 /** Poll cadence while at least one subagent is still running — fast enough to
  *  feel live in the panel, cheap enough (a stat per file) to run per task. */
 const FAST_POLL_MS = 600;
@@ -267,6 +277,15 @@ function readMeta(subagentsDir: string, id: string): SubagentMeta {
 function readAppendedSync(filePath: string, offset: number): { text: string; next: number } {
   let st;
   try { st = statSync(filePath); } catch { return { text: "", next: offset }; }
+  // Non-file (in practice: a directory) reads as "nothing appended" instead of
+  // throwing EISDIR out of `readSync` — which, being outside this function's
+  // catch, would abort the caller's whole tail/cycle pass. The only path that
+  // can hand us a directory is a workflow CONTAINER row's `sourcePath`
+  // (`transcriptDir`), which is deliberately kept out of the `files` map — so
+  // this guard exists to make that hazard structurally impossible rather than
+  // convention-dependent, including on a rollback to a build whose
+  // `toSubagent` coerced container rows into ordinary subagent rows.
+  if (!st.isFile()) return { text: "", next: offset };
   if (st.size <= offset) return { text: "", next: offset };
   const len = st.size - offset;
   const buf = Buffer.alloc(len);
@@ -413,6 +432,21 @@ interface WorkflowState {
   toolUseId: string | null;
 }
 
+/**
+ * Is `filePath` inside `dir`? Both sides are `path.resolve`d first because they
+ * come from different producers — a container's dir is claude's own
+ * `transcriptDir` string, while agent paths are built here with `path.join` —
+ * and those can disagree on symlinked or non-normalised roots (`/tmp` vs
+ * `/private/tmp` on macOS, `~` symlinked homes, a trailing `.`). The explicit
+ * separator suffix keeps a sibling dir whose name merely starts the same
+ * (`…/wf_1` vs `…/wf_12`) from matching.
+ */
+function isInsideDir(filePath: string, dir: string): boolean {
+  const resolved = path.resolve(dir);
+  const prefix = resolved.endsWith(path.sep) ? resolved : resolved + path.sep;
+  return path.resolve(filePath).startsWith(prefix);
+}
+
 function toWorkflowShape(w: WorkflowState, taskId: string): Subagent {
   return {
     id: w.id,
@@ -466,14 +500,59 @@ export function orphanRunningSubagents(taskId: string): void {
     return;
   }
   if (rows.length === 0) return;
+  const watcher = watchers.get(taskId);
   for (const row of rows) {
     try {
       emitLifecycleForRow(row);
     } catch (e) {
       console.error(`[claude-subagents] orphan lifecycle emit failed for subagent ${row.id}:`, e);
     }
+    // Mirror the DB flip into the watcher's in-memory state. Not every orphan
+    // path detaches the watcher afterwards — `stopHeldTask` orphans a task
+    // whose session stays alive — so without this the watcher would keep
+    // believing those rows are `running`: a settled workflow container would
+    // pin the poll on `FAST_POLL_MS` forever, and `checkDone`/`tailFile` would
+    // keep re-deriving state for rows the DB has already retired.
+    try {
+      watcher?.syncSettled(row.id, "orphaned", row.endedAt ?? Date.now());
+    } catch (e) {
+      console.error(`[claude-subagents] orphan sync failed for subagent ${row.id}:`, e);
+    }
   }
   fireSettle(taskId);
+}
+
+/**
+ * Run one synchronous watcher cycle for a task, right now, outside the poll
+ * schedule — the deterministic fix for a hold-check race.
+ *
+ * The orchestrator decides whether a finished run must be HELD in `running`
+ * by asking `subagents.hasRunning(taskId)` shortly (~`END_TURN_IDLE_FIRE_MS`)
+ * after the turn's end_turn. But the signals that create those rows are
+ * watcher-side and poll-driven: a task that has not yet discovered any
+ * background agent polls at `SLOW_POLL_MS` (or `DEEP_IDLE_POLL_MS`), so a
+ * workflow (or an async subagent) launched in the closing moments of a turn is
+ * very likely NOT yet in the DB when that predicate runs. The card would then
+ * flip to `review` and only be dragged back by `pullBackParkedTask` on the
+ * next poll — a visible bounce plus a spurious status breadcrumb, on nearly
+ * every workflow launch.
+ *
+ * Pumping here closes the window: the launch line is already in the main JSONL
+ * by the time the turn ends, so one cycle registers the container/subagent rows
+ * before the predicate reads them. A no-op when the task has no watcher (codex,
+ * grok, tracking disabled) — never an error the caller has to handle.
+ */
+export function pumpWatcherForHoldCheck(taskId: string): void {
+  if (!ENABLED) return;
+  const handle = watchers.get(taskId);
+  if (!handle) return;
+  try {
+    handle.pump();
+  } catch (e) {
+    // `pump` → `cycle` already swallows its own failures; this is the
+    // belt-and-braces guard so a future throw can never reach run settlement.
+    console.error(`[claude-subagents] hold-check pump failed for task ${taskId}:`, e);
+  }
 }
 
 /**
@@ -531,11 +610,13 @@ export function attachSubagentWatcher(opts: {
   // polling then only re-reads `running` files; resumes of a finished agent
   // after that are caught by the dir watcher's append notification.
   let firstCycle = true;
-  // Byte cursor into the MAIN session JSONL for `scanMainForToolResults`
-  // below — independent of any per-subagent `FileState.offset`. Starts at 0
-  // so a fresh watcher (boot reattach, held-task repair) sees the full
-  // history on its first scan, the same "offset 0 on attach" idiom the
-  // per-subagent rehydration above relies on.
+  // Byte cursor into the MAIN session JSONL for `scanMainSignals` below —
+  // independent of any per-subagent `FileState.offset`. Starts at 0 so a fresh
+  // watcher (boot reattach, held-task repair) sees the full history on its
+  // first scan, the same "offset 0 on attach" idiom the per-subagent
+  // rehydration above relies on — but see the replay-window clamp after the
+  // rehydration loop, which bounds that first read when the only reason to
+  // scan is workflow signals.
   let mainOffset = 0;
   // `Date.now()` of the last discovery or dir-watcher event — the idle clock
   // for the deep-idle tier (`DEEP_IDLE_POLL_MS`). Only consulted while
@@ -624,6 +705,37 @@ export function attachSubagentWatcher(opts: {
     console.error(`[claude-subagents] rehydration failed for task ${taskId}:`, e);
   }
 
+  // Replay-window clamp. Before workflows, the main scan only ran at all when
+  // some row was waiting on a `tool_result`, so the offset-0 full read was
+  // paid rarely and deliberately. Workflow signals removed that gate — every
+  // attach would otherwise read the WHOLE main transcript synchronously, and
+  // these files reach tens of megabytes on a long-lived session while boot
+  // reconciliation attaches several watchers back-to-back.
+  //
+  // So: when nothing needs the full history (no `running` row waiting on a
+  // tool_result correlation), start the workflow scan `REPLAY_WINDOW_BYTES`
+  // from the end instead of at 0. The tool_result path is untouched — it still
+  // gets its full replay when it needs one, and `discover()` still rewinds to
+  // 0 outright when a new correlation key shows up.
+  //
+  // Accepted edges: (1) the first line read is very likely a partial one; it
+  // fails `JSON.parse` and is skipped, which is exactly what a truncated line
+  // deserves. (2) A workflow whose launch line sits further back than the
+  // window is not re-registered by this scan — but if it was ever seen live
+  // its row is already in the DB and rehydrated above (including its journal
+  // cursor), and a workflow that was never seen at all belongs to a session
+  // whose runs boot reconciliation orphans anyway. The window only needs to
+  // cover "launched shortly before agetor went down", not all history.
+  if (WORKFLOWS_ENABLED) {
+    const needsFullReplay = [...files.values()].some((fs) => fs.status === "running" && fs.toolUseId);
+    if (!needsFullReplay) {
+      try {
+        const size = statSync(opts.jsonlPath).size;
+        if (size > REPLAY_WINDOW_BYTES) mainOffset = size - REPLAY_WINDOW_BYTES;
+      } catch { /* no main JSONL yet — offset 0 is already right */ }
+    }
+  }
+
   function emitLifecycle(fs: FileState, phase: "started" | "finished"): void {
     const payload: SubagentEvent = { phase, subagent: toSubagentShape(fs, taskId) };
     emitFn?.({
@@ -703,6 +815,29 @@ export function attachSubagentWatcher(opts: {
   function workflowForDir(dir: string): WorkflowState | null {
     for (const w of workflows.values()) if (w.dir === dir) return w;
     return null;
+  }
+
+  /**
+   * Should this file keep being tailed even though its row is no longer
+   * `running`? Only for a workflow agent whose CONTAINER is still running.
+   *
+   * Steady-state tailing is restricted to `running` files, and the dir watcher
+   * that would otherwise catch a late append is armed on `subagents/` and is
+   * NOT recursive — so it never fires for writes inside
+   * `subagents/workflows/<wf>/`. A workflow agent can be settled EARLY relative
+   * to its transcript (its `journal.jsonl` receipt lands before the last lines
+   * flush — which is the whole point of the receipt), and without this its tab
+   * would be permanently truncated: the missing lines are never read again.
+   *
+   * Cheap: a settled agent's file has stopped growing, so this is a `statSync`
+   * that reads nothing, and it stops entirely once the container settles.
+   */
+  function tailPastSettle(fs: FileState): boolean {
+    if (fs.parentKind !== "workflow_agent") return false;
+    for (const w of workflows.values()) {
+      if (w.status === "running" && isInsideDir(fs.sourcePath, w.dir)) return true;
+    }
+    return false;
   }
 
   /**
@@ -1155,18 +1290,30 @@ export function attachSubagentWatcher(opts: {
    * a `<task-id>` naming a regular background subagent is left to the existing
    * paths, exactly as before this feature.
    *
+   * BOTH tags are required in the prefilter, not just `<task-id>`: settling a
+   * container is irreversible here (a later launch line for a known id
+   * early-returns in `registerWorkflowContainer`), so a line that merely
+   * mentions a task id — an assistant message quoting a notification back, a
+   * future launch blurb embedding the tag — must not be enough to release the
+   * hold. Requiring the enclosing `<task-notification>` marker, which both real
+   * on-disk shapes carry verbatim, keeps the match anchored to an actual
+   * notification payload.
+   *
    * The notification's `<status>` is deliberately ignored — completed, failed,
    * killed and stopped all mean "this workflow is over", and the hold must
    * release in every one of those cases (plan assumption A4).
    */
   function scanLineForWorkflowNotification(line: string): void {
-    if (!line.includes("<task-id>")) return;
-    const m = /<task-id>([^<]+)<\/task-id>/.exec(line);
-    if (!m) return;
-    const id = m[1]!.trim();
-    const w = workflows.get(id);
-    if (!w || w.status !== "running") return;
-    settleSubagentById(id, "completed");
+    if (!line.includes("<task-notification>") || !line.includes("<task-id>")) return;
+    // `matchAll`, not a single `exec`: one physical line can carry more than
+    // one notification (a batched enqueue), and stopping at the first would
+    // silently drop the rest — leaving a finished workflow holding the card.
+    for (const m of line.matchAll(/<task-id>([^<]+)<\/task-id>/g)) {
+      const id = m[1]!.trim();
+      const w = workflows.get(id);
+      if (!w || w.status !== "running") continue;
+      settleSubagentById(id, "completed");
+    }
   }
 
   /**
@@ -1180,8 +1327,17 @@ export function attachSubagentWatcher(opts: {
    * tool_results were its only signal) would starve workflow detection on
    * exactly the common case — a task with no `toolUseId`-bearing subagent rows
    * at all. So it only short-circuits when there is nothing of EITHER kind to
-   * look for, which keeps the "task with no background agents never pays for
-   * this scan" property intact whenever workflow tracking is off.
+   * look for.
+   *
+   * COST NOTE — that widening means a workflow-tracking watcher scans the main
+   * transcript on every cycle, where before it usually skipped the read
+   * entirely. Two things keep that bounded: the first read after attach starts
+   * at most `REPLAY_WINDOW_BYTES` from the end (see the clamp in
+   * `attachSubagentWatcher`), and every read after it is incremental — the
+   * cursor only ever moves forward, so steady state is one `statSync` plus the
+   * handful of bytes the turn actually appended. The old "a task with no
+   * background agents never pays for this scan at all" property survives only
+   * with `AGETOR_TRACK_WORKFLOWS=0`.
    */
   function scanMainSignals(): void {
     const pending = [...files.values()].filter((fs) => fs.status === "running" && fs.toolUseId);
@@ -1236,11 +1392,12 @@ export function attachSubagentWatcher(opts: {
       // no per-tick cost; a resume (rare) re-opens them via the dir watcher's
       // append notification (see `armDirWatcher`, which tails ALL files). The
       // first cycle is the exception — it tails everything to drain a reattach
-      // backlog.
+      // backlog — as is a settled workflow agent whose workflow is still live
+      // (`tailPastSettle`), which the non-recursive dir watcher cannot cover.
       const tailAll = firstCycle;
       firstCycle = false;
       for (const fs of files.values()) {
-        if (tailAll || fs.status === "running") tailFile(fs);
+        if (tailAll || fs.status === "running" || tailPastSettle(fs)) tailFile(fs);
       }
       tailJournals();
       scanMainSignals();
@@ -1348,20 +1505,22 @@ export function settleSubagentById(id: string, status: "completed" | "orphaned")
  * exception that needs nothing here: `subagents.orphanRunning` already flips
  * every running row for the task in a single kind-agnostic UPDATE.
  *
- * Matching is by `sourcePath` prefix (container dir → agent files inside it),
- * with an explicit separator so a sibling dir sharing a name prefix
- * (`…/wf_12` vs `…/wf_1`) can never be swept in.
+ * Matching is by `sourcePath` containment (container dir → agent files inside
+ * it) via `isInsideDir`, which normalises both sides and requires a separator
+ * boundary — see that helper for why.
+ *
+ * Each cascaded row gets its own DB write, lifecycle emit and watcher sync,
+ * but NOT its own settle-hook fire: the caller fires once, after this returns,
+ * so the orchestrator's release predicate runs a single time against a
+ * fully-settled workflow instead of N+1 times with siblings still running.
  */
 function cascadeWorkflowAgents(taskId: string, container: Subagent, depth: number): void {
   if (!container.sourcePath) return;
-  const prefix = container.sourcePath.endsWith(path.sep)
-    ? container.sourcePath
-    : container.sourcePath + path.sep;
   try {
     for (const row of subagentsDb.listForTask(taskId)) {
       if (row.status !== "running") continue;
       if (row.parentKind !== "workflow_agent") continue;
-      if (!row.sourcePath.startsWith(prefix)) continue;
+      if (!isInsideDir(row.sourcePath, container.sourcePath)) continue;
       settleSubagent(row.id, "completed", depth + 1);
     }
   } catch (e) {
@@ -1372,7 +1531,13 @@ function cascadeWorkflowAgents(taskId: string, container: Subagent, depth: numbe
 /** Shared body of `settleSubagentById`, carrying the cascade recursion depth.
  *  Agent rows are never containers, so the cascade is structurally one level
  *  deep — the depth guard is belt-and-braces against a future kind (or a
- *  corrupt row) that could make the graph cyclic. */
+ *  corrupt row) that could make the graph cyclic.
+ *
+ *  `depth` also decides who fires the settle hook: only the OUTERMOST call
+ *  (depth 0) does, after any cascade beneath it has finished, so a workflow
+ *  releasing N agents costs the orchestrator one release check instead of
+ *  N + 1 — and every one of those checks sees the final state rather than a
+ *  half-settled workflow. */
 function settleSubagent(id: string, status: "completed" | "orphaned", depth: number): boolean {
   let result: { changed: boolean; taskId: string | null };
   try {
@@ -1393,11 +1558,10 @@ function settleSubagent(id: string, status: "completed" | "orphaned", depth: num
     }
   }
   watchers.get(taskId)?.syncSettled(id, status, row?.endedAt ?? now);
-  // Before `fireSettle`, so the orchestrator's release predicate
-  // (`subagents.hasRunning`) sees the whole workflow settled at once rather
-  // than re-checking once per cascaded row with the container's siblings still
-  // running.
+  // Cascade BEFORE the hook (and the hook only at depth 0), so the
+  // orchestrator's release predicate (`subagents.hasRunning`) runs exactly once
+  // per settle event, against a workflow that is settled in full.
   if (row?.parentKind === "workflow" && depth < 1) cascadeWorkflowAgents(taskId, row, depth);
-  fireSettle(taskId);
+  if (depth === 0) fireSettle(taskId);
   return true;
 }
