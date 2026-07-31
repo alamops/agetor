@@ -8,6 +8,7 @@ import type {
   GitHubListItem,
   GitHubListResult,
   GitHubPullDefaultsResult,
+  GitHubPullMergeability,
   GitHubPullLineComment,
   GitHubPullMergeMethod,
   GitHubPullMergeResult,
@@ -874,6 +875,148 @@ export async function getBitbucketPullChecks(repo: ProviderRepoInfo, number: num
   return { ok: true, repo: `${repo.owner}/${repo.name}`, pullNumber: number, sha, checkRuns };
 }
 
+type BitbucketMergeabilityResponse = ({ ok: true } & GitHubPullMergeability) | BitbucketError;
+
+/** How many diffstat pages `scanBitbucketDiffstatConflicts` will follow before
+ *  giving up and reporting "unknown" rather than risk a false "clean" on
+ *  partial data — 10 pages of `pagelen=100` covers 1000 changed files. */
+const BITBUCKET_DIFFSTAT_PAGE_CAP = 10;
+
+/**
+ * Scans a pull request's diffstat for Bitbucket's per-file `status: "merge
+ * conflict"` marker — Bitbucket Cloud's PR resource has no top-level
+ * mergeable field (unlike GitHub's `mergeable`/`mergeable_state`), so the
+ * diffstat listing is the only conflict signal available. Stops as soon as a
+ * conflicted entry is found. Returns:
+ *  - "dirty" as soon as any page yields a conflicted entry.
+ *  - "clean" only once every page has been walked (no `next` remains) with
+ *    no conflicted entry seen.
+ *  - "unknown" on any fetch/parse failure, or when the page cap is exhausted
+ *    while a `next` link still remains — reporting "clean" on partial data
+ *    would be worse than reporting "unknown".
+ */
+async function scanBitbucketDiffstatConflicts(
+  repo: ProviderRepoInfo,
+  number: number,
+  creds: BitbucketCreds | null,
+): Promise<"dirty" | "clean" | "unknown"> {
+  const firstUrl = new URL(`${BITBUCKET_API_BASE}${repoBasePath(repo)}/pullrequests/${number}/diffstat`);
+  firstUrl.searchParams.set("pagelen", "100");
+  let url: string | null = firstUrl.toString();
+
+  for (let page = 0; page < BITBUCKET_DIFFSTAT_PAGE_CAP && url; page++) {
+    const res = await fetchBitbucket(url, creds, "application/json");
+    if (!("status" in res) || !res.ok) return "unknown";
+    const body = await res.json().catch(() => null);
+    const values = body && typeof body === "object" && Array.isArray((body as { values?: unknown }).values)
+      ? (body as { values: unknown[] }).values
+      : null;
+    if (!values) return "unknown";
+    for (const raw of values) {
+      const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : null;
+      if (obj && obj.status === "merge conflict") return "dirty";
+    }
+    const next = (body as { next?: unknown }).next;
+    url = typeof next === "string" && next ? next : null;
+  }
+  return url ? "unknown" : "clean";
+}
+
+/**
+ * Pure field mapping from a Bitbucket PR detail JSON plus a pre-computed
+ * `conflictScan` verdict (from `scanBitbucketDiffstatConflicts`) into the
+ * shared `GitHubPullMergeability` shape. Kept separate from the network walk
+ * so the mapping is test-friendly without mocking fetch. `mergeable`/
+ * `mergeableState` only reflect `conflictScan` when the PR is OPEN — a
+ * merged/declined/superseded PR has nothing left to conflict against, so it
+ * always reports "unknown"/null there, matching `getBitbucketPullMergeability`
+ * (which skips the diffstat scan entirely for non-OPEN state).
+ */
+export function normalizeBitbucketMergeability(
+  repo: ProviderRepoInfo,
+  number: number,
+  pr: unknown,
+  conflictScan: "dirty" | "clean" | "unknown",
+): GitHubPullMergeability {
+  const obj = pr && typeof pr === "object" ? pr as Record<string, unknown> : {};
+  const source = obj.source && typeof obj.source === "object" ? obj.source as Record<string, unknown> : {};
+  const destination = obj.destination && typeof obj.destination === "object"
+    ? obj.destination as Record<string, unknown>
+    : {};
+  const sourceBranch = source.branch && typeof source.branch === "object" ? source.branch as Record<string, unknown> : {};
+  const destBranch = destination.branch && typeof destination.branch === "object"
+    ? destination.branch as Record<string, unknown>
+    : {};
+  const sourceCommit = source.commit && typeof source.commit === "object" ? source.commit as Record<string, unknown> : {};
+  const sourceRepo = source.repository && typeof source.repository === "object"
+    ? source.repository as Record<string, unknown>
+    : {};
+  const destRepo = destination.repository && typeof destination.repository === "object"
+    ? destination.repository as Record<string, unknown>
+    : {};
+
+  const headRepo = typeof sourceRepo.full_name === "string" ? sourceRepo.full_name : null;
+  const baseRepo = typeof destRepo.full_name === "string" ? destRepo.full_name : null;
+  const state = typeof obj.state === "string" ? obj.state : "";
+
+  const { mergeable, mergeableState } = state === "OPEN"
+    ? conflictScan === "dirty"
+      ? { mergeable: false, mergeableState: "dirty" }
+      : conflictScan === "clean"
+        ? { mergeable: true, mergeableState: "clean" }
+        : { mergeable: null, mergeableState: "unknown" }
+    : { mergeable: null, mergeableState: "unknown" };
+
+  return {
+    repo: `${repo.owner}/${repo.name}`,
+    pullNumber: number,
+    mergeable,
+    mergeableState,
+    rebaseable: null,
+    merged: state === "MERGED",
+    draft: obj.draft === true,
+    headRef: typeof sourceBranch.name === "string" ? sourceBranch.name : "",
+    baseRef: typeof destBranch.name === "string" ? destBranch.name : "",
+    headSha: typeof sourceCommit.hash === "string" ? sourceCommit.hash : "",
+    autoMerge: false,
+    headRepo,
+    crossRepo: headRepo !== null && baseRepo !== null && headRepo !== baseRepo,
+  };
+}
+
+/**
+ * Bitbucket's PR resource carries no `mergeable`/`mergeable_state` fields
+ * (unlike GitHub), so this fetches the PR detail for the head/base/state
+ * fields and — only when the PR is OPEN — follows up with a diffstat scan
+ * (`scanBitbucketDiffstatConflicts`) for the actual conflict signal. Non-OPEN
+ * PRs (merged/declined/superseded) skip the scan entirely, matching
+ * `normalizeBitbucketMergeability`'s non-OPEN "unknown" mapping. Unlike
+ * `getGitHubPullMergeability`, there's no retry/poll loop — Bitbucket's
+ * diffstat is computed synchronously, not in the background.
+ */
+export async function getBitbucketPullMergeability(
+  repo: ProviderRepoInfo,
+  number: number,
+): Promise<BitbucketMergeabilityResponse> {
+  if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
+  const creds = await bitbucketCreds(repo.remoteHost);
+
+  const res = await fetchBitbucket(`${repoBasePath(repo)}/pullrequests/${number}`, creds, "application/json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!json || typeof json !== "object") {
+    return { ok: false, error: "Bitbucket returned an unexpected pull request response" };
+  }
+
+  const state = typeof (json as Record<string, unknown>).state === "string"
+    ? (json as Record<string, unknown>).state as string
+    : "";
+  const conflictScan = state === "OPEN" ? await scanBitbucketDiffstatConflicts(repo, number, creds) : "unknown";
+
+  return { ok: true, ...normalizeBitbucketMergeability(repo, number, json, conflictScan) };
+}
+
 /** The shared `GitHubPullMergeMethod` enum ("merge"|"squash"|"rebase") maps to
  *  Bitbucket's three `merge_strategy` values. There is no fast-forward entry
  *  in the shared enum, so Bitbucket's `fast_forward` (a linear, no-merge-
@@ -1119,6 +1262,8 @@ export const __bitbucketInternals = {
   normalizeBitbucketComment,
   normalizeBitbucketLineComment,
   normalizeBitbucketCheckRun,
+  normalizeBitbucketMergeability,
+  scanBitbucketDiffstatConflicts,
   escapeBBQLString,
   prStateParams,
   issueStateBBQL,

@@ -12,6 +12,7 @@ import type {
   GitHubMilestone,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
+  GitHubPullMergeability,
   GitHubPullMergeMethod,
   GitHubPullMergeResult,
   GitHubPullReviewCommentsResult,
@@ -64,6 +65,7 @@ type GitLabCommentResponse = ({ ok: true; comment: GitHubComment }) | GitLabErro
 type GitLabPullLineCommentResponse = ({ ok: true; comment: GitHubPullLineComment }) | GitLabError;
 type GitLabPullReviewCommentsResponse = ({ ok: true } & GitHubPullReviewCommentsResult) | GitLabError;
 type GitLabChecksResponse = ({ ok: true } & GitHubChecksResult) | GitLabError;
+type GitLabMergeabilityResponse = ({ ok: true } & GitHubPullMergeability) | GitLabError;
 type GitLabPullMergeResponse = GitHubPullMergeResult | GitLabError;
 type GitLabActionResponse = ({ ok: true; message?: string; item?: GitHubListItem; commentPosted?: boolean }) | GitLabError;
 type GitLabViewerResponse = ({ ok: true; login: string }) | GitLabError;
@@ -835,6 +837,113 @@ export async function replyGitLabLineComment(repo: ProviderRepoInfo, number: num
   const comment = normalizeLineComment(json, repo, number);
   if (!comment) return { ok: false, error: "GitLab returned an unexpected reply response" };
   return { ok: true, comment };
+}
+
+function pickString(obj: Record<string, unknown>, key: string): string {
+  return typeof obj[key] === "string" ? (obj[key] as string) : "";
+}
+
+/** Maps GitLab's MR merge-status fields onto GitHub's `mergeableState`
+ *  vocabulary (`clean|dirty|behind|blocked|unstable|draft|unknown`). Prefers
+ *  the newer `detailed_merge_status` (GitLab 15.6+) when it's a recognized
+ *  value; falls back to the coarser `merge_status`/`has_conflicts` pair for
+ *  older instances or an unrecognized/missing `detailed_merge_status`. Pure —
+ *  unit-tested via `__gitlabInternals`. */
+function mapMergeableState(obj: Record<string, unknown>): string {
+  switch (typeof obj.detailed_merge_status === "string" ? obj.detailed_merge_status : "") {
+    case "conflict": return "dirty";
+    case "mergeable": return "clean";
+    case "need_rebase": return "behind";
+    case "draft_status": return "draft";
+    case "ci_still_running": return "unstable";
+    case "blocked_status":
+    case "discussions_not_resolved":
+    case "not_approved":
+    case "external_status_checks":
+      return "blocked";
+    case "unchecked":
+    case "checking":
+      return "unknown";
+  }
+  if (obj.has_conflicts === true) return "dirty";
+  const mergeStatus = typeof obj.merge_status === "string" ? obj.merge_status : "";
+  if (mergeStatus === "can_be_merged") return "clean";
+  if (mergeStatus === "cannot_be_merged") return "dirty";
+  return "unknown";
+}
+
+/** `mergeable` boolean for a given `mergeableState`: `dirty`/`clean`/`unknown`
+ *  map directly; the remaining states (`behind`/`blocked`/`unstable`/`draft`)
+ *  don't imply a verdict on their own, so `has_conflicts` (when GitLab
+ *  actually reports it as a boolean) is used as the best available signal. */
+function computeMergeable(mergeableState: string, obj: Record<string, unknown>): boolean | null {
+  if (mergeableState === "dirty") return false;
+  if (mergeableState === "clean") return true;
+  if (mergeableState === "unknown") return null;
+  return typeof obj.has_conflicts === "boolean" ? !obj.has_conflicts : null;
+}
+
+/** Maps a GitLab MR detail payload (`GET /merge_requests/:iid`) onto
+ *  `GitHubPullMergeability` — see `mapMergeableState`/`computeMergeable` for
+ *  the vocabulary mapping. GitLab's MR payload doesn't carry the source
+ *  project's path (only its numeric id), so `headRepo` reports the repo
+ *  itself for a same-repo MR and `null` for a cross-repo (fork) one — there's
+ *  no owner/name to report in the fork case. Exported (rather than folded
+ *  into `__gitlabInternals` like the other pure normalizers) so tests can
+ *  exercise it directly. */
+export function normalizeGitLabMergeability(repo: ProviderRepoInfo, number: number, mr: unknown): GitHubPullMergeability {
+  const obj = mr && typeof mr === "object" ? mr as Record<string, unknown> : {};
+  const mergeableState = mapMergeableState(obj);
+  const diffRefs = obj.diff_refs && typeof obj.diff_refs === "object" ? obj.diff_refs as Record<string, unknown> : null;
+  const headSha = (diffRefs ? pickString(diffRefs, "head_sha") : "") || pickString(obj, "sha");
+  const sourceProjectId = obj.source_project_id;
+  const targetProjectId = obj.target_project_id;
+  const crossRepo = typeof sourceProjectId === "number" && typeof targetProjectId === "number" && sourceProjectId !== targetProjectId;
+  const repoSlug = `${repo.owner}/${repo.name}`;
+  return {
+    repo: repoSlug,
+    pullNumber: number,
+    mergeable: computeMergeable(mergeableState, obj),
+    mergeableState,
+    rebaseable: null,
+    merged: obj.state === "merged",
+    draft: obj.draft === true || obj.work_in_progress === true,
+    headRef: pickString(obj, "source_branch"),
+    baseRef: pickString(obj, "target_branch"),
+    headSha,
+    // `merge_when_pipeline_succeeds` is GitLab's counterpart to GitHub's
+    // `auto_merge` — true once the "merge when pipeline succeeds" toggle is on.
+    autoMerge: obj.merge_when_pipeline_succeeds === true,
+    headRepo: crossRepo ? null : repoSlug,
+    crossRepo,
+  };
+}
+
+/** Matches `getGitHubPullMergeability`'s shape and polling behavior. GitLab
+ *  also computes mergeability asynchronously (`detailed_merge_status:
+ *  "unchecked"`/`"checking"` right after a push) — poll up to 3 times,
+ *  1.2s apart, stopping early once the verdict settles (merged, a resolved
+ *  `mergeable`, or any `mergeableState` other than `"unknown"`). Always
+ *  returns the last successful parse even if it's still unresolved; only
+ *  `ok:false` when every fetch attempt failed. */
+export async function getGitLabPullMergeability(repo: ProviderRepoInfo, number: number): Promise<GitLabMergeabilityResponse> {
+  if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "merge request number must be positive" };
+  const token = await gitlabToken(repo.remoteHost);
+  const projectId = encodeProjectId(repo.owner, repo.name);
+  const url = `${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}`;
+
+  let last: GitHubPullMergeability | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 1_200));
+    const res = await fetchGitLab(url, token);
+    if (!("status" in res)) return res;
+    const json = await res.json().catch(() => null);
+    if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
+    const parsed = normalizeGitLabMergeability(repo, number, json);
+    last = parsed;
+    if (parsed.merged || parsed.mergeable !== null || parsed.mergeableState !== "unknown") break;
+  }
+  return last ? { ok: true, ...last } : { ok: false, error: "GitLab did not return mergeability for this merge request" };
 }
 
 /** Matches `getGitHubPullChecks`'s shape. GitLab has no single "check-runs"

@@ -15,7 +15,7 @@ export interface MergeabilityView {
 export function mergeabilityView(m: GitHubPullMergeability): MergeabilityView {
   if (m.mergeable === null) {
     return {
-      label: "GitHub is still checking mergeability…",
+      label: "Mergeability is still being checked…",
       tone: "muted",
       canMerge: false,
       showUpdateBranch: m.mergeableState === "behind",
