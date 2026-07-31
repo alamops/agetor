@@ -4,6 +4,8 @@ import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { SearchSelect } from "@/components/ui/search-select";
+import { InfoTip } from "@/components/ui/info-tip";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
@@ -727,18 +729,19 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
               Plan
             </Button>
           </div>
-          <Select
-            value={mode}
-            onChange={(e) => setMode(e.target.value)}
-            className="h-8"
-          >
-            {modes.map((m) => (
-              <option key={m.id} value={m.id}>{m.label}</option>
-            ))}
-          </Select>
-          {selectedModeHint && (
-            <p className="text-[11px] leading-snug text-muted-foreground">{selectedModeHint}</p>
-          )}
+          <div className="flex items-center gap-1.5">
+            <SearchSelect
+              value={mode}
+              onChange={setMode}
+              items={modes.map((m) => ({ value: m.id, label: m.label, hint: m.hint }))}
+              searchable={false}
+              wrapHints
+              placement="bottom"
+              className="min-w-0 flex-1"
+              triggerClassName="h-8 text-xs"
+            />
+            {selectedModeHint && <InfoTip text={selectedModeHint} label="About this mode" />}
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-2">

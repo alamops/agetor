@@ -24,6 +24,8 @@ interface Props {
   /** Override the trigger label for an arbitrary value (e.g. show basename for a path). */
   displayValue?: (value: string) => string;
   className?: string;
+  /** Extra classes on the trigger button itself (className applies to the root wrapper). */
+  triggerClassName?: string;
   /** Left-side icon in the trigger. */
   leadingIcon?: ReactNode;
   disabled?: boolean;
@@ -35,6 +37,11 @@ interface Props {
    * picker near the top of a modal should pass "bottom".
    */
   placement?: "top" | "bottom";
+  /** Show the search box and filter items as the user types. Default true;
+   *  pass false for short enumerated lists where search adds no value. */
+  searchable?: boolean;
+  /** Let the item hint wrap across lines instead of truncating to one. */
+  wrapHints?: boolean;
 }
 
 /**
@@ -51,10 +58,13 @@ export function SearchSelect({
   footer,
   displayValue,
   className,
+  triggerClassName,
   leadingIcon,
   disabled,
   title,
   placement = "top",
+  searchable = true,
+  wrapHints = false,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -72,12 +82,12 @@ export function SearchSelect({
     document.addEventListener("mousedown", onDown);
     document.addEventListener("keydown", onKey);
     // Focus the search box once the panel is mounted.
-    queueMicrotask(() => searchRef.current?.focus());
+    if (searchable) queueMicrotask(() => searchRef.current?.focus());
     return () => {
       document.removeEventListener("mousedown", onDown);
       document.removeEventListener("keydown", onKey);
     };
-  }, [open]);
+  }, [open, searchable]);
 
   // Reset the query each time the panel closes so the next open starts clean.
   useEffect(() => {
@@ -85,13 +95,14 @@ export function SearchSelect({
   }, [open]);
 
   const filtered = useMemo(() => {
+    if (!searchable) return items;
     const q = query.trim().toLowerCase();
     if (!q) return items;
     return items.filter((i) =>
       i.label.toLowerCase().includes(q)
       || i.value.toLowerCase().includes(q)
       || (i.hint?.toLowerCase().includes(q) ?? false));
-  }, [items, query]);
+  }, [items, query, searchable]);
 
   // Show pinned matches at the top of the filtered view.
   const ordered = useMemo(() => {
@@ -100,8 +111,9 @@ export function SearchSelect({
     return [...pinned, ...rest];
   }, [filtered]);
 
+  const selected = items.find((i) => i.value === value);
   const triggerLabel = value
-    ? (displayValue ? displayValue(value) : value)
+    ? (displayValue ? displayValue(value) : selected?.label ?? value)
     : (emptyLabel ?? placeholder);
 
   return (
@@ -114,6 +126,7 @@ export function SearchSelect({
         className={cn(
           "flex h-9 w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-1 text-left text-sm shadow-sm transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
           disabled && "cursor-not-allowed opacity-50",
+          triggerClassName,
         )}
       >
         {leadingIcon && <span className="shrink-0 text-muted-foreground">{leadingIcon}</span>}
@@ -133,16 +146,18 @@ export function SearchSelect({
             placement === "top" ? "bottom-full mb-1" : "top-full mt-1",
           )}
         >
-          <div className="flex items-center gap-2 border-b border-border/60 px-2 py-1.5">
-            <Search className="size-3.5 shrink-0 opacity-60" aria-hidden />
-            <Input
-              ref={searchRef}
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder={placeholder}
-              className="h-7 border-0 px-0 shadow-none focus-visible:ring-0"
-            />
-          </div>
+          {searchable && (
+            <div className="flex items-center gap-2 border-b border-border/60 px-2 py-1.5">
+              <Search className="size-3.5 shrink-0 opacity-60" aria-hidden />
+              <Input
+                ref={searchRef}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder={placeholder}
+                className="h-7 border-0 px-0 shadow-none focus-visible:ring-0"
+              />
+            </div>
+          )}
           <div className="max-h-64 overflow-y-auto py-1">
             {ordered.length === 0 ? (
               <div className="px-3 py-2 text-xs text-muted-foreground">No matches.</div>
@@ -172,7 +187,12 @@ export function SearchSelect({
                     <span className="min-w-0 flex-1">
                       <span className="block truncate">{item.label}</span>
                       {item.hint && (
-                        <span className="block truncate text-[11px] text-muted-foreground">
+                        <span
+                          className={cn(
+                            "block text-[11px] text-muted-foreground",
+                            wrapHints ? "whitespace-normal break-words" : "truncate",
+                          )}
+                        >
                           {item.hint}
                         </span>
                       )}
