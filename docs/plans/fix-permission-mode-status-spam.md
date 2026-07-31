@@ -140,6 +140,44 @@ Two independent layers:
 - Client helper runs per render on the memoized event list — O(n), same cost
   class as the existing `normalizeLegacyEvent` map.
 
+## Follow-up (same branch): "session hibernated after 30m idle" chip spam
+
+Reported with a second screenshot: the idle-session reaper's hibernate
+breadcrumb repeats exactly like the permission-mode chips. Root cause chain
+(verified live against the user's running prod app + tmux 3.6a):
+
+- On tmux 3.6a, `display-message -p -t '=<name>' '#{session_attached}:#{session_activity}'`
+  does NOT resolve `=`-prefixed exact-match targets: it prints the format
+  with every variable expanded to empty (stdout `:`), exit 0 — identically
+  for live and nonexistent sessions. (`has-session`/`kill-session` honor
+  `=` correctly; only `display-message` is affected. The no-prefix form
+  works but prefix-matches sibling `agetor-*` names — not an option.)
+- `probeSessionActivity` (claude-tmux.ts:1174) parses that with
+  `Number("") === 0`, which passes `Number.isFinite` — so every probe
+  returns `{attached: false, activityAt: 0}`: "never attached, idle since
+  1970".
+- `reapIdleSessions` (orchestrator.ts:~2400) therefore re-reaps every
+  candidate task (finished run, no in-memory SessionState) on every
+  5-minute sweep, appending the hibernate breadcrumb each time — 528
+  persisted rows across 12 tasks in the user's prod DB, ~50 per run. The
+  "never reap attached" guard was also dead.
+
+Fix tasks (all on fix/permission-auto-spam):
+
+- **F1** (`src/bun/claude-tmux.ts` + `claude-tmux.test.ts`): rewrite
+  `probeSessionActivity` on `list-sessions -F ... -f '#{==:#{session_name},<name>}'`
+  (verified exact-match on 3.6a; empty stdout ⇒ null). Extract a pure,
+  exported parse helper; reject non-digit/empty fields BEFORE `Number()`.
+- **F2** (`src/bun/orchestrator.ts` + `db.ts` + `orchestrator.test.ts`):
+  idempotence guard — skip appending/emitting the hibernate breadcrumb when
+  the target run's latest persisted event is that identical status line
+  (defense-in-depth against any future re-reap regression).
+- **F3** (`src/mainview/lib/status-collapse.ts` + its test): also drop a
+  `status` event starting with `"session hibernated after "` when the
+  immediately-preceding kept event is a status with identical data
+  (adjacency semantics — a genuine later hibernate always has user/agent
+  events between). Cleans the persisted backlog at render time.
+
 ## 8. Open questions / assumptions (autonomous mode)
 
 1. **Assumed** desired UX is "announce only changes", including suppressing

@@ -1155,35 +1155,98 @@ export function sessionExistsByName(name: string): boolean {
 }
 
 /**
+ * Pure parser for one `#{session_attached}:#{session_activity}` line as
+ * produced by `probeSessionActivity`'s `list-sessions -F` call. Exported so
+ * the tmux-version quirk below is unit-testable without a real tmux binary.
+ *
+ * Both fields must be non-empty, all-digit strings BEFORE we hand them to
+ * `Number()` — `Number("")` is `0`, which is a finite number, so a naive
+ * `Number.isFinite` guard silently accepts an empty field as "zero" instead
+ * of rejecting it as malformed. That footgun is exactly what let a tmux 3.6a
+ * quirk (see `probeSessionActivity`'s doc comment) turn "session not found"
+ * into "activity at epoch 0" instead of `null`.
+ */
+export function parseSessionActivityLine(line: string): { attached: boolean; activityAt: number } | null {
+  const trimmed = line.trim();
+  if (trimmed === "") return null;
+  const parts = trimmed.split(":");
+  if (parts.length !== 2) return null;
+  const attachedRaw = parts[0] ?? "";
+  const activityRaw = parts[1] ?? "";
+  const digitsOnly = /^[0-9]+$/;
+  if (!digitsOnly.test(attachedRaw) || !digitsOnly.test(activityRaw)) return null;
+  const attachedNum = Number(attachedRaw);
+  const activitySec = Number(activityRaw);
+  // tmux reports session_activity in epoch SECONDS; callers (idle-clock math
+  // against `Date.now()`) expect milliseconds.
+  return { attached: attachedNum > 0, activityAt: activitySec * 1000 };
+}
+
+/**
  * Keyed, single-round-trip liveness + activity probe for a task's tmux
  * session, with no dependency on in-memory `SessionState`. This is what the
  * reaper falls back to for a task it holds no `SessionState` for (e.g. after
  * a restart, before boot reconciliation reattaches it) instead of a bare
  * `has-session` check that can't tell whether the session is still doing
- * anything. One `tmux display-message` round-trip pulls both
- * `#{session_attached}` (nonzero while a real `tmux attach` is live) and
- * `#{session_activity}` (tmux's own last-activity timestamp for the session —
- * updated on any pane output, independent of whether we're the ones tailing
- * it) in a single call. `-t '=<name>'` forces an exact-match target, matching
- * every other tmux() call in this file — see `sessionExists`'s comment for
- * why an unanchored name prefix-matches a sibling `agetor-<id>` session and
- * would misreport a live, unrelated session as this task's. Returns null
- * when the command fails or the session doesn't exist; the caller treats
- * that as "can't tell," not "definitely dead."
+ * anything. Pulls both `#{session_attached}` (nonzero while a real `tmux
+ * attach` is live) and `#{session_activity}` (tmux's own last-activity
+ * timestamp for the session — updated on any pane output, independent of
+ * whether we're the ones tailing it) in a single round-trip, with no
+ * dependency on `SessionState`.
+ *
+ * Uses `list-sessions -F '#{session_attached}:#{session_activity}' -f
+ * '#{==:#{session_name},<name>}'` rather than `display-message -p -t
+ * '=<name>'`. We used to use `display-message`, but on tmux 3.6a it does NOT
+ * resolve an `=`-prefixed exact-match TARGET the way `has-session` and
+ * `kill-session` do: instead of failing for a nonexistent session, it prints
+ * the requested format with every variable expanded to empty (stdout `:`)
+ * and exits 0 — identically for a live session and a dead one. Parsed the
+ * old way (`Number("") === 0` sailing through `Number.isFinite`), that
+ * turned into `{attached: false, activityAt: 0}` for EVERY task, live or
+ * dead — "idle since epoch 1970" — which made the idle-session reaper
+ * re-reap every candidate task on every sweep. `list-sessions -f
+ * '#{==:...}'` uses a session FILTER, not a resolved target, so it isn't
+ * subject to that `=`-target quirk: verified on tmux 3.6a to return e.g.
+ * `0:1785511908` for a live session and empty stdout (exit 0, server up)
+ * for a dead one.
+ *
+ * `-f '#{==:#{session_name},<name>}'` is an exact-match filter, matching the
+ * `-t '=<name>'` exact-match target used by every other tmux() call in this
+ * file — see `sessionExists`'s comment for why an unanchored name
+ * prefix-matches a sibling `agetor-<id>` session and would misreport a live,
+ * unrelated session as this task's. Since the name is unique, the filter
+ * should never yield more than one line; if it somehow does, we treat that
+ * as ambiguous and return null rather than guess which line is "ours."
+ *
+ * Returns null when the command fails (no tmux server), stdout is empty or
+ * whitespace-only (session doesn't exist), or the output doesn't parse —
+ * the caller treats that as "can't tell," not "definitely dead."
  */
+let probeFailureWarned = false;
 export function probeSessionActivity(taskId: string): { attached: boolean; activityAt: number } | null {
   const r = tmux([
-    "display-message", "-p", "-t", "=" + sessionNameFor(taskId),
-    "#{session_attached}:#{session_activity}",
+    "list-sessions", "-F", "#{session_attached}:#{session_activity}",
+    "-f", "#{==:#{session_name}," + sessionNameFor(taskId) + "}",
   ]);
-  if (!r.ok) return null;
-  const [attachedRaw, activityRaw] = r.stdout.trim().split(":");
-  const attachedNum = Number(attachedRaw);
-  const activitySec = Number(activityRaw);
-  if (!Number.isFinite(attachedNum) || !Number.isFinite(activitySec)) return null;
-  // tmux reports session_activity in epoch SECONDS; callers (idle-clock math
-  // against `Date.now()`) expect milliseconds.
-  return { attached: attachedNum > 0, activityAt: activitySec * 1000 };
+  if (!r.ok) {
+    // A missing server is the routine failure (nothing running → nothing to
+    // probe) — stay silent for that. Anything else gets one warn per
+    // process: `-f` + the `#{==:}` comparison are a newer tmux surface than
+    // the has-session/kill-session calls elsewhere in this file, and a tmux
+    // build that rejects them would otherwise silently disable reaping for
+    // every session with no in-memory SessionState — the same *class* of
+    // invisible misread the display-message quirk this function replaced.
+    if (!probeFailureWarned && !/no server running|error connecting/i.test(r.stderr)) {
+      probeFailureWarned = true;
+      console.warn(`[agetor] probeSessionActivity: tmux list-sessions failed: ${r.stderr.trim()}`);
+    }
+    return null;
+  }
+  const trimmed = r.stdout.trim();
+  if (trimmed === "") return null;
+  const lines = trimmed.split("\n");
+  if (lines.length !== 1) return null;
+  return parseSessionActivityLine(lines[0] ?? "");
 }
 
 /** Tri-state liveness of a tmux session — the safe signal for the death watch. */

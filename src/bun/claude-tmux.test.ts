@@ -21,6 +21,7 @@ import {
   encodeProjectPath,
   jsonlPathFor,
   mapJsonlEventToChunks,
+  parseSessionActivityLine,
   rebuildEventsFromJsonl,
   sessionNameFor,
   toClaudeModeString,
@@ -54,6 +55,44 @@ test("encodeProjectPath turns every slash and dot into a dash", () => {
 
 test("sessionNameFor uses the first 12 chars of the task id", () => {
   expect(sessionNameFor("abcdef0123456789-rest")).toBe("agetor-abcdef012345");
+});
+
+test("parseSessionActivityLine parses a detached live session", () => {
+  expect(parseSessionActivityLine("0:1785511908")).toEqual({
+    attached: false,
+    // seconds -> ms
+    activityAt: 1785511908 * 1000,
+  });
+});
+
+test("parseSessionActivityLine parses an attached session", () => {
+  expect(parseSessionActivityLine("1:123")).toEqual({ attached: true, activityAt: 123000 });
+});
+
+test("parseSessionActivityLine rejects an empty string", () => {
+  expect(parseSessionActivityLine("")).toBeNull();
+});
+
+test("parseSessionActivityLine rejects the tmux 3.6a empty-target shape", () => {
+  // `display-message -p -t '=<name>'` on tmux 3.6a expands an unresolvable
+  // exact-match target's variables to empty and still exits 0 — this is the
+  // literal stdout that caused the reap-spam bug. list-sessions -f no longer
+  // produces this shape, but the parser must reject it defensively too.
+  expect(parseSessionActivityLine(":")).toBeNull();
+});
+
+test("parseSessionActivityLine rejects non-digit fields", () => {
+  expect(parseSessionActivityLine("abc:123")).toBeNull();
+  expect(parseSessionActivityLine("0:abc")).toBeNull();
+  expect(parseSessionActivityLine("garbage")).toBeNull();
+});
+
+test("parseSessionActivityLine rejects negative and whitespace variants", () => {
+  expect(parseSessionActivityLine("-1:123")).toBeNull();
+  expect(parseSessionActivityLine("0:-123")).toBeNull();
+  expect(parseSessionActivityLine("0: 123")).toBeNull();
+  expect(parseSessionActivityLine(" 0:123 ")).toEqual({ attached: false, activityAt: 123000 });
+  expect(parseSessionActivityLine("0 :123")).toBeNull();
 });
 
 test("buildClaudeSessionEnv pins the classic renderer and re-injects PATH", () => {

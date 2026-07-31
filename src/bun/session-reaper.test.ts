@@ -321,3 +321,113 @@ test("back-to-back reap sweeps never reap the same task twice", async () => {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
 });
+
+test("runs.lastEventData returns the most recently appended MAIN-stream event's data, and null for an eventless run", async () => {
+  const { db, runs } = await import("./db.ts");
+
+  // run_events.run_id carries an FK to runs(id) (ON DELETE CASCADE), so this
+  // needs a real task + run row, not a bare uuid.
+  const task = await createClaudeTask("lastEventData accessor");
+  const taskId = task.id;
+  const runId = randomUUID();
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "running",
+    startedAt: Date.now(),
+    endedAt: null,
+    exitCode: null,
+    tmuxSession: null,
+    claudeSessionId: null,
+    codexSessionId: null,
+  });
+
+  try {
+    expect(runs.lastEventData(runId)).toBeNull();
+
+    runs.appendEvent(runId, "status", "first");
+    expect(runs.lastEventData(runId)).toBe("first");
+
+    runs.appendEvent(runId, "status", "second");
+    expect(runs.lastEventData(runId)).toBe("second");
+
+    // Re-appending the same text is exactly what the reap guard checks for —
+    // confirm the accessor reports it as unchanged (still "second", not a
+    // stale read behind the new row).
+    runs.appendEvent(runId, "status", "second");
+    expect(runs.lastEventData(runId)).toBe("second");
+
+    // A subagent row landing after the breadcrumb must NOT become "the last
+    // event" — the guard compares main-stream text against main-stream text.
+    runs.appendEvent(runId, "assistant", "subagent chatter", null, "subagent-1");
+    expect(runs.lastEventData(runId)).toBe("second");
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+test("never appends the hibernate breadcrumb twice in a row to the same run, even across a re-reap regression", async () => {
+  // Regression guard for the tmux 3.6a `probeSessionActivity` bug (see
+  // docs/plans/fix-permission-mode-status-spam.md, "Follow-up" section): a
+  // broken probe made every idle-fallback check look like "never attached,
+  // idle since 1970", so `reapIdleSessions` re-reaped the same
+  // already-hibernated task on every 5-minute sweep and appended a fresh
+  // duplicate breadcrumb each time (528 rows across 12 tasks in prod). The
+  // probe fix is covered by `parseSessionActivityLine`'s unit tests in
+  // claude-tmux.test.ts; this test exercises the defense-in-depth backstop
+  // instead — it doesn't rely on the probe being broken, it simulates a
+  // re-reap directly (reinstalling an idle in-memory session on the very run
+  // the first sweep already hibernated) and asserts the breadcrumb still
+  // can't duplicate no matter what caused the second sweep to think the task
+  // was idle again.
+  const { startTask, reapIdleSessions } = await import("./orchestrator.ts");
+  const { db, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+  const { IDLE_SESSION_REAP_MS } = await import("../shared/types.ts");
+
+  const task = await createClaudeTask("no double hibernate breadcrumb");
+  const taskId = task.id;
+
+  const started = await startTask(taskId);
+  if (!("runId" in started)) throw new Error("expected the run to start");
+  const runId = started.runId;
+  // Let the fake driver's turn resolve so `active` no longer holds this run
+  // — otherwise the in-flight guard would (correctly) block every reap
+  // attempt below regardless of idle time.
+  await new Promise((r) => setTimeout(r, 100));
+
+  try {
+    // First sweep: genuinely idle in-memory session → reaps and appends the
+    // hibernate breadcrumb once.
+    await installIdleSession(taskId, IDLE_SESSION_REAP_MS + 5_000);
+    const first = await reapIdleSessions();
+    expect(first.reaped).toContain(taskId);
+
+    const afterFirst = runs
+      .eventsForTask(taskId)
+      .filter((e) => e.runId === runId && e.stream === "status" && e.data.includes("hibernated"));
+    expect(afterFirst.length).toBe(1);
+
+    // Simulate the regression: something makes the reaper see this exact
+    // task/run as idle again on the very next sweep (in prod this was the
+    // broken tmux probe; here we reinstall an idle session directly so the
+    // test doesn't depend on reproducing the tmux 3.6a bug itself). No
+    // follow-up message was sent, so `recent` still resolves to the same
+    // run — this is the scenario the guard exists for.
+    await installIdleSession(taskId, IDLE_SESSION_REAP_MS + 5_000);
+    const second = await reapIdleSessions();
+    expect(second.reaped).toContain(taskId);
+
+    const afterSecond = runs
+      .eventsForTask(taskId)
+      .filter((e) => e.runId === runId && e.stream === "status" && e.data.includes("hibernated"));
+    // The guard must have skipped the duplicate append — still exactly one
+    // hibernate breadcrumb on this run, not two.
+    expect(afterSecond.length).toBe(1);
+    expect(afterSecond[0]!.data).toBe(afterFirst[0]!.data);
+  } finally {
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});

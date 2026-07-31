@@ -2440,8 +2440,21 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
         const data = findLastClaudeSessionId(taskId)
           ? "session hibernated after 30m idle — next message will resume it"
           : "session hibernated after 30m idle — no saved session id, next message starts a fresh context";
-        runs.appendEvent(recent.id, "status", data);
-        emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+        // Idempotence backstop: a re-reap regression (e.g. the tmux 3.6a
+        // `display-message` exact-match bug worked around in
+        // `probeSessionActivity`, which made every probe look like "never
+        // attached, idle since 1970" and re-reaped every candidate on every
+        // sweep) must not re-spam the run with duplicate hibernate
+        // breadcrumbs. A legitimate later hibernate always has intervening
+        // events (resuming creates a new run / new events), so "the last
+        // persisted event for this run is this exact breadcrumb" is safe to
+        // treat as "already reaped, skip" — both the append AND the emit,
+        // since an emit without persistence would still paint a new chip
+        // client-side on every sweep.
+        if (runs.lastEventData(recent.id) !== data) {
+          runs.appendEvent(recent.id, "status", data);
+          emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+        }
       }
     }
 
