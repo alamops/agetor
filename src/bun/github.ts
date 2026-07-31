@@ -1719,6 +1719,30 @@ export async function getGitHubPullDiff(input: GetGitHubPullDiffInput): Promise<
   };
 }
 
+/** `GET /repos/:o/:r/pulls/:number` — a single pull request by number,
+ *  normalized through the same `normalizeItem` mapper `reopenGitHubPull` and
+ *  `listGitHubItems` use, so the UI's PR detail subpage renders an item
+ *  shaped identically to one that arrived via a list fetch. Unlike the
+ *  mutation endpoints above, this is a plain read — no token is required for
+ *  a public repo (`fetchGitHub` already treats `token: null` as anonymous). */
+export async function getGitHubPullDetail(input: GitHubItemNumberInput): Promise<GitHubIssueResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive" };
+  }
+
+  const token = await githubToken(repo.remoteHost ?? null);
+  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const item = normalizeItem("pulls", json, input.dir);
+  if (!item) return { ok: false, error: "GitHub returned an unexpected pull request response" };
+  return { ok: true, item };
+}
+
 export async function listGitHubComments(input: GitHubItemNumberInput): Promise<GitHubCommentsResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
