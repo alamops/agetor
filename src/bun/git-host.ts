@@ -9,6 +9,7 @@ import type {
   GitHubListResult,
   GitHubPullDefaultsResult,
   GitHubPullLineComment,
+  GitHubPullMergeability,
   GitHubPullMergeMethod,
   GitHubPullMergeResult,
   GitHubPullReviewCommentsResult,
@@ -26,6 +27,7 @@ import {
   getGitHubPullChecks,
   getGitHubPullDefaults,
   getGitHubPullDiff,
+  getGitHubPullMergeability,
   getGitHubViewer,
   listGitHubComments,
   listGitHubItems,
@@ -49,6 +51,7 @@ import {
   getGitLabPullChecks,
   getGitLabPullDefaults,
   getGitLabPullDiff,
+  getGitLabPullMergeability,
   getGitLabViewer,
   listGitLabComments,
   listGitLabItems,
@@ -69,6 +72,7 @@ import {
   getBitbucketPullChecks,
   getBitbucketPullDefaults,
   getBitbucketPullDiff,
+  getBitbucketPullMergeability,
   getBitbucketViewer,
   listBitbucketComments,
   listBitbucketItems,
@@ -126,6 +130,7 @@ type CommentResponse = ({ ok: true; comment: GitHubComment }) | FacadeError;
 type LineCommentResponse = ({ ok: true; comment: GitHubPullLineComment }) | FacadeError;
 type ReviewCommentsResponse = ({ ok: true } & GitHubPullReviewCommentsResult) | FacadeError;
 type ChecksResponse = ({ ok: true } & GitHubChecksResult) | FacadeError;
+type MergeabilityResponse = ({ ok: true } & GitHubPullMergeability) | FacadeError;
 type MergeResponse = GitHubPullMergeResult | FacadeError;
 type ActionResponse = ({ ok: true; message?: string; item?: GitHubListItem; commentPosted?: boolean }) | FacadeError;
 type ViewerResponse = ({ ok: true; login: string }) | FacadeError;
@@ -459,6 +464,15 @@ export async function pullChecks(input: { dir: string; number: number }): Promis
   if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
   if (repoInfo.provider === "github") return getGitHubPullChecks(input);
   return repoInfo.provider === "gitlab" ? getGitLabPullChecks(repoInfo, input.number) : getBitbucketPullChecks(repoInfo, input.number);
+}
+
+export async function pullMergeability(input: { dir: string; number: number }): Promise<MergeabilityResponse> {
+  const repoInfo = await providerRepoForDir(input.dir);
+  if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
+  if (repoInfo.provider === "github") return getGitHubPullMergeability(input);
+  return repoInfo.provider === "gitlab"
+    ? getGitLabPullMergeability(repoInfo, input.number)
+    : getBitbucketPullMergeability(repoInfo, input.number);
 }
 
 export interface PullMergeInput {

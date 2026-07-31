@@ -97,7 +97,6 @@ import {
   getGitHubPullLinkedIssues,
   getGitHubRepoPermissions,
   getGitHubThreadSubscription,
-  getGitHubPullMergeability,
   getGitHubPullReviewThreads,
   listGitHubAssignees,
   listGitHubDiscussions,
@@ -1464,7 +1463,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (!Number.isInteger(number) || number <= 0) {
             return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await getGitHubPullMergeability({ dir, number });
+          const result = await gitHost.pullMergeability({ dir, number });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
