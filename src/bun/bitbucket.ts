@@ -880,8 +880,8 @@ export async function getBitbucketPullChecks(repo: ProviderRepoInfo, number: num
  *  other adapter function — the facade (`git-host.ts`) stitches it on via
  *  `withSourcePath`. */
 export async function getBitbucketPullDetail(repo: ProviderRepoInfo, number: number): Promise<BitbucketIssueResponse> {
-  const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
+  const creds = await bitbucketCreds(repo.remoteHost);
   const res = await fetchBitbucket(`${repoBasePath(repo)}/pullrequests/${number}`, creds, "application/json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);

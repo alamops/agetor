@@ -15,18 +15,23 @@
  * throws — for anything else, including a malformed URL.
  */
 export function parsePullNumber(url: string): number | null {
-  let pathname: string;
+  let parsed: URL;
   try {
-    pathname = new URL(url).pathname;
+    parsed = new URL(url);
   } catch {
     return null;
   }
-  const segments = pathname.split("/").filter(Boolean);
+  // Only web URLs qualify — a non-http(s) scheme must keep taking the
+  // ExternalLink branch, where its whitelist applies.
+  if (!/^https?:$/.test(parsed.protocol)) return null;
+  const segments = parsed.pathname.split("/").filter(Boolean);
   const markers = new Set(["pull", "merge_requests", "pull-requests"]);
   for (let i = 0; i < segments.length - 1; i++) {
     const marker = segments[i];
     const next = segments[i + 1];
     if (marker === undefined || next === undefined || !markers.has(marker)) continue;
+    // Canonical decimal only — Number() would also admit "1e3"/"0x10"/"12.0".
+    if (!/^\d+$/.test(next)) continue;
     const n = Number(next);
     if (Number.isInteger(n) && n > 0) return n;
   }

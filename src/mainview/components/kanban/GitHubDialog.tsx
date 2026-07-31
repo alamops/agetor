@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
@@ -179,6 +179,18 @@ function sameItem(
   b: Pick<GitHubListItem, "kind" | "number" | "sourcePath">,
 ): boolean {
   return a.kind === b.kind && a.number === b.number && (a.sourcePath ?? null) === (b.sourcePath ?? null);
+}
+
+/** Normalizes a PR URL for the detail-prefill mismatch check (strips a query
+ *  string/fragment and any trailing slash) so e.g.
+ *  `https://github.com/a/b/pull/12?diff=split` and
+ *  `https://github.com/a/b/pull/12/` compare equal to
+ *  `https://github.com/a/b/pull/12`. A plain string compare of the
+ *  normalized forms is enough — this only needs to catch "the fetch returned
+ *  an unrelated PR," not validate URL well-formedness, so host casing etc.
+ *  is deliberately left alone. */
+function normalizePrUrl(url: string): string {
+  return (url.split(/[?#]/)[0] ?? "").replace(/\/+$/, "");
 }
 
 const fmtDate = (value: string) => {
@@ -570,6 +582,14 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // itemKey (G8) so two same-numbered PRs across repos don't share a retry budget.
   const mergeabilityRetries = useRef<Record<string, number>>({});
   const [view, setView] = useState<GitHubDialogView>({ kind: "list" });
+  // Mirrors `view` for the async prefill effect below, which needs to check
+  // "has the user navigated away from the list?" from inside a promise
+  // continuation — a plain closure over `view` would see the value from the
+  // render that started the fetch, not the current one. Kept in sync by
+  // inline assignment on every render rather than an effect, since an effect
+  // would only update it a tick after the render already committed.
+  const viewRef = useRef(view);
+  viewRef.current = view;
   // Derived rather than independent booleans — the 7 manager panels are
   // mutually exclusive with each other and with the detail subpage by
   // construction of the `GitHubDialogView` union, so there's no "close the
@@ -687,6 +707,37 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // detail subpage prefill instead of the New-PR composer prefill.
   const lastPullDetailPrefillRef = useRef<GitHubPullDetailPrefill | null>(null);
   const pendingPullDetailPrefillRef = useRef<GitHubPullDetailPrefill | null>(null);
+
+  // Wipes every pull + issue composer field, including the prefill task-id
+  // tag — the single source of truth for "reset the composers" so the
+  // project/kind-change effect, the close-reset effect, both create-success
+  // paths, and every compose-exit path (Cancel, Escape, back-chevron) can't
+  // drift out of sync with each other again. Deliberately leaves `view` and
+  // the prefill one-shot refs alone — callers differ on whether those need
+  // touching (e.g. the close-reset also clears the refs; a plain compose
+  // exit does not), so they handle it themselves. Stable identity via
+  // `useCallback` since it closes over nothing but setters.
+  const resetComposers = useCallback(() => {
+    setNewIssueTitle("");
+    setNewIssueBody("");
+    setNewIssueLabels("");
+    setNewIssueAssignees("");
+    setNewIssueMilestone("");
+    setNewIssueSubmitting(false);
+    setNewIssueError(null);
+    setNewPullTitle("");
+    setNewPullBody("");
+    setNewPullHead("");
+    setNewPullBase("");
+    setNewPullReviewers("");
+    setNewPullDraft(false);
+    setNewPullSubmitting(false);
+    setNewPullError(null);
+    setNewPullPushing(false);
+    setNewPullPushError(null);
+    setNewPullPushMessage(null);
+    setPullPrefillTaskId(null);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -974,26 +1025,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     // synthetic aggregate value) from ever showing the compose page: a
     // project switch into aggregate fires this same effect.
     setView((cur) => (cur.kind === "compose" ? backToList() : cur));
-    setNewIssueTitle("");
-    setNewIssueBody("");
-    setNewIssueLabels("");
-    setNewIssueAssignees("");
-    setNewIssueMilestone("");
-    setNewIssueSubmitting(false);
-    setNewIssueError(null);
-    setNewPullTitle("");
-    setNewPullBody("");
-    setNewPullHead("");
-    setNewPullBase("");
-    setNewPullReviewers("");
-    setNewPullDraft(false);
-    setNewPullSubmitting(false);
-    setNewPullError(null);
-    setNewPullPushing(false);
-    setNewPullPushError(null);
-    setNewPullPushMessage(null);
-    setPullPrefillTaskId(null);
-  }, [projectPath, kind]);
+    resetComposers();
+  }, [projectPath, kind, resetComposers]);
 
   // Prefill consumption, part 2 of 2: declared *after* the reset effect above
   // and sharing its [projectPath, kind] deps, so in the render where part 1
@@ -1023,9 +1056,15 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // and navigates to its detail subpage; guards against a stale in-flight
   // fetch (dialog closed/reopened, or these deps re-firing for another
   // reason) via the effect's own `cancelled` cleanup flag, same pattern as
-  // any other fetch-in-effect. Falls back to the plain external link on any
+  // any other fetch-in-effect, AND against the user having already navigated
+  // away from the list while the fetch was in flight (`viewRef` — a plain
+  // closure over `view` would only see the value from the render that
+  // started the fetch). Falls back to the plain external link on any
   // failure — including a well-formed `{ ok: false }` body, in case a future
-  // server change starts returning one instead of a non-2xx status.
+  // server change starts returning one instead of a non-2xx status, and
+  // including a fetched item whose URL doesn't match the prefill's `prUrl`
+  // (item numbers are per-repo, so a project-path mismatch upstream could
+  // otherwise land the user on an unrelated repo's PR #N).
   useEffect(() => {
     if (!open) return;
     const pending = pendingPullDetailPrefillRef.current;
@@ -1035,13 +1074,18 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     void (async () => {
       try {
         const result = await api.getGitHubPullDetail(pending.projectPath, pending.number);
-        if (cancelled) return;
+        if (cancelled || viewRef.current.kind !== "list") return;
         if (!result?.ok || !result.item) throw new Error("Pull request not found");
+        if (normalizePrUrl(result.item.htmlUrl) !== normalizePrUrl(pending.prUrl)) {
+          throw new Error("That pull request URL points at a different repository — opening in browser.");
+        }
         setView(openDetail(result.item));
       } catch (err) {
-        if (cancelled) return;
+        if (cancelled || viewRef.current.kind !== "list") return;
         toast.error(err instanceof Error ? err.message : "Could not load the pull request");
-        void api.openExternal(pending.prUrl);
+        void api.openExternal(pending.prUrl).catch((e: unknown) => {
+          toast.error(e instanceof Error ? e.message : "Could not open the browser");
+        });
       }
     })();
     return () => {
@@ -1063,23 +1107,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   useEffect(() => {
     if (open) return;
     setView((cur) => (cur.kind === "compose" ? backToList() : cur));
-    setNewIssueTitle("");
-    setNewIssueBody("");
-    setNewIssueLabels("");
-    setNewIssueAssignees("");
-    setNewIssueMilestone("");
-    setNewIssueSubmitting(false);
-    setNewIssueError(null);
-    setNewPullTitle("");
-    setNewPullBody("");
-    setNewPullHead("");
-    setNewPullBase("");
-    setPullPrefillTaskId(null);
+    resetComposers();
     pendingPullPrefillRef.current = null;
     lastPullPrefillRef.current = null;
     pendingPullDetailPrefillRef.current = null;
     lastPullDetailPrefillRef.current = null;
-  }, [open]);
+  }, [open, resetComposers]);
 
   const availableLabels = useMemo(() => {
     // Prefer the full repo-label list; fall back to labels seen on loaded items
@@ -2731,11 +2764,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
       // Land on the created issue's detail subpage rather than just closing
       // back to the list — mirrors clicking the row you just made.
       setView(openDetail(result.item));
-      setNewIssueTitle("");
-      setNewIssueBody("");
-      setNewIssueLabels("");
-      setNewIssueAssignees("");
-      setNewIssueMilestone("");
+      resetComposers();
     } catch (e) {
       setNewIssueError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -2781,12 +2810,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
       // Land on the created pull's detail subpage rather than just closing
       // back to the list — mirrors clicking the row you just made.
       setView(openDetail(result.item));
-      setNewPullTitle("");
-      setNewPullBody("");
-      setNewPullReviewers("");
-      setNewPullDraft(false);
-      setPullPrefillTaskId(null);
-      setActionMessages((cur) => ({ ...cur, [result.item.number]: result.message ?? "Pull request created." }));
+      resetComposers();
+      // Keyed by itemKey (not the bare number) to match every other
+      // actionMessages writer/reader — a bare-number key would silently miss
+      // in aggregate mode where two repos can share PR #N.
+      setActionMessages((cur) => ({ ...cur, [itemKey(result.item)]: result.message ?? "Pull request created." }));
     } catch (e) {
       setNewPullError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -2917,13 +2945,26 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     setView(openDetail(item));
   };
   const closeDetail = () => setView(backToList());
+  // Every path that can leave the compose subpage without submitting
+  // (Cancel, Escape/backdrop, the header back-chevron) must route through
+  // this instead of the plain `closeDetail` above — otherwise
+  // `pullPrefillTaskId` stays armed and a later manual "New PR" in the same
+  // dialog session stamps an unrelated PR's URL onto the prefilled task.
+  const exitCompose = () => {
+    setView(backToList());
+    resetComposers();
+  };
 
   return (
     <Dialog
       open={open}
       onClose={() => {
         if (resolveEscape(view) === "pop") {
-          closeDetail();
+          if (view.kind === "compose") {
+            exitCompose();
+          } else {
+            closeDetail();
+          }
           return;
         }
         onClose();
@@ -2985,13 +3026,17 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
               variant="ghost"
               aria-label="Back"
               title="Back to list"
-              onClick={closeDetail}
+              onClick={exitCompose}
             >
               <ChevronLeft className="size-4" />
             </Button>
             <div className="min-w-0">
+              {/* Same label source as the list's "New <abbrev>" trigger button
+                  below (`caps.pullAbbrev`) rather than `caps.pullNoun`, so the
+                  trigger and this header can never drift to different nouns
+                  for the same provider. */}
               <div id="github-dialog-title" className="text-sm font-semibold">
-                {kind === "pulls" ? `New ${caps.pullNoun.toLowerCase()}` : "New issue"}
+                {kind === "pulls" ? `New ${caps.pullAbbrev}` : "New issue"}
               </div>
               <div className="mt-0.5 truncate text-xs text-muted-foreground">
                 {result ? result.repo : caps.providerName}
@@ -3136,6 +3181,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
           )}
           </>
           )}
+          {/* Reloads the (hidden) list, so it has no business staying live on
+              the compose subpage — unlike the toggles above it stays visible
+              on the detail subpage, where a refresh is still meaningful. */}
+          {!isComposeView && (
           <Button
             size="icon"
             variant="ghost"
@@ -3146,6 +3195,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
           >
             {loading ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
           </Button>
+          )}
         </div>
       </header>
 
@@ -3511,7 +3561,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
               onReviewersChange={setNewPullReviewers}
               onDraftChange={setNewPullDraft}
               onPushHead={() => { void pushHead(); }}
-              onCancel={() => setView(backToList())}
+              onCancel={exitCompose}
               onSubmit={() => { void createPull(); }}
             />
           ) : (
@@ -3529,7 +3579,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
               onLabelsChange={setNewIssueLabels}
               onAssigneesChange={setNewIssueAssignees}
               onMilestoneChange={setNewIssueMilestone}
-              onCancel={() => setView(backToList())}
+              onCancel={exitCompose}
               onSubmit={() => { void createIssue(); }}
             />
           )

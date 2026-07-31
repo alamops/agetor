@@ -864,7 +864,15 @@ export default function App() {
         }}
         onViewPullRequest={({ projectPath, prUrl }) => {
           const number = parsePullNumber(prUrl);
-          if (number == null) return;
+          if (number == null) {
+            // Can't drive the in-app detail subpage without a parsed PR
+            // number — fall back to the plain external link rather than
+            // silently doing nothing.
+            void api.openExternal(prUrl).catch((err: unknown) => {
+              toast.error(err instanceof Error ? err.message : "Could not open link");
+            });
+            return;
+          }
           setGithubPullDetailPrefill({ projectPath, number, prUrl });
           setGithubPullPrefill(null);
           setGithubOpen(true);
