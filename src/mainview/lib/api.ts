@@ -27,6 +27,7 @@ import type {
   GitHubRepoMilestone,
   GitHubLinkedIssue,
   GitHubLinkedIssuesResult,
+  GitHubListItem,
   GitHubListResult,
   GitHubNotification,
   GitHubNotificationsResult,
@@ -116,6 +117,7 @@ export type {
   GitHubRepoMilestone,
   GitHubLinkedIssue,
   GitHubLinkedIssuesResult,
+  GitHubListItem,
   GitHubListResult,
   GitHubNotification,
   GitHubNotificationsResult,
@@ -506,6 +508,10 @@ export const api = {
       number: String(input.number),
     });
     return j<TaskDiff>(`/github/pull-diff?${q.toString()}`);
+  },
+  getGitHubPullDetail: (path: string, number: number) => {
+    const q = new URLSearchParams({ path, number: String(number) });
+    return j<{ ok: true; item: GitHubListItem }>(`/github/pull-detail?${q.toString()}`);
   },
   getGitHubPullChecks: (input: { path: string; number: number }) => {
     const q = new URLSearchParams({

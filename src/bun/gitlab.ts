@@ -874,6 +874,22 @@ export async function getGitLabPullChecks(repo: ProviderRepoInfo, number: number
   return { ok: true, repo: `${repo.owner}/${repo.name}`, pullNumber: number, sha, checkRuns };
 }
 
+/** Matches `getGitHubPullDetail`'s shape — a single merge request by number,
+ *  normalized through the same `normalizeItem` mapper `closeGitLabPull` /
+ *  `reopenGitLabPull` use. */
+export async function getGitLabPullDetail(repo: ProviderRepoInfo, number: number): Promise<GitLabIssueResponse> {
+  if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "merge request number must be positive" };
+  const token = await gitlabToken(repo.remoteHost);
+  const projectId = encodeProjectId(repo.owner, repo.name);
+  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}`, token);
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
+  const item = normalizeItem("pulls", json);
+  if (!item) return { ok: false, error: "GitLab returned an unexpected merge request response" };
+  return { ok: true, item };
+}
+
 /** Matches `mergeGitHubPull`'s shape. GitLab's `merge_strategy`/merge-method
  *  vocabulary is squash-or-not (`squash: boolean`) rather than GitHub's
  *  named strategies — `PROVIDER_CAPS.gitlab.mergeMethods` only ever offers

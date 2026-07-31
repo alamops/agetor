@@ -68,6 +68,7 @@ import { mergeabilityView, type MergeTone } from "@/lib/mergeability";
 import { ResolveConflictsDialog, type ResolveConflictsContext } from "./ResolveConflictsDialog";
 import {
   backToList,
+  openCompose,
   openDetail,
   resolveEscape,
   togglePanel,
@@ -637,7 +638,6 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // Success banner for a completed transfer — shown at the list level since the
   // transferred item is removed from `result.items` the moment it succeeds.
   const [transferNotice, setTransferNotice] = useState<{ message: string; url: string } | null>(null);
-  const [issueComposerOpen, setIssueComposerOpen] = useState(false);
   const [newIssueTitle, setNewIssueTitle] = useState("");
   const [newIssueBody, setNewIssueBody] = useState("");
   const [newIssueLabels, setNewIssueLabels] = useState("");
@@ -645,7 +645,6 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   const [newIssueMilestone, setNewIssueMilestone] = useState("");
   const [newIssueSubmitting, setNewIssueSubmitting] = useState(false);
   const [newIssueError, setNewIssueError] = useState<string | null>(null);
-  const [pullComposerOpen, setPullComposerOpen] = useState(false);
   const [newPullTitle, setNewPullTitle] = useState("");
   const [newPullBody, setNewPullBody] = useState("");
   const [newPullHead, setNewPullHead] = useState("");
@@ -870,11 +869,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     commitsSeq.current += 1;
     linkedIssuesSeq.current += 1;
     reviewCommentSeq.current += 1;
-    // Only pop an open detail view back to the list — a manager panel (still
-    // showing the filter controls) should survive a filter edit. Functional
-    // update so `view` doesn't need to be a dep (popping must not re-trigger
-    // this effect on its own view-driven state changes).
-    setView((cur) => (cur.kind === "detail" ? backToList() : cur));
+    // Only pop an open detail or compose view back to the list — a manager
+    // panel (still showing the filter controls) should survive a filter
+    // edit. Functional update so `view` doesn't need to be a dep (popping
+    // must not re-trigger this effect on its own view-driven state changes).
+    setView((cur) => (cur.kind === "detail" || cur.kind === "compose" ? backToList() : cur));
     setDiffs({});
     setDiffLoading({});
     setDiffErrors({});
@@ -936,7 +935,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   }, [kind]);
 
   useEffect(() => {
-    setIssueComposerOpen(false);
+    // Also pops an active compose page back to the list — this is what keeps
+    // aggregate mode ("All repositories", which switches `projectPath` to the
+    // synthetic aggregate value) from ever showing the compose page: a
+    // project switch into aggregate fires this same effect.
+    setView((cur) => (cur.kind === "compose" ? backToList() : cur));
     setNewIssueTitle("");
     setNewIssueBody("");
     setNewIssueLabels("");
@@ -944,7 +947,6 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     setNewIssueMilestone("");
     setNewIssueSubmitting(false);
     setNewIssueError(null);
-    setPullComposerOpen(false);
     setNewPullTitle("");
     setNewPullBody("");
     setNewPullHead("");
@@ -970,7 +972,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     if (!open) return;
     const pending = pendingPullPrefillRef.current;
     if (!pending || projectPath !== pending.projectPath || kind !== "pulls") return;
-    setPullComposerOpen(true);
+    setView(openCompose());
     setNewPullHead(pending.head);
     setNewPullTitle(pending.title);
     setNewPullBody(pending.body);
@@ -978,15 +980,27 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     pendingPullPrefillRef.current = null;
   }, [open, projectPath, kind, pullPrefill]);
 
-  // Close wipes the pull composer + prefill bookkeeping. Without this, the
-  // dialog (which stays mounted) reopens later — often on the SAME project,
-  // since `initialProjectPath` falls back to the selected task's workdir, so
-  // the [projectPath, kind] reset above never fires — with the previous
-  // task's seeded composer and, worse, its `pullPrefillTaskId` still armed:
-  // a manual "New PR" would then stamp an unrelated PR's URL onto that task.
+  // Close wipes both composers' field state + prefill bookkeeping, and pops an
+  // active compose page back to the list. Without the pull-composer half of
+  // this, the dialog (which stays mounted) reopens later — often on the SAME
+  // project, since `initialProjectPath` falls back to the selected task's
+  // workdir, so the [projectPath, kind] reset above never fires — with the
+  // previous task's seeded composer and, worse, its `pullPrefillTaskId` still
+  // armed: a manual "New PR" would then stamp an unrelated PR's URL onto that
+  // task. The issue-composer fields are cleared here too (previously only the
+  // pull composer was — issue-composer state used to leak across opens).
+  // Detail/panel views are deliberately left untouched — they already survive
+  // close/reopen, and that's unrelated to this cleanup.
   useEffect(() => {
     if (open) return;
-    setPullComposerOpen(false);
+    setView((cur) => (cur.kind === "compose" ? backToList() : cur));
+    setNewIssueTitle("");
+    setNewIssueBody("");
+    setNewIssueLabels("");
+    setNewIssueAssignees("");
+    setNewIssueMilestone("");
+    setNewIssueSubmitting(false);
+    setNewIssueError(null);
     setNewPullTitle("");
     setNewPullBody("");
     setNewPullHead("");
@@ -2643,7 +2657,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         milestone,
       });
       upsertListItem(result.item, true);
-      setIssueComposerOpen(false);
+      // Land on the created issue's detail subpage rather than just closing
+      // back to the list — mirrors clicking the row you just made.
+      setView(openDetail(result.item));
       setNewIssueTitle("");
       setNewIssueBody("");
       setNewIssueLabels("");
@@ -2691,7 +2707,9 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         taskId: pullPrefillTaskId ?? undefined,
       });
       upsertListItem(result.item, true);
-      setPullComposerOpen(false);
+      // Land on the created pull's detail subpage rather than just closing
+      // back to the list — mirrors clicking the row you just made.
+      setView(openDetail(result.item));
       setNewPullTitle("");
       setNewPullBody("");
       setNewPullReviewers("");
@@ -2817,11 +2835,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     }
   };
 
-  // Detail and panel are distinct, mutually-exclusive members of the
-  // `GitHubDialogView` union, so no defensive "is anything else open" check
-  // is needed — opening either just replaces `view`.
+  // Detail, panel, and compose are distinct, mutually-exclusive members of
+  // the `GitHubDialogView` union, so no defensive "is anything else open"
+  // check is needed — opening any of them just replaces `view`.
   const showDetail = view.kind === "detail";
   const isPanelView = view.kind === "panel";
+  const isComposeView = view.kind === "compose";
 
   const openItemDetail = (item: GitHubListItem) => {
     setView(openDetail(item));
@@ -2888,6 +2907,26 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
               </div>
             </div>
           </div>
+        ) : isComposeView ? (
+          <div className="flex min-w-0 items-center gap-2">
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Back"
+              title="Back to list"
+              onClick={closeDetail}
+            >
+              <ChevronLeft className="size-4" />
+            </Button>
+            <div className="min-w-0">
+              <div id="github-dialog-title" className="text-sm font-semibold">
+                {kind === "pulls" ? `New ${caps.pullNoun.toLowerCase()}` : "New issue"}
+              </div>
+              <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                {result ? result.repo : caps.providerName}
+              </div>
+            </div>
+          </div>
         ) : (
           <div className="min-w-0">
             <div id="github-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
@@ -2923,7 +2962,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
               <ExternalLink className="size-4" />
             </Button>
           )}
-          {!showDetail && (
+          {/* Repo-level toolbar (manager panel toggles + "open repository")
+              stays up while browsing the list or a manager panel (the toggles
+              are how panels switch and toggle off) — hidden on the detail and
+              compose subpages, which have their own back-chevron header. */}
+          {!showDetail && !isComposeView && (
           <>
           {panelsEnabled && caps.labels && (
             <Button
@@ -3035,7 +3078,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         </div>
       </header>
 
-      {!showDetail && (
+      {/* Filter bar serves the item list, which stays visible below an open
+          manager panel — hidden only on the detail and compose subpages,
+          which replace the list entirely. */}
+      {!showDetail && !isComposeView && (
       <div className="grid gap-2 border-b border-border/60 p-3 md:grid-cols-[minmax(0,1.2fr)_auto_auto]">
         <Select
           value={projectPath}
@@ -3368,6 +3414,54 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
               setCommitsErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
             }}
           />
+        ) : isComposeView ? (
+          // Compose is its own dedicated subpage — render only the composer,
+          // never the manager panels or the item list underneath it. Which
+          // composer shows follows the dialog's existing pulls/issues `kind`
+          // state, exactly like the list body below does.
+          kind === "pulls" ? (
+            <PullComposer
+              caps={caps}
+              title={newPullTitle}
+              body={newPullBody}
+              head={newPullHead}
+              base={newPullBase}
+              reviewers={newPullReviewers}
+              draft={newPullDraft}
+              submitting={newPullSubmitting}
+              error={newPullError}
+              pushing={newPullPushing}
+              pushError={newPullPushError}
+              pushMessage={newPullPushMessage}
+              onTitleChange={setNewPullTitle}
+              onBodyChange={setNewPullBody}
+              onHeadChange={setNewPullHead}
+              onBaseChange={setNewPullBase}
+              onReviewersChange={setNewPullReviewers}
+              onDraftChange={setNewPullDraft}
+              onPushHead={() => { void pushHead(); }}
+              onCancel={() => setView(backToList())}
+              onSubmit={() => { void createPull(); }}
+            />
+          ) : (
+            <IssueComposer
+              caps={caps}
+              title={newIssueTitle}
+              body={newIssueBody}
+              labels={newIssueLabels}
+              assignees={newIssueAssignees}
+              milestone={newIssueMilestone}
+              submitting={newIssueSubmitting}
+              error={newIssueError}
+              onTitleChange={setNewIssueTitle}
+              onBodyChange={setNewIssueBody}
+              onLabelsChange={setNewIssueLabels}
+              onAssigneesChange={setNewIssueAssignees}
+              onMilestoneChange={setNewIssueMilestone}
+              onCancel={() => setView(backToList())}
+              onSubmit={() => { void createIssue(); }}
+            />
+          )
         ) : (
         <>
         {labelManagerOpen && (
@@ -3519,52 +3613,25 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
             onClose={() => setView(backToList())}
           />
         )}
+        {/* Trigger buttons for the compose subpage (moved out of the composer
+            components themselves — those now always render in "open" form,
+            only ever mounted on the compose page). */}
         {kind === "pulls" && !isAggregate && (
-          <PullComposer
-            caps={caps}
-            open={pullComposerOpen}
-            title={newPullTitle}
-            body={newPullBody}
-            head={newPullHead}
-            base={newPullBase}
-            reviewers={newPullReviewers}
-            draft={newPullDraft}
-            submitting={newPullSubmitting}
-            error={newPullError}
-            pushing={newPullPushing}
-            pushError={newPullPushError}
-            pushMessage={newPullPushMessage}
-            onOpenChange={setPullComposerOpen}
-            onTitleChange={setNewPullTitle}
-            onBodyChange={setNewPullBody}
-            onHeadChange={setNewPullHead}
-            onBaseChange={setNewPullBase}
-            onReviewersChange={setNewPullReviewers}
-            onDraftChange={setNewPullDraft}
-            onPushHead={() => { void pushHead(); }}
-            onSubmit={() => { void createPull(); }}
-          />
+          <div className="mb-3 flex justify-end">
+            <Button size="sm" onClick={() => setView(openCompose())}>
+              <Plus className="mr-2 size-3.5" />
+              New {caps.pullAbbrev}
+            </Button>
+          </div>
         )}
 
         {kind === "issues" && !isAggregate && (
-          <IssueComposer
-            caps={caps}
-            open={issueComposerOpen}
-            title={newIssueTitle}
-            body={newIssueBody}
-            labels={newIssueLabels}
-            assignees={newIssueAssignees}
-            milestone={newIssueMilestone}
-            submitting={newIssueSubmitting}
-            error={newIssueError}
-            onOpenChange={setIssueComposerOpen}
-            onTitleChange={setNewIssueTitle}
-            onBodyChange={setNewIssueBody}
-            onLabelsChange={setNewIssueLabels}
-            onAssigneesChange={setNewIssueAssignees}
-            onMilestoneChange={setNewIssueMilestone}
-            onSubmit={() => { void createIssue(); }}
-          />
+          <div className="mb-3 flex justify-end">
+            <Button size="sm" onClick={() => setView(openCompose())}>
+              <Plus className="mr-2 size-3.5" />
+              New issue
+            </Button>
+          </div>
         )}
 
         {transferNotice && (
@@ -3643,9 +3710,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   );
 }
 
+// Always rendered in "open" form — only ever mounted on the compose subpage
+// (see the `isComposeView` branch above). The "New <pull>" trigger that used
+// to gate this component closed lives in the list view instead, since
+// opening now navigates to a dedicated page rather than toggling local state.
 function PullComposer({
   caps,
-  open,
   title,
   body,
   head,
@@ -3657,7 +3727,6 @@ function PullComposer({
   pushing,
   pushError,
   pushMessage,
-  onOpenChange,
   onTitleChange,
   onBodyChange,
   onHeadChange,
@@ -3665,10 +3734,10 @@ function PullComposer({
   onReviewersChange,
   onDraftChange,
   onPushHead,
+  onCancel,
   onSubmit,
 }: {
   caps: ProviderCaps;
-  open: boolean;
   title: string;
   body: string;
   head: string;
@@ -3680,7 +3749,6 @@ function PullComposer({
   pushing: boolean;
   pushError: string | null;
   pushMessage: string | null;
-  onOpenChange: (open: boolean) => void;
   onTitleChange: (title: string) => void;
   onBodyChange: (body: string) => void;
   onHeadChange: (head: string) => void;
@@ -3688,19 +3756,9 @@ function PullComposer({
   onReviewersChange: (reviewers: string) => void;
   onDraftChange: (draft: boolean) => void;
   onPushHead: () => void;
+  onCancel: () => void;
   onSubmit: () => void;
 }) {
-  if (!open) {
-    return (
-      <div className="mb-3 flex justify-end">
-        <Button size="sm" onClick={() => onOpenChange(true)}>
-          <Plus className="mr-2 size-3.5" />
-          New {caps.pullAbbrev}
-        </Button>
-      </div>
-    );
-  }
-
   return (
     <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
       <div className="mb-2 flex items-center justify-between gap-2">
@@ -3792,7 +3850,7 @@ function PullComposer({
           Draft
         </label>
         <div className="flex justify-end gap-2">
-          <Button size="sm" variant="ghost" disabled={submitting} onClick={() => onOpenChange(false)}>
+          <Button size="sm" variant="ghost" disabled={submitting} onClick={onCancel}>
             Cancel
           </Button>
           <Button size="sm" disabled={submitting || !title.trim() || !head.trim() || !base.trim()} onClick={onSubmit}>
@@ -3805,9 +3863,12 @@ function PullComposer({
   );
 }
 
+// Always rendered in "open" form — only ever mounted on the compose subpage
+// (see the `isComposeView` branch above). The "New issue" trigger that used
+// to gate this component closed lives in the list view instead, since
+// opening now navigates to a dedicated page rather than toggling local state.
 function IssueComposer({
   caps,
-  open,
   title,
   body,
   labels,
@@ -3815,16 +3876,15 @@ function IssueComposer({
   milestone,
   submitting,
   error,
-  onOpenChange,
   onTitleChange,
   onBodyChange,
   onLabelsChange,
   onAssigneesChange,
   onMilestoneChange,
+  onCancel,
   onSubmit,
 }: {
   caps: ProviderCaps;
-  open: boolean;
   title: string;
   body: string;
   labels: string;
@@ -3832,25 +3892,14 @@ function IssueComposer({
   milestone: string;
   submitting: boolean;
   error: string | null;
-  onOpenChange: (open: boolean) => void;
   onTitleChange: (title: string) => void;
   onBodyChange: (body: string) => void;
   onLabelsChange: (labels: string) => void;
   onAssigneesChange: (assignees: string) => void;
   onMilestoneChange: (milestone: string) => void;
+  onCancel: () => void;
   onSubmit: () => void;
 }) {
-  if (!open) {
-    return (
-      <div className="mb-3 flex justify-end">
-        <Button size="sm" onClick={() => onOpenChange(true)}>
-          <Plus className="mr-2 size-3.5" />
-          New issue
-        </Button>
-      </div>
-    );
-  }
-
   return (
     <div className="mb-3 rounded-md border border-border/60 bg-card p-3">
       <div className="mb-2 flex items-center justify-between gap-2">
@@ -3909,7 +3958,7 @@ function IssueComposer({
         </div>
       </div>
       <div className="mt-3 flex justify-end gap-2">
-        <Button size="sm" variant="ghost" disabled={submitting} onClick={() => onOpenChange(false)}>
+        <Button size="sm" variant="ghost" disabled={submitting} onClick={onCancel}>
           Cancel
         </Button>
         <Button size="sm" disabled={submitting || !title.trim()} onClick={onSubmit}>

@@ -874,6 +874,23 @@ export async function getBitbucketPullChecks(repo: ProviderRepoInfo, number: num
   return { ok: true, repo: `${repo.owner}/${repo.name}`, pullNumber: number, sha, checkRuns };
 }
 
+/** Matches `getGitHubPullDetail`'s shape — a single pull request by number,
+ *  normalized through the same `normalizeBitbucketPull` mapper
+ *  `closeBitbucketPull` uses. `sourcePath` is left `null` here, same as every
+ *  other adapter function — the facade (`git-host.ts`) stitches it on via
+ *  `withSourcePath`. */
+export async function getBitbucketPullDetail(repo: ProviderRepoInfo, number: number): Promise<BitbucketIssueResponse> {
+  const creds = await bitbucketCreds(repo.remoteHost);
+  if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
+  const res = await fetchBitbucket(`${repoBasePath(repo)}/pullrequests/${number}`, creds, "application/json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  const item = normalizeBitbucketPull(json, null);
+  if (!item) return { ok: false, error: "Bitbucket returned an unexpected pull request response" };
+  return { ok: true, item };
+}
+
 /** The shared `GitHubPullMergeMethod` enum ("merge"|"squash"|"rebase") maps to
  *  Bitbucket's three `merge_strategy` values. There is no fast-forward entry
  *  in the shared enum, so Bitbucket's `fast_forward` (a linear, no-merge-
