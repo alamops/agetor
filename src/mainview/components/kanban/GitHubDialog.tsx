@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { toast } from "sonner";
 import {
   AlertCircle,
   ArrowDownWideNarrow,
@@ -122,6 +123,18 @@ export interface GitHubPullPrefill {
   taskId: string;
 }
 
+/** One-shot prefill for the PR detail subpage (T4, "View PR" from a task's
+ *  run panel): selects the given project, switches to the pulls tab, fetches
+ *  the single PR by number, and navigates straight to `openDetail(item)` —
+ *  landing on the same in-app detail subpage a list click would, instead of
+ *  shelling out to the browser. `prUrl` is kept alongside so a fetch failure
+ *  can still fall back to the plain external link. */
+export interface GitHubPullDetailPrefill {
+  projectPath: string;
+  number: number;
+  prUrl: string;
+}
+
 interface Props {
   open: boolean;
   projects: Project[];
@@ -131,6 +144,10 @@ interface Props {
    *  single effect can't do this safely against the composer's own
    *  reset-on-project/kind-change effect. */
   pullPrefill?: GitHubPullPrefill | null;
+  /** Same one-shot-by-reference contract as `pullPrefill` above, mirrored
+   *  with its own ref pair — see the two-part effect pair around
+   *  `pendingPullDetailPrefillRef` below. */
+  pullDetailPrefill?: GitHubPullDetailPrefill | null;
   onClose: () => void;
 }
 
@@ -427,7 +444,7 @@ function RateLimitBadge({ rateLimit }: { rateLimit: GitHubRateLimit }) {
   );
 }
 
-export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, onClose }: Props) {
+export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, pullDetailPrefill, onClose }: Props) {
   const [projectPath, setProjectPath] = useState("");
   // "All repositories" (G8/F15) — see AGGREGATE_PROJECT_PATH.
   const isAggregate = projectPath === AGGREGATE_PROJECT_PATH;
@@ -666,6 +683,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // Holds a prefill that part 1 (below) has pointed project/kind at but part
   // 2 (after the composer-reset effect) hasn't applied yet.
   const pendingPullPrefillRef = useRef<GitHubPullPrefill | null>(null);
+  // Same one-shot-by-reference bookkeeping as the pair above, for the PR
+  // detail subpage prefill instead of the New-PR composer prefill.
+  const lastPullDetailPrefillRef = useRef<GitHubPullDetailPrefill | null>(null);
+  const pendingPullDetailPrefillRef = useRef<GitHubPullDetailPrefill | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -689,6 +710,19 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     setProjectPath(pullPrefill.projectPath);
     setKind("pulls");
   }, [open, pullPrefill]);
+
+  // PR-detail prefill consumption, part 1 of 2 — same shape as the New-PR
+  // prefill's part 1 above: point project + kind at the target PR, but leave
+  // the actual fetch-and-navigate to part 2 (declared after the composer-
+  // reset effect) so a project switch has already landed.
+  useEffect(() => {
+    if (!open || !pullDetailPrefill) return;
+    if (lastPullDetailPrefillRef.current === pullDetailPrefill) return;
+    lastPullDetailPrefillRef.current = pullDetailPrefill;
+    pendingPullDetailPrefillRef.current = pullDetailPrefill;
+    setProjectPath(pullDetailPrefill.projectPath);
+    setKind("pulls");
+  }, [open, pullDetailPrefill]);
 
   // Stable signal of the aggregate candidate set (G8): the joined project paths
   // when "All repositories" is selected, "" otherwise. Threaded into the reload
@@ -980,6 +1014,41 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     pendingPullPrefillRef.current = null;
   }, [open, projectPath, kind, pullPrefill]);
 
+  // PR-detail prefill consumption, part 2 of 2 — declared after the reset
+  // effect for the same reason as the New-PR prefill's part 2: the reset
+  // effect's `[projectPath, kind]` deps fire in the same pass as part 1's
+  // `setProjectPath`/`setKind`, and declaration order makes reset run first,
+  // so by the time this runs the list body wouldn't have been popped back
+  // over whatever we're about to set here. Fetches the single PR by number
+  // and navigates to its detail subpage; guards against a stale in-flight
+  // fetch (dialog closed/reopened, or these deps re-firing for another
+  // reason) via the effect's own `cancelled` cleanup flag, same pattern as
+  // any other fetch-in-effect. Falls back to the plain external link on any
+  // failure — including a well-formed `{ ok: false }` body, in case a future
+  // server change starts returning one instead of a non-2xx status.
+  useEffect(() => {
+    if (!open) return;
+    const pending = pendingPullDetailPrefillRef.current;
+    if (!pending || projectPath !== pending.projectPath || kind !== "pulls") return;
+    pendingPullDetailPrefillRef.current = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await api.getGitHubPullDetail(pending.projectPath, pending.number);
+        if (cancelled) return;
+        if (!result?.ok || !result.item) throw new Error("Pull request not found");
+        setView(openDetail(result.item));
+      } catch (err) {
+        if (cancelled) return;
+        toast.error(err instanceof Error ? err.message : "Could not load the pull request");
+        void api.openExternal(pending.prUrl);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, projectPath, kind, pullDetailPrefill]);
+
   // Close wipes both composers' field state + prefill bookkeeping, and pops an
   // active compose page back to the list. Without the pull-composer half of
   // this, the dialog (which stays mounted) reopens later — often on the SAME
@@ -1008,6 +1077,8 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     setPullPrefillTaskId(null);
     pendingPullPrefillRef.current = null;
     lastPullPrefillRef.current = null;
+    pendingPullDetailPrefillRef.current = null;
+    lastPullDetailPrefillRef.current = null;
   }, [open]);
 
   const availableLabels = useMemo(() => {
