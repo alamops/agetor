@@ -64,6 +64,7 @@ import {
   interruptTaskSession,
   setContinuationRunFactory,
   setHeldSessionProbe,
+  setActiveRunProbe,
   setBackgroundTaskSettledHandler,
 } from "./claude-tmux.ts";
 import {
@@ -266,6 +267,21 @@ setContinuationRunFactory(startContinuationRun);
 // silently stranding the card in `running` until the next boot. Reuses the
 // existing DB-derived hold predicate — no new state to track.
 setHeldSessionProbe(isHeldByBackgroundAgents);
+
+// Run association for `signalSubagentApiError` (#93): answers "what run id
+// is currently in flight for this task, per the orchestrator's OWN `active`
+// map?" so a stale async subagent from an older run can't abort a newer
+// run's turn. `task.runId` alone isn't enough — it's set the instant
+// `startTask` inserts the run row, before `spawnAgent` returns and
+// `registerActiveRun` populates `active`, and it's also left stale after a
+// run resolves — so the extra `active.has` check (the exact idiom used
+// throughout this file, e.g. the busy/idle branch in `sendInput`) is what
+// actually answers "in flight right now."
+setActiveRunProbe((taskId) => {
+  const task = tasks.get(taskId);
+  if (!task?.runId) return null;
+  return active.has(task.runId) ? task.runId : null;
+});
 
 // Background-task settle signal: a parent task-notification JSONL line named
 // the finishing agent/background-task id — settle that subagent row the same
@@ -2356,6 +2372,17 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
     const isReapable = (task: Task): boolean => {
       if (task.runId && active.has(task.runId)) return false;
       if (isTaskHeldByBackgroundAgents(task)) return false;
+      // `isTaskHeldByBackgroundAgents` only covers the `running`-column
+      // #92 hold (main run succeeded, subagents still finishing) — it
+      // requires `task.column === "running"`. Since #93
+      // (`signalSubagentApiError`), a task can leave the `active` map via
+      // `blocked` instead: one subagent's API error aborts the main turn
+      // while SIBLING subagents are still legitimately running and tailed.
+      // That case slips past the check above (column is `blocked`, not
+      // `running`), so re-check independently of column/hold state — a
+      // task with any running subagent row must never have its tmux
+      // session reaped out from under agents still writing to it.
+      if (subagents.hasRunning(task.id)) return false;
       if (countPendingForTask(task.id) > 0) return false;
       return true;
     };
