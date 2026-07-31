@@ -161,6 +161,50 @@ function heldProbeSafe(taskId: string): boolean {
 }
 
 /**
+ * Predicate the orchestrator injects to answer "what run id is currently
+ * in flight (i.e. tracked in the orchestrator's own `active` map) for this
+ * task?" — `null` when none. `signalSubagentApiError` uses this to guard
+ * against a STALE async subagent (spawned by an OLDER run) erroring while a
+ * NEWER run is in flight on the same tmux session: `TurnSlot` carries no
+ * run id of its own (it's just `{ onChunk, resolve, reject }`), so there is
+ * no way to answer "which run does the live turn belong to" from
+ * `SessionState` alone — the orchestrator's `active` map (keyed by run id)
+ * is the only place that association lives. Mirrors `heldSessionProbe`
+ * exactly: installed as a *module-level* side effect of importing
+ * `orchestrator.ts` (not lazily on first use), `null` until then. In
+ * production that import always happens (`index.ts` pulls it in at boot), so
+ * "unset" is not a reachable production state — it only shows up when a unit
+ * test drives `signalSubagentApiError` directly without ever importing
+ * `orchestrator.ts`. Because `bun test` shares one module cache across every
+ * file in a run, importing `orchestrator.ts` from *any* test file installs
+ * this probe for the rest of the process — so a test that wants "no probe"
+ * semantics can only get that reliably when run in isolation. Tests that
+ * exercise this gate should install an explicit matching (or mismatching)
+ * probe via `setActiveRunProbe` and restore the previous value afterward,
+ * rather than assuming the ambient value is `null`. */
+let activeRunProbe: ((taskId: string) => string | null) | null = null;
+export function setActiveRunProbe(
+  fn: ((taskId: string) => string | null) | null,
+): ((taskId: string) => string | null) | null {
+  const prev = activeRunProbe;
+  activeRunProbe = fn;
+  return prev;
+}
+
+/** Call `activeRunProbe`, never letting a throwing probe reach the tailer's
+ *  api-error callback — same rationale as `heldProbeSafe`. Only meaningful
+ *  to call once the caller has confirmed `activeRunProbe` is non-null (a
+ *  throw mid-call still degrades to "no active run", not "unset"). */
+function activeRunProbeSafe(taskId: string): string | null {
+  try {
+    return activeRunProbe?.(taskId) ?? null;
+  } catch (e) {
+    console.error(`[claude-tmux] activeRunProbe threw for task ${taskId}:`, e);
+    return null;
+  }
+}
+
+/**
  * Handler the orchestrator installs to learn that a background task/agent
  * named in a task-notification JSONL line has settled, so it can flip the
  * matching `subagents` row and re-check the hold predicate above. Fired
@@ -477,6 +521,19 @@ interface ParsedJsonlEvent {
  *  consumer (orchestrator) can't drift. */
 export const CLAUDE_API_ERROR_STATUS_PREFIX = "api error: ";
 
+/** Human-readable detail appended after `CLAUDE_API_ERROR_STATUS_PREFIX`.
+ *  Single source of truth for both the mapper's own emit site (main-stream
+ *  api errors, below) and `claude-subagents.ts`'s tailer peek (subagent api
+ *  errors) — factored out so the two can't drift in wording, and so
+ *  detection never has to string-match this rendered text (see
+ *  `signalSubagentApiError` / the subagent tailer's peek, which key off the
+ *  raw `isApiErrorMessage`/`apiErrorStatus` JSONL fields instead). */
+export function formatApiErrorDetail(status: number | undefined): string {
+  return typeof status === "number"
+    ? `HTTP ${status} — turn aborted; blocked for manual retry`
+    : "turn aborted; blocked for manual retry";
+}
+
 /** Status-chunk prefix for the "claude's TUI rejected the message as an
  *  unknown slash command" sentinel — mirrors `CLAUDE_API_ERROR_STATUS_PREFIX`
  *  exactly (producer here, consumer in orchestrator.ts's `makeChunkHandler`).
@@ -695,9 +752,18 @@ function formatTurnDuration(ms: number): string {
   return s === 0 ? `${m}m` : `${m}m ${s}s`;
 }
 
+/**
+ * @param includeUuidForApiError See `mapParsedEventToChunks`'s param of the
+ * same name. Defaults `false` (unchanged behavior for every existing
+ * caller/test that doesn't pass it). `claude-subagents.ts`'s tailer — the
+ * ONLY external caller of this raw-line entry point (`dispatchLine`, the
+ * main stream, parses up front and calls `mapParsedEventToChunks` directly)
+ * — passes `true`.
+ */
 export function mapJsonlEventToChunks(
   line: string,
   onChunk: ChunkHandler,
+  includeUuidForApiError = false,
 ): { endOfTurn: boolean; lineUuid?: string } {
   let evt: ParsedJsonlEvent;
   try {
@@ -706,15 +772,36 @@ export function mapJsonlEventToChunks(
     onChunk("stderr", `jsonl parse error: ${(e as Error).message}`);
     return { endOfTurn: false };
   }
-  return mapParsedEventToChunks(evt, onChunk);
+  return mapParsedEventToChunks(evt, onChunk, includeUuidForApiError);
 }
 
 /** String-variant entry point delegates to this once the JSON has been
  *  parsed. `dispatchLine` parses up front (to peek the uuid for dedup) and
- *  calls this directly — saves a second JSON.parse per JSONL line. */
+ *  calls this directly — saves a second JSON.parse per JSONL line.
+ *
+ * @param includeUuidForApiError Whether the `isApiErrorMessage` sentinel
+ * `status` chunk should carry the line's own uuid as its `line_uuid` dedup
+ * key. `dispatchLine`'s direct call (main stream) never passes this, so it
+ * defaults `false`: a main-stream api-error line's assistant TEXT block is
+ * emitted first with that SAME uuid, so reusing it here would collide on
+ * the `(run_id, IFNULL(subagent_id,''), line_uuid)` partial unique index
+ * and the status row would be silently dropped via INSERT OR IGNORE (see
+ * the dedicated test in claude-tmux.test.ts). `mapJsonlEventToChunks`
+ * passes `true` for its one real caller, the subagent tailer: a subagent's
+ * own api-error line needs a durable `line_uuid` so reattach seeding
+ * (`seenLineUuidsForSubagent`) reliably recognizes a replayed api-error
+ * line even in the edge case where the line carries no text content block
+ * (so no assistant chunk exists to carry the uuid instead) — without that,
+ * a replayed error line on a boot reattach could re-fire
+ * `signalSubagentApiError` against whatever run happens to be in flight at
+ * that point. When a text block IS present (the common case), the
+ * duplicate write is a harmless no-op — INSERT OR IGNORE silently keeps
+ * the first (assistant) row, which already carries the same uuid.
+ */
 function mapParsedEventToChunks(
   evt: ParsedJsonlEvent,
   onChunk: ChunkHandler,
+  includeUuidForApiError = false,
 ): { endOfTurn: boolean; lineUuid?: string } {
   // Claude stamps a uuid on every event line. Forward it as the third arg
   // to onChunk so the orchestrator can persist it as the run_events row's
@@ -878,17 +965,23 @@ function mapParsedEventToChunks(
       // to flip the task into the `blocked` column, and signal endOfTurn so
       // the run row resolves instead of sitting in `running` forever.
       //
-      // Emitted with `uuid: undefined` (not the JSONL line uuid) on purpose:
-      // the assistant text block above was just appended to run_events with
-      // that uuid, and the partial unique index on `(run_id, line_uuid)`
-      // would silently drop this status via INSERT OR IGNORE if we reused
-      // it. The NULL key path inserts unconditionally, so the breadcrumb
-      // also shows up on panel reload — not just live SSE.
+      // Emitted with `uuid: undefined` on the MAIN stream (the default here
+      // — see `includeUuidForApiError`'s doc) on purpose: the assistant text
+      // block above was just appended to run_events with that SAME uuid (a
+      // typical api-error line has both), and the `(run_id,
+      // IFNULL(subagent_id,''), line_uuid)` partial unique index would
+      // silently drop this status row via INSERT OR IGNORE if we reused it
+      // — verified against `claude-tmux.test.ts`'s
+      // "synthetic isApiErrorMessage line" test, which asserts exactly this.
+      // The NULL key path inserts unconditionally, so the breadcrumb still
+      // shows up on panel reload, just under a different (non-deduped) row.
       if (evt.isApiErrorMessage === true) {
-        const detail = typeof evt.apiErrorStatus === "number"
-          ? `HTTP ${evt.apiErrorStatus} — turn aborted; blocked for manual retry`
-          : "turn aborted; blocked for manual retry";
-        onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}${detail}`);
+        const detail = formatApiErrorDetail(evt.apiErrorStatus);
+        onChunk(
+          "status",
+          `${CLAUDE_API_ERROR_STATUS_PREFIX}${detail}`,
+          includeUuidForApiError ? uuid : undefined,
+        );
         return { endOfTurn: true, lineUuid: uuid };
       }
       // Signal a candidate turn-end. `dispatchLine` stages this and confirms
@@ -3659,6 +3752,110 @@ function signalSessionDeath(state: SessionState): void {
 }
 
 /**
+ * Settle an in-flight turn because a BACKGROUND agent's own transcript
+ * emitted an API-error line (`isApiErrorMessage: true` — 529 Overloaded,
+ * 400, any status; see `mapJsonlEventToChunks`). `claude-subagents.ts`'s
+ * tailer has already settled that subagent's own row `failed` by the time
+ * this fires (see `attachSubagentWatcher`'s `onApiError` — wired below in
+ * `attachTailer`); this module-side half propagates that failure to the
+ * PARENT turn, which the subagent tailer cannot do itself — it is read-only
+ * w.r.t. the agent and has no `SessionState` to act on.
+ *
+ * Reuses `CLAUDE_API_ERROR_STATUS_PREFIX`, the same sentinel the main
+ * stream's own API errors emit, so the orchestrator's chunk handler needs
+ * zero changes: prefix match → `handle.apiError = true` +
+ * `updateColumn(taskId, runId, "blocked", "api-error")`; the done handler
+ * folds that into run `failed` — identical to a main-stream API error.
+ *
+ * Mirrors `signalSessionDeath`'s in-flight settle mechanics exactly (emit
+ * the sentinel via the head slot's `onChunk`, resolve the slot / fire
+ * `onEndOfTurn`) but performs NONE of its teardown: the tmux session is
+ * provably alive — a background agent errored, not the session itself — so
+ * the JSONL watcher, poll/scrape timers, and the subagent watcher all stay
+ * attached, and `orphanRunningSubagents` is deliberately NOT called. Other
+ * background agents may legitimately still be running and must keep being
+ * tailed (#92 semantics: only the errored subagent's own row settles).
+ *
+ * Won't-fix, by design: after this settle, a GENUINELY recovering main
+ * agent's next assistant line can trigger `maybeAdoptContinuation`,
+ * resurrecting the card from `blocked` to a fresh continuation run. That's
+ * intentional self-healing, not a bug — the aborted run stays `failed`; a
+ * real recovery lands as its own adopted run. The truly-stuck case (no more
+ * assistant lines ever arrive) simply stays `blocked`, which is the whole
+ * point of this feature.
+ */
+function signalSubagentApiError(
+  state: SessionState,
+  info: { subagentId: string; detail: string; runId: string },
+): void {
+  if (!turnInFlight(state)) {
+    // No active turn to abort — the tailer already settled the subagent's
+    // own row and already called `fireSettle`, which is what lets a held
+    // task (main run already succeeded, only background agents keep it
+    // open) release to `review` on its own. There is no main-turn handle
+    // here to flip to `blocked`. If the task IS held, still leave a
+    // breadcrumb on the main stream so the failure isn't silent — mirrors
+    // `signalSessionDeath`'s held branch ("say so honestly instead of
+    // reusing the sentinel": there's no handle for the orchestrator to flip
+    // to `blocked`, so a sentinel here would just lie). Neither in flight
+    // nor held: truly nothing to do.
+    if (heldProbeSafe(state.taskId)) {
+      const onChunk = state.lastChunk ?? (() => {});
+      onChunk(
+        "status",
+        `background agent hit an API error (${info.detail}) — it stopped; task releases when `
+          + `remaining agents finish`,
+      );
+    }
+    return;
+  }
+  // Run association: a STALE async subagent spawned by an OLDER run can
+  // error while a NEWER run is in flight on this same session — settling
+  // here would wrongly abort the new run over an old failure. `TurnSlot`
+  // carries no run id (verified: `interface TurnSlot` above is just
+  // `{ onChunk, resolve, reject }`), so this can't be checked locally;
+  // resolved via the same orchestrator-injected-probe seam as
+  // `heldSessionProbe` (`setActiveRunProbe`, wired in orchestrator.ts next
+  // to `setHeldSessionProbe`). Unset `activeRunProbe` (unit tests that
+  // drive this function directly, with no orchestrator wiring) allows
+  // through unconditionally — same posture as every other probe in this
+  // file when unregistered.
+  if (activeRunProbe !== null && info.runId !== activeRunProbeSafe(state.taskId)) return;
+  // The turn is being settled by a different sentinel below — an armed
+  // slash token / staged end_turn / hold-until-idle latch all have nothing
+  // left to watch for. Mirrors `signalUnknownCommand`'s "queue popped ⇒
+  // nothing staged" invariant: without clearing `pendingEndTurn`, a stale
+  // staged end_turn from BEFORE this abort could pop the user's *retry*
+  // slot via the poll's empty-text flush and instantly mis-resolve the new
+  // run as succeeded. `holdUntilIdle` likewise has no folded turn left to
+  // wait out once the slot underneath it is gone.
+  state.pendingSlashToken = null;
+  state.pendingEndTurn = null;
+  state.holdUntilIdle = false;
+  const slot = state.turnQueue[0];
+  const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
+  onChunk(
+    "status",
+    `${CLAUDE_API_ERROR_STATUS_PREFIX}background agent aborted: ${info.detail}`,
+  );
+  if (slot && slot.resolve) {
+    state.turnQueue.shift();
+    state.lastChunk = slot.onChunk;
+    const resolve = slot.resolve;
+    slot.resolve = null;
+    slot.reject = null;
+    resolve(0);
+  } else if (state.onEndOfTurn) {
+    const handler = state.onEndOfTurn;
+    state.onEndOfTurn = null;
+    handler();
+  }
+  // Nothing will end this turn naturally now — cancel any watchdog waiting
+  // on it so it can't fire redundantly against an already-settled slot.
+  clearContinuationWatchdog(state);
+}
+
+/**
  * Settle an in-flight turn because claude's Ink TUI rejected the last-pasted
  * message as an unknown slash command (`Unknown command: /<token>`). No
  * JSONL line is ever written for this — the message was never delivered as
@@ -3847,7 +4044,11 @@ function attachTailer(state: SessionState): void {
   // dispose a prior handle first so a re-attach (reconcileOrphans defensive
   // overwrite) can't leave two watchers polling the same dir.
   state.subagentWatcher?.detach();
-  state.subagentWatcher = attachSubagentWatcher({ taskId: state.taskId, jsonlPath: state.jsonlPath });
+  state.subagentWatcher = attachSubagentWatcher({
+    taskId: state.taskId,
+    jsonlPath: state.jsonlPath,
+    onApiError: (info) => signalSubagentApiError(state, info),
+  });
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -4942,6 +5143,10 @@ export const __forTest = {
   /** Death-watch settlement — exposed so the death test can drive it against a
    *  synthetic session without a real tmux server. */
   signalSessionDeath,
+  /** Background-agent API-error settlement — exposed so the subagent
+   *  API-error test can drive it against a synthetic session without a real
+   *  tmux server or a live `attachSubagentWatcher`. */
+  signalSubagentApiError,
   /** Unknown-slash-command settlement — exposed so the matcher/signal test
    *  can drive it against a synthetic session without a real tmux server. */
   signalUnknownCommand,

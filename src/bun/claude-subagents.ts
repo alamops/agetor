@@ -56,7 +56,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 import { runs, subagents as subagentsDb, tasks } from "./db.ts";
-import { mapJsonlEventToChunks } from "./claude-tmux.ts";
+import { formatApiErrorDetail, mapJsonlEventToChunks } from "./claude-tmux.ts";
 import type { RunEvent, Subagent, SubagentEvent, SubagentStatus } from "../shared/types.ts";
 
 /** Off only when explicitly disabled. The watcher is cheap when idle, but the
@@ -244,6 +244,13 @@ interface FileState {
    *  matches against `tool_result` blocks in the main session JSONL. Null until
    *  discovery (or rehydration backfill) finds one in the meta sidecar. */
   toolUseId: string | null;
+  /** Set when `status` was flipped to `failed` via the api-error path (below),
+   *  cleared the next time this row flips back to `running` (a resumed
+   *  background agent appending after the abort). Distinguishes an
+   *  api-errored row from an ordinary `completed` one in the "flip back to
+   *  running" block, which otherwise retires `toolUseId` unconditionally —
+   *  see that block for why an api-errored row must NOT lose it. */
+  apiErrored: boolean;
 }
 
 export interface SubagentWatcherHandle {
@@ -360,6 +367,18 @@ export function attachSubagentWatcher(opts: {
   /** Test-only: suppress the self-scheduling poll timer so a test drives the
    *  watcher via `pump()` instead of real timers. */
   manual?: boolean;
+  /** Fired the moment a subagent's own transcript emits an API-error line
+   *  (`isApiErrorMessage: true`), right after this module has already
+   *  settled that subagent's row `failed`. This module has no visibility
+   *  into the parent claude-tmux `SessionState` (see the module header —
+   *  read-only w.r.t. the agent), so it cannot itself abort the main turn;
+   *  claude-tmux wires this to `signalSubagentApiError` to do that part.
+   *  `runId` (the subagent's OWN parent run — `FileState.runId`, captured at
+   *  discovery time and stable thereafter) lets the claude-tmux side detect
+   *  a stale async subagent from an OLDER run erroring while a NEWER run is
+   *  in flight on the same session, and no-op instead of wrongly aborting
+   *  the new run. */
+  onApiError?: (info: { subagentId: string; detail: string; runId: string }) => void;
 }): SubagentWatcherHandle {
   const { taskId } = opts;
   // Make double-attach for the same task structurally impossible: whatever
@@ -432,6 +451,14 @@ export function attachSubagentWatcher(opts: {
         startedAt: row.startedAt,
         endedAt: row.endedAt,
         toolUseId,
+        // `"failed"` has exactly one writer in this codebase — the api-error
+        // settle block below — so a rehydrated row already in that status
+        // was necessarily api-errored pre-restart. Reconstructing the latch
+        // here (not just at the live settle site) is what keeps the finding
+        // #5 fix correct across a restart: an agetor restart right after an
+        // api-error, followed by the same background agent resuming, must
+        // still preserve `toolUseId` in the flip-back block below.
+        apiErrored: row.status === "failed",
       });
     }
   } catch (e) {
@@ -450,6 +477,20 @@ export function attachSubagentWatcher(opts: {
       ts: Date.now(),
       subagentId: fs.subagentId,
     });
+  }
+
+  /** Call the per-attach `onApiError` hook, never letting a throwing hook
+   *  reach `tailFile`/`cycle` — mirrors `fireSettle`/`fireParkedDiscovery`'s
+   *  posture exactly: this hook runs orchestrator logic (claude-tmux's
+   *  `signalSubagentApiError`, which does DB-adjacent session-state work) we
+   *  don't control, and a bad handler must not take the tail (or the poll
+   *  timer driving it) down. */
+  function fireApiError(info: { subagentId: string; detail: string; runId: string }): void {
+    try {
+      opts.onApiError?.(info);
+    } catch (e) {
+      console.error(`[claude-subagents] api-error hook threw for subagent ${info.subagentId}:`, e);
+    }
   }
 
   /** Pick up newly-created `agent-*.jsonl` files. */
@@ -483,6 +524,7 @@ export function attachSubagentWatcher(opts: {
         startedAt,
         endedAt: null,
         toolUseId: meta.toolUseId,
+        apiErrored: false,
       };
       files.set(id, fs);
       lastChangeAt = Date.now();
@@ -511,10 +553,38 @@ export function attachSubagentWatcher(opts: {
       // the line, not per onChunk call). Peek the uuid + end_turn first.
       let uuid: string | undefined;
       let endTurnHint = false;
+      // Detected here (parsed-flag peek), NOT by string-matching the
+      // rendered `CLAUDE_API_ERROR_STATUS_PREFIX` status chunk after the
+      // mapper runs: the mapper's `isMeta` path forwards transcript text
+      // verbatim on the `status` stream, so a transcript-controlled string
+      // could otherwise spoof the sentinel, and a future wording change to
+      // `formatApiErrorDetail` would silently break detection. Reading
+      // `isApiErrorMessage`/`apiErrorStatus` straight off the JSONL line
+      // sidesteps both.
+      let apiErrorInfo: { detail: string } | null = null;
       try {
-        const o = JSON.parse(line) as { uuid?: unknown; type?: unknown; message?: { stop_reason?: unknown } };
+        const o = JSON.parse(line) as {
+          uuid?: unknown;
+          type?: unknown;
+          message?: { stop_reason?: unknown };
+          isApiErrorMessage?: unknown;
+          apiErrorStatus?: unknown;
+        };
         uuid = typeof o.uuid === "string" ? o.uuid : undefined;
         endTurnHint = o.type === "assistant" && o.message?.stop_reason === "end_turn";
+        // Gate the WHOLE api-error settle on `uuid` being a string: a
+        // uuid-less line has no durable dedup key (`fs.seen` and
+        // `run_events.line_uuid` both key off it), so a replayed uuid-less
+        // line on a boot reattach would look brand-new every time and could
+        // re-fire the settle (and `onApiError` → an abort of whatever run
+        // happens to be in flight at that point) on every restart. Real
+        // claude JSONL lines always carry a uuid in practice, so this only
+        // ever excludes a malformed/synthetic line — never a genuine error.
+        if (uuid !== undefined && o.isApiErrorMessage === true) {
+          apiErrorInfo = {
+            detail: formatApiErrorDetail(typeof o.apiErrorStatus === "number" ? o.apiErrorStatus : undefined),
+          };
+        }
       } catch { /* fall through; mapper will surface the parse error */ }
 
       if (uuid && fs.seen.has(uuid)) {
@@ -538,18 +608,65 @@ export function attachSubagentWatcher(opts: {
         // re-settle a resumed agent, but the next append flips it right
         // back (dir watcher) and its real completion arrives via
         // task-notification / its own end_turn.
-        fs.toolUseId = null;
+        //
+        // EXCEPT when the row being flipped was settled `failed` via an
+        // API error (`fs.apiErrored`): for a SYNCHRONOUS subagent,
+        // `toolUseId` is the ONLY remaining fallback settle signal
+        // (`scanMainForToolResults`) — the agent's own transcript may never
+        // produce another terminal end_turn (that is the exact hang class
+        // this feature exists to fix) and there is no task-notification for
+        // a synchronous agent either. Retiring the id here would stop that
+        // fallback from ever firing again, stranding the row `running`
+        // forever after this trailing append — reintroducing the bug.
+        // Keeping it means trailing garbage appended after the abort can
+        // still be reconciled via the tool_result scan. The asymmetry with
+        // the `completed`-row case above is deliberate: a completed row's
+        // stale tool_result genuinely predates the resume and retiring it
+        // there only prevents a MIS-settle, never a stuck one — so that
+        // case still retires unconditionally.
+        if (!fs.apiErrored) fs.toolUseId = null;
+        fs.apiErrored = false;
         subagentsDb.setStatus(fs.subagentId, "running", null);
         emitLifecycle(fs, "started");
         fireParkedDiscovery(taskId);
       }
-      const { endOfTurn } = mapJsonlEventToChunks(line, (stream, data, lineUuid) => {
-        runs.appendEvent(fs.runId, stream, data, lineUuid ?? null, fs.subagentId);
-        emitFn?.({ runId: fs.runId, taskId, stream, data, ts: Date.now(), subagentId: fs.subagentId });
-      });
+      const { endOfTurn } = mapJsonlEventToChunks(
+        line,
+        (stream, data, lineUuid) => {
+          runs.appendEvent(fs.runId, stream, data, lineUuid ?? null, fs.subagentId);
+          emitFn?.({ runId: fs.runId, taskId, stream, data, ts: Date.now(), subagentId: fs.subagentId });
+        },
+        // Ask the mapper to carry this line's uuid on its own api-error
+        // `status` chunk too (unlike the MAIN stream's `dispatchLine`,
+        // which never opts in — see `mapParsedEventToChunks`'s doc): gives
+        // the row a durable `line_uuid` even in the edge case where the
+        // line has no text content block to carry it instead, so reattach
+        // seeding (`seenLineUuidsForSubagent`, below) reliably covers this
+        // line. A harmless no-op write when a text block IS present (the
+        // common case) — INSERT OR IGNORE just keeps that first row.
+        true,
+      );
       if (uuid) fs.seen.add(uuid);
       if (endOfTurn) fs.sawEndOfTurn = true;
       fs.lastAppendAt = Date.now();
+      // A reattach replay never reaches here for a HISTORICAL error line:
+      // `fs.seen` is seeded from `run_events.line_uuid` on rehydrate, so the
+      // dedup check above (`if (uuid && fs.seen.has(uuid))`) skips the line
+      // — and this whole per-line block — before we ever get here again.
+      if (apiErrorInfo !== null) {
+        // Settle immediately — do NOT wait for `DONE_IDLE_MS`. Mirrors
+        // `checkDone`'s completed block, but `failed` instead of
+        // `completed`; DB write must land before `fireSettle` for the same
+        // reason noted there (the orchestrator's release predicate reads
+        // `subagentsDb.hasRunning`).
+        fs.status = "failed";
+        fs.endedAt = fs.lastAppendAt;
+        fs.apiErrored = true;
+        subagentsDb.setStatus(fs.subagentId, "failed", fs.endedAt);
+        emitLifecycle(fs, "finished");
+        fireSettle(taskId);
+        fireApiError({ subagentId: fs.subagentId, detail: apiErrorInfo.detail, runId: fs.runId });
+      }
     }
   }
 
