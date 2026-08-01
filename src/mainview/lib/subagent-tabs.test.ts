@@ -9,12 +9,24 @@ import {
   MAX_VISIBLE_TABS,
 } from "./subagent-tabs.ts";
 
-function sub(id: string, status: SubagentStatus, startedAt = 0): Subagent {
+function sub(
+  id: string,
+  status: SubagentStatus,
+  startedAt = 0,
+  parentKind: Subagent["parentKind"] = "subagent",
+): Subagent {
   return {
-    id, taskId: "t", runId: "r", parentKind: "subagent",
+    id, taskId: "t", runId: "r", parentKind,
     agentType: "Explore", description: "x", spawnDepth: 1, sourcePath: `/p/agent-${id}.jsonl`,
     status, startedAt, endedAt: status === "running" ? null : startedAt + 1,
   };
+}
+
+/** Workflow container row helper — id/sourcePath mirror the workflow's own
+ *  background taskId/transcriptDir per the shared-types doc comment, but the
+ *  exact values don't matter for these pure-derivation tests. */
+function container(id: string, status: SubagentStatus, startedAt = 0): Subagent {
+  return sub(id, status, startedAt, "workflow");
 }
 
 test("shouldShowSubagentTabs: hidden with none, shown while a subagent runs", () => {
@@ -108,4 +120,65 @@ test("MAX_VISIBLE_TABS default applies", () => {
   const subs = Array.from({ length: 8 }, (_, i) => sub(`s${i}`, "completed", i));
   const { visible } = splitTabsForOverflow(subs, "main");
   expect(visible.length).toBe(MAX_VISIBLE_TABS);
+});
+
+// ── Claude Code Workflow container/agent rows ───────────────────────────────
+
+test("sortSubagentTabs: excludes a workflow container row from tab derivation", () => {
+  const subs = [container("wf", "running", 0), sub("a", "completed", 1)];
+  expect(sortSubagentTabs(subs).map((s) => s.id)).toEqual(["a"]);
+});
+
+test("sortSubagentTabs: a solo running container yields zero tabs", () => {
+  const subs = [container("wf", "running", 0)];
+  expect(sortSubagentTabs(subs)).toEqual([]);
+});
+
+test("sortSubagentTabs: workflow_agent rows are treated exactly like subagent rows", () => {
+  const subs = [
+    sub("a", "completed", 0, "subagent"),
+    sub("b", "running", 1, "workflow_agent"),
+    sub("c", "completed", 2, "workflow_agent"),
+  ];
+  // Running sorts first regardless of parentKind, finished trail in spawn order.
+  expect(sortSubagentTabs(subs).map((s) => s.id)).toEqual(["b", "a", "c"]);
+});
+
+test("sortSubagentTabs: mixed container + subagent + workflow_agent list — stable ordering, container dropped", () => {
+  const subs = [
+    container("wf", "running", 0),
+    sub("a", "completed", 1, "workflow_agent"),
+    sub("b", "running", 2, "subagent"),
+    sub("c", "completed", 3, "workflow_agent"),
+  ];
+  expect(sortSubagentTabs(subs).map((s) => s.id)).toEqual(["b", "a", "c"]);
+});
+
+test("anySubagentRunning: a running workflow container counts as running", () => {
+  expect(anySubagentRunning([container("wf", "running")])).toBe(true);
+  expect(anySubagentRunning([container("wf", "completed")])).toBe(false);
+});
+
+test("shouldShowSubagentTabs: a solo running container shows no tabs (nothing tabbable yet)", () => {
+  // The container alone satisfies "something is active" but there's nothing to
+  // switch to, so the strip stays collapsed rather than showing an empty shell.
+  expect(shouldShowSubagentTabs([container("wf", "running")], false)).toBe(false);
+});
+
+test("shouldShowSubagentTabs: a running container keeps the strip open around a finished wave", () => {
+  // First wave's agent finished; the container is still running between waves.
+  // The strip must stay open so the finished tab from wave 1 stays readable.
+  const subs = [container("wf", "running", 0), sub("a", "completed", 1, "workflow_agent")];
+  expect(shouldShowSubagentTabs(subs, false)).toBe(true);
+});
+
+test("shouldShowSubagentTabs: a finished container with a finished agent and no running parent turn collapses", () => {
+  const subs = [container("wf", "completed", 0), sub("a", "completed", 1, "workflow_agent")];
+  expect(shouldShowSubagentTabs(subs, false)).toBe(false);
+});
+
+test("resolveActiveStream: a workflow container id is never a valid stream to land on", () => {
+  const subs = [container("wf", "running", 0), sub("a", "running", 1, "workflow_agent")];
+  expect(resolveActiveStream("wf", true, subs)).toBe("main");
+  expect(resolveActiveStream("a", true, subs)).toBe("a");
 });

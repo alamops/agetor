@@ -1818,9 +1818,14 @@ export type SubagentStatus =
 
 /**
  * A background / sub agent the main agent spawned, tracked so the run panel can
- * offer a read-only tab into its live stream. Today every row is a Claude Code
- * in-session subagent (`parentKind: "subagent"`); `parentKind` leaves room for
- * future `claude --bg` independent sessions without a schema change.
+ * offer a read-only tab into its live stream. `parentKind` distinguishes:
+ * an in-session Claude Code subagent (`"subagent"`); an independent `claude --bg`
+ * session (`"bg_session"`); a Claude Code Workflow (`/workflow`) run's container
+ * row (`"workflow"` — id = the workflow's background taskId, sourcePath = its
+ * transcriptDir, no event stream of its own — exists to hold the task in
+ * `running` for the workflow's lifetime); and one agent inside a workflow
+ * (`"workflow_agent"` — a normal sidechain transcript rendered as a read-only
+ * tab).
  */
 export interface Subagent {
   /** Claude's agentId — the basename of `subagents/agent-<id>.jsonl`. */
@@ -1828,7 +1833,7 @@ export interface Subagent {
   taskId: string;
   /** Parent run that was in flight when this subagent was spawned. */
   runId: string | null;
-  parentKind: "subagent" | "bg_session";
+  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent";
   /** Registered subagent type, e.g. "Explore" / "general-purpose". */
   agentType: string | null;
   /** Short human label from the spawning Agent tool call. */

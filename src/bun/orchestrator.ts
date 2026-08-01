@@ -78,6 +78,7 @@ import {
   settleSubagentById,
   orphanRunningSubagents,
   attachSubagentWatcher,
+  pumpWatcherForHoldCheck,
 } from "./claude-subagents.ts";
 import {
   prepareWorkdir,
@@ -1032,6 +1033,23 @@ function attachDoneHandler(
         // above, so the concurrent-settle path (`maybeReleaseHeldTask`) reads
         // the correct terminal status; whichever of the two fires last wins and
         // both interleavings converge on the right column, so no lock is needed.
+        // Give the subagent watcher one synchronous cycle before asking it
+        // whether anything is still running. The rows that answer that
+        // question are created by the watcher's own poll, and a task that has
+        // not discovered a background agent yet polls on the SLOW/DEEP_IDLE
+        // tier (4-10s) — while this runs ~END_TURN_IDLE_FIRE_MS after the
+        // turn's end_turn. So an agent (or a `/workflow`) launched in the
+        // closing moments of a turn is usually NOT in the DB yet at this
+        // point, and the card would flip to `review` only to be dragged back
+        // by `pullBackParkedTask` a few seconds later — a visible bounce and a
+        // misleading breadcrumb. Pumping here reads the launch line that is
+        // already on disk and makes the hold decision deterministic.
+        try {
+          pumpWatcherForHoldCheck(taskId);
+        } catch {
+          // Belt-and-braces: the callee already swallows its own errors, but a
+          // watcher problem must never derail run settlement.
+        }
         const holdForSubagents =
           newStatus === "succeeded"
           && !wasCancelled
