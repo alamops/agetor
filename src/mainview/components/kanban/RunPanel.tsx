@@ -14,6 +14,7 @@ import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@
 import { latestPrProposal } from "@/lib/pr-proposal";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
+import { eventWindowKeepCount } from "@/lib/event-window";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -385,7 +386,7 @@ function RunPanelBody({
   // to distinguish the two without threading a suppression ref through every
   // collapsible in the tree. A pin skipped because unrelated async content
   // happened to land inside the window is recovered on the next growth event
-  // or by the post-commit pin effect (path 1 below).
+  // or by the pre-paint layout-effect pin (path 1 below).
   const pinSuppressUntilRef = useRef(0);
   // Monotonic id source for `StreamEvent.id`, incremented once per event as
   // it's accepted into the unified stream (see the SSE subscription effect
@@ -737,10 +738,25 @@ function RunPanelBody({
         // functional-setState form (which would run twice under StrictMode's
         // dev double-invoke and could double-decrement counters/side effects
         // if this logic lived inside it).
+        //
+        // The trim itself is deferred (see `eventWindowKeepCount` in
+        // `lib/event-window.ts`) while the user is mid-history
+        // (`!nearBottomRef.current`): trimming unconditionally deletes
+        // content above the viewport on every flush, and with
+        // `[overflow-anchor:none]` on the log container (see that div's
+        // className comment below) there's no browser-side absorber left to
+        // paper over the resulting jump — the reader would get yanked
+        // forward with no pin path armed to catch it (`nearBottomRef` is
+        // false, so neither pin fires, and "Load earlier"'s scroll-restore
+        // only covers its own prepend). Deferral is hard-capped at 2x
+        // `EVENTS_WINDOW_MAX` so memory still stays bounded for a reader who
+        // never returns to the bottom; the jerk can still happen once that
+        // cap is hit, which is the accepted trade-off.
         const merged = [...eventsRef.current, ...batch];
         let next = merged;
-        if (merged.length > EVENTS_WINDOW_MAX) {
-          next = merged.slice(merged.length - EVENTS_WINDOW_MAX);
+        const keep = eventWindowKeepCount(merged.length, nearBottomRef.current, EVENTS_WINDOW_MAX);
+        if (keep != null) {
+          next = merged.slice(merged.length - keep);
           const front = next[0];
           const newEarliestId = front?.dbId ?? null;
           setEarliestId(newEarliestId);
@@ -926,14 +942,14 @@ function RunPanelBody({
         // what a previous fetch (or the live/replayed window) already loaded.
         const fresh = page.events.filter((ev) => !loadedDbIdsRef.current.has(ev.id));
         if (fresh.length > 0) {
-          // Set BEFORE the prepend's setState, not after: the pin-to-bottom
-          // effect below reads `nearBottomRef` on every `events` change, and
-          // runs as a passive effect AFTER this component's commit — if this
-          // flag flipped after `setEvents`, that effect could still see the
-          // pre-prepend (stale) `true` and yank the viewport back to the
-          // bottom, fighting the `useLayoutEffect` scroll restore just below
-          // (which always wins the ordering race, but only for scrollTop —
-          // the pin effect would then immediately override it again).
+          // Set BEFORE the prepend's setState: the pin effect below is a
+          // layout effect declared AFTER this scroll-restore layout effect
+          // (see that effect just below), so on the same commit the restore
+          // runs first and the pin — reading `nearBottomRef` on every
+          // `events` change — would immediately overwrite it if the ref
+          // were still (stale) `true`. This flag is the only thing that
+          // makes the pin skip that commit instead of clobbering the
+          // restored scrollTop.
           nearBottomRef.current = false;
           const mapped: StreamEvent[] = fresh.map((ev) => {
             loadedDbIdsRef.current.add(ev.id);
@@ -972,13 +988,29 @@ function RunPanelBody({
 
   // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
   // a user who scrolled up to read history is never yanked back down:
-  //   1. On every event / rebuild / interaction change, scroll once after
-  //      the React commit. This is the cheap backstop: it only fires on
-  //      the dependencies listed below, so it covers commits that change
-  //      content without changing either box the ResizeObserver watches,
-  //      and it also recovers any pin that path 2 skipped under the
-  //      suppression window (see below) once the next real growth or a
-  //      dependency change comes through.
+  //   1. On every event / rebuild / interaction change, scroll once as a
+  //      layout effect — pre-paint, before the browser gets a chance to
+  //      dispatch any scroll event of its own. This is the cheap backstop:
+  //      it only fires on the dependencies listed below, so it covers
+  //      commits that change content without changing either box the
+  //      ResizeObserver watches, and it also recovers any pin that path 2
+  //      skipped under the suppression window (see below) once the next
+  //      real growth or a dependency change comes through. Running
+  //      pre-paint (not as a passive effect) matters most on a violent
+  //      commit — e.g. the live→rebuilt `displayedEvents` swap, where every
+  //      event's key changes and the whole transcript remounts. The two
+  //      changes here are jointly, not independently, sufficient:
+  //      `[overflow-anchor:none]` (see the container's className comment)
+  //      removes native anchoring as a competing `scrollTop` writer — left
+  //      enabled, it runs during layout, which happens AFTER layout
+  //      effects, so even with the pin converted to `useLayoutEffect` an
+  //      anchoring-driven jump would still land after the pin and override
+  //      it. The layout-effect conversion, in turn, closes the remaining
+  //      window where a same-frame scroll event could latch `nearBottomRef`
+  //      false before the pin gets a chance to read it. With both in place,
+  //      the pin runs while `nearBottomRef` still holds its pre-commit
+  //      value, and no post-effect scroll adjustment is left that could
+  //      latch it false first.
   //   2. A ResizeObserver on both the scroll container (`logRef`) and the
   //      content wrapper (`logContentRef`) below. The container's own box
   //      shrinks when something mounts above it in the flex column —
@@ -990,16 +1022,19 @@ function RunPanelBody({
   //      settling after mount, and a `UserMessageBlock`'s "Show more"
   //      toggle appearing once it measures itself. Observing both, rather
   //      than enumerating every async cause as a dependency, makes the pin
-  //      self-healing against future async widgets, and this is the
-  //      lower-latency path of the two: ResizeObserver callbacks are
-  //      delivered pre-paint in the same rendering opportunity as the
-  //      resize, ahead of path 1's passive effect (which only flushes after
-  //      paint). Assigning `scrollTop` does not change either observed
-  //      element's size, so the pin can't feed back into its own observer;
-  //      the resulting scroll event just re-confirms `nearBottomRef` as
-  //      true. Mount-scoped (`[]`) is correct — `RunPanelBody` doesn't
-  //      remount on task switch, so both refs stay attached to the same DOM
-  //      nodes across tasks and a fresh `observe()` isn't needed per task.
+  //      self-healing against future async widgets. Both paths now run
+  //      pre-paint (path 1 as a layout effect, this one via ResizeObserver's
+  //      own pre-paint delivery in the same rendering opportunity as the
+  //      resize), so neither is "ahead" of the other in the sense that used
+  //      to matter; ResizeObserver still earns its keep as a separate path
+  //      because it fires on box-size changes path 1's dependency list
+  //      can't see (see above). Assigning `scrollTop` does not change
+  //      either observed element's size, so the pin can't feed back into
+  //      its own observer; the resulting scroll event just re-confirms
+  //      `nearBottomRef` as true. Mount-scoped (`[]`) is correct —
+  //      `RunPanelBody` doesn't remount on task switch, so both refs stay
+  //      attached to the same DOM nodes across tasks and a fresh
+  //      `observe()` isn't needed per task.
   //
   //      Two additional guards keep path 2 from hijacking a user-initiated
   //      resize (e.g. expanding/collapsing a "Show more" toggle while
@@ -1017,7 +1052,7 @@ function RunPanelBody({
   //          `true` mid-fling. `el.scrollTop` read synchronously is always
   //          current even when scroll events lag, so the pre-resize
   //          distance is trustworthy where the latched ref may not be.
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!nearBottomRef.current) return;
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -2468,7 +2503,22 @@ function RunPanelBody({
         // width; `overflow-x-hidden` keeps the panel from gaining a
         // horizontal scrollbar — text wraps via `break-all` on the
         // problematic spots instead.
-        className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed"
+        // `[overflow-anchor:none]` disables the browser's native scroll
+        // anchoring on this container. This component already owns
+        // bottom-pinning end to end (the two pin paths below), so native
+        // anchoring is just a second, uncoordinated writer of `scrollTop`.
+        // It mattered most on the live→rebuilt `displayedEvents` swap: every
+        // event gets a new React key, so the whole transcript remounts, and
+        // anchoring — seeing a wholesale DOM replacement — picked an
+        // arbitrary new anchor node and jumped `scrollTop` to keep it in
+        // view. Before this fix (when path 1 was still a plain `useEffect`
+        // and this property wasn't set), that scroll event landed before
+        // either pin effect got a chance to run, latching `nearBottomRef`
+        // false and permanently de-arming both auto-scroll paths for the
+        // rest of the panel's life — this property, together with
+        // converting path 1 to a layout effect (see the pin-paths comment
+        // above), is what closes that hole.
+        className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed [overflow-anchor:none]"
       >
         <div ref={logContentRef}>
           {/* "Load earlier messages" — only meaningful once we have a real DB
