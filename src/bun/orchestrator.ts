@@ -289,9 +289,13 @@ setActiveRunProbe((taskId) => {
 // way a naturally-detected completion would (DB flip → lifecycle emit →
 // settle hook → `maybeReleaseHeldTask`). Tolerant by design: a line whose id
 // matches no row, or a duplicate fired again on reattach replay, is a no-op
-// inside `settleSubagentById`.
+// inside `settleSubagentById`. `source: "receipt"` (claude-subagents.ts fix 4)
+// — this IS the live `<task-notification>` dispatch, the harness's own
+// authoritative completion signal, so the settled row should resist a
+// trailing assistant/attachment flush resurrecting it the way an inferred
+// settle would allow.
 setBackgroundTaskSettledHandler((_taskId, agentId) => {
-  settleSubagentById(agentId, "completed");
+  settleSubagentById(agentId, "completed", "receipt");
 });
 
 /**

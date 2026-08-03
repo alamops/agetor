@@ -275,7 +275,7 @@ test("a retry after an api-error settle flips the row back to running and preser
   const { attachSubagentWatcher, setSubagentEmitter, setSubagentSettleHook } = await import(
     "./claude-subagents.ts"
   );
-  const { taskId, jsonlPath, subagentsDir } = await seed();
+  const { taskId, runId, jsonlPath, subagentsDir } = await seed();
 
   setSubagentEmitter(() => { /* drain */ });
   setSubagentSettleHook(() => { /* drain */ });
@@ -283,27 +283,29 @@ test("a retry after an api-error settle flips the row back to running and preser
   const agentId = `apierr4-${randomUUID()}`;
   const toolUseId = "toolu_retry_x";
   const file = path.join(subagentsDir, `agent-${agentId}.jsonl`);
-  writeFileSync(path.join(subagentsDir, `agent-${agentId}.meta.json`),
-    JSON.stringify({ agentType: "Explore", description: "retry", spawnDepth: 1, toolUseId }));
-  writeFileSync(file, sidechainLines() + apiErrorLine({ uuid: "err4", status: 529 }) + "\n");
+  // Seed the row directly as already `failed` from a prior api-error settle
+  // (rehydration reconstructs the `apiErrored` latch from `status ===
+  // "failed"` — see claude-subagents.ts), with nothing on disk yet at attach
+  // time: `replayFloor` pins to 0 there, so the retry line written below is
+  // unambiguously "beyond the floor" (W1) rather than replayed history that
+  // the flip-back block must ignore.
+  writeFileSync(file, "");
+  const now = Date.now();
+  subagents.insertIfAbsent({
+    id: agentId, taskId, runId, parentKind: "subagent",
+    agentType: "Explore", description: "retry", spawnDepth: 1,
+    sourcePath: file, status: "failed", startedAt: now - 60_000, endedAt: now - 30_000,
+    toolUseId,
+  });
 
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
   const t0 = Date.now();
-  w.pump(t0);
-  expect(subagents.get(agentId)!.status).toBe("failed");
-
-  // Retry: a resumed background agent appends a fresh (non-terminal) turn.
-  // Steady-state polling only re-reads `running` files (a real dir-watcher
-  // append event is what re-opens a non-running one in production — see
-  // `armDirWatcher`'s doc comment); the deterministic way to force a full
-  // re-tail in a `manual: true` test, exactly like claude-subagents.test.ts's
-  // own "resumed subagent" test, is to detach and attach a fresh watcher
-  // (its first cycle always tails every file, regardless of status).
-  appendFileSync(file,
+  // Retry: a resumed background agent appends a fresh (non-terminal) turn,
+  // written strictly after attach — beyond the replay floor, so it flips the
+  // `failed` row back to running.
+  writeFileSync(file,
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: "retryA", message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t2", name: "Bash", input: { command: "pwd" } }] } }) + "\n");
-  w.detach();
-  const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
-  w2.pump(t0 + 1);
+  w.pump(t0);
   expect(subagents.get(agentId)!.status).toBe("running");
 
   // Prove `toolUseId` survived the flip-back (the `apiErrored` latch's whole
@@ -314,11 +316,11 @@ test("a retry after an api-error settle flips the row back to running and preser
   // matched and the row would stay stuck `running` forever.
   writeFileSync(jsonlPath,
     JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: toolUseId, content: "ok" }] } }) + "\n");
-  w2.pump(t0 + 2);
+  w.pump(t0 + 1);
 
   expect(subagents.get(agentId)!.status).toBe("completed");
 
-  w2.detach();
+  w.detach();
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *

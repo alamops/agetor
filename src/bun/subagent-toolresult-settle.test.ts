@@ -271,10 +271,10 @@ test("meta without toolUseId degrades gracefully: unaffected by tool_results, st
   w.detach();
 });
 
-test("resume flip-back: a tool_result-settled subagent whose file grows again returns to running", async () => {
+test("resume flip-back is gated by the replay floor: pre-reattach growth stays settled, post-attach growth flips to running", async () => {
   const { subagents } = await import("./db.ts");
   const { attachSubagentWatcher, setSubagentEmitter } = await import("./claude-subagents.ts");
-  const { taskId, jsonlPath, subagentsDir } = await seed();
+  const { taskId, runId, jsonlPath, subagentsDir } = await seed();
   const captured: RunEvent[] = [];
   setSubagentEmitter((e) => captured.push(e));
 
@@ -286,30 +286,64 @@ test("resume flip-back: a tool_result-settled subagent whose file grows again re
   const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
   w.pump(Date.now());
   expect(subagents.get(agentId)!.status).toBe("completed");
+  // One "started" lifecycle from `w`'s own discovery of the file, before it
+  // ever settled — the baseline every later count is compared against, since
+  // a "resurrected" row would add a SECOND one.
+  const startedForAgent = () =>
+    captured.filter(
+      (e) => e.stream === "subagent" && e.subagentId === agentId && JSON.parse(e.data).phase === "started",
+    ).length;
+  expect(startedForAgent()).toBe(1);
 
-  // Resume: new turn appended. Steady-state pumps skip completed files (the
-  // production dir-watcher covers this); mirror the module's own resume test
-  // by re-attaching, whose first cycle tails everything.
+  // (a) Growth that lands BEFORE a reattach is replayed history — every
+  // attach pins `replayFloor` to the file's size AT THAT MOMENT, and this
+  // growth is already on disk by then — so under W1 it must NOT resurrect the
+  // row, even though the resumed line's own content still flows through the
+  // mapper (persist + emit) like any other unseen line.
   appendFileSync(file,
     JSON.stringify({ type: "assistant", isSidechain: true, uuid: `r-${randomUUID()}`, message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t9", name: "Bash", input: { command: "ls" } }] } }) + "\n");
   w.detach();
   const w2 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
   const t1 = Date.now();
   w2.pump(t1);
-  expect(subagents.get(agentId)!.status).toBe("running");
-  expect(captured.some((e) => e.stream === "subagent" && JSON.parse(e.data).phase === "started" && e.subagentId === agentId)).toBe(true);
-  // The flip-back retires the correlation key, so the stale tool_result
-  // (re-served by the fresh watcher's offset-0 replay) can never re-settle
-  // the resumed agent — not on this pump, not on later ones.
-  w2.pump(t1 + 60_000);
-  expect(subagents.get(agentId)!.status).toBe("running");
-  // Its real completion still lands via its own end_turn.
-  appendFileSync(file,
-    JSON.stringify({ type: "assistant", isSidechain: true, uuid: `r2-${randomUUID()}`, message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "resumed turn done" }] } }) + "\n");
-  w2.pump(t1 + 60_001);
-  w2.pump(t1 + 120_000);
   expect(subagents.get(agentId)!.status).toBe("completed");
+  // The gap-grown line's content still made it through...
+  expect(captured.some((e) => e.stream === "tool_use" && e.subagentId === agentId)).toBe(true);
+  // ...but no ADDITIONAL "started" lifecycle was emitted for it — the row was
+  // never flipped back to running.
+  expect(startedForAgent()).toBe(1);
+  // Stays settled on further pumps too, not just the first.
+  w2.pump(t1 + 60_000);
+  expect(subagents.get(agentId)!.status).toBe("completed");
+  expect(startedForAgent()).toBe(1);
   w2.detach();
+
+  // (b) Growth that lands AFTER attach is beyond the replay floor and DOES
+  // flip a settled row back to running. Give this second row nothing on disk
+  // at attach time (so `replayFloor` pins to 0), then write its resumed turn
+  // strictly afterward — unambiguously "new bytes since attach".
+  const agentId2 = `resume-post-${randomUUID()}`;
+  const file2 = path.join(subagentsDir, `agent-${agentId2}.jsonl`);
+  writeFileSync(file2, "");
+  const now2 = Date.now();
+  subagents.insertIfAbsent({
+    id: agentId2, taskId, runId, parentKind: "subagent",
+    agentType: "general-purpose", description: "work", spawnDepth: 1,
+    sourcePath: file2, status: "completed", startedAt: now2 - 60_000, endedAt: now2 - 30_000,
+  });
+
+  const w3 = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  writeFileSync(file2,
+    JSON.stringify({ type: "assistant", isSidechain: true, uuid: `r2-${randomUUID()}`, message: { role: "assistant", stop_reason: "tool_use", content: [{ type: "tool_use", id: "t10", name: "Bash", input: { command: "ls" } }] } }) + "\n");
+  w3.pump(Date.now());
+  expect(subagents.get(agentId2)!.status).toBe("running");
+  expect(
+    captured.some(
+      (e) => e.stream === "subagent" && e.subagentId === agentId2 && JSON.parse(e.data).phase === "started",
+    ),
+  ).toBe(true);
+
+  w3.detach();
 });
 
 test("late discovery rewinds the scan: a tool_result consumed before its agent's file existed still settles it", async () => {

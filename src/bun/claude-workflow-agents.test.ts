@@ -6,7 +6,12 @@
  * (the flush-loss backstop), the notification-anchored container settle +
  * cascade, replay idempotency on reattach, the `pumpWatcherForHoldCheck`
  * synchronous hold-check path, the `AGETOR_TRACK_WORKFLOWS` kill switch, and
- * the `REPLAY_WINDOW_BYTES` attach-time clamp.
+ * the `REPLAY_WINDOW_BYTES` attach-time clamp. Also covers W6/W7 from
+ * docs/plans/fix-stuck-subagent-running-detection.md §3: the journal-cursor
+ * rewind on late agent discovery (an early receipt consumed before its row
+ * existed must still settle it once discovered) and settle-on-discovery under
+ * an already-settled container (a straggling agent file must never read as
+ * `running` for even one tick once its container is over).
  *
  * Companion to claude-subagents.test.ts — same conventions, disjoint scope
  * (that file covers classic in-session subagents; this one covers only the
@@ -460,17 +465,18 @@ describe("tailPastSettle: an agent settled early by its journal keeps tailing wh
     const lateEvents = captured.filter((e) => e.subagentId === agentId);
     expect(lateEvents.length).toBeGreaterThan(0);
     expect(lateEvents.some((e) => e.stream === "assistant")).toBe(true);
-    // Surprising but verified: `tailFile`'s own resume-detection treats ANY
-    // append to an already-non-`running` row as a resumed background agent
-    // (the "flip back to running" block), regardless of WHY it was settled.
-    // So tailing past a journal settle doesn't just recover the lost content
-    // — it also flips the row back to `running` (and re-fires
-    // parked-discovery) the moment a trailing line is read. A real workflow
-    // agent's transcript stops growing once the harness kills it, so in
-    // practice this window is short-lived, but it means the row is NOT
-    // stably `completed` immediately after a journal settle if its file
-    // keeps growing afterwards.
-    expect(subagents.get(agentId)!.status).toBe("running");
+    // Updated for fix 4 (docs/plans/fix-stuck-subagent-running-detection.md
+    // §3): a journal `result` receipt settles with `source: "receipt"`,
+    // latching `FileState.receiptSettled`. Previously (see git history)
+    // `tailFile`'s resume-detection treated ANY append to an already-settled
+    // row as a resumed background agent, regardless of why it was settled —
+    // so tailing past a journal settle didn't just recover the lost content,
+    // it also flipped the row back to `running`. That was the live
+    // trailing-flush race fix 4 closes: the harness's journal receipt is
+    // authoritative, and a trailing `assistant` line (not a fresh `user`
+    // prompt) landing after it must NOT resurrect the row. The content is
+    // still recovered (`lateEvents` above) — only the status flip is gone.
+    expect(subagents.get(agentId)!.status).toBe("completed");
 
     w.detach();
   });
@@ -749,6 +755,155 @@ describe("REPLAY_WINDOW_BYTES clamp on attach", () => {
     const recentRow = subagents.get(recentWtaskId);
     expect(recentRow).not.toBeNull();
     expect(recentRow!.status).toBe("running");
+
+    w.detach();
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 11. W6 — journal cursor rewind on late agent discovery
+ * (docs/plans/fix-stuck-subagent-running-detection.md §3)
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("W6: journal cursor rewind on late agent discovery", () => {
+  test("a result receipt consumed before its agent's file existed still settles it once the file appears", async () => {
+    const { subagents } = await import("./db.ts");
+    const { attachSubagentWatcher, setSubagentEmitter, setParkedDiscoveryHandler } = await import(
+      "./claude-subagents.ts"
+    );
+    const { taskId, jsonlPath, subagentsDir } = await seed();
+    setSubagentEmitter(() => { /* drain */ });
+    setParkedDiscoveryHandler(() => { /* drain */ });
+
+    const wtaskId = `wtask-${randomUUID()}`;
+    const toolUseId = `toolu-${randomUUID()}`;
+    const wfRunId = "wf_rewind";
+    const dir = wfDirFor(subagentsDir, wfRunId);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(jsonlPath, launchLine({ wtaskId, workflowName: "rewind-wf", wfRunId, transcriptDir: dir, toolUseId }));
+
+    const agentId = `rwagent-${randomUUID().slice(0, 8)}`;
+
+    const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    const t0 = Date.now();
+    w.pump(t0); // registers the container; arms this dir's journal cursor at 0
+
+    // The harness's own completion receipt for `agentId` lands in the journal
+    // BEFORE its own `agent-<id>.jsonl` ever becomes readdir-visible — the
+    // exact early-receipt race W6 closes (the analog of `discover()`'s own
+    // `mainOffset = 0` rewind for the main-JSONL scan). Consumed now, the row
+    // doesn't exist yet in the DB, so `settleSubagentById` is a silent no-op —
+    // but the journal cursor has already moved past this line.
+    writeFileSync(path.join(dir, "journal.jsonl"), journalLine("result", "k1", agentId, "ok"));
+    w.pump(t0 + 1);
+    expect(subagents.get(agentId)).toBeNull(); // nothing to settle yet — the row doesn't exist
+
+    // The agent's transcript materializes late (readdir-visibility race).
+    writeFileSync(path.join(dir, `agent-${agentId}.meta.json`), wfAgentMeta());
+    writeFileSync(path.join(dir, `agent-${agentId}.jsonl`), sidechainUserLine(agentId, `u-${agentId}`));
+    w.pump(t0 + 2);
+
+    // `discoverWorkflowAgents` rewound this dir's journal cursor back to 0 the
+    // moment it registered the new file, so the already-consumed receipt was
+    // re-read (idempotent settle) and closed the row instead of stranding it
+    // `running` forever with no signal left to consume.
+    const row = subagents.get(agentId)!;
+    expect(row.status).toBe("completed");
+    expect(row.endedAt).not.toBeNull();
+    expect(subagents.get(wtaskId)!.status).toBe("running"); // container untouched
+
+    w.detach();
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 12. W7 — settle-on-discovery under an already-settled container
+ * (docs/plans/fix-stuck-subagent-running-detection.md §3)
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("W7: settle-on-discovery under an already-settled container", () => {
+  test("a workflow agent discovered after its container already settled is inserted completed, never running — no parked-discovery, hasRunning stays false", async () => {
+    const { subagents } = await import("./db.ts");
+    const { attachSubagentWatcher, setSubagentEmitter, setParkedDiscoveryHandler } = await import(
+      "./claude-subagents.ts"
+    );
+    const { taskId, jsonlPath, subagentsDir } = await seed();
+
+    const captured: RunEvent[] = [];
+    setSubagentEmitter((e) => captured.push(e));
+    const parked: string[] = [];
+    setParkedDiscoveryHandler((tid) => parked.push(tid));
+
+    const wtaskId = `wtask-${randomUUID()}`;
+    const toolUseId = `toolu-${randomUUID()}`;
+    const wfRunId = "wf_late";
+    const dir = wfDirFor(subagentsDir, wfRunId);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(jsonlPath, launchLine({ wtaskId, workflowName: "late-wf", wfRunId, transcriptDir: dir, toolUseId }));
+
+    const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+    const t0 = Date.now();
+    w.pump(t0);
+    expect(parked).toEqual([taskId]);
+    expect(subagents.hasRunning(taskId)).toBe(true);
+
+    // Settle the container via its completion notification, BEFORE any agent
+    // file has appeared under it at all — the cascade invariant this test
+    // pins is: nothing under a settled container may ever read as running,
+    // including a row discovered after the fact.
+    appendFileSync(jsonlPath, notificationLine({ wtaskId, toolUseId }));
+    w.pump(t0 + 1);
+    expect(subagents.get(wtaskId)!.status).toBe("completed");
+    expect(subagents.hasRunning(taskId)).toBe(false);
+    parked.length = 0;
+    captured.length = 0;
+
+    // A straggling agent file only becomes readdir-visible AFTER the
+    // container already settled (a slow flush / readdir race).
+    const agentId = `lateagent-${randomUUID().slice(0, 8)}`;
+    writeFileSync(path.join(dir, `agent-${agentId}.meta.json`), wfAgentMeta());
+    writeFileSync(path.join(dir, `agent-${agentId}.jsonl`), sidechainUserLine(agentId, `u-${agentId}`));
+    w.pump(t0 + 2);
+
+    const row = subagents.get(agentId)!;
+    expect(row).not.toBeNull();
+    expect(row.status).toBe("completed"); // born settled — never running, not even for one tick
+    expect(row.endedAt).not.toBeNull();
+    expect(parked.length).toBe(0); // no parked-discovery for a row born settled
+    expect(subagents.hasRunning(taskId)).toBe(false);
+
+    const lifecycleForAgent = captured.filter((e) => e.stream === "subagent" && e.subagentId === agentId);
+    expect(lifecycleForAgent.length).toBe(1);
+    expect(JSON.parse(lifecycleForAgent[0]!.data).phase).toBe("finished"); // not "started"
+
+    // Fix 2 — a born-settled row's transcript must still be drained (tailed)
+    // once, even though it never renders as `running`: fix 1's
+    // discovery-time floor is what keeps that drain from flipping the row
+    // back to running on the SAME pump, but without fix 2's `fs.offset === 0`
+    // steady-state exception the content would never be read at all (a
+    // non-`running` row is otherwise only re-tailed via `tailPastSettle` —
+    // false here, the container is settled — or fix 3's poll backstop, which
+    // only fires once there's something new to see). `sidechainUserLine`
+    // writes a single plain "go" user turn, so exactly one content chunk
+    // (not a lifecycle event) should have been emitted for it.
+    const contentEvents = captured.filter((e) => e.subagentId === agentId && e.stream !== "subagent");
+    expect(contentEvents.length).toBe(1);
+    expect(contentEvents[0]!.stream).toBe("user");
+    expect(contentEvents[0]!.data).toBe("go");
+
+    // And the row must never flip back to running across further pumps —
+    // the general container-settled guard in `tailFile` (fix 1's other
+    // half) holds even once the drain above has advanced `fs.offset` past 0
+    // (so the primary tail predicate no longer applies and fix 3's poll
+    // backstop is what would otherwise re-tail it, finding nothing new).
+    captured.length = 0;
+    parked.length = 0;
+    w.pump(t0 + 3);
+    w.pump(t0 + 4);
+    expect(subagents.get(agentId)!.status).toBe("completed");
+    expect(subagents.hasRunning(taskId)).toBe(false);
+    expect(parked.length).toBe(0);
+    expect(captured.filter((e) => e.subagentId === agentId).length).toBe(0); // no re-drain, no re-flip
 
     w.detach();
   });
