@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
@@ -111,6 +111,60 @@ import type {
   TaskDiff,
 } from "../../../shared/types.ts";
 import { PROVIDER_CAPS } from "../../../shared/types.ts";
+
+// Hoisted ReactMarkdown `components` map for GitHub markdown bodies (PR/issue
+// descriptions, comments, list previews). Module scope keeps the prop identity
+// stable across renders, same rationale as RunPanel's maps. Wrap the container
+// in `agetor-md` (index.css) for block spacing and heading/list styles.
+type GhMdComponents = NonNullable<ComponentProps<typeof ReactMarkdown>["components"]>;
+
+// Markdown links route through the OS browser instead of navigating the
+// webview away from the app. stopPropagation keeps a link click inside a
+// clickable list row from also triggering the row's own handler.
+const ghMdLink: NonNullable<GhMdComponents["a"]> = ({ href, children, ...rest }) => {
+  const safe = typeof href === "string" && /^(https?|mailto):/i.test(href) ? href : null;
+  return (
+    <a
+      {...rest}
+      href={safe ?? "#"}
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!safe) return;
+        void api.openExternal(safe).catch((err: unknown) => {
+          toast.error(err instanceof Error ? err.message : "Could not open link");
+        });
+      }}
+      className="text-primary underline-offset-2 hover:underline"
+    >
+      {children}
+    </a>
+  );
+};
+
+const ghMdCode: NonNullable<GhMdComponents["code"]> = ({ className, children, ...props }) => {
+  const isBlock = /language-/.test(className ?? "");
+  if (isBlock) {
+    return (
+      <code className={cn(className, "font-mono text-[11px]")} {...props}>
+        {children}
+      </code>
+    );
+  }
+  return (
+    <code className="rounded bg-muted/60 px-1 py-0.5 font-mono text-[11px] text-foreground" {...props}>
+      {children}
+    </code>
+  );
+};
+
+const GH_MD_COMPONENTS: GhMdComponents = {
+  a: ghMdLink,
+  code: ghMdCode,
+  pre: ({ children }) => (
+    <pre className="overflow-x-auto rounded-md bg-muted/40 px-3 py-2">{children}</pre>
+  ),
+};
 
 /** One-shot prefill for the New-PR composer (T3, "Open PR" from a task's run
  *  panel): selects the given project, switches to the pulls tab, opens the
@@ -5973,8 +6027,8 @@ function DiscussionDetailView({
       {detail && (
         <>
           {detail.body && (
-            <div className="markdown-body mb-2 max-h-40 overflow-y-auto rounded border border-border/50 bg-background/40 px-2 py-1.5 text-xs">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{detail.body}</ReactMarkdown>
+            <div className="agetor-md mb-2 max-h-40 overflow-y-auto rounded border border-border/50 bg-background/40 px-2 py-1.5 text-xs">
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={GH_MD_COMPONENTS}>{detail.body}</ReactMarkdown>
             </div>
           )}
           <div className="space-y-1.5">
@@ -6087,8 +6141,8 @@ function DiscussionCommentRow({
           </Button>
         </div>
       </div>
-      <div className="markdown-body text-xs">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{comment.body}</ReactMarkdown>
+      <div className="agetor-md text-xs">
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={GH_MD_COMPONENTS}>{comment.body}</ReactMarkdown>
       </div>
       {error && (
         <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
@@ -6181,8 +6235,8 @@ function GitHubItemRow({
             </div>
           )}
           {item.body && (
-            <div className="markdown-body mt-2 max-h-28 overflow-hidden text-xs text-muted-foreground">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            <div className="agetor-md mt-2 max-h-28 overflow-hidden text-xs text-muted-foreground">
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={GH_MD_COMPONENTS}>
                 {item.body}
               </ReactMarkdown>
             </div>
@@ -6486,9 +6540,9 @@ function GitHubItemDetail({
           onSave={onSaveEdit}
         />
       ) : (
-        <div className="max-h-64 overflow-y-auto rounded-md border border-border/50 bg-card px-3 py-2 text-sm">
+        <div className="agetor-md max-h-64 overflow-y-auto rounded-md border border-border/50 bg-card px-3 py-2 text-sm">
           {item.body ? (
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={GH_MD_COMPONENTS}>
               {item.body}
             </ReactMarkdown>
           ) : (
@@ -8463,11 +8517,12 @@ function EditableCommentBody({
   }
 
   return (
-    <div className="px-3 py-2 text-sm">
+    <div className="agetor-md px-3 py-2 text-sm">
       {body ? (
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           components={suggestion ? {
+            a: ghMdLink,
             code({ className, children }) {
               if (typeof className === "string" && /language-suggestion/.test(className)) {
                 return (
@@ -8501,7 +8556,7 @@ function EditableCommentBody({
               }
               return <code className={className}>{children}</code>;
             },
-          } : undefined}
+          } : GH_MD_COMPONENTS}
         >
           {body}
         </ReactMarkdown>
