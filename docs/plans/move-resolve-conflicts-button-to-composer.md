@@ -27,6 +27,10 @@ Success: button renders next to Commit & push above the composer, no longer in t
 
 Cut the button JSX (with its gating comment) from the header cluster and re-insert it in the right-side chip group, after "Open PR" (they're near-mutually-exclusive: Open PR shows pre-PR, Resolve Conflicts post-PR-with-conflicts). Switch `variant="outline"` → `variant="secondary"` to match its new siblings. Keep the full disabled expression and title ladder verbatim. Alternative considered: hide-on-`sending` like Commit & push — rejected; the disabled ladder carries the "Sent to agent" cooldown state that hiding would lose.
 
+This supersedes the placement convention stated in `docs/plans/resolve-conflicts-from-task-details.md` ("PR-state-driven actions belong in the header; git-working-tree chips live in the composer row"): Resolve Conflicts now joins the composer row deliberately, because it composes a message to the agent — same interaction family as Commit & push / Open PR — even though its trigger is PR state. The header keeps View PR and the mergeability re-check.
+
+Post-review amendments (Phase 8): the row gate gains `|| showResolveConflicts` so an offerable button isn't hidden when `canSend` is false (orphan-reconciled runs), and the dead `activeStream === "main"` clause was dropped — the composer dock already excludes subagent tabs.
+
 ## 4. Work breakdown — implementation
 
 - **T1** (sonnet, wave 1): move the button block in `src/mainview/components/kanban/RunPanel.tsx` as per §3; update the `:1765` comment. Owns only this file. Acceptance: button gone from header, present after Open PR in chip row, gates/disabled/title/label logic byte-identical apart from variant.

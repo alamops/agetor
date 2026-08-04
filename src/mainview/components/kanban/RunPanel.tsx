@@ -2118,6 +2118,10 @@ function RunPanelBody({
   // and "Sent to agent" confirmation don't get tangled up with the composer's.
   const [resolvingConflicts, setResolvingConflicts] = useState(false);
   const [resolveConflictsSent, setResolveConflictsSent] = useState(false);
+  // Offer survives `!canSend` (e.g. an orphan-reconciled run) — the button
+  // then renders disabled with its "start the task" tooltip instead of
+  // vanishing from the row.
+  const showResolveConflicts = !archived && canOfferResolveConflicts(parsedPrUrl, prStatus);
   const resolveConflictsSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
@@ -2147,9 +2151,10 @@ function RunPanelBody({
       const res = await api.sendRunInput(resumableRunId, prompt);
       if (!res.delivered) {
         setSendHint(res.reason);
-        // The button can be hidden (archived, subagent tab) by the time this
-        // resolves, which would make `sendHint` invisible — toast so the
-        // failure is surfaced regardless.
+        // The button can be hidden by the time this resolves — archived,
+        // a subagent tab (dock-level), or the mergeability re-fetch clearing
+        // `prStatus` — any of which would make `sendHint` invisible, so
+        // toast to surface the failure regardless.
         toast.error(res.reason);
       } else {
         setRebuilt(null);
@@ -2638,8 +2643,11 @@ function RunPanelBody({
             </p>
           )}
           {/* Shown once the task is sendable, OR as soon as there's something to
-              stash — that's what lets "Save for later" work pre-run. */}
-          {(canSend || input.trim() || sendRefs.length > 0) && (
+              stash — that's what lets "Save for later" work pre-run. Also
+              shown whenever Resolve Conflicts is offerable (even disabled),
+              so an offerable-but-not-yet-sendable task doesn't have the
+              button pop in and out as the draft is typed. */}
+          {(canSend || input.trim() || sendRefs.length > 0 || showResolveConflicts) && (
             // Picker on the left; "Save for later" / "Commit & push" pushed to
             // the right so they aren't stacked directly on top of the picker.
             <div className="flex items-center justify-between gap-2">
@@ -2717,11 +2725,14 @@ function RunPanelBody({
                     task's PR reports merge conflicts. Gated on `!archived`
                     (the server silently auto-unarchives on other mutations,
                     but this button must not act as though it were live on a
-                    frozen task) and on `activeStream === "main"` (a read-only
-                    subagent stream tab has no `sendHint` rendered, so a
-                    failure here would be invisible; `sendResolveConflicts`
-                    also toasts for the same reason). */}
-                {!archived && activeStream === "main" && canOfferResolveConflicts(parsedPrUrl, prStatus) && (
+                    frozen task — an archived-but-`canSend` task DOES render
+                    this dock, so the clause is live, not dead code). The
+                    composer dock as a whole already excludes subagent tabs
+                    (`activeStream !== "main"` renders a read-only footer
+                    instead), so no separate check is needed here. Rendered
+                    even when `!canSend` (see `showResolveConflicts` above) —
+                    disabled, with a tooltip explaining why. */}
+                {showResolveConflicts && (
                   <Button
                     size="sm"
                     variant="secondary"
