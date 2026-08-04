@@ -2735,9 +2735,9 @@ function RunPanelBody({
                         taskId: task.id,
                       });
                     }}
-                    title="Open a pull request for this task's branch — prefilled from the agent's summary when available"
+                    title="Create a pull request for this task's branch — prefilled from the agent's summary when available"
                   >
-                    <GitPullRequest className="mr-1 size-3" /> Open PR
+                    <GitPullRequest className="mr-1 size-3" /> Create PR
                   </Button>
                 )}
               </div>
