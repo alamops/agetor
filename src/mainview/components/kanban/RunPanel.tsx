@@ -1762,7 +1762,7 @@ function RunPanelBody({
     return () => { cancelled = true; };
   }, [task.id]);
 
-  // PR mergeability for the header "Resolve Conflicts" button. `parsedPrUrl`
+  // PR mergeability for the composer-row "Resolve Conflicts" button. `parsedPrUrl`
   // is derived once per `task.prUrl` change and reused for both the fetch
   // effect and the render-time gate (`canOfferResolveConflicts`).
   const parsedPrUrl = useMemo(() => parsePrUrl(task.prUrl), [task.prUrl]);
@@ -2294,33 +2294,6 @@ function RunPanelBody({
               <RefreshCw className="size-3.5" />
             </Button>
           )}
-          {/* Gated on `!archived` (the server silently auto-unarchives on
-              other mutations, but this button must not act as though it
-              were live on a frozen task) and on `activeStream === "main"`
-              (mirrors Stop below — a read-only subagent stream tab has no
-              `sendHint` rendered, so a failure here would be invisible;
-              `sendResolveConflicts` also toasts for the same reason). */}
-          {!archived && activeStream === "main" && canOfferResolveConflicts(parsedPrUrl, prStatus) && (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => void sendResolveConflicts()}
-              disabled={!canSend || modalPending || sending || backlogBusy || resolvingConflicts || resolveConflictsSent}
-              title={
-                !canSend
-                  ? "Start the task before asking the agent to resolve conflicts"
-                  : modalPending
-                    ? "Answer the pending prompt before sending another message"
-                    : resolveConflictsSent
-                      ? "Already sent — waiting for the agent to pick it up"
-                      : sending || backlogBusy || resolvingConflicts
-                        ? "A message is already being sent"
-                        : "Ask the agent to merge the base branch and resolve the reported conflicts"
-              }
-            >
-              <GitMerge className="mr-1 size-3" /> {resolveConflictsSent ? "Sent to agent" : "Resolve Conflicts"}
-            </Button>
-          )}
           <Button
             size="sm"
             variant="outline"
@@ -2738,6 +2711,35 @@ function RunPanelBody({
                     title="Open a pull request for this task's branch — prefilled from the agent's summary when available"
                   >
                     <GitPullRequest className="mr-1 size-3" /> Open PR
+                  </Button>
+                )}
+                {/* Post-PR counterpart to "Open PR" above: offered once the
+                    task's PR reports merge conflicts. Gated on `!archived`
+                    (the server silently auto-unarchives on other mutations,
+                    but this button must not act as though it were live on a
+                    frozen task) and on `activeStream === "main"` (a read-only
+                    subagent stream tab has no `sendHint` rendered, so a
+                    failure here would be invisible; `sendResolveConflicts`
+                    also toasts for the same reason). */}
+                {!archived && activeStream === "main" && canOfferResolveConflicts(parsedPrUrl, prStatus) && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void sendResolveConflicts()}
+                    disabled={!canSend || modalPending || sending || backlogBusy || resolvingConflicts || resolveConflictsSent}
+                    title={
+                      !canSend
+                        ? "Start the task before asking the agent to resolve conflicts"
+                        : modalPending
+                          ? "Answer the pending prompt before sending another message"
+                          : resolveConflictsSent
+                            ? "Already sent — waiting for the agent to pick it up"
+                            : sending || backlogBusy || resolvingConflicts
+                              ? "A message is already being sent"
+                              : "Ask the agent to merge the base branch and resolve the reported conflicts"
+                    }
+                  >
+                    <GitMerge className="mr-1 size-3" /> {resolveConflictsSent ? "Sent to agent" : "Resolve Conflicts"}
                   </Button>
                 )}
               </div>
