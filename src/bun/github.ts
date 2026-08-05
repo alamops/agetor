@@ -832,45 +832,6 @@ export async function repoForDir(dir: string): Promise<GitHubRepo | null> {
   return null;
 }
 
-/** Canonical hosts recognized by any provider adapter (github.ts, gitlab.ts,
- *  bitbucket.ts) — the set `remoteHostsForDirs` uses to decide whether a
- *  remote's host is "supported" at all, independent of which provider it is. */
-const SUPPORTED_PROVIDER_HOSTS = new Set(["github.com", "gitlab.com", "bitbucket.org"]);
-
-/** Distinct raw remote hosts (the ssh-alias identity, or the provider's own
- *  domain for a plain remote) across the given project dirs, sorted — drives
- *  the Settings "detected hosts" suggestion list so a user's real aliases are
- *  one click away instead of hand-typed. Provider-generic: considers every
- *  remote whose canonical host (via `parseGitRemote`) resolves to a supported
- *  provider (github.com, gitlab.com, or bitbucket.org) — not just GitHub — so
- *  a Bitbucket- or GitLab-only repo's alias host still surfaces here. Per dir,
- *  walks remotes origin-first (same order as `repoForDir`) and stops at the
- *  first one that resolves to a supported provider. Implemented inline
- *  (rather than via `git-provider.ts`'s `providerRepoForDir`) to avoid a
- *  circular import — `git-provider.ts` imports this file. Dirs with no
- *  supported-provider remote (or that aren't a repo at all) are tolerated
- *  silently, same as `repoForDir`. */
-export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
-  const hosts = new Set<string>();
-  await Promise.all(dirs.map(async (dir) => {
-    if (!existsSync(dir)) return;
-    const remotes = await run(["git", "remote"], dir);
-    if (!remotes.ok) return;
-    const names = remotes.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
-    const ordered = ["origin", ...names.filter((n) => n !== "origin")];
-    for (const name of ordered) {
-      const url = await run(["git", "remote", "get-url", name], dir);
-      if (!url.ok) continue;
-      const parsed = parseGitRemote(url.stdout);
-      if (parsed && SUPPORTED_PROVIDER_HOSTS.has(parsed.host)) {
-        hosts.add(parsed.rawHost);
-        break;
-      }
-    }
-  }));
-  return Array.from(hosts).sort();
-}
-
 /** Resolve the token to authenticate a GitHub request with, for a repo whose
  *  raw remote host is `host` (null when there's no repo in scope). Order:
  *  (1) a stored token for `host` (or the `github.com` default entry —

@@ -25,6 +25,15 @@ import { tokenForHost } from "./github-tokens.ts";
  * Leaf module: does not import `db.ts` or `server.ts`. May import from
  * `github-tokens.ts`, `../shared/types.ts`, and `github.ts` (only the
  * provider-agnostic exports: `parseGitRemote`, `canonicalGitHost`, `run`).
+ *
+ * `remoteHostsForDirs` (docs/plans/consolidate-git-host-discovery.md) lives
+ * here rather than in `github.ts` for the same reason the rest of this file
+ * does: it needs to be provider-generic over `providerRepoForDir`, and
+ * `github.ts` can't import this module (this module imports `github.ts` for
+ * `parseGitRemote`/`canonicalGitHost`/`run` — the reverse edge would cycle).
+ * It used to live in github.ts with its own duplicated
+ * supported-provider-hosts set and inline remote-walk for exactly that
+ * reason; moving it here instead of duplicating deletes the duplication.
  */
 
 const GITLAB_FETCH_TIMEOUT_MS = 5_000;
@@ -75,6 +84,87 @@ export async function providerRepoForDir(dir: string): Promise<ProviderRepoInfo 
     };
   }
   return null;
+}
+
+const REMOTE_HOSTS_POOL_SIZE = 6;
+const REMOTE_HOSTS_CACHE_TTL_MS = 10_000;
+
+/** Promise-cache entry for `remoteHostsForDirs`: `expiresAt` is a wall-clock
+ *  deadline (ms since epoch) rather than a timer handle, so a stale entry is
+ *  detected lazily on the next call — no cleanup timers to leak or clear. */
+interface RemoteHostsCacheEntry {
+  expiresAt: number;
+  promise: Promise<string[]>;
+}
+
+/** Keyed on the sorted, newline-joined dir list (so caller-side ordering of
+ *  `dirs` never causes a spurious cache miss). Distinct project-list
+ *  snapshots get distinct entries; the map is small in practice (one entry
+ *  per distinct set of registered project paths, effectively one at a time
+ *  in production) so it's never proactively swept — a stale entry just sits
+ *  until its key is requested again post-expiry and gets overwritten. */
+const remoteHostsCache = new Map<string, RemoteHostsCacheEntry>();
+
+/** Test-only escape hatch: forces the next `remoteHostsForDirs` call (for any
+ *  key) to re-scan instead of reusing a cached promise. Exported rather than
+ *  threading a `{ fresh: true }` option through the production signature,
+ *  since the only caller that ever needs to bypass the cache is a test
+ *  proving the TTL actually expires/cache actually reuses. */
+export function clearRemoteHostsCache(): void {
+  remoteHostsCache.clear();
+}
+
+async function scanRemoteHosts(dirs: string[]): Promise<string[]> {
+  const hosts = new Set<string>();
+  // Bounded concurrency: each dir costs one `git remote` + up to one `git
+  // remote get-url` per remote (via providerRepoForDir), and the Settings
+  // page can list dozens of projects — an unbounded Promise.all over all of
+  // them would burst that many subprocesses at once. Same pool-worker shape
+  // as listGitHubItemsAcrossRepos (github.ts) / listItemsAcrossRepos
+  // (git-host.ts): a shared `next` cursor, workers pull the next index until
+  // exhausted, order doesn't matter since results only feed a Set.
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= dirs.length) return;
+      const dir = dirs[i]!;
+      const info = await providerRepoForDir(dir);
+      if (info) hosts.add(info.remoteHost);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(REMOTE_HOSTS_POOL_SIZE, dirs.length) }, worker));
+  return Array.from(hosts).sort();
+}
+
+/**
+ * Distinct raw remote hosts (the ssh-alias identity, or the provider's own
+ * domain for a plain remote) across the given project dirs, sorted — drives
+ * the Settings "detected hosts" suggestion list so a user's real aliases are
+ * one click away instead of hand-typed. Provider-generic via
+ * `providerRepoForDir`: considers every dir whose first origin-first remote
+ * resolves to a supported provider (github.com, gitlab.com, or
+ * bitbucket.org) — not just GitHub. Dirs with no supported-provider remote
+ * (or that aren't a repo at all) are tolerated silently, same as
+ * `providerRepoForDir` itself returning null.
+ *
+ * Result is cached (10s TTL) per distinct sorted-dirs key: the Settings
+ * "/github/tokens" GET and PUT handlers both call this with the same project
+ * list back-to-back (GET on page load, PUT immediately after on every token
+ * save), so without a cache a single Settings save always re-runs the whole
+ * scan twice. A cache miss beyond the TTL just re-scans; staleness cost is a
+ * newly-added project's host not appearing in the detected list for up to
+ * 10s, which self-heals on the next Settings open (see
+ * docs/plans/consolidate-git-host-discovery.md §7).
+ */
+export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
+  const key = Array.from(dirs).sort().join("\n");
+  const now = Date.now();
+  const cached = remoteHostsCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.promise;
+  const promise = scanRemoteHosts(dirs);
+  remoteHostsCache.set(key, { expiresAt: now + REMOTE_HOSTS_CACHE_TTL_MS, promise });
+  return promise;
 }
 
 /**

@@ -1,8 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { expect, test } from "bun:test";
-import { __githubInternals, githubRepoFromRemoteForTest, remoteHostsForDirs } from "./github.ts";
+import { __githubInternals, githubRepoFromRemoteForTest } from "./github.ts";
 import type { GitHubListItem } from "../shared/types.ts";
 
 const {
@@ -1310,45 +1307,6 @@ test("parseGitRemote preserves rawHost for a github ssh host alias while canonic
   });
 });
 
-// ---------------------------------------------------------------------------
-// remoteHostsForDirs — provider-generic alias-host discovery
-// (fix-bitbucket-alias-host-credentials.md §3/§5). Not a pure function (it
-// shells out to `git`), so unlike the rest of this file these tests build
-// throwaway temp git repos, mirroring git-host.test.ts's `makeRepo` convention.
-// ---------------------------------------------------------------------------
-
-async function git(args: string[], cwd: string): Promise<void> {
-  const proc = Bun.spawn(["git", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  await proc.exited;
-}
-
-/** A throwaway git repo whose sole `origin` remote is the given URL. */
-async function makeRemoteHostDir(remoteUrl: string): Promise<string> {
-  const dir = mkdtempSync(path.join(tmpdir(), "agetor-remote-hosts-"));
-  await git(["init", "-b", "main"], dir);
-  await git(["remote", "add", "origin", remoteUrl], dir);
-  return dir;
-}
-
-test("remoteHostsForDirs returns the sorted alias hosts of every supported provider (github/gitlab/bitbucket), excluding an unsupported host, and tolerates a dir that isn't a repo", async () => {
-  const dirs: string[] = [];
-  try {
-    const githubDir = await makeRemoteHostDir("git@github-work.com:a/b.git");
-    dirs.push(githubDir);
-    const bitbucketDir = await makeRemoteHostDir("git@bitbucket-work.com:w/r.git");
-    dirs.push(bitbucketDir);
-    const gitlabDir = await makeRemoteHostDir("git@gitlab-work.io:g/p.git");
-    dirs.push(gitlabDir);
-    const unsupportedDir = await makeRemoteHostDir("git@example.com:x/y.git");
-    dirs.push(unsupportedDir);
-    // A dir that isn't a git repo at all (but does exist) — must be tolerated
-    // silently, same as repoForDir.
-    const notARepoDir = mkdtempSync(path.join(tmpdir(), "agetor-remote-hosts-plain-"));
-    dirs.push(notARepoDir);
-
-    const hosts = await remoteHostsForDirs([githubDir, bitbucketDir, gitlabDir, unsupportedDir, notARepoDir]);
-    expect(hosts).toEqual(["bitbucket-work.com", "github-work.com", "gitlab-work.io"]);
-  } finally {
-    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
-  }
-});
+// remoteHostsForDirs moved to git-provider.ts, reimplemented over
+// providerRepoForDir (docs/plans/consolidate-git-host-discovery.md) — its
+// test moved with it, to git-provider.test.ts.
