@@ -4,6 +4,7 @@ import { api, type GitHubTokensResult } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { GitHubSetupDialog } from "@/components/settings/GitHubSetupDialog";
+import { GIT_HOST_TOKENS_SECTION } from "../../../shared/types.ts";
 
 const DATALIST_ID = "github-token-hosts";
 
@@ -105,7 +106,7 @@ export function GitHubTokensSection() {
     <section className="space-y-2">
       <div className="flex items-center justify-between gap-2">
         <div>
-          <label className="text-xs text-muted-foreground">Git host tokens</label>
+          <label className="text-xs text-muted-foreground">{GIT_HOST_TOKENS_SECTION}</label>
           <p className="text-[11px] leading-snug text-muted-foreground">
             Repos reached through an ssh host alias (git@github-work.com:…, git@gitlab-work.com:…,
             git@bitbucket-work.com:…) authenticate with the token stored for that alias; github.com,

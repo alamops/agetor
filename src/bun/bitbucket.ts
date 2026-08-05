@@ -235,25 +235,34 @@ function apiErrorMessage(body: unknown, status: number, statusText: string): str
  *  not found / add a credential" treatment; a genuine 401 (missing/invalid
  *  credentials on the request itself) gets an authentication-failed flavor
  *  instead, but points at the same Settings section and credential format.
- *  403 is narrower: it's only enriched when `hadCreds === false`, since an
- *  *unauthenticated* 403 is plausibly the same credential-gap signal as an
- *  unauthenticated 404 — but an *authenticated* 403 usually means something
- *  the enrichment would actively mislead about (branch restrictions blocking
- *  a merge, a permission the credential's account genuinely lacks, a rate
- *  limit) and must pass through with its real message intact rather than
- *  being reframed as "add/replace a credential". The underlying `message` is
- *  always preserved in the enriched text so a real, specific API error is
- *  never discarded. `hadCreds` (was a credential configured for this host at
- *  all, regardless of whether it worked?) picks between "add a credential"
- *  and "the configured credential can't access it" for 404 — the latter also
- *  calls out Bitbucket's 2026-06-09 app-password retirement, since a stale
- *  app password is a common way a previously-working credential starts
- *  failing. Any other status is returned unchanged. Pure — exported via
- *  `__bitbucketInternals` for unit testing. */
+ *  403 is narrower: an *unauthenticated* 403 is plausibly the same
+ *  credential-gap signal as an unauthenticated 404, so it gets the full 404
+ *  treatment. An *authenticated* 403 (`hadCreds === true`) usually means
+ *  something the enrichment would actively mislead about (branch restrictions
+ *  blocking a merge, a permission the credential's account genuinely lacks, a
+ *  rate limit) — a real, specific error like that must stay front and center,
+ *  never reframed as a bare "add/replace a credential". But it does get one
+ *  thing appended: a pointer to Settings for the single most common
+ *  authenticated-403 cause since Bitbucket's app-password retirement — a
+ *  token that authenticates fine but lacks the scope the call needs. The
+ *  append keeps the real message first (so it's never discarded or buried)
+ *  and still carries the `Settings → ${GIT_HOST_TOKENS_SECTION}` marker
+ *  phrase so the webview's credential-error panel renders for this case too.
+ *  The underlying `message` is always preserved in the enriched text so a
+ *  real, specific API error is never discarded. `hadCreds` (was a credential
+ *  configured for this host at all, regardless of whether it worked?) picks
+ *  between "add a credential" and "the configured credential can't access
+ *  it" for 404 — the latter also calls out Bitbucket's 2026-06-09
+ *  app-password retirement, since a stale app password is a common way a
+ *  previously-working credential starts failing. Any other status is
+ *  returned unchanged. Pure — exported via `__bitbucketInternals` for unit
+ *  testing. */
 function bitbucketAccessHint(status: number, message: string, repo: ProviderRepoInfo, hadCreds: boolean): string {
   if (status !== 401 && status !== 403 && status !== 404) return message;
-  if (status === 403 && hadCreds) return message;
   const host = repo.remoteHost || "bitbucket.org";
+  if (status === 403 && hadCreds) {
+    return `${message} — if the configured credential for ${host} lacks the required Bitbucket scopes, update it in Settings → ${GIT_HOST_TOKENS_SECTION}.`;
+  }
   const settingsPointer = `Settings → ${GIT_HOST_TOKENS_SECTION} (Bitbucket Basic auth: email:api_token)`;
   if (status === 401) {
     return hadCreds

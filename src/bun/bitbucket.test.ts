@@ -110,9 +110,18 @@ test("bitbucketAccessHint on a 403 with no prior credential is enriched the same
   expect(hint).toContain("email:api_token");
 });
 
-test("bitbucketAccessHint on an authenticated 403 passes the real message through UNCHANGED — e.g. a branch-restriction merge error", () => {
+test("bitbucketAccessHint on an authenticated 403 preserves the real message first — e.g. a branch-restriction merge error — and appends a scope-check pointer to Settings", () => {
   const branchRestrictionMsg = "Branch restrictions: at least 2 approvals are required to merge this pull request.";
-  expect(bitbucketAccessHint(403, branchRestrictionMsg, ALIAS_REPO, true)).toBe(branchRestrictionMsg);
+  const hint = bitbucketAccessHint(403, branchRestrictionMsg, ALIAS_REPO, true);
+  expect(hint.startsWith(branchRestrictionMsg)).toBe(true);
+  expect(hint).toContain("bitbucket-work.com");
+  expect(hint).toContain("Settings → Git host tokens");
+  expect(hint).toContain("lacks the required Bitbucket scopes");
+});
+
+test("bitbucketAccessHint on an authenticated 403 carries the Settings marker phrase the webview panel detects, unlike the pre-fix pass-through", () => {
+  const hint = bitbucketAccessHint(403, "some other authenticated 403 message", ALIAS_REPO, true);
+  expect(hint).toContain(`Settings → Git host tokens`);
 });
 
 test("bitbucketAccessHint on a 401 without a stored credential says to add one", () => {
