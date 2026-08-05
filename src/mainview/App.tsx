@@ -894,6 +894,12 @@ export default function App() {
           setGithubPullPrefill(null);
           setGithubPullDetailPrefill(null);
         }}
+        onOpenSettings={() => {
+          setGithubOpen(false);
+          setGithubPullPrefill(null);
+          setGithubPullDetailPrefill(null);
+          setSettingsOpen(true);
+        }}
       />
       <WorktreesDialog
         open={worktreesOpen}

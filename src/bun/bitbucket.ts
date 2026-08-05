@@ -18,6 +18,7 @@ import type {
   ProviderRepoInfo,
   TaskDiff,
 } from "../shared/types.ts";
+import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { bitbucketCreds, type BitbucketCreds } from "./git-provider.ts";
 
@@ -253,7 +254,7 @@ function bitbucketAccessHint(status: number, message: string, repo: ProviderRepo
   if (status !== 401 && status !== 403 && status !== 404) return message;
   if (status === 403 && hadCreds) return message;
   const host = repo.remoteHost || "bitbucket.org";
-  const settingsPointer = "Settings → Git host tokens (Bitbucket Basic auth: email:api_token)";
+  const settingsPointer = `Settings → ${GIT_HOST_TOKENS_SECTION} (Bitbucket Basic auth: email:api_token)`;
   if (status === 401) {
     return hadCreds
       ? `Bitbucket authentication failed (${message}) — the credential stored for ${host} was rejected; replace it in ${settingsPointer}. Check it's a current API token, not a retired app password.`
@@ -1367,7 +1368,7 @@ function bitbucketViewerAccessHint(status: number, message: string, repo: Provid
   if (status === 401) return bitbucketAccessHint(status, message, repo, hadCreds);
   if (status !== 403 && status !== 404) return message;
   const host = repo.remoteHost || "bitbucket.org";
-  return `your Bitbucket account could not be read (${message}) — check the credential for ${host} in Settings → Git host tokens`;
+  return `your Bitbucket account could not be read (${message}) — check the credential for ${host} in Settings → ${GIT_HOST_TOKENS_SECTION}`;
 }
 
 /** Matches `getGitHubViewer`'s shape (`{ok:true; login}` only — no token

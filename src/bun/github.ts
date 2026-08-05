@@ -62,6 +62,7 @@ import type {
   GitHubWorkflowsResult,
   TaskDiff,
 } from "../shared/types.ts";
+import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { tokenForHost } from "./github-tokens.ts";
 
@@ -1277,7 +1278,7 @@ function apiError(body: unknown, status: number, statusText: string): string {
 function privateRepoHint(status: number, message: string, repo: GitHubRepo, hadToken: boolean): string {
   if (status !== 404) return message;
   const host = repo.remoteHost || "github.com";
-  const base = `${repo.owner}/${repo.name} was not found on GitHub — if the repo is private, add a token for ${host} in Settings → Git host tokens`;
+  const base = `${repo.owner}/${repo.name} was not found on GitHub — if the repo is private, add a token for ${host} in Settings → ${GIT_HOST_TOKENS_SECTION}`;
   return hadToken
     ? `${base} (the configured token cannot access it — check it belongs to the right account)`
     : base;

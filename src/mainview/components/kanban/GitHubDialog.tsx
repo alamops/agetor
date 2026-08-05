@@ -26,6 +26,7 @@ import {
   GitMerge,
   GitPullRequest,
   Kanban,
+  KeyRound,
   ListTree,
   Loader2,
   Lock,
@@ -40,6 +41,7 @@ import {
   Rocket,
   RotateCcw,
   Search,
+  Settings,
   Sparkles,
   Tag,
   Unlock,
@@ -110,7 +112,7 @@ import type {
   ProviderCaps,
   TaskDiff,
 } from "../../../shared/types.ts";
-import { PROVIDER_CAPS } from "../../../shared/types.ts";
+import { GIT_HOST_TOKENS_SECTION, PROVIDER_CAPS } from "../../../shared/types.ts";
 
 // Hoisted ReactMarkdown `components` map for GitHub markdown bodies (PR/issue
 // descriptions, comments, list previews). Module scope keeps the prop identity
@@ -203,6 +205,11 @@ interface Props {
    *  `pendingPullDetailPrefillRef` below. */
   pullDetailPrefill?: GitHubPullDetailPrefill | null;
   onClose: () => void;
+  /** Wired from App.tsx: closes this dialog and opens SettingsDialog. Optional
+   *  so other mounts (tests, storybook-style usages) don't need to supply it —
+   *  when absent, the credential-error panel below simply omits its "Open
+   *  Settings" button rather than rendering a dead one. */
+  onOpenSettings?: () => void;
 }
 
 const basename = (p: string) => {
@@ -510,7 +517,7 @@ function RateLimitBadge({ rateLimit }: { rateLimit: GitHubRateLimit }) {
   );
 }
 
-export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, pullDetailPrefill, onClose }: Props) {
+export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, pullDetailPrefill, onClose, onOpenSettings }: Props) {
   const [projectPath, setProjectPath] = useState("");
   // "All repositories" (G8/F15) — see AGGREGATE_PROJECT_PATH.
   const isAggregate = projectPath === AGGREGATE_PROJECT_PATH;
@@ -3826,10 +3833,43 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
           </div>
         )}
 
+        {/* Credential errors are enriched server-side with the marker phrase
+            `Settings → ${GIT_HOST_TOKENS_SECTION}` (github.ts's
+            `privateRepoHint`, gitlab.ts's `authHint`, bitbucket.ts's
+            `bitbucketAccessHint`/`bitbucketViewerAccessHint`) — matching it
+            here (rather than a status code we don't have at this layer) is
+            what lets us swap the bare error row for an actionable explainer,
+            while every other list-load failure keeps the plain row below. */}
         {!loading && error && (
-          <div className="flex items-center justify-center gap-2 py-12 text-sm text-rose-400">
-            <AlertCircle className="size-4" /> {error}
-          </div>
+          error.includes(`Settings → ${GIT_HOST_TOKENS_SECTION}`) ? (
+            <div className="mx-auto my-6 flex max-w-md flex-col gap-3 rounded-md border border-border/60 bg-card p-4">
+              <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                <KeyRound className="size-4 text-amber-400" />
+                A credential is needed for this repository
+              </div>
+              <p className="text-xs text-muted-foreground">{error}</p>
+              <div className="rounded-md border border-border/50 bg-background/40 p-3">
+                <div className="mb-1.5 text-[11px] font-medium text-muted-foreground">One-time setup</div>
+                <ol className="list-decimal space-y-1 pl-4 text-xs text-muted-foreground">
+                  <li>Create a token on your git host — for Bitbucket that&apos;s an Atlassian API token with scopes at id.atlassian.com.</li>
+                  <li>In Settings → {GIT_HOST_TOKENS_SECTION}, save it for the host named above — Bitbucket credentials are entered as email:api_token.</li>
+                  <li>Reopen this dialog. The Setup guide button inside the Settings section walks through each provider step by step.</li>
+                </ol>
+              </div>
+              {onOpenSettings && (
+                <div className="flex justify-end">
+                  <Button size="sm" onClick={onOpenSettings}>
+                    <Settings className="mr-2 size-3.5" />
+                    Open Settings
+                  </Button>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex items-center justify-center gap-2 py-12 text-sm text-rose-400">
+              <AlertCircle className="size-4" /> {error}
+            </div>
+          )
         )}
 
         {loading && !result && (
