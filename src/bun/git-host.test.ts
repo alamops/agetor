@@ -109,6 +109,18 @@ test("providerInfoForDir resolves a bitbucket repo", async () => {
   });
 });
 
+test("providerInfoForDir resolves an ssh host-alias bitbucket remote — provider bitbucket, host canonicalized, remoteHost preserved as the alias", async () => {
+  const dir = await makeRepo("git@bitbucket-work.com:acme/app.git");
+  expect(await providerInfoForDir(dir)).toEqual({
+    ok: true,
+    provider: "bitbucket",
+    owner: "acme",
+    name: "app",
+    host: "bitbucket.org",
+    remoteHost: "bitbucket-work.com",
+  });
+});
+
 test("providerInfoForDir errors on an unsupported git remote", async () => {
   const dir = await makeRepo("git@example.com:acme/app.git");
   expect(await providerInfoForDir(dir)).toEqual({
