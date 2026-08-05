@@ -13,22 +13,31 @@ import {
   GITHUB_URLS,
   MULTI_ACCOUNT_NOTE,
   ORG_CAVEATS,
+  type GuideScopeRow,
   type GuideStep,
 } from "@/lib/github-setup-guide";
 
 /** Click-path to create a Bitbucket Atlassian API token, used in place of
  *  the retired (2026-06-09) app-password flow. Stored as a single
- *  `email:api_token` string — Bitbucket's Basic auth format. */
+ *  `email:api_token` string — Bitbucket's Basic auth format. A *scopeless*
+ *  Atlassian API token (the default the Atlassian account UI offers, aimed at
+ *  Jira/Confluence) is rejected by api.bitbucket.org — the token must be
+ *  created "with scopes" and have the Bitbucket scopes below selected. */
 const BITBUCKET_CREATE_STEPS: GuideStep[] = [
   {
     title: "Open id.atlassian.com → Security",
     detail: "Sign in at id.atlassian.com, then choose \"Security\" in the left sidebar.",
   },
   {
-    title: "Create an API token",
+    title: "Create an API token with scopes",
     detail:
-      "Under \"API tokens\", click \"Create API token\", give it a name, and copy the " +
-      "generated token — it's shown only once.",
+      "Under \"API tokens\", click \"Create API token with scopes\" (NOT the plain, scopeless " +
+      "\"Create API token\" — a scopeless token works for Jira/Confluence but api.bitbucket.org " +
+      "rejects it). Give it a name, then select \"Bitbucket\" and tick the scopes listed below.",
+  },
+  {
+    title: "Copy the token",
+    detail: "Click \"Create\" and copy the generated token — it's shown only once.",
   },
   {
     title: "Save it as email:api_token",
@@ -37,6 +46,32 @@ const BITBUCKET_CREATE_STEPS: GuideStep[] = [
       "alias host) and put your Atlassian account email, a colon, then the API token in " +
       "the token field — e.g. \"jane@example.com:ATATT3x…\". Bitbucket app passwords were " +
       "retired on 2026-06-09; replace any saved app password with a token in this format.",
+  },
+];
+
+/** Bitbucket scopes to select when creating the scoped API token above — the
+ *  minimum set covering everything this adapter's ~18 call sites touch
+ *  (src/bun/bitbucket.ts): repository read/write for PR diffs, statuses, and
+ *  merges; pull request and issue read/write; account read to resolve the
+ *  viewer (`getBitbucketViewer`, used for the "me"-scoped BBQL filters). */
+const BITBUCKET_SCOPES: GuideScopeRow[] = [
+  {
+    scope: "Repositories: Read, Write",
+    usedFor: "Listing repos, reading diffs/commit statuses, and merging pull requests.",
+  },
+  {
+    scope: "Pull requests: Read, Write",
+    usedFor:
+      "Listing, creating, merging, declining, and reviewing PRs; PR and line comments; " +
+      "merge-conflict detection.",
+  },
+  {
+    scope: "Issues: Read, Write",
+    usedFor: "The repository issue tracker — listing, creating, updating, and commenting.",
+  },
+  {
+    scope: "Account: Read",
+    usedFor: "Resolving the signed-in account, used for \"assigned to me\"/\"created by me\" filters.",
   },
 ];
 
@@ -106,6 +141,14 @@ export function GitHubSetupDialog({ open, onClose }: { open: boolean; onClose: (
 
         <GuideSection heading="GitHub: how Agetor finds a token">
           <StepList steps={AUTH_RESOLUTION_STEPS} />
+          <p className="text-[11px] leading-snug text-muted-foreground">
+            Bitbucket and GitLab resolve the same way minus the CLI-login step: Bitbucket tries a
+            stored host entry, then the bitbucket.org entry, then the{" "}
+            <code className="font-mono">BITBUCKET_TOKEN</code>/
+            <code className="font-mono">BITBUCKET_EMAIL</code> environment variables; GitLab tries a
+            stored entry, then <code className="font-mono">GITLAB_TOKEN</code>, then a stored{" "}
+            <code className="font-mono">glab</code> CLI login.
+          </p>
         </GuideSection>
 
         <GuideSection heading="GitHub — recommended: classic token (full access)">
@@ -173,6 +216,14 @@ export function GitHubSetupDialog({ open, onClose }: { open: boolean; onClose: (
 
         <GuideSection heading="Bitbucket: Atlassian API token">
           <StepList steps={BITBUCKET_CREATE_STEPS} />
+          <div className="space-y-1.5">
+            {BITBUCKET_SCOPES.map((row) => (
+              <div key={row.scope} className="rounded-md border border-border/60 px-3 py-2">
+                <div className="font-mono text-xs">{row.scope}</div>
+                <div className="text-[11px] leading-snug text-muted-foreground">{row.usedFor}</div>
+              </div>
+            ))}
+          </div>
           <div className="flex justify-end">
             <Button
               size="sm"

@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Date | 2026-08-05 |
-| Source | /implement task: "BitBucket Git integration not loading PRs — 'You may not have access to this repository…'; perhaps custom git host domains (bitbucket-agetor.com)" |
+| Source | /implement task: "BitBucket Git integration not loading PRs — 'You may not have access to this repository…'; perhaps custom git host domains (bitbucket-work.com)" |
 | Config | AGENTS_CONFIG.yml (balanced) |
 | Branch | fix/bitbucket-git-integration-not-loading-pr |
 | Base SHA | 1ac4dc62273745a11dae88a7d11c36828301b15e |
@@ -12,7 +12,7 @@
 ## 1. Objective & success criteria
 
 A user whose Bitbucket repo is reached through an ssh host alias (e.g.
-`git@bitbucket-agetor.com:workspace/repo.git`) can discover, store, and use a
+`git@bitbucket-work.com:workspace/repo.git`) can discover, store, and use a
 Bitbucket credential so PR list / detail / diff / comments / mergeability all
 work; and when auth is missing or wrong, the error shown names the exact host
 and the exact Settings section (with Bitbucket's `email:api_token` format)

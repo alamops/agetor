@@ -107,10 +107,10 @@ export function GitHubTokensSection() {
         <div>
           <label className="text-xs text-muted-foreground">Git host tokens</label>
           <p className="text-[11px] leading-snug text-muted-foreground">
-            Repos reached through an ssh host alias (git@github-work.com:…, git@bitbucket-work.com:…)
-            authenticate with the token stored for that alias; github.com, gitlab.com, and
-            bitbucket.org act as the per-provider defaults. Bitbucket credentials are entered as{" "}
-            <code className="font-mono">email:api_token</code>.
+            Repos reached through an ssh host alias (git@github-work.com:…, git@gitlab-work.com:…,
+            git@bitbucket-work.com:…) authenticate with the token stored for that alias; github.com,
+            gitlab.com, and bitbucket.org act as the per-provider defaults. Bitbucket credentials are
+            entered as <code className="font-mono">email:api_token</code>.
           </p>
         </div>
         <Button
@@ -194,7 +194,7 @@ export function GitHubTokensSection() {
           <Input
             value={host}
             onChange={(e) => setHost(e.target.value)}
-            placeholder="github.com / bitbucket.org"
+            placeholder="github.com / gitlab.com / bitbucket.org"
             list={DATALIST_ID}
             spellCheck={false}
           />

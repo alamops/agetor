@@ -230,27 +230,39 @@ function apiErrorMessage(body: unknown, status: number, statusText: string): str
  *  github.ts's `privateRepoHint` and gitlab.ts's `authHint`. Bitbucket hides a
  *  private repo behind 404 — and sometimes 403 — rather than answering with a
  *  clean 401 (its documented "You may not have access to this repository or
- *  it no longer exists in this workspace…" body), so both get the "was not
- *  found / add a credential" treatment; a genuine 401 (missing/invalid
+ *  it no longer exists in this workspace…" body), so 404 always gets the "was
+ *  not found / add a credential" treatment; a genuine 401 (missing/invalid
  *  credentials on the request itself) gets an authentication-failed flavor
  *  instead, but points at the same Settings section and credential format.
- *  Any other status is returned unchanged. `hadCreds` (was a credential
- *  configured for this host at all, regardless of whether it worked?) picks
- *  between "add a credential" and "the configured credential can't access
- *  it" — the latter also calls out Bitbucket's 2026-06-09 app-password
- *  retirement, since a stale app password is a common way a previously-working
- *  credential starts failing. Pure — unit-tested via `__bitbucketInternals`. */
+ *  403 is narrower: it's only enriched when `hadCreds === false`, since an
+ *  *unauthenticated* 403 is plausibly the same credential-gap signal as an
+ *  unauthenticated 404 — but an *authenticated* 403 usually means something
+ *  the enrichment would actively mislead about (branch restrictions blocking
+ *  a merge, a permission the credential's account genuinely lacks, a rate
+ *  limit) and must pass through with its real message intact rather than
+ *  being reframed as "add/replace a credential". The underlying `message` is
+ *  always preserved in the enriched text so a real, specific API error is
+ *  never discarded. `hadCreds` (was a credential configured for this host at
+ *  all, regardless of whether it worked?) picks between "add a credential"
+ *  and "the configured credential can't access it" for 404 — the latter also
+ *  calls out Bitbucket's 2026-06-09 app-password retirement, since a stale
+ *  app password is a common way a previously-working credential starts
+ *  failing. Any other status is returned unchanged. Pure — exported via
+ *  `__bitbucketInternals` for unit testing. */
 function bitbucketAccessHint(status: number, message: string, repo: ProviderRepoInfo, hadCreds: boolean): string {
   if (status !== 401 && status !== 403 && status !== 404) return message;
+  if (status === 403 && hadCreds) return message;
   const host = repo.remoteHost || "bitbucket.org";
   const settingsPointer = "Settings → Git host tokens (Bitbucket Basic auth: email:api_token)";
-  const cantAccess = " (the configured credential cannot access it — check it belongs to the right account and is a current API token, not a retired app password)";
   if (status === 401) {
-    const base = `Bitbucket authentication failed (${message}) — add a credential for ${host} in ${settingsPointer}.`;
-    return hadCreds ? `${base}${cantAccess}` : base;
+    return hadCreds
+      ? `Bitbucket authentication failed (${message}) — the credential stored for ${host} was rejected; replace it in ${settingsPointer}. Check it's a current API token, not a retired app password.`
+      : `Bitbucket authentication failed (${message}) — add a credential for ${host} in ${settingsPointer}.`;
   }
-  const base = `${repo.owner}/${repo.name} was not found on Bitbucket — if the repo is private, add a credential for ${host} in ${settingsPointer}`;
-  return hadCreds ? `${base}${cantAccess}` : base;
+  const base = `${repo.owner}/${repo.name} was not found on Bitbucket (${message}) — if the repo is private, add a credential for ${host} in ${settingsPointer}`;
+  return hadCreds
+    ? `${base} (the configured credential cannot access it — check it belongs to the right account and is a current API token, not a retired app password).`
+    : base;
 }
 
 /** Single choke point tying a non-2xx `Response` + parsed body to the enriched
@@ -593,7 +605,12 @@ export async function listBitbucketItems(
   if (!("status" in res)) return res;
   const body = await res.json().catch(() => null);
   if (!res.ok) {
-    if (opts.kind === "issues" && res.status === 404) {
+    // Only shortcut to "issue tracker is not enabled" when a credential was
+    // actually sent — an unauthenticated 404 is ambiguous (could just as
+    // easily be a private repo with no credential configured), so it falls
+    // through to `errorFrom`'s enriched hint instead of masking the real
+    // credential-gap signal behind a misleading tracker-disabled message.
+    if (opts.kind === "issues" && res.status === 404 && creds) {
       return { ok: false, error: "issue tracker is not enabled for this repository" };
     }
     return { ok: false, error: errorFrom(res, body, repo, !!creds) };
@@ -752,7 +769,10 @@ export async function listBitbucketComments(
   if (!("status" in res)) return res;
   const body = await res.json().catch(() => null);
   if (!res.ok) {
-    if (kind === "issues" && res.status === 404) {
+    // Same gating as listBitbucketItems above: only shortcut to
+    // "issue tracker is not enabled" once a credential was sent, so an
+    // unauthenticated 404 falls through to the enriched hint instead.
+    if (kind === "issues" && res.status === 404 && creds) {
       return { ok: false, error: "issue tracker is not enabled for this repository" };
     }
     return { ok: false, error: errorFrom(res, body, repo, !!creds) };
@@ -1335,6 +1355,21 @@ export async function updateBitbucketIssue(
   return { ok: true, item, message: "Issue updated." };
 }
 
+/** Account-flavored counterpart to `bitbucketAccessHint`, used only by
+ *  `getBitbucketViewer`. `/2.0/user` has no repo in scope — reusing
+ *  `bitbucketAccessHint`'s 403/404 wording verbatim would render a nonsensical
+ *  "owner/repo was not found on Bitbucket" for what is really an account-level
+ *  read failure. 401 handling (auth flavor: invalid/missing credentials) is
+ *  identical regardless of endpoint, so it's delegated straight to
+ *  `bitbucketAccessHint`; 403/404 instead get account-flavored wording; any
+ *  other status passes the message through unchanged. */
+function bitbucketViewerAccessHint(status: number, message: string, repo: ProviderRepoInfo, hadCreds: boolean): string {
+  if (status === 401) return bitbucketAccessHint(status, message, repo, hadCreds);
+  if (status !== 403 && status !== 404) return message;
+  const host = repo.remoteHost || "bitbucket.org";
+  return `your Bitbucket account could not be read (${message}) — check the credential for ${host} in Settings → Git host tokens`;
+}
+
 /** Matches `getGitHubViewer`'s shape (`{ok:true; login}` only — no token
  *  means an anonymous "" login rather than an error, same no-token behavior
  *  as the GitHub counterpart). */
@@ -1344,7 +1379,12 @@ export async function getBitbucketViewer(repo: ProviderRepoInfo): Promise<Bitbuc
   const res = await fetchBitbucket("/2.0/user", creds, "application/json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
+  if (!res.ok) {
+    return {
+      ok: false,
+      error: bitbucketViewerAccessHint(res.status, apiErrorMessage(json, res.status, res.statusText), repo, !!creds),
+    };
+  }
   const obj = json && typeof json === "object" ? json as Record<string, unknown> : {};
   const login = typeof obj.nickname === "string" && obj.nickname
     ? obj.nickname
@@ -1360,6 +1400,7 @@ export const __bitbucketInternals = {
   resolveUrl,
   apiErrorMessage,
   bitbucketAccessHint,
+  bitbucketViewerAccessHint,
   errorFrom,
   normalizeBitbucketUser,
   normalizeBitbucketPull,
