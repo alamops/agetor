@@ -832,17 +832,42 @@ export async function repoForDir(dir: string): Promise<GitHubRepo | null> {
   return null;
 }
 
-/** Distinct raw GitHub hosts (the ssh-alias identity, or `github.com` for a
- *  plain remote) across the given project dirs, sorted — drives the Settings
- *  "detected hosts" suggestion list so a user's real aliases are one click
- *  away instead of hand-typed. Dirs with no GitHub remote (or that aren't a
- *  repo at all) are tolerated silently, same as `repoForDir`. */
+/** Canonical hosts recognized by any provider adapter (github.ts, gitlab.ts,
+ *  bitbucket.ts) — the set `remoteHostsForDirs` uses to decide whether a
+ *  remote's host is "supported" at all, independent of which provider it is. */
+const SUPPORTED_PROVIDER_HOSTS = new Set(["github.com", "gitlab.com", "bitbucket.org"]);
+
+/** Distinct raw remote hosts (the ssh-alias identity, or the provider's own
+ *  domain for a plain remote) across the given project dirs, sorted — drives
+ *  the Settings "detected hosts" suggestion list so a user's real aliases are
+ *  one click away instead of hand-typed. Provider-generic: considers every
+ *  remote whose canonical host (via `parseGitRemote`) resolves to a supported
+ *  provider (github.com, gitlab.com, or bitbucket.org) — not just GitHub — so
+ *  a Bitbucket- or GitLab-only repo's alias host still surfaces here. Per dir,
+ *  walks remotes origin-first (same order as `repoForDir`) and stops at the
+ *  first one that resolves to a supported provider. Implemented inline
+ *  (rather than via `git-provider.ts`'s `providerRepoForDir`) to avoid a
+ *  circular import — `git-provider.ts` imports this file. Dirs with no
+ *  supported-provider remote (or that aren't a repo at all) are tolerated
+ *  silently, same as `repoForDir`. */
 export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
-  const repos = await Promise.all(dirs.map((dir) => repoForDir(dir)));
   const hosts = new Set<string>();
-  for (const repo of repos) {
-    if (repo) hosts.add(repo.remoteHost);
-  }
+  await Promise.all(dirs.map(async (dir) => {
+    if (!existsSync(dir)) return;
+    const remotes = await run(["git", "remote"], dir);
+    if (!remotes.ok) return;
+    const names = remotes.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+    const ordered = ["origin", ...names.filter((n) => n !== "origin")];
+    for (const name of ordered) {
+      const url = await run(["git", "remote", "get-url", name], dir);
+      if (!url.ok) continue;
+      const parsed = parseGitRemote(url.stdout);
+      if (parsed && SUPPORTED_PROVIDER_HOSTS.has(parsed.host)) {
+        hosts.add(parsed.rawHost);
+        break;
+      }
+    }
+  }));
   return Array.from(hosts).sort();
 }
 
@@ -1291,7 +1316,7 @@ function apiError(body: unknown, status: number, statusText: string): string {
 function privateRepoHint(status: number, message: string, repo: GitHubRepo, hadToken: boolean): string {
   if (status !== 404) return message;
   const host = repo.remoteHost || "github.com";
-  const base = `${repo.owner}/${repo.name} was not found on GitHub — if the repo is private, add a token for ${host} in Settings → GitHub tokens`;
+  const base = `${repo.owner}/${repo.name} was not found on GitHub — if the repo is private, add a token for ${host} in Settings → Git host tokens`;
   return hadToken
     ? `${base} (the configured token cannot access it — check it belongs to the right account)`
     : base;

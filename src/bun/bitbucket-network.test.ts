@@ -145,7 +145,8 @@ test("listBitbucketItems maps a 401 to a friendly error mentioning credential co
     const res = await listBitbucketItems(REPO, { kind: "pulls", state: "open" });
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("expected failure");
-    expect(res.error).toContain("configure credentials in Settings");
+    expect(res.error).toContain("Settings → Git host tokens");
+    expect(res.error).toContain("configured credential cannot access it");
   } finally {
     mock.restore();
   }

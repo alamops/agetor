@@ -215,19 +215,51 @@ async function fetchBitbucket(
 
 /** Extract a friendly error message from a non-2xx Bitbucket response body
  *  (`{type:"error", error:{message}}`), falling back to `status statusText`.
- *  A 401 gets an actionable hint pointing at where credentials are
- *  configured, mirroring github.ts's `privateRepoHint` — a bare 401 passthrough
- *  otherwise reads as "this doesn't exist" rather than "you're not authed". */
+ *  Pure message extraction only — no status-specific enrichment; that lives
+ *  in `bitbucketAccessHint`/`errorFrom` below, mirroring gitlab.ts's split
+ *  between `apiError` and `authHint`. */
 function apiErrorMessage(body: unknown, status: number, statusText: string): string {
-  const message = body && typeof body === "object" && (body as { error?: unknown }).error
+  return body && typeof body === "object" && (body as { error?: unknown }).error
     && typeof (body as { error?: unknown }).error === "object"
     && typeof ((body as { error: Record<string, unknown> }).error.message) === "string"
     ? (body as { error: { message: string } }).error.message
     : `${status} ${statusText}`;
+}
+
+/** Enriches a 401/403/404 with an actionable pointer to Settings, mirroring
+ *  github.ts's `privateRepoHint` and gitlab.ts's `authHint`. Bitbucket hides a
+ *  private repo behind 404 — and sometimes 403 — rather than answering with a
+ *  clean 401 (its documented "You may not have access to this repository or
+ *  it no longer exists in this workspace…" body), so both get the "was not
+ *  found / add a credential" treatment; a genuine 401 (missing/invalid
+ *  credentials on the request itself) gets an authentication-failed flavor
+ *  instead, but points at the same Settings section and credential format.
+ *  Any other status is returned unchanged. `hadCreds` (was a credential
+ *  configured for this host at all, regardless of whether it worked?) picks
+ *  between "add a credential" and "the configured credential can't access
+ *  it" — the latter also calls out Bitbucket's 2026-06-09 app-password
+ *  retirement, since a stale app password is a common way a previously-working
+ *  credential starts failing. Pure — unit-tested via `__bitbucketInternals`. */
+function bitbucketAccessHint(status: number, message: string, repo: ProviderRepoInfo, hadCreds: boolean): string {
+  if (status !== 401 && status !== 403 && status !== 404) return message;
+  const host = repo.remoteHost || "bitbucket.org";
+  const settingsPointer = "Settings → Git host tokens (Bitbucket Basic auth: email:api_token)";
+  const cantAccess = " (the configured credential cannot access it — check it belongs to the right account and is a current API token, not a retired app password)";
   if (status === 401) {
-    return `Bitbucket authentication failed (${message}) — configure credentials in Settings → API tokens (Basic auth: email:api_token).`;
+    const base = `Bitbucket authentication failed (${message}) — add a credential for ${host} in ${settingsPointer}.`;
+    return hadCreds ? `${base}${cantAccess}` : base;
   }
-  return message;
+  const base = `${repo.owner}/${repo.name} was not found on Bitbucket — if the repo is private, add a credential for ${host} in ${settingsPointer}`;
+  return hadCreds ? `${base}${cantAccess}` : base;
+}
+
+/** Single choke point tying a non-2xx `Response` + parsed body to the enriched
+ *  message, threading the resolved repo and whether creds were sent — mirrors
+ *  gitlab.ts's `errorFrom(res, body, repo, hadToken)`. Nearly every Bitbucket
+ *  call site routes its error branch through this so the whole adapter gets
+ *  hint parity in one place. */
+function errorFrom(res: Response, body: unknown, repo: ProviderRepoInfo, hadCreds: boolean): string {
+  return bitbucketAccessHint(res.status, apiErrorMessage(body, res.status, res.statusText), repo, hadCreds);
 }
 
 function normalizeBitbucketUser(raw: unknown): GitHubUser | null {
@@ -564,7 +596,7 @@ export async function listBitbucketItems(
     if (opts.kind === "issues" && res.status === 404) {
       return { ok: false, error: "issue tracker is not enabled for this repository" };
     }
-    return { ok: false, error: apiErrorMessage(body, res.status, res.statusText) };
+    return { ok: false, error: errorFrom(res, body, repo, !!creds) };
   }
   const values = body && typeof body === "object" && Array.isArray((body as { values?: unknown }).values)
     ? (body as { values: unknown[] }).values
@@ -596,7 +628,7 @@ export async function getBitbucketPullDefaults(repo: ProviderRepoInfo): Promise<
   const res = await fetchBitbucket(repoBasePath(repo), creds, "application/json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   const obj = json && typeof json === "object" ? json as Record<string, unknown> : {};
   const mainbranch = obj.mainbranch && typeof obj.mainbranch === "object" ? obj.mainbranch as Record<string, unknown> : {};
   const base = typeof mainbranch.name === "string" && mainbranch.name ? mainbranch.name : "main";
@@ -641,7 +673,7 @@ export async function createBitbucketPull(
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   const item = normalizeBitbucketPull(json, null);
   if (!item) return { ok: false, error: "Bitbucket returned an unexpected pull request response" };
   return { ok: true, item, message: "Pull request created." };
@@ -673,7 +705,7 @@ export async function getBitbucketPullDiff(repo: ProviderRepoInfo, number: numbe
       const parsed = JSON.parse(body) as { error?: { message?: unknown } };
       if (parsed.error && typeof parsed.error.message === "string") msg = parsed.error.message;
     } catch { /* the diff endpoint returns plain text on success, not JSON */ }
-    return { ok: false, error: msg || `${res.status} ${res.statusText}` };
+    return { ok: false, error: bitbucketAccessHint(res.status, msg || `${res.status} ${res.statusText}`, repo, !!creds) };
   }
   const bodyBytes = Buffer.byteLength(body, "utf8");
   if (bodyBytes > BITBUCKET_DIFF_BODY_CAP_BYTES) {
@@ -723,7 +755,7 @@ export async function listBitbucketComments(
     if (kind === "issues" && res.status === 404) {
       return { ok: false, error: "issue tracker is not enabled for this repository" };
     }
-    return { ok: false, error: apiErrorMessage(body, res.status, res.statusText) };
+    return { ok: false, error: errorFrom(res, body, repo, !!creds) };
   }
   const values = body && typeof body === "object" && Array.isArray((body as { values?: unknown }).values)
     ? (body as { values: unknown[] }).values
@@ -764,7 +796,7 @@ export async function createBitbucketComment(
     if (kind === "issues" && res.status === 404) {
       return { ok: false, error: "issue tracker is not enabled for this repository" };
     }
-    return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+    return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   }
   const comment = normalizeBitbucketComment(json);
   if (!comment) return { ok: false, error: "Bitbucket returned an unexpected comment response" };
@@ -786,7 +818,7 @@ export async function listBitbucketPullReviewComments(
   const res = await fetchBitbucket(url.toString(), creds, "application/json");
   if (!("status" in res)) return res;
   const body = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(body, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, body, repo, !!creds) };
   const values = body && typeof body === "object" && Array.isArray((body as { values?: unknown }).values)
     ? (body as { values: unknown[] }).values
     : null;
@@ -840,7 +872,7 @@ export async function createBitbucketPullLineComment(
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   const comment = normalizeBitbucketLineComment(json);
   if (!comment) return { ok: false, error: "Bitbucket returned an unexpected line comment response" };
   return { ok: true, comment };
@@ -867,7 +899,7 @@ export async function replyBitbucketLineComment(
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   const comment = normalizeBitbucketLineComment(json);
   if (!comment) return { ok: false, error: "Bitbucket returned an unexpected reply response" };
   return { ok: true, comment };
@@ -886,7 +918,7 @@ export async function getBitbucketPullChecks(repo: ProviderRepoInfo, number: num
   const prRes = await fetchBitbucket(`${repoBasePath(repo)}/pullrequests/${number}`, creds, "application/json");
   if (!("status" in prRes)) return prRes;
   const prJson = await prRes.json().catch(() => null);
-  if (!prRes.ok) return { ok: false, error: apiErrorMessage(prJson, prRes.status, prRes.statusText) };
+  if (!prRes.ok) return { ok: false, error: errorFrom(prRes, prJson, repo, !!creds) };
   const prObj = prJson && typeof prJson === "object" ? prJson as Record<string, unknown> : {};
   const source = prObj.source && typeof prObj.source === "object" ? prObj.source as Record<string, unknown> : {};
   const commit = source.commit && typeof source.commit === "object" ? source.commit as Record<string, unknown> : {};
@@ -897,7 +929,7 @@ export async function getBitbucketPullChecks(repo: ProviderRepoInfo, number: num
   const res = await fetchBitbucket(statusesUrl.toString(), creds, "application/json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   const values = json && typeof json === "object" && Array.isArray((json as { values?: unknown }).values)
     ? (json as { values: unknown[] }).values
     : [];
@@ -1058,7 +1090,7 @@ export async function getBitbucketPullMergeability(
   const res = await fetchBitbucket(`${repoBasePath(repo)}/pullrequests/${number}`, creds, "application/json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   if (!json || typeof json !== "object") {
     return { ok: false, error: "Bitbucket returned an unexpected pull request response" };
   }
@@ -1082,7 +1114,7 @@ export async function getBitbucketPullDetail(repo: ProviderRepoInfo, number: num
   const res = await fetchBitbucket(`${repoBasePath(repo)}/pullrequests/${number}`, creds, "application/json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   const item = normalizeBitbucketPull(json, null);
   if (!item) return { ok: false, error: "Bitbucket returned an unexpected pull request response" };
   return { ok: true, item };
@@ -1119,7 +1151,7 @@ export async function mergeBitbucketPull(
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   const obj = json && typeof json === "object" ? json as Record<string, unknown> : {};
   const mergeCommit = obj.merge_commit && typeof obj.merge_commit === "object"
     ? obj.merge_commit as Record<string, unknown>
@@ -1144,7 +1176,7 @@ export async function closeBitbucketPull(repo: ProviderRepoInfo, number: number)
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   const item = normalizeBitbucketPull(json, null);
   return { ok: true, message: "Pull request declined.", ...(item ? { item } : {}) };
 }
@@ -1197,7 +1229,7 @@ export async function reviewBitbucketPull(
   );
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
 
   const verdictLabel = verdict === "APPROVE" ? "Pull request approved" : "Changes requested";
   if (trimmedBody) {
@@ -1243,7 +1275,7 @@ export async function createBitbucketIssue(
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     if (res.status === 404) return { ok: false, error: "issue tracker is not enabled for this repository" };
-    return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+    return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   }
   const item = normalizeBitbucketIssue(json, null);
   if (!item) return { ok: false, error: "Bitbucket returned an unexpected issue response" };
@@ -1296,7 +1328,7 @@ export async function updateBitbucketIssue(
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     if (res.status === 404) return { ok: false, error: "issue tracker is not enabled for this repository" };
-    return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+    return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   }
   const item = normalizeBitbucketIssue(json, null);
   if (!item) return { ok: false, error: "Bitbucket returned an unexpected issue response" };
@@ -1312,7 +1344,7 @@ export async function getBitbucketViewer(repo: ProviderRepoInfo): Promise<Bitbuc
   const res = await fetchBitbucket("/2.0/user", creds, "application/json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiErrorMessage(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!creds) };
   const obj = json && typeof json === "object" ? json as Record<string, unknown> : {};
   const login = typeof obj.nickname === "string" && obj.nickname
     ? obj.nickname
@@ -1327,6 +1359,8 @@ export const __bitbucketInternals = {
   repoBasePath,
   resolveUrl,
   apiErrorMessage,
+  bitbucketAccessHint,
+  errorFrom,
   normalizeBitbucketUser,
   normalizeBitbucketPull,
   normalizeBitbucketIssue,

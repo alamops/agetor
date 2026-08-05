@@ -679,7 +679,7 @@ test("a 401 response surfaces the authHint wording pointing at Settings", async 
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("expected failure");
     expect(res.error).toContain("Settings");
-    expect(res.error).toContain("GitLab tokens");
+    expect(res.error).toContain("Git host tokens");
   } finally {
     mock.restore();
   }

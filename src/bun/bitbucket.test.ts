@@ -61,11 +61,13 @@ test("apiErrorMessage falls back to `status statusText` for a malformed/absent b
   expect(apiErrorMessage({ error: "not an object" }, 400, "Bad Request")).toBe("400 Bad Request");
 });
 
-test("apiErrorMessage gives a 401 an actionable credentials hint, wrapping the underlying message", () => {
+// The 401 actionable-credentials hint moved out of apiErrorMessage (now a
+// pure body/status extractor, matching gitlab.ts's apiError) and into
+// bitbucketAccessHint/errorFrom — see bitbucket-network.test.ts for coverage
+// of the enriched wording end-to-end.
+test("apiErrorMessage extracts the plain body.error.message on a 401, with no enrichment", () => {
   const msg = apiErrorMessage({ error: { message: "Invalid credentials" } }, 401, "Unauthorized");
-  expect(msg).toContain("Invalid credentials");
-  expect(msg).toContain("configure credentials in Settings");
-  expect(msg).toContain("Basic auth: email:api_token");
+  expect(msg).toBe("Invalid credentials");
 });
 
 // ---------------------------------------------------------------------------

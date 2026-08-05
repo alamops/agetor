@@ -2600,7 +2600,7 @@ test("a 404 on an alias-host repo is enriched with the Settings pointer, naming 
       expect(res.ok).toBe(false);
       if (res.ok) throw new Error("expected getGitHubViewer to fail on a 404");
       expect(res.error).toContain(
-        "add a token for github-testalias-404.com in Settings → GitHub tokens",
+        "add a token for github-testalias-404.com in Settings → Git host tokens",
       );
       expect(res.error).toContain("configured token cannot access it");
     } finally {

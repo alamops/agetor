@@ -133,7 +133,7 @@ function apiError(body: unknown, status: number, statusText: string): string {
 function authHint(status: number, message: string, repo: ProviderRepoInfo, hadToken: boolean): string {
   if (status !== 401 && status !== 404) return message;
   const host = repo.remoteHost || "gitlab.com";
-  const base = `${repo.owner}/${repo.name} was not found on GitLab — if the project is private, add a token for ${host} in Settings → GitLab tokens`;
+  const base = `${repo.owner}/${repo.name} was not found on GitLab — if the project is private, add a token for ${host} in Settings → Git host tokens`;
   return hadToken
     ? `${base} (the configured token cannot access it — check it belongs to the right account)`
     : base;

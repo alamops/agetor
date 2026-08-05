@@ -10,12 +10,18 @@ const DATALIST_ID = "github-token-hosts";
 const EMPTY: GitHubTokensResult = { tokens: [], detectedHosts: [] };
 
 /**
- * "GitHub tokens" Settings section — lists stored per-host PATs and lets the
- * user add/replace or delete one. Tokens are keyed by the raw ssh remote host
- * (e.g. `github-work.com`); `github.com` acts as the default entry used when
- * no alias-specific token exists. The raw token is never returned by the API
- * — only a redacted `tokenPreview` — so the add-form input is always cleared
- * (never re-populated) after a successful save.
+ * "Git host tokens" Settings section — lists stored per-host credentials and
+ * lets the user add/replace or delete one. One shared store serves GitHub,
+ * GitLab, and Bitbucket: entries are keyed by the raw remote host, which may
+ * be a plain provider domain (github.com, gitlab.com, bitbucket.org) or an
+ * ssh alias host (e.g. `github-work.com`, `bitbucket-work.com`) — the
+ * provider domains act as the default entry used when no alias-specific
+ * credential exists for that provider. GitHub and GitLab use a plain PAT;
+ * Bitbucket expects Basic auth entered as a single `email:api_token` string
+ * (an Atlassian API token, not the retired app-password format). The raw
+ * credential is never returned by the API — only a redacted `tokenPreview`
+ * — so the add-form input is always cleared (never re-populated) after a
+ * successful save.
  */
 export function GitHubTokensSection() {
   const [data, setData] = useState<GitHubTokensResult>(EMPTY);
@@ -99,10 +105,12 @@ export function GitHubTokensSection() {
     <section className="space-y-2">
       <div className="flex items-center justify-between gap-2">
         <div>
-          <label className="text-xs text-muted-foreground">GitHub tokens</label>
+          <label className="text-xs text-muted-foreground">Git host tokens</label>
           <p className="text-[11px] leading-snug text-muted-foreground">
-            Repos reached through an ssh host alias (git@github-work.com:…) authenticate with the
-            token stored for that alias; github.com acts as the default.
+            Repos reached through an ssh host alias (git@github-work.com:…, git@bitbucket-work.com:…)
+            authenticate with the token stored for that alias; github.com, gitlab.com, and
+            bitbucket.org act as the per-provider defaults. Bitbucket credentials are entered as{" "}
+            <code className="font-mono">email:api_token</code>.
           </p>
         </div>
         <Button
@@ -186,7 +194,7 @@ export function GitHubTokensSection() {
           <Input
             value={host}
             onChange={(e) => setHost(e.target.value)}
-            placeholder="github.com"
+            placeholder="github.com / bitbucket.org"
             list={DATALIST_ID}
             spellCheck={false}
           />
@@ -211,7 +219,7 @@ export function GitHubTokensSection() {
           type="password"
           value={token}
           onChange={(e) => setToken(e.target.value)}
-          placeholder="ghp_…"
+          placeholder="ghp_… / glpat-… / email:api_token"
           autoComplete="off"
         />
       </div>
