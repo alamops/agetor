@@ -95,6 +95,7 @@ When iterating on the webview, run `bun run dev:hmr`. When iterating on `src/bun
 - shadcn primitives live under `src/mainview/components/ui/` and were added manually (no shadcn CLI). `components.json` is configured (`new-york`, base color `zinc`, alias `@/components`, `@/lib/utils`) so `bunx shadcn add <component>` will work for future additions.
 - Tailwind v3 with class-based dark mode and shadcn-style HSL CSS variables — do not migrate to Tailwind v4 without updating `tailwind.config.js` and the `@layer base` block in `index.css` together.
 - The `@/` import alias is wired in **both** `vite.config.ts` (`resolve.alias`) and `tsconfig.json` (`paths`). Keep them in sync.
+- **Layout chrome state (collapsed panels, etc.) lives in `localStorage`, not the server preferences API** — see `src/mainview/lib/panel-collapse.ts` (`agetor:*` keys, read/write wrapped because storage access throws under some privacy settings). It has to resolve *synchronously in the first render* (lazy `useState` initializer), otherwise the panel paints in the wrong state and snaps. Anything that affects a task or the agent still belongs in `api.setPreference`. First user: the New Task sidebar's collapse toggle (`NewTaskForm`), whose `w-80` ⇄ `w-11` width transition is all the board's `<main className="flex-1">` needs to reclaim the space.
 
 ## Things that will trip you up
 
