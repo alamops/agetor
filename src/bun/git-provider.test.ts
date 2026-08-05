@@ -6,7 +6,7 @@ import {
   providerForHost,
   providerRepoForDir,
   remoteHostsForDirs,
-  clearRemoteHostsCache,
+  __clearRemoteHostsCacheForTest,
   gitlabToken,
   bitbucketCreds,
 } from "./git-provider.ts";
@@ -38,7 +38,7 @@ beforeEach(() => {
   // fresh mkdtemp dirs so cross-test collisions can't happen in practice, but
   // clearing up front keeps every test's cache behavior self-contained and
   // independent of suite run order.
-  clearRemoteHostsCache();
+  __clearRemoteHostsCacheForTest();
 });
 
 afterEach(() => {
@@ -189,7 +189,7 @@ test("remoteHostsForDirs returns the sorted alias hosts of every supported provi
   expect(hosts).toEqual(["bitbucket-work.com", "github-work.com", "gitlab-work.io"]);
 });
 
-test("remoteHostsForDirs caches within the TTL: a second call for the same dirs reuses the first scan even after the repo's remote changes, and clearRemoteHostsCache() bypasses it", async () => {
+test("remoteHostsForDirs caches within the TTL: a second call for the same dirs reuses the first scan even after the repo's remote changes, and __clearRemoteHostsCacheForTest() bypasses it", async () => {
   const dir = await makeRepoWithRemotes([{ name: "origin", url: "git@github-host-one.example:a/b.git" }]);
 
   const first = await remoteHostsForDirs([dir]);
@@ -204,7 +204,7 @@ test("remoteHostsForDirs caches within the TTL: a second call for the same dirs 
   expect(second).toEqual(["github-host-one.example"]);
 
   // Bypassing the cache observes the mutation immediately.
-  clearRemoteHostsCache();
+  __clearRemoteHostsCacheForTest();
   const third = await remoteHostsForDirs([dir]);
   expect(third).toEqual(["github-host-two.example"]);
 });
