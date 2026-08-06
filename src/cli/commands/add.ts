@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import * as p from "@clack/prompts";
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, isTTY } from "../output.ts";
@@ -110,7 +111,11 @@ function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
     model: o.model,
     mode: o.mode,
     effort: o.effort,
-    workdir: o.workdir,
+    // Resolve relative to the CLI's cwd (not the daemon's — it may be a
+    // long-lived detached process with a stale/unrelated cwd) so a typed or
+    // `--workdir`-flagged relative path lands on disk where the user meant,
+    // matching `projects add`'s path.resolve(target).
+    workdir: o.workdir ? path.resolve(o.workdir) : o.workdir,
     isolation: o.isolation,
     baseRef: o.baseRef,
     taskType: o.type,
