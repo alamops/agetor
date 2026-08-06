@@ -3339,7 +3339,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // before attaching, so the client's own size wins instead of being
           // confined to whatever the pin left behind — see `healWindowSize`.
           // Best-effort: must not block or delay the attach below.
-          healWindowSize(task.id);
+          // `assumeAlive`: `sessionExists(task.id)` was just checked above, so
+          // skip the internal probe's duplicate round-trip.
+          healWindowSize(task.id, { assumeAlive: true });
           // AppleScript `do script` runs the string through `/bin/bash`, so
           // we escape anything bash would interpret inside double-quotes:
           // backslash, dollar, backtick, and the double-quote itself. Without

@@ -59,6 +59,15 @@ export async function cmdAttach(args: string[], flags: Flags): Promise<void> {
     );
   }
 
+  // Best-effort unpin of a stuck `window-size manual` pin before attaching —
+  // this CLI surface can't import claude-tmux.ts's `healWindowSize` (see the
+  // module comment above), so it duplicates the minimal fix inline. See
+  // `healWindowSize` in ../../bun/claude-tmux.ts for the full rationale.
+  Bun.spawnSync(
+    [tmuxBin, ...socketArgs, "set-window-option", "-t", "=" + session, "window-size", "latest"],
+    { stdout: "ignore", stderr: "ignore" },
+  );
+
   out(c.dim(`attaching to ${session} — detach with Ctrl-b d`));
   const proc = Bun.spawn([tmuxBin, ...socketArgs, "attach", "-t", session], {
     stdin: "inherit",
