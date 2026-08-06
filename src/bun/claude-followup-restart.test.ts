@@ -19,6 +19,23 @@ import path from "node:path";
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-followup-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
 
+/** Real tmux resolvable on THIS process's PATH? This file needs the genuine
+ *  binary (see the header — it can't stub AGETOR_TMUX_BIN), but an agent's
+ *  non-interactive shell often lacks /opt/homebrew/bin, and `Bun.spawnSync`
+ *  then THROWS ENOENT mid-test — a false hard failure. Skip (visibly) instead:
+ *  on any machine that can actually run agetor, tmux is present and the test
+ *  runs; only PATH-stripped harness shells skip. */
+const HAVE_TMUX = (() => {
+  try {
+    return Bun.spawnSync(["tmux", "-V"]).exitCode === 0;
+  } catch {
+    return false;
+  }
+})();
+if (!HAVE_TMUX) {
+  console.warn("[claude-followup-restart.test] tmux not on PATH — skipping real-tmux test");
+}
+
 const saved: Record<string, string | undefined> = {};
 function restore(key: string) {
   if (saved[key] === undefined) delete process.env[key];
@@ -41,7 +58,7 @@ afterAll(() => {
   restore("AGETOR_CLAUDE_BIN");
 });
 
-test("follow-up to a task whose session outlived the process resumes instead of rejecting", async () => {
+test.skipIf(!HAVE_TMUX)("follow-up to a task whose session outlived the process resumes instead of rejecting", async () => {
   const { db, tasks, runs } = await import("./db.ts");
   const { sendInput } = await import("./orchestrator.ts");
   const { sessionNameFor, dropSession } = await import("./claude-tmux.ts");
@@ -88,14 +105,17 @@ test("follow-up to a task whose session outlived the process resumes instead of 
       isolation: "none",
       taskType: "task",
       branch: null,
+      branchSource: "created",
       worktreePath: null,
       baseRef: null,
+      prUrl: null,
       mode: null,
       // buildCommand requires a model + effort for claude-code; the values are
       // inert here since AGETOR_CLAUDE_BIN=/bin/echo makes the launch a no-op.
       model: "claude-opus-4-7",
       effort: "medium",
       references: [],
+      backlog: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
       pendingInteractionCount: 0,
@@ -118,7 +138,7 @@ test("follow-up to a task whose session outlived the process resumes instead of 
       cursorSessionId: null,
     });
 
-    const result = sendInput(priorRunId, "please continue");
+    const result = await sendInput(priorRunId, "please continue");
     expect(result.delivered).toBe(true);
     if (!result.delivered) throw new Error(result.reason);
 

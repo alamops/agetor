@@ -23,8 +23,25 @@ import m020 from "./020_task_type.sql" with { type: "text" };
 import m021 from "./021_codex_session_id.sql" with { type: "text" };
 import m022 from "./022_subagents.sql" with { type: "text" };
 import m023 from "./023_run_origin.sql" with { type: "text" };
-import m024 from "./024_cursor_harness.sql" with { type: "text" };
-import m025 from "./025_cursor_session_id.sql" with { type: "text" };
+import m024 from "./024_reseed_harness_builtins.sql" with { type: "text" };
+import m025 from "./025_task_backlog.sql" with { type: "text" };
+// Appends after main's 022–025 (this branch originally used 024, renumbered on
+// merge to avoid the clash with 024_reseed_harness_builtins).
+import m026 from "./026_project_branch_config.sql" with { type: "text" };
+import m027 from "./027_subagent_tool_use_id.sql" with { type: "text" };
+import m028 from "./028_branch_source.sql" with { type: "text" };
+// This branch originally used 028 for task_draft; renumbered to 029 on merge
+// to avoid the clash with main's 028_branch_source (same as 026 above).
+import m029 from "./029_task_draft.sql" with { type: "text" };
+import m030 from "./030_runs_task_id_index.sql" with { type: "text" };
+// This branch originally used 030 for task_pr_url; renumbered to 031 on merge
+// to avoid the clash with main's 030_runs_task_id_index (same as 026/029 above).
+import m031 from "./031_task_pr_url.sql" with { type: "text" };
+// The cursor branch originally used 024/025; renumbered to 032/033 on merge to
+// avoid the clash with 024_reseed_harness_builtins/025_task_backlog (same as
+// 026/029/031 above).
+import m032 from "./032_cursor_harness.sql" with { type: "text" };
+import m033 from "./033_cursor_session_id.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -52,6 +69,14 @@ export const migrations: Migration[] = [
   { id: "021_codex_session_id", sql: m021 },
   { id: "022_subagents", sql: m022 },
   { id: "023_run_origin", sql: m023 },
-  { id: "024_cursor_harness", sql: m024 },
-  { id: "025_cursor_session_id", sql: m025 },
+  { id: "024_reseed_harness_builtins", sql: m024 },
+  { id: "025_task_backlog", sql: m025 },
+  { id: "026_project_branch_config", sql: m026 },
+  { id: "027_subagent_tool_use_id", sql: m027 },
+  { id: "028_branch_source", sql: m028 },
+  { id: "029_task_draft", sql: m029 },
+  { id: "030_runs_task_id_index", sql: m030 },
+  { id: "031_task_pr_url", sql: m031 },
+  { id: "032_cursor_harness", sql: m032 },
+  { id: "033_cursor_session_id", sql: m033 },
 ];

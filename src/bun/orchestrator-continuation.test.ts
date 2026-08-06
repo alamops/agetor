@@ -328,7 +328,7 @@ test("a follow-up sent while the continuation run is in flight folds into it (bu
   claudeTmux.__forTest.installSession(taskId, jsonlPath);
   try {
     const { sendInput } = await import("./orchestrator.ts");
-    const sent = sendInput(newRunId, "follow-up while continuation is in flight");
+    const sent = await sendInput(newRunId, "follow-up while continuation is in flight");
     expect(sent.delivered).toBe(true);
     if (sent.delivered) expect(sent.runId).toBe(newRunId);
 

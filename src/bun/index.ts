@@ -3,7 +3,8 @@ import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } fr
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
-import { reconcileOrphans } from "./orchestrator.ts";
+import { reconcileOrphans, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
+import { SESSION_REAP_SWEEP_MS } from "../shared/types.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
@@ -118,6 +119,31 @@ rehydratePath();
 // Mark any runs that were "running" when we last shut down as orphaned, so the
 // kanban doesn't show stuck cards.
 reconcileOrphans();
+
+// Heal any archive/delete teardown (tmux kill, terminal shells, worktree
+// detach) that was deferred to the in-memory teardown queue but never ran
+// because agetor quit or crashed before the job fired. Fire-and-forget — it
+// only enqueues jobs onto that queue, keyed to this instance's own task ids.
+sweepArchivedTeardowns();
+
+// Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
+// claude REPL tmux sessions that have sat idle (no turn in flight, nothing
+// pending, no activity) for IDLE_SESSION_REAP_MS, reclaiming their ~300–500MB
+// "node" process and per-session timers. A 30s delay before the first sweep
+// lets `reconcileOrphans` above finish reattaching live sessions first, so a
+// task that's mid-reattach isn't mistaken for idle. Errors are swallowed —
+// this is best-effort background hygiene, never something that should crash
+// the app.
+setTimeout(() => {
+  reapIdleSessions().catch((err) => {
+    console.error("[agetor] idle-session reap (post-boot) failed:", err);
+  });
+}, 30_000);
+setInterval(() => {
+  reapIdleSessions().catch((err) => {
+    console.error("[agetor] idle-session reap (interval) failed:", err);
+  });
+}, SESSION_REAP_SWEEP_MS);
 
 installNativeMenu();
 

@@ -25,7 +25,7 @@ import {
   type TmuxPromptChoice,
 } from "./interactions.ts";
 import { resolveTmuxBin, tmuxSocketArgs } from "./tmux-resolution.ts";
-import { detectAskModal, parseModalPane, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
+import { detectAskModal, parseModalPane, type AskModalKind, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
 /**
  * Driver that hosts Claude Code's interactive REPL inside a per-task tmux
@@ -47,6 +47,7 @@ import { detectAskModal, parseModalPane, type NavKey, type ParsedQuestionPane } 
 
 import type { RunEventStream } from "../shared/types.ts";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import { imageSourceMetaPath } from "../shared/attachments.ts";
 
 /**
  * Stream chunk callback. `lineUuid` is the JSONL line's `uuid` field (claude
@@ -160,6 +161,50 @@ function heldProbeSafe(taskId: string): boolean {
 }
 
 /**
+ * Predicate the orchestrator injects to answer "what run id is currently
+ * in flight (i.e. tracked in the orchestrator's own `active` map) for this
+ * task?" — `null` when none. `signalSubagentApiError` uses this to guard
+ * against a STALE async subagent (spawned by an OLDER run) erroring while a
+ * NEWER run is in flight on the same tmux session: `TurnSlot` carries no
+ * run id of its own (it's just `{ onChunk, resolve, reject }`), so there is
+ * no way to answer "which run does the live turn belong to" from
+ * `SessionState` alone — the orchestrator's `active` map (keyed by run id)
+ * is the only place that association lives. Mirrors `heldSessionProbe`
+ * exactly: installed as a *module-level* side effect of importing
+ * `orchestrator.ts` (not lazily on first use), `null` until then. In
+ * production that import always happens (`index.ts` pulls it in at boot), so
+ * "unset" is not a reachable production state — it only shows up when a unit
+ * test drives `signalSubagentApiError` directly without ever importing
+ * `orchestrator.ts`. Because `bun test` shares one module cache across every
+ * file in a run, importing `orchestrator.ts` from *any* test file installs
+ * this probe for the rest of the process — so a test that wants "no probe"
+ * semantics can only get that reliably when run in isolation. Tests that
+ * exercise this gate should install an explicit matching (or mismatching)
+ * probe via `setActiveRunProbe` and restore the previous value afterward,
+ * rather than assuming the ambient value is `null`. */
+let activeRunProbe: ((taskId: string) => string | null) | null = null;
+export function setActiveRunProbe(
+  fn: ((taskId: string) => string | null) | null,
+): ((taskId: string) => string | null) | null {
+  const prev = activeRunProbe;
+  activeRunProbe = fn;
+  return prev;
+}
+
+/** Call `activeRunProbe`, never letting a throwing probe reach the tailer's
+ *  api-error callback — same rationale as `heldProbeSafe`. Only meaningful
+ *  to call once the caller has confirmed `activeRunProbe` is non-null (a
+ *  throw mid-call still degrades to "no active run", not "unset"). */
+function activeRunProbeSafe(taskId: string): string | null {
+  try {
+    return activeRunProbe?.(taskId) ?? null;
+  } catch (e) {
+    console.error(`[claude-tmux] activeRunProbe threw for task ${taskId}:`, e);
+    return null;
+  }
+}
+
+/**
  * Handler the orchestrator installs to learn that a background task/agent
  * named in a task-notification JSONL line has settled, so it can flip the
  * matching `subagents` row and re-check the hold predicate above. Fired
@@ -225,6 +270,15 @@ export interface ClaudeLaunchOptions {
    * installation — see `ensureInstalledForCwd` in hook-installer.ts.)
    */
   mode: string | null;
+  /**
+   * Set by `agents.ts` (`buildCommand` → `spawnAgent`) when the prompt was
+   * too large to embed in `argv` (over `CLAUDE_PROMPT_ARGV_MAX_BYTES` — tmux's
+   * ~16KB client-command cap). When present, `argv` carries no prompt at all
+   * and this raw text is delivered post-launch by pasting it into the tmux
+   * pane once claude's composer is idle, via the same load-buffer/paste-
+   * buffer machinery `sendTurn` uses for live-session follow-ups.
+   */
+  deferredPrompt?: string;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -467,6 +521,38 @@ interface ParsedJsonlEvent {
  *  consumer (orchestrator) can't drift. */
 export const CLAUDE_API_ERROR_STATUS_PREFIX = "api error: ";
 
+/** Human-readable detail appended after `CLAUDE_API_ERROR_STATUS_PREFIX`.
+ *  Single source of truth for both the mapper's own emit site (main-stream
+ *  api errors, below) and `claude-subagents.ts`'s tailer peek (subagent api
+ *  errors) — factored out so the two can't drift in wording, and so
+ *  detection never has to string-match this rendered text (see
+ *  `signalSubagentApiError` / the subagent tailer's peek, which key off the
+ *  raw `isApiErrorMessage`/`apiErrorStatus` JSONL fields instead). */
+export function formatApiErrorDetail(status: number | undefined): string {
+  return typeof status === "number"
+    ? `HTTP ${status} — turn aborted; blocked for manual retry`
+    : "turn aborted; blocked for manual retry";
+}
+
+/** Status-chunk prefix for the "claude's TUI rejected the message as an
+ *  unknown slash command" sentinel — mirrors `CLAUDE_API_ERROR_STATUS_PREFIX`
+ *  exactly (producer here, consumer in orchestrator.ts's `makeChunkHandler`).
+ *  See `signalUnknownCommand` for the emit site and `matchUnknownCommand` /
+ *  `slashTokenOf` for detection. */
+export const CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX = "unknown command: ";
+
+/** Returns the first whitespace-delimited token of `prompt`'s first line iff
+ *  that line starts with `/` (e.g. `"/skill-creator do the thing"` →
+ *  `"/skill-creator"`), else null. Used to arm/disarm
+ *  `SessionState.pendingSlashToken` at every prompt-delivery point — a prompt
+ *  starting with `/` is the one case claude's Ink TUI may swallow as a slash
+ *  command instead of delivering it as a message. */
+function slashTokenOf(prompt: string): string | null {
+  const firstLine = prompt.split("\n", 1)[0] ?? "";
+  if (!firstLine.startsWith("/")) return null;
+  return firstLine.match(/^(\S+)/)?.[1] ?? null;
+}
+
 /**
  * True for an assistant JSONL line that claims to end a turn. Used by
  * `dispatchLine` to decide whether to stage a pending end_turn. The claim
@@ -666,9 +752,22 @@ function formatTurnDuration(ms: number): string {
   return s === 0 ? `${m}m` : `${m}m ${s}s`;
 }
 
+/**
+ * @param includeUuidForApiError See `mapParsedEventToChunks`'s param of the
+ * same name. Defaults `false` (unchanged behavior for every existing
+ * caller/test that doesn't pass it). `claude-subagents.ts`'s tailer — the
+ * ONLY external caller of this raw-line entry point (`dispatchLine`, the
+ * main stream, parses up front and calls `mapParsedEventToChunks` directly)
+ * — passes `true`.
+ * @param lastPermissionMode See `mapParsedEventToChunks`'s param of the same
+ * name. Threaded straight through so the subagent tailer gets the same
+ * emit-on-change suppression as the main stream.
+ */
 export function mapJsonlEventToChunks(
   line: string,
   onChunk: ChunkHandler,
+  includeUuidForApiError = false,
+  lastPermissionMode?: string | null,
 ): { endOfTurn: boolean; lineUuid?: string } {
   let evt: ParsedJsonlEvent;
   try {
@@ -677,15 +776,46 @@ export function mapJsonlEventToChunks(
     onChunk("stderr", `jsonl parse error: ${(e as Error).message}`);
     return { endOfTurn: false };
   }
-  return mapParsedEventToChunks(evt, onChunk);
+  return mapParsedEventToChunks(evt, onChunk, includeUuidForApiError, lastPermissionMode);
 }
 
 /** String-variant entry point delegates to this once the JSON has been
  *  parsed. `dispatchLine` parses up front (to peek the uuid for dedup) and
- *  calls this directly — saves a second JSON.parse per JSONL line. */
+ *  calls this directly — saves a second JSON.parse per JSONL line.
+ *
+ * @param includeUuidForApiError Whether the `isApiErrorMessage` sentinel
+ * `status` chunk should carry the line's own uuid as its `line_uuid` dedup
+ * key. `dispatchLine`'s direct call (main stream) never passes this, so it
+ * defaults `false`: a main-stream api-error line's assistant TEXT block is
+ * emitted first with that SAME uuid, so reusing it here would collide on
+ * the `(run_id, IFNULL(subagent_id,''), line_uuid)` partial unique index
+ * and the status row would be silently dropped via INSERT OR IGNORE (see
+ * the dedicated test in claude-tmux.test.ts). `mapJsonlEventToChunks`
+ * passes `true` for its one real caller, the subagent tailer: a subagent's
+ * own api-error line needs a durable `line_uuid` so reattach seeding
+ * (`seenLineUuidsForSubagent`) reliably recognizes a replayed api-error
+ * line even in the edge case where the line carries no text content block
+ * (so no assistant chunk exists to carry the uuid instead) — without that,
+ * a replayed error line on a boot reattach could re-fire
+ * `signalSubagentApiError` against whatever run happens to be in flight at
+ * that point. When a text block IS present (the common case), the
+ * duplicate write is a harmless no-op — INSERT OR IGNORE silently keeps
+ * the first (assistant) row, which already carries the same uuid.
+ * @param lastPermissionMode The mode `SessionState.permissionMode` held
+ * BEFORE this event (undefined = caller has no tracking — e.g. a test that
+ * predates this param, or a one-off call site that doesn't care — always
+ * emit, matching pre-existing behavior). Claude journals a mode-bearing
+ * event at every turn start, not just on an actual mode change, so without
+ * this the `system`/`permission-mode` case below would emit an identical
+ * `permission-mode: <mode>` status chip after every single turn. Passing
+ * the previous value lets that case suppress the chunk when nothing
+ * actually changed.
+ */
 function mapParsedEventToChunks(
   evt: ParsedJsonlEvent,
   onChunk: ChunkHandler,
+  includeUuidForApiError = false,
+  lastPermissionMode?: string | null,
 ): { endOfTurn: boolean; lineUuid?: string } {
   // Claude stamps a uuid on every event line. Forward it as the third arg
   // to onChunk so the orchestrator can persist it as the run_events row's
@@ -727,6 +857,15 @@ function mapParsedEventToChunks(
             : Array.isArray(content)
               ? content.filter((b) => b?.type === "text").map((b) => b.text ?? "").join(" ")
               : "";
+        // Image attachment marker: claude injects a dedicated isMeta entry
+        // whose sole content is `[Image: source: <path>]`, twinning the
+        // thumbnail chip already rendered on the user's own message bubble.
+        // Surfacing it as a status breadcrumb too would just be a redundant
+        // uppercase caption, so suppress it entirely — same silent-drop
+        // treatment as a truly-empty synthetic entry below.
+        if (imageSourceMetaPath(text) !== null) {
+          return { endOfTurn: false, lineUuid: uuid };
+        }
         // Strip a leading wrapper tag (`<local-command-caveat>`, `<task-notification>`,
         // …) so the breadcrumb reads as prose rather than raw markup.
         // Split on any newline form — tmux/claude can leak `\r`-only
@@ -840,17 +979,23 @@ function mapParsedEventToChunks(
       // to flip the task into the `blocked` column, and signal endOfTurn so
       // the run row resolves instead of sitting in `running` forever.
       //
-      // Emitted with `uuid: undefined` (not the JSONL line uuid) on purpose:
-      // the assistant text block above was just appended to run_events with
-      // that uuid, and the partial unique index on `(run_id, line_uuid)`
-      // would silently drop this status via INSERT OR IGNORE if we reused
-      // it. The NULL key path inserts unconditionally, so the breadcrumb
-      // also shows up on panel reload — not just live SSE.
+      // Emitted with `uuid: undefined` on the MAIN stream (the default here
+      // — see `includeUuidForApiError`'s doc) on purpose: the assistant text
+      // block above was just appended to run_events with that SAME uuid (a
+      // typical api-error line has both), and the `(run_id,
+      // IFNULL(subagent_id,''), line_uuid)` partial unique index would
+      // silently drop this status row via INSERT OR IGNORE if we reused it
+      // — verified against `claude-tmux.test.ts`'s
+      // "synthetic isApiErrorMessage line" test, which asserts exactly this.
+      // The NULL key path inserts unconditionally, so the breadcrumb still
+      // shows up on panel reload, just under a different (non-deduped) row.
       if (evt.isApiErrorMessage === true) {
-        const detail = typeof evt.apiErrorStatus === "number"
-          ? `HTTP ${evt.apiErrorStatus} — turn aborted; blocked for manual retry`
-          : "turn aborted; blocked for manual retry";
-        onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}${detail}`);
+        const detail = formatApiErrorDetail(evt.apiErrorStatus);
+        onChunk(
+          "status",
+          `${CLAUDE_API_ERROR_STATUS_PREFIX}${detail}`,
+          includeUuidForApiError ? uuid : undefined,
+        );
         return { endOfTurn: true, lineUuid: uuid };
       }
       // Signal a candidate turn-end. `dispatchLine` stages this and confirms
@@ -867,9 +1012,20 @@ function mapParsedEventToChunks(
 
     case "system":
     case "permission-mode":
-      if (evt.permissionMode) {
+      // Claude journals a mode-bearing event at the start of every turn, not
+      // just when the mode actually changes — emit the chip only when it
+      // differs from what the caller already knows, so identical
+      // "permission-mode: auto" chips don't spam the stream after every turn.
+      if (evt.permissionMode && evt.permissionMode !== lastPermissionMode) {
         onChunk("status", `permission-mode: ${evt.permissionMode}`, uuid);
-      } else if (evt.subtype === "turn_duration" && typeof evt.durationMs === "number") {
+      }
+      // Independent `if` (not `else if`): a mode-bearing event and a
+      // turn-duration event are conceptually unrelated fields on the same
+      // envelope. Coupling them would mean a future claude build that
+      // stamps `permissionMode` onto a `subtype:"turn_duration"` line
+      // silently swaps the mode-change chip for the duration chip instead
+      // of emitting both.
+      if (evt.subtype === "turn_duration" && typeof evt.durationMs === "number") {
         // Emitted right after the assistant end_turn. The end_turn itself
         // already produced a "turn complete" status; this just adds the
         // duration so the user can see at a glance whether the turn was
@@ -977,11 +1133,120 @@ export function hasSessionState(taskId: string): boolean {
   return sessions.has(taskId);
 }
 
+/**
+ * Idle metadata for the reaper (T4, orchestrator.ts imports this by exact
+ * name/signature). Returns `null` when we hold no in-memory `SessionState`
+ * for the task — the reaper falls back to `task.updatedAt` in that case (a
+ * post-restart done/review task has no live driver state to ask). Otherwise
+ * returns how long it's been since the session last showed life — see the
+ * `lastActivityAt` field doc on `SessionState` for the full list of triggers.
+ */
+export function sessionIdleInfo(taskId: string): { idleMs: number } | null {
+  const state = sessions.get(taskId);
+  if (!state) return null;
+  return { idleMs: Date.now() - state.lastActivityAt };
+}
+
 /** Name-keyed variant for callers that hold a persisted session name (e.g.
  *  `runs.tmux_session`) and don't want to recompute it from a task id.
  *  Exact-match `=` prefix — see `sessionExists`. */
 export function sessionExistsByName(name: string): boolean {
   return tmux(["has-session", "-t", "=" + name]).ok;
+}
+
+/**
+ * Pure parser for one `#{session_attached}:#{session_activity}` line as
+ * produced by `probeSessionActivity`'s `list-sessions -F` call. Exported so
+ * the tmux-version quirk below is unit-testable without a real tmux binary.
+ *
+ * Both fields must be non-empty, all-digit strings BEFORE we hand them to
+ * `Number()` — `Number("")` is `0`, which is a finite number, so a naive
+ * `Number.isFinite` guard silently accepts an empty field as "zero" instead
+ * of rejecting it as malformed. That footgun is exactly what let a tmux 3.6a
+ * quirk (see `probeSessionActivity`'s doc comment) turn "session not found"
+ * into "activity at epoch 0" instead of `null`.
+ */
+export function parseSessionActivityLine(line: string): { attached: boolean; activityAt: number } | null {
+  const trimmed = line.trim();
+  if (trimmed === "") return null;
+  const parts = trimmed.split(":");
+  if (parts.length !== 2) return null;
+  const attachedRaw = parts[0] ?? "";
+  const activityRaw = parts[1] ?? "";
+  const digitsOnly = /^[0-9]+$/;
+  if (!digitsOnly.test(attachedRaw) || !digitsOnly.test(activityRaw)) return null;
+  const attachedNum = Number(attachedRaw);
+  const activitySec = Number(activityRaw);
+  // tmux reports session_activity in epoch SECONDS; callers (idle-clock math
+  // against `Date.now()`) expect milliseconds.
+  return { attached: attachedNum > 0, activityAt: activitySec * 1000 };
+}
+
+/**
+ * Keyed, single-round-trip liveness + activity probe for a task's tmux
+ * session, with no dependency on in-memory `SessionState`. This is what the
+ * reaper falls back to for a task it holds no `SessionState` for (e.g. after
+ * a restart, before boot reconciliation reattaches it) instead of a bare
+ * `has-session` check that can't tell whether the session is still doing
+ * anything. Pulls both `#{session_attached}` (nonzero while a real `tmux
+ * attach` is live) and `#{session_activity}` (tmux's own last-activity
+ * timestamp for the session — updated on any pane output, independent of
+ * whether we're the ones tailing it) in a single round-trip, with no
+ * dependency on `SessionState`.
+ *
+ * Uses `list-sessions -F '#{session_attached}:#{session_activity}' -f
+ * '#{==:#{session_name},<name>}'` rather than `display-message -p -t
+ * '=<name>'`. We used to use `display-message`, but on tmux 3.6a it does NOT
+ * resolve an `=`-prefixed exact-match TARGET the way `has-session` and
+ * `kill-session` do: instead of failing for a nonexistent session, it prints
+ * the requested format with every variable expanded to empty (stdout `:`)
+ * and exits 0 — identically for a live session and a dead one. Parsed the
+ * old way (`Number("") === 0` sailing through `Number.isFinite`), that
+ * turned into `{attached: false, activityAt: 0}` for EVERY task, live or
+ * dead — "idle since epoch 1970" — which made the idle-session reaper
+ * re-reap every candidate task on every sweep. `list-sessions -f
+ * '#{==:...}'` uses a session FILTER, not a resolved target, so it isn't
+ * subject to that `=`-target quirk: verified on tmux 3.6a to return e.g.
+ * `0:1785511908` for a live session and empty stdout (exit 0, server up)
+ * for a dead one.
+ *
+ * `-f '#{==:#{session_name},<name>}'` is an exact-match filter, matching the
+ * `-t '=<name>'` exact-match target used by every other tmux() call in this
+ * file — see `sessionExists`'s comment for why an unanchored name
+ * prefix-matches a sibling `agetor-<id>` session and would misreport a live,
+ * unrelated session as this task's. Since the name is unique, the filter
+ * should never yield more than one line; if it somehow does, we treat that
+ * as ambiguous and return null rather than guess which line is "ours."
+ *
+ * Returns null when the command fails (no tmux server), stdout is empty or
+ * whitespace-only (session doesn't exist), or the output doesn't parse —
+ * the caller treats that as "can't tell," not "definitely dead."
+ */
+let probeFailureWarned = false;
+export function probeSessionActivity(taskId: string): { attached: boolean; activityAt: number } | null {
+  const r = tmux([
+    "list-sessions", "-F", "#{session_attached}:#{session_activity}",
+    "-f", "#{==:#{session_name}," + sessionNameFor(taskId) + "}",
+  ]);
+  if (!r.ok) {
+    // A missing server is the routine failure (nothing running → nothing to
+    // probe) — stay silent for that. Anything else gets one warn per
+    // process: `-f` + the `#{==:}` comparison are a newer tmux surface than
+    // the has-session/kill-session calls elsewhere in this file, and a tmux
+    // build that rejects them would otherwise silently disable reaping for
+    // every session with no in-memory SessionState — the same *class* of
+    // invisible misread the display-message quirk this function replaced.
+    if (!probeFailureWarned && !/no server running|error connecting/i.test(r.stderr)) {
+      probeFailureWarned = true;
+      console.warn(`[agetor] probeSessionActivity: tmux list-sessions failed: ${r.stderr.trim()}`);
+    }
+    return null;
+  }
+  const trimmed = r.stdout.trim();
+  if (trimmed === "") return null;
+  const lines = trimmed.split("\n");
+  if (lines.length !== 1) return null;
+  return parseSessionActivityLine(lines[0] ?? "");
 }
 
 /** Tri-state liveness of a tmux session — the safe signal for the death watch. */
@@ -1249,6 +1514,182 @@ export async function sendModalKeys(taskId: string, keys: NavKey[]): Promise<boo
   return ok;
 }
 
+/**
+ * Gap between the review-screen tab transition and the first poll for the
+ * "Ready to submit your answers?" screen to render. This is Ink's heaviest
+ * repaint on the whole AskUserQuestion modal — the full review summary,
+ * every question + answer — and the flat 35ms `sendModalKeys` gap that
+ * suffices for every other keystroke was intermittently too short for it:
+ * the confirm Enter would arrive mid-repaint and get swallowed, producing a
+ * false `ok:true` with the modal still stranded on the pane. 80ms per poll,
+ * up to `ASK_REVIEW_POLL_ATTEMPTS` (~800ms total), gives the repaint room
+ * without blocking the common case, where the screen is usually already up
+ * by the first or second poll. Prefer raising over lowering if the race
+ * resurfaces — the cost of raising is a few hundred ms of added drive
+ * latency; the cost of lowering is a return of the swallowed-Enter bug this
+ * whole driver exists to fix.
+ */
+const ASK_REVIEW_POLL_MS = 80;
+/** Poll budget for `ASK_REVIEW_POLL_MS` — bounds how long `driveAskAnswers`
+ *  waits for the review screen before giving up on the confirm-gate and
+ *  falling through to verification without ever sending a blind Enter. */
+const ASK_REVIEW_POLL_ATTEMPTS = 10;
+
+/**
+ * Poll gap for the post-confirm verification phase (`detectAskModal` →
+ * `null` = the modal actually closed). Looser than the review-wait gap
+ * because there's no repaint to catch mid-frame here — this loop is purely
+ * confirming the confirm landed, and a lone "review" sighting is the signal
+ * to resend, not a race to win. `ASK_VERIFY_POLL_ATTEMPTS` (~1s total at
+ * this gap) comfortably covers ordinary repaint + teardown latency; a
+ * mis-drive that never resolves times out to `false` rather than hanging
+ * the answer route.
+ */
+const ASK_VERIFY_POLL_MS = 120;
+const ASK_VERIFY_POLL_ATTEMPTS = 8;
+/** Cap on resending the confirm Enter when verification still sees
+ *  "review" — i.e. the earlier send (from the review-wait phase or a prior
+ *  resend) was swallowed. A stray extra Enter lands on the empty REPL
+ *  prompt once the modal genuinely closes, which is a no-op, so this is
+ *  purely a loop-termination bound, not a correctness one. */
+const ASK_VERIFY_MAX_RESENDS = 2;
+
+/** Outcome of one poll in `driveAskAnswers`'s confirm/verify phases. */
+type AskDriveStep = "done" | "send-enter" | "wait" | "fail";
+
+/**
+ * Pure per-poll decision for `driveAskAnswers`, factored out of the
+ * tmux-driving loop so the swallowed-confirm retry logic is unit-testable
+ * without a live tmux pane (mirrors `decideScrapeTick`'s split). The same
+ * decision table drives both of `driveAskAnswers`'s phases:
+ *
+ *  - waiting for the review screen to render before sending the confirm
+ *    (`confirmSent: false`) — a `"review"` sighting fires the confirm
+ *    immediately (not bounded by `resends`, since this is the first send,
+ *    not a resend); a lingering `"question"` (still navigating the tab bar)
+ *    or an already-vanished modal both fall through without a blind Enter;
+ *  - verifying the modal actually closed after the confirm (`confirmSent:
+ *    true`, or no confirm phase at all for a singleFlat plan) — a
+ *    `"review"` sighting here means the just-sent confirm was swallowed by
+ *    Ink's repaint and must be resent, bounded by `ASK_VERIFY_MAX_RESENDS`
+ *    so a genuinely stuck review screen fails instead of looping forever.
+ *    (A singleFlat plan never renders a review screen, so `confirmSent`
+ *    stays false there; if one ever appeared anyway, the step would send —
+ *    not resend — the confirm, which is the robust choice.)
+ *
+ * `kind === null` (the modal has left the pane) is `"done"` regardless of
+ * phase or resend count — the only success case. `"question"` is always
+ * `"wait"`: mid-drive it's normal progress toward the review screen, and
+ * during verification it's treated as a teardown transient rather than a
+ * fresh mis-drive (a genuine mis-drive times out via the caller's attempt
+ * budget, which this function doesn't own).
+ */
+function decideAskDriveStep(
+  kind: AskModalKind | null,
+  confirmSent: boolean,
+  resends: number,
+): AskDriveStep {
+  if (kind === null) return "done";
+  if (kind === "review") {
+    if (!confirmSent) return "send-enter";
+    return resends < ASK_VERIFY_MAX_RESENDS ? "send-enter" : "fail";
+  }
+  return "wait";
+}
+
+/**
+ * Drive a `planAskAnswers` `mode: "drive"` plan into the task's tmux
+ * session, verified-and-retried rather than trusting `send-keys` exit codes.
+ *
+ * This supersedes the blind trailing Enter `sendModalKeys` used to send for
+ * plans that end on the "Ready to submit your answers?" review screen: that
+ * Enter arrived a flat 35ms after the tab-transition key while Ink was still
+ * repainting the heaviest screen in the whole modal, and was intermittently
+ * swallowed. `driveAskAnswers` instead:
+ *
+ *  1. Sends every key up to (but not including) a review-confirming trailing
+ *     Enter exactly like `sendModalKeys` — same 35ms gap, same per-key
+ *     `stillCurrent()` re-gate. (`plan.confirmsReview` is false for the
+ *     singleFlat shape, which has no review screen and no confirm to gate —
+ *     the full key list is sent here and phase 2 below just verifies.)
+ *  2. When `confirmsReview`, polls the pane (`ASK_REVIEW_POLL_MS` /
+ *     `ASK_REVIEW_POLL_ATTEMPTS`) until the review screen is actually
+ *     rendered, then sends the confirm Enter. A mis-drive that never reaches
+ *     the review screen within the window is not force-confirmed with a
+ *     blind Enter — it falls through to verification, which will time out.
+ *  3. Always verifies (including singleFlat): polls
+ *     (`ASK_VERIFY_POLL_MS` / `ASK_VERIFY_POLL_ATTEMPTS`) until the modal is
+ *     gone, resending the confirm on a `"review"` sighting (bounded by
+ *     `ASK_VERIFY_MAX_RESENDS`) and waiting out a `"question"` sighting.
+ *
+ * The whole sequence runs inside one `queueTmuxOp` callback (same
+ * serialization-behind-any-in-flight-paste rationale as `sendModalKeys`), so
+ * the confirm-wait and verify polls can't interleave with a racing user
+ * paste either. `sendModalKeys` is unchanged and still used for the
+ * `Escape` dismissal paths, which have no review screen to wait for.
+ */
+export async function driveAskAnswers(
+  taskId: string,
+  plan: { keys: NavKey[]; confirmsReview: boolean },
+): Promise<boolean> {
+  const state = sessions.get(taskId);
+  if (!state) return false;
+  const { keys, confirmsReview } = plan;
+  if (keys.length === 0) return true;
+  // The trailing key IS the confirm Enter when confirmsReview — split it off
+  // so it can be gated on the review screen actually rendering (step 2)
+  // instead of fired blind after the flat inter-key gap (step 1).
+  const body = confirmsReview ? keys.slice(0, -1) : keys;
+
+  let ok = false;
+  await queueTmuxOp(taskId, async (stillCurrent) => {
+    for (const key of body) {
+      if (!tmux(["send-keys", "-t", state.sessionName, key]).ok) return;
+      // Inter-key gap mirrors sendModalKeys: a bursted pair can read as a
+      // single Ink event, and the gap lets the dispose re-gate fire.
+      await Bun.sleep(35);
+      if (!stillCurrent()) return;
+    }
+
+    let confirmSent = false;
+    if (confirmsReview) {
+      for (let attempt = 0; attempt < ASK_REVIEW_POLL_ATTEMPTS && !confirmSent; attempt++) {
+        await Bun.sleep(ASK_REVIEW_POLL_MS);
+        if (!stillCurrent()) return;
+        const step = decideAskDriveStep(detectAskModal(captureTail(state)), confirmSent, 0);
+        if (step === "done") { ok = true; return; }
+        if (step === "send-enter") {
+          if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
+          confirmSent = true;
+        }
+        // "wait" — review screen not up yet; keep polling. ("fail" cannot
+        // occur here — decideAskDriveStep only returns it once confirmSent.)
+      }
+      // Attempts exhausted without a "review" sighting: don't send a blind
+      // Enter (see doc comment). Fall through to verification below, which
+      // times out to false if the modal genuinely never resolves.
+    }
+
+    let resends = 0;
+    for (let attempt = 0; attempt < ASK_VERIFY_POLL_ATTEMPTS; attempt++) {
+      await Bun.sleep(ASK_VERIFY_POLL_MS);
+      if (!stillCurrent()) return;
+      const step = decideAskDriveStep(detectAskModal(captureTail(state)), confirmSent, resends);
+      if (step === "done") { ok = true; return; }
+      if (step === "fail") return;
+      if (step === "send-enter") {
+        if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
+        confirmSent = true;
+        resends++;
+      }
+      // "wait" — keep polling; a persistent "question" sighting times out
+      // here rather than being force-resolved.
+    }
+    // Verify budget exhausted without ever seeing the modal close.
+  }, state);
+  return ok;
+}
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * Per-task session state.
  * ────────────────────────────────────────────────────────────────────────── */
@@ -1265,8 +1706,30 @@ interface SessionState {
   watcher: FSWatcher | null;
   /** Periodic poll timer that flushes appended JSONL bytes — backstop for
    *  fs.watch on macOS, which silently drops notifications on slow append
-   *  streams. Without this, after the first event we'd never see the rest. */
-  pollTimer: ReturnType<typeof setInterval> | null;
+   *  streams. Without this, after the first event we'd never see the rest.
+   *  Self-rescheduling `setTimeout` (see `armPollTimer`) rather than a fixed
+   *  `setInterval` — the cadence backs off from `POLL_FAST_MS` to
+   *  `POLL_SLOW_MS` once `lastActivityAt` has been quiet for
+   *  `POLL_IDLE_AFTER_MS`, and snaps back on the next activity. */
+  pollTimer: ReturnType<typeof setTimeout> | null;
+  /** `Date.now()` stamp of the last time this session "showed life": JSONL
+   *  bytes appended (`flush`), a scraped tmux pane change (`scrapeOnce`), a
+   *  turn starting (`sendTurn` / the deferred-prompt paste in
+   *  `spawnClaudeViaTmux`), a turn settling (`popEndOfTurn`), or a folded-in
+   *  follow-up paste (`pasteFollowUp`). Initialized to the construction time
+   *  in `makeSessionState`, so a freshly spawned or reattached session starts
+   *  its idle clock at "now" rather than epoch 0. Two consumers: the exported
+   *  `sessionIdleInfo` (the reaper's idle signal, T4/orchestrator.ts) and the
+   *  `pollTimer`'s own self-throttle just above. */
+  lastActivityAt: number;
+  /** Last full tmux pane capture `scrapeOnce` took (the same trimmed tail
+   *  text used for modal matching), kept purely to detect "the pane changed
+   *  since last capture" as an activity signal independent of JSONL writes —
+   *  covers a native AskUserQuestion modal or a user driving the session via
+   *  `tmux attach`, neither of which necessarily appends to the JSONL. Null
+   *  until the first capture (so the very first tick never counts as a
+   *  "change"). */
+  scrapeLastPaneText: string | null;
   /** FIFO of turns waiting for end_turn. The head is the active turn —
    *  events flowing through the JSONL belong to it until end_turn fires,
    *  at which point we shift it off and the next turn becomes active.
@@ -1309,6 +1772,19 @@ interface SessionState {
    *     safety dialog because it bypasses our PreToolUse hook).
    */
   permissionMode: string | null;
+  /**
+   * The mode value of the last mode-bearing JSONL line `dispatchLine`
+   * processed (or the launch/reattach seed) — the baseline handed to
+   * `mapParsedEventToChunks` as `lastPermissionMode` for chip-suppression
+   * purposes. Unlike `permissionMode`, this field is NEVER written from a
+   * pane scrape (`cycleToModeInner`'s Shift+Tab verification writes only
+   * `permissionMode`) — so when the user switches modes via the UI, this
+   * field still lags the live mode until claude journals the corresponding
+   * JSONL line at the next turn start, and the confirmation chip for that
+   * genuinely user-initiated change is not wrongly suppressed as a "no-op"
+   * repeat.
+   */
+  lastAnnouncedPermissionMode: string | null;
   /**
    * Whether `bypassPermissions` is in this session's Shift+Tab cycle. True
    * iff the session was launched with `--dangerously-skip-permissions` (the
@@ -1411,6 +1887,20 @@ interface SessionState {
    *  been quiet for `END_TURN_IDLE_FIRE_MS`. Cleared in `popEndOfTurn` when the
    *  slot finally pops (the whole busy period is over). */
   holdUntilIdle: boolean;
+  /** First whitespace-delimited token of the current turn's prompt, iff its
+   *  FIRST line starts with `/` (e.g. `/skill-creator`) — null otherwise. Set
+   *  by every prompt-delivery point (`sendTurn`, `pasteFollowUp`, the
+   *  deferred-prompt paste and argv-prompt spawn path in
+   *  `spawnClaudeViaTmux`), which lets `scrapeOnce` arm a token-matched
+   *  lookout for claude's TUI rejecting the message with `Unknown command:
+   *  /<token>` — no JSONL is ever written for that case, so nothing else
+   *  would ever unstick the run. Cleared (a) on the next real JSONL line
+   *  (`dispatchLine` — the message was delivered/ran for real), (b) when a
+   *  turn resolves normally (`popEndOfTurn`), (c) on session death
+   *  (`signalSessionDeath`), and (d) by `signalUnknownCommand` itself, which
+   *  doubles as its one-shot re-entry guard (`scrapeOnce` only calls it while
+   *  this is non-null). */
+  pendingSlashToken: string | null;
   /** Watches `<sessionId>/subagents/` for background/sub agents this session
    *  spawns, tailing each into the task's event stream (tagged by subagent id)
    *  for the run panel's read-only tabs. Armed in `attachTailer`, released in
@@ -1436,6 +1926,14 @@ interface SessionState {
    * places. Content-triggered adoption arms nothing — real content already
    * arrived, so there's nothing to wait for. Null when not armed. */
   continuationWatchdog: { timer: ReturnType<typeof setTimeout>; slot: TurnSlot } | null;
+  /** True while `collectAskQuestionsFromPane` has grown the detached pane and
+   *  `window-size` is legitimately `manual` for this session — set right before
+   *  the grow, cleared by the SAME `finally` (nested inside it) that restores
+   *  the pane, so a throwing `restore` still clears the flag. Brackets the
+   *  ONLY period a stuck `manual` pin is expected; `healWindowSize` checks
+   *  this so it never races the scraper's own restore (which would fight over
+   *  window-size mid-grow and could strand the pane at the wrong size). */
+  paneGrowInFlight: boolean;
 }
 
 interface TurnSlot {
@@ -1501,6 +1999,12 @@ interface MakeSessionStateOpts {
   seenLineUuids?: Set<string>;
   onEndOfTurn?: (() => void) | null;
   permissionMode?: string | null;
+  /** Defaults to `permissionMode` (or its own default of `null`) when
+   *  omitted — the common case where the caller has no reason for the two
+   *  fields to start out of sync. See `SessionState.lastAnnouncedPermissionMode`
+   *  for what it means to pass something different (used by `reattachSession`
+   *  to seed the suppression baseline without also seeding `permissionMode`). */
+  lastAnnouncedPermissionMode?: string | null;
   bypassEnabled?: boolean;
 }
 
@@ -1516,12 +2020,18 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     seenLineUuids: o.seenLineUuids ?? new Set(),
     onEndOfTurn: o.onEndOfTurn ?? null,
     permissionMode: o.permissionMode ?? null,
+    lastAnnouncedPermissionMode: o.lastAnnouncedPermissionMode ?? o.permissionMode ?? null,
     bypassEnabled: o.bypassEnabled ?? false,
     // Defaults shared by every site — timers, scrape state, staging buffers.
     watcher: null,
     pollTimer: null,
     scrapeTimer: null,
     deathTimer: null,
+    // "Initialize at spawn/reattach" — every construction site (fresh spawn,
+    // reattach, rebuild, the test helper) routes through here, so stamping
+    // "now" here covers all of them uniformly.
+    lastActivityAt: Date.now(),
+    scrapeLastPaneText: null,
     scrapeLastFingerprint: null,
     lastJsonlAppendAt: 0,
     lastIdleScrapeAt: 0,
@@ -1531,9 +2041,20 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     askFirstSeenAt: null,
     pendingEndTurn: null,
     holdUntilIdle: false,
+    pendingSlashToken: null,
     subagentWatcher: null,
     continuationWatchdog: null,
+    paneGrowInFlight: false,
   };
+}
+
+/** Stamp `lastActivityAt` to "now" — the single write site for the idle
+ *  clock, called from every place a session "shows life" (see the field's
+ *  doc comment on `SessionState`). Kept as a named helper (rather than
+ *  inlining `Date.now()` at each call site) so the exact set of triggers is
+ *  grep-able and can't silently drift out of sync with the doc comment. */
+function bumpActivity(state: SessionState): void {
+  state.lastActivityAt = Date.now();
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -1637,9 +2158,17 @@ const END_TURN_IDLE_FIRE_MS = 800;
  *  one-shot `onEndOfTurn` listener (reattach path, where there's no slot
  *  but the orchestrator still needs to know the run completed). */
 function popEndOfTurn(state: SessionState): void {
+  // A turn settling is itself a life signal — reset the idle clock even
+  // though `flush`'s JSONL-append bump already fired for the line that
+  // triggered this (the reattach path fires `onEndOfTurn` with no fresh
+  // append behind it, so this can't be dropped as redundant).
+  bumpActivity(state);
   // The busy period (the active turn plus any folded follow-ups) is ending —
   // clear the hold so the next genuinely-sequential turn resolves normally.
   state.holdUntilIdle = false;
+  // The turn resolved normally (real end_turn) — whatever was armed for the
+  // unknown-command lookout no longer applies to it.
+  state.pendingSlashToken = null;
   // A turn resolving through the normal end-turn machinery means any
   // notification-triggered continuation watchdog has nothing left to guard
   // against — cancel it. Safe unconditionally: the watchdog is only ever
@@ -1863,19 +2392,87 @@ function paneSize(state: SessionState): { w: number; h: number } | null {
 }
 
 /** Force a detached window to a fixed size (`window-size manual` is required for
- *  `resize-window` to stick on a session no client is attached to). */
+ *  `resize-window` to stick on a session no client is attached to). Chained as a
+ *  SINGLE tmux invocation (`;` as its own argv element — no shell involved, so
+ *  it's a literal semicolon, not a shell-escaped `\;`) so the two commands reach
+ *  the tmux server atomically: if agetor dies mid-call there's no window where
+ *  `window-size` is `manual` but the resize hasn't landed yet. */
 function resizePane(state: SessionState, w: number, h: number): void {
-  tmux(["set-window-option", "-t", state.sessionName, "window-size", "manual"]);
-  tmux(["resize-window", "-t", state.sessionName, "-x", String(w), "-y", String(h)]);
+  tmux([
+    "set-window-option", "-t", "=" + state.sessionName, "window-size", "manual", ";",
+    "resize-window", "-t", "=" + state.sessionName, "-x", String(w), "-y", String(h),
+  ]);
 }
 
-/** Restore the original size and hand sizing back to tmux (`latest`). Best-effort
- *  — if the process dies between the grow and this call the pane is just left
- *  larger, which is harmless (claude's TUI reflows to any size and the next
- *  attach/resize corrects it). */
+/** Restore the original size and hand sizing back to tmux. Chained as a single
+ *  invocation for the same reason as `resizePane`: two separate tmux calls
+ *  left a window where a crash between them stranded the session pinned
+ *  `window-size manual` (potentially at the small grown-then-half-restored
+ *  size) — a client attaching later gets confined to that fixed size instead of
+ *  renegotiating to its own, which is exactly the "minimized" rendering bug.
+ *  Chaining closes that window going forward.
+ *
+ *  BUT tmux aborts a `;`-chain at the first failing command (empirically
+ *  verified) — if `resize-window` fails (bad dims, session gone mid-chain,
+ *  etc.) the trailing `set-window-option … latest` never runs, and the
+ *  session is left pinned `manual`: the exact bug this file fixes, just
+ *  triggered by a failed command instead of a crash. The old two-invocation
+ *  form ran the unpin unconditionally, so a failed resize alone couldn't
+ *  strand the pin. Restore that guarantee: if the chain didn't report ok,
+ *  issue a standalone unpin as a fallback. `-u` (unset) reverts to the
+ *  inherited value rather than forcing `latest` — see the comment on
+ *  `healWindowSize` for why that heal path, unlike this one, deliberately
+ *  forces `latest` instead. */
 function restorePaneSize(state: SessionState, w: number, h: number): void {
-  tmux(["resize-window", "-t", state.sessionName, "-x", String(w), "-y", String(h)]);
-  tmux(["set-window-option", "-t", state.sessionName, "window-size", "latest"]);
+  const r = tmux([
+    "resize-window", "-t", "=" + state.sessionName, "-x", String(w), "-y", String(h), ";",
+    "set-window-option", "-u", "-t", "=" + state.sessionName, "window-size",
+  ]);
+  if (!r.ok) {
+    console.warn(
+      `[claude-tmux] restorePaneSize chain failed for session ${state.sessionName} — ` +
+        `falling back to a standalone unpin: ${r.stderr}`,
+    );
+    tmux(["set-window-option", "-u", "-t", "=" + state.sessionName, "window-size"]);
+  }
+}
+
+/**
+ * Heal a session's `window-size` back to `latest` if a prior crash left it
+ * stuck `manual` (chaining above closes the race going forward, but a pin
+ * from before this fix — or from any other interruption — can still be
+ * sitting on a session that outlived an agetor restart). A `manual` pin
+ * confines every future attach to whatever size it was left at instead of
+ * letting the attaching client's own size win, which is exactly the
+ * "minimized" rendering bug. Best-effort and never throws — called right
+ * before an attach (where failing shouldn't block the user from getting a
+ * terminal) and on reattach (where there's no one to report a failure to).
+ *
+ * Forces the explicit `latest` value rather than `-u` (unset): unlike
+ * `restorePaneSize`'s revert-to-inherited, a stuck-`manual` session's
+ * inherited/global `window-size` setting is exactly what could be `manual`
+ * on the user's tmux (deliberate override) — reverting to it would re-expose
+ * the bug this function exists to heal. This is the one place in the file
+ * that deliberately overrides a user global; don't "simplify" it to `-u`.
+ *
+ * No-ops when the session doesn't exist, or when a pane-grow is legitimately
+ * in flight for it (`paneGrowInFlight`) — healing mid-grow would fight the
+ * scraper's own resize/restore. A taskId with no in-memory `SessionState`
+ * (boot before reattach, or a session that survived a crash with no state
+ * rebuilt yet) can't have a grow in flight — there's no code path that could
+ * be running one without state — so it's safe to heal in that case too.
+ *
+ * `opts.assumeAlive` skips the internal `sessionExists` probe when the
+ * caller already knows the session is live (a duplicate round-trip
+ * otherwise): the `open-tmux` route just checked existence itself, and
+ * `reattachSession` only runs for sessions `reconcileOrphans` already
+ * verified alive.
+ */
+export function healWindowSize(taskId: string, opts: { assumeAlive?: boolean } = {}): void {
+  const state = sessions.get(taskId);
+  if (state?.paneGrowInFlight) return;
+  if (!opts.assumeAlive && !sessionExists(taskId)) return;
+  tmux(["set-window-option", "-t", "=" + sessionNameFor(taskId), "window-size", "latest"]);
 }
 
 /** Full pane capture (NOT the 40-line tail) — a grown preview panel can be much
@@ -1971,12 +2568,19 @@ async function collectAskQuestionsFromPane(
   const collected: Array<ParsedQuestionPane | null> = [];
   await queueTmuxOp(state.taskId, async (stillCurrent) => {
     const orig = io.size();
-    if (orig) {
-      io.resize(Math.max(orig.w, PREVIEW_PANE_MIN_COLS), PREVIEW_PANE_ROWS);
-      await io.sleep(PREVIEW_REFLOW_MS);
-      if (!stillCurrent()) { io.restore(orig.w, orig.h); return; }
-    }
+    // Brackets the ONLY window where `window-size manual` is expected on this
+    // session. ONE `finally` below owns both the restore and the clear (the
+    // clear nested inside it) so a throwing `io.restore` — the injected
+    // `PaneIo` can throw even though the production tmux-backed one can't —
+    // still clears the flag instead of stranding it true forever, which
+    // would permanently disable `healWindowSize` for this session.
+    if (orig) state.paneGrowInFlight = true;
     try {
+      if (orig) {
+        io.resize(Math.max(orig.w, PREVIEW_PANE_MIN_COLS), PREVIEW_PANE_ROWS);
+        await io.sleep(PREVIEW_REFLOW_MS);
+        if (!stillCurrent()) return; // finally below restores + clears
+      }
       for (let t = 0; t < n; t++) {
         if (t > 0) {
           if (!io.send("Right")) return; // entering a tab resets the cursor to option 0
@@ -2008,7 +2612,13 @@ async function collectAskQuestionsFromPane(
         if (!stillCurrent()) break;
       }
     } finally {
-      if (orig) io.restore(orig.w, orig.h);
+      if (orig) {
+        try {
+          io.restore(orig.w, orig.h);
+        } finally {
+          state.paneGrowInFlight = false;
+        }
+      }
     }
   }, state);
 
@@ -2251,6 +2861,11 @@ function maybeAdoptContinuation(
 }
 
 function dispatchLine(state: SessionState, line: string): void {
+  // Any JSONL line reaching us at all is proof claude accepted the
+  // last-pasted message as a real turn (an unknown-slash-command rejection
+  // never writes one) — disarm the lookout so a later, unrelated pane match
+  // can't misfire against a stale token.
+  state.pendingSlashToken = null;
   let evt: ParsedJsonlEvent;
   try {
     evt = JSON.parse(line);
@@ -2282,9 +2897,25 @@ function dispatchLine(state: SessionState, line: string): void {
   // On reattach the dedup set is pre-seeded from run_events, so every
   // replayed line — including mode events the prior process recorded — would
   // otherwise be silently skipped and state.permissionMode would stay null.
+  //
+  // Captured BEFORE the mirror writes the new value so the mapper call below
+  // can compare "what the event says" against "what we last announced" and
+  // suppress a same-mode repeat (see `mapParsedEventToChunks`'s
+  // `lastPermissionMode` param). Deliberately read from
+  // `lastAnnouncedPermissionMode`, NOT `permissionMode`: `permissionMode` can
+  // also be written by `cycleToModeInner`'s pane-scrape verification when the
+  // USER switches modes via Shift+Tab, which happens before claude journals
+  // the corresponding JSONL line. Using `permissionMode` here would make that
+  // pane-scrape write look like "already announced" and suppress the
+  // legitimate confirmation chip once the JSONL line does arrive.
+  // `lastAnnouncedPermissionMode` is written only from JSONL lines (below and
+  // at the launch/reattach seed), so it always tracks what was actually
+  // announced.
+  const prevAnnouncedPermissionMode = state.lastAnnouncedPermissionMode;
   if ((evt.type === "system" || evt.type === "permission-mode")
     && typeof evt.permissionMode === "string") {
     state.permissionMode = evt.permissionMode;
+    state.lastAnnouncedPermissionMode = evt.permissionMode;
   }
 
   // Staging step: the new line either confirms or cancels the pending end_turn.
@@ -2380,7 +3011,7 @@ function dispatchLine(state: SessionState, line: string): void {
   // recently popped slot's handler so trailing metadata still reaches the
   // correct run. If neither exists it's safe to drop.
   const onChunk: ChunkHandler = slot?.onChunk ?? state.lastChunk ?? (() => {});
-  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk);
+  const { endOfTurn } = mapParsedEventToChunks(evt, onChunk, false, prevAnnouncedPermissionMode);
   if (uuid) state.seenLineUuids.add(uuid);
   if (endOfTurn) {
     // Stage: don't resolve the turn yet. The banner and slot-pop happen in
@@ -2547,6 +3178,10 @@ async function flush(state: SessionState): Promise<void> {
   // turn (and that one-tick-stable list-printing wouldn't normally
   // beat the two-tick stability requirement).
   state.lastJsonlAppendAt = Date.now();
+  // JSONL bytes appended is the primary "session is alive" signal — feeds
+  // the reaper's idle clock (`sessionIdleInfo`) and the pollTimer's own
+  // idle backoff below.
+  bumpActivity(state);
   for (const line of lines) {
     if (!line) continue;
     dispatchLine(state, line);
@@ -2759,6 +3394,37 @@ function sha1(s: string): string {
 }
 
 /**
+ * Recognise claude's Ink TUI rejecting a pasted message as an unknown slash
+ * command, e.g.:
+ *
+ *   ● Unknown command: /skill-creator
+ *
+ * No JSONL line is ever written for this — the message was never delivered
+ * as a turn — so this pane scrape is the only signal. Scans only the last
+ * ~12 NON-BLANK lines of the tail (a stale sighting further up the pane
+ * shouldn't false-fire on a later, unrelated turn) and requires an exact
+ * word-boundary match on `token`: `"Unknown command: /skill-creator"` must
+ * NOT match an armed token of `"/skill"` (a prefix), so the token is
+ * followed by whitespace or end-of-line.
+ *
+ * Known non-matches, accepted because claude's error line is short and
+ * always "● "-prefixed: a leading glyph other than "●", trailing
+ * punctuation right after the token, and a command name tmux hard-wrapped
+ * across physical lines (`capture-pane` without `-J`).
+ */
+function matchUnknownCommand(tail: string[], token: string): boolean {
+  const nonBlank = tail.filter((l) => l.trim().length > 0).slice(-12);
+  const escapedToken = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^Unknown command: ${escapedToken}(?:\\s|$)`);
+  return nonBlank.some((raw) => {
+    // Strip leading whitespace and an optional "●" bullet + following
+    // whitespace — claude prefixes its own status lines with "● ".
+    const stripped = raw.replace(/^\s*(?:●\s*)?/, "");
+    return re.test(stripped);
+  });
+}
+
+/**
  * One-time *startup consent* dialogs claude can draw before it ever reaches
  * the REPL. These are special because they block JSONL creation entirely:
  * the normal scraper only arms after the JSONL exists (`attachTailer`), so it
@@ -2956,6 +3622,33 @@ function decideScrapeTick(p: {
   return { run: true, stampIdle: true };
 }
 
+/** Pane chrome that repaints on a fixed cadence independent of anything
+ *  meaningful happening — claude's "esc to interrupt" spinner/status footer
+ *  (its elapsed-time-and-token-count portion ticks every render) and its
+ *  rotating "Tip: …" hint banner. Matched against a line AFTER trailing
+ *  whitespace has already been trimmed off (see `normalizePaneForActivity`). */
+const VOLATILE_PANE_LINE_RE = /esc to interrupt|^\s*Tip:/i;
+
+/**
+ * Normalize a captured pane tail into the form used for the "did the pane
+ * meaningfully change" activity signal in `scrapeOnce`. Mirrors the
+ * normalization the modal matchers (`matchNumberedModal`, `detectAskModal`)
+ * already apply when fingerprinting a pane — right-trim each line, since
+ * `tmux capture-pane` pads rows with trailing spaces that vary run to run —
+ * and additionally drops lines that are pure volatile chrome (see
+ * `VOLATILE_PANE_LINE_RE`). Without this, a session idling at the REPL can
+ * keep resetting the reaper's 30-minute idle clock (`lastActivityAt`)
+ * forever purely from chrome redraws that never touch real transcript
+ * content, neutering the reaper. Only affects the activity-diff comparison —
+ * modal matching still runs against the raw, unnormalized tail. */
+function normalizePaneForActivity(tail: string): string {
+  return tail
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => !VOLATILE_PANE_LINE_RE.test(line))
+    .join("\n");
+}
+
 /** Run a single scrape tick. Idempotent: registers at most one new
  *  TmuxPromptRequest per call, auto-cancels any pending one whose
  *  fingerprint no longer matches the pane. */
@@ -2982,7 +3675,39 @@ function scrapeOnce(state: SessionState): void {
     return;
   }
   const lines = cap.stdout.split("\n");
-  const tail = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES)).join("\n");
+  const tailLines = lines.slice(Math.max(0, lines.length - SCRAPE_TAIL_LINES));
+  const tail = tailLines.join("\n");
+
+  // The pane changing is a life signal independent of the JSONL — a native
+  // AskUserQuestion modal, or the user driving the session directly via
+  // `tmux attach`, can both change what's on screen without ever writing to
+  // the JSONL. Compare the NORMALIZED tail (see `normalizePaneForActivity`),
+  // not the raw capture — volatile chrome (the "esc to interrupt" spinner's
+  // elapsed-time/token counter, a rotating "Tip: …" line, trailing
+  // whitespace) would otherwise diff on nearly every tick and pin
+  // `lastActivityAt` at "now" forever, neutering the reaper's idle clock.
+  // Skip the very first capture (nothing to compare against yet).
+  const normalizedTail = normalizePaneForActivity(tail);
+  if (state.scrapeLastPaneText !== null && state.scrapeLastPaneText !== normalizedTail) {
+    bumpActivity(state);
+  }
+  state.scrapeLastPaneText = normalizedTail;
+
+  // Armed, token-matched lookout for claude's TUI rejecting the last-pasted
+  // message as an unknown slash command. Cheap and early-guarded — only
+  // evaluated while a token is armed AND a turn is genuinely in flight — so
+  // this never runs for the (overwhelmingly common) non-slash-prompt case.
+  // No JSONL line is ever written when this fires, so this scrape is the
+  // only place that can catch it. Runs before the modal-detection block
+  // below; ordering doesn't otherwise matter (an unknown-command error never
+  // coexists with a modal) since `signalUnknownCommand` is one-shot (it
+  // clears `pendingSlashToken`, so a re-check later in the same tick — there
+  // isn't one — or the next tick can't double-fire).
+  if (state.pendingSlashToken !== null
+    && turnInFlight(state)
+    && matchUnknownCommand(tailLines, state.pendingSlashToken)) {
+    signalUnknownCommand(state);
+  }
 
   // JSONL-recency gate: claude is actively writing. The pane content
   // is mid-render, not a stable modal — defer matching until things
@@ -2994,12 +3719,33 @@ function scrapeOnce(state: SessionState): void {
   // Native AskUserQuestion modal handling. Its options render as a numbered
   // checkbox list (`❯ 1. [✔] Cheese …`) that matchNumberedModal would otherwise
   // grab, producing a competing single-keystroke tmux_prompt card. So whenever
-  // the modal is on the pane we (a) suppress the numbered matcher and (b) drive
-  // the structured-card flow off the pane (collectAndRegisterAskCard). When the
-  // modal leaves the pane (answered/cancelled) we drop the card. ExitPlanMode's
-  // approval modal carries no AskUserQuestion signature, so it still flows
-  // through the numbered matcher as intended.
-  const askOnPane = detectAskModal(tail) !== null;
+  // the *question* screen is on the pane we (a) suppress the numbered matcher
+  // and (b) drive the structured-card flow off the pane
+  // (collectAndRegisterAskCard). When it leaves the pane (answered/cancelled)
+  // we drop the card. ExitPlanMode's approval modal carries no AskUserQuestion
+  // signature, so it still flows through the numbered matcher as intended.
+  //
+  // The *review* screen ("Ready to submit your answers?") is deliberately
+  // NOT included in this suppression, even though `detectAskModal` reports it
+  // too. `driveAskAnswers` (claude-tmux.ts) verifies its own confirm Enter
+  // and self-heals a swallowed one, but two cases still land a review screen
+  // that nothing is driving: the drive's bounded resends genuinely exhausted
+  // (a real failure, not just a slow repaint), or the user attached to tmux
+  // directly and navigated to review by hand. `parseModalPane` can't parse
+  // the review screen (no question/footer signature) and the JSONL has no
+  // tool_use until the modal is answered, so with the old blanket suppression
+  // a stranded review screen matched nothing on every tick, forever — the
+  // bug this whole change fixes. Letting `askOnPane` go false for "review"
+  // lets it fall through to `matchNumberedModal`, which DOES match it
+  // (`❯ 1. Submit answers` / `2. Cancel` — ≥2 numbered choices, cursor
+  // marker, "1." anchor) and, after the usual two-tick stability gate,
+  // registers an ordinary clickable tmux_prompt card. If an ask card is
+  // still registered when that happens (the driver hadn't dropped it yet,
+  // or the user reached review by hand), the `else` branch below resolves it
+  // as externally-answered — the same semantics external dismissal already
+  // has for the question screen.
+  const askKind = detectAskModal(tail);
+  const askOnPane = askKind === "question";
   if (askOnPane) {
     if (state.askFirstSeenAt === null) state.askFirstSeenAt = now;
     if (!claudeIsWriting && !state.askCardId && !state.askCollecting) {
@@ -3165,6 +3911,9 @@ export const DEATH_JSONL_QUIET_MS = 3_000;
 function signalSessionDeath(state: SessionState): void {
   const inFlight = turnInFlight(state);
   if (!inFlight && !heldProbeSafe(state.taskId)) return;
+  // The turn (if any) is being settled by a different sentinel below — an
+  // armed slash token has nothing left to watch for.
+  state.pendingSlashToken = null;
   const slot = state.turnQueue[0];
   const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
   onChunk(
@@ -3198,7 +3947,7 @@ function signalSessionDeath(state: SessionState): void {
   // killed" rejection would double-settle the run.
   state.watcher?.close();
   state.watcher = null;
-  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
   if (state.scrapeTimer) { clearInterval(state.scrapeTimer); state.scrapeTimer = null; }
   // The session is gone, so a notification-triggered watchdog waiting on it
   // will never see content or a normal end-turn either way — cancel rather
@@ -3214,6 +3963,160 @@ function signalSessionDeath(state: SessionState): void {
   // that no longer exists. Release it the same way the run itself is
   // released above.
   orphanRunningSubagents(state.taskId);
+}
+
+/**
+ * Settle an in-flight turn because a BACKGROUND agent's own transcript
+ * emitted an API-error line (`isApiErrorMessage: true` — 529 Overloaded,
+ * 400, any status; see `mapJsonlEventToChunks`). `claude-subagents.ts`'s
+ * tailer has already settled that subagent's own row `failed` by the time
+ * this fires (see `attachSubagentWatcher`'s `onApiError` — wired below in
+ * `attachTailer`); this module-side half propagates that failure to the
+ * PARENT turn, which the subagent tailer cannot do itself — it is read-only
+ * w.r.t. the agent and has no `SessionState` to act on.
+ *
+ * Reuses `CLAUDE_API_ERROR_STATUS_PREFIX`, the same sentinel the main
+ * stream's own API errors emit, so the orchestrator's chunk handler needs
+ * zero changes: prefix match → `handle.apiError = true` +
+ * `updateColumn(taskId, runId, "blocked", "api-error")`; the done handler
+ * folds that into run `failed` — identical to a main-stream API error.
+ *
+ * Mirrors `signalSessionDeath`'s in-flight settle mechanics exactly (emit
+ * the sentinel via the head slot's `onChunk`, resolve the slot / fire
+ * `onEndOfTurn`) but performs NONE of its teardown: the tmux session is
+ * provably alive — a background agent errored, not the session itself — so
+ * the JSONL watcher, poll/scrape timers, and the subagent watcher all stay
+ * attached, and `orphanRunningSubagents` is deliberately NOT called. Other
+ * background agents may legitimately still be running and must keep being
+ * tailed (#92 semantics: only the errored subagent's own row settles).
+ *
+ * Won't-fix, by design: after this settle, a GENUINELY recovering main
+ * agent's next assistant line can trigger `maybeAdoptContinuation`,
+ * resurrecting the card from `blocked` to a fresh continuation run. That's
+ * intentional self-healing, not a bug — the aborted run stays `failed`; a
+ * real recovery lands as its own adopted run. The truly-stuck case (no more
+ * assistant lines ever arrive) simply stays `blocked`, which is the whole
+ * point of this feature.
+ */
+function signalSubagentApiError(
+  state: SessionState,
+  info: { subagentId: string; detail: string; runId: string },
+): void {
+  if (!turnInFlight(state)) {
+    // No active turn to abort — the tailer already settled the subagent's
+    // own row and already called `fireSettle`, which is what lets a held
+    // task (main run already succeeded, only background agents keep it
+    // open) release to `review` on its own. There is no main-turn handle
+    // here to flip to `blocked`. If the task IS held, still leave a
+    // breadcrumb on the main stream so the failure isn't silent — mirrors
+    // `signalSessionDeath`'s held branch ("say so honestly instead of
+    // reusing the sentinel": there's no handle for the orchestrator to flip
+    // to `blocked`, so a sentinel here would just lie). Neither in flight
+    // nor held: truly nothing to do.
+    if (heldProbeSafe(state.taskId)) {
+      const onChunk = state.lastChunk ?? (() => {});
+      onChunk(
+        "status",
+        `background agent hit an API error (${info.detail}) — it stopped; task releases when `
+          + `remaining agents finish`,
+      );
+    }
+    return;
+  }
+  // Run association: a STALE async subagent spawned by an OLDER run can
+  // error while a NEWER run is in flight on this same session — settling
+  // here would wrongly abort the new run over an old failure. `TurnSlot`
+  // carries no run id (verified: `interface TurnSlot` above is just
+  // `{ onChunk, resolve, reject }`), so this can't be checked locally;
+  // resolved via the same orchestrator-injected-probe seam as
+  // `heldSessionProbe` (`setActiveRunProbe`, wired in orchestrator.ts next
+  // to `setHeldSessionProbe`). Unset `activeRunProbe` (unit tests that
+  // drive this function directly, with no orchestrator wiring) allows
+  // through unconditionally — same posture as every other probe in this
+  // file when unregistered.
+  if (activeRunProbe !== null && info.runId !== activeRunProbeSafe(state.taskId)) return;
+  // The turn is being settled by a different sentinel below — an armed
+  // slash token / staged end_turn / hold-until-idle latch all have nothing
+  // left to watch for. Mirrors `signalUnknownCommand`'s "queue popped ⇒
+  // nothing staged" invariant: without clearing `pendingEndTurn`, a stale
+  // staged end_turn from BEFORE this abort could pop the user's *retry*
+  // slot via the poll's empty-text flush and instantly mis-resolve the new
+  // run as succeeded. `holdUntilIdle` likewise has no folded turn left to
+  // wait out once the slot underneath it is gone.
+  state.pendingSlashToken = null;
+  state.pendingEndTurn = null;
+  state.holdUntilIdle = false;
+  const slot = state.turnQueue[0];
+  const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
+  onChunk(
+    "status",
+    `${CLAUDE_API_ERROR_STATUS_PREFIX}background agent aborted: ${info.detail}`,
+  );
+  if (slot && slot.resolve) {
+    state.turnQueue.shift();
+    state.lastChunk = slot.onChunk;
+    const resolve = slot.resolve;
+    slot.resolve = null;
+    slot.reject = null;
+    resolve(0);
+  } else if (state.onEndOfTurn) {
+    const handler = state.onEndOfTurn;
+    state.onEndOfTurn = null;
+    handler();
+  }
+  // Nothing will end this turn naturally now — cancel any watchdog waiting
+  // on it so it can't fire redundantly against an already-settled slot.
+  clearContinuationWatchdog(state);
+}
+
+/**
+ * Settle an in-flight turn because claude's Ink TUI rejected the last-pasted
+ * message as an unknown slash command (`Unknown command: /<token>`). No
+ * JSONL line is ever written for this — the message was never delivered as
+ * a turn — so `scrapeOnce`'s pane scrape is the only signal, gated on
+ * `state.pendingSlashToken` being armed (see `slashTokenOf`) and a turn
+ * genuinely being in flight (checked by the caller).
+ *
+ * Mirrors `signalSessionDeath`'s settle mechanics exactly — emit the
+ * sentinel `status` chunk via the head slot's `onChunk` (or `onEndOfTurn` on
+ * the reattach path), resolve the slot with code 0 — but, UNLIKE session
+ * death, the tmux session and claude process stay alive and reusable: we do
+ * NOT stop the scrape/death/poll timers or the JSONL watcher. The next turn
+ * on this task routes through `sendTurn` exactly as if nothing happened.
+ *
+ * One-shot: clearing `state.pendingSlashToken` up front is both the disarm
+ * and the re-entry guard — a second call (or a stale timer callback) with
+ * nothing armed is a no-op.
+ */
+function signalUnknownCommand(state: SessionState): void {
+  const token = state.pendingSlashToken;
+  if (!token) return;
+  state.pendingSlashToken = null;
+  state.pendingEndTurn = null;
+  state.holdUntilIdle = false;
+  const slot = state.turnQueue[0];
+  const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
+  onChunk(
+    "status",
+    `${CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX}${token} — claude treated the message as a slash `
+      + `command; it was not delivered. Edit the message so it doesn't start with "/" and resend.`,
+  );
+  if (slot && slot.resolve) {
+    state.turnQueue.shift();
+    state.lastChunk = slot.onChunk;
+    const resolve = slot.resolve;
+    slot.resolve = null;
+    slot.reject = null;
+    resolve(0);
+  } else if (state.onEndOfTurn) {
+    // Symmetry with `signalSessionDeath`; in production this branch can't
+    // fire on a genuinely reattached run — `pendingSlashToken` is in-memory
+    // and never re-armed after a restart (plan limitation L2) — so it's
+    // reachable only from synthetic test states.
+    const handler = state.onEndOfTurn;
+    state.onEndOfTurn = null;
+    handler();
+  }
 }
 
 /** Whether a turn is currently in flight on this session — a live head slot
@@ -3270,39 +4173,133 @@ function startDeathWatch(state: SessionState): void {
   }, DEATH_POLL_MS);
 }
 
+/** Backstop poll cadence while the session has shown life within the last
+ *  `POLL_IDLE_AFTER_MS` — matches the original fixed `setInterval` rate. */
+const POLL_FAST_MS = 400;
+/** Backstop poll cadence once `lastActivityAt` has been quiet for
+ *  `POLL_IDLE_AFTER_MS` or longer. fs.watch stays the primary signal (its own
+ *  callback flushes immediately, independent of this timer) — this only
+ *  changes how often the cheap "did fs.watch miss anything" stat-and-read
+ *  backstop runs for a session nobody is doing anything with. Never fully
+ *  stops (see the scraper's own idle-throttle comment for why a hard stop
+ *  would be wrong here too: a native AskUserQuestion modal writes no JSONL,
+ *  so something must keep noticing when the session goes busy again). */
+const POLL_SLOW_MS = 5_000;
+/** How long the session must be quiet before the backstop poll backs off
+ *  from `POLL_FAST_MS` to `POLL_SLOW_MS`. */
+const POLL_IDLE_AFTER_MS = 30_000;
+
+/**
+ * Arm (or re-arm) the JSONL backstop poll. Self-rescheduling `setTimeout`
+ * rather than a fixed `setInterval`: each tick decides the NEXT tick's delay
+ * from how long the session has been quiet, so the cadence backs off to
+ * `POLL_SLOW_MS` on its own once idle, and — because `rearmPollTimerFast`
+ * below cancels and reschedules on any fresh activity — snaps back to
+ * `POLL_FAST_MS` immediately rather than waiting out a stale long wait.
+ * Chained after `flush` settles (not fire-and-forget) so a slow flush can't
+ * pile up overlapping poll ticks against the same session.
+ */
+function armPollTimer(state: SessionState, delayMs: number = POLL_FAST_MS): void {
+  // Capture the handle by identity rather than relying on `state.pollTimer`'s
+  // truthiness: `rearmPollTimerFast` (fs.watch callback) can fire *while*
+  // this tick's `flush` is still awaiting, clear+replace `state.pollTimer`
+  // with a brand-new chain, and then this tick's `.finally` would see a
+  // truthy-but-different pollTimer and reschedule anyway — spawning a second
+  // independent self-rescheduling chain that multiplies every time that
+  // race repeats. Comparing against the exact handle this closure owns means
+  // only the chain `state.pollTimer` still actually points at may continue.
+  const handle: ReturnType<typeof setTimeout> = setTimeout(() => {
+    // `disposeSessionState` / `signalSessionDeath` null `pollTimer`
+    // synchronously on teardown; a superseding `armPollTimer` call (via
+    // `rearmPollTimerFast`) overwrites it with a different handle. Either
+    // way, if `state.pollTimer` isn't this handle anymore, this chain is
+    // stale — don't run its flush.
+    if (state.pollTimer !== handle) return;
+    void flush(state).finally(() => {
+      if (state.pollTimer !== handle) return;
+      const idleMs = Date.now() - state.lastActivityAt;
+      armPollTimer(state, idleMs >= POLL_IDLE_AFTER_MS ? POLL_SLOW_MS : POLL_FAST_MS);
+    });
+  }, delayMs);
+  state.pollTimer = handle;
+}
+
+/** Cancel whatever poll tick is pending and re-arm at `POLL_FAST_MS`
+ *  immediately. Called from every place that counts as "fresh activity" for
+ *  the poll cadence specifically (fs.watch events, a turn starting, a folded
+ *  follow-up paste) so a session that's been backed off to `POLL_SLOW_MS`
+ *  doesn't wait out a stale long tick before resuming full-rate backstop
+ *  polling. No-op when no poll timer is armed yet (pre-`attachTailer`, or an
+ *  already-disposed session) — nothing to snap back to. */
+function rearmPollTimerFast(state: SessionState): void {
+  if (!state.pollTimer) return;
+  clearTimeout(state.pollTimer);
+  armPollTimer(state, POLL_FAST_MS);
+}
+
 function attachTailer(state: SessionState): void {
   // Drain whatever's already in the file (claude may have written events
   // before our watcher attached).
   void flush(state);
   state.watcher = fsWatch(state.jsonlPath, { persistent: false }, () => {
     void flush(state);
+    rearmPollTimerFast(state);
   });
   // Backstop poll. macOS fs.watch (FSEvents/kqueue) coalesces rapid appends
   // and drops notifications on slow append-only streams — we saw a real run
   // where the first event came through fine and then 16 more events silently
   // accumulated in the JSONL without firing the watcher. A 400ms tick is
-  // cheap (one stat + read-if-grew) and bulletproof.
-  state.pollTimer = setInterval(() => { void flush(state); }, 400);
+  // cheap (one stat + read-if-grew) and bulletproof; it backs off to
+  // `POLL_SLOW_MS` after `POLL_IDLE_AFTER_MS` of quiet (see `armPollTimer`).
+  armPollTimer(state);
   startScraper(state);
   startDeathWatch(state);
   // Track any background/sub agents this session spawns. Idempotent re-arm:
   // dispose a prior handle first so a re-attach (reconcileOrphans defensive
   // overwrite) can't leave two watchers polling the same dir.
   state.subagentWatcher?.detach();
-  state.subagentWatcher = attachSubagentWatcher({ taskId: state.taskId, jsonlPath: state.jsonlPath });
+  state.subagentWatcher = attachSubagentWatcher({
+    taskId: state.taskId,
+    jsonlPath: state.jsonlPath,
+    onApiError: (info) => signalSubagentApiError(state, info),
+  });
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Public entry points.
  * ────────────────────────────────────────────────────────────────────────── */
 
+/** How often `spawnClaudeViaTmux`'s deferred-paste loop polls `readPaneMode`
+ *  while waiting for a large prompt's target session to reach an idle
+ *  composer. Same cadence as the startup-dialog poller (STARTUP_DIALOG_POLL_MS)
+ *  — frequent enough to paste promptly once claude draws, cheap enough to run
+ *  for the duration of the timeout below. */
+const DEFERRED_PROMPT_POLL_MS = 400;
+/** Bound on how long the deferred-paste loop waits for a confirmed-idle
+ *  composer before pasting best-effort anyway. Generous — matches
+ *  BOOT_TIMEOUT_MS below — because the same startup work (auth probe,
+ *  plugin/skill scan, model warmup) that can delay the JSONL also delays the
+ *  composer. Deliberately the same literal as `BOOT_TIMEOUT_MS`: both bound
+ *  the same claude startup work, so keeping them numerically co-sized reads
+ *  naturally, but they're independent constants — there's no shared source
+ *  and no requirement to change one when the other changes. */
+const DEFERRED_PROMPT_TIMEOUT_MS = 30_000;
+
 /**
- * Start a new claude tmux session for the task. The initial prompt rides
- * inside `opts.argv` (claude's documented `claude "query"` form), so we
- * don't paste anything via tmux for the first turn — claude submits it
- * itself on startup. Assumes `sessionExists(taskId)` is false; the caller
- * (orchestrator) is responsible for routing follow-up turns through
- * `sendTurn`.
+ * Start a new claude tmux session for the task. Two delivery modes for the
+ * initial prompt, chosen by `agents.ts` before this is called:
+ *
+ *   - Common case: the prompt rides inside `opts.argv` (claude's documented
+ *     `claude "query"` form), so we don't paste anything via tmux for the
+ *     first turn — claude submits it itself on startup.
+ *   - Large prompt (`opts.deferredPrompt` set, `opts.argv` carries none):
+ *     `argv` boots a bare claude with no initial query, and once the
+ *     composer is confirmed idle (or a bounded timeout elapses) the prompt
+ *     is pasted in via the same load-buffer/paste-buffer machinery
+ *     live-session follow-ups use — see the deferred-paste block below.
+ *
+ * Assumes `sessionExists(taskId)` is false; the caller (orchestrator) is
+ * responsible for routing follow-up turns through `sendTurn`.
  */
 export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   const sessionName = sessionNameFor(opts.taskId);
@@ -3396,14 +4393,133 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   disposeSessionState(sessions.get(opts.taskId), true);
   sessions.set(opts.taskId, state);
 
+  // Keep a handle on the pushed slot (mirrors `sendTurn`'s idiom below) so
+  // the deferred-paste loop can (a) recognise cancellation — `kill()`
+  // splices `turnQueue` without touching `sessions`, so slot-presence is the
+  // only reliable "has this launch been cancelled?" signal — and (b) settle
+  // this exact slot on a paste failure instead of leaving the run `running`
+  // forever.
+  const initialSlot: TurnSlot = { onChunk: opts.onChunk, resolve: null, reject: null };
   const done = new Promise<number>((resolve, reject) => {
-    state.turnQueue.push({ onChunk: opts.onChunk, resolve, reject });
+    initialSlot.resolve = resolve;
+    initialSlot.reject = reject;
   });
+  state.turnQueue.push(initialSlot);
   // Brand-new session has no prior turn to inherit metadata from, but
   // seed `lastChunk` so any metadata claude writes before its first
   // user/assistant entries (e.g. permission-mode banner) still lands on
   // the opening run's stream.
   state.lastChunk = opts.onChunk;
+
+  // Argv-prompt spawn path: the small-prompt case already embedded the
+  // opening message as the final `-- <prompt>` pair in `opts.argv`, baked
+  // into the `tmux new-session` command dispatched above — there is no
+  // separate paste call after this point to arm at, so arm right here, as
+  // soon as the SessionState exists. (Mirrors `sendTurn`/`pasteFollowUp`;
+  // the large-prompt `deferredPrompt` case arms itself right where it's
+  // actually pasted, further down.) A no-op (armed to null) when
+  // `deferredPrompt` is set — that branch below owns arming for its prompt.
+  if (!opts.deferredPrompt) {
+    const argv = opts.argv;
+    const embeddedPrompt = argv.length >= 2 && argv[argv.length - 2] === "--"
+      ? argv[argv.length - 1]
+      : undefined;
+    state.pendingSlashToken = embeddedPrompt ? slashTokenOf(embeddedPrompt) : null;
+  }
+
+  // Large-prompt delivery: `buildCommand` (agents.ts) omits any prompt over
+  // CLAUDE_PROMPT_ARGV_MAX_BYTES from argv — embedding it would blow tmux's
+  // client-command cap and fail `new-session` outright — and hands it back
+  // as `deferredPrompt` instead. Paste it in once claude's composer is
+  // confirmed idle (`readPaneMode` returns non-null). Known startup consent
+  // dialogs (the bypass-permissions warning, trust-folder prompt) are handled
+  // for free: the boot poller below auto-confirms those, and the composer
+  // can't be idle while one is still painted over it. A *generic* startup
+  // question (something only the user can answer — see the boot poller's
+  // "other interactive question" branch) is different: it surfaces as a
+  // `tmux_prompt` card, and pasting over it would corrupt whatever partial
+  // answer is on screen. So each readiness window that times out re-checks
+  // `activeTmuxPromptsForTask` and, if one is still pending, re-arms instead
+  // of pasting — mirroring the boot JSONL-wait's re-arm loop a few dozen
+  // lines down. Fire-and-forget, wrapped in try/catch so a throw here can
+  // never become an unhandled rejection (mirrors the boot-dialog poller's
+  // posture a few lines down) — this must never affect the JSONL boot wait
+  // itself.
+  if (opts.deferredPrompt) {
+    const deferredPrompt = opts.deferredPrompt;
+    opts.onChunk(
+      "status",
+      "prompt too large for launch argv — delivering via paste once claude is ready",
+    );
+    void (async () => {
+      try {
+        // `kill()` (a cancel, or any other path that settles/removes the
+        // initial slot) splices it out of `turnQueue` without touching
+        // `sessions` or the tmux session itself, so neither of the liveness/
+        // identity checks below would ever catch a cancel on their own —
+        // slot-presence is the signal. Checked on every poll tick, on every
+        // re-arm, and immediately before the final paste attempt.
+        const slotLive = () => state.turnQueue.includes(initialSlot);
+        let ready = false;
+        windows: for (;;) {
+          const deadline = Date.now() + DEFERRED_PROMPT_TIMEOUT_MS;
+          while (Date.now() < deadline) {
+            if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return; // session died — nothing to paste into
+            if (sessions.get(opts.taskId) !== state) return; // superseded by a newer spawn/reattach
+            if (!slotLive()) return; // cancelled (or otherwise settled) — never paste over it
+            if (readPaneMode(state) !== null) { ready = true; break windows; }
+            await Bun.sleep(DEFERRED_PROMPT_POLL_MS);
+          }
+          // Window timed out. Don't paste over an unanswered startup
+          // question — re-arm a fresh window instead, as long as there's
+          // still something to wait for.
+          if (activeTmuxPromptsForTask(opts.taskId).length === 0) break;
+          if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return;
+          if (sessions.get(opts.taskId) !== state) return;
+          if (!slotLive()) return;
+        }
+        // Re-check liveness/identity before the final attempt — the loop can
+        // exit via the timeout with the session still alive, and a dropped
+        // prompt is worse than a best-effort paste into whatever's on screen.
+        if (!tmux(["has-session", "-t", "=" + sessionName]).ok) return;
+        if (sessions.get(opts.taskId) !== state) return;
+        if (!slotLive()) return; // cancelled during the final liveness check
+        if (!ready) {
+          opts.onChunk("status", "claude readiness never confirmed — delivering prompt anyway");
+        }
+        // Arm the unknown-command lookout right at the actual delivery point
+        // — mirrors `sendTurn`/`pasteFollowUp`. (The small-prompt argv case
+        // arms right after SessionState is created instead, since its
+        // "paste" already happened via the launch argv before this function
+        // even returned.)
+        state.pendingSlashToken = slashTokenOf(deferredPrompt);
+        // Prompt paste is a life signal — matters here specifically because
+        // boot (and the readiness wait above) can take up to
+        // DEFERRED_PROMPT_TIMEOUT_MS, well past the construction-time stamp
+        // `makeSessionState` set. `attachTailer` (and its pollTimer) hasn't
+        // run yet at this point — `rearmPollTimerFast` would no-op — so only
+        // the idle-clock bump applies here.
+        bumpActivity(state);
+        void queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, {
+          bracketed: true,
+          onPasteFailure: () => {
+            // Mirror `sendTurn`'s onPasteFailure idiom exactly: guard against
+            // the (theoretical) race where the slot already popped normally
+            // between the paste call and this failure callback, remove it
+            // from the queue if still present, then reject `done` so the run
+            // settles instead of hanging in `running` forever.
+            if (!initialSlot.reject) return;
+            const idx = state.turnQueue.indexOf(initialSlot);
+            if (idx !== -1) state.turnQueue.splice(idx, 1);
+            const reject = initialSlot.reject;
+            initialSlot.resolve = null;
+            initialSlot.reject = null;
+            reject(new Error("paste failed"));
+          },
+        });
+      } catch { /* never let the deferred-paste poller crash the spawn */ }
+    })();
+  }
 
   // Bounded wait for claude to create the JSONL. This is just claude's
   // bootup (auth probe, plugin/skill scan, model warmup, MCP initialize on
@@ -3599,6 +4715,14 @@ export interface ReattachOptions {
    *  `onEndOfTurn` on end_turn lines belonging to long-completed prior
    *  turns. */
   seenLineUuids: Set<string>;
+  /** The task's agetor mode at reattach time (`task.mode`), used to seed
+   *  `SessionState.lastAnnouncedPermissionMode` so the offset-0 JSONL replay
+   *  doesn't re-emit a "permission-mode: <mode>" chip for a mode-bearing line
+   *  the prior process already announced (those lines carry no uuid, so the
+   *  usual seenLineUuids dedup can't catch them). Optional/nullable because
+   *  a task can have `mode: null` (defaults to `auto`/`workspace-write`
+   *  elsewhere) or reattach can be invoked without task context in tests. */
+  mode?: string | null;
 }
 
 /**
@@ -3648,6 +4772,16 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
     lastChunk: opts.onChunk,
     seenLineUuids: opts.seenLineUuids,
     onEndOfTurn: () => resolveDone?.(0),
+    // Seed the chip-suppression baseline from the task's mode so the
+    // offset-0 JSONL replay doesn't re-announce a mode the prior process
+    // already announced (permission-mode lines carry no uuid, so
+    // seenLineUuids can't dedup them). Deliberately NOT passed as
+    // `permissionMode` — that field feeds `cycleToModeInner`'s "current mode
+    // unknown" guard and Shift+Tab cycle math, and seeding it here (rather
+    // than leaving it null until the JSONL replay re-hydrates it) would
+    // change that guard's semantics on a reattach where the true live mode
+    // might differ from the task's last-saved mode.
+    lastAnnouncedPermissionMode: opts.mode ? toClaudeModeString(opts.mode) : null,
   });
   // Belt to reconcileOrphans's sort-and-dedup suspender: if some prior
   // reattach (or other code path) already left a SessionState in the map
@@ -3658,6 +4792,13 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
   disposeSessionState(sessions.get(opts.taskId));
   sessions.set(opts.taskId, state);
   attachTailer(state);
+  // A crashed previous process is exactly when a stuck `window-size manual`
+  // pin (see `healWindowSize`) would have been left behind — heal it now so
+  // a subsequent attach isn't confined to whatever size the pin left.
+  // `assumeAlive`: `reattachSession` only runs for sessions `reconcileOrphans`
+  // already verified alive, so the internal `sessionExists` probe would be a
+  // duplicate round-trip.
+  healWindowSize(opts.taskId, { assumeAlive: true });
 
   return {
     kill: () => {
@@ -3697,12 +4838,21 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
     onChunk("stderr", err.message);
     return rejectedAgent(taskId, err);
   }
+  // A turn starting is a life signal — reset the idle clock and snap the
+  // backstop poll back to full rate immediately (relevant when this session
+  // had backed off to POLL_SLOW_MS while idle).
+  bumpActivity(state);
+  rearmPollTimerFast(state);
   // Drain any unprocessed JSONL content under whatever turn is currently
   // active BEFORE pushing the new slot — otherwise a trailing end_turn
   // already in the file would be dispatched against the new slot and
   // pop it immediately. After flushSync, the queue head reflects the
   // truly in-flight turn (or is empty if the previous turn just ended).
   flushSync(state);
+  // Arm (or disarm) the unknown-command lookout for THIS turn's prompt —
+  // must happen after flushSync (which may itself clear a stale token left
+  // over from the previous turn) so the new value sticks.
+  state.pendingSlashToken = slashTokenOf(prompt);
   // Keep a handle on the pushed slot (rather than only closing over
   // resolve/reject) so a paste failure below can settle *this specific*
   // slot in-process instead of leaving the run stuck `running` until the
@@ -3773,7 +4923,18 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
 export function pasteFollowUp(taskId: string, prompt: string): boolean {
   const state = sessions.get(taskId);
   if (!state) return false;
+  // A folded-in follow-up paste is a life signal — reset the idle clock and
+  // snap the backstop poll back to full rate immediately.
+  bumpActivity(state);
+  rearmPollTimerFast(state);
   state.holdUntilIdle = true;
+  // Arm (or disarm) the unknown-command lookout for the folded-in prompt —
+  // same rule as `sendTurn`: only a first line starting with "/" arms it.
+  // Best-effort here: the in-flight turn's own JSONL lines clear the token
+  // (`dispatchLine`), so a folded slash command is only caught when the turn
+  // has already gone JSONL-quiet before claude replays it (plan limitation
+  // L1 in docs/plans/catch-unknown-command-error.md).
+  state.pendingSlashToken = slashTokenOf(prompt);
   void queuePaste(taskId, state.sessionName, prompt, 0, state, { bracketed: true });
   return true;
 }
@@ -4133,7 +5294,7 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   if (!state) return;
   state.watcher?.close();
   state.watcher = null;
-  if (state.pollTimer) clearInterval(state.pollTimer);
+  if (state.pollTimer) clearTimeout(state.pollTimer);
   state.pollTimer = null;
   if (state.scrapeTimer) clearInterval(state.scrapeTimer);
   state.scrapeTimer = null;
@@ -4221,6 +5382,15 @@ export const __forTest = {
   /** Death-watch settlement — exposed so the death test can drive it against a
    *  synthetic session without a real tmux server. */
   signalSessionDeath,
+  /** Background-agent API-error settlement — exposed so the subagent
+   *  API-error test can drive it against a synthetic session without a real
+   *  tmux server or a live `attachSubagentWatcher`. */
+  signalSubagentApiError,
+  /** Unknown-slash-command settlement — exposed so the matcher/signal test
+   *  can drive it against a synthetic session without a real tmux server. */
+  signalUnknownCommand,
+  matchUnknownCommand,
+  slashTokenOf,
   turnInFlight,
   matchNumberedModal,
   matchYesNoModal,
@@ -4235,6 +5405,16 @@ export const __forTest = {
   SCRAPE_IDLE_POLL_MS,
   SCRAPE_DEEP_IDLE_AFTER_MS,
   SCRAPE_DEEP_IDLE_POLL_MS,
+  /** Pure per-poll decision used by `driveAskAnswers`'s confirm/verify
+   *  phases — exposed so the swallowed-confirm retry logic (resend on a
+   *  "review" sighting, wait out a "question" sighting, bounded resends)
+   *  can be asserted without a live tmux pane. */
+  decideAskDriveStep,
+  ASK_REVIEW_POLL_MS,
+  ASK_REVIEW_POLL_ATTEMPTS,
+  ASK_VERIFY_POLL_MS,
+  ASK_VERIFY_POLL_ATTEMPTS,
+  ASK_VERIFY_MAX_RESENDS,
   readPendingAskQuestionsFromJsonl,
   shouldWaitForAskJsonl,
   resumeJsonlOffset,

@@ -49,12 +49,14 @@ function makeTaskRow(taskId: string, agent: Task["agent"] = "claude-code"): Task
     isolation: "none",
     taskType: "task",
     branch: null,
+    branchSource: "created",
     worktreePath: null,
     baseRef: null,
+    prUrl: null,
     mode: null,
     model: null,
     effort: null,
-    references: [],
+    references: [],    backlog: [], draft: null,
     column: "ready",
     runId: null,
     createdAt: Date.now(),
@@ -189,7 +191,7 @@ test("sendInput on a finished claude-code task inserts a NEW run row with status
   // through spawnResumedSession deterministically (regardless of whether a
   // stray tmux session with this name exists), which uses the fake driver
   // (AGETOR_CLAUDE_DRIVER=fake) and inserts a fresh run row.
-  const result = sendInput(firstRunId, "follow-up");
+  const result = await sendInput(firstRunId, "follow-up");
   if (!result.delivered) throw new Error(`sendInput failed: ${result.reason}`);
   expect(result.runId).not.toBe(firstRunId);
 

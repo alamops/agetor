@@ -1,12 +1,15 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { dataDir } from "./db.ts";
-import type { BranchInfo, DiffFile, Task, TaskDiff } from "../shared/types.ts";
+import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
+import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
+import type { BranchInfo, Task, TaskDiff, WorktreeTeardownResult } from "../shared/types.ts";
 
 export type { BranchInfo };
 
-const WORKTREES_DIR = path.join(dataDir, "worktrees");
+export const WORKTREES_DIR = path.join(dataDir, "worktrees");
 
 interface GitResult {
   ok: boolean;
@@ -111,6 +114,109 @@ export async function getAheadCount(dir: string, baseRef: string | null): Promis
   return 0;
 }
 
+export interface RemoteSyncState {
+  hasUpstream: boolean;
+  ahead: number | null;
+  behind: number | null;
+}
+
+/**
+ * Whether `dir`'s current branch has a configured upstream and, if so, how
+ * many commits it is ahead/behind that upstream. Drives the "Open PR" gate —
+ * a PR only makes sense once the branch exists on the remote and local HEAD
+ * has nothing left to push.
+ *
+ * Deliberately local-only: no `fetch`/`ls-remote`, so this reflects the
+ * remote-tracking ref as of the last fetch/push rather than the literal
+ * current remote state. That's exactly right for "did my push already
+ * land" — `git push` updates the local tracking ref synchronously, so
+ * right after a push this is accurate with zero network latency.
+ *
+ * `hasUpstream: false` (both counts `null`) covers missing dir, not a git
+ * repo, or no upstream configured for HEAD — "no upstream" is itself a
+ * meaningful, definitive answer (unlike `getAheadCount`'s `null`-means-
+ * "unknown" contract, there's no fallback tier here to attempt first).
+ * A git failure on the count step (upstream resolved but `rev-list` failed)
+ * degrades to `{hasUpstream: true, ahead: null, behind: null}` rather than
+ * collapsing back to `hasUpstream: false` — the upstream unambiguously
+ * exists, only the counts are unknown.
+ */
+export async function remoteSyncState(dir: string): Promise<RemoteSyncState> {
+  const NO_UPSTREAM: RemoteSyncState = { hasUpstream: false, ahead: null, behind: null };
+  if (!existsSync(dir)) return NO_UPSTREAM;
+  if (!(await isGitRepo(dir))) return NO_UPSTREAM;
+
+  const upstream = await git(["rev-parse", "--abbrev-ref", "@{u}"], dir);
+  if (!upstream.ok || !upstream.stdout) return NO_UPSTREAM;
+
+  // `--left-right --count @{u}...HEAD` prints "<behind>\t<ahead>" — commits
+  // only reachable from @{u} (left) vs only reachable from HEAD (right).
+  const counts = await git(["rev-list", "--left-right", "--count", "@{u}...HEAD"], dir);
+  if (!counts.ok) return { hasUpstream: true, ahead: null, behind: null };
+
+  const [behindRaw, aheadRaw] = counts.stdout.split(/\s+/);
+  const behind = Number.parseInt(behindRaw ?? "", 10);
+  const ahead = Number.parseInt(aheadRaw ?? "", 10);
+  if (Number.isNaN(behind) || Number.isNaN(ahead)) {
+    return { hasUpstream: true, ahead: null, behind: null };
+  }
+  return { hasUpstream: true, ahead, behind };
+}
+
+/**
+ * Whether `dir`'s HEAD has already landed on the source repo's default
+ * branch — i.e. is an ancestor of it, so the worktree's work is safe to
+ * throw away. `null` means "couldn't determine" and must never be presented
+ * as merged; callers should treat it as unknown, same contract as
+ * `hasUncommittedChanges`/`getAheadCount`.
+ *
+ * Default branch resolution, most to least authoritative:
+ *
+ * 1. `git rev-parse --abbrev-ref origin/HEAD` — the remote's advertised
+ *    default (e.g. resolves to `origin/main`). Used verbatim when it
+ *    succeeds and isn't the literal unresolved `origin/HEAD` (that string
+ *    comes back when the symbolic ref exists but doesn't point anywhere
+ *    useful, e.g. no remote configured).
+ * 2. No `origin/HEAD` — try local `main`, then `master`, via
+ *    `git show-ref --verify --quiet refs/heads/<b>` (exit 0 = branch exists).
+ * 3. Neither resolves: return `null` rather than guessing.
+ *
+ * Once a default branch candidate is picked, `git merge-base --is-ancestor
+ * HEAD <default>` maps exit code 0 → `true` (HEAD is an ancestor, i.e.
+ * merged), exit code 1 → `false` (diverged/not merged), and any other exit
+ * code (git error) → `null`.
+ *
+ * Runs with `cwd` = `dir`; a linked worktree shares the source repo's refs
+ * via its common git dir, so this resolves correctly without needing the
+ * source repo's own path.
+ */
+export async function isMergedIntoDefaultBranch(dir: string): Promise<boolean | null> {
+  if (!existsSync(dir)) return null;
+  if (!(await isGitRepo(dir))) return null;
+
+  let defaultBranch: string | null = null;
+
+  const originHead = await git(["rev-parse", "--abbrev-ref", "origin/HEAD"], dir);
+  if (originHead.ok && originHead.stdout.length > 0 && originHead.stdout !== "origin/HEAD") {
+    defaultBranch = originHead.stdout;
+  } else {
+    for (const candidate of ["main", "master"]) {
+      const ref = await git(["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`], dir);
+      if (ref.ok) {
+        defaultBranch = candidate;
+        break;
+      }
+    }
+  }
+
+  if (!defaultBranch || defaultBranch.startsWith("-")) return null;
+
+  const res = await git(["merge-base", "--is-ancestor", "HEAD", defaultBranch], dir);
+  if (res.exitCode === 0) return true;
+  if (res.exitCode === 1) return false;
+  return null;
+}
+
 // A directory's git top-level is stable for the lifetime of the process, so
 // resolved roots are memoized — discovery (/agent-discovery) resolves the same
 // workdir on every refresh and would otherwise spawn a `git rev-parse` for
@@ -213,7 +319,11 @@ export async function resolveRef(dir: string, ref: string): Promise<string | nul
  * float it to the top regardless of recency. `HEAD` pointer aliases such as
  * `origin/HEAD` are skipped.
  */
-export async function listBranches(dir: string): Promise<BranchInfo[]> {
+export async function listBranches(
+  dir: string,
+  opts?: { exclude?: Set<string> },
+): Promise<BranchInfo[]> {
+  const exclude = opts?.exclude;
   const root = await repoRoot(dir);
   if (!root) return [];
   const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], root);
@@ -247,7 +357,11 @@ export async function listBranches(dir: string): Promise<BranchInfo[]> {
     if (!line) continue;
     const parts = line.split("\t");
     if (parts.length < 3) continue;
-    if (parts[0]!.startsWith("refs/heads/") && !parts[1]!.startsWith("agetor/")) {
+    if (
+      parts[0]!.startsWith("refs/heads/") &&
+      !parts[1]!.startsWith(LEGACY_BRANCH_PREFIX) &&
+      !exclude?.has(parts[1]!)
+    ) {
       localNames.add(parts[1]!);
     }
   }
@@ -278,8 +392,12 @@ export async function listBranches(dir: string): Promise<BranchInfo[]> {
       seenRemote.add(bare);
     } else {
       // Branches agetor manages itself aren't the user's own — hide them. Local
-      // short-names are unique, so no further dedup is needed for heads.
-      if (shortName.startsWith("agetor/")) continue;
+      // short-names are unique, so no further dedup is needed for heads. Legacy
+      // per-task branches carry the `agetor/` prefix; custom-nomenclature ones
+      // (feature/…, fix/…) are recognized via the caller-supplied `exclude` set
+      // of pinned task branches.
+      if (shortName.startsWith(LEGACY_BRANCH_PREFIX)) continue;
+      if (exclude?.has(shortName)) continue;
     }
     // Upstream tracking. Only meaningful for local branches with a configured
     // upstream that still exists. `track` looks like "[ahead 2, behind 3]",
@@ -321,6 +439,23 @@ export async function gitFetch(dir: string): Promise<{ ok: boolean; error?: stri
   const root = await repoRoot(dir);
   if (!root) return { ok: false, error: "not a git repository" };
   const res = await git(["fetch", "--all", "--prune"], root, 120_000);
+  if (!res.ok) return { ok: false, error: res.stderr || `git fetch failed (exit ${res.exitCode})` };
+  return { ok: true };
+}
+
+/**
+ * Fetch a single branch from `origin` into `dir`'s repo — a targeted refresh
+ * used before resolving or checking out a pre-existing branch (e.g. a PR's
+ * head branch), so `origin/<branch>` reflects the remote even if it was
+ * pushed after the last full fetch. Unlike `gitFetch` (`--all --prune`), this
+ * touches only the one ref. Callers treat this as best-effort — the ref may
+ * already exist locally, so a failure here isn't necessarily fatal.
+ */
+export async function fetchBranch(dir: string, branch: string): Promise<{ ok: boolean; error?: string }> {
+  if (branch.startsWith("-")) return { ok: false, error: `invalid branch name: ${branch}` };
+  const root = await repoRoot(dir);
+  if (!root) return { ok: false, error: "not a git repository" };
+  const res = await git(["fetch", "origin", branch], root, 120_000);
   if (!res.ok) return { ok: false, error: res.stderr || `git fetch failed (exit ${res.exitCode})` };
   return { ok: true };
 }
@@ -391,6 +526,48 @@ export async function gitPull(dir: string, branch: string): Promise<{ ok: boolea
   return { ok: true };
 }
 
+/**
+ * Push a local `branch` to the repo's remote and set its upstream, so a branch
+ * that only exists locally (e.g. an agetor worktree branch) can be turned into a
+ * pull request. The target remote is the branch's existing upstream remote if it
+ * has one, else `origin`, else the first configured remote.
+ *
+ * Network-bound, so it gets the same longer budget as `gitFetch`/`gitPull`.
+ * Returns `{ ok: false, error }` when `dir` isn't a git repo, has no remote, or
+ * the push failed (rejected, auth, network) — the git stderr is surfaced for the
+ * UI. On success, `remote` names the remote the branch was pushed to.
+ */
+export async function gitPush(
+  dir: string,
+  branch: string,
+): Promise<{ ok: boolean; error?: string; remote?: string }> {
+  // Defense-in-depth against a "-"-leading value being read as a git flag,
+  // mirroring gitPull's guard.
+  if (branch.startsWith("-")) return { ok: false, error: `invalid branch name: ${branch}` };
+  const root = await repoRoot(dir);
+  if (!root) return { ok: false, error: "not a git repository" };
+
+  // Prefer the branch's existing upstream remote; fall back to `origin`, then the
+  // first configured remote. No remotes → nothing to push to.
+  let remote: string;
+  const up = await git(["rev-parse", "--abbrev-ref", `${branch}@{upstream}`], root, 5_000);
+  if (up.ok && up.stdout.includes("/")) {
+    remote = up.stdout.slice(0, up.stdout.indexOf("/"));
+  } else {
+    const remotes = await git(["remote"], root, 5_000);
+    const list = remotes.ok ? remotes.stdout.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+    if (list.length === 0) return { ok: false, error: "no git remote configured to push to" };
+    remote = list.includes("origin") ? "origin" : list[0]!;
+  }
+
+  // `--set-upstream` so subsequent PR creation and the behind indicator have a
+  // tracking ref to work against. The leading-dash guard above is what keeps the
+  // branch arg from being read as a flag (git push has no `--end-of-options`).
+  const res = await git(["push", "--set-upstream", remote, branch], root, 120_000);
+  if (!res.ok) return { ok: false, error: res.stderr || res.stdout || `git push failed (exit ${res.exitCode})` };
+  return { ok: true, remote };
+}
+
 function slugify(s: string): string {
   return s
     .toLowerCase()
@@ -400,11 +577,80 @@ function slugify(s: string): string {
 }
 
 export function branchName(task: Pick<Task, "id" | "title">): string {
-  return `agetor/${task.id.replace(/-/g, "").slice(0, 12)}-${slugify(task.title)}`;
+  return `${LEGACY_BRANCH_PREFIX}${task.id.replace(/-/g, "").slice(0, 12)}-${slugify(task.title)}`;
+}
+
+/**
+ * Whether a failed `git worktree add` means "that branch name is taken" — a
+ * create-time uniqueness race we can recover from by re-pinning. Git words it
+ * differently depending on which add form was used:
+ *   • `worktree add <path> <branch>`    → "'X' is already used by worktree at …"
+ *                                          (older git: "is already checked out at …")
+ *   • `worktree add -b <branch> <path>` → "a branch named 'X' already exists"
+ *
+ * Deliberately excludes `"'<path>' already exists"` — a stale worktree directory,
+ * where renaming the branch would not help and the error should surface as-is.
+ */
+export function isBranchNameTakenError(output: string): boolean {
+  return /is already used by worktree|already checked out|a branch named .* already exists/i
+    .test(output);
+}
+
+/**
+ * Return a branch name based on `desired` that is free within the repo at
+ * `root`: not already a local branch AND not in `taken` (the set of names
+ * pinned on other task rows, which may not exist as refs yet because branches
+ * are created lazily at start-time). Appends `-2`, `-3`, … until a free name
+ * is found. Guards against two tasks with the same title+type — and therefore
+ * the same computed name — colliding on one branch.
+ */
+export async function ensureUniqueBranch(
+  root: string,
+  desired: string,
+  taken: Set<string>,
+): Promise<string> {
+  const free = async (name: string): Promise<boolean> => {
+    if (taken.has(name)) return false;
+    const res = await git(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`], root, 5_000);
+    return !res.ok; // rev-parse fails (non-zero) when the ref doesn't exist
+  };
+  if (await free(desired)) return desired;
+  for (let n = 2; n < 10_000; n++) {
+    const candidate = `${desired}-${n}`;
+    if (await free(candidate)) return candidate;
+  }
+  return desired; // give up after 10k collisions — practically unreachable
 }
 
 export function worktreePath(task: Task): string {
   return path.join(WORKTREES_DIR, task.id);
+}
+
+/**
+ * Best-effort parse of a linked worktree's `.git` file — for a worktree
+ * (unlike an ordinary checkout) `.git` is a *file* containing a single line
+ * `gitdir: <repo>/.git/worktrees/<id>`, pointing back at the source repo's
+ * common dir. Used for orphaned worktree dirs (no task row to read `workdir`
+ * from) so the worktrees list can still show which repo they came from.
+ *
+ * Plain fs only — no git subprocess. Returns null when `.git` is missing,
+ * isn't a pointer file, or the path doesn't match the expected
+ * `.git/worktrees/<id>` shape.
+ */
+export function parseWorktreeGitPointer(worktreeDir: string): string | null {
+  try {
+    const gitFile = path.join(worktreeDir, ".git");
+    const contents = readFileSync(gitFile, "utf8").trim();
+    const match = /^gitdir:\s*(.+)$/.exec(contents);
+    if (!match) return null;
+    const gitdir = match[1]!;
+    const marker = `${path.sep}.git${path.sep}worktrees${path.sep}`;
+    const idx = gitdir.indexOf(marker);
+    if (idx < 0) return null;
+    return gitdir.slice(0, idx);
+  } catch {
+    return null;
+  }
 }
 
 export interface PreparedWorkdir {
@@ -435,7 +681,17 @@ export type PrepareResult = PreparedWorkdir | PrepareError;
  * the user's live working tree when they asked for isolation is worse than a
  * clear error. Callers should surface the message and abort the run.
  */
-export async function prepareWorkdir(task: Task): Promise<PrepareResult> {
+export async function prepareWorkdir(
+  task: Task,
+  opts?: {
+    /**
+     * Branch names already pinned on other task rows. Used by the collision
+     * recovery below so a re-pin can't steal a name a not-yet-started task is
+     * holding (those have no git ref yet, so a ref-only search can't see them).
+     */
+    takenBranches?: Set<string>;
+  },
+): Promise<PrepareResult> {
   if (task.isolation !== "worktree") {
     return { cwd: task.workdir, branch: null, worktreePath: null, note: "isolation: none" };
   }
@@ -472,11 +728,20 @@ export async function prepareWorkdir(task: Task): Promise<PrepareResult> {
   const wt = worktreePath(task);
   // Branch name: pinned at create time (task.branch is set by createTask for
   // worktree-isolation tasks). Fall back to computing it for legacy rows
-  // created before the pinning was added.
-  const branch = task.branch ?? branchName(task);
+  // created before the pinning was added. `let` because a create-time
+  // uniqueness race may force us to re-pin below.
+  let branch = task.branch ?? branchName(task);
   // Pinned base sha if set on the task; otherwise use HEAD at start time.
   // The sha makes the start state sticky across re-runs even when HEAD moves.
   const base = task.baseRef ?? "HEAD";
+
+  // For a task pinned to a pre-existing branch (e.g. a PR's head branch),
+  // refresh it from origin before deciding how to materialize the worktree —
+  // best-effort, since the branch may already be present locally with no
+  // remote at all.
+  if (task.branchSource === "existing") {
+    await fetchBranch(root, branch);
+  }
 
   // If the branch already exists (e.g. the worktree dir was manually deleted
   // but the branch survived), re-attach rather than reset — using `-B` would
@@ -487,13 +752,70 @@ export async function prepareWorkdir(task: Task): Promise<PrepareResult> {
   // a path it still tracks as a missing-but-registered worktree without a
   // prune step first.
   await git(["worktree", "prune"], root, 10_000);
-  const created = branchExists
+  let created = branchExists
     ? await git(["worktree", "add", wt, branch], root)
-    : await git(["worktree", "add", "-b", branch, wt, base], root);
+    : task.branchSource === "existing"
+      ? await git(["worktree", "add", "--track", "-b", branch, wt, `origin/${branch}`], root)
+      : await git(["worktree", "add", "-b", branch, wt, base], root);
+
+  // Collision recovery — ONLY on a first materialization (`!task.worktreePath`).
+  //
+  // Branch names are pinned at create time but only materialized here, so two
+  // tasks that computed the same name (a create-time uniqueness race — neither
+  // branch exists as a ref yet, so the create-time dedup can't see its twin) can
+  // end up pointing at one branch. Depending on which task wins, git rejects the
+  // loser in one of two ways, so neither `branchExists` arm can be assumed:
+  //   • re-attach path (branchExists) → "'X' is already used by worktree at …"
+  //   • new-branch path (-b)          → "a branch named 'X' already exists"
+  //     (the twin created it between our branchExists probe and this add)
+  // Rather than fail the run, pin a fresh unique variant off the base. The
+  // re-pinned name flows back via the returned `branch`; startTask persists it.
+  //
+  // The `!task.worktreePath` gate is load-bearing. Once a task HAS materialized,
+  // `task.branch` is ours and may hold the previous run's commits; we reach this
+  // code again only when the worktree dir was deleted, and the `worktree add`
+  // above is a deliberate *re-attach* that preserves those commits (see the `-B`
+  // note further up). Re-pinning there would create a fresh branch at `base` and
+  // silently orphan that work — so a re-attach failure must stay a hard error
+  // (e.g. the user checked the branch out in their main repo; they can free it).
+  //
+  // `takenBranches` keeps the replacement from stealing a name that another task
+  // has pinned but not yet started (no ref exists for those, so a ref-only search
+  // would miss them). See `isBranchNameTakenError` for the exact git wordings,
+  // and what it deliberately does not match (e.g. a stale worktree directory).
+  //
+  // Excluded for `branchSource === "existing"`: that branch name is the PR's
+  // real head branch, not one agetor minted — re-pinning it to a fresh variant
+  // would silently disconnect the task from the branch the user asked for. A
+  // collision there (branch checked out elsewhere) surfaces as a hard error.
+  if (
+    !created.ok &&
+    !task.worktreePath &&
+    task.branchSource !== "existing" &&
+    isBranchNameTakenError(`${created.stderr}\n${created.stdout}`)
+  ) {
+    const unique = await ensureUniqueBranch(root, branch, opts?.takenBranches ?? new Set());
+    if (unique !== branch) {
+      const retry = await git(["worktree", "add", "-b", unique, wt, base], root);
+      if (retry.ok) {
+        branch = unique;
+        created = retry;
+      }
+    }
+  }
 
   if (!created.ok) {
+    const detail = created.stderr || created.stdout;
+    if (task.branchSource === "existing") {
+      const used = /already used by worktree at '?([^'\n]+)'?/.exec(detail);
+      if (used) {
+        return {
+          error: `'${branch}' is currently checked out in ${used[1]} — switch that working tree to another branch, then start the task again`,
+        };
+      }
+    }
     return {
-      error: `worktree creation failed: ${created.stderr || created.stdout}`,
+      error: `worktree creation failed: ${detail}`,
     };
   }
 
@@ -506,103 +828,9 @@ export async function prepareWorkdir(task: Task): Promise<PrepareResult> {
   };
 }
 
-// Hunks larger than this (per file) are truncated before crossing the API so
-// a generated lockfile or vendored blob can't bloat the payload / freeze the
-// renderer. The viewer surfaces the truncation.
-const PER_FILE_HUNK_CAP = 200_000;
 // Process at most this many newly-created (untracked) files. Each costs a
 // `git diff --no-index` spawn, so cap to keep a runaway scratch dir cheap.
 const MAX_UNTRACKED = 200;
-// Cap the total number of changed files crossing the API. A reformat-the-world
-// or accidentally-committed build dir shouldn't ship a multi-MB payload the
-// renderer then has to mount. The viewer surfaces the omission via `note`.
-const MAX_FILES = 500;
-
-/** Strip a leading `a/` or `b/` prefix and un-quote git's C-style path. */
-function cleanPath(raw: string): string | null {
-  let p = raw.trim();
-  if (p === "/dev/null") return null;
-  if (p.startsWith('"') && p.endsWith('"')) {
-    // git quotes paths containing unusual bytes; the escaping overlaps with
-    // JSON for the common cases (spaces, unicode). Best-effort un-quote.
-    try { p = JSON.parse(p) as string; } catch { /* keep quoted form */ }
-  }
-  if (p.startsWith("a/") || p.startsWith("b/")) p = p.slice(2);
-  return p;
-}
-
-/**
- * Parse `git diff` (unified, --no-color) output into one entry per file.
- * Sections start at each `diff --git …` line; the body keeps the extended
- * header (`new file mode`, `rename to`, `Binary files …`) plus the `@@` hunks.
- */
-function parseGitDiff(raw: string): DiffFile[] {
-  const files: DiffFile[] = [];
-  const headerRe = /^diff --git .*$/gm;
-  const starts: number[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = headerRe.exec(raw))) starts.push(m.index);
-
-  for (let i = 0; i < starts.length; i++) {
-    const section = raw.slice(starts[i], starts[i + 1] ?? raw.length);
-    const lines = section.split("\n");
-    let status: DiffFile["status"] = "modified";
-    let binary = false;
-    let oldPath: string | null = null;
-    let newPath: string | null = null;
-    let renameFrom: string | null = null;
-    let renameTo: string | null = null;
-    let hunkStart = -1;
-
-    for (let j = 1; j < lines.length; j++) {
-      const l = lines[j]!;
-      if (l.startsWith("new file mode")) status = "added";
-      else if (l.startsWith("deleted file mode")) status = "deleted";
-      else if (l.startsWith("rename from ")) { renameFrom = cleanPath(l.slice(12)); status = "renamed"; }
-      else if (l.startsWith("rename to ")) { renameTo = cleanPath(l.slice(10)); status = "renamed"; }
-      else if (l.startsWith("Binary files") || l.startsWith("GIT binary patch")) binary = true;
-      else if (l.startsWith("--- ")) oldPath = cleanPath(l.slice(4));
-      else if (l.startsWith("+++ ")) newPath = cleanPath(l.slice(4));
-      else if (l.startsWith("@@")) { hunkStart = j; break; }
-    }
-
-    const fullHunks = hunkStart >= 0 ? lines.slice(hunkStart).join("\n") : "";
-
-    // Count from the full hunks before any truncation so the summary line
-    // stays honest even when the rendered body is cut. (`+++`/`---` headers
-    // sit before the first `@@`, so they're never in `fullHunks` — the guards
-    // are belt-and-suspenders.)
-    let additions = 0;
-    let deletions = 0;
-    for (const l of fullHunks.split("\n")) {
-      if (l.startsWith("+") && !l.startsWith("+++")) additions++;
-      else if (l.startsWith("-") && !l.startsWith("---")) deletions++;
-    }
-
-    // Cap the rendered body, slicing at a line boundary so the last visible
-    // row isn't a partial line.
-    let hunks = fullHunks;
-    let truncated = false;
-    if (fullHunks.length > PER_FILE_HUNK_CAP) {
-      const cut = fullHunks.lastIndexOf("\n", PER_FILE_HUNK_CAP);
-      hunks = fullHunks.slice(0, cut > 0 ? cut : PER_FILE_HUNK_CAP);
-      truncated = true;
-    }
-
-    files.push({
-      path: renameTo ?? newPath ?? oldPath ?? "(unknown)",
-      oldPath: status === "renamed" ? renameFrom ?? oldPath : null,
-      status,
-      additions,
-      deletions,
-      binary,
-      hunks: binary ? "" : hunks,
-      truncated,
-    });
-  }
-  return files;
-}
-
 /**
  * Compute everything a task changed in its working directory — committed AND
  * uncommitted changes to tracked files, plus newly created (untracked) files
@@ -675,12 +903,12 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
     return { base: shortBase, files: [], note: emptyNote };
   }
   files.sort((a, b) => a.path.localeCompare(b.path));
-  if (files.length > MAX_FILES) {
+  if (files.length > MAX_DIFF_FILES) {
     const total = files.length;
     return {
       base: shortBase,
-      files: files.slice(0, MAX_FILES),
-      note: `Showing the first ${MAX_FILES} of ${total} changed files — the rest are omitted to keep the viewer responsive.`,
+      files: files.slice(0, MAX_DIFF_FILES),
+      note: `Showing the first ${MAX_DIFF_FILES} of ${total} changed files — the rest are omitted to keep the viewer responsive.`,
     };
   }
   return { base: shortBase, files };
@@ -703,7 +931,11 @@ export async function removeWorktree(task: Task): Promise<void> {
   const root = await repoRoot(task.workdir);
   if (root) {
     await git(["worktree", "remove", "--force", task.worktreePath], root);
-    if (task.branch) await git(["branch", "-D", task.branch], root);
+    // A `branchSource: "existing"` branch is the user's own (e.g. a PR's head
+    // branch) — deleting it here would destroy a branch agetor doesn't own.
+    if (task.branch && task.branchSource !== "existing") {
+      await git(["branch", "-D", task.branch], root);
+    }
     // Clean up any stale .git/worktrees/<id>/ registrations left by previous
     // partial removes (e.g. workdir was changed after the worktree was created).
     await git(["worktree", "prune"], root, 10_000);
@@ -713,7 +945,86 @@ export async function removeWorktree(task: Task): Promise<void> {
     task.worktreePath.startsWith(ownedPrefix)
     && existsSync(task.worktreePath)
   ) {
-    try { rmSync(task.worktreePath, { recursive: true, force: true }); }
+    // Async on purpose: a synchronous rmSync over a large worktree (e.g. one
+    // with node_modules) would block the event loop for seconds, starving
+    // every other HTTP connection and SSE stream.
+    try { await rm(task.worktreePath, { recursive: true, force: true }); }
     catch { /* best-effort */ }
   }
+}
+
+/**
+ * Best-effort `git worktree prune` in `root` — clears the stale
+ * `.git/worktrees/<id>` registration left behind after a worktree directory
+ * is removed outside of `git worktree remove` (e.g. `deleteOrphanWorktree`,
+ * which `rm -rf`s an orphaned dir with no task row to drive a proper
+ * removal). Never throws.
+ */
+export async function pruneWorktrees(root: string): Promise<void> {
+  await git(["worktree", "prune"], root, 10_000);
+}
+
+/**
+ * Branch-preserving teardown for archive. Unlike `removeWorktree`, this keeps
+ * the branch (and thus every commit on it) intact — it only removes the
+ * worktree *checkout* from disk, so `prepareWorkdir`'s re-attach path
+ * (`task.worktreePath` recorded but the dir is gone, branch still exists) can
+ * rematerialize it later at the same deterministic path. This is what lets an
+ * archived task's session (claude JSONL, run history, codex thread id — none
+ * of which live inside the worktree) be resumed after unarchiving or after a
+ * follow-up message.
+ *
+ * No-op when there's nothing to detach: `task.worktreePath` is null, or the
+ * directory is already gone (idempotent — safe to call repeatedly).
+ *
+ * Skips removal when the worktree has uncommitted changes — `git worktree
+ * remove --force` would otherwise permanently discard them with no way back
+ * (the branch only has what was committed). `hasUncommittedChanges` returns
+ * null whenever it can't get an answer — dir gone (vanished between the two
+ * checks), path not a git repo, or `git status` failing on a broken/pruned
+ * registration; all of those are "can't confirm clean" → skip removal.
+ *
+ * Pass `{ force: true }` to skip that dirty gate entirely — the Worktrees
+ * page's delete action offers this as an explicit, user-confirmed "discard
+ * uncommitted changes" option once the ordinary path above has left a row
+ * permanently stuck (dirty checkouts, or a `git status` that keeps failing on
+ * a broken registration, would otherwise never clear). Force only ever skips
+ * the dirty check — the rest of the body, including the branch-preserving
+ * guarantee below, is unchanged: `git branch -D` is never called, forced or
+ * not, so the branch and every commit on it survive for a later re-attach.
+ *
+ * Never throws — best-effort, mirroring `removeWorktree`.
+ */
+export async function detachWorktree(
+  task: Task,
+  opts?: { force?: boolean },
+): Promise<WorktreeTeardownResult> {
+  if (!task.worktreePath) return { removed: false, reason: "no-worktree" };
+  if (!existsSync(task.worktreePath)) return { removed: false, reason: "already-absent" };
+
+  if (!opts?.force) {
+    const dirty = await hasUncommittedChanges(task.worktreePath);
+    if (dirty !== false) return { removed: false, reason: "dirty" };
+  }
+
+  const root = await repoRoot(task.workdir);
+  if (root) {
+    await git(["worktree", "remove", "--force", task.worktreePath], root);
+    // Deliberately no `git branch -D` — the whole point of detach is to keep
+    // the branch around for a later re-attach.
+    await git(["worktree", "prune"], root, 10_000);
+  }
+  const ownedPrefix = WORKTREES_DIR + path.sep;
+  if (
+    task.worktreePath.startsWith(ownedPrefix)
+    && existsSync(task.worktreePath)
+  ) {
+    // Async on purpose: a synchronous rmSync over a large worktree (e.g. one
+    // with node_modules) would block the event loop for seconds, starving
+    // every other HTTP connection and SSE stream.
+    try { await rm(task.worktreePath, { recursive: true, force: true }); }
+    catch { /* best-effort */ }
+  }
+  const removed = !existsSync(task.worktreePath);
+  return removed ? { removed } : { removed, reason: "failed" };
 }

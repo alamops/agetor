@@ -2,6 +2,7 @@ import { test, expect, beforeEach } from "bun:test";
 import {
   buildCommand,
   buildHarnessTerminalCommand,
+  CLAUDE_PROMPT_ARGV_MAX_BYTES,
   isValidEnvKey,
   toTerminalAppleScript,
 } from "./agents.ts";
@@ -174,6 +175,16 @@ test("claude-code 'opus-4.8' maps to --model claude-opus-4-8", () => {
   ]);
 });
 
+test("claude-code 'opus-5' maps to --model claude-opus-5", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "opus-5", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-opus-5",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
 test("claude-code 'fable-5' maps to --model claude-fable-5", () => {
   const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "fable-5", mode: "auto" });
   expect(cmd).toEqual([
@@ -267,6 +278,66 @@ test("claude-code appends the prompt as the final argv element", () => {
 test("claude-code with empty prompt does not append an empty argv element", () => {
   const { cmd } = buildCommand(builtin("claude-code"), "", { ...claudeDefaults });
   expect(cmd).not.toContain("");
+});
+
+// --- deferred prompt (CLAUDE_PROMPT_ARGV_MAX_BYTES) -------------------------
+// Above CLAUDE_PROMPT_ARGV_MAX_BYTES, embedding the prompt in argv blows
+// tmux's ~16KB client-command cap ("command too long"). buildCommand omits
+// the prompt from argv entirely above the threshold and returns it as
+// `deferredPrompt` instead; at-or-below the threshold argv is byte-identical
+// to today's shape.
+
+test("claude-code prompt of exactly CLAUDE_PROMPT_ARGV_MAX_BYTES bytes still rides argv, deferredPrompt undefined", () => {
+  const prompt = "a".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES);
+  const { cmd, deferredPrompt } = buildCommand(builtin("claude-code"), prompt, { ...claudeDefaults });
+  expect(cmd[cmd.length - 2]).toBe("--");
+  expect(cmd[cmd.length - 1]).toBe(prompt);
+  expect(deferredPrompt).toBeUndefined();
+});
+
+test("claude-code prompt one byte over CLAUDE_PROMPT_ARGV_MAX_BYTES is deferred, not in argv", () => {
+  const prompt = "a".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES + 1);
+  const { cmd, deferredPrompt } = buildCommand(builtin("claude-code"), prompt, { ...claudeDefaults });
+  expect(cmd).not.toContain(prompt);
+  // No dangling `--` terminator left behind for the (now-absent) prompt.
+  expect(cmd[cmd.length - 1]).not.toBe("--");
+  expect(deferredPrompt).toBe(prompt);
+});
+
+test("claude-code deferred prompt still emits --resume <id>; only the prompt itself is deferred", () => {
+  const prompt = "a".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES + 1);
+  const { cmd, deferredPrompt } = buildCommand(builtin("claude-code"), prompt, {
+    ...claudeDefaults,
+    resumeSessionId: "abc-123-uuid",
+  });
+  const i = cmd.indexOf("--resume");
+  expect(i).toBeGreaterThan(-1);
+  expect(cmd[i + 1]).toBe("abc-123-uuid");
+  expect(cmd).not.toContain(prompt);
+  expect(cmd[cmd.length - 1]).not.toBe("--");
+  expect(deferredPrompt).toBe(prompt);
+});
+
+test("claude-code defers on UTF-8 byte length, not JS string length (multi-byte prompt)", () => {
+  // "€" is 1 UTF-16 code unit (.length counts it as 1) but 3 UTF-8 bytes.
+  // 2000 of them → .length 2000 (well under the threshold) but byteLength
+  // 6000 (over it) — this only defers if the check is Buffer.byteLength.
+  const prompt = "€".repeat(2000);
+  expect(prompt.length).toBeLessThan(CLAUDE_PROMPT_ARGV_MAX_BYTES);
+  expect(Buffer.byteLength(prompt, "utf8")).toBeGreaterThan(CLAUDE_PROMPT_ARGV_MAX_BYTES);
+  const { cmd, deferredPrompt } = buildCommand(builtin("claude-code"), prompt, { ...claudeDefaults });
+  expect(cmd).not.toContain(prompt);
+  expect(deferredPrompt).toBe(prompt);
+});
+
+test("codex is unaffected by prompt size — always delivered via stdin, never deferred", () => {
+  // Codex's prompt never rides argv (it's piped via stdin, the trailing `-`
+  // sentinel), so it has no size-driven argv problem and no deferredPrompt.
+  const prompt = "a".repeat(CLAUDE_PROMPT_ARGV_MAX_BYTES * 4);
+  const result = buildCommand(builtin("codex"), prompt, { ...codexDefaults });
+  expect(result.cmd).not.toContain(prompt);
+  expect(result.cmd[result.cmd.length - 1]).toBe("-");
+  expect(result.deferredPrompt).toBeUndefined();
 });
 
 test("claude-code resumeSessionId adds --resume <id> to the argv (no --session-id)", () => {

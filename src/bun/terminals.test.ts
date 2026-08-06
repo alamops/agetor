@@ -35,12 +35,14 @@ function makeTask(workdir: string, extra: Partial<Task> = {}): Task {
     isolation: "none", // no git repo needed; cwd resolves to workdir
     taskType: "task",
     branch: null,
+    branchSource: "created",
     worktreePath: null,
     baseRef: null,
+    prUrl: null,
     mode: null,
     model: null,
     effort: null,
-    references: [],
+    references: [],    backlog: [], draft: null,
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,
@@ -148,11 +150,11 @@ test("archiving a task closes its terminals", async () => {
   expect(countTerminals(task.id)).toBe(2);
 
   const { archiveTask } = await import("./orchestrator.ts");
-  const res = archiveTask(task.id);
+  const res = await archiveTask(task.id);
   expect("task" in res).toBe(true);
 
-  // killTerminalsForTask runs its teardown synchronously (only the shell-reap
-  // is deferred), so the tabs are gone the moment archiveTask returns.
+  // archiveTask awaits killTerminalsForTask (a live shell would block the
+  // worktree detach), so the tabs are gone once it resolves.
   expect(countTerminals(task.id)).toBe(0);
   expect(tasks.get(task.id)!.openTerminalCount).toBe(0);
 });

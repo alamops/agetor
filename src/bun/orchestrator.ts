@@ -1,15 +1,23 @@
 import { randomUUID } from "node:crypto";
-import { db, tasks, runs, harnesses, subagents } from "./db.ts";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import {
   AGENT_OPTIONS,
+  DEFAULT_BRANCH_CONFIG,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
+  IDLE_SESSION_REAP_MS,
   MODEL_EFFORT_SUPPORT,
   SESSION_DIED_STATUS_PREFIX,
   TASK_TYPES,
+  branchPattern,
+  renderBranchTemplate,
+  validateBranchName,
   type AgentKind,
   type Harness,
   type TaskType,
@@ -27,6 +35,7 @@ function resolveHarness(harnessId: string): Harness | null {
 }
 import {
   cancelPendingForTask,
+  countPendingForTask,
   setBroadcaster,
   setResolvedBroadcaster,
   type AnyRequest,
@@ -34,6 +43,7 @@ import {
 } from "./interactions.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
+  CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
   cycleToMode,
   type CycleResult,
   type ContinuationHooks,
@@ -46,12 +56,15 @@ import {
   hasSessionState,
   sessionExists,
   sessionExistsByName,
+  sessionIdleInfo,
   sessionLiveness,
   sessionNameFor,
+  probeSessionActivity,
   jsonlPathFor,
   interruptTaskSession,
   setContinuationRunFactory,
   setHeldSessionProbe,
+  setActiveRunProbe,
   setBackgroundTaskSettledHandler,
 } from "./claude-tmux.ts";
 import {
@@ -69,8 +82,24 @@ import {
   settleSubagentById,
   orphanRunningSubagents,
   attachSubagentWatcher,
+  pumpWatcherForHoldCheck,
 } from "./claude-subagents.ts";
-import { prepareWorkdir, removeWorktree, repoRoot, resolveRef, branchName } from "./worktree.ts";
+import {
+  prepareWorkdir,
+  removeWorktree,
+  detachWorktree,
+  repoRoot,
+  resolveRef,
+  branchName,
+  ensureUniqueBranch,
+  fetchBranch,
+  WORKTREES_DIR,
+  parseWorktreeGitPointer,
+  pruneWorktrees,
+  hasUncommittedChanges,
+  getAheadCount,
+  isMergedIntoDefaultBranch,
+} from "./worktree.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
@@ -79,7 +108,12 @@ import type {
   RunEvent,
   RunStatus,
   Task,
+  WorktreeGitStatus,
+  WorktreeInfo,
+  WorktreeStaleReason,
+  WorktreeTeardownResult,
 } from "../shared/types.ts";
+import { WORKTREE_STALE_AFTER_MS } from "../shared/types.ts";
 import { appendReferences } from "../shared/refs.ts";
 
 type Listener = (e: RunEvent) => void;
@@ -112,8 +146,91 @@ interface ActiveRun {
    *  handler reads this on resolution to keep it there (record the run as
    *  `failed`, not bounce to `ready`). */
   sessionDied: boolean;
+  /** Set when claude's TUI rejected the pasted message as an unknown slash
+   *  command (the driver emitted the `CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX`
+   *  sentinel — no JSONL line was ever written for that turn). Like
+   *  `apiError`/`sessionDied`, the chunk handler flips the column to
+   *  `blocked` immediately and the done handler reads this on resolution to
+   *  keep it there (record the run as `failed`, not bounce to `ready`). */
+  unknownCommand: boolean;
 }
 const active = new Map<string, ActiveRun>(); // runId -> handle
+
+// Guards `reapIdleSessions` against overlapping sweeps — the boot one-shot
+// and the recurring `setInterval` in index.ts could otherwise both be
+// in-flight if a sweep ever ran long (many candidate tasks, a slow tmux
+// probe). A simple boolean is enough: sweeps are infrequent (every
+// `SESSION_REAP_SWEEP_MS`) and idempotent, so skipping one entirely when
+// another is still running just means its candidates get picked up next tick.
+let reapInFlight = false;
+
+// Archive/delete teardown (tmux session kill, terminal teardown, worktree
+// detach/remove) is deferred onto a per-source-workdir FIFO queue so
+// `archiveTask` can flip the DB column and respond in milliseconds instead of
+// blocking on `spawnSync` tmux kills and `git worktree remove --force`/
+// `prune`. The serialization is deliberate, not incidental: concurrent `git
+// worktree remove`/`prune` invocations against the SAME source repo contend
+// on git's internal locks (`.git/worktrees/.lock` etc.), so archiving several
+// tasks that share a workdir must still tear them down one at a time — just
+// not on the request's critical path. Tasks in *different* source repos have
+// no such lock contention, so they get independent chains and never wait on
+// each other — a big worktree removal for repo A must not stall a DELETE in
+// unrelated repo B. `teardownTails` keys the chain by `task.workdir` (the raw
+// string, not a resolved repo root — two tasks pointed at different subdirs
+// of the same repo would therefore get separate chains and could still
+// contend on git's locks; accepted as rare, and best-effort teardown plus the
+// boot sweep heal any resulting strand). `teardowns` is unchanged: it lets
+// callers (unarchive/start/delete, plus the boot-time sweep) await a specific
+// task's in-flight teardown before touching the same worktree, keyed by task
+// id as before — this still works under per-workdir chains because a task's
+// workdir can't change while a teardown is pending (archived tasks are
+// PATCH-frozen, and every materializing path awaits `pendingTeardown` first).
+const teardownTails = new Map<string, Promise<void>>();
+const teardowns = new Map<string, Promise<void>>();
+
+/**
+ * Chain `job` onto the teardown FIFO for `key` (the task's source `workdir`)
+ * and track it per-task so `pendingTeardown` can be awaited by callers that
+ * must not race a deferred teardown (unarchive, start, delete, the orphan
+ * sweep). Errors from `job` are caught and logged — a single misbehaving
+ * teardown must never break the chain for every task queued behind it on the
+ * same workdir.
+ */
+function enqueueTeardown(taskId: string, key: string, job: () => Promise<void>): Promise<void> {
+  const tail = teardownTails.get(key) ?? Promise.resolve();
+  const p = tail
+    .then(job)
+    .catch((err) => {
+      console.warn(`[agetor] deferred teardown failed for task ${taskId}:`, err);
+    });
+  teardownTails.set(key, p);
+  p.finally(() => {
+    // Only clear the entry if it's still the current tail for this key — a
+    // later enqueue for the same workdir must not have its chain slot
+    // clobbered by this settle, and this also bounds the map's size (an idle
+    // workdir's entry is removed once its chain drains).
+    if (teardownTails.get(key) === p) teardownTails.delete(key);
+  });
+  teardowns.set(taskId, p);
+  p.finally(() => {
+    // Only clear the entry if it's still ours — a later enqueue for the same
+    // task (e.g. delete right after archive) must not have its promise
+    // clobbered by this settle.
+    if (teardowns.get(taskId) === p) teardowns.delete(taskId);
+  });
+  return p;
+}
+
+/**
+ * Await any deferred teardown currently in flight (or queued) for `taskId`.
+ * Resolves immediately when nothing is pending. Exported so `unarchiveTask`,
+ * `startTask`, and the boot-time sweep can serialize against a still-running
+ * archive/delete teardown before touching the same worktree, and so tests can
+ * drain the queue deterministically.
+ */
+export function pendingTeardown(taskId: string): Promise<void> {
+  return teardowns.get(taskId) ?? Promise.resolve();
+}
 
 export function subscribe(fn: Listener): () => void {
   listeners.add(fn);
@@ -156,14 +273,33 @@ setContinuationRunFactory(startContinuationRun);
 // existing DB-derived hold predicate — no new state to track.
 setHeldSessionProbe(isHeldByBackgroundAgents);
 
+// Run association for `signalSubagentApiError` (#93): answers "what run id
+// is currently in flight for this task, per the orchestrator's OWN `active`
+// map?" so a stale async subagent from an older run can't abort a newer
+// run's turn. `task.runId` alone isn't enough — it's set the instant
+// `startTask` inserts the run row, before `spawnAgent` returns and
+// `registerActiveRun` populates `active`, and it's also left stale after a
+// run resolves — so the extra `active.has` check (the exact idiom used
+// throughout this file, e.g. the busy/idle branch in `sendInput`) is what
+// actually answers "in flight right now."
+setActiveRunProbe((taskId) => {
+  const task = tasks.get(taskId);
+  if (!task?.runId) return null;
+  return active.has(task.runId) ? task.runId : null;
+});
+
 // Background-task settle signal: a parent task-notification JSONL line named
 // the finishing agent/background-task id — settle that subagent row the same
 // way a naturally-detected completion would (DB flip → lifecycle emit →
 // settle hook → `maybeReleaseHeldTask`). Tolerant by design: a line whose id
 // matches no row, or a duplicate fired again on reattach replay, is a no-op
-// inside `settleSubagentById`.
+// inside `settleSubagentById`. `source: "receipt"` (claude-subagents.ts fix 4)
+// — this IS the live `<task-notification>` dispatch, the harness's own
+// authoritative completion signal, so the settled row should resist a
+// trailing assistant/attachment flush resurrecting it the way an inferred
+// settle would allow.
 setBackgroundTaskSettledHandler((_taskId, agentId) => {
-  settleSubagentById(agentId, "completed");
+  settleSubagentById(agentId, "completed", "receipt");
 });
 
 /**
@@ -211,7 +347,7 @@ function updateColumn(
   taskId: string,
   runId: string | null,
   next: ColumnId,
-  reason?: "api-error" | "approval" | "session-died",
+  reason?: "api-error" | "approval" | "session-died" | "unknown-command",
 ): void {
   const before = tasks.get(taskId);
   const prev: ColumnId | null = before?.column ?? null;
@@ -227,12 +363,21 @@ function updateColumn(
  * `active` map) so the answer survives a restart and doesn't depend on
  * whether the subagent's settle fired before or after the run's completion
  * landed — either interleaving reads the same committed rows.
+ *
+ * Split into a pure `(task) => boolean` predicate plus a taskId-keyed
+ * wrapper so callers that already hold a freshly-fetched `Task` row (e.g.
+ * `reapIdleSessions`'s per-candidate guard) can reuse it without a second,
+ * redundant `tasks.get`.
  */
+function isTaskHeldByBackgroundAgents(task: Task): boolean {
+  if (task.column !== "running" || task.runId == null) return false;
+  if (runs.get(task.runId)?.status !== "succeeded") return false;
+  return subagents.hasRunning(task.id);
+}
+
 function isHeldByBackgroundAgents(taskId: string): boolean {
   const task = tasks.get(taskId);
-  if (!task || task.column !== "running" || task.runId == null) return false;
-  if (runs.get(task.runId)?.status !== "succeeded") return false;
-  return subagents.hasRunning(taskId);
+  return task ? isTaskHeldByBackgroundAgents(task) : false;
 }
 
 /**
@@ -444,6 +589,7 @@ export function reconcileOrphans(): number {
             configDir: harness?.home ?? null,
             onChunk,
             seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+            mode: task.mode,
           })
         : kind === "codex"
         ? reattachCodexSession({
@@ -641,9 +787,22 @@ export function reconcileOrphans(): number {
 
 
 export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
-  const task = tasks.get(taskId);
+  let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
+
+  // startTask auto-unarchives and materializes the worktree below — it must
+  // not race a teardown archiveTask (or deleteTask) deferred for this task,
+  // or a `detachWorktree`/`removeWorktree` still in flight could yank the
+  // directory out from under the freshly-prepared one.
+  await pendingTeardown(taskId);
+
+  // Starting an archived task auto-unarchives it — otherwise the card would
+  // move through columns (running → review/ready) while hidden behind the
+  // archive filter, which is confusing at best.
+  if (task.archivedAt != null) {
+    task = tasks.update(taskId, { archivedAt: null }) ?? task;
+  }
 
   const harness = resolveHarness(task.agent);
   if (!harness) {
@@ -661,7 +820,17 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     return { error: `${harness.label} is not available — ${status.reason}.${hint}` };
   }
 
-  const prepared = await prepareWorkdir(task);
+  // Pass the branches other tasks have pinned. If materializing this task's
+  // branch hits a create-time uniqueness race, the recovery re-pins to a name
+  // that's free of both existing refs AND those not-yet-started pins.
+  const prepared = await prepareWorkdir(task, {
+    takenBranches: new Set(
+      tasks.list()
+        .filter((t) => t.id !== taskId)
+        .map((t) => t.branch)
+        .filter((b): b is string => Boolean(b)),
+    ),
+  });
   if ("error" in prepared) return { error: prepared.error };
 
   // Lazy-pin baseRef: workdir wasn't a git repo when the task was created but
@@ -802,6 +971,26 @@ function makeChunkHandler(
         }
       }
     }
+    // Unknown-slash-command path (claude-code only): claude's TUI rejected
+    // the pasted message as an unknown slash command — no JSONL line was
+    // ever written for it, so claude-tmux's pane scraper is the only source
+    // of this sentinel. Flip to `blocked` here so the card stops sitting in
+    // `running`, and mark the handle so `attachDoneHandler` doesn't bounce
+    // it back to `ready` when the resolution lands a moment later.
+    if (
+      kind === "claude-code"
+      && stream === "status"
+      && data.startsWith(CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX)
+    ) {
+      const handle = active.get(runId);
+      if (handle && !handle.unknownCommand) {
+        handle.unknownCommand = true;
+        const task = tasks.get(taskId);
+        if (task && task.runId === runId) {
+          updateColumn(taskId, runId, "blocked", "unknown-command");
+        }
+      }
+    }
   };
 }
 
@@ -818,6 +1007,7 @@ function registerActiveRun(
     cancelled: false,
     apiError: false,
     sessionDied: false,
+    unknownCommand: false,
     writeInput: (line) => agent.writeInput(line),
   });
 }
@@ -838,15 +1028,16 @@ function attachDoneHandler(
       const wasCancelled = handle?.cancelled ?? false;
       const wasApiError = handle?.apiError ?? false;
       const wasSessionDied = handle?.sessionDied ?? false;
+      const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
 
-      // API error / session-death override the exit-code mapping: the driver
-      // resolves the turn with code 0 (a clean end_turn was staged), but the
-      // run really failed — record it as such so the badge and history are
-      // honest.
+      // API error / session-death / unknown-command override the exit-code
+      // mapping: the driver resolves the turn with code 0 (a clean end_turn
+      // was staged), but the run really failed — record it as such so the
+      // badge and history are honest.
       const newStatus: RunStatus = wasCancelled
         ? "cancelled"
-        : (wasApiError || wasSessionDied) ? "failed"
+        : (wasApiError || wasSessionDied || wasUnknownCommand) ? "failed"
         : code === 0 ? "succeeded" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: code });
       // Only flip the task's column when the run that just resolved is
@@ -866,11 +1057,29 @@ function attachDoneHandler(
         // above, so the concurrent-settle path (`maybeReleaseHeldTask`) reads
         // the correct terminal status; whichever of the two fires last wins and
         // both interleavings converge on the right column, so no lock is needed.
+        // Give the subagent watcher one synchronous cycle before asking it
+        // whether anything is still running. The rows that answer that
+        // question are created by the watcher's own poll, and a task that has
+        // not discovered a background agent yet polls on the SLOW/DEEP_IDLE
+        // tier (4-10s) — while this runs ~END_TURN_IDLE_FIRE_MS after the
+        // turn's end_turn. So an agent (or a `/workflow`) launched in the
+        // closing moments of a turn is usually NOT in the DB yet at this
+        // point, and the card would flip to `review` only to be dragged back
+        // by `pullBackParkedTask` a few seconds later — a visible bounce and a
+        // misleading breadcrumb. Pumping here reads the launch line that is
+        // already on disk and makes the hold decision deterministic.
+        try {
+          pumpWatcherForHoldCheck(taskId);
+        } catch {
+          // Belt-and-braces: the callee already swallows its own errors, but a
+          // watcher problem must never derail run settlement.
+        }
         const holdForSubagents =
           newStatus === "succeeded"
           && !wasCancelled
           && !wasApiError
           && !wasSessionDied
+          && !wasUnknownCommand
           && subagents.hasRunning(taskId);
         if (holdForSubagents) {
           const runningCount = subagents.runningCountForTask(taskId);
@@ -887,7 +1096,7 @@ function attachDoneHandler(
           // `blocked` just because it had previously hit an API error.
           const nextColumn: ColumnId = wasCancelled
             ? "ready"
-            : (wasApiError || wasSessionDied) ? "blocked"
+            : (wasApiError || wasSessionDied || wasUnknownCommand) ? "blocked"
             : newStatus === "succeeded" ? "review" : "ready";
           updateColumn(taskId, runId, nextColumn);
         }
@@ -910,16 +1119,18 @@ function attachDoneHandler(
       const handle = active.get(runId);
       const wasCancelled = handle?.cancelled ?? false;
       const wasSessionDied = handle?.sessionDied ?? false;
+      const wasUnknownCommand = handle?.unknownCommand ?? false;
       active.delete(runId);
       const newStatus: RunStatus = wasCancelled ? "cancelled" : "failed";
       runs.update(runId, { status: newStatus, endedAt: Date.now(), exitCode: -1 });
       const task = tasks.get(taskId);
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
-        // A session-death that reaches the reject path (not the case today —
-        // both drivers resolve on death — but keep the column consistent with
-        // the resolve path if a future refactor ever rejects instead).
-        updateColumn(taskId, runId, wasSessionDied ? "blocked" : "ready");
+        // A session-death / unknown-command that reaches the reject path (not
+        // the case today — both drivers resolve on these — but keep the
+        // column consistent with the resolve path if a future refactor ever
+        // rejects instead).
+        updateColumn(taskId, runId, (wasSessionDied || wasUnknownCommand) ? "blocked" : "ready");
       }
       emit({
         runId,
@@ -1089,6 +1300,37 @@ function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult
   }
 }
 
+/**
+ * Stop the active handle `h`'s task. `kill()` sends Ctrl+C to the tmux
+ * session, which also clears claude's queued-input buffer, so every queued
+ * run in this task is going down too. Mark each active handle as cancelled
+ * so their done handlers record "cancelled" (not "failed") when their
+ * slot's reject fires. Resolve any in-flight approval / question for this
+ * task BEFORE the interrupt — otherwise the hook script's curl and the MCP
+ * server's fetch would sit on a doomed HTTP response until their own
+ * timeouts. Shared by `cancelRun` (Stop button) and `archiveTask`
+ * (`stopRun`) so the two can't drift.
+ */
+function stopActiveHandle(h: ActiveRun, reason: string): void {
+  for (const [, handle] of active) {
+    if (handle.taskId === h.taskId) handle.cancelled = true;
+  }
+  cancelPendingForTask(h.taskId, reason);
+  h.kill();
+}
+
+/**
+ * Stop a task that's "held" (see `isHeldByBackgroundAgents`) — its terminal
+ * run already succeeded but background agents are still running, so there's
+ * no `active` handle to kill. Interrupt the live session and release the
+ * hold. Shared by `cancelRun` (Stop button) and `archiveTask` (`stopRun`).
+ */
+function stopHeldTask(taskId: string, reason: string): void {
+  cancelPendingForTask(taskId, reason);
+  interruptTaskSession(taskId);
+  orphanRunningSubagents(taskId);
+}
+
 export function cancelRun(runId: string): boolean {
   const h = active.get(runId);
   if (!h) {
@@ -1100,24 +1342,11 @@ export function cancelRun(runId: string): boolean {
     // already succeeded, so the card advances to `review`.
     const taskId = runs.get(runId)?.taskId;
     if (!taskId || !isHeldByBackgroundAgents(taskId)) return false;
-    cancelPendingForTask(taskId, "cancelled by user");
-    interruptTaskSession(taskId);
-    orphanRunningSubagents(taskId);
+    stopHeldTask(taskId, "cancelled by user");
     return true;
   }
-  // Stop targets the whole task, not just one run. `kill()` sends Ctrl+C
-  // to the tmux session, which also clears claude's queued-input buffer,
-  // so every queued run in this task is going down too. Mark each
-  // active handle as cancelled so their done handlers record "cancelled"
-  // (not "failed") when their slot's reject fires.
-  for (const [, handle] of active) {
-    if (handle.taskId === h.taskId) handle.cancelled = true;
-  }
-  // Resolve any in-flight approval / question for this task BEFORE the
-  // interrupt — otherwise the hook script's curl and the MCP server's
-  // fetch would sit on a doomed HTTP response until their own timeouts.
-  cancelPendingForTask(h.taskId, "cancelled by user");
-  h.kill();
+  // Stop targets the whole task, not just one run.
+  stopActiveHandle(h, "cancelled by user");
   return true;
 }
 
@@ -1142,12 +1371,50 @@ export type SendInputResult =
  *     is in flight is queued (`codexTurnQueue` / `cursorTurnQueue`) and spawned
  *     as a fresh `resume` turn once the active one resolves; otherwise it
  *     spawns immediately. See `sendCodexTurn` / `sendCursorTurn`.
+ *
+ * Archived / detached-worktree restore: a message to an archived task
+ * auto-unarchives it (sending is an unambiguous signal of continued
+ * interest), and if the task's worktree was detached (by archive) or is
+ * otherwise missing on disk, it's rematerialized via `prepareWorkdir` before
+ * dispatch — same deterministic path, branch, and history, so the resumed
+ * turn lands in the same place the agent left off. A hard restore failure
+ * (e.g. the branch was deleted or checked out elsewhere) is surfaced as a
+ * `delivered: false` result rather than silently falling back to an
+ * unisolated cwd.
  */
-export function sendInput(runId: string, line: string): SendInputResult {
+export async function sendInput(runId: string, line: string): Promise<SendInputResult> {
   const row = db.query<{ task_id: string; agent: string }, [string]>(
     `SELECT task_id, agent FROM runs WHERE id = ?`,
   ).get(runId);
   if (!row) return { delivered: false, reason: "run not found" };
+
+  const task = tasks.get(row.task_id);
+  if (!task) return { delivered: false, reason: "task not found" };
+
+  if (task.archivedAt != null) {
+    tasks.update(row.task_id, { archivedAt: null });
+  }
+
+  // Same race as unarchiveTask/startTask: a deferred archive teardown may
+  // still be removing this task's worktree — let it finish before the
+  // existsSync check decides whether a restore is needed.
+  await pendingTeardown(row.task_id);
+
+  if (task.worktreePath && !existsSync(task.worktreePath)) {
+    // Re-fetch so the restore sees the just-cleared archivedAt (prepareWorkdir
+    // doesn't care about it, but keeping the object fresh avoids acting on a
+    // stale snapshot).
+    const fresh = tasks.get(row.task_id) ?? task;
+    try {
+      const restored = await prepareWorkdir(fresh);
+      if ("error" in restored) {
+        return { delivered: false, reason: `worktree restore failed: ${restored.error}` };
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { delivered: false, reason: `worktree restore failed: ${msg}` };
+    }
+  }
 
   const kind = resolveHarness(row.agent)?.kind;
   if (kind === "claude-code") {
@@ -1741,6 +2008,14 @@ export interface CreateTaskInput extends Partial<Task> {
   prompt: string;
   /** Optional ref name (branch / tag / sha). Defaults to "HEAD". Resolved to a sha at create time. */
   baseRef?: string;
+  /**
+   * Check the worktree out on this pre-existing branch (e.g. a PR's head
+   * branch) instead of minting a fresh one. Requires worktree isolation and
+   * a git `workdir`; sets `task.branchSource = "existing"` and pins `baseRef`
+   * to the branch's current sha rather than resolving `baseRef`/`branch`
+   * from a template.
+   */
+  existingBranch?: string;
 }
 
 /**
@@ -1762,10 +2037,43 @@ export async function createTask(
   const workdir = explicitWorkdir ?? process.cwd();
   const isolation = input.isolation ?? "worktree";
   const requestedRef = input.baseRef?.trim() || "HEAD";
+  const existingBranch = input.existingBranch?.trim() || null;
 
   let baseRef: string | null = null;
+  let plannedBranch: string | null = null;
+  let branchSource: Task["branchSource"] = "created";
   const workdirRoot = isolation === "worktree" ? await repoRoot(workdir) : null;
-  if (workdirRoot) {
+
+  if (existingBranch) {
+    if (isolation !== "worktree" || !workdirRoot) {
+      return {
+        error: `existingBranch requires worktree isolation and a git repo — "${workdir}" isn't one, or isolation is "${isolation}"`,
+      };
+    }
+    if (existingBranch.startsWith("-")) {
+      return { error: `invalid branch name: ${existingBranch}` };
+    }
+    const validated = validateBranchName(existingBranch);
+    if (!validated.ok) {
+      return { error: `invalid branch name "${existingBranch}": ${validated.reason}` };
+    }
+    const collision = tasks.list().some(
+      (t) => !t.archivedAt && t.workdir === workdir && t.branch === existingBranch,
+    );
+    if (collision) {
+      return { error: `another task already has "${existingBranch}" checked out in ${workdir}` };
+    }
+    await fetchBranch(workdir, existingBranch);
+    const sha =
+      (await resolveRef(workdir, `refs/remotes/origin/${existingBranch}`)) ??
+      (await resolveRef(workdir, `refs/heads/${existingBranch}`));
+    if (!sha) {
+      return { error: `branch not found: "${existingBranch}" (checked origin and local refs)` };
+    }
+    baseRef = sha;
+    plannedBranch = existingBranch;
+    branchSource = "existing";
+  } else if (workdirRoot) {
     const sha = await resolveRef(workdir, requestedRef);
     if (!sha) {
       if (requestedRef !== "HEAD") {
@@ -1782,10 +2090,6 @@ export async function createTask(
   // worktree temp paths and stray ad-hoc dirs in the sidebar.
 
   const id = randomUUID();
-  // Pin the branch name now so renaming the task later (before the first run)
-  // doesn't produce a different branch name on each start attempt. Only set
-  // when workdir is confirmed to be a git repo.
-  const plannedBranch = workdirRoot ? branchName({ id, title: input.title }) : null;
 
   // Resolve the harness so we can default model/effort by kind. A bad alias
   // id is rejected up-front rather than persisted and surfacing as a launch
@@ -1812,6 +2116,46 @@ export async function createTask(
     requestedType && TASK_TYPES.some((t) => t.id === requestedType)
       ? requestedType
       : DEFAULT_TASK_TYPE;
+
+  // Pin the branch name now so renaming the task later (before the first run)
+  // doesn't produce a different name on each start attempt. Only set when the
+  // workdir is a git repo. An explicit override (from the New Task sidebar's
+  // editable branch field) wins when valid; otherwise the name is composed from
+  // the project's branch nomenclature (falling back to the built-in defaults).
+  // Either way, any branch-template tags (`<slug>`, `<project_name>`, `<type>`,
+  // `<date>`, `<timestamp>`, `<token>`) are resolved server-side (the server is
+  // authoritative for direct API callers and for `<timestamp>` at true creation
+  // time) BEFORE validation, and the resolved name is made unique within the
+  // repo so two same-title/type tasks don't collide on one branch. Skipped
+  // entirely when `existingBranch` already pinned `plannedBranch` above.
+  if (!existingBranch && workdirRoot) {
+    const override = typeof input.branch === "string" ? input.branch.trim() : "";
+    const token = id.replace(/-/g, "").slice(0, 6);
+    const ctx = { title: input.title, projectName: basename(workdir), taskType, token, now: new Date() };
+    let desired: string;
+    if (override) {
+      const rendered = renderBranchTemplate(override, ctx);
+      const v = validateBranchName(rendered);
+      if (!v.ok) {
+        const detail = rendered !== override
+          ? `invalid branch name "${rendered}" (from template "${override}"): ${v.reason}`
+          : `invalid branch name "${override}": ${v.reason}`;
+        return { error: detail };
+      }
+      desired = rendered;
+    } else {
+      const config = projects.get(workdir)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
+      desired = renderBranchTemplate(branchPattern(config, taskType), ctx);
+      // Defensive: a hand-edited/corrupt config shouldn't hard-fail task
+      // creation — fall back to the legacy scheme if it produced an illegal name.
+      if (!validateBranchName(desired).ok) desired = branchName({ id, title: input.title });
+    }
+    const taken = new Set(
+      tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
+    );
+    plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
+  }
+
   const task = tasks.insert({
     id,
     title: input.title,
@@ -1822,12 +2166,20 @@ export async function createTask(
     isolation,
     taskType,
     branch: plannedBranch,
+    branchSource,
     worktreePath: null,
     baseRef,
+    // No PR exists for a brand-new task; set server-side by pull-create.
+    prUrl: null,
     mode: input.mode ?? null,
     model,
     effort,
     references: input.references ?? [],
+    // Brand-new tasks start with an empty backlog; drafts are added later from
+    // the run panel.
+    backlog: [],
+    // Composer draft starts empty; autosaved from the run panel thereafter.
+    draft: null,
     runId: null,
     // Derived at fetch time via SQL EXISTS — supply `false` here so the
     // `Task` shape is complete; `tasks.insert` re-fetches and the real
@@ -1847,61 +2199,235 @@ export async function createTask(
 }
 
 /**
+ * Shared teardown job for archiving a task — tmux/codex session kill, then
+ * open terminal tabs, then `detachWorktree` — in that exact order, because a
+ * live shell cwd'd inside the worktree would block `git worktree remove`.
+ * Both `archiveTask` (the fresh-archive path AND the already-archived
+ * re-enqueue path below) and the boot-time `sweepArchivedTeardowns` route
+ * through this one function so the three call sites can never drift apart.
+ *
+ * The harness kind is resolved synchronously here, before the job closure is
+ * built and handed to `enqueueTeardown` — same as the original inline code,
+ * just no longer duplicated at each call site.
+ *
+ * `enqueueTeardown` deliberately swallows job errors to keep its per-workdir
+ * FIFO chain alive for every other task queued behind this one (see its doc
+ * comment) — so it can't just return the `detachWorktree` result. Instead the
+ * result is captured in a closure variable (`result`, exposed via the
+ * returned getter) that a caller reads AFTER awaiting `promise`. This is the
+ * same idiom `deleteOrphanWorktree` already uses to get a real outcome out of
+ * a swallowed job.
+ */
+function enqueueArchiveTeardown(
+  task: Task,
+  opts?: { force?: boolean },
+): { promise: Promise<void>; result: () => WorktreeTeardownResult | undefined } {
+  const kind = resolveHarness(task.agent)?.kind;
+  let result: WorktreeTeardownResult | undefined;
+  const promise = enqueueTeardown(task.id, task.workdir, async () => {
+    // `enqueueTeardown` only guarantees this job runs after everything already
+    // queued for `task.workdir` — it can sit behind other jobs for seconds,
+    // and `task` was captured at ENQUEUE time by every call site (fresh
+    // archive, already-archived re-enqueue, boot sweep). The
+    // `pendingTeardown(taskId)` discipline elsewhere only protects
+    // materialize-AFTER-teardown; it does nothing about the opposite
+    // interleaving: `sendInput`/`startTask` clear `archivedAt` and start
+    // `prepareWorkdir`'s multi-second `git worktree add` BEFORE a fresh
+    // `archiveTask` call (e.g. the Worktrees page's delete button) can see the
+    // half-built directory and enqueue a teardown job right behind it. By the
+    // time that job reaches the front of the queue, the task has moved on —
+    // tearing down with the stale `task` snapshot would rip out a worktree the
+    // agent is (or is about to be) running in. So re-read the row here, at job
+    // execution time, and bail if it moved: gone entirely, un-archived
+    // (`archivedAt == null` — both `sendInput` and `startTask` clear it
+    // *before* calling `prepareWorkdir`, so this check is the same signal that
+    // closes the window), or a run has since started. A bail is reported as
+    // `"failed"` (not `"no-worktree"`/`"already-absent"`, which the client
+    // reads as silent success) because the directory is still there — the
+    // caller should retry, not assume it's clean.
+    //
+    // The live-run check keys on `cancelled`, NOT on `active.has(runId)`:
+    // `archiveTask({ stopRun: true })` — what the Worktrees page's delete
+    // button always sends — stops the run via `stopActiveHandle`, which
+    // flags the handle `cancelled` and kills it, but the `active.delete`
+    // only happens later in the async exit handler. A bare `active.has`
+    // would therefore see the run we ourselves just stopped, bail, and
+    // report a bogus failure for every delete of a *running* worktree. A
+    // handle that's present and NOT cancelled is the real signal: a run
+    // that started after we enqueued, which we must not tear down under.
+    const cur = tasks.get(task.id);
+    const liveHandle = cur?.runId ? active.get(cur.runId) : undefined;
+    if (!cur || cur.archivedAt == null || (liveHandle && !liveHandle.cancelled)) {
+      result = { removed: false, reason: "failed" };
+      return;
+    }
+    // Same contract as deleteTask: dropSession is non-throwing (it
+    // best-efforts tmux teardown internally). Don't wrap — a silent catch
+    // would hide a regression in claude-tmux from the next reviewer.
+    if (kind === "claude-code") dropSession(cur.id);
+    else if (kind === "codex") dropCodexSession(cur.id);
+    else if (kind === "cursor") dropCursorSession(cur.id);
+    await killTerminalsForTask(cur.id);
+    result = await detachWorktree(cur, { force: opts?.force });
+  });
+  return { promise, result: () => result };
+}
+
+/**
  * Archive a finished task: stamp `archivedAt`, kill its claude tmux session
  * AND any open terminal tabs (both best-effort) so no background shell outlives
  * the user's interest in the task — once archived the card is hidden, so the
- * user can no longer reach those shells to close them. Worktree, run history,
- * and prompt stay intact for later reference.
+ * user can no longer reach those shells to close them — then **detach** the
+ * worktree from disk (`detachWorktree`): the checkout is removed to reclaim
+ * space, but the branch, every commit, the run/run_events history, and
+ * claude's external JSONL transcript all survive untouched. Sending a
+ * follow-up message or unarchiving later rematerializes the worktree at the
+ * same deterministic path (`prepareWorkdir`'s re-attach path) and resumes the
+ * conversation right where it left off.
  *
  * Only allowed when the task is in the `done` column — archive is the
- * terminal step of the explicit review → done → archive flow.
+ * terminal step of the explicit review → done → archive flow. Pass
+ * `{ force: true }` to bypass ONLY that column gate (e.g. the Worktrees page's
+ * delete action, which archives a stale worktree's task regardless of where
+ * it sits on the board) — the active-run rejection, `archivedAt` stamping,
+ * and deferred teardown below are unchanged either way.
+ *
+ * Pass `{ stopRun: true }` to archive a task with an in-flight (or
+ * held-by-background-agents) run anyway: the run is stopped exactly the way
+ * the Stop button stops it (`stopActiveHandle`/`stopHeldTask`, shared with
+ * `cancelRun`) before the normal archive path below proceeds. Without it,
+ * the active-run guard stays in place as a backstop.
+ *
+ * Pass `{ forceWorktree: true }` to have the detach discard uncommitted
+ * changes in the checkout rather than leaving it in place (threaded straight
+ * through to `detachWorktree`'s `force` option) — an explicit, user-confirmed
+ * opt-in from the Worktrees page, since it's a destructive, unrecoverable
+ * discard of anything not committed.
+ *
+ * Pass `{ awaitTeardown: true }` to block until the deferred teardown above
+ * has actually run and get its real `WorktreeTeardownResult` back as
+ * `teardown` — the Worktrees page's delete action needs to know the
+ * directory is truly gone before it refreshes the list, unlike the kanban
+ * archive button, which stays fire-and-forget by leaving this unset.
  */
-export function archiveTask(taskId: string): { task: Task } | { error: string } {
+export async function archiveTask(
+  taskId: string,
+  opts?: { force?: boolean; stopRun?: boolean; forceWorktree?: boolean; awaitTeardown?: boolean },
+): Promise<{ task: Task; teardown?: WorktreeTeardownResult } | { error: string }> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
-  if (task.column !== "done") {
+  if (task.column !== "done" && !opts?.force) {
     return { error: "only tasks in Done can be archived" };
   }
   // Defence-in-depth: column='done' should imply no live run, but column is
   // freely PATCHable (drag-to-Done on a running card is allowed today). If a
   // run is still active, refuse rather than killing tmux out from under it —
   // the exit handler would then flip the now-archived task to 'ready' and
-  // leave the row in a contradictory state.
+  // leave the row in a contradictory state — UNLESS the caller explicitly
+  // asked us to stop it first (`stopRun`), in which case we do exactly what
+  // the Stop button does before proceeding.
   if (task.runId && active.has(task.runId)) {
-    return { error: "task is still running — cancel the run before archiving" };
+    if (!opts?.stopRun) {
+      return { error: "task is still running — cancel the run before archiving" };
+    }
+    stopActiveHandle(active.get(task.runId)!, "task archived");
+  } else if (opts?.stopRun && isHeldByBackgroundAgents(taskId)) {
+    stopHeldTask(taskId, "task archived");
   }
   if (task.archivedAt != null) {
+    // Already archived is normally a cheap no-op — repeat-archives (e.g. a
+    // double click) shouldn't re-enqueue teardown work every time. But when
+    // the worktree is STILL on disk, the previous teardown either never ran
+    // (this instance crashed before the boot sweep got to it) or never
+    // finished — and this is exactly the reported bug: the Worktrees page's
+    // "archive & delete" action calls archive on a row that's already
+    // archived, and the old bare `return { task }` here meant that row could
+    // never be cleaned up. Re-enqueue instead, gated on the same
+    // `worktreePath && existsSync(...)` condition `sweepArchivedTeardowns`
+    // already uses at boot, so an ordinary repeat-archive with nothing left
+    // to remove stays a bare return.
+    if (task.worktreePath && existsSync(task.worktreePath)) {
+      const { promise, result } = enqueueArchiveTeardown(task, { force: opts?.forceWorktree });
+      if (opts?.awaitTeardown) {
+        await promise;
+        // A requested outcome should never come back silently absent — if
+        // the job threw and enqueueTeardown swallowed it, `result()` is
+        // still undefined here, so report it as a failed removal instead of
+        // omitting `teardown` from the response.
+        return { task, teardown: result() ?? { removed: false, reason: "failed" } };
+      }
+      void promise;
+    } else if (opts?.awaitTeardown) {
+      // Same "never come back silently absent" contract as the branch above,
+      // for the case where there was never anything to tear down. Both
+      // outcomes are successes for the client (nothing left to remove) — this
+      // only stops the response from omitting `teardown` when it was asked
+      // for, matching `WorktreeTeardownResult`'s documented contract.
+      return {
+        task,
+        teardown: task.worktreePath
+          ? { removed: false, reason: "already-absent" }
+          : { removed: false, reason: "no-worktree" },
+      };
+    }
     return { task };
   }
   const updated = tasks.update(taskId, { archivedAt: Date.now() });
   if (!updated) return { error: "task not found" };
-  // Same contract as deleteTask: dropSession is non-throwing (it best-efforts
-  // tmux teardown internally). Don't wrap — a silent catch would hide a
-  // regression in claude-tmux from the next reviewer.
-  const archiveKind = resolveHarness(task.agent)?.kind;
-  if (archiveKind === "claude-code") dropSession(taskId);
-  else if (archiveKind === "codex") dropCodexSession(taskId);
-  else if (archiveKind === "cursor") dropCursorSession(taskId);
+  // Turn queues are cheap in-memory bookkeeping (no I/O), so they're dropped
+  // inline rather than folded into the deferred job.
   codexTurnQueue.delete(taskId);
   cursorTurnQueue.delete(taskId);
-  // Tear down terminal tabs too — same rationale as the tmux session above.
-  // Fire-and-forget (archive keeps the worktree, so there's no removal race);
-  // the synchronous part of killTerminalsForTask drops the tabs immediately,
-  // the awaited part just reaps the shells. `.catch` keeps the async function's
-  // best-effort failures from surfacing as an unhandled rejection.
-  void killTerminalsForTask(taskId).catch(() => { /* best-effort */ });
+  // Deferred: the actual teardown (tmux kill, terminal shells, worktree
+  // detach) is pushed onto this task's source-workdir teardown queue rather
+  // than awaited here, so `archiveTask` can flip the DB column and return in
+  // milliseconds. Archiving several tasks against the same workdir back-to-
+  // back no longer blocks each POST on `spawnSync` tmux kills or `git
+  // worktree remove --force`/`prune` — those still run (serialized per
+  // workdir, see `enqueueTeardown`), just off the request's critical path;
+  // tasks in a different workdir proceed independently. Callers that must
+  // not race a deferred teardown (unarchive, start, delete, the boot sweep)
+  // await `pendingTeardown(taskId)` first. `awaitTeardown` is the one opt-in
+  // exception: the Worktrees page explicitly wants to block on this specific
+  // teardown to get a truthful result back.
+  const { promise, result } = enqueueArchiveTeardown(updated, { force: opts?.forceWorktree });
+  if (opts?.awaitTeardown) {
+    await promise;
+    return { task: updated, teardown: result() ?? { removed: false, reason: "failed" } };
+  }
+  void promise;
   return { task: updated };
 }
 
-/** Reverse of `archiveTask`: clear the timestamp. No tmux work — sending a
- *  follow-up message on a non-archived task already spawns a fresh session via
- *  the resume path. */
-export function unarchiveTask(taskId: string): { task: Task } | { error: string } {
+/**
+ * Reverse of `archiveTask`: clear the timestamp and, best-effort, restore the
+ * worktree if `archiveTask` detached it (or it's otherwise missing on disk).
+ * Restore failure doesn't block the unarchive — the card comes back either
+ * way; a later send/start/terminal-open retries the restore lazily.
+ */
+export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { error: string }> {
   const task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.archivedAt == null) return { task };
+  // Wait out any teardown archiveTask deferred for this task BEFORE deciding
+  // whether the worktree needs restoring. Without this, a still-in-flight
+  // `detachWorktree` could delete the worktree right after the `existsSync`
+  // check below decided it was still present (or right after a restore
+  // recreated it), leaving the task unarchived but pointing at a directory
+  // that's about to vanish out from under it.
+  await pendingTeardown(taskId);
   const updated = tasks.update(taskId, { archivedAt: null });
   if (!updated) return { error: "task not found" };
+  if (updated.worktreePath && updated.branch && !existsSync(updated.worktreePath)) {
+    try {
+      const restored = await prepareWorkdir(updated);
+      if ("error" in restored) {
+        console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}: ${restored.error}`);
+      }
+    } catch (err) {
+      console.warn(`[agetor] unarchiveTask: worktree restore failed for ${taskId}:`, err);
+    }
+  }
   return { task: updated };
 }
 
@@ -1923,17 +2449,436 @@ export async function deleteTask(taskId: string): Promise<void> {
   // / dropCursorSession also clear any in-memory tailer. No-op when no session
   // exists.
   const deleteKind = resolveHarness(task.agent)?.kind;
-  if (deleteKind === "claude-code") dropSession(taskId);
-  else if (deleteKind === "codex") dropCodexSession(taskId);
-  else if (deleteKind === "cursor") dropCursorSession(taskId);
   codexTurnQueue.delete(taskId);
   cursorTurnQueue.delete(taskId);
-  // Kill any open terminal tabs before removing the worktree — a live shell
-  // sitting in the worktree dir would block `git worktree remove`. Awaited so
-  // the shells are actually gone before we tear the directory down.
-  await killTerminalsForTask(taskId);
-  await removeWorktree(task);
+  // Routed through the same per-workdir teardown queue archiveTask uses —
+  // DELETE's semantics are unchanged (still awaited before `tasks.delete`
+  // below), but this serializes it behind any archive teardown already in
+  // flight for another task in the SAME source workdir, so two `git worktree
+  // remove`/`prune` calls against the same repo never contend on git's locks
+  // at the same time. A delete against an unrelated workdir is unaffected.
+  await enqueueTeardown(taskId, task.workdir, async () => {
+    if (deleteKind === "claude-code") dropSession(taskId);
+    else if (deleteKind === "codex") dropCodexSession(taskId);
+    else if (deleteKind === "cursor") dropCursorSession(taskId);
+    // Kill any open terminal tabs before removing the worktree — a live shell
+    // sitting in the worktree dir would block `git worktree remove`. Awaited
+    // so the shells are actually gone before we tear the directory down.
+    await killTerminalsForTask(taskId);
+    await removeWorktree(task);
+  });
   // No per-task attachments directory to clean up — refs are path-only,
   // agetor never copied anything to disk.
   tasks.delete(taskId);
+}
+
+/**
+ * Boot-time healing pass for teardowns that never ran: if agetor quit or
+ * crashed between an `archiveTask` response landing (DB flipped, teardown
+ * enqueued) and the deferred job actually executing, the in-memory queue is
+ * gone on restart but the worktree is still sitting on disk. This also heals
+ * the pre-existing crash-mid-archive case that could strand a worktree even
+ * before teardown was deferred (a crash between the DB update and the old
+ * synchronous `detachWorktree` call).
+ *
+ * `tasks.list()` already includes archived rows (no archived filter in its
+ * query), so a plain scan is enough. Re-enqueues the identical teardown job
+ * `archiveTask` would have run — session drop keyed to the task's own id,
+ * `killTerminalsForTask`, `detachWorktree` — through the same per-workdir
+ * queue (keyed on each task's own `workdir`), so it's serialized against
+ * anything already in flight for that source repo without waiting on
+ * unrelated repos' backlogs. Kills are always keyed to a specific task id
+ * from this instance's own DB; this never enumerates or kills `agetor-*`
+ * tmux sessions directly (the shared-socket rule reconcileOrphans documents
+ * above applies here too).
+ *
+ * Fire-and-forget from the caller's perspective — returns the count enqueued,
+ * not a promise, since it only needs to kick the jobs off.
+ */
+export function sweepArchivedTeardowns(): number {
+  let enqueued = 0;
+  for (const task of tasks.list()) {
+    if (task.archivedAt == null) continue;
+    if (!task.worktreePath) continue;
+    if (!existsSync(task.worktreePath)) continue;
+    // Defensive: an archived task shouldn't have a live run (archiveTask
+    // refuses to archive one), but mirror that guard here too rather than
+    // risk tearing down a worktree out from under an in-flight run.
+    if (task.runId && active.has(task.runId)) continue;
+    // No `force` — an explicit owner decision (see the plan doc): discarding
+    // uncommitted work with no human in the loop, unattended at boot, is not
+    // a trade worth making. A dirty worktree just stays stuck until the user
+    // forces it from the Worktrees page.
+    enqueueArchiveTeardown(task);
+    enqueued++;
+  }
+  return enqueued;
+}
+
+/**
+ * Idle-session reaper (T4, `docs/plans/reduce-cpu-and-memory.md` §3.1). Kills
+ * the tmux session backing a claude-code task's REPL once it's sat idle —
+ * no turn in flight, nothing waiting on the user, no session activity — for
+ * `IDLE_SESSION_REAP_MS` (30min), reclaiming the ~300–500MB "node" process
+ * and every per-session timer (`disposeSessionState`, invoked via
+ * `dropSession`). A follow-up sent afterward still works: `sendClaudeTurn`
+ * falls back to `spawnResumedSession` (`claude --resume <id>`) whenever
+ * `hasSessionState` is false, so this is invisible to the user beyond a
+ * slightly slower first reply.
+ *
+ * Candidates come ONLY from this instance's own DB — this must never
+ * enumerate-and-kill tmux sessions (the shared-socket rule documented on
+ * `reconcileOrphans` above applies here identically: a blind sweep would
+ * reap a sibling agetor instance's or a `bun test` run's sessions). Probing
+ * a specific candidate task id we already own (`probeSessionActivity`,
+ * `sessionIdleInfo`) is fine — that's a keyed lookup, not a sweep. Codex is
+ * never a candidate: its sessions are one-shot per turn and self-dispose
+ * (`codex-tmux.ts`), so there's nothing to reap.
+ *
+ * Two performance properties keep a sweep from becoming a synchronous burst
+ * that stalls the main process for the duration of the scan (previously: N
+ * non-archived claude tasks × ~5 DB queries + a blocking tmux probe each, all
+ * in one event-loop turn):
+ *  - **Cheap pre-filter.** `candidateIds` is derived entirely from the rows
+ *    `tasks.list()` already fetched (no per-candidate `tasks.get` yet) and
+ *    excludes any task that plainly can't own a session: archived, non-claude,
+ *    or — the key trim — neither holding in-memory `SessionState` nor ever
+ *    having started a run (`hasSessionState(t.id) || t.runId != null`). A
+ *    never-started task fails both and drops out before it costs anything
+ *    more than an array filter.
+ *  - **Per-candidate yield.** `await Bun.sleep(0)` at the top of every loop
+ *    iteration hands control back to the event loop between candidates, so
+ *    HTTP requests, SSE pushes, and session tailers keep running throughout a
+ *    sweep instead of queuing up behind it. This is what makes the pre-kill
+ *    re-check below load-bearing rather than defensive-only: with real
+ *    yields between iterations, a message that lands mid-sweep (starts a
+ *    turn, opens a pending interaction) MUST be caught by a guard re-read
+ *    immediately before the kill, not just the one the loop started with.
+ *
+ * Every guard is re-checked against a freshly-read task row immediately
+ * before the kill, not from the snapshot the loop started with. Guard work
+ * itself is hoisted to avoid redundant reads: `isReapable` takes the already
+ * -fetched `Task` row and calls the pure `isTaskHeldByBackgroundAgents(task)`
+ * predicate directly rather than the taskId-keyed `isHeldByBackgroundAgents`
+ * wrapper, which would otherwise re-fetch the same row internally.
+ *
+ * Called once ~30s after boot (letting boot reattach settle first) and then
+ * on a `SESSION_REAP_SWEEP_MS` interval from `src/bun/index.ts` and
+ * `src/bun/headless.ts`.
+ */
+export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
+  if (reapInFlight) return { reaped: [] };
+  reapInFlight = true;
+  try {
+    const reaped: string[] = [];
+    const candidateIds = tasks
+      .list()
+      .filter(
+        (t) =>
+          t.archivedAt == null
+          && resolveHarness(t.agent)?.kind === "claude-code"
+          && (hasSessionState(t.id) || t.runId != null),
+      )
+      .map((t) => t.id);
+
+    const isReapable = (task: Task): boolean => {
+      if (task.runId && active.has(task.runId)) return false;
+      if (isTaskHeldByBackgroundAgents(task)) return false;
+      // `isTaskHeldByBackgroundAgents` only covers the `running`-column
+      // #92 hold (main run succeeded, subagents still finishing) — it
+      // requires `task.column === "running"`. Since #93
+      // (`signalSubagentApiError`), a task can leave the `active` map via
+      // `blocked` instead: one subagent's API error aborts the main turn
+      // while SIBLING subagents are still legitimately running and tailed.
+      // That case slips past the check above (column is `blocked`, not
+      // `running`), so re-check independently of column/hold state — a
+      // task with any running subagent row must never have its tmux
+      // session reaped out from under agents still writing to it.
+      if (subagents.hasRunning(task.id)) return false;
+      if (countPendingForTask(task.id) > 0) return false;
+      return true;
+    };
+
+    for (const taskId of candidateIds) {
+      // Yield between candidates — see the perf-properties doc above. Safe
+      // because every guard is re-checked against a fresh row immediately
+      // before the kill below.
+      await Bun.sleep(0);
+
+      const task = tasks.get(taskId);
+      if (!task || !isReapable(task)) continue;
+
+      const idleInfo = sessionIdleInfo(taskId);
+      let idleLongEnough: boolean;
+      if (idleInfo) {
+        idleLongEnough = idleInfo.idleMs >= IDLE_SESSION_REAP_MS;
+      } else {
+        // No in-memory SessionState — e.g. a done/review task whose session
+        // survived a restart (boot reconciliation only reattaches `running`
+        // rows). Probe tmux directly for the session's own activity clock
+        // (`#{session_activity}`) instead of the previous `task.updatedAt`
+        // heuristic, which could read stale on a task nobody touched through
+        // agetor but that's still being used interactively in its terminal.
+        // `null` means the session is already gone (or unreachable) — nothing
+        // to reap. `attached === true` means a human has the pane open right
+        // now — never reap that regardless of how long it's been idle by the
+        // clock. Otherwise require BOTH tmux's activity clock AND the task
+        // row's `updatedAt` past the threshold before reaping a session we
+        // have no in-memory visibility into — the extra-conservative choice
+        // called out in the review: a session could be driven by something
+        // other than agetor (a human at the tmux client) bumping tmux's
+        // activity clock without ever updating our DB row, or vice versa.
+        const activity = probeSessionActivity(taskId);
+        if (!activity) continue;
+        if (activity.attached) continue;
+        idleLongEnough =
+          Date.now() - activity.activityAt >= IDLE_SESSION_REAP_MS
+          && Date.now() - task.updatedAt >= IDLE_SESSION_REAP_MS;
+      }
+      if (!idleLongEnough) continue;
+
+      // Re-check immediately before the kill against a fresh row — closes
+      // the window between the idle check above (which may itself have
+      // awaited a yield or a tmux probe) and the kill below.
+      const fresh = tasks.get(taskId);
+      if (!fresh || !isReapable(fresh)) continue;
+
+      dropSession(taskId);
+      reaped.push(taskId);
+
+      const recent = runs.listForTask(taskId)[0];
+      if (recent) {
+        const data = findLastClaudeSessionId(taskId)
+          ? "session hibernated after 30m idle — next message will resume it"
+          : "session hibernated after 30m idle — no saved session id, next message starts a fresh context";
+        // Idempotence backstop: a re-reap regression (e.g. the tmux 3.6a
+        // `display-message` exact-match bug worked around in
+        // `probeSessionActivity`, which made every probe look like "never
+        // attached, idle since 1970" and re-reaped every candidate on every
+        // sweep) must not re-spam the run with duplicate hibernate
+        // breadcrumbs. A legitimate later hibernate always has intervening
+        // events (resuming creates a new run / new events), so "the last
+        // persisted event for this run is this exact breadcrumb" is safe to
+        // treat as "already reaped, skip" — both the append AND the emit,
+        // since an emit without persistence would still paint a new chip
+        // client-side on every sweep.
+        if (runs.lastEventData(recent.id) !== data) {
+          runs.appendEvent(recent.id, "status", data);
+          emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+        }
+      }
+    }
+
+    if (reaped.length > 0) {
+      console.log(`[agetor] reaped ${reaped.length} idle claude session(s)`);
+    }
+    return { reaped };
+  } finally {
+    reapInFlight = false;
+  }
+}
+
+/**
+ * Enumerate every git worktree materialized on disk under `WORKTREES_DIR` and
+ * cross-reference it against `tasks.list()` (the directory basename equals
+ * the owning task's id by construction — see `worktreePath` in worktree.ts).
+ * Backs `GET /worktrees`.
+ *
+ * Deliberately fs + DB only — no git subprocesses — so this stays cheap
+ * enough to poll. Staleness is classified per `WorktreeStaleReason`:
+ *  - `"orphaned"` — no task row for the dir (crash/failed teardown leftover).
+ *  - `"archived"` — the owning task is archived but the dir is still present
+ *    (teardown pending, failed, or skipped because the worktree was dirty).
+ *  - `"inactive"` — not archived, no run in flight, and the task hasn't been
+ *    touched in over `WORKTREE_STALE_AFTER_MS`.
+ *
+ * Returns `[]` when `WORKTREES_DIR` doesn't exist yet (no worktree has ever
+ * been created). Non-directory entries and dotfiles are skipped.
+ */
+export function listWorktrees(): WorktreeInfo[] {
+  let entries: string[];
+  try {
+    entries = readdirSync(WORKTREES_DIR);
+  } catch {
+    return [];
+  }
+  const taskById = new Map(tasks.list().map((t) => [t.id, t]));
+  const out: WorktreeInfo[] = [];
+  for (const name of entries) {
+    if (name.startsWith(".")) continue;
+    const dirPath = join(WORKTREES_DIR, name);
+    let isDir = false;
+    try {
+      isDir = statSync(dirPath).isDirectory();
+    } catch {
+      continue; // vanished between readdir and stat — skip rather than error
+    }
+    if (!isDir) continue;
+
+    const task = taskById.get(name);
+    const staleReasons: WorktreeStaleReason[] = [];
+    // Same active-run check archiveTask uses for its defence-in-depth guard.
+    const runActive = !!(task?.runId && active.has(task.runId));
+    if (!task) {
+      // No owning row — nothing else applies (can't be archived or idle-by-age).
+      staleReasons.push("orphaned");
+    } else {
+      // A worktree can carry both reasons at once (archived AND past the
+      // inactivity threshold), so these are independent checks, not a chain.
+      if (task.archivedAt != null) staleReasons.push("archived");
+      if (!runActive && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS) {
+        staleReasons.push("inactive");
+      }
+    }
+
+    out.push({
+      id: name,
+      path: dirPath,
+      taskId: task?.id ?? null,
+      taskTitle: task?.title ?? null,
+      column: task?.column ?? null,
+      archivedAt: task?.archivedAt ?? null,
+      taskUpdatedAt: task?.updatedAt ?? null,
+      branch: task?.branch ?? null,
+      // Owned worktree: the task's own workdir. Orphan: best-effort parse of
+      // the `.git` pointer file — plain fs, no git subprocess.
+      workdir: task?.workdir ?? parseWorktreeGitPointer(dirPath),
+      runActive,
+      stale: staleReasons.length > 0,
+      staleReasons,
+    });
+  }
+  return out;
+}
+
+/**
+ * Resolve a worktree id (a directory basename under `WORKTREES_DIR`) to its
+ * absolute path, with the confinement checks shared by every worktree-id
+ * endpoint: no `/`, `\`, `..`, or empty string, and the resolved path must
+ * be a direct child of `WORKTREES_DIR`, never the directory itself (guards
+ * against ids like `"."` that pass the substring checks but normalize to
+ * `WORKTREES_DIR` — an `rm -rf` there would delete every task's worktree).
+ * Factored out of `deleteOrphanWorktree` so `worktreeGitStatus` shares the
+ * exact same guard rather than a hand-copied one that could drift.
+ */
+function resolveWorktreeDir(id: string): { dir: string } | { error: string } {
+  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
+    return { error: "invalid worktree id" };
+  }
+  const dirPath = join(WORKTREES_DIR, id);
+  if (basename(dirPath) !== id) {
+    return { error: "invalid worktree id" };
+  }
+  return { dir: dirPath };
+}
+
+/**
+ * Delete an orphaned worktree directory — one with no owning task row, so
+ * there's no ticket for `archiveTask` to archive. Used by the Worktrees
+ * page's delete action for `WorktreeInfo` rows where `taskId` is null.
+ *
+ * Refuses (rather than silently no-oping) when a task row for `id` still
+ * exists — that worktree is owned, and the caller should archive the task
+ * instead, which routes through the normal teardown path. `id` is validated
+ * via `resolveWorktreeDir` so the resolved path can never escape
+ * `WORKTREES_DIR`.
+ *
+ * Awaits `pendingTeardown(id)` before touching the directory — the fleet
+ * invariant every worktree-touching path follows, in case a stale teardown
+ * from a task that used to own this id is still draining. Never kills any
+ * tmux session: an orphan has no owning task, and the fleet rule forbids
+ * enumerate-and-kill of `agetor-*` sessions on the shared tmux socket.
+ */
+export async function deleteOrphanWorktree(id: string): Promise<{ ok: true } | { error: string }> {
+  const resolved = resolveWorktreeDir(id);
+  if ("error" in resolved) return resolved;
+  const dirPath = resolved.dir;
+
+  let isDir = false;
+  try {
+    isDir = statSync(dirPath).isDirectory();
+  } catch {
+    return { error: "worktree not found" };
+  }
+  if (!isDir) return { error: "worktree not found" };
+  if (tasks.get(id)) {
+    return { error: "this worktree is owned by an active task — archive the task instead" };
+  }
+
+  await pendingTeardown(id);
+
+  // Best-effort: find the source repo before the dir is gone so we can prune
+  // its stale `.git/worktrees/<id>` registration afterwards.
+  const sourceRoot = parseWorktreeGitPointer(dirPath);
+
+  // Run the rm + prune on the source repo's teardown FIFO (keyed by
+  // sourceRoot, same as archiveTask/deleteTask's teardown) so an orphan
+  // cleanup can't contend on git's `.git/worktrees/.lock` with a concurrent
+  // same-repo archive/delete teardown. `enqueueTeardown` swallows job errors
+  // — a single misbehaving teardown must not break the chain for every task
+  // queued behind it — so the closure-captured `result` is how we still
+  // surface a failed rm to the caller after the await. When the source repo
+  // can't be determined, key by `dirPath` instead: there's no shared lock
+  // domain to serialize against, so this degrades to a private one-entry
+  // chain, behaviorally the same as running it inline.
+  //
+  // Caveat: archive/delete key their chains by the raw `task.workdir` string,
+  // whereas `sourceRoot` here is the realpath'd repo root git wrote into the
+  // `.git` pointer. If those aren't byte-identical (trailing slash, a symlinked
+  // path, or a workdir that's a repo *subdir*), the orphan prune lands on a
+  // different FIFO and could still race that repo's `.git/worktrees/.lock` —
+  // the same best-effort limitation `teardownTails` already documents. Harmless
+  // (a lost lock just skips one prune; the next worktree op in that repo clears
+  // the stale registration), so not worth resolving the root to reconcile keys.
+  let result: { ok: true } | { error: string } = { ok: true };
+  await enqueueTeardown(id, sourceRoot ?? dirPath, async () => {
+    try {
+      await rm(dirPath, { recursive: true, force: true });
+    } catch (err) {
+      result = { error: `failed to remove worktree directory: ${err instanceof Error ? err.message : String(err)}` };
+      return; // don't prune if the removal failed
+    }
+    if (sourceRoot) await pruneWorktrees(sourceRoot);
+  });
+
+  return result;
+}
+
+/**
+ * On-demand live git status for a single worktree — dirty / ahead / merged —
+ * composing `hasUncommittedChanges`, `getAheadCount`, and
+ * `isMergedIntoDefaultBranch`. Deliberately not part of `listWorktrees` (fs +
+ * DB only, safe to poll): each of these spawns a git subprocess, so this is
+ * fetched per row on demand instead. Backs `GET /worktrees/:id/git-status`.
+ *
+ * Shares `resolveWorktreeDir`'s confinement with `deleteOrphanWorktree`, but
+ * — unlike delete — does not refuse task-owned ids: git status is useful for
+ * both orphan and task-backed worktrees, so callers can check staleness
+ * before deciding whether to archive.
+ *
+ * For a task-backed id, resolves the live worktree dir + pinned base ref
+ * from the task row (`worktreePath ?? workdir`, `baseRef`). For an orphan id
+ * (no task row), uses the `WORKTREES_DIR/id` path directly with no base ref
+ * — `getAheadCount` degrades to its unknown-but-not-blocking `0` in that
+ * case, same contract as everywhere else `baseRef` may be null.
+ */
+export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus | { error: string }> {
+  const resolved = resolveWorktreeDir(id);
+  if ("error" in resolved) return resolved;
+
+  const task = tasks.get(id);
+  const dir = task ? task.worktreePath ?? task.workdir : resolved.dir;
+  const baseRef = task ? task.baseRef ?? null : null;
+
+  const dirty0 = await hasUncommittedChanges(dir);
+  if (dirty0 === null) {
+    return { dirty: false, ahead: 0, merged: null, ignored: true };
+  }
+
+  const [aheadResult, merged] = await Promise.all([
+    getAheadCount(dir, baseRef),
+    isMergedIntoDefaultBranch(dir),
+  ]);
+
+  return { dirty: dirty0, ahead: aheadResult ?? 0, merged, ignored: false };
 }

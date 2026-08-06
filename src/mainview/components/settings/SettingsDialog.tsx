@@ -10,6 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
+import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
   HARNESS_TEMPLATES,
@@ -536,6 +537,8 @@ function ListView({
           binary if you don't want to install tmux system-wide.
         </p>
       </section>
+
+      <GitHubTokensSection />
 
       <section className="space-y-2">
         <div className="flex items-center justify-between">

@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, Harness, HarnessUsage, Project, Task, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, Task, TaskDraft, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -14,11 +15,11 @@ import { coreCredsPath } from "./core-creds.ts";
 // tasks.get(...)` at module scope in interactions.ts) — under ESM live
 // bindings the unresolved cycle becomes an undefined-binding crash at
 // import time. Keep both sides lazy.
-import { countPendingForTask } from "./interactions.ts";
+import { countPendingForTask, pendingCountsByTask } from "./interactions.ts";
 // Same lazy-cycle contract as interactions.ts above: terminals.ts imports
 // `tasks` from this module, and we call `countTerminals` only inside `toTask`
 // (a function body), never at top level. Do not hoist this call site.
-import { countTerminals } from "./terminals.ts";
+import { countTerminals, terminalCountsByTask } from "./terminals.ts";
 
 // Hard guard against test fixtures silently leaking into the user's real
 // SQLite db. `bun test` runs every *.test.ts file in one process, so the
@@ -66,8 +67,12 @@ type TaskRow = {
   workdir: string; isolation: string;
   task_type: string;
   branch: string | null; worktree_path: string | null; base_ref: string | null;
+  branch_source: string;
+  pr_url: string | null;
   mode: string | null; model: string | null; effort: string | null;
   refs: string;
+  backlog: string;
+  draft: string | null;
   run_id: string | null; created_at: number; updated_at: number;
   archived_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
@@ -97,7 +102,67 @@ const parseRefs = (raw: string): TaskReference[] => {
   } catch { return []; }
 };
 
-const toTask = (r: TaskRow): Task => ({
+/** Coerce the raw refs value (already a TaskReference[]-ish) through the same
+ *  sanitizer `parseRefs` applies to on-disk JSON, so a backlog item's refs are
+ *  validated identically whether they come from the DB column or a fresh
+ *  client payload. */
+const sanitizeRefs = (value: unknown): TaskReference[] =>
+  Array.isArray(value) ? parseRefs(JSON.stringify(value)) : [];
+
+const parseBacklog = (raw: string): BacklogMessage[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((m): BacklogMessage[] => {
+      if (!m || typeof m !== "object") return [];
+      const id = (m as { id?: unknown }).id;
+      if (typeof id !== "string" || !id) return [];
+      const text = (m as { text?: unknown }).text;
+      const createdAt = (m as { createdAt?: unknown }).createdAt;
+      return [{
+        id,
+        text: typeof text === "string" ? text : "",
+        references: sanitizeRefs((m as { references?: unknown }).references),
+        createdAt: typeof createdAt === "number" ? createdAt : 0,
+      }];
+    });
+  } catch { return []; }
+};
+
+/** Parse the stored draft JSON, tolerating NULL (no draft), malformed JSON,
+ *  and legacy/bad shapes — all collapse to `null` rather than throwing.
+ *  References are sanitized through the same `sanitizeRefs` path as backlog
+ *  items. An apparently-well-formed but effectively-empty draft (blank text,
+ *  no references) also normalizes to `null` so a stray write can't leave a
+ *  zombie draft that silently reappears in the composer. Non-empty text is
+ *  otherwise preserved verbatim — no trimming of the stored value. */
+const parseDraft = (raw: unknown): TaskDraft | null => {
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const text = (parsed as { text?: unknown }).text;
+    const draft: TaskDraft = {
+      text: typeof text === "string" ? text : "",
+      references: sanitizeRefs((parsed as { references?: unknown }).references),
+    };
+    if (!draft.text.trim() && draft.references.length === 0) return null;
+    return draft;
+  } catch { return null; }
+};
+
+/** Optional pre-computed grouped counts, threaded in by `tasks.list()` so a
+ *  multi-row query does one pass over each in-memory registry instead of a
+ *  per-row `countPendingForTask`/`countTerminals` scan (289 tasks × 2 linear
+ *  scans on every 2s `/tasks` poll, before this). Single-task reads
+ *  (`tasks.get`, `insert`, `update`) omit this and fall back to the
+ *  per-task counters — called far less often than the poll. */
+interface TaskCounts {
+  pending?: Map<string, number>;
+  terminals?: Map<string, number>;
+}
+
+const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   id: r.id,
   title: r.title,
   prompt: r.prompt,
@@ -107,19 +172,23 @@ const toTask = (r: TaskRow): Task => ({
   isolation: r.isolation as Task["isolation"],
   taskType: r.task_type as TaskType,
   branch: r.branch,
+  branchSource: r.branch_source as Task["branchSource"],
   worktreePath: r.worktree_path,
   baseRef: r.base_ref,
+  prUrl: r.pr_url,
   mode: r.mode,
   model: r.model,
   effort: r.effort,
   references: parseRefs(r.refs),
+  backlog: parseBacklog(r.backlog),
+  draft: parseDraft(r.draft),
   runId: r.run_id,
   // `has_openable_run` comes back as SQLite's 0/1; missing means we didn't
   // join (e.g. insert/update returning the freshly-written shape, where
   // no runs exist yet → false is the right default).
   hasOpenableRun: r.has_openable_run === 1,
-  pendingInteractionCount: countPendingForTask(r.id),
-  openTerminalCount: countTerminals(r.id),
+  pendingInteractionCount: counts?.pending ? (counts.pending.get(r.id) ?? 0) : countPendingForTask(r.id),
+  openTerminalCount: counts?.terminals ? (counts.terminals.get(r.id) ?? 0) : countTerminals(r.id),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   archivedAt: r.archived_at,
@@ -136,12 +205,18 @@ const TASKS_SELECT = `
 `;
 
 export const tasks = {
+  // Computes the pending-interaction and open-terminal grouped counts ONCE
+  // for the whole result set (two single-pass scans over their respective
+  // in-memory maps) instead of once per row via `toTask`'s per-task fallback
+  // — this is the hot path hit by the 2s `/tasks` poll.
   list(): Task[] {
-    return db.query<TaskRow, []>(
+    const rows = db.query<TaskRow, []>(
       `${TASKS_SELECT}
          GROUP BY tasks.id
          ORDER BY tasks.created_at DESC`,
-    ).all().map(toTask);
+    ).all();
+    const counts: TaskCounts = { pending: pendingCountsByTask(), terminals: terminalCountsByTask() };
+    return rows.map((r) => toTask(r, counts));
   },
   get(id: string): Task | null {
     const row = db.query<TaskRow, [string]>(
@@ -155,14 +230,16 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, worktree_path, base_ref, mode, model, effort, refs,
+          branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, refs, backlog, draft,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
-        t.branch, t.worktreePath, t.baseRef, t.mode, t.model, t.effort,
+        t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.mode, t.model, t.effort,
         JSON.stringify(t.references ?? []),
+        JSON.stringify(t.backlog ?? []),
+        t.draft ? JSON.stringify(t.draft) : null,
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
       ],
     );
@@ -178,14 +255,16 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, worktree_path=?, base_ref=?, mode=?, model=?, effort=?, refs=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, refs=?, backlog=?, draft=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
         next.taskType,
-        next.branch, next.worktreePath, next.baseRef, next.mode, next.model, next.effort,
+        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.mode, next.model, next.effort,
         JSON.stringify(next.references ?? []),
+        JSON.stringify(next.backlog ?? []),
+        next.draft ? JSON.stringify(next.draft) : null,
         next.runId, next.updatedAt, next.archivedAt ?? null, id,
       ],
     );
@@ -202,12 +281,117 @@ export const tasks = {
   },
 };
 
-type ProjectRow = { path: string; name: string; added_at: number };
+/**
+ * Per-task backlog of saved, not-yet-sent draft messages. Every op is a
+ * read-modify-write on the task's `backlog` JSON column (via `tasks.update`)
+ * and returns the freshly-updated Task, or null when the task is gone. Item
+ * ids are minted here so clients never supply their own. Array order is the
+ * display order the UI renders and the user reorders. All ops are pure list
+ * transforms — there is no process side effect, so the server can call them
+ * directly without going through the orchestrator.
+ */
+export const backlog = {
+  add(taskId: string, input: { text: string; references?: TaskReference[] }): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    const item: BacklogMessage = {
+      id: randomUUID(),
+      text: input.text,
+      references: sanitizeRefs(input.references),
+      createdAt: Date.now(),
+    };
+    // Newest draft on top: the thing you just jotted is the one most likely
+    // to be sent or edited next.
+    return tasks.update(taskId, { backlog: [item, ...task.backlog] });
+  },
+  updateItem(
+    taskId: string,
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    // Unknown id → return the task unchanged rather than writing a no-op row.
+    if (!task.backlog.some((m) => m.id === itemId)) return task;
+    const next = task.backlog.map((m) =>
+      m.id === itemId
+        ? {
+            ...m,
+            text: patch.text !== undefined ? patch.text : m.text,
+            references:
+              patch.references !== undefined ? sanitizeRefs(patch.references) : m.references,
+          }
+        : m,
+    );
+    return tasks.update(taskId, { backlog: next });
+  },
+  remove(taskId: string, itemId: string): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    return tasks.update(taskId, {
+      backlog: task.backlog.filter((m) => m.id !== itemId),
+    });
+  },
+  /** Reorder the backlog to match `order` (item ids in the desired sequence).
+   *  Ids not in the current backlog are ignored; items absent from `order` are
+   *  appended in their existing relative order — so a stale or partial `order`
+   *  can never silently drop a saved draft. */
+  reorder(taskId: string, order: string[]): Task | null {
+    const task = tasks.get(taskId);
+    if (!task) return null;
+    const byId = new Map(task.backlog.map((m) => [m.id, m]));
+    const seen = new Set<string>();
+    const next: BacklogMessage[] = [];
+    for (const id of order) {
+      const m = byId.get(id);
+      if (m && !seen.has(id)) {
+        next.push(m);
+        seen.add(id);
+      }
+    }
+    for (const m of task.backlog) if (!seen.has(m.id)) next.push(m);
+    return tasks.update(taskId, { backlog: next });
+  },
+};
+
+/**
+ * The task's single composer draft — a pure wrapper over `tasks.update`, no
+ * process side effect. `null` clears it (stored as SQL NULL by `update`).
+ * References run through the same `sanitizeRefs` the read path (`parseDraft`)
+ * applies, and an effectively-empty draft (blank text, no sanitized refs)
+ * normalizes to `null` here too — otherwise a caller with junk refs could
+ * write a non-null row that reads back as `null`, a zombie draft that never
+ * shows up but never gets treated as absent either.
+ */
+export const drafts = {
+  set(taskId: string, draft: TaskDraft | null): Task | null {
+    if (draft) {
+      const references = sanitizeRefs(draft.references);
+      draft = draft.text.trim() || references.length > 0 ? { text: draft.text, references } : null;
+    }
+    return tasks.update(taskId, { draft });
+  },
+};
+
+type ProjectRow = { path: string; name: string; added_at: number; branch_config: string | null };
+
+/** Parse the stored branch-config JSON, tolerating legacy NULLs and bad data. */
+function parseBranchConfig(raw: string | null): BranchNamingConfig | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    if (v && typeof v === "object" && "rules" in v) return v as BranchNamingConfig;
+  } catch {
+    /* corrupt row — treat as "no custom config" so consumers use defaults */
+  }
+  return null;
+}
 
 const toProject = (r: ProjectRow): Project => ({
   path: r.path,
   name: r.name,
   addedAt: r.added_at,
+  branchConfig: parseBranchConfig(r.branch_config),
 });
 
 export const projects = {
@@ -216,10 +400,17 @@ export const projects = {
       `SELECT * FROM projects ORDER BY added_at DESC`,
     ).all().map(toProject);
   },
+  get(path: string): Project | null {
+    const row = db.query<ProjectRow, [string]>(
+      `SELECT * FROM projects WHERE path = ?`,
+    ).get(path);
+    return row ? toProject(row) : null;
+  },
   /**
    * Insert if new, refresh `added_at` if already present. The refresh lets the
    * picker surface "recently used" paths at the top — every task creation
-   * bumps its project to the front.
+   * bumps its project to the front. `branch_config` is left untouched on
+   * conflict so re-picking a project doesn't wipe its nomenclature.
    */
   upsert(path: string, name: string): Project {
     const now = Date.now();
@@ -228,7 +419,18 @@ export const projects = {
        ON CONFLICT(path) DO UPDATE SET added_at = excluded.added_at`,
       [path, name, now],
     );
-    return { path, name, addedAt: now };
+    return this.get(path)!;
+  },
+  /**
+   * Persist (or clear, with `null`) a project's branch nomenclature. Returns
+   * the refreshed row, or null if the project isn't registered.
+   */
+  setBranchConfig(path: string, config: BranchNamingConfig | null): Project | null {
+    db.run(
+      `UPDATE projects SET branch_config = ? WHERE path = ?`,
+      [config ? JSON.stringify(config) : null, path],
+    );
+    return this.get(path);
   },
   delete(path: string) {
     db.run(`DELETE FROM projects WHERE path = ?`, [path]);
@@ -549,22 +751,82 @@ export const runs = {
        ORDER BY id ASC`,
     ).all(runId);
   },
+  /** The most recently persisted MAIN-stream event's raw `data` for a run
+   *  (`subagent_id IS NULL`, like `seenLineUuidsForTask`), or `null` if the
+   *  run has none yet.
+   *
+   *  Backs `reapIdleSessions`'s idempotence guard: a re-reap regression
+   *  would try to append the identical hibernate breadcrumb to the same run
+   *  again, and comparing against the last persisted event's exact text is
+   *  enough to catch that without a full row fetch. The breadcrumb itself is
+   *  a main-stream row, so a subagent row landing afterwards must not
+   *  re-arm the guard — hence the filter. */
+  lastEventData(runId: string): string | null {
+    const row = db.query<{ data: string }, [string]>(
+      `SELECT data FROM run_events WHERE run_id = ? AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
+    ).get(runId);
+    return row ? row.data : null;
+  },
   /** All events across every run of a task, in event-id order (which is
    *  chronological — id is autoincrement, ts can collide when bursts of
    *  events land in the same Date.now() ms). Used by the unified
    *  task-level stream so the panel shows the whole conversation as one
-   *  scrollback instead of per-run silos. */
-  eventsForTask(taskId: string) {
-    return db.query<
-      { runId: string; stream: string; data: string; ts: number; subagentId: string | null },
-      [string]
-    >(
-      `SELECT run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
+   *  scrollback instead of per-run silos.
+   *
+   *  With no `opts` (or no `opts.limit`), returns the full unbounded
+   *  ascending history — the original behavior, kept for existing callers
+   *  (tests, `rebuildEventsFromJsonl`-adjacent tooling) that want everything.
+   *
+   *  With `opts.limit` set, returns only the MOST RECENT `limit` events:
+   *  filters `id < opts.beforeId` when given, orders by id DESC, takes
+   *  `limit`, then reverses so the caller still sees ascending order. This
+   *  is what powers the capped SSE replay window and the `/events/page`
+   *  paging route — both want "the newest N (before some cursor)", not
+   *  "the first N". */
+  eventsForTask(
+    taskId: string,
+    opts?: { beforeId?: number; limit?: number },
+  ): Array<{ id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null }> {
+    type Row = { id: number; runId: string; stream: string; data: string; ts: number; subagentId: string | null };
+    if (opts?.limit) {
+      const conditions = ["runs.task_id = ?"];
+      const params: Array<string | number> = [taskId];
+      if (opts.beforeId != null) {
+        conditions.push("run_events.id < ?");
+        params.push(opts.beforeId);
+      }
+      params.push(opts.limit);
+      const rows = db.query<Row, Array<string | number>>(
+        `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
+         FROM run_events
+         JOIN runs ON runs.id = run_events.run_id
+         WHERE ${conditions.join(" AND ")}
+         ORDER BY run_events.id DESC
+         LIMIT ?`,
+      ).all(...params);
+      return rows.reverse();
+    }
+    return db.query<Row, [string]>(
+      `SELECT run_events.id as id, run_events.run_id as runId, stream, data, ts, run_events.subagent_id as subagentId
        FROM run_events
        JOIN runs ON runs.id = run_events.run_id
        WHERE runs.task_id = ?
        ORDER BY run_events.id ASC`,
     ).all(taskId);
+  },
+  /** Cheap existence check — is there at least one persisted event for this
+   *  task older than `beforeId`? Backs the `hasMore` flag on both the SSE
+   *  `replay_meta` frame and the `/events/page` paging route, so the client
+   *  knows whether to keep showing "Load earlier" without fetching (and
+   *  counting) the whole remaining history. */
+  hasEventsBefore(taskId: string, beforeId: number): boolean {
+    const row = db.query<{ 1: number }, [string, number]>(
+      `SELECT 1 FROM run_events
+       JOIN runs ON runs.id = run_events.run_id
+       WHERE runs.task_id = ? AND run_events.id < ?
+       LIMIT 1`,
+    ).get(taskId, beforeId);
+    return row !== null;
   },
   appendEvent(
     runId: string,
@@ -646,18 +908,30 @@ interface SubagentRow {
   status: string;
   started_at: number;
   ended_at: number | null;
+  tool_use_id: string | null;
 }
+
+/** Every `parent_kind` the app understands. The column is plain TEXT with no
+ *  CHECK constraint (see `022_subagents.sql`) precisely so new kinds need no
+ *  migration — but an unknown value read back from a future/foreign build must
+ *  still land on a member of the union, so `toSubagent` falls back to
+ *  `"subagent"` for anything not listed here. Keep in sync with
+ *  `Subagent.parentKind` in shared/types.ts. */
+const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent"]);
 
 function toSubagent(r: SubagentRow): Subagent {
   return {
     id: r.id,
     taskId: r.task_id,
     runId: r.run_id,
-    parentKind: r.parent_kind === "bg_session" ? "bg_session" : "subagent",
+    parentKind: PARENT_KINDS.has(r.parent_kind)
+      ? (r.parent_kind as Subagent["parentKind"])
+      : "subagent",
     agentType: r.agent_type,
     description: r.description,
     spawnDepth: r.spawn_depth,
     sourcePath: r.source_path,
+    toolUseId: r.tool_use_id,
     status: r.status as SubagentStatus,
     startedAt: r.started_at,
     endedAt: r.ended_at,
@@ -682,13 +956,20 @@ export const subagents = {
   insertIfAbsent(s: Subagent): void {
     db.run(
       `INSERT OR IGNORE INTO subagents
-         (id, task_id, run_id, parent_kind, agent_type, description, spawn_depth, source_path, status, started_at, ended_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [s.id, s.taskId, s.runId, s.parentKind, s.agentType, s.description, s.spawnDepth, s.sourcePath, s.status, s.startedAt, s.endedAt],
+         (id, task_id, run_id, parent_kind, agent_type, description, spawn_depth, source_path, status, started_at, ended_at, tool_use_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [s.id, s.taskId, s.runId, s.parentKind, s.agentType, s.description, s.spawnDepth, s.sourcePath, s.status, s.startedAt, s.endedAt, s.toolUseId ?? null],
     );
   },
   setStatus(id: string, status: SubagentStatus, endedAt: number | null): void {
     db.run(`UPDATE subagents SET status = ?, ended_at = ? WHERE id = ?`, [status, endedAt, id]);
+  },
+  /** Backfill the tool_result correlation key for a row created before this
+   *  column existed (or whose meta sidecar hadn't been read yet). Only fills
+   *  a NULL — never overwrites an id already recorded, so a stale re-read of
+   *  the sidecar can't clobber a value another path already set. */
+  setToolUseId(id: string, toolUseId: string): void {
+    db.run(`UPDATE subagents SET tool_use_id = ? WHERE id = ? AND tool_use_id IS NULL`, [toolUseId, id]);
   },
   /** Settle a single subagent by id — the DB half of an *externally*-detected
    *  completion (a parent task-notification naming the finishing agent, or

@@ -36,8 +36,8 @@ async function seedScrapedAskQuestions(args: {
   tasks.insert({
     id: args.taskId, title: args.taskId, prompt: "", column: "running",
     agent: "claude-code", workdir: cwd, isolation: "none", taskType: "task",
-    branch: null, worktreePath: null, baseRef: null, mode: null,
-    model: "opus-4.7", effort: null, references: [], runId: "run-askq",
+    branch: null, branchSource: "created", worktreePath: null, baseRef: null, prUrl: null, mode: null,
+    model: "opus-4.7", effort: null, references: [], backlog: [], draft: null, runId: "run-askq",
     createdAt: Date.now(), updatedAt: Date.now(), hasOpenableRun: false,
     pendingInteractionCount: 0, openTerminalCount: 0, archivedAt: null,
   });

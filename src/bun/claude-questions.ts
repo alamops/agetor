@@ -45,6 +45,12 @@
  *          ❯ 1. Submit answers
  *            2. Cancel
  *      Enter (cursor defaults to "1. Submit answers") submits everything.
+ *      `planAskAnswers` marks this shape with `confirmsReview: true`, so the
+ *      driver (`driveAskAnswers` in claude-tmux.ts) withholds that final
+ *      Enter until the review screen is actually rendered — and, once sent,
+ *      re-verifies the modal actually closed rather than trusting the
+ *      keystroke's exit code, since the review screen's full-summary repaint
+ *      is Ink's heaviest and can swallow a keystroke arriving mid-repaint.
  *
  * "Type something." (the Other/custom entry) does NOT open an inline field in
  * 2.1.161 — selecting it cancels the structured question ("User declined to
@@ -82,14 +88,24 @@ export interface AskAnswer {
  * How to deliver the answer back to claude:
  *  - `drive`: emulate keystrokes into the native modal and let claude record
  *     a real structured tool_result. Only possible when every answer is a
- *     non-empty subset of preset options.
+ *     non-empty subset of preset options. `keys` is the full send-keys
+ *     sequence, including the trailing confirm `Enter` when the drive ends
+ *     on the "Ready to submit your answers?" review screen. `confirmsReview`
+ *     tells the driver whether that trailing key is a blind Enter (false —
+ *     the singleFlat case submits directly on the selection Enter, no review
+ *     screen ever renders) or a confirm that must be sent only once the
+ *     review screen is actually on the pane (true — every other shape). The
+ *     driver (`driveAskAnswers` in claude-tmux.ts) uses this flag to gate
+ *     and verify the confirm instead of firing it blind; the key sequence
+ *     itself is unchanged so existing consumers of `keys` (and tests
+ *     asserting it) keep working.
  *  - `message`: dismiss the modal (Esc) and post the answer as a normal turn.
  *     Used whenever a custom/free-text answer is involved, or the picks can't
  *     be driven safely (empty answer, unknown label, arity mismatch). `text`
  *     is the message body to paste; `reason` explains the choice (for logs).
  */
 export type SubmitPlan =
-  | { mode: "drive"; keys: NavKey[] }
+  | { mode: "drive"; keys: NavKey[]; confirmsReview: boolean }
   | { mode: "message"; text: string; reason: string };
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -429,7 +445,10 @@ export type MessageFallbackReason =
  *   - single-select: arrow to the one pick and Enter (which auto-advances);
  *   - a single single-select question submits on that Enter (no review screen);
  *     every other shape ends on the review screen, so a trailing Enter confirms
- *     "1. Submit answers".
+ *     "1. Submit answers". `confirmsReview` mirrors that split (`false` for
+ *     the singleFlat case, `true` otherwise) so the driver knows whether the
+ *     last key in `keys` needs to wait for the review screen to render before
+ *     it's safe to send.
  */
 export function planAskAnswers(specs: AskQuestionSpec[], answers: AskAnswer[]): SubmitPlan {
   const fallback = (reason: MessageFallbackReason): SubmitPlan => ({
@@ -497,7 +516,7 @@ export function planAskAnswers(specs: AskQuestionSpec[], answers: AskAnswer[]): 
   // review screen with the cursor on "1. Submit answers".
   if (!singleFlat) keys.push("Enter");
 
-  return { mode: "drive", keys };
+  return { mode: "drive", keys, confirmsReview: !singleFlat };
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *

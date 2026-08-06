@@ -25,7 +25,8 @@ export type InteractionKind =
  * invisible to the user. The scraper in `claude-tmux.ts` detects it on the
  * pane, pairs it with the structured `questions` it saw in the JSONL tool_use,
  * and surfaces it as a structured card. The answer is driven back as keystrokes
- * (`planAskAnswers` + `sendModalKeys`); there is no blocking hook curl.
+ * (`planAskAnswers` + `driveAskAnswers`, or `sendModalKeys(["Escape"])` for the
+ * message-mode fallback); there is no blocking hook curl.
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** One question inside an AskUserQuestion tool call (claude code shape). */
@@ -51,7 +52,7 @@ export interface AskQuestionsRequest {
   /**
    * How the answer is delivered back to claude. Only `"scraper"` exists now:
    * the native modal is detected on the tmux pane and the answer is driven
-   * back as keystrokes (`planAskAnswers` + `sendModalKeys`), then the card is
+   * back as keystrokes (`planAskAnswers` + `driveAskAnswers`), then the card is
    * removed via `resolveScrapedAskQuestions`. Registered by
    * `registerScrapedAskQuestions`.
    */
@@ -391,6 +392,20 @@ export function countPendingForTask(taskId: string): number {
   for (const e of askQuestions.values()) if (e.req.taskId === taskId) n++;
   for (const e of tmuxPrompts.values()) if (e.req.taskId === taskId) n++;
   return n;
+}
+
+/** Grouped counts of pending interactions across every task in one pass over
+ *  both in-memory maps — used by `tasks.list()` so the 2s `/tasks` poll does
+ *  a single scan instead of calling `countPendingForTask` per task row. */
+export function pendingCountsByTask(): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const e of askQuestions.values()) {
+    counts.set(e.req.taskId, (counts.get(e.req.taskId) ?? 0) + 1);
+  }
+  for (const e of tmuxPrompts.values()) {
+    counts.set(e.req.taskId, (counts.get(e.req.taskId) ?? 0) + 1);
+  }
+  return counts;
 }
 
 /** Test-only handle for asserting the registry state. */

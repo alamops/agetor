@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
-import { AlertTriangle, Settings, X } from "lucide-react";
+import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
+import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -14,12 +15,15 @@ import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
 import { UpdateBanner } from "@/components/updater/UpdateBanner";
+import { WorktreesDialog } from "@/components/worktrees/WorktreesDialog";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
+import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
-import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess } from "@/lib/toasts";
+import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
+import { parsePullNumber } from "@/lib/pr-url";
 import { cn } from "@/lib/utils";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
@@ -69,6 +73,68 @@ function ErrorToast({ error, onDismiss }: { error: string | null; onDismiss: () 
   );
 }
 
+/**
+ * Reconcile a freshly-fetched list against the previously-rendered one,
+ * preserving object identity for entries that haven't actually changed.
+ * Poll-driven fetches (`/tasks` every 2s, `/harnesses` every 15s) otherwise
+ * hand back brand-new object graphs every tick even when nothing changed
+ * server-side — that defeats `React.memo` on every downstream card/column
+ * and force-renders the selected-task sync effect. Deep-equality here is a
+ * plain `JSON.stringify` compare: cheap at this scale (hundreds of small
+ * objects, once per poll) and robust against any field changing without a
+ * corresponding `updatedAt` bump (e.g. `pendingInteractionCount`,
+ * `runningSubagents`, `openTerminalCount` are all computed server-side per
+ * request and aren't reflected in `updatedAt`).
+ *
+ * `cache`, when passed, memoizes each entry's serialized form by id so a
+ * poll where nothing changed only has to `JSON.stringify` the freshly
+ * fetched (`next`) side — the `prev` side is a cache hit as long as the
+ * cached entry's object reference still matches what's actually in `prev`
+ * (it can legitimately not: several call sites patch `tasks` state directly
+ * for optimistic updates, bypassing this function, so a stale/mismatched
+ * cache entry falls back to recomputing rather than trusting a stringified
+ * form for a different object). Entries whose id no longer appears in
+ * `next` are evicted so the cache doesn't grow unboundedly across a
+ * session's worth of deleted/archived tasks.
+ *
+ * Returns `prev` itself (same array reference) when every entry, in the
+ * same order, is unchanged — letting the caller's `setState` bail out
+ * entirely instead of triggering a render.
+ */
+function reconcileById<T>(
+  prev: T[],
+  next: T[],
+  keyOf: (item: T) => string,
+  cache?: Map<string, { obj: T; json: string }>,
+): T[] {
+  const prevByKey = new Map(prev.map((item) => [keyOf(item), item] as const));
+  const seen = new Set<string>();
+  const merged = next.map((item) => {
+    const key = keyOf(item);
+    seen.add(key);
+    const old = prevByKey.get(key);
+    const nextJson = JSON.stringify(item);
+    let unchanged = false;
+    if (old !== undefined) {
+      const cached = cache?.get(key);
+      const oldJson = cached && cached.obj === old ? cached.json : JSON.stringify(old);
+      unchanged = oldJson === nextJson;
+    }
+    const finalItem = unchanged ? old! : item;
+    if (cache) cache.set(key, { obj: finalItem, json: nextJson });
+    return finalItem;
+  });
+  if (cache) {
+    for (const key of cache.keys()) {
+      if (!seen.has(key)) cache.delete(key);
+    }
+  }
+  if (merged.length === prev.length && merged.every((item, i) => item === prev[i])) {
+    return prev;
+  }
+  return merged;
+}
+
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
@@ -85,6 +151,17 @@ export default function App() {
   const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [githubOpen, setGithubOpen] = useState(false);
+  // Set by RunPanel's "Open PR" chip to open GitHubDialog pre-seeded for a
+  // specific task; cleared when the dialog closes so a later plain "GitHub"
+  // open (no prefill) doesn't inherit a stale project/task.
+  const [githubPullPrefill, setGithubPullPrefill] = useState<GitHubPullPrefill | null>(null);
+  // Set by RunPanel's "View PR" header affordance to open GitHubDialog
+  // straight on that PR's detail subpage; cleared alongside `githubPullPrefill`
+  // above (dialog close, or the other prefill kind winning a race) so only
+  // one prefill kind is ever live at a time.
+  const [githubPullDetailPrefill, setGithubPullDetailPrefill] = useState<GitHubPullDetailPrefill | null>(null);
+  const [worktreesOpen, setWorktreesOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -111,19 +188,34 @@ export default function App() {
     return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
   }, []);
 
-  const refresh = async () => {
-    try { setTasks(await api.listTasks()); } catch { /* keep last good snapshot; retry next tick */ }
-  };
-  const refreshAgents = async () => {
+  // Per-task serialized-form cache for `reconcileById` below — see that
+  // function's doc comment. A ref (not state) since it's pure bookkeeping
+  // that must survive across polls without itself triggering a render.
+  const taskReconcileCacheRef = useRef(new Map<string, { obj: Task; json: string }>());
+
+  /** Re-list tasks. Returns the fetched list so callers that need to inspect a
+   *  task right after a mutation don't have to issue a second GET. `null` on
+   *  failure — the last good snapshot stays rendered and the poll retries. */
+  const refresh = useCallback(async (): Promise<Task[] | null> => {
+    try {
+      const list = await api.listTasks();
+      // `list` (unreconciled) is what callers get back for immediate reads
+      // (e.g. re-checking a just-created task's branch); the reconciled,
+      // identity-preserving version is what actually lands in state.
+      setTasks((prev) => reconcileById(prev, list, (t) => t.id, taskReconcileCacheRef.current));
+      return list;
+    } catch { return null; /* keep last good snapshot; retry next tick */ }
+  }, []);
+  const refreshAgents = useCallback(async () => {
     try {
       const payload = await api.listHarnesses();
-      setHarnesses(payload.harnesses);
-      setAgents(payload.statuses);
+      setHarnesses((prev) => reconcileById(prev, payload.harnesses, (h) => h.id));
+      setAgents((prev) => reconcileById(prev, payload.statuses, (a) => a.harnessId));
     } catch { /* leave previous state */ }
-  };
-  const refreshAgentModels = async () => {
+  }, []);
+  const refreshAgentModels = useCallback(async () => {
     try { setAgentModels(await api.listAgentModels()); } catch { /* leave previous state */ }
-  };
+  }, []);
   useEffect(() => {
     void refresh();
     void refreshAgents();
@@ -153,14 +245,34 @@ export default function App() {
     // freshly-opened webview wouldn't know about an update that was already
     // downloaded by the previous main-process tick.
     api.getUpdateStatus().then(setUpdateSnapshot).catch(() => { /* fine */ });
-    const t = setInterval(refresh, 2000);
-    const a = setInterval(refreshAgents, 15_000);
+    // Skip poll ticks while the window is hidden — a backgrounded kanban
+    // board has no reason to keep re-fetching + re-rendering every 2s/15s.
+    // The intervals themselves keep running (cheap — it's just the fetch +
+    // setState that's skipped) so there's nothing to re-arm; `visible`
+    // fires an immediate refresh so returning to the window doesn't wait
+    // out a stale tick. This mirrors the existing `flushNow`-on-visible
+    // wiring in RunPanel and is mandatory, not an optimization: WKWebView
+    // suspends rAF (not setInterval) while occluded, but a naive "just
+    // gate the poll" change without an immediate on-return refresh would
+    // reintroduce the same class of "frozen until you nudge the window"
+    // bug previously fixed there.
+    const t = setInterval(() => { if (!document.hidden) void refresh(); }, 2000);
+    const a = setInterval(() => { if (!document.hidden) void refreshAgents(); }, 15_000);
+    const onVisible = () => {
+      if (document.hidden) return;
+      void refresh();
+      void refreshAgents();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
     return () => {
       clearInterval(t);
       clearInterval(a);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
       if (defaultsTimer) clearTimeout(defaultsTimer);
     };
-  }, []);
+  }, [refresh, refreshAgents, refreshAgentModels]);
 
   // Keep the selected task in sync as the list refreshes.
   useEffect(() => {
@@ -367,6 +479,8 @@ export default function App() {
           toastApiError({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else if (ev.reason === "session-died") {
           toastSessionEnded({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
+        } else if (ev.reason === "unknown-command") {
+          toastUnknownCommand({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         } else {
           toastPending({ taskId: ev.taskId, title, subtitle, isSelected, isFocused, onOpen });
         }
@@ -411,14 +525,26 @@ export default function App() {
     [tasks],
   );
 
-  const surfaceError = (e: unknown) =>
+  // Every handler below is wrapped in `useCallback` so it keeps a stable
+  // identity across App re-renders (poll ticks, unrelated state changes,
+  // etc.) — they're passed straight down to `Column`/`TaskCard`, both
+  // `React.memo`'d, and an unstable function prop would force every card in
+  // every column to re-render on every tick regardless of the task-list
+  // equality guard above. None of these actually need to read the current
+  // `tasks`/`selected` state (they operate on the `t` argument the caller
+  // already has), except `del`'s "is the deleted task the open one" check —
+  // that reads `selectedIdRef` (already kept in sync by the effect above)
+  // instead of `selected` directly, so `del` doesn't have to change identity
+  // every time the user opens a different task.
+  const surfaceError = useCallback((e: unknown) => {
     setError(e instanceof Error ? e.message : String(e));
+  }, []);
 
-  const onDragEnd = async (e: DragEndEvent) => {
+  const onDragEnd = useCallback(async (e: DragEndEvent) => {
     const id = String(e.active.id);
     const col = e.over?.id as ColumnId | undefined;
     if (!col) return;
-    const t = tasks.find((x) => x.id === id);
+    const t = tasksRef.current.find((x) => x.id === id);
     if (!t || t.column === col) return;
     setTasks((cur) => cur.map((x) => (x.id === id ? { ...x, column: col } : x)));
     try {
@@ -429,13 +555,27 @@ export default function App() {
       // Server didn't accept the move — re-sync the optimistic UI.
       await refresh();
     }
-  };
+  }, [refresh, surfaceError]);
 
-  const start = async (t: Task) => {
+  // `startTask` materializes the worktree, which can re-pin the branch when a
+  // create-time uniqueness race is only detectable once the branch actually
+  // exists. Surface the change so the user isn't left believing the name they
+  // saw. Reads the new branch out of the refresh we already do — no extra GET.
+  // Best-effort: if the refresh failed, the 2s poll still shows the real branch.
+  const startAndNotifyBranch = useCallback(async (taskId: string, branchBefore: string | null) => {
+    await api.startTask(taskId);
+    const list = await refresh();
+    if (!branchBefore || !list) return;
+    const after = list.find((t) => t.id === taskId);
+    if (after?.branch && after.branch !== branchBefore) {
+      toast(`Branch changed to “${after.branch}” — “${branchBefore}” was already taken.`);
+    }
+  }, [refresh]);
+
+  const start = useCallback(async (t: Task) => {
     try {
       setError(null);
-      await api.startTask(t.id);
-      await refresh();
+      await startAndNotifyBranch(t.id, t.branch);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // tmux-missing errors get a guided fix dialog instead of a toast — the
@@ -447,8 +587,8 @@ export default function App() {
       }
       void refreshAgents();
     }
-  };
-  const cancel = async (t: Task) => {
+  }, [startAndNotifyBranch, surfaceError, refreshAgents]);
+  const cancel = useCallback(async (t: Task) => {
     if (!t.runId) return;
     try {
       setError(null);
@@ -456,8 +596,8 @@ export default function App() {
     } catch (e) {
       surfaceError(e);
     }
-  };
-  const markDone = async (t: Task) => {
+  }, [surfaceError]);
+  const markDone = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, column: "done" } : x)));
     try {
       setError(null);
@@ -467,20 +607,31 @@ export default function App() {
       surfaceError(e);
       await refresh();
     }
-  };
-  const archive = async (t: Task) => {
+  }, [refresh, surfaceError]);
+  const archive = useCallback(async (t: Task) => {
+    const active = t.column === "running" || t.column === "blocked";
+    if (active) {
+      const ok = await confirm({
+        title: `Archive "${t.title}"?`,
+        description:
+          "An agent is still working on this task. Archiving will stop it.",
+        confirmLabel: "Stop & archive",
+        variant: "destructive",
+      });
+      if (!ok) return;
+    }
     const now = Date.now();
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: now } : x)));
     try {
       setError(null);
-      await api.archiveTask(t.id);
+      await api.archiveTask(t.id, active ? { force: true, stopRun: true } : undefined);
       await refresh();
     } catch (e) {
       surfaceError(e);
       await refresh();
     }
-  };
-  const unarchive = async (t: Task) => {
+  }, [confirm, refresh, surfaceError]);
+  const unarchive = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: null } : x)));
     try {
       setError(null);
@@ -490,8 +641,8 @@ export default function App() {
       surfaceError(e);
       await refresh();
     }
-  };
-  const del = async (t: Task) => {
+  }, [refresh, surfaceError]);
+  const del = useCallback(async (t: Task) => {
     const ok = await confirm({
       title: `Delete "${t.title}"?`,
       description: (
@@ -513,14 +664,26 @@ export default function App() {
     try {
       setError(null);
       await api.deleteTask(t.id);
-      if (selected?.id === t.id) setSelected(null);
+      if (selectedIdRef.current === t.id) setSelected(null);
       await refresh();
     } catch (e) {
       surfaceError(e);
       // Refresh anyway so the UI matches the server.
       await refresh();
     }
-  };
+  }, [confirm, refresh, surfaceError]);
+
+  // Shared by GitHubDialog's `onClose` and `onOpenSettings` (the latter also
+  // opens SettingsDialog) so the three-setter teardown can't drift out of
+  // sync between the two call sites — both must clear the dialog's own open
+  // state and both prefill kinds, or a later plain "GitHub" open (no
+  // prefill) could inherit a stale project/task from whichever prefill path
+  // was last used.
+  const closeGithubDialog = useCallback(() => {
+    setGithubOpen(false);
+    setGithubPullPrefill(null);
+    setGithubPullDetailPrefill(null);
+  }, []);
 
   return (
     <div className="flex h-screen w-screen flex-col bg-background text-foreground">
@@ -581,6 +744,24 @@ export default function App() {
           <Button
             variant="ghost"
             size="icon"
+            onClick={() => setGithubOpen(true)}
+            aria-label="Git"
+            title="Git pull requests and issues (GitHub, GitLab, Bitbucket)"
+          >
+            <GitPullRequest className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setWorktreesOpen(true)}
+            aria-label="Worktrees"
+            title="Worktrees"
+          >
+            <FolderGit2 className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
             onClick={() => setSettingsOpen(true)}
             aria-label="Settings"
             title="Settings"
@@ -605,10 +786,17 @@ export default function App() {
                 ...input,
                 column: start ? "ready" : "backlog",
               });
+              // The server makes the branch unique within the repo, so the
+              // pinned name can differ from what the sidebar showed (a
+              // same-name task already exists). Surface the final name rather
+              // than let the user assume the one they saw.
+              if (input.branch && created.branch && created.branch !== input.branch) {
+                toast(`Branch set to “${created.branch}” to keep it unique.`);
+              }
               await refresh();
               if (start) {
-                await api.startTask(created.id);
-                await refresh();
+                // Refreshes internally, so no second refresh here.
+                await startAndNotifyBranch(created.id, created.branch);
               }
             } catch (e) {
               setError(e instanceof Error ? e.message : String(e));
@@ -681,12 +869,54 @@ export default function App() {
         onShowDiff={setDiffTask}
         onArchive={archive}
         onUnarchive={unarchive}
+        onOpenPullRequest={(prefill) => {
+          setGithubPullPrefill(prefill);
+          setGithubPullDetailPrefill(null);
+          setGithubOpen(true);
+        }}
+        onViewPullRequest={({ projectPath, prUrl }) => {
+          const number = parsePullNumber(prUrl);
+          if (number == null) {
+            // Can't drive the in-app detail subpage without a parsed PR
+            // number — fall back to the plain external link rather than
+            // silently doing nothing.
+            void api.openExternal(prUrl).catch((err: unknown) => {
+              toast.error(err instanceof Error ? err.message : "Could not open link");
+            });
+            return;
+          }
+          setGithubPullDetailPrefill({ projectPath, number, prUrl });
+          setGithubPullPrefill(null);
+          setGithubOpen(true);
+        }}
       />
       <DiffDialog
         open={!!diffTask}
-        taskId={diffTask?.id ?? null}
-        taskTitle={diffTask?.title}
+        task={diffTask ? (tasks.find((t) => t.id === diffTask.id) ?? diffTask) : null}
         onClose={() => setDiffTask(null)}
+      />
+      <GitHubDialog
+        open={githubOpen}
+        projects={projects}
+        initialProjectPath={githubPullDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        pullPrefill={githubPullPrefill}
+        pullDetailPrefill={githubPullDetailPrefill}
+        onClose={closeGithubDialog}
+        onOpenSettings={() => {
+          closeGithubDialog();
+          setSettingsOpen(true);
+        }}
+      />
+      <WorktreesDialog
+        open={worktreesOpen}
+        onClose={() => setWorktreesOpen(false)}
+        tasks={tasks}
+        projects={projects}
+        homeDir={homeDir}
+        onOpenTask={(t) => {
+          setWorktreesOpen(false);
+          setSelected(t);
+        }}
       />
       <SettingsDialog
         open={settingsOpen}

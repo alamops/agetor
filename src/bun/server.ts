@@ -7,6 +7,8 @@ import { API_TOKEN, getApiPort } from "./api-config.ts";
 import { removeCoreCreds } from "./core-creds.ts";
 import {
   tasks,
+  backlog,
+  drafts,
   runs,
   subagents,
   projects,
@@ -16,8 +18,9 @@ import {
   HarnessInUseError,
   dataDir,
 } from "./db.ts";
-import { archiveTask, createTask, deleteTask, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask } from "./orchestrator.ts";
+import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
   buildHarnessTerminalCommand,
   harnessEnv,
@@ -37,6 +40,8 @@ import {
 } from "./tmux-resolution.ts";
 import {
   dismissTmuxPrompt,
+  driveAskAnswers,
+  healWindowSize,
   jsonlPathFor,
   rebuildEventsFromJsonl,
   markTmuxPromptAnswered,
@@ -51,8 +56,10 @@ import {
   getTaskDiff,
   gitFetch,
   gitPull,
+  gitPush,
   hasUncommittedChanges,
   listBranches,
+  remoteSyncState,
 } from "./worktree.ts";
 import {
   attachSocket,
@@ -66,6 +73,69 @@ import {
   type TerminalSocketData,
 } from "./terminals.ts";
 import { listAgentCapabilities } from "./commands.ts";
+import {
+  addGitHubDiscussionComment,
+  addGitHubProjectItem,
+  addGitHubReaction,
+  addGitHubSubIssue,
+  applyGitHubSuggestion,
+  cancelGitHubWorkflowRun,
+  createGitHubDiscussion,
+  createGitHubLabel,
+  createGitHubMilestone,
+  createGitHubRelease,
+  deleteGitHubComment,
+  deleteGitHubDiscussion,
+  deleteGitHubDiscussionComment,
+  deleteGitHubLabel,
+  deleteGitHubMilestone,
+  deleteGitHubRelease,
+  dispatchGitHubWorkflow,
+  getGitHubCommitStatus,
+  getGitHubDiscussion,
+  getGitHubIssuePinned,
+  getGitHubProjectItems,
+  getGitHubPullLinkedIssues,
+  getGitHubRepoPermissions,
+  getGitHubThreadSubscription,
+  getGitHubPullReviewThreads,
+  listGitHubAssignees,
+  listGitHubDiscussions,
+  listGitHubMilestones,
+  listGitHubNotifications,
+  listGitHubProjectsV2,
+  listGitHubPullCommits,
+  listGitHubReactions,
+  listGitHubReleases,
+  listGitHubSubIssues,
+  listGitHubTags,
+  listGitHubWorkflowRuns,
+  listGitHubWorkflows,
+  markAllGitHubNotificationsRead,
+  markGitHubNotificationRead,
+  removeGitHubProjectItem,
+  removeGitHubReaction,
+  removeGitHubSubIssue,
+  requestGitHubPullReviewers,
+  rerunGitHubWorkflowRun,
+  setGitHubDiscussionAnswer,
+  setGitHubIssueLock,
+  setGitHubIssuePinned,
+  setGitHubProjectItemStatus,
+  setGitHubPullAutoMerge,
+  setGitHubPullDraft,
+  setGitHubReviewThreadResolved,
+  setGitHubThreadSubscription,
+  transferGitHubIssue,
+  unsubscribeGitHubThread,
+  updateGitHubComment,
+  updateGitHubLabel,
+  updateGitHubMilestone,
+  updateGitHubPullBranch,
+  updateGitHubRelease,
+} from "./github.ts";
+import { remoteHostsForDirs } from "./git-provider.ts";
+import * as gitHost from "./git-host.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";
 import {
@@ -75,10 +145,34 @@ import {
   listPendingForTask,
   type AskQuestionsAnswer,
 } from "./interactions.ts";
-import { MODEL_EFFORT_SUPPORT, TASK_TYPES } from "../shared/types.ts";
-import type { AgentKind, AppEvent, GlobalEvent, RunEvent, Task, TaskReference } from "../shared/types.ts";
+import {
+  DEFAULT_BRANCH_CONFIG,
+  EVENTS_REPLAY_LIMIT,
+  MODEL_EFFORT_SUPPORT,
+  TASK_EVENTS_REPLAY_META_EVENT,
+  TASK_TYPES,
+  validateBranchConfig,
+} from "../shared/types.ts";
+import type {
+  AgentKind,
+  AppEvent,
+  BranchNamingConfig,
+  GitHubItemKind,
+  GitHubItemState,
+  GitHubPullMergeMethod,
+  GitHubPullReviewEvent,
+  GitHubReactionContent,
+  GitHubReactionSubject,
+  GlobalEvent,
+  RunEvent,
+  Task,
+  TaskEventsReplayMeta,
+  TaskGitStatus,
+  TaskReference,
+} from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
+import { isImagePath } from "../shared/attachments.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -109,6 +203,15 @@ const json = (data: unknown, init?: ResponseInit) =>
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
     status: init?.status,
   });
+
+// Content-type map for GET /files/preview. Module-scope so it isn't
+// reallocated on every request.
+const PREVIEW_CONTENT_TYPES: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  svg: "image/svg+xml",
+  ico: "image/x-icon",
+};
 
 // Derived, never-persisted count of this task's still-`running` subagent
 // rows — drives the kanban card's "N background agents" badge. Single-task
@@ -194,6 +297,11 @@ const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
   "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "taskType",
 ]);
 
+/** The 8 reaction contents GitHub's API accepts — validated here before the
+ *  request ever reaches `addGitHubReaction` (which re-validates independently,
+ *  same defense-in-depth as the other GitHub POST routes). */
+const REACTION_CONTENTS = new Set<string>(["+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"]);
+
 function filterPatch(raw: unknown): Partial<Task> {
   if (!raw || typeof raw !== "object") return {};
   const patch: Partial<Task> = {};
@@ -201,6 +309,61 @@ function filterPatch(raw: unknown): Partial<Task> {
     if (ALLOWED_PATCH_FIELDS.has(k as keyof Task)) (patch as Record<string, unknown>)[k] = v;
   }
   return patch;
+}
+
+/** Shared precondition for the backlog-mutation routes: the task must exist
+ *  and not be archived. Returns an error Response to short-circuit with, or
+ *  null when the caller may proceed. Mirrors the archived-freeze that the
+ *  task PATCH route enforces so a direct API caller can't stash/edit drafts on
+ *  a frozen task the UI has already made read-only. */
+function backlogGuard(req: { params: { id: string } } & Request): Response | null {
+  const task = tasks.get(req.params.id);
+  if (!task) {
+    return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+  }
+  if (task.archivedAt != null) {
+    return json(
+      { error: "task is archived — unarchive it before editing the backlog" },
+      { status: 400, headers: corsHeaders(req) },
+    );
+  }
+  return null;
+}
+
+/**
+ * Coerce an untrusted request body into a well-formed BranchNamingConfig,
+ * dropping unknown fields and filling every task-type rule (missing ones fall
+ * back to the built-in default). Returns `{ error }` when the shape is
+ * unusable or a prefix wouldn't produce a legal branch.
+ */
+/** Wire shape for a stored GitHub PAT: the raw token never leaves the Bun
+ *  process — only a last-4-chars preview, and even that is withheld when the
+ *  token is so short the suffix would be the entire secret. */
+function sanitizedTokenInfo(t: { host: string; label: string | null; token: string }) {
+  return {
+    host: t.host,
+    label: t.label,
+    tokenPreview: t.token.length > 4 ? `…${t.token.slice(-4)}` : "…",
+  };
+}
+
+function coerceBranchConfig(raw: unknown): { config: BranchNamingConfig } | { error: string } {
+  if (!raw || typeof raw !== "object") return { error: "config (object) required" };
+  const src = raw as { rules?: unknown; includeSlug?: unknown };
+  const rulesSrc = (src.rules && typeof src.rules === "object" ? src.rules : {}) as Record<string, unknown>;
+  const rules = {} as BranchNamingConfig["rules"];
+  for (const t of TASK_TYPES) {
+    const r = rulesSrc[t.id] as { prefix?: unknown } | undefined;
+    const prefix = r && typeof r.prefix === "string" ? r.prefix : DEFAULT_BRANCH_CONFIG.rules[t.id].prefix;
+    rules[t.id] = { prefix };
+  }
+  const config: BranchNamingConfig = {
+    rules,
+    includeSlug: typeof src.includeSlug === "boolean" ? src.includeSlug : true,
+  };
+  const v = validateBranchConfig(config);
+  if (!v.ok) return { error: v.reason };
+  return { config };
 }
 
 /**
@@ -303,6 +466,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
     port: PORT,
     hostname: "127.0.0.1",
     development: false,
+    // Bun's default idleTimeout is 10s, which is far too short here: it closes
+    // idle pooled keep-alive sockets that WKWebView then reuses for a POST
+    // (CFNetwork never auto-retries on a dropped reused connection, so the
+    // webview surfaces "cannot reach agetor API"), and it kills any handler
+    // that awaits >10s before writing bytes. 255 is Bun's max; some handlers
+    // below opt out entirely via server.timeout(req, 0).
+    idleTimeout: 255,
     websocket: terminalWebSocket,
     routes: {
       // Unauthenticated probes only — never returns data.
@@ -386,7 +556,42 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const url = new URL(req.url);
           const dir = url.searchParams.get("path");
           if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
-          return json(await listBranches(dir), { headers: corsHeaders(req) });
+          // Hide branches agetor created for its own tasks so they don't clutter
+          // the base-ref picker. The legacy `agetor/` prefix is filtered inside
+          // listBranches; custom-prefixed branches (feature/…, fix/…) are only
+          // recognizable via the pinned names on task rows, so pass those too.
+          const managed = new Set(
+            tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
+          );
+          return json(await listBranches(dir, { exclude: managed }), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Per-project branch nomenclature. GET resolves to the built-in defaults
+      // when the project has no stored config (or isn't registered), so the
+      // client always renders a usable form. PUT persists a validated config.
+      "/projects/settings": {
+        GET: authed((req) => {
+          const url = new URL(req.url);
+          const p = url.searchParams.get("path");
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const config = projects.get(p)?.branchConfig ?? DEFAULT_BRANCH_CONFIG;
+          return json(config, { headers: corsHeaders(req) });
+        }),
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: unknown; config?: unknown };
+          if (typeof body.path !== "string" || !body.path) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const coerced = coerceBranchConfig(body.config);
+          if ("error" in coerced) {
+            return json({ error: coerced.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          const updated = projects.setBranchConfig(body.path, coerced.config);
+          if (!updated) {
+            return json({ error: "project not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(updated, { headers: corsHeaders(req) });
         }),
       },
 
@@ -418,6 +623,1895 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (!result.ok) {
             return json({ error: result.error ?? "git pull failed" }, { status: 400, headers: corsHeaders(req) });
           }
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Push a local branch to its remote (the New PR composer's Push button) so
+      // a local-only branch — e.g. an agetor worktree branch — can be opened as a
+      // pull request. Network-bound like /projects/fetch. `--set-upstream` is set
+      // so PR creation and the behind indicator have a tracking ref afterwards.
+      "/projects/push": {
+        POST: authed(async (req) => {
+          const { path: p, branch } = (await req.json().catch(() => ({}))) as { path?: string; branch?: string };
+          if (!p) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!branch) return json({ error: "branch required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitPush(p, branch);
+          if (!result.ok) {
+            return json({ error: result.error ?? "git push failed" }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json({ ok: true, remote: result.remote }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Read-only GitHub repo surface for the project selected in the app.
+      // The helper infers owner/repo from the project's GitHub remote and uses
+      // GITHUB_TOKEN/GH_TOKEN or `gh auth token` when available; public repos
+      // still work unauthenticated.
+      "/github/items": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const kind = url.searchParams.get("kind");
+          const state = url.searchParams.get("state") ?? "open";
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (kind !== "pulls" && kind !== "issues") {
+            return json({ error: "kind must be pulls or issues" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (state !== "open" && state !== "closed" && state !== "all") {
+            return json({ error: "state must be open, closed, or all" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const labels = (url.searchParams.get("labels") ?? "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+          const assignee = url.searchParams.get("assignee") ?? "";
+          const rawPage = Number(url.searchParams.get("page"));
+          const page = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : undefined;
+          const sort = url.searchParams.get("sort");
+          const direction = url.searchParams.get("direction");
+          if (sort !== null && sort !== "created" && sort !== "updated" && sort !== "comments") {
+            return json({ error: "sort must be created, updated, or comments" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (direction !== null && direction !== "asc" && direction !== "desc") {
+            return json({ error: "direction must be asc or desc" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.listItems({
+            dir,
+            kind: kind as GitHubItemKind,
+            state: state as GitHubItemState,
+            query: url.searchParams.get("q") ?? "",
+            labels,
+            assignee,
+            createdByMe: url.searchParams.get("createdByMe") === "1",
+            assignedToMe: url.searchParams.get("assignedToMe") === "1",
+            reviewRequested: url.searchParams.get("reviewRequested") === "1",
+            searchQuery: url.searchParams.get("searchQuery") ?? "",
+            page,
+            sort: sort ?? undefined,
+            direction: direction ?? undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Multi-repo aggregation (G8/F15) — "All repositories" in the GitHub
+      // dialog. POST (not GET) because `paths` is an array. Mirrors /github/items'
+      // filters; per-repo fetches are fanned out server-side and merged.
+      "/github/items-aggregate": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            paths?: unknown;
+            kind?: string;
+            state?: string;
+            q?: string;
+            labels?: unknown;
+            assignee?: string;
+            createdByMe?: boolean;
+            assignedToMe?: boolean;
+            reviewRequested?: boolean;
+            searchQuery?: string;
+            sort?: string;
+            direction?: string;
+          };
+          const paths = Array.isArray(body.paths)
+            ? body.paths.filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+            : [];
+          if (paths.length === 0) return json({ error: "paths required" }, { status: 400, headers: corsHeaders(req) });
+          const kind = body.kind;
+          if (kind !== "pulls" && kind !== "issues") {
+            return json({ error: "kind must be pulls or issues" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const state = body.state ?? "open";
+          if (state !== "open" && state !== "closed" && state !== "all") {
+            return json({ error: "state must be open, closed, or all" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const sort = body.sort;
+          if (sort !== undefined && sort !== "created" && sort !== "updated" && sort !== "comments") {
+            return json({ error: "sort must be created, updated, or comments" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const direction = body.direction;
+          if (direction !== undefined && direction !== "asc" && direction !== "desc") {
+            return json({ error: "direction must be asc or desc" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const labels = Array.isArray(body.labels)
+            ? body.labels.filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+            : [];
+          const result = await gitHost.listItemsAcrossRepos({
+            dirs: paths,
+            kind: kind as GitHubItemKind,
+            state: state as GitHubItemState,
+            query: body.q ?? "",
+            labels,
+            assignee: body.assignee ?? "",
+            createdByMe: body.createdByMe === true,
+            assignedToMe: body.assignedToMe === true,
+            reviewRequested: body.reviewRequested === true,
+            searchQuery: body.searchQuery ?? "",
+            sort,
+            direction,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/repo-permissions": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await getGitHubRepoPermissions({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-diff": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullDiff({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-detail": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullDetail({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/viewer": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitHost.viewer({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Provider detection (T4, docs/plans/multi-provider-git-modal.md) — the
+      // dialog calls this before anything else to pick terminology/gating for
+      // the project's resolved provider (GitHub/GitLab/Bitbucket).
+      "/github/provider-info": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitHost.providerInfoForDir(dir);
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/labels": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitHost.labels({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            name?: string;
+            color?: string;
+            description?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.name !== "string" || !body.name.trim()) {
+            return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubLabel({
+            dir,
+            name: body.name,
+            color: typeof body.color === "string" ? body.color : "",
+            description: typeof body.description === "string" ? body.description : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/label-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            name?: string;
+            newName?: string;
+            color?: string;
+            description?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.name !== "string" || !body.name.trim()) {
+            return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await updateGitHubLabel({
+            dir,
+            name: body.name,
+            newName: typeof body.newName === "string" ? body.newName : undefined,
+            color: typeof body.color === "string" ? body.color : undefined,
+            description: typeof body.description === "string" ? body.description : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/label-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; name?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.name !== "string" || !body.name.trim()) {
+            return json({ error: "label name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubLabel({ dir, name: body.name });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/assignees": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubAssignees({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/milestones": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubMilestones({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            title?: string;
+            description?: string;
+            dueOn?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.title !== "string" || !body.title.trim()) {
+            return json({ error: "milestone title required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubMilestone({
+            dir,
+            title: body.title,
+            description: typeof body.description === "string" ? body.description : undefined,
+            dueOn: typeof body.dueOn === "string" ? body.dueOn : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/milestone-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            title?: string;
+            description?: string;
+            dueOn?: string | null;
+            state?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.number !== "number") {
+            return json({ error: "milestone number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const state = body.state === "open" || body.state === "closed" ? body.state : undefined;
+          const result = await updateGitHubMilestone({
+            dir,
+            number: body.number,
+            title: typeof body.title === "string" ? body.title : undefined,
+            description: typeof body.description === "string" ? body.description : undefined,
+            dueOn: body.dueOn === null || typeof body.dueOn === "string" ? body.dueOn : undefined,
+            state,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/milestone-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.number !== "number") {
+            return json({ error: "milestone number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubMilestone({ dir, number: body.number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/releases": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubReleases({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            tagName?: string;
+            name?: string;
+            body?: string;
+            draft?: boolean;
+            prerelease?: boolean;
+            targetCommitish?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.tagName !== "string" || !body.tagName.trim()) {
+            return json({ error: "tag name required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubRelease({
+            dir,
+            tagName: body.tagName,
+            name: typeof body.name === "string" ? body.name : undefined,
+            body: typeof body.body === "string" ? body.body : undefined,
+            draft: typeof body.draft === "boolean" ? body.draft : undefined,
+            prerelease: typeof body.prerelease === "boolean" ? body.prerelease : undefined,
+            targetCommitish: typeof body.targetCommitish === "string" ? body.targetCommitish : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/release-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            id?: number;
+            name?: string;
+            body?: string;
+            draft?: boolean;
+            prerelease?: boolean;
+            tagName?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.id !== "number" || !Number.isInteger(body.id) || body.id <= 0) {
+            return json({ error: "valid release id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await updateGitHubRelease({
+            dir,
+            id: body.id,
+            name: typeof body.name === "string" ? body.name : undefined,
+            body: typeof body.body === "string" ? body.body : undefined,
+            draft: typeof body.draft === "boolean" ? body.draft : undefined,
+            prerelease: typeof body.prerelease === "boolean" ? body.prerelease : undefined,
+            tagName: typeof body.tagName === "string" ? body.tagName : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/release-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; id?: number };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.id !== "number" || !Number.isInteger(body.id) || body.id <= 0) {
+            return json({ error: "valid release id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubRelease({ dir, id: body.id });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/tags": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubTags({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-runs": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubWorkflowRuns({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflows": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubWorkflows({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-rerun": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; runId?: number; failedOnly?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.runId !== "number" || !Number.isInteger(body.runId) || body.runId <= 0) {
+            return json({ error: "valid run id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await rerunGitHubWorkflowRun({
+            dir,
+            runId: body.runId,
+            failedOnly: typeof body.failedOnly === "boolean" ? body.failedOnly : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-cancel": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; runId?: number };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.runId !== "number" || !Number.isInteger(body.runId) || body.runId <= 0) {
+            return json({ error: "valid run id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await cancelGitHubWorkflowRun({ dir, runId: body.runId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/workflow-dispatch": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            workflowId?: number;
+            ref?: string;
+            inputs?: Record<string, string>;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.workflowId !== "number" || !Number.isInteger(body.workflowId) || body.workflowId <= 0) {
+            return json({ error: "valid workflow id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.ref !== "string" || !body.ref.trim()) {
+            return json({ error: "ref required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await dispatchGitHubWorkflow({
+            dir,
+            workflowId: body.workflowId,
+            ref: body.ref,
+            inputs: body.inputs && typeof body.inputs === "object" ? body.inputs : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/comment-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            commentId?: number;
+            kind?: string;
+            body?: string;
+          };
+          const dir = body.path;
+          const commentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof commentId !== "number" || !Number.isInteger(commentId) || commentId <= 0) {
+            return json({ error: "valid comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.kind !== "issue" && body.kind !== "review") {
+            return json({ error: "valid comment kind required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "comment body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await updateGitHubComment({ dir, commentId, kind: body.kind, body: body.body });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/comment-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            commentId?: number;
+            kind?: string;
+          };
+          const dir = body.path;
+          const commentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof commentId !== "number" || !Number.isInteger(commentId) || commentId <= 0) {
+            return json({ error: "valid comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.kind !== "issue" && body.kind !== "review") {
+            return json({ error: "valid comment kind required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubComment({ dir, commentId, kind: body.kind });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/comments": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          const rawKind = url.searchParams.get("kind");
+          const kind = rawKind === "pulls" || rawKind === "issues" ? rawKind : undefined;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid item number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.listComments({ dir, number, kind });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            body?: string;
+            kind?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const commentBody = body.body;
+          const kind = body.kind === "pulls" || body.kind === "issues" ? body.kind : undefined;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid item number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const number = rawNumber;
+          if (typeof commentBody !== "string" || !commentBody.trim()) {
+            return json({ error: "comment body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.createComment({
+            dir,
+            number,
+            body: commentBody,
+            kind,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-line-comment": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            body?: string;
+            filePath?: string;
+            line?: number;
+            side?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "comment body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.filePath !== "string" || !body.filePath.trim()) {
+            return json({ error: "comment file path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.line !== "number" || !Number.isInteger(body.line) || body.line <= 0) {
+            return json({ error: "valid comment line required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.side !== "LEFT" && body.side !== "RIGHT") {
+            return json({ error: "valid comment side required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullLineComment({
+            dir,
+            number: rawNumber,
+            body: body.body,
+            path: body.filePath,
+            line: body.line,
+            side: body.side,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-review-comments": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullReviewComments({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-review-threads": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubPullReviewThreads({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/review-thread-resolve": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string; resolved?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId) {
+            return json({ error: "review thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.resolved !== "boolean") {
+            return json({ error: "resolved (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubReviewThreadResolved({ dir, threadId: body.threadId, resolved: body.resolved });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-line-comment-reply": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            commentId?: number;
+            body?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawCommentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawCommentId !== "number" || !Number.isInteger(rawCommentId) || rawCommentId <= 0) {
+            return json({ error: "valid review comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "reply body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullLineCommentReply({
+            dir,
+            number: rawNumber,
+            commentId: rawCommentId,
+            body: body.body,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-checks": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullChecks({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/commit-status": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const ref = url.searchParams.get("ref");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!ref || !ref.trim()) {
+            return json({ error: "valid commit ref required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubCommitStatus({ dir, ref });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-mergeability": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullMergeability({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-update-branch": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await updateGitHubPullBranch({ dir, number: rawNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-reopen": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullReopen({ dir, number: rawNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-draft": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; draft?: boolean };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.draft !== "boolean") {
+            return json({ error: "draft (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubPullDraft({ dir, number: rawNumber, draft: body.draft });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-auto-merge": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            enable?: boolean;
+            mergeMethod?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.enable !== "boolean") {
+            return json({ error: "enable (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.enable && body.mergeMethod !== undefined
+            && body.mergeMethod !== "merge" && body.mergeMethod !== "squash" && body.mergeMethod !== "rebase") {
+            return json({ error: "valid merge method required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const mergeMethod = (body.mergeMethod as GitHubPullMergeMethod | undefined) ?? "merge";
+          const result = await setGitHubPullAutoMerge({ dir, number: rawNumber, enable: body.enable, mergeMethod });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-commits": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await listGitHubPullCommits({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-linked-issues": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubPullLinkedIssues({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-defaults": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await gitHost.pullDefaults({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-create": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            title?: string;
+            head?: string;
+            base?: string;
+            body?: string;
+            draft?: boolean;
+            reviewers?: string[];
+            taskId?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.title !== "string" || !body.title.trim()) {
+            return json({ error: "pull request title required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.head !== "string" || !body.head.trim()) {
+            return json({ error: "head branch required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.base !== "string" || !body.base.trim()) {
+            return json({ error: "base branch required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullCreate({
+            dir,
+            title: body.title,
+            head: body.head,
+            base: body.base,
+            body: typeof body.body === "string" ? body.body : undefined,
+            draft: body.draft === true,
+            reviewers: Array.isArray(body.reviewers) ? body.reviewers.filter((x): x is string => typeof x === "string") : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          // Best-effort: persist the created PR's URL onto the task so the
+          // run panel can show a durable "View PR" link across restarts.
+          // A missing/invalid taskId or an item with no htmlUrl must never
+          // fail an otherwise-successful creation — this is pure bookkeeping
+          // layered on top of a request that already succeeded.
+          if (typeof body.taskId === "string" && body.taskId) {
+            try {
+              const task = tasks.get(body.taskId);
+              // Guards: archived tasks are frozen (same contract as PATCH /
+              // backlog), a first PR is never silently overwritten, and the
+              // task must actually belong to the project the PR was created
+              // from — a stale/mistargeted taskId must not stamp an unrelated
+              // task.
+              if (
+                task &&
+                task.archivedAt == null &&
+                !task.prUrl &&
+                task.workdir === dir &&
+                result.item?.htmlUrl
+              ) {
+                tasks.update(task.id, { prUrl: result.item.htmlUrl });
+              }
+            } catch (err) {
+              console.warn(`[agetor] failed to persist pr_url for task ${body.taskId}:`, err);
+            }
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-review": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            event?: string;
+            body?: string;
+            comments?: unknown;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.event !== "APPROVE" && body.event !== "REQUEST_CHANGES" && body.event !== "COMMENT") {
+            return json({ error: "valid review event required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const event = body.event as GitHubPullReviewEvent;
+          // Inline comments are re-validated/sanitized in gitHost.pullReview; here
+          // we just narrow the wire shape.
+          const comments = Array.isArray(body.comments)
+            ? body.comments.flatMap((c) => {
+                if (!c || typeof c !== "object") return [];
+                const o = c as Record<string, unknown>;
+                if (typeof o.path !== "string" || typeof o.body !== "string") return [];
+                if (typeof o.line !== "number") return [];
+                if (o.side !== "LEFT" && o.side !== "RIGHT") return [];
+                const side: "LEFT" | "RIGHT" = o.side === "LEFT" ? "LEFT" : "RIGHT";
+                return [{ path: o.path, line: o.line, side, body: o.body }];
+              })
+            : undefined;
+          const result = await gitHost.pullReview({
+            dir,
+            number: rawNumber,
+            event,
+            body: typeof body.body === "string" ? body.body : undefined,
+            comments,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-merge": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            method?: string;
+            title?: string;
+            message?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.method !== "merge" && body.method !== "squash" && body.method !== "rebase") {
+            return json({ error: "valid merge method required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const method = body.method as GitHubPullMergeMethod;
+          const result = await gitHost.pullMerge({
+            dir,
+            number: rawNumber,
+            method,
+            title: typeof body.title === "string" ? body.title : undefined,
+            message: typeof body.message === "string" ? body.message : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-close": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            comment?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.pullClose({
+            dir,
+            number: rawNumber,
+            comment: typeof body.comment === "string" ? body.comment : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-create": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            title?: string;
+            body?: string;
+            labels?: string[];
+            assignees?: string[];
+            milestone?: number | null;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.title !== "string" || !body.title.trim()) {
+            return json({ error: "issue title required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.issueCreate({
+            dir,
+            title: body.title,
+            body: typeof body.body === "string" ? body.body : undefined,
+            labels: Array.isArray(body.labels) ? body.labels.filter((x): x is string => typeof x === "string") : undefined,
+            assignees: Array.isArray(body.assignees) ? body.assignees.filter((x): x is string => typeof x === "string") : undefined,
+            milestone: typeof body.milestone === "number" || body.milestone === null ? body.milestone : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-update": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            kind?: string;
+            title?: string;
+            body?: string;
+            state?: string;
+            labels?: string[];
+            assignees?: string[];
+            milestone?: number | null;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (body.state && body.state !== "open" && body.state !== "closed") {
+            return json({ error: "valid issue state required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await gitHost.issueUpdate({
+            dir,
+            number: rawNumber,
+            kind: body.kind === "pulls" ? "pulls" : "issues",
+            title: typeof body.title === "string" ? body.title : undefined,
+            body: typeof body.body === "string" ? body.body : undefined,
+            state: body.state === "open" || body.state === "closed" ? body.state : undefined,
+            labels: Array.isArray(body.labels) ? body.labels.filter((x): x is string => typeof x === "string") : undefined,
+            assignees: Array.isArray(body.assignees) ? body.assignees.filter((x): x is string => typeof x === "string") : undefined,
+            milestone: typeof body.milestone === "number" || body.milestone === null ? body.milestone : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-lock": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            locked?: boolean;
+            lockReason?: string;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid item number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.locked !== "boolean") {
+            return json({ error: "locked (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubIssueLock({
+            dir,
+            number: rawNumber,
+            locked: body.locked,
+            lockReason: typeof body.lockReason === "string" ? body.lockReason : undefined,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-pin": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; pinned?: boolean };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.pinned !== "boolean") {
+            return json({ error: "pinned (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubIssuePinned({ dir, number: rawNumber, pinned: body.pinned });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-pinned": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubIssuePinned({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/sub-issues": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await listGitHubSubIssues({ dir, number });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/sub-issue-add": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; childNumber?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawChildNumber = body.childNumber;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawChildNumber !== "number" || !Number.isInteger(rawChildNumber) || rawChildNumber <= 0) {
+            return json({ error: "valid child issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await addGitHubSubIssue({ dir, number: rawNumber, childNumber: rawChildNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/sub-issue-remove": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; childId?: number };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawChildId = body.childId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawChildId !== "number" || !Number.isInteger(rawChildId) || rawChildId <= 0) {
+            return json({ error: "valid child issue id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await removeGitHubSubIssue({ dir, number: rawNumber, childId: rawChildId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/issue-transfer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; number?: number; targetRepo?: string };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.targetRepo !== "string" || !body.targetRepo.trim()) {
+            return json({ error: "target repo required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await transferGitHubIssue({ dir, number: rawNumber, targetRepo: body.targetRepo });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/projects": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubProjectsV2({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-items": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const projectId = url.searchParams.get("projectId");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!projectId) return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await getGitHubProjectItems({ dir, projectId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-item-add": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            projectId?: string;
+            contentNumber?: number;
+            contentKind?: "issue" | "pr";
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+            return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.contentNumber !== "number" || !Number.isInteger(body.contentNumber) || body.contentNumber <= 0) {
+            return json({ error: "valid contentNumber required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const contentKind = body.contentKind === "pr" ? "pr" : "issue";
+          const result = await addGitHubProjectItem({
+            dir,
+            projectId: body.projectId,
+            contentNumber: body.contentNumber,
+            contentKind,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-item-remove": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; projectId?: string; itemId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+            return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.itemId !== "string" || !body.itemId.trim()) {
+            return json({ error: "itemId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await removeGitHubProjectItem({ dir, projectId: body.projectId, itemId: body.itemId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/project-item-status": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            projectId?: string;
+            itemId?: string;
+            fieldId?: string;
+            optionId?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.projectId !== "string" || !body.projectId.trim()) {
+            return json({ error: "projectId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.itemId !== "string" || !body.itemId.trim()) {
+            return json({ error: "itemId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.fieldId !== "string" || !body.fieldId.trim()) {
+            return json({ error: "fieldId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.optionId !== "string" || !body.optionId.trim()) {
+            return json({ error: "optionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubProjectItemStatus({
+            dir,
+            projectId: body.projectId,
+            itemId: body.itemId,
+            fieldId: body.fieldId,
+            optionId: body.optionId,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussions": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await listGitHubDiscussions({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const rawNumber = Number(url.searchParams.get("number"));
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid discussion number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubDiscussion({ dir, number: rawNumber });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-create": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            categoryId?: string;
+            title?: string;
+            body?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.categoryId !== "string" || !body.categoryId.trim()) {
+            return json({ error: "categoryId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.title !== "string" || !body.title.trim()) {
+            return json({ error: "title required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createGitHubDiscussion({
+            dir,
+            categoryId: body.categoryId,
+            title: body.title,
+            body: body.body,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-comment": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; discussionId?: string; body?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.discussionId !== "string" || !body.discussionId.trim()) {
+            return json({ error: "discussionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.body !== "string" || !body.body.trim()) {
+            return json({ error: "body required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await addGitHubDiscussionComment({ dir, discussionId: body.discussionId, body: body.body });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-answer": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; commentId?: string; answer?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.commentId !== "string" || !body.commentId.trim()) {
+            return json({ error: "commentId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.answer !== "boolean") {
+            return json({ error: "answer (boolean) required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubDiscussionAnswer({ dir, commentId: body.commentId, answer: body.answer });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; discussionId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.discussionId !== "string" || !body.discussionId.trim()) {
+            return json({ error: "discussionId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubDiscussion({ dir, discussionId: body.discussionId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/discussion-comment-delete": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; commentId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.commentId !== "string" || !body.commentId.trim()) {
+            return json({ error: "commentId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await deleteGitHubDiscussionComment({ dir, commentId: body.commentId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-reviewers": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            reviewers?: string[];
+            teamReviewers?: string[];
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const reviewers = Array.isArray(body.reviewers)
+            ? body.reviewers.filter((x): x is string => typeof x === "string")
+            : [];
+          const teamReviewers = Array.isArray(body.teamReviewers)
+            ? body.teamReviewers.filter((x): x is string => typeof x === "string")
+            : [];
+          if (reviewers.length === 0 && teamReviewers.length === 0) {
+            return json({ error: "at least one reviewer or team required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await requestGitHubPullReviewers({ dir, number: rawNumber, reviewers, teamReviewers });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/pull-apply-suggestion": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            number?: number;
+            commentId?: number;
+          };
+          const dir = body.path;
+          const rawNumber = body.number;
+          const rawCommentId = body.commentId;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof rawNumber !== "number" || !Number.isInteger(rawNumber) || rawNumber <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof rawCommentId !== "number" || !Number.isInteger(rawCommentId) || rawCommentId <= 0) {
+            return json({ error: "valid review comment id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await applyGitHubSuggestion({ dir, number: rawNumber, commentId: rawCommentId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Reactions (👍 👎 😄 🎉 😕 ❤️ 🚀 👀) on an issue/PR or a comment.
+      // `subjectType`/`subjectId` identify the target — see
+      // `GitHubReactionSubject` in shared/types.ts for the id semantics
+      // (an "issue" subject's id is the issue/PR *number*; comment subjects
+      // carry a comment's REST id).
+      "/github/reactions": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const subjectType = url.searchParams.get("subjectType");
+          const subjectId = Number(url.searchParams.get("subjectId"));
+          const viewer = url.searchParams.get("viewer") ?? "";
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (subjectType !== "issue" && subjectType !== "issueComment" && subjectType !== "reviewComment") {
+            return json({ error: "valid subject type required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!Number.isInteger(subjectId) || subjectId <= 0) {
+            return json({ error: "valid subject id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await listGitHubReactions({
+            dir,
+            subject: { type: subjectType, id: subjectId },
+            viewer,
+          });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/reaction-add": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            subjectType?: string;
+            subjectId?: number;
+            content?: string;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (body.subjectType !== "issue" && body.subjectType !== "issueComment" && body.subjectType !== "reviewComment") {
+            return json({ error: "valid subject type required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.subjectId !== "number" || !Number.isInteger(body.subjectId) || body.subjectId <= 0) {
+            return json({ error: "valid subject id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!REACTION_CONTENTS.has(body.content ?? "")) {
+            return json({ error: "valid reaction content required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const subject: GitHubReactionSubject = { type: body.subjectType, id: body.subjectId };
+          const result = await addGitHubReaction({ dir, subject, content: body.content as GitHubReactionContent });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/reaction-remove": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            path?: string;
+            subjectType?: string;
+            subjectId?: number;
+            reactionId?: number;
+          };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (body.subjectType !== "issue" && body.subjectType !== "issueComment" && body.subjectType !== "reviewComment") {
+            return json({ error: "valid subject type required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.subjectId !== "number" || !Number.isInteger(body.subjectId) || body.subjectId <= 0) {
+            return json({ error: "valid subject id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.reactionId !== "number" || !Number.isInteger(body.reactionId) || body.reactionId <= 0) {
+            return json({ error: "valid reaction id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const subject: GitHubReactionSubject = { type: body.subjectType, id: body.subjectId };
+          const result = await removeGitHubReaction({ dir, subject, reactionId: body.reactionId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/notifications": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const all = url.searchParams.get("all") === "true";
+          const result = await listGitHubNotifications({ dir, all });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/notification-read": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await markGitHubNotificationRead({ dir, threadId: body.threadId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/notifications-read-all": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const result = await markAllGitHubNotificationsRead({ dir });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/thread-subscription": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const threadId = url.searchParams.get("threadId");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (!threadId || !threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await getGitHubThreadSubscription({ dir, threadId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string; ignored?: boolean };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await setGitHubThreadSubscription({ dir, threadId: body.threadId, ignored: body.ignored === true });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/github/thread-unsubscribe": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { path?: string; threadId?: string };
+          const dir = body.path;
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof body.threadId !== "string" || !body.threadId.trim()) {
+            return json({ error: "thread id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await unsubscribeGitHubThread({ dir, threadId: body.threadId });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
+          }
+          return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Per-host GitHub PATs (github-tokens.ts), keyed by the raw ssh-alias
+      // remote host — see docs/plans/github-multi-identity-tokens.md. The raw
+      // token is write-only from the webview's perspective: GET/PUT both
+      // reply with a `tokenPreview` (last 4 chars — withheld entirely for
+      // tokens so short the suffix would be the whole secret), never the
+      // token itself.
+      "/github/tokens": {
+        GET: authed(async (req) => {
+          const tokens = listGitHubTokens().map(sanitizedTokenInfo);
+          const detectedHosts = await remoteHostsForDirs(projects.list().map((p) => p.path));
+          return json({ tokens, detectedHosts }, { headers: corsHeaders(req) });
+        }),
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { host?: unknown; token?: unknown; label?: unknown };
+          const host = typeof body.host === "string" ? body.host.trim().toLowerCase() : "";
+          const token = typeof body.token === "string" ? body.token.trim() : "";
+          if (!host) return json({ error: "host required" }, { status: 400, headers: corsHeaders(req) });
+          if (!token) return json({ error: "token required" }, { status: 400, headers: corsHeaders(req) });
+          const label = typeof body.label === "string" && body.label.trim() ? body.label.trim() : null;
+          setGitHubToken(host, token, label);
+          const tokens = listGitHubTokens().map(sanitizedTokenInfo);
+          const detectedHosts = await remoteHostsForDirs(projects.list().map((p) => p.path));
+          return json({ tokens, detectedHosts }, { headers: corsHeaders(req) });
+        }),
+      },
+      "/github/tokens/:host": {
+        DELETE: authed((req) => {
+          const removed = deleteGitHubToken(req.params.host);
+          if (!removed) return json({ error: "token not found" }, { status: 404, headers: corsHeaders(req) });
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
@@ -926,6 +3020,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         POST: authed(async (req) => {
           const body = (await req.json()) as Partial<Task> & {
             baseRef?: string;
+            existingBranch?: string;
             references?: TaskReference[];
           };
           if (!body.title || !body.prompt) {
@@ -1069,6 +3164,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return json(withRunningSubagents(updated), { headers: corsHeaders(req) });
         }),
         DELETE: authed(async (req) => {
+          // Worktree teardown (`git worktree remove` + branch delete, with an
+          // rm -rf fallback) can exceed even the 255s idleTimeout ceiling on
+          // large repos — opt this request out of idle timeout entirely.
+          server.timeout(req, 0);
           await deleteTask(req.params.id);
           return new Response(null, { status: 204, headers: corsHeaders(req) });
         }),
@@ -1076,6 +3175,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks/:id/start": {
         POST: authed(async (req) => {
+          server.timeout(req, 0);
           const result = await startTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
@@ -1084,20 +3184,86 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       "/tasks/:id/archive": {
-        POST: authed((req) => {
-          const result = archiveTask(req.params.id);
+        POST: authed(async (req) => {
+          // Worktree teardown can now be awaited inline (`awaitTeardown`)
+          // behind a real `git worktree remove`, which — like DELETE
+          // /tasks/:id — can exceed the idle timeout ceiling on large repos.
+          server.timeout(req, 0);
+          // Optional body — no body (or a malformed one) means every flag
+          // defaults to false, same as the pre-existing behaviour. `force`
+          // bypasses the done-column gate (Worktrees page's delete action);
+          // `stopRun` additionally stops an in-flight/held run before
+          // archiving instead of erroring; `forceWorktree` discards
+          // uncommitted changes in the checkout instead of leaving a dirty
+          // worktree in place; `awaitTeardown` blocks until the deferred
+          // teardown has actually run and surfaces its outcome.
+          const body = (await req.json().catch(() => ({}))) as {
+            force?: boolean;
+            stopRun?: boolean;
+            forceWorktree?: boolean;
+            awaitTeardown?: boolean;
+          };
+          const result = await archiveTask(req.params.id, {
+            force: body.force === true,
+            stopRun: body.stopRun === true,
+            forceWorktree: body.forceWorktree === true,
+            awaitTeardown: body.awaitTeardown === true,
+          });
+          if ("error" in result) {
+            return json(result, { status: 400, headers: corsHeaders(req) });
+          }
+          // Nest `teardown` as a sibling key rather than spreading its fields
+          // onto the task, so it can never collide with an actual Task
+          // column — the client only reads it when it explicitly asked for
+          // `awaitTeardown`, and it's absent (not `undefined`-valued) on the
+          // ordinary fire-and-forget path.
+          const payload: ReturnType<typeof withRunningSubagents> & { teardown?: typeof result.teardown } =
+            withRunningSubagents(result.task);
+          if (result.teardown) payload.teardown = result.teardown;
+          return json(payload, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/unarchive": {
+        POST: authed(async (req) => {
+          server.timeout(req, 0);
+          const result = await unarchiveTask(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
         }),
       },
 
-      "/tasks/:id/unarchive": {
-        POST: authed((req) => {
-          const result = unarchiveTask(req.params.id);
+      // Every agetor-managed git worktree materialized on disk, with staleness
+      // classification — backs the Worktrees list page.
+      "/worktrees": {
+        GET: authed((req) => json(listWorktrees(), { headers: corsHeaders(req) })),
+      },
+
+      // Delete an orphaned worktree directory (no owning task row — see
+      // `deleteOrphanWorktree`). A worktree still owned by a task is deleted
+      // by archiving the task instead (`POST /tasks/:id/archive`).
+      "/worktrees/:id": {
+        DELETE: authed(async (req) => {
+          // Same rationale as DELETE /tasks/:id — `rm -rf` over a large
+          // worktree can exceed the idle timeout.
+          server.timeout(req, 0);
+          const result = await deleteOrphanWorktree(req.params.id);
           return "error" in result
             ? json(result, { status: 400, headers: corsHeaders(req) })
-            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+            : new Response(null, { status: 204, headers: corsHeaders(req) });
+        }),
+      },
+
+      // On-demand live git status (dirty/ahead/merged) for a single worktree
+      // — task-backed or orphaned. Deliberately not part of `GET /worktrees`:
+      // each field spawns a git subprocess, so it's fetched per row rather
+      // than on every poll of the bulk list.
+      "/worktrees/:id/git-status": {
+        GET: authed(async (req) => {
+          const res = await worktreeGitStatus(req.params.id);
+          if ("error" in res) return json(res, { status: 400, headers: corsHeaders(req) });
+          return json(res, { headers: corsHeaders(req) });
         }),
       },
 
@@ -1171,6 +3337,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 404, headers: corsHeaders(req) },
             );
           }
+          // Heal a stuck `window-size manual` pin (a prior crash mid pane-grow)
+          // before attaching, so the client's own size wins instead of being
+          // confined to whatever the pin left behind — see `healWindowSize`.
+          // Best-effort: must not block or delay the attach below.
+          // `assumeAlive`: `sessionExists(task.id)` was just checked above, so
+          // skip the internal probe's duplicate round-trip.
+          healWindowSize(task.id, { assumeAlive: true });
           // AppleScript `do script` runs the string through `/bin/bash`, so
           // we escape anything bash would interpret inside double-quotes:
           // backslash, dollar, backtick, and the double-quote itself. Without
@@ -1218,6 +3391,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // lookup failure (no upstream, no baseRef, or a git error) degrades to
       // `0` rather than flipping `ignored` — that flag stays keyed to
       // `hasUncommittedChanges` alone.
+      //
+      // `hasUpstream`/`remoteSynced` additionally drive the "Open PR" chip —
+      // computed via `remoteSyncState` (local tracking-ref check, no
+      // network). When an upstream exists, its ahead count IS the push-ahead
+      // count (`rev-list @{u}..HEAD` — the same first tier `getAheadCount`
+      // would run), so `ahead` reuses it and `getAheadCount` only runs as
+      // the fallback for branches with no upstream yet (or a failed count),
+      // where it degrades through `baseRef` comparisons. This route is
+      // polled every 5s per open panel — don't add git spawns here that
+      // recompute what a sibling call already knows.
       "/tasks/:id/git-status": {
         GET: authed(async (req) => {
           const t = tasks.get(req.params.id);
@@ -1225,18 +3408,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const dir = t.worktreePath ?? t.workdir;
-          const [result, aheadResult] = await Promise.all([
+          const [result, syncState] = await Promise.all([
             hasUncommittedChanges(dir),
-            getAheadCount(dir, t.baseRef ?? null),
+            remoteSyncState(dir),
           ]);
           if (result === null) {
             return json(
-              { hasChanges: false, ahead: 0, ignored: true },
+              { hasChanges: false, ahead: 0, ignored: true, hasUpstream: false, remoteSynced: false } satisfies TaskGitStatus,
               { headers: corsHeaders(req) },
             );
           }
+          const ahead = syncState.hasUpstream && syncState.ahead !== null
+            ? syncState.ahead
+            : (await getAheadCount(dir, t.baseRef ?? null)) ?? 0;
           return json(
-            { hasChanges: result, ahead: aheadResult ?? 0, ignored: false },
+            {
+              hasChanges: result,
+              ahead,
+              ignored: false,
+              hasUpstream: syncState.hasUpstream,
+              remoteSynced: syncState.hasUpstream && syncState.ahead === 0,
+            } satisfies TaskGitStatus,
             { headers: corsHeaders(req) },
           );
         }),
@@ -1412,12 +3604,81 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Serve the bytes of a local image file so the webview can render an
+      // `<img>` thumbnail for a referenced attachment. Same trust level as
+      // `/open-path` above — an absolute path under a token-gated,
+      // 127.0.0.1-only route can already be opened with the OS default app,
+      // so reading its bytes back adds nothing a malicious caller couldn't
+      // already get. The per-launch token + loopback bind is the actual
+      // security boundary; the `isImagePath` extension gate exists only to
+      // keep this route from doubling as a generic "read any file" endpoint.
+      "/files/preview": {
+        GET: authed((req) => {
+          const url = new URL(req.url);
+          const raw = url.searchParams.get("path") ?? "";
+          if (!raw) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!path.isAbsolute(raw)) {
+            return json(
+              { error: `path must be absolute: ${raw}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          if (!isImagePath(raw)) {
+            return json(
+              { error: `not an image path: ${raw}` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          let st;
+          try {
+            st = statSync(raw);
+          } catch {
+            return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
+          }
+          // Only regular files: a FIFO, device, or symlink-to-device named
+          // `*.png` would otherwise hang the response stream forever.
+          if (!st.isFile()) {
+            return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
+          }
+          const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
+          const contentType = PREVIEW_CONTENT_TYPES[ext] ?? `image/${ext}`;
+          // ETag derived from size+mtime so a re-saved file at the same path
+          // (e.g. a screenshot overwritten in place) is detected as changed.
+          const etag = `"${st.size}-${st.mtimeMs}"`;
+          if (req.headers.get("if-none-match") === etag) {
+            return new Response(null, {
+              status: 304,
+              headers: { ...corsHeaders(req), etag },
+            });
+          }
+          return new Response(Bun.file(raw), {
+            headers: {
+              ...corsHeaders(req),
+              "content-type": contentType,
+              // This route serves agent-writable content (e.g. SVG, which can
+              // carry <script>) on the origin whose URL carries the API
+              // token; nosniff + img-only consumption keeps active-content
+              // risk down.
+              "x-content-type-options": "nosniff",
+              // Content at a given path can change (a screenshot re-saved in
+              // place), so don't let the browser serve stale bytes without
+              // asking; the ETag makes the revalidation cheap (304, no body).
+              "cache-control": "private, max-age=0, must-revalidate",
+              etag,
+            },
+          });
+        }),
+      },
+
       // ─── Interactions: claude built-in AskUserQuestion (scraper-sourced) ──
       // The native modal is live on the tmux pane; there's no promise. Plan
       // the keystrokes from the user's picks and drive them into the modal
-      // (planAskAnswers + sendModalKeys), or, for a custom/free-text answer,
-      // Esc the modal and post the answer as a normal follow-up turn. Then
-      // drop the card.
+      // (planAskAnswers + driveAskAnswers, which verifies-and-retries the
+      // review-screen confirm rather than trusting send-keys exit codes), or,
+      // for a custom/free-text answer, Esc the modal (sendModalKeys) and post
+      // the answer as a normal follow-up turn. Then drop the card.
       "/ask-questions/:id/answer": {
         POST: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as Partial<AskQuestionsAnswer>;
@@ -1440,7 +3701,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             const plan = planAskAnswers(specs, sanitised);
             let ok = false;
             if (plan.mode === "drive") {
-              ok = await sendModalKeys(pending.taskId, plan.keys);
+              ok = await driveAskAnswers(pending.taskId, plan);
             } else {
               // Custom/free-text (or anything we can't drive): dismiss the
               // native modal, then deliver the answer as a follow-up turn —
@@ -1450,7 +3711,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               // REPL prompt before the paste lands, so it isn't eaten by the
               // dismissing modal.
               await Bun.sleep(150);
-              ok = sendInput(pending.runId, plan.text).delivered;
+              ok = (await sendInput(pending.runId, plan.text)).delivered;
             }
             // Drop the card. `resolveAskCard` also clears the session's
             // `askCardId` tracker, so if a drive FAILED and the modal is still
@@ -1552,6 +3813,133 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           json(listPendingForTask(req.params.id), { headers: corsHeaders(req) })),
       },
 
+      // Messages backlog — saved, not-yet-sent drafts for a task. Each mutation
+      // returns the full updated Task so the webview can re-sync optimistically.
+      // Reorder is PUT on the collection (whole-order replace) so it doesn't
+      // collide with DELETE/PATCH on the `/:itemId` member route.
+      "/tasks/:id/backlog": {
+        POST: authed(async (req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as {
+            text?: unknown;
+            references?: unknown;
+          };
+          const text = typeof body.text === "string" ? body.text : "";
+          const references = Array.isArray(body.references)
+            ? (body.references as TaskReference[])
+            : [];
+          if (!text.trim() && references.length === 0) {
+            return json(
+              { error: "text or references required" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const updated = backlog.add(req.params.id, { text, references });
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        PUT: authed(async (req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as { order?: unknown };
+          const order = Array.isArray(body.order)
+            ? body.order.filter((x): x is string => typeof x === "string")
+            : [];
+          const updated = backlog.reorder(req.params.id, order);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/backlog/:itemId": {
+        PATCH: authed(async (req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as {
+            text?: unknown;
+            references?: unknown;
+          };
+          const patch: { text?: string; references?: TaskReference[] } = {};
+          if (typeof body.text === "string") patch.text = body.text;
+          if (Array.isArray(body.references)) {
+            patch.references = body.references as TaskReference[];
+          }
+          // Parity with POST: an edit must not leave a draft with neither text
+          // nor references. Only enforced when the item actually exists (an
+          // unknown id is a no-op in `updateItem`, handled below).
+          const current = tasks
+            .get(req.params.id)
+            ?.backlog.find((m) => m.id === req.params.itemId);
+          if (current) {
+            const nextText = patch.text !== undefined ? patch.text : current.text;
+            const nextRefs =
+              patch.references !== undefined ? patch.references : current.references;
+            if (!nextText.trim() && nextRefs.length === 0) {
+              return json(
+                { error: "text or references required" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+          }
+          const updated = backlog.updateItem(req.params.id, req.params.itemId, patch);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const blocked = backlogGuard(req);
+          if (blocked) return blocked;
+          const updated = backlog.remove(req.params.id, req.params.itemId);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Composer draft — the single unsent text+refs currently sitting in the
+      // task details modal, autosaved by the webview so closing the modal (or
+      // restarting agetor) doesn't lose it. Unlike the backlog routes above,
+      // draft writes are intentionally allowed on an archived task: the
+      // composer stays typable there (sending auto-unarchives), and freezing
+      // draft writes would reintroduce the very data loss this feature fixes.
+      // Only a missing task 404s.
+      "/tasks/:id/draft": {
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            text?: unknown;
+            references?: unknown;
+          };
+          const text = typeof body.text === "string" ? body.text : "";
+          // The draft rides the 2s /tasks poll, so an unbounded composer paste
+          // would bloat every poll response — cap it well above any realistic
+          // prompt length.
+          const DRAFT_TEXT_MAX_LENGTH = 256 * 1024;
+          if (text.length > DRAFT_TEXT_MAX_LENGTH) {
+            return json(
+              { error: `text exceeds ${DRAFT_TEXT_MAX_LENGTH} characters` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const references = Array.isArray(body.references)
+            ? (body.references as TaskReference[])
+            : [];
+          const draft = text.trim() || references.length > 0 ? { text, references } : null;
+          const updated = drafts.set(req.params.id, draft);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const updated = drafts.set(req.params.id, null);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
       "/runs/:id/input": {
         POST: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as { line?: string };
@@ -1563,7 +3951,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
           return json(
-            sendInput(req.params.id, line),
+            await sendInput(req.params.id, line),
             { headers: corsHeaders(req) },
           );
         }),
@@ -1586,9 +3974,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // and WebKit's fetch rejects with the unhelpful "Load failed".
       "/runs/:id/rebuild-events": { GET: authed((req) => {
         try {
+          // Optional `?limit=` caps the response to the most recent N mapped
+          // events (ascending) plus `hasMore`, so the RunPanel's auto-rebuild
+          // on opening a finished claude task doesn't defeat the SSE replay
+          // window by pulling unbounded full JSONL history. Absent `limit`,
+          // the response keeps its pre-existing shape (bare `events` array,
+          // no `hasMore`) for any other caller — additive-only change.
+          const url = new URL(req.url);
+          const limitParam = url.searchParams.get("limit");
+          const hasLimit = limitParam !== null;
+          const limitRaw = Number(limitParam);
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
+            : EVENTS_REPLAY_LIMIT;
           const run = runs.get(req.params.id);
           if (!run) return json({ error: "run not found" }, { status: 404, headers: corsHeaders(req) });
-          if (!run.claudeSessionId) return json({ events: [], reason: "run has no claude session id" }, { headers: corsHeaders(req) });
+          if (!run.claudeSessionId) {
+            return json(
+              { events: [], reason: "run has no claude session id", ...(hasLimit ? { hasMore: false } : {}) },
+              { headers: corsHeaders(req) },
+            );
+          }
           const task = tasks.get(run.taskId);
           if (!task) return json({ error: "task not found" }, { status: 404, headers: corsHeaders(req) });
           // Reconstruct the cwd claude was launched against. Worktree tasks
@@ -1600,7 +4006,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const harness = harnesses.getByIdOrKind(task.agent);
           const jsonlPath = jsonlPathFor(cwd, run.claudeSessionId, harness?.home ?? null);
           if (!existsSync(jsonlPath)) {
-            return json({ events: [], reason: `JSONL not found at ${jsonlPath}` }, { headers: corsHeaders(req) });
+            return json(
+              { events: [], reason: `JSONL not found at ${jsonlPath}`, ...(hasLimit ? { hasMore: false } : {}) },
+              { headers: corsHeaders(req) },
+            );
           }
           // Drive the JSONL through the same staging pipeline live tailing
           // uses, so the rebuilt event stream contains "turn complete"
@@ -1623,6 +4032,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             });
           };
           rebuildEventsFromJsonl(readFileSync(jsonlPath, "utf8"), onChunk);
+          if (hasLimit) {
+            const hasMore = events.length > limit;
+            const windowed = hasMore ? events.slice(events.length - limit) : events;
+            return json({ events: windowed, hasMore, source: jsonlPath }, { headers: corsHeaders(req) });
+          }
           return json({ events, source: jsonlPath }, { headers: corsHeaders(req) });
         } catch (e) {
           const msg = (e as Error).message ?? String(e);
@@ -1904,6 +4318,46 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Paged access to older events, for the "Load earlier" affordance once
+      // the SSE replay window (below) has been exhausted. `beforeId` is
+      // required — this is a backward-paging cursor, not a general listing
+      // endpoint. Ascending order, same event shape as the SSE frames (plus
+      // `id`, which is handy for chaining the next `beforeId`).
+      "/tasks/:id/events/page": {
+        GET: authed((req) => {
+          const taskId = req.params.id;
+          if (!tasks.get(taskId)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const url = new URL(req.url);
+          const beforeIdParam = url.searchParams.get("beforeId");
+          const beforeIdRaw = beforeIdParam === null ? NaN : Number(beforeIdParam);
+          if (!Number.isInteger(beforeIdRaw) || beforeIdRaw <= 0) {
+            return json(
+              { error: "beforeId (positive integer) required" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const limitRaw = Number(url.searchParams.get("limit"));
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.max(1, Math.min(Math.floor(limitRaw), 2000))
+            : EVENTS_REPLAY_LIMIT;
+          const rows = runs.eventsForTask(taskId, { beforeId: beforeIdRaw, limit });
+          const events = rows.map((ev) => ({
+            id: ev.id,
+            runId: ev.runId,
+            taskId,
+            stream: ev.stream as RunEvent["stream"],
+            data: ev.data,
+            ts: ev.ts,
+            subagentId: ev.subagentId,
+          }));
+          const earliestId = events.length > 0 ? events[0]!.id : null;
+          const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+          return json({ events, earliestId, hasMore }, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/events": authed((req) => {
         const taskId = req.params.id;
         const stream = new ReadableStream({
@@ -1922,6 +4376,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
                 // (which would then permanently block the daemon's idle-shutdown).
               }
             };
+            // Named frame — invisible to a plain `onmessage` listener (only
+            // `addEventListener(name, ...)` sees it), so old/unmodified
+            // clients keep working unchanged even though a new frame now
+            // precedes the replayed window.
+            const sendNamed = (name: string, data: unknown) => {
+              try {
+                controller.enqueue(enc.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`));
+              } catch {
+                // Same rationale as `send`'s catch above.
+              }
+            };
             // Unified task-level stream: one scrollback per task, merging
             // events across every run. Subscribe before replay (same race
             // protection as the per-run endpoint).
@@ -1931,8 +4396,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               if (buffer) buffer.push(e);
               else send(e);
             });
-            for (const ev of runs.eventsForTask(taskId)) {
+            // Cap replay to the most recent EVENTS_REPLAY_LIMIT events instead
+            // of the task's full history — a task with thousands of events
+            // used to replay every one of them on every SSE (re)connect.
+            // Older history is fetched on demand via /tasks/:id/events/page.
+            const window = runs.eventsForTask(taskId, { limit: EVENTS_REPLAY_LIMIT });
+            const earliestId = window.length > 0 ? window[0]!.id : null;
+            const hasMore = earliestId !== null && runs.hasEventsBefore(taskId, earliestId);
+            sendNamed(TASK_EVENTS_REPLAY_META_EVENT, { earliestId, hasMore } satisfies TaskEventsReplayMeta);
+            for (const ev of window) {
               send({
+                id: ev.id,
                 runId: ev.runId,
                 taskId,
                 stream: ev.stream as RunEvent["stream"],

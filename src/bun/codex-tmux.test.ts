@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -7,7 +8,7 @@ import path from "node:path";
 // from it. Set a temp dir before importing.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-codex-tmux-"));
 
-const { mapCodexEvent, codexLogPath } = await import("./codex-tmux.ts");
+const { mapCodexEvent, codexLogPath, spawnCodexViaTmux } = await import("./codex-tmux.ts");
 import type { RunEventStream } from "../shared/types.ts";
 
 type Chunk = { stream: RunEventStream; data: string; lineUuid?: string };
@@ -157,4 +158,74 @@ test("unknown item type without text falls back to a generic tool_use", () => {
 test("codexLogPath is derivable from runId alone (so reattach can recompute it)", () => {
   const p = codexLogPath("run-xyz");
   expect(p.endsWith(path.join("codex-logs", "run-xyz.jsonl"))).toBe(true);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * spawnCodexViaTmux's `new-session` argv — regression guard for the fixed
+ * `-x 200 -y 50` pin (docs/plans/fix-minimized-agent-tmux-attach.md §2: codex
+ * never sets `window-size manual`, so it was never subject to the stuck-pin
+ * bug claude-code's pane-grow scraper could leave behind; this just locks in
+ * that the fixed size itself never regresses). No real tmux involved — a fake
+ * `tmux` (Bun/Node script under a `#!` shebang) logs the full argv of every
+ * invocation and always fails `new-session`, which makes
+ * `spawnCodexViaTmux` bail out synchronously right after logging (no tailer,
+ * no timers to clean up) — same "fail the spawn to keep the observation
+ * synchronous" trick `claude-turn-routing.test.ts` uses for its fake tmux.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+function fakeFailingTmuxBin(): { bin: string; logPath: string } {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-codex-faketmux-"));
+  const bin = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  writeFileSync(
+    bin,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync } from "node:fs";\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ argv }) + "\\n");\n` +
+      `process.exit(1);\n`,
+  );
+  chmodSync(bin, 0o755);
+  return { bin, logPath };
+}
+
+function readArgvLog(logPath: string): Array<{ argv: string[] }> {
+  return readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
+
+test("spawnCodexViaTmux's new-session argv pins -x 200 -y 50 (fixed size, never window-size manual)", () => {
+  const { bin, logPath } = fakeFailingTmuxBin();
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = bin;
+  try {
+    const { chunks, onChunk } = collect();
+    const taskId = `task-codexsize-${randomUUID()}`;
+    const runId = `run-codexsize-${randomUUID()}`;
+    spawnCodexViaTmux({
+      taskId,
+      runId,
+      argv: ["codex", "exec", "-"],
+      env: {},
+      cwd: "/tmp",
+      promptText: "hello",
+      onChunk,
+    });
+    // Sanity: the deliberately-failing new-session surfaced as a stderr chunk
+    // (proves we exercised the real spawn path, not a short-circuit).
+    expect(chunks.some((c) => c.stream === "stderr")).toBe(true);
+
+    const entries = readArgvLog(logPath);
+    const newSession = entries.find((e) => e.argv.includes("new-session"));
+    expect(newSession).toBeDefined();
+    const argv = newSession!.argv;
+    const xIdx = argv.indexOf("-x");
+    const yIdx = argv.indexOf("-y");
+    expect(xIdx).toBeGreaterThan(-1);
+    expect(yIdx).toBeGreaterThan(-1);
+    expect(argv[xIdx + 1]).toBe("200");
+    expect(argv[yIdx + 1]).toBe("50");
+  } finally {
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  }
 });

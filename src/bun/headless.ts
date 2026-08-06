@@ -1,7 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
 import { db, dataDir } from "./db.ts";
-import { reconcileOrphans } from "./orchestrator.ts";
+import { reconcileOrphans, reapIdleSessions } from "./orchestrator.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -12,6 +12,7 @@ import {
   probeLiveCore,
 } from "./core-creds.ts";
 import { daemonLog } from "./daemon-log.ts";
+import { SESSION_REAP_SWEEP_MS } from "../shared/types.ts";
 
 /**
  * Headless Agetor core — the same Bun server + orchestrator the desktop app
@@ -69,6 +70,27 @@ export async function runDaemon(): Promise<void> {
   rehydratePath();
   reconcileOrphans();
   void refreshDiscoveredModels();
+
+  // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4):
+  // mirrors index.ts's wiring so the headless daemon doesn't accumulate the
+  // same idle claude REPLs the desktop app now reaps. A 30s delay before the
+  // first sweep lets `reconcileOrphans` above finish reattaching live
+  // sessions first. Both timers are `.unref()`'d — like the idle-shutdown
+  // timer below, a reap timer must never be what keeps this process alive;
+  // the daemon's own idle-shutdown path (and its resulting `process.exit`)
+  // has to remain reachable regardless of these firing.
+  const reapPostBootTimer = setTimeout(() => {
+    reapIdleSessions().catch((err) => {
+      daemonLog(`idle-session reap (post-boot) failed: ${(err as Error)?.message ?? String(err)}`);
+    });
+  }, 30_000);
+  reapPostBootTimer.unref();
+  const reapIntervalTimer = setInterval(() => {
+    reapIdleSessions().catch((err) => {
+      daemonLog(`idle-session reap (interval) failed: ${(err as Error)?.message ?? String(err)}`);
+    });
+  }, SESSION_REAP_SWEEP_MS);
+  reapIntervalTimer.unref();
 
   let server: ReturnType<typeof startApiServer>;
   try {

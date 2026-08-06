@@ -2,6 +2,7 @@ import path from "node:path";
 import { MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
+  CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
   spawnClaudeViaTmux,
   toClaudeModeString,
   type ChunkHandler,
@@ -16,7 +17,35 @@ export type { SpawnedAgent };
 export interface AgentCommand {
   cmd: string[];
   env?: Record<string, string>;
+  /**
+   * Set only by the claude-code branch of `buildCommand`, when the prompt is
+   * too large to ride in `tmux new-session`'s argv (see
+   * `CLAUDE_PROMPT_ARGV_MAX_BYTES`). `spawnAgent` forwards this to
+   * `spawnClaudeViaTmux` as `ClaudeLaunchOptions.deferredPrompt`, which
+   * delivers it post-launch via the same load-buffer/paste-buffer machinery
+   * live-session follow-ups use, gated on the composer being idle. Always
+   * undefined for codex — its prompt already rides on stdin, never argv, so
+   * it has no size-driven argv problem.
+   */
+  deferredPrompt?: string;
 }
+
+/**
+ * Prompts up to this size stay embedded in the claude-code launch argv
+ * (today's behavior, byte-identical). Above it, `buildCommand` omits the
+ * prompt from argv entirely and returns it as `AgentCommand.deferredPrompt`
+ * instead, so `spawnAgent` can route it through `spawnClaudeViaTmux`'s
+ * post-launch paste path.
+ *
+ * Why: tmux serializes the WHOLE client command — `new-session` flags, every
+ * `-e KEY=VAL` env pair, and the trailing argv — as a single message over its
+ * control socket, and tmux 3.6a rejects anything past its ~16KB imsg cap with
+ * a literal `command too long` (empirically measured: 14KB ok, 16KB fails).
+ * Budgeting 4KB to the prompt alone leaves generous headroom in that same
+ * message for the env block and flags, which ride alongside it regardless of
+ * prompt size.
+ */
+export const CLAUDE_PROMPT_ARGV_MAX_BYTES = 4096;
 
 export interface AgentRunOptions {
   /** Friendly mode id; see AGENT_OPTIONS in shared/types.ts. */
@@ -62,6 +91,7 @@ export interface AgentRunOptions {
 // so it doesn't need a translation table.
 const CLAUDE_MODEL_FLAG: Record<string, string> = {
   "fable-5": "claude-fable-5",
+  "opus-5": "claude-opus-5",
   "opus-4.8": "claude-opus-4-8",
   "opus-4.7": "claude-opus-4-7",
   "opus-4.6": "claude-opus-4-6",
@@ -342,7 +372,22 @@ export function buildCommand(
     // dead session + empty pane + 30s boot timeout (the run just fails with
     // no visible cause). `--` is a no-op for prompts that don't lead with a
     // dash.
-    if (prompt) args.push("--", prompt);
+    //
+    // Above CLAUDE_PROMPT_ARGV_MAX_BYTES, embedding the prompt here blows
+    // tmux's client-command cap and `tmux new-session` fails outright with
+    // `command too long` before claude ever starts — worse than the
+    // unknown-option case above, since there's no session at all to inspect.
+    // Skip the argv entirely and hand the raw prompt back as
+    // `deferredPrompt`; `spawnAgent` forwards it to `spawnClaudeViaTmux`,
+    // which pastes it in once claude's composer is up.
+    let deferredPrompt: string | undefined;
+    if (prompt) {
+      if (Buffer.byteLength(prompt, "utf8") > CLAUDE_PROMPT_ARGV_MAX_BYTES) {
+        deferredPrompt = prompt;
+      } else {
+        args.push("--", prompt);
+      }
+    }
 
     // Effort is required unless the chosen model doesn't accept the flag
     // (Haiku 4.5 today). Unknown effort ids are dropped rather than passed
@@ -356,7 +401,7 @@ export function buildCommand(
       throw new Error(`effort is required for claude-code model ${opts.model}`);
     }
 
-    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+    return { cmd: args, env: Object.keys(env).length ? env : undefined, deferredPrompt };
   }
 
   if (harness.kind === "cursor") {
@@ -552,6 +597,24 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
       onChunk("status", `${SESSION_DIED_STATUS_PREFIX}tmux session agetor-fake ended unexpectedly — task blocked`);
     });
     after(resolveDelayMs, () => { resolveDone(0); });
+  } else if (process.env.AGETOR_FAKE_CLAUDE_UNKNOWN_COMMAND === "1") {
+    // Test hook: simulate claude's TUI rejecting the message as an unknown
+    // slash command. Mirrors what `signalUnknownCommand` (claude-tmux.ts)
+    // emits from the pane scraper — the `CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX`
+    // sentinel status chunk that makeChunkHandler pattern-matches to flip the
+    // column to `blocked`, then resolves the turn with code 0 (the handle
+    // `unknownCommand` flag, not the exit code, drives the failed/blocked
+    // outcome). Optional resolve delay lets cancellation-precedence tests
+    // fire cancelRun between the column flip and the done resolution.
+    const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
+    after(5, () => {
+      onChunk(
+        "status",
+        `${CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX}/fake-command — claude treated the message as a `
+          + `slash command; it was not delivered. Edit the message so it doesn't start with "/" and resend.`,
+      );
+    });
+    after(resolveDelayMs, () => { resolveDone(0); });
   } else {
     after(5, () => onChunk("stdout", `fake response to: ${prompt}`));
     after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });
@@ -633,6 +696,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       sessionId,
       configDir: harness.home,
       mode: opts.mode ?? null,
+      deferredPrompt: built.deferredPrompt,
     });
   }
 

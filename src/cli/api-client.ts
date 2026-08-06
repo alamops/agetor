@@ -15,6 +15,7 @@ import type {
   BranchInfo,
   TaskReference,
   TaskDiff,
+  TaskGitStatus,
 } from "../shared/types.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
 import type { AvailableCommand, AvailableExtension } from "../bun/commands.ts";
@@ -141,7 +142,7 @@ export class AgetorClient {
   getDiff(id: string): Promise<TaskDiff> {
     return this.req("GET", `/tasks/${id}/diff`);
   }
-  getGitStatus(id: string): Promise<{ hasChanges: boolean; ahead: number; ignored?: boolean }> {
+  getGitStatus(id: string): Promise<TaskGitStatus> {
     return this.req("GET", `/tasks/${id}/git-status`);
   }
 

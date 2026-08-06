@@ -3,7 +3,7 @@ import { render } from "ink-testing-library";
 import { Dashboard } from "./Dashboard.tsx";
 import type { AgetorClient, CoreInfo } from "../api-client.ts";
 import type { Task } from "../../shared/types.ts";
-import { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
+import { commitPushPrompt } from "../../shared/types.ts";
 
 const ENTER = "\r";
 const wait = (ms = 60) => new Promise((r) => setTimeout(r, ms));
@@ -72,8 +72,12 @@ test("compose pins the target task even when the board re-sorts under the cursor
 
 test("the 'c' key sends the canned commit & push prompt to the selected task", async () => {
   const sends: Array<{ runId: string; line: string }> = [];
+  const taskA = task({
+    id: "taskA", column: "review", runId: "runA", hasOpenableRun: true, title: "A",
+    branch: "feature/a", taskType: "task",
+  });
   const client = {
-    listTasks: async () => [task({ id: "taskA", column: "review", runId: "runA", hasOpenableRun: true, title: "A" })],
+    listTasks: async () => [taskA],
     getRuns: async () => [],
     sendInput: async (runId: string, line: string) => {
       sends.push({ runId, line });
@@ -87,14 +91,19 @@ test("the 'c' key sends the canned commit & push prompt to the selected task", a
   await wait(90);
   stdin.write("c");
   await wait(80);
-  expect(sends).toEqual([{ runId: "runA", line: COMMIT_PUSH_PROMPT }]);
+  expect(sends).toEqual([{ runId: "runA", line: commitPushPrompt(taskA) }]);
+  // The prompt must be nomenclature-aware (derived from the branch prefix), not
+  // a stale constant — guards the CLI against drifting from the webview.
+  expect(sends[0]!.line).toContain(`"feature:"`);
+  expect(sends[0]!.line).toContain(`git push -u origin 'feature/a'`);
   unmount();
 });
 
 test("the 'c' key commits even while the task is running (mid-turn commit folds into the run)", async () => {
   const sends: Array<{ runId: string; line: string }> = [];
+  const taskR = task({ id: "taskR", column: "running", runId: "runR", title: "R" });
   const client = {
-    listTasks: async () => [task({ id: "taskR", column: "running", runId: "runR", title: "R" })],
+    listTasks: async () => [taskR],
     getRuns: async () => [],
     sendInput: async (runId: string, line: string) => {
       sends.push({ runId, line });
@@ -108,6 +117,6 @@ test("the 'c' key commits even while the task is running (mid-turn commit folds 
   await wait(90);
   stdin.write("c");
   await wait(80);
-  expect(sends).toEqual([{ runId: "runR", line: COMMIT_PUSH_PROMPT }]);
+  expect(sends).toEqual([{ runId: "runR", line: commitPushPrompt(taskR) }]);
   unmount();
 });

@@ -1,21 +1,28 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ClipboardList, Code2, GitBranch } from "lucide-react";
-import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension } from "@/lib/api";
+import { ClipboardList, Code2, GitBranch, SlidersHorizontal } from "lucide-react";
+import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type BranchNamingConfig } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { SearchSelect } from "@/components/ui/search-select";
+import { InfoTip } from "@/components/ui/info-tip";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
+import { branchFieldState } from "@/lib/branch-field";
 import {
   AGENT_OPTIONS,
   CODE_PLAN_MODE,
+  DEFAULT_BRANCH_CONFIG,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   DEFAULT_TASK_TYPE,
   TASK_TYPES,
+  branchPattern,
+  hasBranchTemplateTags,
   supportedEfforts,
   supportedModes,
+  validateBranchName,
   type AgentKind,
   type AgentStatus,
   type Harness,
@@ -23,6 +30,7 @@ import {
   type TaskReference,
   type TaskType,
 } from "../../../shared/types.ts";
+import { BranchNamingDialog } from "@/components/settings/BranchNamingDialog";
 import { AgentIcon } from "./AgentIcon";
 import { BranchPicker } from "./BranchPicker";
 import { ProjectPicker } from "./ProjectPicker";
@@ -38,6 +46,11 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
 
 const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
 
+/** Short unique token seeding the `<slug>`/`<token>` fallback in the preview.
+ *  Always exactly 6 hex chars, mirroring the server's task-id-derived token,
+ *  so the client-side validation can't reject a name the server would accept. */
+const newBranchToken = () => crypto.randomUUID().replace(/-/g, "").slice(0, 6);
+
 interface Props {
   onSubmit: (
     input: {
@@ -48,6 +61,9 @@ interface Props {
       workdir: string;
       isolation: Isolation;
       baseRef?: string;
+      /** Branch name for worktree isolation — the value shown in the sidebar's
+       *  editable preview field. Omitted when isolation is off. */
+      branch?: string;
       mode: string | null;
       model: string | null;
       effort: string | null;
@@ -97,6 +113,73 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   const [workdir, setWorkdir] = useState("");
   const [isolate, setIsolate] = useState(true);
   const [baseRef, setBaseRef] = useState("");
+  // Branch nomenclature for the selected project (loaded from the server;
+  // falls back to the built-in defaults). While clean (`!branchDirty`), the
+  // field DERIVES its display from the tag-visible PATTERN (e.g.
+  // `feature/<slug>`) rendered live against the current title/type/config —
+  // realtime by construction, no seeding effect required. Once the user edits
+  // it (`branchDirty`), `branchOverride` holds their literal text, sent to the
+  // server verbatim — tags and all, the server resolves them authoritatively
+  // at create time. `branchToken` seeds the client-side preview/validation
+  // fallback (used when `<slug>` would otherwise render empty).
+  const [branchConfig, setBranchConfig] = useState<BranchNamingConfig>(DEFAULT_BRANCH_CONFIG);
+  const [branchOverride, setBranchOverride] = useState("");
+  const [branchDirty, setBranchDirty] = useState(false);
+  const [branchToken, setBranchToken] = useState(newBranchToken);
+  const [branchSettingsOpen, setBranchSettingsOpen] = useState(false);
+
+  // Load the selected project's branch nomenclature. Empty workdir → defaults.
+  useEffect(() => {
+    const dir = workdir.trim();
+    if (!dir) { setBranchConfig(DEFAULT_BRANCH_CONFIG); return; }
+    let cancelled = false;
+    api.getProjectBranchConfig(dir)
+      .then((c) => { if (!cancelled) setBranchConfig(c); })
+      .catch(() => { if (!cancelled) setBranchConfig(DEFAULT_BRANCH_CONFIG); });
+    return () => { cancelled = true; };
+  }, [workdir]);
+
+  // The tag-visible pattern for the current config + type, e.g. `feature/<slug>`.
+  // Deliberately stable while the title is typed — only config/taskType move
+  // it — so the field never rewrites itself into a jarring live value.
+  const computedPattern = useMemo(
+    () => branchPattern(branchConfig, taskType),
+    [branchConfig, taskType],
+  );
+
+  // Last path segment of the workdir, used as `<project_name>` in the live
+  // preview — mirrors the server's own resolution so the preview matches what
+  // will actually be created.
+  const projectName = useMemo(() => {
+    const parts = workdir.trim().split("/").filter(Boolean);
+    return parts[parts.length - 1] ?? "";
+  }, [workdir]);
+
+  // Derived clean/dirty projection of the branch field — see
+  // `src/mainview/lib/branch-field.ts`. Clean: `displayValue`/`resolved`
+  // live-render the pattern each render (realtime as title/type/config
+  // change), and `submitValue` is the raw un-rendered pattern so the server
+  // stays the authoritative resolver. Dirty: the user's literal text wins.
+  const branchField = useMemo(
+    () => branchFieldState({
+      dirty: branchDirty,
+      override: branchOverride,
+      pattern: computedPattern,
+      title,
+      projectName,
+      taskType,
+      token: branchToken,
+    }),
+    [branchDirty, branchOverride, computedPattern, title, projectName, taskType, branchToken],
+  );
+
+  // Validation gates on the RESOLVED name (a template like `feature/<slug>` is
+  // always git-legal since `<`/`>` are allowed in ref names, but we want the
+  // error — and canSubmit — to reflect what will actually be created).
+  const branchValidation = useMemo(
+    () => validateBranchName(branchField.resolved.trim()),
+    [branchField.resolved],
+  );
   const [mode, setMode] = useState<string>(initialMode("claude-code"));
   const [model, setModel] = useState<string>(DEFAULT_MODEL["claude-code"]);
   // `null` is reserved for the Haiku-style "model doesn't accept effort" case.
@@ -290,7 +373,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     setMode(codePlan.plan);
   };
 
-  const canSubmit = title.trim() && prompt.trim() && workdir.trim();
+  const canSubmit =
+    title.trim() && prompt.trim() && workdir.trim() && (!isolate || branchValidation.ok);
 
   const submit = ({ start }: { start: boolean }) => {
     if (!canSubmit) return;
@@ -302,6 +386,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
         workdir: workdir.trim(),
         isolation: isolate ? "worktree" : "none",
         baseRef: isolate && baseRef.trim() ? baseRef.trim() : undefined,
+        // The branch is only meaningful under worktree isolation. Clean →
+        // the raw pattern (server resolves authoritatively at create time);
+        // dirty → the user's literal text, trimmed. The server validates it
+        // and guarantees uniqueness either way.
+        branch: isolate && branchField.submitValue ? branchField.submitValue : undefined,
         // model is always an explicit option id. effort is too, except for
         // the Haiku-style "model doesn't accept effort" case which sends null.
         mode,
@@ -325,6 +414,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     setBaseRef("");
     setReferences([]);
     setDropHint(null);
+    // Reset the branch field so the next task re-derives from its (now empty)
+    // title and gets a fresh unique token; drop any manual override.
+    setBranchDirty(false);
+    setBranchToken(newBranchToken());
     // Keep `workdir`, `model`, `effort`, `mode` set on purpose — the next
     // task should default to the same project + picks the user just used.
   };
@@ -531,6 +624,54 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
           <span>Isolate (worktree)</span>
         </label>
 
+        {isolate && (
+          <div className="space-y-1">
+            <label className="text-muted-foreground">Branch name</label>
+            <div className="relative">
+              <Input
+                value={branchField.displayValue}
+                onChange={(e) => { setBranchOverride(e.target.value); setBranchDirty(true); }}
+                spellCheck={false}
+                placeholder="feature/my-task"
+                className={cn(
+                  "pr-9 font-mono text-[11px]",
+                  !branchValidation.ok && "border-destructive focus-visible:ring-destructive",
+                )}
+                title="Git branch the worktree will use. Live-resolved from this project's nomenclature (title, type, project name); edit to override, or use the settings button to change the pattern."
+              />
+              <button
+                type="button"
+                onClick={() => setBranchSettingsOpen(true)}
+                disabled={!workdir.trim()}
+                title="Branch naming settings for this project"
+                aria-label="Configure branch naming"
+                className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
+              >
+                <SlidersHorizontal className="size-3.5" />
+              </button>
+            </div>
+            {!branchValidation.ok ? (
+              <p className="text-[10px] text-destructive">{branchValidation.reason}</p>
+            ) : branchDirty && hasBranchTemplateTags(branchOverride) ? (
+              <p
+                className="text-[10px] font-mono text-muted-foreground truncate"
+                title={branchField.resolved}
+              >
+                → {branchField.resolved}
+              </p>
+            ) : null}
+            {branchDirty && (
+              <button
+                type="button"
+                onClick={() => setBranchDirty(false)}
+                className="text-[10px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+              >
+                Reset to pattern
+              </button>
+            )}
+          </div>
+        )}
+
         <div className="space-y-1">
           <label className="text-muted-foreground">Harness</label>
           <div className="grid grid-cols-2 gap-1">
@@ -592,18 +733,19 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
               Plan
             </Button>
           </div>
-          <Select
-            value={mode}
-            onChange={(e) => setMode(e.target.value)}
-            className="h-8"
-          >
-            {modes.map((m) => (
-              <option key={m.id} value={m.id}>{m.label}</option>
-            ))}
-          </Select>
-          {selectedModeHint && (
-            <p className="text-[11px] leading-snug text-muted-foreground">{selectedModeHint}</p>
-          )}
+          <div className="flex items-center gap-1.5">
+            <SearchSelect
+              value={mode}
+              onChange={setMode}
+              items={modes.map((m) => ({ value: m.id, label: m.label, hint: m.hint }))}
+              searchable={false}
+              wrapHints
+              placement="bottom"
+              className="min-w-0 flex-1"
+              triggerClassName="h-8 text-xs"
+            />
+            {selectedModeHint && <InfoTip text={selectedModeHint} label="About this mode" />}
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-2">
@@ -694,6 +836,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
           Run task
         </Button>
       </div>
+
+      <BranchNamingDialog
+        open={branchSettingsOpen}
+        projectPath={workdir.trim()}
+        activeTaskType={taskType}
+        onClose={() => setBranchSettingsOpen(false)}
+        onSaved={(c) => setBranchConfig(c)}
+      />
     </aside>
   );
 }

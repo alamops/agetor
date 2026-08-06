@@ -2,13 +2,13 @@ import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { resumableRunId } from "../run-logic.ts";
 import { c, out, printJson } from "../output.ts";
-import { COMMIT_PUSH_PROMPT } from "../../shared/types.ts";
+import { commitPushPrompt } from "../../shared/types.ts";
 import { usageError } from "../usage.ts";
 
 /**
  * One-shot "commit & push": ask the agent to commit all changes and push the
  * branch, using the exact prompt the webview's Commit & push chip sends
- * (COMMIT_PUSH_PROMPT). Resumes the session like `agetor send`.
+ * (commitPushPrompt). Resumes the session like `agetor send`.
  */
 export async function cmdCommit(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];
@@ -41,7 +41,7 @@ export async function cmdCommit(args: string[], flags: Flags): Promise<void> {
     /* git-status is advisory — never blocks the request */
   }
 
-  const res = await client.sendInput(runId, COMMIT_PUSH_PROMPT);
+  const res = await client.sendInput(runId, commitPushPrompt(task));
   if (flags.json) {
     return printJson({ delivered: res.delivered !== false, reason: res.reason, note: note.trim() || undefined });
   }

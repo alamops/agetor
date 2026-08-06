@@ -3,15 +3,22 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, Bot, Check, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, Globe, HelpCircle, ListTodo, Plug, Search, Send, Slash,
-  Sparkles, Square, Terminal, Wrench, X,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, RefreshCw, Search, Send, Slash, SquareSlash,
+  Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
-import { api, COMMIT_PUSH_PROMPT, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
+import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
-import { shouldOfferCommitPush, type TaskGitStatus } from "@/lib/commit-push";
-import { Button } from "@/components/ui/button";
+import { shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
+import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
+import { latestPrProposal } from "@/lib/pr-proposal";
+import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
+import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
+import { eventWindowKeepCount } from "@/lib/event-window";
+import type { GitHubPullPrefill } from "./GitHubDialog";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
@@ -20,24 +27,34 @@ import {
   AGENT_OPTIONS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  EVENTS_WINDOW_MAX,
   supportedEfforts,
   supportedModes,
   type AgentKind,
   type AgentStatus,
   type Harness,
+  type BacklogMessage,
+  type GitHubPullMergeability,
   type Run,
   type RunEvent,
   type Subagent,
   type SubagentEvent,
   type Task,
+  type TaskDraft,
+  type TaskEventsReplayMeta,
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
+import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
+import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
 import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
+import { parseUserMessage, splitReferences } from "@/lib/command-message";
+import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
+import { AttachmentChips } from "./AttachmentChips";
 import {
   ReferencesPicker,
   captureDroppedOrPastedItems,
@@ -48,6 +65,8 @@ import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-inser
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
 import { TerminalView } from "./TerminalView";
+import { deriveTodoProgress } from "@/lib/todo-progress";
+import { TodoProgressCard } from "./TodoProgressCard";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -61,14 +80,29 @@ function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
 
 /**
  * `RunEvent` as held in the panel's local `events` state, tagged with a
- * client-assigned monotonic id. The server doesn't expose a stable event id
- * over SSE (`run_events.id` never leaves the DB layer) — `id` here is
- * assigned by `nextEventIdRef` the moment an event is accepted into the
+ * client-assigned monotonic id. `id` here is always assigned by
+ * `nextEventIdRef`/`prevEventIdRef` the moment an event is accepted into the
  * unified stream, purely so `rebuilt-mask.ts` can tell a genuinely NEW live
  * event apart from one the server re-delivers on SSE reconnect (full-history
- * replay) when deciding whether the JSONL rebuild snapshot has gone stale.
+ * replay) when deciding whether the JSONL rebuild snapshot has gone stale —
+ * it is NEVER the server's own event id, even when one is available (see
+ * `dbId` below), since `rebuilt-mask.ts`'s ordering depends on this id space
+ * being contiguous and monotonic per-connection.
+ *
+ * `dbId`, when present, is the REAL `run_events.id` row id. Historically this
+ * was only known for events fetched via `GET /tasks/:id/events/page` ("Load
+ * earlier"), but SSE replayed frames (the burst sent on connect/reconnect,
+ * before `replay_meta`'s window) now carry it too — only a genuinely NEW
+ * live event delivered after the connection has settled lacks one. It's what
+ * lets the live-window trim (`EVENTS_WINDOW_MAX`) figure out a fresh
+ * `beforeId` cursor after eating into previously-loaded earlier history: if
+ * the new front-of-window event carries a `dbId`, that becomes the new
+ * `earliestId`; if it doesn't (the rare case of a brand-new live event
+ * pushing the window over the cap before any replay/page fetch has run),
+ * "Load earlier" has nothing reliable to page from and hides until the next
+ * SSE (re)connect re-seeds `earliestId` from `replay_meta`.
  */
-type StreamEvent = RunEvent & { id: number };
+type StreamEvent = RunEvent & { id: number; dbId?: number };
 
 interface Props {
   /** When null, the panel slides off-screen and unmounts after the exit animation. */
@@ -84,6 +118,14 @@ interface Props {
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
+  /** Open GitHubDialog's New-PR composer prefilled for this task — see the
+   *  "Open PR" chip below. Owned by App so the dialog stays a single
+   *  App-level singleton instead of one instance per task panel. */
+  onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
+  /** Open GitHubDialog directly on the PR detail subpage for this task's
+   *  `prUrl` — see the header "View PR" affordance below. Same App-level-
+   *  singleton ownership rationale as `onOpenPullRequest`. */
+  onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
 }
 
 const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" | "destructive"> = {
@@ -95,6 +137,21 @@ const STATUS_VARIANT: Record<Run["status"], "default" | "secondary" | "outline" 
 };
 
 export const EXIT_DURATION_MS = 250;
+
+// Distance-from-bottom (px) below which the log counts as "near bottom" for
+// auto-scroll purposes. Shared by the onScroll handler and the ResizeObserver
+// pin effect below — the two heuristics must not drift apart, or a user
+// parked just past one threshold but within the other would see the pin
+// fire inconsistently depending on which path last updated `nearBottomRef`.
+const NEAR_BOTTOM_PX = 80;
+
+// Computed once at module load rather than per keystroke — used by the
+// Cmd/Ctrl+F handler below to pick the platform-appropriate modifier
+// (`metaKey` on macOS, `ctrlKey` elsewhere). Agetor packages arm64-only for
+// macOS, but the dev webview (Vite) can run in any browser during
+// development, so this still branches rather than assuming Mac.
+const IS_MAC_PLATFORM =
+  typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent || "");
 
 function formatDuration(r: Run): string {
   const end = r.endedAt ?? Date.now();
@@ -121,7 +178,7 @@ function formatTime(ts: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive }: Props) {
+export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -154,9 +211,10 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
 
   // Escape closes the panel — but only when no higher-priority dismissable
   // layer is up: a modal Dialog (confirm, edit, settings, tmux-missing —
-  // each renders `[role="dialog"][aria-modal="true"]`) or an open
-  // search-select / multi-search-select popover (marked with
-  // `[data-popover-open]`). Esc peels one layer at a time, top down.
+  // each renders `[role="dialog"][aria-modal="true"]`), an open search-select
+  // / multi-search-select popover (marked with `[data-popover-open]`), or the
+  // in-panel message search bar (marked with `[data-search-open]` — see
+  // RunPanelBody). Esc peels one layer at a time, top down.
   //
   // Note: stopPropagation/stopImmediatePropagation can't help here because
   // both the panel and the popovers attach to `document`, so DOM markers
@@ -171,7 +229,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-search-open]')) return;
       e.preventDefault();
       onCloseRef.current();
     };
@@ -204,10 +262,13 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           harnesses={harnesses}
           agentModels={agentModels}
           homeDir={homeDir}
+          open={open}
           onClose={onClose}
           onShowDiff={onShowDiff}
           onArchive={onArchive}
           onUnarchive={onUnarchive}
+          onOpenPullRequest={onOpenPullRequest}
+          onViewPullRequest={onViewPullRequest}
         />
       </aside>
     </>
@@ -224,20 +285,30 @@ function RunPanelBody({
   harnesses,
   agentModels,
   homeDir,
+  open,
   onClose,
   onShowDiff,
   onArchive,
   onUnarchive,
+  onOpenPullRequest,
+  onViewPullRequest,
 }: {
   task: Task;
   agents: AgentStatus[];
   harnesses: Harness[];
   agentModels: AgentModelMap;
   homeDir: string;
+  /** Whether the panel is in its "open" (not mid-close-animation, not
+   *  pre-mount) state — mirrors `RunPanel`'s own `open` state. Gates the
+   *  Cmd/Ctrl+F listener below so it doesn't hijack the shortcut while the
+   *  panel is animating out or not actually visible. */
+  open: boolean;
   onClose: () => void;
   onShowDiff: (task: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
+  onOpenPullRequest: (prefill: GitHubPullPrefill) => void;
+  onViewPullRequest: (input: { projectPath: string; prUrl: string }) => void;
 }) {
   const archived = task.archivedAt != null;
   const kind = harnessKindOf(task.agent, harnesses);
@@ -276,12 +347,47 @@ function RunPanelBody({
    *  subagent id. Background-agent streams are READ-ONLY — the composer is
    *  hidden while one is active. */
   const [activeStream, setActiveStream] = useState<string>("main");
+  /** In-panel search over whichever stream is currently displayed (see
+   *  lib/event-search.ts). Read-only and deliberately NOT gated on
+   *  `activeStream === "main"` or archival state — it works identically on a
+   *  subagent tab or an archived task's frozen log. */
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  /** The selected match, as an index into `displayedEvents` — NOT a
+   *  `StreamEvent.id`. A JSONL-rebuilt event has no client-assigned id at
+   *  all (see `StreamEvent`'s doc comment above), so `findMatchingEventIds`
+   *  (lib/event-search.ts) uses each event's position in `displayedEvents`
+   *  as its id, scoped to whatever's currently displayed. `null` means no
+   *  match is selected. */
+  const [activeMatchId, setActiveMatchId] = useState<number | null>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const logRef = useRef<HTMLDivElement>(null);
+  // Wraps the log's conditional content (empty states + the event list) so a
+  // ResizeObserver can watch content height growth independent of the scroll
+  // container's own box — see the pin-to-bottom effects below.
+  const logContentRef = useRef<HTMLDivElement>(null);
+  // The DOM element currently carrying the search-match highlight classes
+  // (imperatively toggled, not driven by a React prop/memo dep — see the
+  // effect below). `null` when nothing is highlighted.
+  const highlightedElRef = useRef<HTMLElement | null>(null);
   // Tracks whether the log was scrolled near the bottom at the last user
   // interaction. Auto-scroll-to-bottom on new events only fires when this is
   // true, so a user who scrolls up to read history isn't yanked back down on
   // every streamed chunk.
   const nearBottomRef = useRef(true);
+  // Timestamp (performance.now()) until which the ResizeObserver pin effect
+  // below must not force-scroll. Armed on every pointerdown inside the log
+  // (capture phase, see `onPointerDownCapture` on the scroll container) so a
+  // user expanding/collapsing an `ExpandableBlock`, a `UserMessageBlock`, or
+  // any other in-log toggle isn't yanked back to the bottom mid-interaction.
+  // Every user-initiated content-size change starts with a pointerdown
+  // inside the log; async growth (replay-buffer flushes, markdown settling,
+  // a tab strip mounting) never does — so this single timestamp is enough
+  // to distinguish the two without threading a suppression ref through every
+  // collapsible in the tree. A pin skipped because unrelated async content
+  // happened to land inside the window is recovered on the next growth event
+  // or by the pre-paint layout-effect pin (path 1 below).
+  const pinSuppressUntilRef = useRef(0);
   // Monotonic id source for `StreamEvent.id`, incremented once per event as
   // it's accepted into the unified stream (see the SSE subscription effect
   // below). Assigning synchronously at push time — rather than deriving from
@@ -290,6 +396,40 @@ function RunPanelBody({
   // the rebuild-snapshot-invalidation check needs to be race-free. Reset to
   // 0 on task switch alongside the rest of the stream state.
   const nextEventIdRef = useRef(0);
+  // Descending id source for events PREPENDED via "Load earlier" (see
+  // `loadEarlierEvents`). Always negative and always decreasing, so a
+  // page-fetched historical event's client `id` sorts before every live/replay
+  // `StreamEvent.id` (which start at 0 and only increase) — this keeps it
+  // outside `rebuilt-mask.ts`'s "genuinely newer than the snapshot" check
+  // without needing any special-casing there. Reset to -1 on task switch.
+  const prevEventIdRef = useRef(-1);
+  // Mirrors `events` synchronously (state updates land a render later) so the
+  // SSE batch-flush callback and `loadEarlierEvents` can read/trim the
+  // "current" array without relying on React's functional-setState form —
+  // doing the window-cap trim (see EVENTS_WINDOW_MAX below) inside a
+  // setState updater would run twice under StrictMode's dev double-invoke.
+  const eventsRef = useRef<StreamEvent[]>([]);
+  /** Every real `run_events.id` (`StreamEvent.dbId`) currently represented in
+   *  `eventsRef.current`, whether it arrived via SSE replay, a live push, or
+   *  a "Load earlier" page fetch. Populated as events are accepted (see the
+   *  SSE subscription effect and `loadEarlierEvents` below); reset on task
+   *  switch. Lets `loadEarlierEvents` defensively drop rows it's already
+   *  holding — e.g. after an SSE reconnect moves `earliestId` backward (see
+   *  the `replay_meta` handler below) a subsequent page fetch can legitimately
+   *  overlap the tail of what a previous page fetch (or the live window)
+   *  already loaded. */
+  const loadedDbIdsRef = useRef<Set<number>>(new Set());
+  /** DB id of the earliest event currently anchoring the "Load earlier"
+   *  cursor, or null when unknown (hides the button — see `StreamEvent.dbId`
+   *  and the window-trim comment in the SSE effect below). Seeded from the
+   *  SSE `replay_meta` frame on (re)connect; advanced by each successful
+   *  "Load earlier" page fetch; recomputed (possibly to null) when live
+   *  growth trims the window's front past a known anchor. */
+  const [earliestId, setEarliestId] = useState<number | null>(null);
+  /** Whether older history exists before `earliestId` — gates the "Load
+   *  earlier" button together with `earliestId !== null`. */
+  const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
 
   // Reset on task switch (no remount because we no longer key on task.id).
   // Re-arm the auto-scroll heuristic so opening a different task pins the
@@ -297,12 +437,37 @@ function RunPanelBody({
   // task's scrolled-up position.
   useEffect(() => {
     setEvents([]);
+    eventsRef.current = [];
+    prevEventIdRef.current = -1;
+    loadedDbIdsRef.current = new Set();
+    setEarliestId(null);
+    setHasMoreEarlier(false);
+    setLoadingEarlier(false);
     setRebuilt(null);
     setRebuildNote(null);
     setInteractions([]);
     setSubagentList([]);
     setActiveStream("main");
+    setSearchOpen(false);
+    setSearchQuery("");
+    setActiveMatchId(null);
     nearBottomRef.current = true;
+    // Old task's PR mergeability (and "Resolve Conflicts" send confirmation)
+    // must not survive into the new task: RunPanelBody isn't remounted on
+    // task switch, so without this a stale `prStatus` from task A could sit
+    // around and let the button send task A's PR prompt into task B's agent
+    // before the `[task.id, task.prUrl]` fetch effect below resolves. These
+    // setters/refs are declared further down this component (with the rest
+    // of the PR-status state) — safe to reference here since this closure
+    // only runs after the full component body (and their declarations) has
+    // executed at least once.
+    setPrStatus(null);
+    setPrStatusError(null);
+    setResolveConflictsSent(false);
+    if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
+    prStatusRetryTimerRef.current = null;
+    if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+    resolveConflictsSentTimerRef.current = null;
   }, [task.id]);
 
   // Latest run for this task — drives the send button, indicator, and
@@ -353,8 +518,42 @@ function RunPanelBody({
     [],
   );
 
+  // ── Poll gating (runs + subagents) ────────────────────────────────────────
+  // Both 2s polls below share the same "is there any reason to keep looking"
+  // condition: a run in flight, a subagent running, or an interaction waiting
+  // on the user. These booleans are read by each poll's own `evaluate()`
+  // (defined inside the effect so it can start/stop that effect's own timer)
+  // — refs, not plain closures, because `latestRun`/`subagentList`/
+  // `interactions` change on every render without re-running the poll effects
+  // (whose deps are just `[task.id, task.runId]` / `[task.id]`, deliberately,
+  // so an interaction resolving doesn't reset an in-flight interval). The
+  // kick/evaluate refs let the activity-change effect and the SSE handler
+  // below reach into a poll effect that was set up earlier without needing it
+  // in their own dependency arrays.
+  const runActiveRef = useRef(false);
+  const subagentActiveRef = useRef(false);
+  const interactionPendingRef = useRef(false);
+  const runsPollKickRef = useRef<() => void>(() => {});
+  const subagentsPollKickRef = useRef<() => void>(() => {});
+  const runsPollEvaluateRef = useRef<() => void>(() => {});
+  const subagentsPollEvaluateRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    runActiveRef.current = latestRun?.status === "running";
+    subagentActiveRef.current = subagentList.some((s) => s.status === "running");
+    interactionPendingRef.current = interactions.length > 0;
+    // Re-arm (or re-suspend) both polls now that the activity picture changed
+    // — e.g. the latest run just resolved (stop) or a subagent just finished
+    // while the run was already idle (also stop; the reverse case, a run/
+    // subagent starting, is normally already covered by `task.runId`/mount
+    // effects below, but this keeps both polls honest either way).
+    runsPollEvaluateRef.current();
+    subagentsPollEvaluateRef.current();
+  }, [latestRun?.status, subagentList, interactions.length]);
+
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
     const load = async () => {
       try {
         const list = await api.listRuns(task.id);
@@ -362,17 +561,57 @@ function RunPanelBody({
         setRuns(list);
       } catch { /* task may have been deleted */ }
     };
-    void load();
-    const t = setInterval(load, 2000);
-    return () => { cancelled = true; clearInterval(t); };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // Mirrors whether the timer is currently (supposed to be) running.
+    // `evaluate()` is called on every SSE frame during a mid-turn flood (see
+    // the subscription effect's `runsPollEvaluateRef.current()` calls) — the
+    // early return below skips the `document.hidden`/ref reads and the
+    // start/stop call entirely once the desired state already matches,
+    // rather than re-deriving and re-applying the same state on every event.
+    let armed = false;
+    // Paused while the window is hidden (nothing to repaint) or once the task
+    // has gone fully idle (terminal run, no subagent running, no pending
+    // interaction) — resumed by `kick()` below on visible/focus or a live-sign
+    // SSE event, so a change on the server side is never missed for long.
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    runsPollKickRef.current = kick;
+    runsPollEvaluateRef.current = evaluate;
+    void load(); // initial load on mount always happens, regardless of gating
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [task.id, task.runId]);
 
   // Snapshot + poll the task's background/sub agents. The SSE `subagent` deltas
   // keep this fresh live; the poll is a reopen/reconnect backstop (mirrors the
   // runs poll). Merge rather than replace so an in-flight SSE delta isn't
-  // clobbered by a slightly-stale poll.
+  // clobbered by a slightly-stale poll. Same visibility/idle gating as the
+  // runs poll above (own timer, shared activity refs).
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
     const load = async () => {
       try {
         const list = await api.listSubagents(task.id);
@@ -388,9 +627,39 @@ function RunPanelBody({
         });
       } catch { /* task may have been deleted */ }
     };
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const startTimer = () => {
+      if (timer) return;
+      timer = setInterval(() => { if (!document.hidden) void load(); }, 2000);
+    };
+    // See the runs-poll effect above for why this early-returns on a no-op
+    // state transition instead of re-deriving/re-applying on every call.
+    let armed = false;
+    const evaluate = () => {
+      const shouldRun = !document.hidden
+        && (runActiveRef.current || subagentActiveRef.current || interactionPendingRef.current);
+      if (shouldRun === armed) return;
+      armed = shouldRun;
+      if (shouldRun) startTimer(); else stopTimer();
+    };
+    const kick = () => {
+      if (!document.hidden) void load();
+      evaluate();
+    };
+    subagentsPollKickRef.current = kick;
+    subagentsPollEvaluateRef.current = evaluate;
     void load();
-    const t = setInterval(load, 2000);
-    return () => { cancelled = true; clearInterval(t); };
+    evaluate();
+    const onVisible = () => { if (document.visibilityState === "visible") kick(); };
+    const onFocus = () => kick();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      stopTimer();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [task.id]);
 
   // One unified task-level stream: every event from every run, merged in
@@ -425,9 +694,76 @@ function RunPanelBody({
     // arm/flush bookkeeping (and the re-arm-after-flush invariant that fixes
     // the freeze) lives in `createEventBuffer` so it can be unit-tested.
     const FLUSH_FALLBACK_MS = 250;
+    // Wall-clock connect time, used below to suppress poll kicks for the
+    // first ~1s of a (re)connect. The SSE replay burst can contain many
+    // historical `status`/`user` events (a big backlog dumps its whole
+    // recent window in one go), and each used to fire an immediate
+    // `runsPollKickRef`/`subagentsPollKickRef` call — a fetch storm at
+    // panel-open time. Wall-clock time (rather than "has the first batch
+    // flushed yet") is the right gate: a slow flush doesn't shrink the
+    // window, and a burst that keeps arriving past 1s still degrades
+    // gracefully into the debounce below rather than firing on every event.
+    const CONNECT_SETTLE_MS = 1000;
+    const connectedAtRef = { current: Date.now() };
+    // Debounce for kicks that land after the settle window: at most one
+    // poll-kick per second, trailing-edge, so a burst of live `status`/`user`
+    // events (e.g. several follow-ups folding into a turn in quick
+    // succession) can't each trigger their own fetch.
+    const KICK_DEBOUNCE_MS = 1000;
+    const lastKickAtRef = { current: 0 };
+    let kickTimer: ReturnType<typeof setTimeout> | null = null;
+    const debouncedKick = () => {
+      const now = Date.now();
+      const elapsed = now - lastKickAtRef.current;
+      if (elapsed >= KICK_DEBOUNCE_MS) {
+        lastKickAtRef.current = now;
+        runsPollKickRef.current();
+        subagentsPollKickRef.current();
+        return;
+      }
+      if (kickTimer) return;
+      kickTimer = setTimeout(() => {
+        kickTimer = null;
+        lastKickAtRef.current = Date.now();
+        runsPollKickRef.current();
+        subagentsPollKickRef.current();
+      }, KICK_DEBOUNCE_MS - elapsed);
+    };
     const buffer = createEventBuffer<StreamEvent>(
       (batch) => {
-        setEvents((cur) => [...cur, ...batch]);
+        // Trim from the front once the live window exceeds EVENTS_WINDOW_MAX
+        // (see StreamEvent's `dbId` doc comment for how the new earliestId is
+        // derived — or why it sometimes can't be). `eventsRef` mirrors
+        // `events` synchronously so this math doesn't need React's
+        // functional-setState form (which would run twice under StrictMode's
+        // dev double-invoke and could double-decrement counters/side effects
+        // if this logic lived inside it).
+        //
+        // The trim itself is deferred (see `eventWindowKeepCount` in
+        // `lib/event-window.ts`) while the user is mid-history
+        // (`!nearBottomRef.current`): trimming unconditionally deletes
+        // content above the viewport on every flush, and with
+        // `[overflow-anchor:none]` on the log container (see that div's
+        // className comment below) there's no browser-side absorber left to
+        // paper over the resulting jump — the reader would get yanked
+        // forward with no pin path armed to catch it (`nearBottomRef` is
+        // false, so neither pin fires, and "Load earlier"'s scroll-restore
+        // only covers its own prepend). Deferral is hard-capped at 2x
+        // `EVENTS_WINDOW_MAX` so memory still stays bounded for a reader who
+        // never returns to the bottom; the jerk can still happen once that
+        // cap is hit, which is the accepted trade-off.
+        const merged = [...eventsRef.current, ...batch];
+        let next = merged;
+        const keep = eventWindowKeepCount(merged.length, nearBottomRef.current, EVENTS_WINDOW_MAX);
+        if (keep != null) {
+          next = merged.slice(merged.length - keep);
+          const front = next[0];
+          const newEarliestId = front?.dbId ?? null;
+          setEarliestId(newEarliestId);
+          setHasMoreEarlier(newEarliestId != null);
+        }
+        eventsRef.current = next;
+        setEvents(next);
         // A newer live MAIN-stream event landing for a run the rebuilt-from-
         // JSONL snapshot is currently masking means the snapshot is stale —
         // clear it so `displayedEvents` falls back to the live stream. This
@@ -469,85 +805,281 @@ function RunPanelBody({
     const onFocus = () => buffer.flushNow();
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onFocus);
-    const unsub = api.subscribeTask(task.id, (e) => {
-      if (!dedupe.accept(e)) return;
-      if (e.stream === "interaction") {
-        try {
-          const req = JSON.parse(e.data) as PendingInteraction;
-          setInteractions((cur) => cur.some((x) => x.id === req.id) ? cur : [...cur, req]);
-        } catch { /* ignore malformed */ }
-        return;
-      }
-      if (e.stream === "subagent") {
-        // Live lifecycle delta for a background/sub agent — upsert into the tab
-        // list instead of pushing to the log buffer. The agent's actual
-        // transcript rides the normal user/assistant/tool_* streams (tagged
-        // via `subagentId`) and flows through to `buffer.push` below.
-        try {
-          const { subagent } = JSON.parse(e.data) as SubagentEvent;
-          setSubagentList((cur) => {
-            const i = cur.findIndex((s) => s.id === subagent.id);
-            if (i === -1) return [...cur, subagent];
-            const next = cur.slice();
-            next[i] = subagent;
-            return next;
-          });
-        } catch { /* ignore malformed */ }
-        return;
-      }
-      if (e.stream === "interaction_resolved") {
-        // Server-side resolution (scraper auto-cancel, run cancellation,
-        // delete) — drop the matching card so the UI doesn't keep
-        // showing a stale prompt. The card's own submit handler also
-        // calls `dismissInteraction(id)` directly; both paths are
-        // idempotent under `id`-based filtering.
-        try {
-          const { id } = JSON.parse(e.data) as { id: string };
-          setInteractions((cur) => cur.filter((x) => x.id !== id));
-        } catch { /* ignore malformed */ }
-        return;
-      }
-      // Tag with the next client-assigned id (see `StreamEvent`) — the
-      // server doesn't send one over SSE, and the invalidation check above
-      // needs a monotonic ordering to distinguish a genuinely new event from
-      // one the replay burst re-delivers on reconnect.
-      buffer.push({ ...e, id: nextEventIdRef.current++ });
-    });
+    const unsub = api.subscribeTask(
+      task.id,
+      (e) => {
+        if (!dedupe.accept(e)) return;
+        if (e.stream === "interaction") {
+          try {
+            const req = JSON.parse(e.data) as PendingInteraction;
+            setInteractions((cur) => cur.some((x) => x.id === req.id) ? cur : [...cur, req]);
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        if (e.stream === "subagent") {
+          // Live lifecycle delta for a background/sub agent — upsert into the tab
+          // list instead of pushing to the log buffer. The agent's actual
+          // transcript rides the normal user/assistant/tool_* streams (tagged
+          // via `subagentId`) and flows through to `buffer.push` below.
+          try {
+            const { subagent } = JSON.parse(e.data) as SubagentEvent;
+            setSubagentList((cur) => {
+              const i = cur.findIndex((s) => s.id === subagent.id);
+              if (i === -1) return [...cur, subagent];
+              const next = cur.slice();
+              next[i] = subagent;
+              return next;
+            });
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        if (e.stream === "interaction_resolved") {
+          // Server-side resolution (scraper auto-cancel, run cancellation,
+          // delete) — drop the matching card so the UI doesn't keep
+          // showing a stale prompt. The card's own submit handler also
+          // calls `dismissInteraction(id)` directly; both paths are
+          // idempotent under `id`-based filtering.
+          try {
+            const { id } = JSON.parse(e.data) as { id: string };
+            setInteractions((cur) => cur.filter((x) => x.id !== id));
+          } catch { /* ignore malformed */ }
+          return;
+        }
+        // "Life sign" re-arm for the runs/subagents polls (see the poll-gating
+        // block above): a `status` or `user` event is the rare, low-volume
+        // signal that a run's lifecycle actually moved (started/hibernated/
+        // ended, or a follow-up was sent) — worth an immediate poll kick.
+        // Every other stream (assistant/thinking/tool_use/tool_result/stdout/
+        // stderr) can arrive at high frequency mid-turn, so those only get the
+        // cheap no-fetch `evaluate()`. Gated on wall-clock time since connect
+        // so the open-time replay burst (which can contain many historical
+        // status/user events) never turns into a fetch storm, and further
+        // debounced to at most one kick/second so a rapid live burst past the
+        // settle window can't do the same — see `CONNECT_SETTLE_MS`/
+        // `debouncedKick` above.
+        if (e.stream === "status" || e.stream === "user") {
+          if (Date.now() - connectedAtRef.current < CONNECT_SETTLE_MS) {
+            runsPollEvaluateRef.current();
+            subagentsPollEvaluateRef.current();
+          } else {
+            debouncedKick();
+          }
+        } else {
+          runsPollEvaluateRef.current();
+          subagentsPollEvaluateRef.current();
+        }
+        // Tag with the next client-assigned id (see `StreamEvent`) — this
+        // client id space is distinct from the server's own `RunEvent.id`
+        // (only present on replayed/paged frames, see its doc comment), and
+        // the invalidation check above needs a monotonic ordering to
+        // distinguish a genuinely new event from one the replay burst
+        // re-delivers on reconnect. Capture the server id as `dbId` when
+        // present so the window-cap trim above can derive an exact
+        // `earliestId` cursor from replay alone, without waiting on a
+        // "Load earlier" page fetch.
+        const dbId = e.id;
+        if (typeof dbId === "number") loadedDbIdsRef.current.add(dbId);
+        buffer.push({ ...e, id: nextEventIdRef.current++, dbId });
+      },
+      (meta) => {
+        // The server sends `replay_meta` as the FIRST frame of every (re)connect
+        // — including an EventSource-internal reconnect after a network blip,
+        // which reuses this same subscription/effect instance rather than
+        // re-running it. Re-arming the settle window here (not just at effect
+        // setup) is what makes the kick-storm suppression above cover BOTH the
+        // initial open and every later reconnect's replay burst.
+        connectedAtRef.current = Date.now();
+        // Never move the cursor FORWARD on a reconnect: a fresh `replay_meta`
+        // reflects only the just-replayed window, which is capped at
+        // EVENTS_REPLAY_LIMIT and so always starts later than whatever
+        // earlier history "Load earlier" may have already paged in before
+        // the reconnect. Losing that progress would silently re-show a
+        // narrower "Load earlier" cursor (or hide it) after every SSE drop —
+        // taking the min (treating null as "no bound yet") keeps whichever
+        // cursor reaches furthest back. `hasMore` only ever grows for the
+        // same reason: once we know older history exists, a later replay
+        // that (re)confirms a narrower window can't un-know that.
+        setEarliestId((prev) =>
+          prev == null ? meta.earliestId : meta.earliestId == null ? prev : Math.min(prev, meta.earliestId),
+        );
+        setHasMoreEarlier((prev) => prev || meta.hasMore);
+      },
+    );
     return () => {
       buffer.dispose();
+      if (kickTimer) clearTimeout(kickTimer);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onFocus);
       unsub();
     };
   }, [task.id]);
 
+  // Holds a pre-prepend `{scrollHeight, scrollTop}` snapshot for the layout
+  // effect just below to restore from — see that effect's doc comment.
+  const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+
+  /**
+   * "Load earlier messages" — fetches one older page (`beforeId = earliestId`)
+   * and prepends it to `events`. Prepended events get a descending client id
+   * from `prevEventIdRef` (see `StreamEvent`'s doc comment) and carry the
+   * real server `dbId`, which is what lets a later window-cap trim re-derive
+   * `earliestId` after eating into this history. Scroll position is
+   * preserved by capturing the log's `scrollHeight`/`scrollTop` before the
+   * prepend and restoring `scrollTop` by the height delta once the DOM has
+   * grown (see the layout effect below) — the "simple approach" from the
+   * plan rather than anchoring to a specific DOM node.
+   */
+  const loadEarlierEvents = useCallback(() => {
+    if (earliestId == null || !hasMoreEarlier || loadingEarlier) return;
+    const el = logRef.current;
+    setLoadingEarlier(true);
+    void api.fetchTaskEventsPage(task.id, earliestId)
+      .then((page) => {
+        // Defensive dedupe: `earliestId` can point past events this panel
+        // already holds — e.g. an SSE reconnect moved it backward (see the
+        // `replay_meta` handler's "never move forward" comment above), so a
+        // page fetched from that cursor can legitimately overlap the tail of
+        // what a previous fetch (or the live/replayed window) already loaded.
+        const fresh = page.events.filter((ev) => !loadedDbIdsRef.current.has(ev.id));
+        if (fresh.length > 0) {
+          // Set BEFORE the prepend's setState: the pin effect below is a
+          // layout effect declared AFTER this scroll-restore layout effect
+          // (see that effect just below), so on the same commit the restore
+          // runs first and the pin — reading `nearBottomRef` on every
+          // `events` change — would immediately overwrite it if the ref
+          // were still (stale) `true`. This flag is the only thing that
+          // makes the pin skip that commit instead of clobbering the
+          // restored scrollTop.
+          nearBottomRef.current = false;
+          const mapped: StreamEvent[] = fresh.map((ev) => {
+            loadedDbIdsRef.current.add(ev.id);
+            return { ...ev, id: prevEventIdRef.current--, dbId: ev.id };
+          });
+          if (el) {
+            scrollRestoreRef.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: el.scrollTop };
+          }
+          const next = [...mapped, ...eventsRef.current];
+          eventsRef.current = next;
+          setEvents(next);
+        }
+        setEarliestId(page.earliestId);
+        setHasMoreEarlier(page.hasMore);
+      })
+      .catch(() => { /* transient failure — button stays enabled to retry */ })
+      .finally(() => setLoadingEarlier(false));
+  }, [task.id, earliestId, hasMoreEarlier, loadingEarlier]);
+
+  // Restores scroll position after "Load earlier" prepends older events above
+  // the current viewport — without this the browser leaves `scrollTop`
+  // unchanged, which visually yanks the previously-visible content down by
+  // however tall the newly-inserted history is. Runs after every commit (the
+  // ref-guarded early return keeps that cheap) rather than being keyed to a
+  // dependency, since the meaningful trigger is "did `loadEarlierEvents` just
+  // prepend", not any particular prop.
+  useLayoutEffect(() => {
+    const pending = scrollRestoreRef.current;
+    if (!pending) return;
+    scrollRestoreRef.current = null;
+    const el = logRef.current;
+    if (!el) return;
+    const delta = el.scrollHeight - pending.prevScrollHeight;
+    el.scrollTop = pending.prevScrollTop + delta;
+  });
+
   // Two complementary pin-to-bottom paths, both gated on `nearBottomRef` so
   // a user who scrolled up to read history is never yanked back down:
-  //   1. On every event / rebuild / interaction change, scroll once after
-  //      the React commit. Handles the steady-state streaming case.
-  //   2. On task switch, additionally loop on rAF for a short window. Events
-  //      stream in over multiple frames and rendered children (markdown,
-  //      code, tool results) keep growing scrollHeight after their initial
-  //      mount, so a single post-commit scroll can leave us short. The loop
-  //      bails the moment the user scrolls (nearBottomRef flips to false).
-  useEffect(() => {
+  //   1. On every event / rebuild / interaction change, scroll once as a
+  //      layout effect — pre-paint, before the browser gets a chance to
+  //      dispatch any scroll event of its own. This is the cheap backstop:
+  //      it only fires on the dependencies listed below, so it covers
+  //      commits that change content without changing either box the
+  //      ResizeObserver watches, and it also recovers any pin that path 2
+  //      skipped under the suppression window (see below) once the next
+  //      real growth or a dependency change comes through. Running
+  //      pre-paint (not as a passive effect) matters most on a violent
+  //      commit — e.g. the live→rebuilt `displayedEvents` swap, where every
+  //      event's key changes and the whole transcript remounts. The two
+  //      changes here are jointly, not independently, sufficient:
+  //      `[overflow-anchor:none]` (see the container's className comment)
+  //      removes native anchoring as a competing `scrollTop` writer — left
+  //      enabled, it runs during layout, which happens AFTER layout
+  //      effects, so even with the pin converted to `useLayoutEffect` an
+  //      anchoring-driven jump would still land after the pin and override
+  //      it. The layout-effect conversion, in turn, closes the remaining
+  //      window where a same-frame scroll event could latch `nearBottomRef`
+  //      false before the pin gets a chance to read it. With both in place,
+  //      the pin runs while `nearBottomRef` still holds its pre-commit
+  //      value, and no post-effect scroll adjustment is left that could
+  //      latch it false first.
+  //   2. A ResizeObserver on both the scroll container (`logRef`) and the
+  //      content wrapper (`logContentRef`) below. The container's own box
+  //      shrinks when something mounts above it in the flex column —
+  //      `SubagentTabs` or a terminal tab strip resolving from an async
+  //      list fetch — which otherwise leaves the log short with no event to
+  //      hook. The content wrapper's height grows asynchronously for
+  //      reasons invisible to path 1's dependency list: replay-buffer
+  //      flushes landing on their own timer, markdown/code block layout
+  //      settling after mount, and a `UserMessageBlock`'s "Show more"
+  //      toggle appearing once it measures itself. Observing both, rather
+  //      than enumerating every async cause as a dependency, makes the pin
+  //      self-healing against future async widgets. Both paths now run
+  //      pre-paint (path 1 as a layout effect, this one via ResizeObserver's
+  //      own pre-paint delivery in the same rendering opportunity as the
+  //      resize), so neither is "ahead" of the other in the sense that used
+  //      to matter; ResizeObserver still earns its keep as a separate path
+  //      because it fires on box-size changes path 1's dependency list
+  //      can't see (see above). Assigning `scrollTop` does not change
+  //      either observed element's size, so the pin can't feed back into
+  //      its own observer; the resulting scroll event just re-confirms
+  //      `nearBottomRef` as true. Mount-scoped (`[]`) is correct —
+  //      `RunPanelBody` doesn't remount on task switch, so both refs stay
+  //      attached to the same DOM nodes across tasks and a fresh
+  //      `observe()` isn't needed per task.
+  //
+  //      Two additional guards keep path 2 from hijacking a user-initiated
+  //      resize (e.g. expanding/collapsing a "Show more" toggle while
+  //      parked near the bottom):
+  //        - `pinSuppressUntilRef`, armed for a short window by any
+  //          pointerdown inside the log (see `onPointerDownCapture` below),
+  //          skips the pin entirely so it doesn't fight a deliberate toggle
+  //          or the `pendingAdjustRef` scroll compensation in
+  //          `UserMessageBlock`.
+  //        - `prevDist`, the distance-from-bottom computed from box sizes
+  //          tracked across deliveries, re-checks bottom-proximity against
+  //          the pre-resize layout rather than trusting `nearBottomRef`
+  //          alone — that ref is latched by scroll events, which WebKit can
+  //          throttle during momentum scrolling, so it can still read stale
+  //          `true` mid-fling. `el.scrollTop` read synchronously is always
+  //          current even when scroll events lag, so the pre-resize
+  //          distance is trustworthy where the latched ref may not be.
+  useLayoutEffect(() => {
     if (!nearBottomRef.current) return;
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [events, rebuilt, interactions.length, activeStream]);
 
   useEffect(() => {
-    let cancelled = false;
-    const deadline = performance.now() + 600;
-    const pin = () => {
-      if (cancelled || !nearBottomRef.current) return;
-      const el = logRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-      if (performance.now() < deadline) requestAnimationFrame(pin);
-    };
-    requestAnimationFrame(pin);
-    return () => { cancelled = true; };
-  }, [task.id]);
+    const el = logRef.current;
+    const content = logContentRef.current;
+    if (!el || !content) return;
+    let lastScrollHeight = el.scrollHeight;
+    let lastClientHeight = el.clientHeight;
+    const ro = new ResizeObserver(() => {
+      const prevDist = lastScrollHeight - el.scrollTop - lastClientHeight;
+      // Update tracked sizes from the current element before any early
+      // return, so the next delivery's `prevDist` stays correct even on a
+      // delivery that itself skips the pin (suppressed, or not near bottom).
+      lastScrollHeight = el.scrollHeight;
+      lastClientHeight = el.clientHeight;
+      if (performance.now() < pinSuppressUntilRef.current) return;
+      if (!nearBottomRef.current) return;
+      if (prevDist >= NEAR_BOTTOM_PX) return;
+      el.scrollTop = el.scrollHeight;
+    });
+    ro.observe(el);      // viewport shrink: SubagentTabs / terminals mounting above
+    ro.observe(content); // content growth: replay flushes, markdown, "Show more" toggles
+    return () => ro.disconnect();
+  }, []);
 
   // Auto-rebuild from the latest run's on-disk JSONL when the run is
   // finished and has a claude session id. The persisted `run_events`
@@ -592,7 +1124,12 @@ function RunPanelBody({
     if (!latestRun.claudeSessionId) return;
     const sessionId = latestRun.claudeSessionId;
     let cancelled = false;
-    void api.rebuildRunEvents(latestRun.id).then((res) => {
+    // Bounded to EVENTS_WINDOW_MAX — the same cap the live stream itself is
+    // held to (see the SSE batch-flush trim above). Without a limit here, the
+    // auto-rebuild silently replaced the panel's bounded window with an
+    // unbounded full-session dump on every run completion, defeating the
+    // whole point of capping live/replayed history (code review finding).
+    void api.rebuildRunEvents(latestRun.id, EVENTS_WINDOW_MAX).then((res) => {
       if (cancelled) return;
       if (res.events.length > 0) {
         setRebuilt({
@@ -602,6 +1139,11 @@ function RunPanelBody({
           maxLiveEventIdAtSnapshot: nextEventIdRef.current - 1,
         });
         setRebuildNote(`Loaded ${res.events.length} events from session JSONL.`);
+        // The rebuild itself has no DB row ids to page from (JSONL events are
+        // synthesized, not persisted `run_events` rows), so this only ever
+        // grows the affordance's visibility — it never clobbers an
+        // `earliestId` cursor the live/replayed stream already established.
+        if (res.hasMore) setHasMoreEarlier(true);
       } else if (res.reason) {
         setRebuildNote(res.reason);
       }
@@ -656,13 +1198,195 @@ function RunPanelBody({
   /** Events for whichever stream the tab strip has selected. For "main", splice
    *  `rebuilt` in by dropping events from runs that share its sessionId and
    *  appending the rebuilt set (earlier sessions stay visible). A subagent tab
-   *  shows that subagent's transcript directly (no rebuild path applies). */
+   *  shows that subagent's transcript directly (no rebuild path applies).
+   *
+   *  `status` events are the one exception to "drop the rebuilt run's live
+   *  events": they're synthesized by the orchestrator (e.g. "session
+   *  hibernated after idle…"), never appear in the JSONL transcript, and so
+   *  can never duplicate against `rebuilt.events` — dropping them would just
+   *  hide legitimate lifecycle notices for as long as the rebuild snapshot is
+   *  active. Kept in original arrival order, then re-sorted by `ts` against
+   *  the appended rebuild set (whose synthetic timestamps are anchored at the
+   *  run's start, not real wall-clock time) so a status event doesn't jump to
+   *  the wrong end of the transcript. */
+  // `collapseRepeatedStatusChips` MUST run here — not inside `RunEventList`'s
+  // `normalised` memo — because `findMatchingEventIds` below derives each
+  // match's id from an event's own position in `displayedEvents`, and that
+  // same array (uncollapsed) is what supplied the `data-evid` index at render
+  // time. Collapsing downstream of this memo would shorten the rendered
+  // array while search still matched against the longer, uncollapsed one,
+  // scrolling/highlighting the wrong block whenever history has duplicate
+  // permission-mode chips (review-caught bug). Doing it here keeps search,
+  // todo-progress, and rendering all reading from one shared index space.
   const displayedEvents = useMemo(() => {
-    if (activeStream !== "main") return subagentEventsById.get(activeStream) ?? [];
-    if (!rebuilt || !rebuiltRunIds) return mainEvents;
-    const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId));
-    return [...others, ...rebuilt.events];
+    if (activeStream !== "main")
+      return collapseRepeatedStatusChips(subagentEventsById.get(activeStream) ?? []);
+    if (!rebuilt || !rebuiltRunIds) return collapseRepeatedStatusChips(mainEvents);
+    const others = mainEvents.filter((e) => !rebuiltRunIds.has(e.runId) || e.stream === "status");
+    return collapseRepeatedStatusChips([...others, ...rebuilt.events].sort((a, b) => a.ts - b.ts));
   }, [activeStream, subagentEventsById, mainEvents, rebuilt, rebuiltRunIds]);
+
+  /** The current to-do list for whichever stream is selected. Claude re-emits
+   *  the whole TodoWrite list on every change, so this is a latest-wins scan
+   *  (see lib/todo-progress.ts). Memoized on `displayedEvents` alone — it is
+   *  recomputed on every SSE frame, so it must stay a single O(n) pass. */
+  const todoProgress = useMemo(() => deriveTodoProgress(displayedEvents), [displayedEvents]);
+
+  // `findMatchingEventIds` (lib/event-search.ts) takes `displayedEvents`
+  // straight — it derives each event's search id from its own position in
+  // the array, so there's no separate pre-mapped/id-tagged array to build
+  // or memoize here.
+  const matches = useMemo(
+    () => findMatchingEventIds(displayedEvents, searchQuery),
+    [displayedEvents, searchQuery],
+  );
+
+  // Derived purely for display — no state, so there's no "0/0" flash before
+  // an effect catches up and no risk of the position silently desyncing from
+  // `activeMatchId`/`matches`. `-1` (no match) renders as "0/0" below.
+  const activeMatchPosition = resolveActiveMatchIndex(matches, activeMatchId);
+
+  // A splice/clear of the JSONL-rebuild snapshot swaps `displayedEvents` out
+  // from under the current scope exactly like a tab/task switch does (the
+  // positional ids `matches` holds no longer refer to the same events), so
+  // its identity has to be part of the scope key below. `maxLiveEventIdAtSnapshot`
+  // is set fresh every time a snapshot is (re)captured for a session, so
+  // `sessionId:maxLiveEventIdAtSnapshot` is a stable id for "this particular
+  // rebuild snapshot" — distinct from both "no snapshot" and any prior
+  // snapshot of the same session.
+  const rebuiltScopeKey = rebuilt ? `${rebuilt.sessionId}:${rebuilt.maxLiveEventIdAtSnapshot}` : "";
+
+  // Resolve which match is active whenever the match set changes — either
+  // because the query changed, or because `displayedEvents` shifted under an
+  // open search (new streamed events, a JSONL rebuild splice, or a tab/task
+  // switch). `activeMatchId` is read directly from the render closure rather
+  // than a ref: since this effect's callback is recreated fresh every render
+  // but only *invoked* when `matches` changes, the value captured is exactly
+  // "whatever was active before this recompute" — precisely the `prevActiveId`
+  // `resolveActiveMatchIndex` wants. Deliberately excludes `activeMatchId`
+  // from deps: including it would make the effect re-fire the moment it sets
+  // it, driven by its own write instead of a genuine match-set change (the
+  // `nextId !== activeMatchId` guard would still no-op on that redundant run,
+  // but there's no reason to pay for it).
+  //
+  // A tab/task switch OR a rebuild-snapshot splice reuses this SAME effect
+  // rather than a separate reset: `matches` are positional indices scoped to
+  // `displayedEvents`, so an id that was active before any of those changes
+  // is a coincidence, not a carry-over — `searchScopeRef` detects the change
+  // and forces `prevActiveId` to `null` so the resolution can't accidentally
+  // "keep" an unrelated index that happens to also be a match in the new
+  // scope.
+  const searchScopeRef = useRef<string>(`${task.id}:${activeStream}:${rebuiltScopeKey}`);
+  useEffect(() => {
+    const scopeKey = `${task.id}:${activeStream}:${rebuiltScopeKey}`;
+    const scopeChanged = scopeKey !== searchScopeRef.current;
+    searchScopeRef.current = scopeKey;
+    const prevActiveId = scopeChanged ? null : activeMatchId;
+    const idx = resolveActiveMatchIndex(matches, prevActiveId);
+    const nextId = idx >= 0 ? matches[idx]! : null;
+    if (nextId !== activeMatchId) setActiveMatchId(nextId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matches, task.id, activeStream, rebuilt, rebuiltScopeKey]);
+
+  // Highlight + scroll the active match imperatively rather than through a
+  // React prop/memo dep: `RunEventList`'s `sections` memo used to take
+  // `activeMatchId` as a dep purely so it could stamp a highlight class on
+  // one wrapper div, which meant re-deriving (and re-diffing) the ENTIRE
+  // section tree on every match navigation. Toggling classList directly on
+  // the previous/next `[data-evid]` element is O(1) instead. Runs after the
+  // resolve effect above (and after any tab/task/rebuild-scope switch), so by
+  // the time this fires `activeMatchId` already points at an event rendered
+  // in the CURRENT `displayedEvents`.
+  useEffect(() => {
+    const HIGHLIGHT_CLASSES = ["ring-1", "ring-primary/60", "bg-primary/5", "rounded-md"];
+    const prev = highlightedElRef.current;
+    if (prev) {
+      prev.classList.remove(...HIGHLIGHT_CLASSES);
+      highlightedElRef.current = null;
+    }
+    if (activeMatchId === null) return;
+    const el = logRef.current?.querySelector<HTMLElement>(`[data-evid="${activeMatchId}"]`);
+    if (!el) return;
+    el.classList.add(...HIGHLIGHT_CLASSES);
+    highlightedElRef.current = el;
+    el.scrollIntoView({ block: "center" });
+    // The scrollIntoView above can land the log outside the "near bottom"
+    // band (or an SSE flush landing in the same tick could otherwise yank
+    // the view back to the bottom before the browser paints the scroll) —
+    // clear it immediately so neither auto-scroll path fights the jump.
+    nearBottomRef.current = false;
+  }, [activeMatchId]);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery("");
+    setActiveMatchId(null);
+  }, []);
+
+  const stepSearch = useCallback((dir: 1 | -1) => {
+    setActiveMatchId((cur) => {
+      const idx = matches.indexOf(cur ?? -1);
+      const next = stepMatchIndex(matches.length, idx, dir);
+      return next >= 0 ? matches[next]! : null;
+    });
+  }, [matches]);
+
+  // Cmd/Ctrl+F opens the search bar and focuses its input (or, if the bar is
+  // already open, re-selects the existing query so typing replaces it
+  // outright) while the panel is actually open — not mid-close-animation or
+  // pre-mount, matching the panel's own Escape-to-close listener's `if
+  // (!open) return;` gate. Guarded the same way that listener guards against
+  // a higher-priority dismissable layer (modal dialog / open search-select
+  // popover) so it doesn't hijack the browser/OS's own find behavior — or a
+  // dialog's own input — while one of those is up. Also bails when focus is
+  // inside a terminal pane (`.xterm` — see TerminalView.tsx, which mounts
+  // xterm.js's own container carrying that class): Cmd/Ctrl+F there should
+  // reach the shell/program running in the PTY, not this panel's search.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() !== "f" || e.altKey) return;
+      const wantsFind = IS_MAC_PLATFORM ? (e.metaKey && !e.ctrlKey) : e.ctrlKey;
+      if (!wantsFind) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      if ((e.target as Element | null)?.closest?.(".xterm")) return;
+      e.preventDefault();
+      if (searchOpen) {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+        return;
+      }
+      setSearchOpen(true);
+      // The input isn't mounted yet on the render this triggers (the bar
+      // renders conditionally on `searchOpen`) — focus after the next paint.
+      requestAnimationFrame(() => {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      });
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, searchOpen]);
+
+  // Escape closes the search bar regardless of where focus currently is
+  // within the panel (not just while the input itself is focused) — matching
+  // "Escape peels one layer at a time" from the panel's own listener. Gated
+  // on `searchOpen` so it's only attached while there's something to close,
+  // and bails on the same higher-priority dismissable layer (modal dialog /
+  // open search-select popover) as every other document-level listener here
+  // so Escape closes the topmost layer first instead of skipping straight to
+  // the search bar underneath it.
+  useEffect(() => {
+    if (!searchOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      e.preventDefault();
+      closeSearch();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [searchOpen, closeSearch]);
 
   /** Indicator mode for the bottom-pinned heartbeat. A follow-up sent while
    *  the agent is working is folded into the active run (the backend pastes it
@@ -736,6 +1460,10 @@ function RunPanelBody({
   const canControl = !!liveRunId
     && (task.column === "running" || task.column === "blocked")
     && !liveRunTerminal;
+  // Archive gate mirrors TaskCard's `active` — running/blocked, regardless of
+  // whether a live run row has been polled in yet, so Archive shows up as
+  // soon as the board would call this task "active" too.
+  const active = task.column === "running" || task.column === "blocked";
   const resumableRunId = liveRunId
     ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
   // Send is enabled whenever the task has ever been run. While a turn is
@@ -755,8 +1483,213 @@ function RunPanelBody({
 
   const [input, setInput] = useState("");
   const [sendRefs, setSendRefs] = useState<TaskReference[]>([]);
+
+  // ── Composer draft persistence ──────────────────────────────────────────
+  // `RunPanelBody` is a single long-lived instance (no `key={task.id}` — see
+  // the reset-on-task-switch effect above), and the parent keeps a 250ms-
+  // lagged `mountedTask` for the exit animation, so seeding/flushing has to
+  // be driven off `task.id` changes and an unmount effect rather than mount
+  // lifecycle alone.
+  //
+  // Which task.id the composer was last seeded for. Guards against the 2s
+  // board poll: every poll hands this component a freshly-refreshed `task`
+  // object, and reseeding `input`/`sendRefs` from `task.draft` on every one
+  // of those would stomp in-progress typing. Only a genuine task switch
+  // reseeds.
+  const seededTaskIdRef = useRef<string | null>(null);
+  // The draft value last known to be persisted server-side (or null) —
+  // either because we just seeded from `task.draft`, or because our own
+  // autosave/flush/clear just wrote it. Used to skip redundant writes.
+  const lastSavedDraftRef = useRef<TaskDraft | null>(null);
+  // Pending debounce timer for the autosave effect below.
+  const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref mirrors of the latest composer state + task id, read by the mount-
+  // scoped flush effect's cleanup (a cleanup closes over the values from the
+  // render that registered it, not the latest ones) and by the seed effect
+  // when flushing the OUTGOING task before reseeding.
+  const inputRef = useRef(input);
+  const sendRefsRef = useRef(sendRefs);
+  const taskIdRef = useRef(task.id);
+  inputRef.current = input;
+  sendRefsRef.current = sendRefs;
+  // True from the moment the composer is (re)seeded for the current task
+  // until the user actually diverges from that baseline (see the autosave
+  // effect below). While true, a fresher server draft is allowed to adopt
+  // INTO the composer (stale-poll fix, code review finding #2); once false,
+  // nothing may touch `input`/`sendRefs` again until the task changes —
+  // typing must never be silently overwritten.
+  const draftPristineRef = useRef(true);
+  // Monotonic write generation. Every draft write (autosave, unmount/pagehide
+  // flush, task-switch flush) stamps the generation it was issued under and
+  // only advances `lastSavedDraftRef` in its `.then` if that generation is
+  // still current when the response lands — so a slow/late write can never
+  // clobber a newer baseline with stale data (code review finding #4).
+  // send()/saveForLater() bump this *before* firing their clear so an
+  // in-flight autosave PUT that resolves afterward is a no-op against
+  // `lastSavedDraftRef` (it can still land on the wire after the DELETE —
+  // that residual risk is accepted; the next open's fresh `getTask` +
+  // pristine-adopt below will reconcile against whatever the server has).
+  const draftGenRef = useRef(0);
+
+  const cancelDraftSaveTimer = () => {
+    if (draftSaveTimerRef.current) {
+      clearTimeout(draftSaveTimerRef.current);
+      draftSaveTimerRef.current = null;
+    }
+  };
+
+  // Shared write path for every draft persistence site. Advances
+  // `lastSavedDraftRef` only on success (code review finding #3 — a failed
+  // write must stay retryable, not look "saved"), gated by the generation
+  // guard above (finding #4).
+  const writeDraft = (targetTaskId: string, next: TaskDraft | null) => {
+    const gen = ++draftGenRef.current;
+    const p = next ? api.setTaskDraft(targetTaskId, next) : api.clearTaskDraft(targetTaskId);
+    void p
+      .then(() => {
+        if (gen === draftGenRef.current) lastSavedDraftRef.current = next;
+      })
+      .catch(() => {});
+  };
+
+  // Seed (or reseed on task switch) the composer from the server-persisted
+  // draft. Flushes the OUTGOING task's unsaved draft first, using the id
+  // still held in `taskIdRef` from before this run updates it.
+  useEffect(() => {
+    const prevTaskId = taskIdRef.current;
+    if (seededTaskIdRef.current !== null && seededTaskIdRef.current !== task.id) {
+      const pending = normalizeDraft(inputRef.current, sendRefsRef.current);
+      if (!draftsEqual(pending, lastSavedDraftRef.current)) {
+        writeDraft(prevTaskId, pending);
+      }
+    }
+    cancelDraftSaveTimer();
+    taskIdRef.current = task.id;
+    const seeded = task.draft ?? null;
+    // StrictMode double-invoke lockstep (code review finding #1): the app
+    // runs under <StrictMode>, which invokes effect setup → cleanup → setup
+    // before React flushes queued state updates. If the ref mirrors below
+    // were left to update lazily (via the `inputRef.current = input` lines
+    // above, which only run on the NEXT render), the StrictMode cleanup of
+    // the unmount-flush effect could fire in between — observing the
+    // pre-seed `inputRef` ("") against the just-set `lastSavedDraftRef`
+    // (the seeded draft), which looks exactly like "the user cleared the
+    // draft" and fires a spurious `clearTaskDraft` that wipes it. Writing
+    // the mirrors here, synchronously and in lockstep with the state calls
+    // and the baseline, closes that window.
+    setInput(seeded?.text ?? "");
+    setSendRefs(seeded?.references ?? []);
+    inputRef.current = seeded?.text ?? "";
+    sendRefsRef.current = seeded?.references ?? [];
+    lastSavedDraftRef.current = seeded;
+    seededTaskIdRef.current = task.id;
+    draftPristineRef.current = true;
+
+    // Stale-poll seed fix (code review finding #2): `task` here is whatever
+    // the last 2s board poll handed us — reopening the panel within that
+    // window can seed from a draft that predates a very recent flush
+    // elsewhere, and the next keystroke would then permanently overwrite the
+    // newer server draft. Re-fetch the task fresh; if we're still on the
+    // same task AND the user hasn't touched the composer since (pristine),
+    // adopt the fresher draft. Swallow errors — the polled seed above
+    // already stands as a reasonable fallback.
+    const seededForTaskId = task.id;
+    let cancelled = false;
+    void api.getTask(task.id).then((fresh) => {
+      if (cancelled) return;
+      if (taskIdRef.current !== seededForTaskId) return; // switched tasks meanwhile
+      if (!draftPristineRef.current) return; // user already typed — never clobber
+      const freshDraft = fresh.draft ?? null;
+      if (draftsEqual(freshDraft, lastSavedDraftRef.current)) return;
+      setInput(freshDraft?.text ?? "");
+      setSendRefs(freshDraft?.references ?? []);
+      inputRef.current = freshDraft?.text ?? "";
+      sendRefsRef.current = freshDraft?.references ?? [];
+      lastSavedDraftRef.current = freshDraft;
+    }).catch(() => { /* polled seed stands */ });
+    return () => { cancelled = true; };
+    // Only `task.id` — deliberately NOT `task.draft` (would reseed on every
+    // 2s poll refresh) or `task` itself. The pristine-adopt effect below
+    // covers the "newer draft arrives via the poll" case instead, guarded by
+    // `draftPristineRef` so it can never stomp in-progress typing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task.id]);
+
+  // Second half of the stale-poll fix: while still pristine, also adopt
+  // `task.draft` changes that arrive via the normal 2s board poll (covers
+  // the case where the one-shot `getTask` fetch above failed or hasn't
+  // resolved yet). Once the user edits (pristine flips false, below),
+  // nothing here may touch `input`/`sendRefs` again until the task changes.
+  useEffect(() => {
+    if (seededTaskIdRef.current !== task.id) return;
+    if (!draftPristineRef.current) return;
+    const polled = task.draft ?? null;
+    if (draftsEqual(polled, lastSavedDraftRef.current)) return;
+    setInput(polled?.text ?? "");
+    setSendRefs(polled?.references ?? []);
+    inputRef.current = polled?.text ?? "";
+    sendRefsRef.current = polled?.references ?? [];
+    lastSavedDraftRef.current = polled;
+  }, [task.draft, task.id]);
+
+  // Debounced autosave: 600ms after the composer settles, persist the
+  // current text+refs if they differ from what's already saved. Errors are
+  // swallowed — a failed autosave must never toast; the next keystroke (or
+  // the unmount flush) naturally retries (see `writeDraft`).
+  useEffect(() => {
+    if (seededTaskIdRef.current !== task.id) return; // not seeded for this task yet
+    const next = normalizeDraft(input, sendRefs);
+    // The composer has diverged from the last known-saved/seeded baseline —
+    // this is a genuine user edit (typing, or a ref attached/removed), not
+    // an effect re-run caused by our own seed/adopt paths (those set
+    // `lastSavedDraftRef` in lockstep, so `next` already matches there).
+    // Once tripped, stays false until the next task switch reseeds it.
+    if (!draftsEqual(next, lastSavedDraftRef.current)) {
+      draftPristineRef.current = false;
+    }
+    cancelDraftSaveTimer();
+    draftSaveTimerRef.current = setTimeout(() => {
+      draftSaveTimerRef.current = null;
+      if (draftsEqual(next, lastSavedDraftRef.current)) return;
+      writeDraft(task.id, next);
+    }, 600);
+    return cancelDraftSaveTimer;
+  }, [input, sendRefs, task.id]);
+
+  // Flush on unmount (close of the details modal, after the 250ms exit
+  // animation drops `mountedTask`) — a crash or an abrupt close shouldn't
+  // lose a draft the debounce hasn't gotten to yet. Mount-scoped (empty
+  // deps) so the cleanup only runs once, on actual unmount, not on every
+  // dependency change. Also flushes on `pagehide` (code review finding #5):
+  // React effect cleanups don't run when the webview itself is torn down
+  // (app quit), so `pagehide` is the only remaining hook to persist an
+  // unsaved draft in that path. Same flush logic, fire-and-forget either way.
+  useEffect(() => {
+    const flush = () => {
+      cancelDraftSaveTimer();
+      const next = normalizeDraft(inputRef.current, sendRefsRef.current);
+      if (draftsEqual(next, lastSavedDraftRef.current)) return;
+      writeDraft(taskIdRef.current, next);
+    };
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const [sending, setSending] = useState(false);
   const [sendHint, setSendHint] = useState<string | null>(null);
+  // Messages backlog — saved, not-yet-sent drafts for this task. Seeded from
+  // the task prop and kept in sync as the 2s task poll refreshes `task.backlog`;
+  // each mutation also updates this optimistically from the endpoint's returned
+  // Task so the tray reacts immediately instead of waiting for the next poll.
+  const [backlogItems, setBacklogItems] = useState<BacklogMessage[]>(task.backlog);
+  // Guards concurrent backlog mutations (and shares the send lock so a
+  // "Send now" from the tray can't race a composer send).
+  const [backlogBusy, setBacklogBusy] = useState(false);
+  useEffect(() => { setBacklogItems(task.backlog); }, [task.backlog]);
   // The task's live git status (uncommitted changes / unpushed commits).
   // Drives the "Commit & push" action chip above the textarea via
   // `shouldOfferCommitPush`. Deliberately independent of run status —
@@ -829,10 +1762,133 @@ function RunPanelBody({
     return () => { cancelled = true; };
   }, [task.id]);
 
+  // PR mergeability for the composer-row "Resolve Conflicts" button. `parsedPrUrl`
+  // is derived once per `task.prUrl` change and reused for both the fetch
+  // effect and the render-time gate (`canOfferResolveConflicts`).
+  const parsedPrUrl = useMemo(() => parsePrUrl(task.prUrl), [task.prUrl]);
+  const [prStatus, setPrStatus] = useState<GitHubPullMergeability | null>(null);
+  const [prStatusLoading, setPrStatusLoading] = useState(false);
+  const [prStatusError, setPrStatusError] = useState<string | null>(null);
+  // Invalidates an in-flight fetch (including a pending self-heal retry)
+  // when a newer one starts — manual refresh, turn-end retrigger, or the
+  // task switching to a different PR before the previous fetch settled.
+  const prStatusSeqRef = useRef(0);
+  // Self-heal retry budget: GitHub's `mergeable` field is null while it's
+  // still computing in the background. One delayed re-poll (mirrors
+  // GitHubDialog's mergeability self-heal) before giving up; reset to 0
+  // whenever a fresh fetch starts (manual refresh or turn-end retrigger).
+  const prStatusRetriesRef = useRef(0);
+  // Holds the self-heal retry's `setTimeout` id so it can be cancelled on
+  // unmount (or superseded by a fresh fetch) instead of firing later against
+  // an unmounted tree — see the mount-scoped cleanup effect below.
+  const prStatusRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchPrStatus = useCallback((path: string, number: number) => {
+    const requestId = ++prStatusSeqRef.current;
+    if (prStatusRetryTimerRef.current) {
+      clearTimeout(prStatusRetryTimerRef.current);
+      prStatusRetryTimerRef.current = null;
+    }
+    // Clear stale data at fetch start (not just on completion) so a task
+    // switch never leaves the previous task's mergeability visible — and
+    // therefore actionable via "Resolve Conflicts" — while this fetch is
+    // still in flight.
+    setPrStatus(null);
+    setPrStatusError(null);
+    setPrStatusLoading(true);
+    api.getGitHubPullMergeability({ path, number })
+      .then((payload) => {
+        if (requestId !== prStatusSeqRef.current) return;
+        setPrStatus(payload);
+        if (payload.mergeable === null && !payload.merged && prStatusRetriesRef.current < 1) {
+          prStatusRetriesRef.current += 1;
+          prStatusRetryTimerRef.current = setTimeout(() => {
+            prStatusRetryTimerRef.current = null;
+            if (requestId !== prStatusSeqRef.current) return;
+            fetchPrStatus(path, number);
+          }, 2_500);
+        }
+      })
+      .catch((e: unknown) => {
+        if (requestId !== prStatusSeqRef.current) return;
+        setPrStatus(null);
+        setPrStatusError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (requestId !== prStatusSeqRef.current) return;
+        setPrStatusLoading(false);
+      });
+  }, []);
+  // Mount-scoped cleanup: drop any in-flight fetch/self-heal retry and clear
+  // its timer on unmount, so a late response never calls setState on an
+  // unmounted tree (RunPanelBody isn't remounted on task switch, but it *is*
+  // unmounted when the run panel itself closes).
+  useEffect(() => {
+    return () => {
+      prStatusSeqRef.current++;
+      if (prStatusRetryTimerRef.current) clearTimeout(prStatusRetryTimerRef.current);
+    };
+  }, []);
+
+  // Deps are `[task.id, task.prUrl]` ONLY — not `[task]` — for the same
+  // reason as the git-status poll effect above: App.tsx's 2s /tasks poll
+  // rebuilds the task object every tick, and depending on the whole object
+  // (or on `task.workdir`, read via closure below) would refetch on every
+  // poll tick instead of only on an actual task/PR change.
+  useEffect(() => {
+    const parsed = parsePrUrl(task.prUrl);
+    if (!parsed) {
+      prStatusSeqRef.current++; // invalidate any in-flight fetch/retry
+      prStatusRetriesRef.current = 0;
+      setPrStatus(null);
+      setPrStatusLoading(false);
+      setPrStatusError(null);
+      return;
+    }
+    prStatusRetriesRef.current = 0;
+    fetchPrStatus(task.workdir, parsed.number);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [task.id, task.prUrl]);
+
+  // Re-check mergeability at turn-end: track whether the task was "running"
+  // on the previous render and refetch once it transitions away from
+  // "running" (succeeded, failed, blocked, …) — the agent may have pushed
+  // commits that resolve, or newly introduce, a conflict. `task.runId` is
+  // NOT a usable signal for this: it's never nulled on normal turn
+  // completion (only the orphan-reconciliation/error paths null it — see
+  // the comment at `liveRunTerminal` above), so a non-null → null transition
+  // never fires in the common case. `task.column` is authoritative instead.
+  const wasRunningForPrStatusRef = useRef(task.column === "running");
+  useEffect(() => {
+    const wasRunning = wasRunningForPrStatusRef.current;
+    wasRunningForPrStatusRef.current = task.column === "running";
+    if (!wasRunning || task.column === "running") return;
+    const parsed = parsePrUrl(task.prUrl);
+    if (!parsed) return;
+    prStatusRetriesRef.current = 0;
+    fetchPrStatus(task.workdir, parsed.number);
+  }, [task.column, task.prUrl, task.workdir, fetchPrStatus]);
+
+  const refreshPrStatus = () => {
+    if (!parsedPrUrl) return;
+    prStatusRetriesRef.current = 0;
+    fetchPrStatus(task.workdir, parsedPrUrl.number);
+  };
+
   const send = async () => {
     const line = input.trim();
     if (!line && !sendRefs.length) return;
     if (!resumableRunId) return;
+    // Never deliver while a native modal is up: claude is blocked on it inside
+    // the tmux REPL, so the keystrokes would paste into the modal instead of
+    // reaching the agent (and the run would hang "working"). The Send button is
+    // already disabled here, but the textarea now stays typable while a prompt
+    // is pending — so you can stash a draft — which means Enter can reach this
+    // function. Guard it at the source rather than relying on the field.
+    if (modalPending) return;
+    // Don't fire a send while a backlog op (e.g. Save-for-later stashing this
+    // same text) is mid-flight — otherwise a fast Enter could both send and
+    // save the same message.
+    if (sending || backlogBusy) return;
     setSending(true);
     setSendHint(null);
     const body = appendReferences(line, sendRefs);
@@ -843,6 +1899,19 @@ function RunPanelBody({
       } else {
         setInput("");
         setSendRefs([]);
+        // The composer is now empty — clear the persisted draft so it can't
+        // resurrect on next open. Cancel any pending autosave first, then
+        // bump the write generation *before* firing the clear so an
+        // in-flight autosave PUT that resolves afterward can't win the race
+        // and clobber `lastSavedDraftRef` back to the just-sent text (code
+        // review finding #4). Also drop pristine: the composer was just
+        // consumed, so nothing should reseed it from a stale poll that still
+        // shows the pre-clear draft (finding #2's adopt effects check this).
+        cancelDraftSaveTimer();
+        draftGenRef.current++;
+        lastSavedDraftRef.current = null;
+        draftPristineRef.current = false;
+        void api.clearTaskDraft(task.id).catch(() => {});
         // Drop the frozen JSONL snapshot — the auto-rebuild effect set
         // it from the last finished run, and the live SSE stream now
         // carries the new turn's events. Without this, the display
@@ -876,12 +1945,147 @@ function RunPanelBody({
     try { await api.cancelRun(liveRunId); } catch { /* surfaced via log */ }
   };
 
+  // Park the current composer content on the backlog instead of sending it —
+  // "a message that came to mind but isn't ready to send yet." Consumes the
+  // composer (text + refs) exactly like `send()` does, so the two actions feel
+  // symmetric. Available in every state the composer renders — including before
+  // the task's first run and while a prompt is pending. Those are exactly the
+  // moments you can't send but most want to jot something down, so the textarea
+  // stays typable there and only *sending* is gated (see `send()`).
+  const saveForLater = async () => {
+    const text = input.trim();
+    if (!text && !sendRefs.length) return;
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.addBacklogItem(task.id, { text, references: sendRefs });
+      setBacklogItems(updated.backlog);
+      setInput("");
+      setSendRefs([]);
+      // Stashed into the backlog — clear the draft slot so it doesn't also
+      // resurrect in the composer on next open. Cancel any pending autosave
+      // first, then bump the write generation before firing the clear so an
+      // in-flight autosave PUT can't win the race and resurrect the
+      // just-stashed text (code review finding #4), and drop pristine so a
+      // stale poll can't reseed it either (finding #2).
+      cancelDraftSaveTimer();
+      draftGenRef.current++;
+      lastSavedDraftRef.current = null;
+      draftPristineRef.current = false;
+      void api.clearTaskDraft(task.id).catch(() => {});
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
+  // Send a saved draft to the agent, then consume it from the backlog. Reuses
+  // the exact `sendRunInput` plumbing (and success side-effects) as the
+  // composer's `send()` so a backlog send is indistinguishable from a typed
+  // one — same run row, streamed events, scroll-to-bottom. Only removes the
+  // item once the send is actually accepted.
+  const sendBacklogItem = async (item: BacklogMessage) => {
+    if (!resumableRunId || sending || backlogBusy || modalPending) return;
+    setSending(true);
+    setBacklogBusy(true);
+    setSendHint(null);
+    const body = appendReferences(item.text, item.references);
+    try {
+      const res = await api.sendRunInput(resumableRunId, body);
+      if (!res.delivered) {
+        setSendHint(res.reason);
+      } else {
+        try {
+          const updated = await api.deleteBacklogItem(task.id, item.id);
+          setBacklogItems(updated.backlog);
+        } catch {
+          // The send landed; if the consume call fails, drop it locally so the
+          // user doesn't accidentally resend. The next task poll reconciles.
+          setBacklogItems((prev) => prev.filter((m) => m.id !== item.id));
+        }
+        setRebuilt(null);
+        setRebuildNote(null);
+        // No optimistic git-status touch here (main's #94 dropped that): the
+        // git-status polling effect keeps `gitStatus` current on its own.
+        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        nearBottomRef.current = true;
+        requestAnimationFrame(() => {
+          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+        });
+      }
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+      setBacklogBusy(false);
+    }
+  };
+
+  const editBacklogItem = async (
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) => {
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.updateBacklogItem(task.id, itemId, patch);
+      setBacklogItems(updated.backlog);
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
+  const removeBacklogItem = async (itemId: string) => {
+    setBacklogBusy(true);
+    setSendHint(null);
+    const prev = backlogItems;
+    setBacklogItems((p) => p.filter((m) => m.id !== itemId)); // optimistic
+    try {
+      const updated = await api.deleteBacklogItem(task.id, itemId);
+      setBacklogItems(updated.backlog);
+    } catch (e) {
+      setBacklogItems(prev); // roll back
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
+  // Move a draft up (dir -1) or down (dir +1) one slot and persist the new
+  // order. Optimistic: reorders locally first, then confirms from the server's
+  // returned Task.
+  const moveBacklogItem = async (itemId: string, dir: -1 | 1) => {
+    const idx = backlogItems.findIndex((m) => m.id === itemId);
+    const to = idx + dir;
+    if (idx < 0 || to < 0 || to >= backlogItems.length) return;
+    const next = [...backlogItems];
+    const [moved] = next.splice(idx, 1);
+    next.splice(to, 0, moved!);
+    setBacklogItems(next);
+    setBacklogBusy(true);
+    setSendHint(null);
+    try {
+      const updated = await api.reorderBacklog(task.id, next.map((m) => m.id));
+      setBacklogItems(updated.backlog);
+    } catch (e) {
+      setSendHint(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacklogBusy(false);
+    }
+  };
+
   // One-click follow-up: ask the agent to commit & push the changes it just
   // made. Reuses the same `sendRunInput` plumbing as a typed message so the
   // resulting turn shows up as a normal run row with streamed events.
   const sendCommitPush = async () => {
     if (!resumableRunId || sending) return;
-    const message = COMMIT_PUSH_PROMPT;
+    // Nomenclature-aware: the commit subject is prefixed with the task's branch
+    // prefix and the push hint names the real branch. Shared with the CLI's
+    // `agetor commit` / dashboard `c` so every surface sends the same text.
+    const message = commitPushPrompt(task);
     // Intentionally leaves `input` / `sendRefs` alone — Commit & push is a
     // side action that shouldn't discard text the user has typed for the
     // next turn. `send()` clears those because it consumed them.
@@ -904,6 +2108,72 @@ function RunPanelBody({
       setSendHint(e instanceof Error ? e.message : String(e));
     } finally {
       setSending(false);
+    }
+  };
+
+  // One-click follow-up: ask the agent to merge the base branch and resolve
+  // the conflicts blocking this task's PR. Reuses the same `sendRunInput`
+  // plumbing as `sendCommitPush`. `resolvingConflicts` is its own in-flight
+  // flag (rather than reusing `sending`) so the button's own disabled state
+  // and "Sent to agent" confirmation don't get tangled up with the composer's.
+  const [resolvingConflicts, setResolvingConflicts] = useState(false);
+  const [resolveConflictsSent, setResolveConflictsSent] = useState(false);
+  // Offer survives `!canSend` (e.g. an orphan-reconciled run) — the button
+  // then renders disabled with its "start the task" tooltip instead of
+  // vanishing from the row.
+  const showResolveConflicts = !archived && canOfferResolveConflicts(parsedPrUrl, prStatus);
+  const resolveConflictsSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+  }, []);
+  const sendResolveConflicts = async () => {
+    // `resolveConflictsSent` in the guard turns the 5s "Sent to agent"
+    // confirmation window into a lockout, not just a label — otherwise the
+    // button re-enables the instant `resolvingConflicts` resets in `finally`
+    // and a second click pastes a duplicate merge prompt into the live tmux
+    // session (`sendRunInput` is deliberately retry:false).
+    if (!resumableRunId || modalPending || sending || backlogBusy || resolvingConflicts || resolveConflictsSent) return;
+    // Belt-and-braces against the stale-`prStatus` case: even though the
+    // reset effect and fetch-start clear above should keep `prStatus` in
+    // sync with the current task's PR, refuse to send unless it still
+    // matches the PR the button is currently showing.
+    if (!parsedPrUrl || !prStatus || prStatus.pullNumber !== parsedPrUrl.number) return;
+    const prompt = buildResolveConflictsPrompt({
+      repo: prStatus.repo,
+      number: prStatus.pullNumber,
+      title: null,
+      headRef: prStatus.headRef,
+      baseRef: prStatus.baseRef,
+    });
+    setResolvingConflicts(true);
+    setSendHint(null);
+    try {
+      const res = await api.sendRunInput(resumableRunId, prompt);
+      if (!res.delivered) {
+        setSendHint(res.reason);
+        // The button can be hidden by the time this resolves — archived,
+        // a subagent tab (dock-level), or the mergeability re-fetch clearing
+        // `prStatus` — any of which would make `sendHint` invisible, so
+        // toast to surface the failure regardless.
+        toast.error(res.reason);
+      } else {
+        setRebuilt(null);
+        setRebuildNote(null);
+        void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
+        nearBottomRef.current = true;
+        requestAnimationFrame(() => {
+          logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+        });
+        if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
+        setResolveConflictsSent(true);
+        resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setSendHint(msg);
+      toast.error(msg);
+    } finally {
+      setResolvingConflicts(false);
     }
   };
 
@@ -970,6 +2240,12 @@ function RunPanelBody({
     applySendCaptured(result.items);
   };
 
+  // Captured as a local const (not read via `task.prUrl` inline) so its
+  // narrowing to non-null survives into the onClick closure below — TS
+  // drops narrowing on a mutable property access once it's referenced
+  // inside a nested function expression.
+  const prUrl = task.prUrl;
+
   return (
     <>
       <header className="flex items-start justify-between gap-2 border-b border-border/60 p-3">
@@ -984,6 +2260,45 @@ function RunPanelBody({
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {/* Lives in the header (not the composer chip row) so the link stays
+              reachable on archived tasks and after orphan reconciliation
+              clears the resumable run — pr_url is durable, the link must be
+              too. When the URL parses to a PR number, open the in-app detail
+              subpage directly; otherwise (an unrecognized provider URL
+              shape) fall back to the plain external link, as before. */}
+          {prUrl && (
+            parsePullNumber(prUrl) != null ? (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onViewPullRequest({ projectPath: task.workdir, prUrl })}
+                title="Open the pull request created for this task"
+              >
+                <GitPullRequest className="mr-1 size-3" /> View PR
+              </Button>
+            ) : (
+              <ExternalLink
+                href={prUrl}
+                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "no-underline hover:no-underline")}
+                title="Open the pull request created for this task"
+              >
+                <GitPullRequest className="mr-1 size-3" /> View PR
+              </ExternalLink>
+            )
+          )}
+          {/* Manual re-check — only once a first fetch has settled, so it
+              doesn't appear (and immediately duplicate) the initial load. */}
+          {parsedPrUrl && (prStatus != null || prStatusError != null) && (
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={refreshPrStatus}
+              disabled={prStatusLoading}
+              title={prStatusError ?? "Re-check PR mergeability"}
+            >
+              <RefreshCw className="size-3.5" />
+            </Button>
+          )}
           <Button
             size="sm"
             variant="outline"
@@ -1017,8 +2332,13 @@ function RunPanelBody({
               <Square className="mr-1 size-3" /> Stop
             </Button>
           )}
-          {!archived && task.column === "done" && (
-            <Button size="sm" variant="outline" onClick={() => onArchive(task)} title="Archive task">
+          {!archived && (task.column === "done" || active) && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => onArchive(task)}
+              title={active ? "Stop the running agent and archive task" : "Archive task"}
+            >
               <Archive className="mr-1 size-3" /> Archive
             </Button>
           )}
@@ -1027,11 +2347,81 @@ function RunPanelBody({
               <ArchiveRestore className="mr-1 size-3" /> Unarchive
             </Button>
           )}
+          <Button
+            size="icon"
+            variant="ghost"
+            title="Search messages"
+            onClick={() => {
+              if (searchOpen) {
+                closeSearch();
+                return;
+              }
+              setSearchOpen(true);
+              // The input isn't mounted yet on the render this triggers (the
+              // bar renders conditionally on `searchOpen`) — focus after the
+              // next paint.
+              requestAnimationFrame(() => searchInputRef.current?.focus());
+            }}
+          >
+            <Search className="size-4" />
+          </Button>
           <Button size="icon" variant="ghost" onClick={onClose}>
             <X className="size-4" />
           </Button>
         </div>
       </header>
+
+      {searchOpen && (
+        <div data-search-open="" className="flex items-center gap-2 border-b border-border/60 px-3 py-2">
+          <div className="relative flex-1">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
+            <Input
+              ref={searchInputRef}
+              aria-label="Search messages"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  stepSearch(e.shiftKey ? -1 : 1);
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  closeSearch();
+                }
+              }}
+              placeholder="Search messages…"
+              className="h-8 pl-8 text-xs"
+            />
+          </div>
+          <span aria-live="polite" className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+            {matches.length === 0 ? "0/0" : `${activeMatchPosition + 1}/${matches.length}`}
+          </span>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-7"
+            disabled={matches.length === 0}
+            title="Previous match"
+            onClick={() => stepSearch(-1)}
+          >
+            <ChevronUp className="size-3.5" />
+          </Button>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-7"
+            disabled={matches.length === 0}
+            title="Next match"
+            onClick={() => stepSearch(1)}
+          >
+            <ChevronDown className="size-3.5" />
+          </Button>
+          <Button size="icon" variant="ghost" className="size-7" title="Close search" onClick={closeSearch}>
+            <X className="size-3.5" />
+          </Button>
+        </div>
+      )}
 
       <FileMentions task={task} events={events} />
 
@@ -1063,55 +2453,133 @@ function RunPanelBody({
         />
       )}
 
+      {/* Full-bleed section with inner padding, matching RunsList /
+          TerminalsSection above — the card itself is rounded, so it needs the
+          px-3 inset to avoid sitting flush against the panel edges. */}
+      {todoProgress && (
+        <div className="border-b border-border/60 px-3 py-2">
+          <TodoProgressCard progress={todoProgress} />
+        </div>
+      )}
+
       <div
         ref={logRef}
         onScroll={(e) => {
           const el = e.currentTarget;
-          nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+        }}
+        // Capture-phase so it fires before any in-log click handler (a
+        // collapsible's "Show more" toggle, a card's own setOpen, etc.).
+        // Arms `pinSuppressUntilRef` for a short window so the ResizeObserver
+        // pin effect doesn't hijack the resize that toggle causes — see the
+        // comment above that effect for the full rationale.
+        onPointerDownCapture={() => {
+          pinSuppressUntilRef.current = performance.now() + 400;
         }}
         // `min-w-0` lets the inner content actually shrink when long
         // unbreakable strings (paths, URLs) try to exceed the panel
         // width; `overflow-x-hidden` keeps the panel from gaining a
         // horizontal scrollbar — text wraps via `break-all` on the
         // problematic spots instead.
-        className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed"
+        // `[overflow-anchor:none]` disables the browser's native scroll
+        // anchoring on this container. This component already owns
+        // bottom-pinning end to end (the two pin paths below), so native
+        // anchoring is just a second, uncoordinated writer of `scrollTop`.
+        // It mattered most on the live→rebuilt `displayedEvents` swap: every
+        // event gets a new React key, so the whole transcript remounts, and
+        // anchoring — seeing a wholesale DOM replacement — picked an
+        // arbitrary new anchor node and jumped `scrollTop` to keep it in
+        // view. Before this fix (when path 1 was still a plain `useEffect`
+        // and this property wasn't set), that scroll event landed before
+        // either pin effect got a chance to run, latching `nearBottomRef`
+        // false and permanently de-arming both auto-scroll paths for the
+        // rest of the panel's life — this property, together with
+        // converting path 1 to a layout effect (see the pin-paths comment
+        // above), is what closes that hole.
+        className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 text-xs leading-relaxed [overflow-anchor:none]"
       >
-        {runs.length === 0 ? (
-          <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
-        ) : displayedEvents.length === 0 ? (
-          <div className="text-muted-foreground">Waiting for the first event…</div>
-        ) : (
-          <>
-            <div className="mb-2 flex items-center justify-between gap-2">
-              {activeStream === "main" && latestRun?.claudeSessionId ? (
-                <button
-                  type="button"
-                  onClick={() => void rebuildFromJsonl()}
-                  disabled={rebuildBusy}
-                  className="rounded-md border border-border/60 bg-card px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground hover:bg-accent/40 disabled:opacity-50"
-                  title="Re-parse the latest run's events from claude's on-disk session JSONL. Useful when the stored events were truncated by an older agetor version."
-                >
-                  {rebuildBusy
-                    ? "Reloading…"
-                    : rebuilt
-                      ? `Reload from JSONL (${rebuilt.events.length} events)`
-                      : "Load from session JSONL"}
-                </button>
-              ) : <span />}
-              {rebuildNote && (
-                <span className="text-[10px] text-muted-foreground">{rebuildNote}</span>
-              )}
+        <div ref={logContentRef}>
+          {/* "Load earlier messages" — only meaningful once we have a real DB
+              cursor to page from (see StreamEvent's `dbId` doc comment for why
+              `earliestId` can go null). Sits above everything else in the
+              scrollback, including the rebuild-from-JSONL row below. Lives
+              inside the `logContentRef` wrapper so its appearance/removal is
+              a content-size change the ResizeObserver pin effect can see —
+              though a pin never actually fires from it: the button is only
+              reachable at the top of the scrollback (nearBottomRef false),
+              and clicking it arms the pointerdown suppression window anyway. */}
+          {hasMoreEarlier && earliestId != null && (
+            <div className="mb-2 flex justify-center">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={loadEarlierEvents}
+                disabled={loadingEarlier}
+                className="h-6 px-2 text-[10px] uppercase tracking-wide text-muted-foreground"
+              >
+                {loadingEarlier ? "Loading…" : "Load earlier messages"}
+              </Button>
             </div>
-            <RunEventList
-              events={displayedEvents}
-              interactions={interactions}
-              onInteractionResolved={dismissInteraction}
-              runStatus={activeRunStatus}
-              indicatorMode={indicatorMode}
-            />
-          </>
-        )}
+          )}
+          {runs.length === 0 ? (
+            <div className="text-muted-foreground">(no runs yet — press Run to start the agent)</div>
+          ) : displayedEvents.length === 0 ? (
+            <div className="text-muted-foreground">Waiting for the first event…</div>
+          ) : (
+            <>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                {activeStream === "main" && latestRun?.claudeSessionId ? (
+                  <button
+                    type="button"
+                    onClick={() => void rebuildFromJsonl()}
+                    disabled={rebuildBusy}
+                    className="rounded-md border border-border/60 bg-card px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground hover:bg-accent/40 disabled:opacity-50"
+                    title="Re-parse the latest run's events from claude's on-disk session JSONL. Useful when the stored events were truncated by an older agetor version."
+                  >
+                    {rebuildBusy
+                      ? "Reloading…"
+                      : rebuilt
+                        ? `Reload from JSONL (${rebuilt.events.length} events)`
+                        : "Load from session JSONL"}
+                  </button>
+                ) : <span />}
+                {rebuildNote && (
+                  <span className="text-[10px] text-muted-foreground">{rebuildNote}</span>
+                )}
+              </div>
+              <RunEventList
+                events={displayedEvents}
+                interactions={interactions}
+                onInteractionResolved={dismissInteraction}
+                runStatus={activeRunStatus}
+                indicatorMode={indicatorMode}
+                taskId={task.id}
+              />
+            </>
+          )}
+        </div>
       </div>
+
+      {/* Messages backlog — saved drafts to send later. Sits just above the
+          composer so the "stash a thought / send it when ready" loop is one
+          glance apart. Hidden when empty and on a background-agent (subagent)
+          tab — those streams are read-only, so an interactive tray whose "Send
+          now" targets the main run would sit contradictorily above the
+          read-only footer. On an archived task the tray still renders, but
+          view-only (`readOnly`), so saved drafts aren't silently invisible. */}
+      {activeStream === "main" && backlogItems.length > 0 && (
+        <BacklogTray
+          items={backlogItems}
+          canSend={canSend && !modalPending}
+          busy={sending || backlogBusy}
+          readOnly={archived}
+          startingFolder={task.worktreePath ?? task.workdir}
+          onSend={sendBacklogItem}
+          onEdit={editBacklogItem}
+          onDelete={removeBacklogItem}
+          onMove={moveBacklogItem}
+        />
+      )}
 
       {/* Bottom-fixed input. Enabled the moment the task has had at least one
           run — the backend reattaches to the live tmux session if there is one,
@@ -1120,10 +2588,14 @@ function RunPanelBody({
           height as the textarea so they baseline together. The whole dock is
           one drop zone so dragging a screenshot anywhere over the input area
           (chips, textarea, send button gap) routes through the same capture
-          path. */}
-      {archived ? (
+          path. An archived task with a resumable run gets the same composer as
+          an idle one — the backend auto-unarchives and rematerializes the
+          worktree on send (see the inline hint below); only a genuinely
+          non-sendable archived task (no resumable run) falls back to the
+          static notice. */}
+      {archived && !canSend ? (
         <div className="shrink-0 border-t border-border/60 p-3 text-[11px] text-muted-foreground">
-          This task is archived. Unarchive it to send messages.
+          This task is archived. Unarchive it to interact.
         </div>
       ) : activeStream !== "main" ? (
         // Background-agent streams are read-only — you can watch them but not
@@ -1152,38 +2624,136 @@ function RunPanelBody({
           onDragLeave={onSendDragLeave}
           onDrop={onSendDrop}
         >
-          {canSend && (
-            <ReferencesPicker
-              variant="inline"
-              refs={sendRefs}
-              onChange={setSendRefs}
-              startingFolder={task.worktreePath ?? task.workdir}
-            />
+          {/* Always available: refs can be attached to a draft you're only
+              stashing, before the task has ever run. */}
+          <ReferencesPicker
+            variant="inline"
+            refs={sendRefs}
+            onChange={setSendRefs}
+            startingFolder={task.worktreePath ?? task.workdir}
+          />
+          {/* Archived-but-sendable: the task has a resumable run, so the
+              composer above is fully live — but sending here has a side
+              effect (auto-unarchive + worktree restore) that a non-archived
+              idle task doesn't have, so call it out inline rather than
+              silently. */}
+          {archived && (
+            <p className="text-[10px] text-muted-foreground">
+              Sending will unarchive this task and restore its worktree.
+            </p>
           )}
-          {canSend && (
-            // Picker on the left; "Commit & push" (when offered) pushed to the
-            // right so it isn't stacked directly on top of the picker.
+          {/* Shown once the task is sendable, OR as soon as there's something to
+              stash — that's what lets "Save for later" work pre-run. Also
+              shown whenever Resolve Conflicts is offerable (even disabled),
+              so an offerable-but-not-yet-sendable task doesn't have the
+              button pop in and out as the draft is typed. */}
+          {(canSend || input.trim() || sendRefs.length > 0 || showResolveConflicts) && (
+            // Picker on the left; "Save for later" / "Commit & push" pushed to
+            // the right so they aren't stacked directly on top of the picker.
             <div className="flex items-center justify-between gap-2">
-              <ExtensionPicker
-                extensions={sendExtensions}
-                value={input}
-                onChange={setInput}
-                textareaRef={sendRef}
-                placement="above"
-                // Already gated by the enclosing `canSend &&`, so only the
-                // in-flight send needs to disable the trigger here.
-                disabled={sending}
-              />
-              {shouldOfferCommitPush(gitStatus) && !sending && (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => void sendCommitPush()}
-                  title="Ask the agent to commit the working-tree changes and push the current branch to origin."
-                >
-                  <GitCommit className="mr-1 size-3" /> Commit &amp; push
-                </Button>
+              {canSend ? (
+                <ExtensionPicker
+                  extensions={sendExtensions}
+                  value={input}
+                  onChange={setInput}
+                  textareaRef={sendRef}
+                  placement="above"
+                  // Only the in-flight send needs to disable the trigger here.
+                  disabled={sending}
+                />
+              ) : (
+                // Keep `justify-between` pushing the buttons right when the
+                // picker isn't offered (pre-run).
+                <span />
               )}
+              <div className="flex items-center gap-2">
+                {/* Backlog mutations are frozen server-side while archived
+                    (`backlogGuard`) — only Send (which auto-unarchives) is
+                    offered on an archived task. */}
+                {!archived && (input.trim() || sendRefs.length > 0) && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void saveForLater()}
+                    disabled={sending || backlogBusy}
+                    title="Save this message to the backlog to send later — without sending it now."
+                  >
+                    <BookmarkPlus className="mr-1 size-3" /> Save for later
+                  </Button>
+                )}
+                {/* Commit & push keys on live git state (uncommitted changes or
+                    unpushed commits), not run status — see `shouldOfferCommitPush`.
+                    Can surface even mid-run (a background agent dirtied the tree). */}
+                {shouldOfferCommitPush(gitStatus) && !sending && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void sendCommitPush()}
+                    title="Ask the agent to commit the working-tree changes, push the current branch to origin, and reply with the link to open a PR plus a PR title and description in copyable code blocks."
+                  >
+                    <GitCommit className="mr-1 size-3" /> Commit &amp; push
+                  </Button>
+                )}
+                {/* Offered once the branch is pushed and synced with its
+                    remote (git-state-only, same convention as Commit & push
+                    above). Requires a real task branch — an isolation:"none"
+                    task sits on the project's own checkout (often main with a
+                    synced upstream), where "open a PR" would degenerate to
+                    base == head. Gone once a PR exists (the durable "View PR"
+                    link lives in the panel header). The proposal parse runs
+                    on click, not per event flush — the stream can be long. */}
+                {!task.prUrl && task.branch != null && shouldOfferOpenPr(gitStatus) && !sending && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      const proposal = latestPrProposal(events);
+                      onOpenPullRequest({
+                        projectPath: task.workdir,
+                        head: task.branch ?? "",
+                        title: proposal?.title ?? "",
+                        body: proposal?.description ?? "",
+                        taskId: task.id,
+                      });
+                    }}
+                    title="Create a pull request for this task's branch — prefilled from the agent's summary when available"
+                  >
+                    <GitPullRequest className="mr-1 size-3" /> Create PR
+                  </Button>
+                )}
+                {/* Post-PR counterpart to "Open PR" above: offered once the
+                    task's PR reports merge conflicts. Gated on `!archived`
+                    (the server silently auto-unarchives on other mutations,
+                    but this button must not act as though it were live on a
+                    frozen task — an archived-but-`canSend` task DOES render
+                    this dock, so the clause is live, not dead code). The
+                    composer dock as a whole already excludes subagent tabs
+                    (`activeStream !== "main"` renders a read-only footer
+                    instead), so no separate check is needed here. Rendered
+                    even when `!canSend` (see `showResolveConflicts` above) —
+                    disabled, with a tooltip explaining why. */}
+                {showResolveConflicts && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void sendResolveConflicts()}
+                    disabled={!canSend || modalPending || sending || backlogBusy || resolvingConflicts || resolveConflictsSent}
+                    title={
+                      !canSend
+                        ? "Start the task before asking the agent to resolve conflicts"
+                        : modalPending
+                          ? "Answer the pending prompt before sending another message"
+                          : resolveConflictsSent
+                            ? "Already sent — waiting for the agent to pick it up"
+                            : sending || backlogBusy || resolvingConflicts
+                              ? "A message is already being sent"
+                              : "Ask the agent to merge the base branch and resolve the reported conflicts"
+                    }
+                  >
+                    <GitMerge className="mr-1 size-3" /> {resolveConflictsSent ? "Sent to agent" : "Resolve Conflicts"}
+                  </Button>
+                )}
+              </div>
             </div>
           )}
           <div className="flex items-stretch gap-2">
@@ -1203,22 +2773,44 @@ function RunPanelBody({
                   if (e.defaultPrevented) return;
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
+                    // The field is typable in states we can't send from (before
+                    // the first run, or while a prompt is pending). Swallowing
+                    // Enter there would be a dead key, so it does the thing the
+                    // user means: stash the draft. `send()` guards both states
+                    // too, so this is the only place that decides.
+                    if (!canSend || modalPending) {
+                      // Archived tasks can't stash drafts (server freezes the
+                      // backlog) — swallow Enter instead of surfacing a 400.
+                      if (!archived) void saveForLater();
+                      return;
+                    }
                     void send();
                   }
                 }}
                 placeholder={
                   modalPending
-                    ? "Answer the prompt above — or press Stop to cancel, then send a new message."
+                    ? "Answer the prompt above — or type a message and Save it for later."
                     : canSend
                     ? task.column === "running"
                       ? "Agent is working — your message will be added to the current turn. Type / for commands."
                       : task.column === "blocked"
                         ? "Answer the question, or send any follow-up. Type / for commands."
                         : "Send a message — resumes the conversation in a fresh session. Type / for commands."
-                    : "Press Run task first to start a conversation."
+                    // `!canSend` covers two states: never run, and "ran but has
+                    // no resumable session" (a codex task whose run_id was
+                    // cleared — claude falls back to its newest run). Don't
+                    // claim "not running yet" in the latter.
+                    : runs.length > 0
+                      ? "No live session to send to — save this message for later, or re-run the task."
+                      : "Not running yet — type a message and Save it for later, ready to send once the task runs."
                 }
                 rows={2}
-                disabled={!canSend || sending || modalPending}
+                // Typing is allowed in every state the composer renders, even
+                // when we can't send: that's the point of "Save for later".
+                // Sending is gated separately — the Send button below plus the
+                // `canSend` / `modalPending` guards inside `send()` — so a
+                // keystroke can never leak into a live tmux modal.
+                disabled={sending || backlogBusy}
                 className="h-16 min-h-0 w-full resize-none text-xs"
               />
               <SlashAutocomplete
@@ -1235,7 +2827,7 @@ function RunPanelBody({
             <Button
               size="icon"
               onClick={() => void send()}
-              disabled={!canSend || sending || modalPending || (!input.trim() && sendRefs.length === 0)}
+              disabled={!canSend || sending || backlogBusy || modalPending || (!input.trim() && sendRefs.length === 0)}
               title={
                 // Distinguish "live session exists" from "needs resume" — not
                 // "turn in flight". `liveRunId` (task.runId) stays set while the
@@ -1258,6 +2850,272 @@ function RunPanelBody({
         </div>
       )}
     </>
+  );
+}
+
+/** Shared styling for the compact icon buttons in a backlog item's action row. */
+const BACKLOG_ICON_BTN =
+  "rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground "
+  + "disabled:pointer-events-none disabled:opacity-40";
+
+/**
+ * The messages-backlog tray: a list of saved, not-yet-sent drafts shown just
+ * above the composer. Purely presentational — all mutations are handed back to
+ * RunPanelBody, which owns the optimistic state and the API calls. Manages only
+ * which item is currently in inline-edit mode.
+ */
+function BacklogTray({
+  items,
+  canSend,
+  busy,
+  readOnly,
+  startingFolder,
+  onSend,
+  onEdit,
+  onDelete,
+  onMove,
+}: {
+  items: BacklogMessage[];
+  /** Whether "Send now" is available (task has a resumable run and no pending prompt). */
+  canSend: boolean;
+  /** A send / backlog mutation is in flight — disables destructive actions. */
+  busy: boolean;
+  /** View-only mode (archived task): render the drafts but strip every
+   *  mutation affordance, since the server freezes backlog edits on archived
+   *  tasks. The drafts stay visible so they aren't silently hidden. */
+  readOnly: boolean;
+  startingFolder: string;
+  onSend: (item: BacklogMessage) => void;
+  onEdit: (
+    itemId: string,
+    patch: { text?: string; references?: TaskReference[] },
+  ) => void | Promise<void>;
+  onDelete: (itemId: string) => void;
+  onMove: (itemId: string, dir: -1 | 1) => void;
+}) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  return (
+    <div className="shrink-0 border-t border-border/60">
+      <div className="flex items-center gap-1.5 px-3 pb-1 pt-2 text-[11px] font-medium text-muted-foreground">
+        <ClipboardList className="size-3.5" />
+        <span>Backlog</span>
+        <span className="rounded bg-muted px-1 text-[10px]">{items.length}</span>
+        <span className="ml-1 font-normal text-muted-foreground/70">
+          {readOnly
+            ? "saved messages — unarchive the task to edit or send"
+            : "saved messages — send when you're ready"}
+        </span>
+      </div>
+      {/* Grow the window while a row is being edited: the inline editor is
+          ~140px tall, so under the resting max-h-40 (160px) its Save/Cancel row
+          would be clipped below the fold whenever another draft sits above it —
+          which reads as "there is no save button". */}
+      <div
+        className={cn(
+          "space-y-1 overflow-y-auto px-2 pb-2",
+          editingId !== null ? "max-h-72" : "max-h-40",
+        )}
+      >
+        {items.map((item, i) => (
+          <BacklogItemRow
+            key={item.id}
+            item={item}
+            index={i}
+            total={items.length}
+            canSend={canSend}
+            busy={busy}
+            readOnly={readOnly}
+            editing={editingId === item.id}
+            startingFolder={startingFolder}
+            onStartEdit={() => setEditingId(item.id)}
+            onCancelEdit={() => setEditingId(null)}
+            onSaveEdit={async (patch) => {
+              await onEdit(item.id, patch);
+              setEditingId(null);
+            }}
+            onSend={() => onSend(item)}
+            onDelete={() => onDelete(item.id)}
+            onMove={(dir) => onMove(item.id, dir)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** One saved draft: a read-only row with hover actions, or an inline editor
+ *  (textarea + references picker) when `editing` is true. */
+function BacklogItemRow({
+  item,
+  index,
+  total,
+  canSend,
+  busy,
+  readOnly,
+  editing,
+  startingFolder,
+  onStartEdit,
+  onCancelEdit,
+  onSaveEdit,
+  onSend,
+  onDelete,
+  onMove,
+}: {
+  item: BacklogMessage;
+  index: number;
+  total: number;
+  canSend: boolean;
+  busy: boolean;
+  readOnly: boolean;
+  editing: boolean;
+  startingFolder: string;
+  onStartEdit: () => void;
+  onCancelEdit: () => void;
+  onSaveEdit: (patch: { text: string; references: TaskReference[] }) => void;
+  onSend: () => void;
+  onDelete: () => void;
+  onMove: (dir: -1 | 1) => void;
+}) {
+  const [draft, setDraft] = useState(item.text);
+  const [draftRefs, setDraftRefs] = useState<TaskReference[]>(item.references);
+  const actionsRef = useRef<HTMLDivElement>(null);
+  // Re-seed the edit form only when we *enter* edit mode. We deliberately do
+  // NOT depend on `item.text` / `item.references`: the 2s task poll rebuilds
+  // `task.backlog` into fresh objects (new array references) on every tick, so
+  // depending on them would re-run this effect every poll and clobber the
+  // user's in-progress edit back to the saved value. The row is keyed by
+  // `item.id`, so `useState` already seeds the initial value on mount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (editing) {
+      setDraft(item.text);
+      setDraftRefs(item.references);
+      // The editor expands the row well past what was visible before the
+      // click. Anchor the scroll on the Save/Cancel row — the form's last
+      // element — so the buttons are revealed even when the form itself is
+      // taller than the tray's scroll window (many reference chips).
+      actionsRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [editing]);
+
+  // `readOnly` wins over `editing` — an archived task can never open the editor
+  // (the Edit button is hidden), but guard here too so a stale `editingId` from
+  // just before an archive can't strand the row in an uncommittable form.
+  if (editing && !readOnly) {
+    const canSave = draft.trim().length > 0 || draftRefs.length > 0;
+    return (
+      <div className="space-y-1.5 rounded-md border border-border/60 bg-background/50 p-2">
+        <Textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          rows={2}
+          autoFocus
+          className="min-h-0 w-full resize-none text-xs"
+        />
+        <ReferencesPicker
+          variant="inline"
+          refs={draftRefs}
+          onChange={setDraftRefs}
+          startingFolder={startingFolder}
+        />
+        <div ref={actionsRef} className="flex items-center justify-end gap-1.5">
+          <Button size="sm" variant="ghost" onClick={onCancelEdit}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            disabled={!canSave || busy}
+            onClick={() => onSaveEdit({ text: draft.trim(), references: draftRefs })}
+          >
+            <Check className="mr-1 size-3" /> Save
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="group flex items-start gap-2 rounded-md border border-transparent px-2 py-1.5 hover:border-border/60 hover:bg-background/40">
+      <div className="min-w-0 flex-1">
+        <p className="line-clamp-3 whitespace-pre-wrap break-words text-xs text-foreground/90">
+          {item.text || (
+            <span className="italic text-muted-foreground">(references only)</span>
+          )}
+        </p>
+        {item.references.length > 0 && (
+          <div className="mt-1 flex flex-wrap gap-1">
+            {item.references.map((r) => {
+              const Icon = iconForRef(r);
+              return (
+                <span
+                  key={r.path}
+                  title={r.path}
+                  className="inline-flex items-center gap-1 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground"
+                >
+                  <Icon className="size-3 shrink-0 opacity-70" />
+                  {refBasename(r.path)}{r.isDirectory ? "/" : ""}
+                </span>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      {!readOnly && (
+        <div className="flex shrink-0 items-center gap-0.5 opacity-60 transition-opacity group-hover:opacity-100">
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={index === 0 || busy}
+            onClick={() => onMove(-1)}
+            title="Move up"
+          >
+            <ArrowUp className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={index === total - 1 || busy}
+            onClick={() => onMove(1)}
+            title="Move down"
+          >
+            <ArrowDown className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            onClick={onStartEdit}
+            title="Edit"
+          >
+            <FilePenLine className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={BACKLOG_ICON_BTN}
+            disabled={!canSend || busy}
+            onClick={onSend}
+            // `canSend` here is the parent's `canSend && !modalPending`, so it
+            // goes false for two different reasons — no live/resumable session,
+            // or a prompt is waiting. Keep the copy true for both.
+            title={
+              canSend
+                ? "Send now"
+                : "Can't send right now — run the task, or answer the pending prompt first"
+            }
+          >
+            <Send className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            className={cn(BACKLOG_ICON_BTN, "hover:bg-destructive/10 hover:text-destructive")}
+            disabled={busy}
+            onClick={onDelete}
+            title="Delete"
+          >
+            <Trash2 className="size-3.5" />
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1628,12 +3486,17 @@ function RunEventList({
   onInteractionResolved,
   runStatus,
   indicatorMode = "off",
+  taskId,
 }: {
   events: RunEvent[];
   interactions?: PendingInteraction[];
   onInteractionResolved?: (id: string) => void;
   runStatus?: Run["status"] | null;
   indicatorMode?: RunIndicatorMode;
+  /** Threaded through to each `UserMessageBlock`'s `AttachmentChips` so a
+   *  relative attachment ref can resolve against the task's worktree/workdir
+   *  when the user clicks it. */
+  taskId?: string;
 }) {
   // Index tool_results by their tool_use_id so the tool-use card can show
   // Normalise legacy `[tool: Name] {...}` / `[thinking] ...` / `[result] ...`
@@ -1695,34 +3558,85 @@ function RunEventList({
   // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`)
   // are tracked explicitly.
   const sections = useMemo(() => {
-    const renderEvent = (e: RunEvent, key: string): React.ReactNode[] => {
+    // Wrap a rendered block in the `data-evid` carrier the search bar scrolls
+    // to and imperatively highlights (`logRef.current?.querySelector('[data-
+    // evid="…"]')` in RunPanelBody — see the highlight effect there). `evid`
+    // is `i` from the loop below — the position of this event within
+    // `normalised` (and so within `events`/`displayedEvents`), which is
+    // exactly the id scheme `event-search.ts` uses. The wrapper carries the
+    // key so the memoized block components underneath keep their
+    // identity/props untouched. Only STATIC classes belong here — the
+    // highlight ring itself is toggled by the DOM effect in RunPanelBody, not
+    // by a render-time class, so this memo doesn't need `activeMatchId` as a
+    // dep (re-deriving the whole section tree on every match navigation was
+    // the point being fixed). `extraClassName` lets a specific stream (only
+    // `user`, below) opt into a class that has to live on THIS wrapper rather
+    // than on the block's own root — sticky positioning needs to be applied
+    // to the element that's actually the flex child of the scroll container.
+    // Returns `null` (no wrapper at all) when `node` is nullish, so an event
+    // with nothing to render (e.g. an unparseable orphan tool_result — see
+    // the `tool_result` case below) doesn't still leave a phantom empty div
+    // consuming a `gap-4` slot in the section's flex column.
+    const wrap = (
+      key: string,
+      evid: number,
+      node: React.ReactNode,
+      extraClassName?: string,
+    ): React.ReactNode => {
+      if (node === null || node === undefined) return null;
+      return (
+        <div key={key} data-evid={evid} className={extraClassName}>
+          {node}
+        </div>
+      );
+    };
+    const renderEvent = (e: RunEvent, key: string, evid: number): React.ReactNode[] => {
       switch (e.stream) {
         case "user":
-          return [<UserMessageBlock key={key} text={e.data} />];
+          // Sticky positioning lives on this wrapper, not on
+          // `UserMessageBlock`'s own root — the wrapper is the actual flex
+          // child of the scroll container (`sections.map` below renders one
+          // `<section>` per user-message group), so THIS is the element that
+          // has to pin to `top-0` for the sticky header to work at all.
+          return [wrap(key, evid, <UserMessageBlock text={e.data} taskId={taskId} />, "sticky top-0 z-10")];
         case "assistant":
-          return [<AssistantBlock key={key} text={e.data} />];
+          return [wrap(key, evid, <AssistantBlock text={e.data} />)];
         case "thinking":
-          return [<ThinkingBlock key={key} text={e.data} />];
+          return [wrap(key, evid, <ThinkingBlock text={e.data} />)];
         case "tool_use": {
           const parsed = safeParse<ParsedToolUse>(e.data);
-          if (!parsed) return [<RawText key={key} text={e.data} muted />];
+          if (!parsed) return [wrap(key, evid, <RawText text={e.data} muted />)];
           const result = resultByToolId.get(parsed.id);
-          return [<ToolUseBlock key={key} call={parsed} result={result} />];
+          return [wrap(key, evid, <ToolUseBlock call={parsed} result={result} />)];
         }
         case "tool_result": {
           const parsed = safeParse<ParsedToolResult>(e.data);
-          if (parsed && parsed.toolUseId && resultByToolId.get(parsed.toolUseId)) return [];
-          return [<ToolResultBlock key={key} result={parsed} />];
+          // Unparseable JSON — `ToolResultBlock` would render nothing for it
+          // anyway (its `!result` guard), so skip the wrapper entirely rather
+          // than emitting an empty `data-evid` div.
+          if (!parsed) return [];
+          if (parsed.toolUseId && resultByToolId.get(parsed.toolUseId)) return [];
+          return [wrap(key, evid, <ToolResultBlock result={parsed} />)];
         }
         case "status":
-          return [<StatusDivider key={key} text={e.data} />];
+          // Suppress claude's synthetic "[Image: source: <path>]" breadcrumb
+          // — it's a separate (isMeta) transcript entry for the attachment
+          // itself, not a status worth showing, and the image is now
+          // rendered as a proper thumbnail chip under the user bubble
+          // instead. Uses the lax matcher (not the strict `imageSourceMetaPath`)
+          // so historical rows persisted before this event type existed —
+          // truncated at the old 140-char status cap, possibly missing the
+          // trailing `]` or ending in an ellipsis — are filtered too, on
+          // replay as well as live.
+          if (isImageSourceMetaBreadcrumb(e.data)) return [];
+          return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
-          return [<ErrorBlock key={key} text={e.data} />];
+          return [wrap(key, evid, <ErrorBlock text={e.data} />)];
         case "stdout":
         case "interaction":
         default:
           if (e.stream === "interaction") return [];
-          return [<RawText key={key} text={e.data} />];
+          return [wrap(key, evid, <RawText text={e.data} />)];
       }
     };
     const renderInteraction = (it: PendingInteraction) => {
@@ -1746,17 +3660,17 @@ function RunEventList({
       const before = (interactionByIndex.get(i) ?? []).map(renderInteraction);
       if (e.stream === "user") {
         if (current.header !== null || current.body.length > 0) out.push(current);
-        current = { key, header: renderEvent(e, key)[0] ?? null, body: [...before] };
+        current = { key, header: renderEvent(e, key, i)[0] ?? null, body: [...before] };
       } else {
         if (current.key === "") current.key = key;
-        current.body.push(...before, ...renderEvent(e, key));
+        current.body.push(...before, ...renderEvent(e, key, i));
       }
     }
     const tail = (interactionByIndex.get(normalised.length) ?? []).map(renderInteraction);
     current.body.push(...tail);
     if (current.header !== null || current.body.length > 0) out.push(current);
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -1943,7 +3857,7 @@ const ASSISTANT_MD_COMPONENTS: MdComponents = {
   pre: ({ children }) => <CodeBlock bgClassName="bg-muted/40">{children}</CodeBlock>,
 };
 
-const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string }) {
+const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text: string; taskId?: string }) {
   const [expanded, setExpanded] = useState(false);
   const [needsToggle, setNeedsToggle] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -1954,13 +3868,54 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
   // visual position after expand/collapse.
   const pendingAdjustRef = useRef<{ scroller: HTMLElement; prevHeight: number } | null>(null);
 
+  // Recognize slash-command invocations (XML expansion or plain echo) and
+  // `<local-command-stdout>` blocks so they render as structured UI instead
+  // of literal `<command-*>` tags. `null` for an ordinary message — the
+  // fallback branch below renders exactly what this component always has.
+  const parsed = useMemo(() => parseUserMessage(text), [text]);
+
+  // For an ordinary (non-command) message, split off a trailing "Referenced
+  // files/folders:" block the same way the command branch already does, so
+  // an image-attached (or file/folder-attached) send renders its paths as
+  // chips instead of a literal bullet list in the markdown body. Newlines
+  // are normalized first — `splitReferences`' blank-line paragraph split
+  // needs real `\n`s, and the JSONL twin of a send can carry bare `\r`s (see
+  // event-dedup.ts). When there's no trailing refs block, `splitReferences`
+  // returns `args` unchanged and an empty `references` array, so this is a
+  // no-op split for the common case.
+  const ordinary = useMemo(
+    () => splitReferences(text.replace(/\r\n?/g, "\n")),
+    [text],
+  );
+
+  // Strip `[Image #N]` placeholders only when the message actually carries
+  // references — a user who literally types "[Image #1]" in a plain message
+  // with no attachments keeps their text verbatim. Computed for both the
+  // command-args and ordinary-message branches below (used for the
+  // truthiness check as well as the rendered body, so an args string that's
+  // non-empty only because of a placeholder doesn't render an empty
+  // markdown block).
+  const commandArgsText =
+    parsed?.kind === "command" && parsed.command.references.length > 0
+      ? stripImagePlaceholders(parsed.command.args)
+      : (parsed?.kind === "command" ? parsed.command.args : "");
+  const ordinaryArgsText =
+    ordinary.references.length > 0
+      ? stripImagePlaceholders(ordinary.args)
+      : ordinary.args;
+
   // Default to the collapsed ~3-line cap and measure once mounted. The cap
   // is always rendered so short messages don't flash full-height first;
   // the toggle button only surfaces when scrollHeight exceeds clientHeight,
-  // i.e. content actually overflows the cap.
+  // i.e. content actually overflows the cap. When a command has no args (no
+  // `contentRef` div rendered at all), reset rather than early-return so a
+  // stale toggle can't survive a text change that removed the capped div.
   useEffect(() => {
     const el = contentRef.current;
-    if (!el) return;
+    if (!el) {
+      setNeedsToggle(false);
+      return;
+    }
     setNeedsToggle(el.scrollHeight > el.clientHeight + 2);
   }, [text]);
 
@@ -1984,24 +3939,58 @@ const UserMessageBlock = memo(function UserMessageBlock({ text }: { text: string
     setExpanded((v) => !v);
   };
 
+  const collapseClassName = cn(
+    "agetor-md",
+    expanded ? "max-h-[40vh] overflow-y-auto" : "max-h-[4.5rem] overflow-hidden",
+  );
+
   return (
-    <div className="sticky top-0 z-10 flex justify-end">
+    <div className="flex justify-end">
       <div ref={bubbleRef} className="max-w-[85%] rounded-2xl rounded-br-md border border-primary/30 bg-card/50 px-3 py-1.5 text-foreground shadow-sm backdrop-blur-md">
-        <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
-          you
-        </div>
-        <div
-          ref={contentRef}
-          className={cn(
-            "agetor-md",
-            expanded
-              ? "max-h-[40vh] overflow-y-auto"
-              : "max-h-[4.5rem] overflow-hidden",
-          )}>
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
-            {text}
-          </ReactMarkdown>
-        </div>
+        {parsed?.kind === "command-output" ? (
+          <>
+            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
+              command output
+            </div>
+            <div ref={contentRef} className={collapseClassName}>
+              <div className="whitespace-pre-wrap font-mono text-[11px] text-muted-foreground">
+                {parsed.output || "—"}
+              </div>
+            </div>
+          </>
+        ) : parsed?.kind === "command" ? (
+          <>
+            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
+              you
+            </div>
+            <div className="mb-1">
+              <span className="inline-flex items-center gap-1 rounded-md border border-primary/40 bg-primary/15 px-1.5 py-0.5 font-mono text-[11px] font-medium text-primary">
+                <SquareSlash className="size-3" />
+                {parsed.command.name}
+              </span>
+            </div>
+            {commandArgsText && (
+              <div ref={contentRef} className={collapseClassName}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
+                  {commandArgsText}
+                </ReactMarkdown>
+              </div>
+            )}
+            <AttachmentChips references={parsed.command.references} taskId={taskId} />
+          </>
+        ) : (
+          <>
+            <div className="mb-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/80">
+              you
+            </div>
+            <div ref={contentRef} className={collapseClassName}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={USER_MD_COMPONENTS}>
+                {ordinaryArgsText}
+              </ReactMarkdown>
+            </div>
+            <AttachmentChips references={ordinary.references} taskId={taskId} />
+          </>
+        )}
         {needsToggle && (
           <button
             type="button"

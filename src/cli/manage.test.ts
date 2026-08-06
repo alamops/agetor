@@ -201,7 +201,9 @@ test("getGitStatus: ignored short-circuit for a non-git workdir", async () => {
     const t = await client.createTask({
       title: "GS-nogit", prompt: "p", agent: "claude-code", isolation: "none", workdir: dir,
     });
-    expect(await client.getGitStatus(t.id)).toEqual({ hasChanges: false, ahead: 0, ignored: true });
+    expect(await client.getGitStatus(t.id)).toEqual({
+      hasChanges: false, ahead: 0, ignored: true, hasUpstream: false, remoteSynced: false,
+    });
 
     await client.deleteTask(t.id);
     rmSync(dir, { recursive: true, force: true });
