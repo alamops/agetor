@@ -41,6 +41,7 @@ import {
 import {
   dismissTmuxPrompt,
   driveAskAnswers,
+  healWindowSize,
   jsonlPathFor,
   rebuildEventsFromJsonl,
   markTmuxPromptAnswered,
@@ -3334,6 +3335,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 404, headers: corsHeaders(req) },
             );
           }
+          // Heal a stuck `window-size manual` pin (a prior crash mid pane-grow)
+          // before attaching, so the client's own size wins instead of being
+          // confined to whatever the pin left behind — see `healWindowSize`.
+          // Best-effort: must not block or delay the attach below.
+          healWindowSize(task.id);
           // AppleScript `do script` runs the string through `/bin/bash`, so
           // we escape anything bash would interpret inside double-quotes:
           // backslash, dollar, backtick, and the double-quote itself. Without
