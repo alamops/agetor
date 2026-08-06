@@ -132,8 +132,8 @@ import {
   updateGitHubMilestone,
   updateGitHubPullBranch,
   updateGitHubRelease,
-  remoteHostsForDirs,
 } from "./github.ts";
+import { remoteHostsForDirs } from "./git-provider.ts";
 import * as gitHost from "./git-host.ts";
 import { getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
 import { getMainWindow } from "./window.ts";

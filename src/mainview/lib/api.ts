@@ -218,17 +218,26 @@ export type PendingInteraction =
   | PendingAskQuestions
   | PendingTmuxPrompt;
 
-/** One stored per-host GitHub PAT, as surfaced to the webview. The raw token
- *  is never returned — `tokenPreview` is a redacted tail (e.g. "…abcd"). */
+/** One stored per-host git credential, as surfaced to the webview. The store
+ *  is shared across GitHub/GitLab/Bitbucket — `host` may be a plain provider
+ *  domain (github.com, gitlab.com, bitbucket.org) or a raw ssh alias host
+ *  (e.g. github-work.com, bitbucket-work.com). The raw credential is never
+ *  returned — `tokenPreview` is a redacted tail (e.g. "…abcd"). Routes keep
+ *  the `/github/tokens` path and the `GitHub` type-name prefix for
+ *  backwards compatibility with existing stored tokens; the type name is
+ *  legacy naming only, not a GitHub-only shape. */
 export interface GitHubTokenInfo {
   host: string;
   label: string | null;
   tokenPreview: string;
 }
 
-/** Response shape for the GitHub tokens routes. `detectedHosts` are the
- *  distinct raw remote hosts (including ssh aliases) seen across registered
- *  project dirs — used to suggest hosts that don't have a token yet. */
+/** Response shape for the (misleadingly-named, back-compat) `/github/tokens`
+ *  routes, which actually serve credentials for any supported git host —
+ *  GitHub, GitLab, and Bitbucket. `detectedHosts` are the distinct raw
+ *  remote hosts (including ssh aliases, across all three providers) seen
+ *  across registered project dirs — used to suggest hosts that don't have a
+ *  token yet. */
 export interface GitHubTokensResult {
   tokens: GitHubTokenInfo[];
   detectedHosts: string[];
@@ -984,11 +993,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  /** Stored per-host GitHub tokens + hosts detected across registered
-   *  projects (drives the "GitHub tokens" Settings section). */
+  /** Stored per-host git credentials (GitHub, GitLab, and Bitbucket all
+   *  share this store) + hosts detected across registered projects — drives
+   *  the "Git host tokens" Settings section. Route path kept as
+   *  `/github/tokens` for back-compat with existing stored credentials. */
   listGitHubTokens: () => j<GitHubTokensResult>("/github/tokens"),
-  /** Upsert the token for `input.host`. Returns the refreshed list — never
-   *  the raw token. */
+  /** Upsert the credential for `input.host`. Returns the refreshed list —
+   *  never the raw token. */
   setGitHubToken: (input: { host: string; token: string; label?: string | null }) =>
     j<GitHubTokensResult>("/github/tokens", {
       method: "PUT",

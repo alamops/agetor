@@ -26,6 +26,7 @@ import {
   GitMerge,
   GitPullRequest,
   Kanban,
+  KeyRound,
   ListTree,
   Loader2,
   Lock,
@@ -40,6 +41,7 @@ import {
   Rocket,
   RotateCcw,
   Search,
+  Settings,
   Sparkles,
   Tag,
   Unlock,
@@ -66,6 +68,7 @@ import {
 import { cn } from "@/lib/utils";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
 import { mergeabilityView, type MergeTone } from "@/lib/mergeability";
+import { isCredentialError } from "@/lib/credential-error";
 import { ResolveConflictsDialog, type ResolveConflictsContext } from "./ResolveConflictsDialog";
 import {
   backToList,
@@ -110,7 +113,7 @@ import type {
   ProviderCaps,
   TaskDiff,
 } from "../../../shared/types.ts";
-import { PROVIDER_CAPS } from "../../../shared/types.ts";
+import { GIT_HOST_TOKENS_SECTION, PROVIDER_CAPS } from "../../../shared/types.ts";
 
 // Hoisted ReactMarkdown `components` map for GitHub markdown bodies (PR/issue
 // descriptions, comments, list previews). Module scope keeps the prop identity
@@ -203,6 +206,11 @@ interface Props {
    *  `pendingPullDetailPrefillRef` below. */
   pullDetailPrefill?: GitHubPullDetailPrefill | null;
   onClose: () => void;
+  /** Wired from App.tsx: closes this dialog and opens SettingsDialog. Optional
+   *  so other mounts (tests, storybook-style usages) don't need to supply it —
+   *  when absent, the credential-error panel below simply omits its "Open
+   *  Settings" button rather than rendering a dead one. */
+  onOpenSettings?: () => void;
 }
 
 const basename = (p: string) => {
@@ -510,7 +518,28 @@ function RateLimitBadge({ rateLimit }: { rateLimit: GitHubRateLimit }) {
   );
 }
 
-export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, pullDetailPrefill, onClose }: Props) {
+/** First step of the credential-error panel's one-time-setup list (review
+ *  pass on commit 1cb3fa5, finding #1) — names the actual token flavor each
+ *  git host expects, since "create a token on your git host" was true but
+ *  unhelpfully vague for the two most common hosts. `provider` mirrors the
+ *  dialog's own resolved-provider state; "mixed" (aggregate view across
+ *  repos on different hosts) and `null` (not yet resolved, or resolution
+ *  failed) fall back to the original host-neutral wording since we can't say
+ *  which token flavor applies. */
+function credentialSetupStep1(provider: GitProvider | "mixed" | null): string {
+  switch (provider) {
+    case "bitbucket":
+      return "Create an Atlassian API token with scopes at id.atlassian.com — Bitbucket credentials are saved as email:api_token.";
+    case "github":
+      return "Create a personal access token (classic or fine-grained) on github.com.";
+    case "gitlab":
+      return "Create a personal access token with the api scope on gitlab.com (or your self-hosted GitLab instance).";
+    default:
+      return "Create a token on your git host.";
+  }
+}
+
+export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, pullDetailPrefill, onClose, onOpenSettings }: Props) {
   const [projectPath, setProjectPath] = useState("");
   // "All repositories" (G8/F15) — see AGGREGATE_PROJECT_PATH.
   const isAggregate = projectPath === AGGREGATE_PROJECT_PATH;
@@ -994,6 +1023,14 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
       setReloadPending(false);
       return;
     }
+    // Clear a stale error immediately (rather than waiting out the debounce
+    // below + the in-flight request) so reopening the dialog on a task that
+    // previously errored shows the loading state, not last time's credential
+    // panel flashing before the fresh load replaces it. `result` is left
+    // alone — every other reload path here (filter/sort changes) already
+    // keeps showing the previous list while the next page loads, and this
+    // shouldn't regress that.
+    setError(null);
     setReloadPending(true);
     const t = setTimeout(() => { setReloadPending(false); void load({ requestId }); }, 250);
     return () => clearTimeout(t);
@@ -3826,10 +3863,48 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
           </div>
         )}
 
+        {/* Credential errors are enriched server-side with the marker phrase
+            `Settings → ${GIT_HOST_TOKENS_SECTION}` (github.ts's
+            `privateRepoHint`, gitlab.ts's `authHint`, bitbucket.ts's
+            `bitbucketAccessHint`/`bitbucketViewerAccessHint`) — detecting it
+            via the shared `isCredentialError` helper (rather than a status
+            code we don't have at this layer) is what lets us swap the bare
+            error row for an actionable explainer, while every other
+            list-load failure keeps the plain row below. */}
         {!loading && error && (
-          <div className="flex items-center justify-center gap-2 py-12 text-sm text-rose-400">
-            <AlertCircle className="size-4" /> {error}
-          </div>
+          isCredentialError(error) ? (
+            <div
+              role="alert"
+              className="mx-auto my-6 flex max-w-md flex-col gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-4"
+            >
+              <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                <KeyRound className="size-4 text-amber-400" />
+                Can&apos;t reach this repository
+              </div>
+              <p className="text-xs text-muted-foreground">This is usually a missing or invalid credential.</p>
+              <p className="text-xs text-muted-foreground">{error}</p>
+              <div className="rounded-md border border-border/50 bg-background/40 p-3">
+                <div className="mb-1.5 text-[11px] font-medium text-muted-foreground">If the repository is private:</div>
+                <ol className="list-decimal space-y-1 pl-4 text-xs text-muted-foreground">
+                  <li>{credentialSetupStep1(provider)}</li>
+                  <li>In Settings → {GIT_HOST_TOKENS_SECTION}, save it for the host named above.</li>
+                  <li>Reopen this dialog. The Setup guide button inside the Settings section walks through each provider step by step.</li>
+                </ol>
+              </div>
+              {onOpenSettings && (
+                <div className="flex justify-end">
+                  <Button size="sm" onClick={onOpenSettings}>
+                    <Settings className="mr-2 size-3.5" />
+                    Open Settings
+                  </Button>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex items-center justify-center gap-2 py-12 text-sm text-rose-400">
+              <AlertCircle className="size-4" /> {error}
+            </div>
+          )
         )}
 
         {loading && !result && (

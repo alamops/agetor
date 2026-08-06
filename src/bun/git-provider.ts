@@ -25,6 +25,15 @@ import { tokenForHost } from "./github-tokens.ts";
  * Leaf module: does not import `db.ts` or `server.ts`. May import from
  * `github-tokens.ts`, `../shared/types.ts`, and `github.ts` (only the
  * provider-agnostic exports: `parseGitRemote`, `canonicalGitHost`, `run`).
+ *
+ * `remoteHostsForDirs` (docs/plans/consolidate-git-host-discovery.md) lives
+ * here rather than in `github.ts` for the same reason the rest of this file
+ * does: it needs to be provider-generic over `providerRepoForDir`, and
+ * `github.ts` can't import this module (this module imports `github.ts` for
+ * `parseGitRemote`/`canonicalGitHost`/`run` — the reverse edge would cycle).
+ * It used to live in github.ts with its own duplicated
+ * supported-provider-hosts set and inline remote-walk for exactly that
+ * reason; moving it here instead of duplicating deletes the duplication.
  */
 
 const GITLAB_FETCH_TIMEOUT_MS = 5_000;
@@ -75,6 +84,111 @@ export async function providerRepoForDir(dir: string): Promise<ProviderRepoInfo 
     };
   }
   return null;
+}
+
+const REMOTE_HOSTS_POOL_SIZE = 6;
+const REMOTE_HOSTS_CACHE_TTL_MS = 10_000;
+
+/** Single-slot promise cache for `remoteHostsForDirs`. Production only ever
+ *  has one live key at a time (the current registered-project list), so a
+ *  one-entry slot replaces what would otherwise be a never-pruned `Map` —
+ *  there's nothing to sweep because a new key simply overwrites the slot.
+ *
+ *  `expiresAt` is anchored at *settle*, not at call start: while `promise` is
+ *  in flight it's set to `Infinity` (always share, never re-scan), and only
+ *  once the scan resolves does it get stamped to `Date.now() + TTL`. This is
+ *  what makes a slow scan always shared — a second caller arriving mid-scan
+ *  reuses the same in-flight promise instead of kicking off a duplicate one —
+ *  and it means freshness is measured from when the data actually landed,
+ *  not from when the scan happened to start. The Settings page's GET-then-PUT
+ *  `/github/tokens` round trip is the motivating case: both handlers call
+ *  `remoteHostsForDirs` with the same project list back-to-back, and this
+ *  design guarantees they share one scan no matter how long that scan takes. */
+let remoteHostsCache: { key: string; expiresAt: number; promise: Promise<string[]> } | null = null;
+
+/** Test-only escape hatch: forces the next `remoteHostsForDirs` call (for any
+ *  key) to re-scan instead of reusing a cached promise. Exported rather than
+ *  threading a `{ fresh: true }` option through the production signature,
+ *  since the only caller that ever needs to bypass the cache is a test
+ *  proving the TTL actually expires/cache actually reuses. */
+export function __clearRemoteHostsCacheForTest(): void {
+  remoteHostsCache = null;
+}
+
+async function scanRemoteHosts(dirs: string[]): Promise<string[]> {
+  const hosts = new Set<string>();
+  // Bounded concurrency: each dir costs one `git remote` + up to one `git
+  // remote get-url` per remote (via providerRepoForDir), and the Settings
+  // page can list dozens of projects — an unbounded Promise.all over all of
+  // them would burst that many subprocesses at once. Same pool-worker shape
+  // as listGitHubItemsAcrossRepos (github.ts) / listItemsAcrossRepos
+  // (git-host.ts): a shared `next` cursor, workers pull the next index until
+  // exhausted, order doesn't matter since results only feed a Set.
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= dirs.length) return;
+      const dir = dirs[i]!;
+      const info = await providerRepoForDir(dir);
+      if (info) hosts.add(info.remoteHost);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(REMOTE_HOSTS_POOL_SIZE, dirs.length) }, worker));
+  return Array.from(hosts).sort();
+}
+
+/**
+ * Distinct raw remote hosts (the ssh-alias identity, or the provider's own
+ * domain for a plain remote) across the given project dirs, sorted — drives
+ * the Settings "detected hosts" suggestion list so a user's real aliases are
+ * one click away instead of hand-typed. Provider-generic via
+ * `providerRepoForDir`: considers every dir whose remotes — walked
+ * origin-first, same order `providerRepoForDir` tries them in — yield a
+ * supported provider (github.com, gitlab.com, or bitbucket.org) anywhere in
+ * that walk, not just via its first remote. Dirs with no supported-provider
+ * remote (or that aren't a repo at all) are tolerated silently, same as
+ * `providerRepoForDir` itself returning null.
+ *
+ * `dirs` is normalized (deduped via `Set`, then sorted) before it's used both
+ * as the cache key and as the input to the scan, mirroring the sibling pools
+ * (`listGitHubItemsAcrossRepos` in github.ts, `listItemsAcrossRepos` in
+ * git-host.ts) — this also means a caller passing the same dir twice doesn't
+ * pay for scanning it twice.
+ *
+ * Result is cached (10s TTL, single-slot — see `remoteHostsCache` above) per
+ * distinct normalized-dirs key: the Settings "/github/tokens" GET and PUT
+ * handlers both call this with the same project list back-to-back (GET on
+ * page load, PUT immediately after on every token save), so without a cache
+ * a single Settings save always re-runs the whole scan twice. A cache miss
+ * beyond the TTL just re-scans; staleness cost is a newly-added project's
+ * host not appearing in the detected list for up to 10s, which self-heals on
+ * the next Settings open (see docs/plans/consolidate-git-host-discovery.md
+ * §7).
+ */
+export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
+  const normalizedDirs = Array.from(new Set(dirs.filter((d) => d.trim()))).sort();
+  const key = normalizedDirs.join("\0");
+  const now = Date.now();
+  if (remoteHostsCache && remoteHostsCache.key === key && remoteHostsCache.expiresAt > now) {
+    return remoteHostsCache.promise;
+  }
+  const promise = scanRemoteHosts(normalizedDirs);
+  const slot = { key, expiresAt: Infinity, promise };
+  remoteHostsCache = slot;
+  // Don't cache rejections: on failure, clear the slot (only if it's still
+  // the one we just set — a later call may have already replaced it) so the
+  // next call retries instead of replaying a stale error. On success, anchor
+  // the TTL here at settle time rather than at call start.
+  promise.then(
+    () => {
+      if (remoteHostsCache === slot) slot.expiresAt = Date.now() + REMOTE_HOSTS_CACHE_TTL_MS;
+    },
+    () => {
+      if (remoteHostsCache === slot) remoteHostsCache = null;
+    },
+  );
+  return promise;
 }
 
 /**

@@ -10,6 +10,9 @@ const {
   repoBasePath,
   resolveUrl,
   apiErrorMessage,
+  bitbucketAccessHint,
+  bitbucketViewerAccessHint,
+  errorFrom,
   normalizeBitbucketUser,
   normalizeBitbucketPull,
   normalizeBitbucketIssue,
@@ -61,11 +64,121 @@ test("apiErrorMessage falls back to `status statusText` for a malformed/absent b
   expect(apiErrorMessage({ error: "not an object" }, 400, "Bad Request")).toBe("400 Bad Request");
 });
 
-test("apiErrorMessage gives a 401 an actionable credentials hint, wrapping the underlying message", () => {
+// The 401 actionable-credentials hint moved out of apiErrorMessage (now a
+// pure body/status extractor, matching gitlab.ts's apiError) and into
+// bitbucketAccessHint/errorFrom — see bitbucket-network.test.ts for coverage
+// of the enriched wording end-to-end.
+test("apiErrorMessage extracts the plain body.error.message on a 401, with no enrichment", () => {
   const msg = apiErrorMessage({ error: { message: "Invalid credentials" } }, 401, "Unauthorized");
-  expect(msg).toContain("Invalid credentials");
-  expect(msg).toContain("configure credentials in Settings");
-  expect(msg).toContain("Basic auth: email:api_token");
+  expect(msg).toBe("Invalid credentials");
+});
+
+// ---------------------------------------------------------------------------
+// bitbucketAccessHint — alias-host credential UX (fix-bitbucket-alias-host-
+// credentials.md §3/§5). Repo always carries a synthetic alias remoteHost
+// ("bitbucket-work.com"), never a real one.
+// ---------------------------------------------------------------------------
+
+const ALIAS_REPO = makeBitbucketRepo("acme", "app", "bitbucket-work.com");
+const NOT_FOUND_MSG = "You may not have access to this repository or it no longer exists in this workspace.";
+
+test("bitbucketAccessHint on a 404 with no prior credential names the repo, host, Settings section, and credential format, and preserves the original message", () => {
+  const hint = bitbucketAccessHint(404, NOT_FOUND_MSG, ALIAS_REPO, false);
+  expect(hint).toContain("acme/app");
+  expect(hint).toContain(NOT_FOUND_MSG);
+  expect(hint).toContain("bitbucket-work.com");
+  expect(hint).toContain("Settings → Git host tokens");
+  expect(hint).toContain("email:api_token");
+});
+
+test("bitbucketAccessHint on a 404 with a stored (but ineffective) credential additionally calls out a current API token vs a retired app password", () => {
+  const hint = bitbucketAccessHint(404, NOT_FOUND_MSG, ALIAS_REPO, true);
+  expect(hint).toContain("acme/app");
+  expect(hint).toContain(NOT_FOUND_MSG);
+  expect(hint).toContain("bitbucket-work.com");
+  expect(hint).toContain("Settings → Git host tokens");
+  expect(hint).toContain("email:api_token");
+  expect(hint).toContain("current API token, not a retired app password");
+});
+
+test("bitbucketAccessHint on a 403 with no prior credential is enriched the same way as an unauthenticated 404", () => {
+  const hint = bitbucketAccessHint(403, NOT_FOUND_MSG, ALIAS_REPO, false);
+  expect(hint).toContain("acme/app");
+  expect(hint).toContain(NOT_FOUND_MSG);
+  expect(hint).toContain("bitbucket-work.com");
+  expect(hint).toContain("Settings → Git host tokens");
+  expect(hint).toContain("email:api_token");
+});
+
+test("bitbucketAccessHint on an authenticated 403 preserves the real message first — e.g. a branch-restriction merge error — and appends a scope-check pointer to Settings", () => {
+  const branchRestrictionMsg = "Branch restrictions: at least 2 approvals are required to merge this pull request.";
+  const hint = bitbucketAccessHint(403, branchRestrictionMsg, ALIAS_REPO, true);
+  expect(hint.startsWith(branchRestrictionMsg)).toBe(true);
+  expect(hint).toContain("bitbucket-work.com");
+  expect(hint).toContain("Settings → Git host tokens");
+  expect(hint).toContain("lacks the required Bitbucket scopes");
+});
+
+test("bitbucketAccessHint on an authenticated 403 carries the Settings marker phrase the webview panel detects, unlike the pre-fix pass-through", () => {
+  const hint = bitbucketAccessHint(403, "some other authenticated 403 message", ALIAS_REPO, true);
+  expect(hint).toContain(`Settings → Git host tokens`);
+});
+
+test("bitbucketAccessHint on a 401 without a stored credential says to add one", () => {
+  const hint = bitbucketAccessHint(401, "Unauthorized", ALIAS_REPO, false);
+  expect(hint).toContain("bitbucket-work.com");
+  expect(hint).toContain("Settings → Git host tokens");
+  expect(hint).toContain("email:api_token");
+  expect(hint).toContain("add a credential");
+  expect(hint).not.toContain("was rejected; replace it");
+});
+
+test("bitbucketAccessHint on a 401 with a stored credential says it was rejected and to replace it", () => {
+  const hint = bitbucketAccessHint(401, "Unauthorized", ALIAS_REPO, true);
+  expect(hint).toContain("bitbucket-work.com");
+  expect(hint).toContain("Settings → Git host tokens");
+  expect(hint).toContain("was rejected; replace it");
+  expect(hint).not.toContain("add a credential for");
+});
+
+test("bitbucketAccessHint leaves a non-auth status (e.g. 500) unchanged, regardless of hadCreds", () => {
+  expect(bitbucketAccessHint(500, "Internal Server Error", ALIAS_REPO, false)).toBe("Internal Server Error");
+  expect(bitbucketAccessHint(500, "Internal Server Error", ALIAS_REPO, true)).toBe("Internal Server Error");
+});
+
+test("errorFrom threads a Response's status/statusText plus the parsed body into bitbucketAccessHint", () => {
+  const res = new Response(null, { status: 404, statusText: "Not Found" });
+  const hint = errorFrom(res, { type: "error", error: { message: NOT_FOUND_MSG } }, ALIAS_REPO, false);
+  expect(hint).toBe(bitbucketAccessHint(404, NOT_FOUND_MSG, ALIAS_REPO, false));
+});
+
+// ---------------------------------------------------------------------------
+// bitbucketViewerAccessHint — account-flavored wording for /2.0/user
+// failures, never owner/repo (fix-bitbucket-alias-host-credentials.md §3).
+// ---------------------------------------------------------------------------
+
+test("bitbucketViewerAccessHint on a 403/404 talks about the account, names the host, and never mentions owner/repo", () => {
+  for (const status of [403, 404]) {
+    const hint = bitbucketViewerAccessHint(status, "Unauthorized", ALIAS_REPO, false);
+    expect(hint).toContain("your Bitbucket account could not be read");
+    expect(hint).toContain("bitbucket-work.com");
+    expect(hint).toContain("Settings → Git host tokens");
+    expect(hint).not.toContain("acme/app");
+    expect(hint).not.toContain("was not found on Bitbucket");
+  }
+});
+
+test("bitbucketViewerAccessHint on a 401 delegates to the same auth wording as bitbucketAccessHint, for both hadCreds values", () => {
+  expect(bitbucketViewerAccessHint(401, "Unauthorized", ALIAS_REPO, false)).toBe(
+    bitbucketAccessHint(401, "Unauthorized", ALIAS_REPO, false),
+  );
+  expect(bitbucketViewerAccessHint(401, "Unauthorized", ALIAS_REPO, true)).toBe(
+    bitbucketAccessHint(401, "Unauthorized", ALIAS_REPO, true),
+  );
+});
+
+test("bitbucketViewerAccessHint leaves a non-auth status unchanged", () => {
+  expect(bitbucketViewerAccessHint(500, "boom", ALIAS_REPO, false)).toBe("boom");
 });
 
 // ---------------------------------------------------------------------------

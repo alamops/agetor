@@ -5,6 +5,8 @@ import path from "node:path";
 import {
   providerForHost,
   providerRepoForDir,
+  remoteHostsForDirs,
+  __clearRemoteHostsCacheForTest,
   gitlabToken,
   bitbucketCreds,
 } from "./git-provider.ts";
@@ -32,6 +34,11 @@ beforeEach(() => {
     savedEnv[key] = process.env[key];
     delete process.env[key];
   }
+  // remoteHostsForDirs caches by sorted-dirs key; each test below uses its own
+  // fresh mkdtemp dirs so cross-test collisions can't happen in practice, but
+  // clearing up front keeps every test's cache behavior self-contained and
+  // independent of suite run order.
+  __clearRemoteHostsCacheForTest();
 });
 
 afterEach(() => {
@@ -161,6 +168,54 @@ test("providerRepoForDir falls through to another remote when origin is unsuppor
     owner: "acme",
     name: "app",
   });
+});
+
+// ---------------------------------------------------------------------------
+// remoteHostsForDirs (moved from github.ts — reimplemented over
+// providerRepoForDir, docs/plans/consolidate-git-host-discovery.md)
+// ---------------------------------------------------------------------------
+
+test("remoteHostsForDirs returns the sorted alias hosts of every supported provider (github/gitlab/bitbucket), excluding an unsupported host, and tolerates a dir that isn't a repo", async () => {
+  const githubDir = await makeRepoWithRemotes([{ name: "origin", url: "git@github-work.com:a/b.git" }]);
+  const bitbucketDir = await makeRepoWithRemotes([{ name: "origin", url: "git@bitbucket-work.com:w/r.git" }]);
+  const gitlabDir = await makeRepoWithRemotes([{ name: "origin", url: "git@gitlab-work.io:g/p.git" }]);
+  const unsupportedDir = await makeRepoWithRemotes([{ name: "origin", url: "git@example.com:x/y.git" }]);
+  // A dir that isn't a git repo at all (but does exist) — must be tolerated
+  // silently, same as providerRepoForDir returning null for it.
+  const notARepoDir = mkdtempSync(path.join(tmpdir(), "agetor-remote-hosts-plain-"));
+  createdDirs.push(notARepoDir);
+
+  const hosts = await remoteHostsForDirs([githubDir, bitbucketDir, gitlabDir, unsupportedDir, notARepoDir]);
+  expect(hosts).toEqual(["bitbucket-work.com", "github-work.com", "gitlab-work.io"]);
+});
+
+test("remoteHostsForDirs caches within the TTL: a second call for the same dirs reuses the first scan even after the repo's remote changes, and __clearRemoteHostsCacheForTest() bypasses it", async () => {
+  const dir = await makeRepoWithRemotes([{ name: "origin", url: "git@github-host-one.example:a/b.git" }]);
+
+  const first = await remoteHostsForDirs([dir]);
+  expect(first).toEqual(["github-host-one.example"]);
+
+  // Mutate the remote after the first scan. Within the TTL, a second call for
+  // the exact same dir list must reuse the cached promise/result rather than
+  // re-scanning — this is the GET-then-PUT /github/tokens back-to-back-scan
+  // case the cache exists for.
+  await git(["remote", "set-url", "origin", "git@github-host-two.example:a/b.git"], dir);
+  const second = await remoteHostsForDirs([dir]);
+  expect(second).toEqual(["github-host-one.example"]);
+
+  // Bypassing the cache observes the mutation immediately.
+  __clearRemoteHostsCacheForTest();
+  const third = await remoteHostsForDirs([dir]);
+  expect(third).toEqual(["github-host-two.example"]);
+});
+
+test("remoteHostsForDirs processes every dir even when the dir count exceeds the concurrency pool size", async () => {
+  const hosts = ["a", "b", "c", "d", "e", "f", "g", "h"];
+  const dirs = await Promise.all(
+    hosts.map((h) => makeRepoWithRemotes([{ name: "origin", url: `git@github-pool-${h}.example:x/y.git` }])),
+  );
+  const result = await remoteHostsForDirs(dirs);
+  expect(result).toEqual(hosts.map((h) => `github-pool-${h}.example`).sort());
 });
 
 // ---------------------------------------------------------------------------

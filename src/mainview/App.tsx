@@ -673,6 +673,18 @@ export default function App() {
     }
   }, [confirm, refresh, surfaceError]);
 
+  // Shared by GitHubDialog's `onClose` and `onOpenSettings` (the latter also
+  // opens SettingsDialog) so the three-setter teardown can't drift out of
+  // sync between the two call sites — both must clear the dialog's own open
+  // state and both prefill kinds, or a later plain "GitHub" open (no
+  // prefill) could inherit a stale project/task from whichever prefill path
+  // was last used.
+  const closeGithubDialog = useCallback(() => {
+    setGithubOpen(false);
+    setGithubPullPrefill(null);
+    setGithubPullDetailPrefill(null);
+  }, []);
+
   return (
     <div className="flex h-screen w-screen flex-col bg-background text-foreground">
       {/* Top app bar sits on the same row as the macOS traffic lights (see
@@ -889,10 +901,10 @@ export default function App() {
         initialProjectPath={githubPullDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
         pullPrefill={githubPullPrefill}
         pullDetailPrefill={githubPullDetailPrefill}
-        onClose={() => {
-          setGithubOpen(false);
-          setGithubPullPrefill(null);
-          setGithubPullDetailPrefill(null);
+        onClose={closeGithubDialog}
+        onOpenSettings={() => {
+          closeGithubDialog();
+          setSettingsOpen(true);
         }}
       />
       <WorktreesDialog

@@ -8,6 +8,7 @@ import path from "node:path";
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { makeBitbucketPrJson, makeBitbucketRepo, mockGitHubFetch } from "./bitbucket-test-util.ts";
 import type { MockRoute } from "./bitbucket-test-util.ts";
+import { setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
   closeBitbucketPull,
   createBitbucketComment,
@@ -127,13 +128,49 @@ test("listBitbucketItems resolves the viewer uuid via GET /2.0/user only when cr
   }
 });
 
-test("listBitbucketItems (issues) maps a 404 to the issue-tracker-disabled friendly error", async () => {
+test("listBitbucketItems (issues) maps a 404 to the issue-tracker-disabled friendly error — WITH a credential present (the shortcut only fires once authed)", async () => {
   const mock = mockGitHubFetch([{ match: "/issues", status: 404, json: { error: { message: "Not Found" } } }]);
   try {
+    // REPO carries no per-host stored token, but beforeAll's BITBUCKET_TOKEN
+    // env fallback means a credential IS sent here — this is the authed case.
     const res = await listBitbucketItems(REPO, { kind: "issues", state: "open" });
     expect(res).toEqual({ ok: false, error: "issue tracker is not enabled for this repository" });
   } finally {
     mock.restore();
+  }
+});
+
+test("listBitbucketItems (issues) with NO credential at all surfaces the enriched Settings hint instead of the issue-tracker-disabled shortcut — an unauthed 404 is ambiguous", async () => {
+  const priorToken = process.env.BITBUCKET_TOKEN;
+  const priorEmail = process.env.BITBUCKET_EMAIL;
+  delete process.env.BITBUCKET_TOKEN;
+  delete process.env.BITBUCKET_EMAIL;
+  const aliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work.com");
+  const mock = mockGitHubFetch([
+    {
+      match: "/issues",
+      status: 404,
+      json: {
+        type: "error",
+        error: { message: "You may not have access to this repository or it no longer exists in this workspace." },
+      },
+    },
+  ]);
+  try {
+    const res = await listBitbucketItems(aliasRepo, { kind: "issues", state: "open" });
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).not.toContain("issue tracker is not enabled");
+    expect(res.error).toContain("bitbucket-work.com");
+    expect(res.error).toContain("Settings → Git host tokens");
+    expect(res.error).toContain("email:api_token");
+    expect(mock.calls[0]!.headers.authorization).toBeUndefined();
+  } finally {
+    mock.restore();
+    if (priorToken === undefined) delete process.env.BITBUCKET_TOKEN;
+    else process.env.BITBUCKET_TOKEN = priorToken;
+    if (priorEmail === undefined) delete process.env.BITBUCKET_EMAIL;
+    else process.env.BITBUCKET_EMAIL = priorEmail;
   }
 });
 
@@ -145,7 +182,8 @@ test("listBitbucketItems maps a 401 to a friendly error mentioning credential co
     const res = await listBitbucketItems(REPO, { kind: "pulls", state: "open" });
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("expected failure");
-    expect(res.error).toContain("configure credentials in Settings");
+    expect(res.error).toContain("Settings → Git host tokens");
+    expect(res.error).toContain("was rejected; replace it in");
   } finally {
     mock.restore();
   }
@@ -178,6 +216,57 @@ test("email:token credentials send Authorization: Basic base64(email:token)", as
     mock.restore();
     process.env.BITBUCKET_TOKEN = "test-token";
     delete process.env.BITBUCKET_EMAIL;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Alias-host credential resolution (fix-bitbucket-alias-host-credentials.md
+// §5) — a repo reached through an ssh host alias like `bitbucket-work.com`.
+// ---------------------------------------------------------------------------
+
+test("a stored credential for the alias host authenticates the outgoing request with Basic email:api_token", async () => {
+  setGitHubToken("bitbucket-work.com", "user@example.com:storedtoken456");
+  const aliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work.com");
+  const mock = mockGitHubFetch([{ match: "/2.0/user", json: { nickname: "octo" } }]);
+  try {
+    const res = await getBitbucketViewer(aliasRepo);
+    expect(res).toEqual({ ok: true, login: "octo" });
+    const expected = `Basic ${Buffer.from("user@example.com:storedtoken456").toString("base64")}`;
+    expect(mock.calls[0]!.headers.authorization).toBe(expected);
+  } finally {
+    mock.restore();
+    deleteGitHubToken("bitbucket-work.com");
+  }
+});
+
+test("no credential at all (alias host, no stored entry, no env) sends an unauthenticated request, and Bitbucket's real 404 body surfaces enriched with host + Settings + email:api_token, preserving the original message", async () => {
+  const priorToken = process.env.BITBUCKET_TOKEN;
+  const priorEmail = process.env.BITBUCKET_EMAIL;
+  delete process.env.BITBUCKET_TOKEN;
+  delete process.env.BITBUCKET_EMAIL;
+  const aliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work.com");
+  const bitbucketBody = {
+    type: "error",
+    error: { message: "You may not have access to this repository or it no longer exists in this workspace." },
+  };
+  const mock = mockGitHubFetch([
+    { match: "/2.0/repositories/acme/app", status: 404, json: bitbucketBody },
+  ]);
+  try {
+    const res = await getBitbucketPullDefaults(aliasRepo);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(mock.calls[0]!.headers.authorization).toBeUndefined();
+    expect(res.error).toContain("bitbucket-work.com");
+    expect(res.error).toContain("Settings → Git host tokens");
+    expect(res.error).toContain("email:api_token");
+    expect(res.error).toContain(bitbucketBody.error.message);
+  } finally {
+    mock.restore();
+    if (priorToken === undefined) delete process.env.BITBUCKET_TOKEN;
+    else process.env.BITBUCKET_TOKEN = priorToken;
+    if (priorEmail === undefined) delete process.env.BITBUCKET_EMAIL;
+    else process.env.BITBUCKET_EMAIL = priorEmail;
   }
 });
 

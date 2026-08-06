@@ -17,6 +17,20 @@ export const TMUX_MISSING_REASON = "tmux is required to drive claude-code intera
  * claude and codex drivers emit it and the orchestrator consumes it. */
 export const SESSION_DIED_STATUS_PREFIX = "session ended: ";
 
+/**
+ * The Settings section name where per-host git credentials live, interpolated
+ * into the server-side credential-error hints (github.ts `privateRepoHint`,
+ * gitlab.ts `authHint`, bitbucket.ts `bitbucketAccessHint` and friends) as
+ * `Settings → ${GIT_HOST_TOKENS_SECTION}`, and reused as the section's own
+ * label (GitHubTokensSection.tsx). The webview pattern-matches that same
+ * phrase to recognize a credential error and swap the bare error row for an
+ * actionable explainer panel (GitHubDialog.tsx / credential-error.ts). This
+ * constant keeps those three — server hints, the section label, and the
+ * webview's detection — in sync; it does NOT guarantee a full rename, since
+ * the setup guide (GitHubSetupDialog) still names the section in informal
+ * prose that won't follow a change here. */
+export const GIT_HOST_TOKENS_SECTION = "Git host tokens";
+
 export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "backlog", label: "Backlog" },
   { id: "ready", label: "Ready" },

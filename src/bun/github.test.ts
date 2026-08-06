@@ -1306,3 +1306,7 @@ test("parseGitRemote preserves rawHost for a github ssh host alias while canonic
     name: "r",
   });
 });
+
+// remoteHostsForDirs moved to git-provider.ts, reimplemented over
+// providerRepoForDir (docs/plans/consolidate-git-host-discovery.md) — its
+// test moved with it, to git-provider.test.ts.

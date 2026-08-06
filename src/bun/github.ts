@@ -62,6 +62,7 @@ import type {
   GitHubWorkflowsResult,
   TaskDiff,
 } from "../shared/types.ts";
+import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { tokenForHost } from "./github-tokens.ts";
 
@@ -832,20 +833,6 @@ export async function repoForDir(dir: string): Promise<GitHubRepo | null> {
   return null;
 }
 
-/** Distinct raw GitHub hosts (the ssh-alias identity, or `github.com` for a
- *  plain remote) across the given project dirs, sorted — drives the Settings
- *  "detected hosts" suggestion list so a user's real aliases are one click
- *  away instead of hand-typed. Dirs with no GitHub remote (or that aren't a
- *  repo at all) are tolerated silently, same as `repoForDir`. */
-export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
-  const repos = await Promise.all(dirs.map((dir) => repoForDir(dir)));
-  const hosts = new Set<string>();
-  for (const repo of repos) {
-    if (repo) hosts.add(repo.remoteHost);
-  }
-  return Array.from(hosts).sort();
-}
-
 /** Resolve the token to authenticate a GitHub request with, for a repo whose
  *  raw remote host is `host` (null when there's no repo in scope). Order:
  *  (1) a stored token for `host` (or the `github.com` default entry —
@@ -1291,7 +1278,7 @@ function apiError(body: unknown, status: number, statusText: string): string {
 function privateRepoHint(status: number, message: string, repo: GitHubRepo, hadToken: boolean): string {
   if (status !== 404) return message;
   const host = repo.remoteHost || "github.com";
-  const base = `${repo.owner}/${repo.name} was not found on GitHub — if the repo is private, add a token for ${host} in Settings → GitHub tokens`;
+  const base = `${repo.owner}/${repo.name} was not found on GitHub — if the repo is private, add a token for ${host} in Settings → ${GIT_HOST_TOKENS_SECTION}`;
   return hadToken
     ? `${base} (the configured token cannot access it — check it belongs to the right account)`
     : base;
