@@ -3,6 +3,7 @@ import {
   buildCommand,
   buildHarnessTerminalCommand,
   CLAUDE_PROMPT_ARGV_MAX_BYTES,
+  GEMINI_PROMPT_ARGV_MAX_BYTES,
   isValidEnvKey,
   toTerminalAppleScript,
 } from "./agents.ts";
@@ -16,8 +17,10 @@ beforeEach(() => {
   // absolute path in argv[0] and the equality checks would drift per host.
   process.env.AGETOR_CLAUDE_BIN = "claude";
   process.env.AGETOR_CODEX_BIN = "codex";
+  process.env.AGETOR_GEMINI_BIN = "gemini";
   delete process.env.AGETOR_CLAUDE_ARGS;
   delete process.env.AGETOR_CODEX_ARGS;
+  delete process.env.AGETOR_GEMINI_ARGS;
 });
 
 /** Build a built-in harness for tests — kind doubles as id, no overrides. */
@@ -53,6 +56,9 @@ function alias(kind: AgentKind, opts: { home?: string; bin?: string; env?: Recor
 // will now always pass at runtime.
 const claudeDefaults = { mode: "auto", model: "opus-4.7", effort: "high" } as const;
 const codexDefaults = { mode: "auto", model: "gpt-5-codex", effort: "high" } as const;
+// Gemini has no effort flag at all (see MODEL_EFFORT_SUPPORT.gemini in
+// shared/types.ts) — buildCommand's gemini branch never reads opts.effort.
+const geminiDefaults = { mode: "auto", model: "gemini-3-pro-preview" } as const;
 
 test("aliased claude-code with a config-dir override emits CLAUDE_CONFIG_DIR (not HOME)", () => {
   // HOME is deliberately not overridden — see harnessEnv: re-homing breaks
@@ -494,6 +500,123 @@ test("codex throws when effort is missing for a model that supports it", () => {
   expect(() =>
     buildCommand(builtin("codex"), "hi", { mode: "auto", model: "gpt-5" }),
   ).toThrow(/effort is required/);
+});
+
+// Prompt rides in argv (`-p <prompt>`) — see GEMINI_PROMPT_ARGV_MAX_BYTES's
+// doc comment for why this differs from codex's stdin delivery.
+test("gemini with defaults emits -m + stream-json + --yolo + --skip-trust, prompt via -p", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults });
+  expect(cmd).toEqual([
+    "gemini",
+    "-m", "gemini-3-pro-preview",
+    "--output-format", "stream-json",
+    "--yolo",
+    "--skip-trust",
+    "-p", "hi",
+  ]);
+});
+
+test("gemini 'ask' mode uses --approval-mode plan instead of --yolo", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, mode: "ask" });
+  expect(cmd).not.toContain("--yolo");
+  expect(cmd).toEqual([
+    "gemini",
+    "-m", "gemini-3-pro-preview",
+    "--output-format", "stream-json",
+    "--approval-mode", "plan",
+    "--skip-trust",
+    "-p", "hi",
+  ]);
+});
+
+test("gemini resumeSessionId adds --resume <id> to the argv (no --session-id)", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", {
+    ...geminiDefaults,
+    resumeSessionId: "b89c9f01-1938-474f-b8be-19be0dc071ad",
+  });
+  const i = cmd.indexOf("--resume");
+  expect(i).toBeGreaterThan(-1);
+  expect(cmd[i + 1]).toBe("b89c9f01-1938-474f-b8be-19be0dc071ad");
+  expect(cmd).not.toContain("--session-id");
+});
+
+test("gemini sessionId adds --session-id <uuid> to the argv", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", {
+    ...geminiDefaults,
+    sessionId: "550e8400-e29b-41d4-a716-446655440000",
+  });
+  const i = cmd.indexOf("--session-id");
+  expect(i).toBeGreaterThan(-1);
+  expect(cmd[i + 1]).toBe("550e8400-e29b-41d4-a716-446655440000");
+});
+
+test("gemini resumeSessionId takes precedence over sessionId", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", {
+    ...geminiDefaults,
+    resumeSessionId: "resumed-id",
+    sessionId: "fresh-id",
+  });
+  expect(cmd).toContain("--resume");
+  expect(cmd).not.toContain("--session-id");
+});
+
+test("gemini without resumeSessionId or sessionId omits both flags", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults });
+  expect(cmd).not.toContain("--resume");
+  expect(cmd).not.toContain("--session-id");
+});
+
+test("gemini throws when model is missing", () => {
+  expect(() =>
+    buildCommand(builtin("gemini"), "hi", { mode: "auto" }),
+  ).toThrow(/model is required/);
+});
+
+test("gemini never requires effort — no flag emitted, no throw, even when omitted", () => {
+  const { cmd, env } = buildCommand(builtin("gemini"), "hi", { mode: "auto", model: "gemini-3-pro-preview" });
+  expect(cmd).toContain("-p");
+  // No effort-shaped flag anywhere in argv, and no env var either.
+  expect(cmd.join(" ")).not.toMatch(/effort/i);
+  expect(env?.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
+});
+
+test("gemini throws when the prompt is missing", () => {
+  expect(() =>
+    buildCommand(builtin("gemini"), "", { ...geminiDefaults }),
+  ).toThrow(/prompt is required/);
+});
+
+test("gemini throws above GEMINI_PROMPT_ARGV_MAX_BYTES — no deferred-paste fallback exists", () => {
+  const prompt = "a".repeat(GEMINI_PROMPT_ARGV_MAX_BYTES + 1);
+  expect(() =>
+    buildCommand(builtin("gemini"), prompt, { ...geminiDefaults }),
+  ).toThrow(/exceeds .* bytes/);
+});
+
+test("gemini stays within GEMINI_PROMPT_ARGV_MAX_BYTES for an at-budget prompt", () => {
+  const prompt = "a".repeat(GEMINI_PROMPT_ARGV_MAX_BYTES);
+  const { cmd } = buildCommand(builtin("gemini"), prompt, { ...geminiDefaults });
+  expect(cmd).toContain(prompt);
+});
+
+test("AGETOR_GEMINI_ARGS extra args land before -p", () => {
+  process.env.AGETOR_GEMINI_ARGS = "--include-directories /tmp/extra";
+  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults });
+  expect(cmd.indexOf("--include-directories")).toBeLessThan(cmd.indexOf("-p"));
+  expect(cmd.slice(-2)).toEqual(["-p", "hi"]);
+});
+
+test("aliased gemini with a home override emits GEMINI_CLI_HOME (not HOME)", () => {
+  // GEMINI_CLI_HOME is gemini's own dedicated home-override env var — unlike
+  // codex, there's no need to also touch the real HOME (verified in the
+  // bundled CLI source; see harnessEnv's doc comment).
+  const result = buildCommand(
+    alias("gemini", { home: "/tmp/agetor-test/gemini-2" }),
+    "hi",
+    { ...geminiDefaults },
+  );
+  expect(result.env?.GEMINI_CLI_HOME).toBe("/tmp/agetor-test/gemini-2");
+  expect(result.env?.HOME).toBeUndefined();
 });
 
 test("claude-code 'max' effort sets CLAUDE_CODE_EFFORT_LEVEL=max env", () => {

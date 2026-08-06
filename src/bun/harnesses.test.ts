@@ -145,3 +145,40 @@ test("getByIdOrKind synthesises a built-in row for legacy kind ids without a mat
   // And unknown ids still return null — no silent fallback to a random kind.
   expect(harnesses.getByIdOrKind("does-not-exist")).toBeNull();
 });
+
+test("gemini is a built-in row (carve-out setEnabled toggle works like every other built-in)", () => {
+  // 033_harness_kind_gemini.sql seeds gemini with enabled=0 (mirrors codex's
+  // 016 disabled-by-default rollout) — verified directly against a fresh
+  // migrate() run in the migrations smoke check, not re-asserted here since
+  // this file's beforeEach unconditionally re-enables every built-in for
+  // test isolation (`UPDATE harnesses SET enabled = 1 WHERE is_builtin = 1`),
+  // which would make a "seeds disabled" assertion here just test the
+  // beforeEach, not the migration.
+  const h = harnesses.get("gemini")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("gemini");
+  expect(harnesses.setEnabled("gemini", false).enabled).toBe(false);
+  expect(harnesses.get("gemini")!.enabled).toBe(false);
+  expect(() => harnesses.update("gemini", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'gemini' and round-trips a gemini alias", () => {
+  const inserted = harnesses.insert({
+    id: "gemini-work",
+    kind: "gemini",
+    label: "Gemini (work)",
+    home: "/tmp/agetor-test-gemini-home",
+    bin: null,
+    env: {},
+  });
+  expect(inserted.kind).toBe("gemini");
+  expect(harnesses.get("gemini-work")!.home).toBe("/tmp/agetor-test-gemini-home");
+});
+
+test("getByIdOrKind synthesises a built-in gemini row for legacy id without a matching row", () => {
+  db.run(`DELETE FROM harnesses WHERE id = ?`, ["gemini"]);
+  const synth = harnesses.getByIdOrKind("gemini");
+  expect(synth?.kind).toBe("gemini");
+  expect(synth?.isBuiltin).toBe(true);
+  expect(synth?.label).toBe("Gemini CLI");
+});

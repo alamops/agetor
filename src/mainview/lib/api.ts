@@ -181,6 +181,7 @@ export interface AvailableExtension {
 export interface AgentModelMap {
   "claude-code": { id: string; label?: string }[];
   "codex": { id: string; label?: string }[];
+  "gemini": { id: string; label?: string }[];
 }
 
 /** Pending multi-question card from claude's built-in AskUserQuestion tool

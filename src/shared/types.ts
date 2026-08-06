@@ -66,7 +66,7 @@ export function isApprovalPrompt(text: string): boolean {
   return APPROVAL_PROMPT_PATTERNS.some((re) => re.test(text));
 }
 
-export type AgentKind = "claude-code" | "codex";
+export type AgentKind = "claude-code" | "codex" | "gemini";
 
 /**
  * A "harness" is the user-facing name for an agent configuration. Built-in
@@ -92,6 +92,12 @@ export interface Harness {
    *    "Not logged in" even with valid tokens.
    *  - codex: emitted as HOME=<home> + CODEX_HOME=<home>/.codex (codex doesn't
    *    use the macOS keychain, so re-homing it is safe).
+   *  - gemini: emitted as GEMINI_CLI_HOME=<home>. Gemini CLI has its own
+   *    dedicated home-override env var (verified in its bundled source —
+   *    `homedir()` returns `process.env.GEMINI_CLI_HOME || os.homedir()`,
+   *    and every gemini state dir — `.gemini/`, session chats, OAuth creds —
+   *    is joined onto that), so unlike codex there's no need to touch the
+   *    real `HOME` at all.
    *  NULL means "inherit the agetor process env". */
   home: string | null;
   /** Optional binary path override. NULL falls back to the AGETOR_*_BIN
@@ -182,6 +188,17 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
     kind: "codex",
     suggestedHarnessId: "codex-2",
     home: "{dataDir}/harnesses/codex-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "gemini-additional",
+    label: "Additional Gemini",
+    description:
+      "Another gemini harness with its own GEMINI_CLI_HOME so login and session history are isolated from the built-in.",
+    kind: "gemini",
+    suggestedHarnessId: "gemini-2",
+    home: "{dataDir}/harnesses/gemini-2",
     bin: null,
     env: {},
   },
@@ -898,10 +915,22 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // usage, so the default stays on the most-capable non-premium tier.
   "claude-code": "opus-5",
   "codex": "gpt-5.5",
+  // gemini-3-pro-preview is the current flagship per google-gemini/gemini-cli
+  // docs (verified 2026-08-06). Deliberately NOT the "auto" alias — a spike
+  // showed "auto" internally routes across mixed pro/flash-lite models even
+  // for simple prompts, which fails "always default to the best available
+  // model" (root CLAUDE.md). Pin an explicit flagship instead.
+  "gemini": "gemini-3-pro-preview",
 };
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
   "codex": "high",
+  // Gemini has no per-invocation effort/thinking-budget flag (verified via
+  // `gemini --help` on CLI 0.54.0 — thinkingBudget/thinkingLevel are
+  // settings.json-only, not scriptable per-task without a race across
+  // concurrent tasks). MODEL_EFFORT_SUPPORT.gemini is empty for every model
+  // so the picker collapses; this default is unused but kept for symmetry.
+  "gemini": "high",
 };
 
 /**
@@ -927,6 +956,11 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
 export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> = {
   "claude-code": { code: "auto", plan: "plan" },
   "codex": { code: "auto", plan: "ask" },
+  // Gemini's `--approval-mode plan` is a real read-only mode (verified via
+  // `gemini --help` on CLI 0.54.0), closer to claude's native `plan` than
+  // codex's read-only-sandbox stand-in — but reuse codex's "ask" id since
+  // AGENT_OPTIONS.gemini.modes below labels it the same "Read-only" way.
+  "gemini": { code: "auto", plan: "ask" },
 };
 
 /**
@@ -997,6 +1031,17 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
   },
+  // Empty for every model: gemini has no per-invocation effort flag (see
+  // DEFAULT_EFFORT.gemini comment above). supportedEfforts() falls back to
+  // [] for any model key here, which collapses the effort picker in the UI —
+  // the same treatment claude-code's haiku-4.5 gets.
+  gemini: {
+    "gemini-3-pro-preview": [],
+    "gemini-3.1-pro-preview": [],
+    "gemini-2.5-pro": [],
+    "gemini-3.5-flash": [],
+    "gemini-2.5-flash": [],
+  },
 };
 
 /**
@@ -1038,6 +1083,7 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
     "haiku-4.5": [],
   },
   codex: {},
+  gemini: {},
 };
 
 export function supportedModes(agent: AgentKind, model: string | null): AgentOption[] {
@@ -1087,6 +1133,22 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     ],
     efforts: EFFORT_OPTIONS,
   },
+  gemini: {
+    models: [
+      { id: "gemini-3-pro-preview", label: "Gemini 3 Pro (preview)", hint: "Recommended default — current flagship." },
+      { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Newer preview tier." },
+      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "Prior stable flagship." },
+      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost." },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, prior generation." },
+    ],
+    modes: [
+      { id: "auto", label: "Auto (yolo)", hint: "Edit files without approval prompts (--yolo)." },
+      { id: "ask", label: "Read-only", hint: "Inspect only — gemini can't modify files (--approval-mode plan)." },
+    ],
+    // No model in MODEL_EFFORT_SUPPORT.gemini accepts the effort flag, so the
+    // picker collapses for every model — see EFFORT_OPTIONS list comment.
+    efforts: EFFORT_OPTIONS,
+  },
 };
 
 export type RunStatus =
@@ -1130,6 +1192,15 @@ export interface Run {
    * for claude-code and legacy rows.
    */
   codexSessionId: string | null;
+  /**
+   * Gemini CLI's own per-session uuid — self-issued by agetor (not
+   * discovered from the CLI) and passed as `--session-id` on the first turn,
+   * `--resume` on every follow-up. Captured synchronously at spawn time
+   * (mirrors claude's pre-generated-uuid pattern), unlike codex's
+   * discovered-from-an-event `codexSessionId`. NULL for claude-code/codex
+   * and legacy rows.
+   */
+  geminiSessionId: string | null;
   /**
    * How this run came to exist. `null`/undefined = user-initiated (Run
    * button, a follow-up message typed into the panel — every run before

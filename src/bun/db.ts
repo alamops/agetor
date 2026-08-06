@@ -561,11 +561,12 @@ export const harnesses = {
   getByIdOrKind(id: string): Harness | null {
     const direct = this.get(id);
     if (direct) return direct;
-    if (id === "claude-code" || id === "codex") {
+    if (id === "claude-code" || id === "codex" || id === "gemini") {
+      const label = id === "claude-code" ? "Claude Code" : id === "codex" ? "Codex" : "Gemini CLI";
       return {
         id,
         kind: id,
-        label: id === "claude-code" ? "Claude Code" : "Codex",
+        label,
         isBuiltin: true,
         home: null,
         bin: null,
@@ -581,7 +582,7 @@ export const harnesses = {
         `invalid harness id "${input.id}" — must match ${HARNESS_ID_RE}`,
       );
     }
-    if (input.kind !== "claude-code" && input.kind !== "codex") {
+    if (input.kind !== "claude-code" && input.kind !== "codex" && input.kind !== "gemini") {
       throw new Error(`unknown harness kind: ${input.kind}`);
     }
     const now = Date.now();
@@ -684,6 +685,7 @@ type RunRow = {
   tmux_session: string | null;
   claude_session_id: string | null;
   codex_session_id: string | null;
+  gemini_session_id: string | null;
   origin: string | null;
 };
 
@@ -698,6 +700,7 @@ const toRun = (r: RunRow): Run => ({
   tmuxSession: r.tmux_session,
   claudeSessionId: r.claude_session_id,
   codexSessionId: r.codex_session_id,
+  geminiSessionId: r.gemini_session_id,
   origin: (r.origin as Run["origin"]) ?? null,
 });
 
@@ -717,9 +720,9 @@ export const runs = {
    *  bun:sqlite would otherwise bind. */
   insert(r: Run): Run {
     db.run(
-      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, origin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.origin ?? null],
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, gemini_session_id, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.geminiSessionId, r.origin ?? null],
     );
     return { ...r, origin: r.origin ?? null };
   },
@@ -729,8 +732,8 @@ export const runs = {
     const current = toRun(row);
     const next: Run = { ...current, ...patch, id };
     db.run(
-      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=? WHERE id=?`,
-      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, id],
+      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, gemini_session_id=? WHERE id=?`,
+      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.geminiSessionId, id],
     );
     return next;
   },

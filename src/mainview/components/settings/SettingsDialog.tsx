@@ -85,6 +85,31 @@ function resolveTemplate(t: HarnessTemplate, dataDir: string): HarnessTemplate {
  *  picking the same template twice doesn't pre-fill a colliding id (the
  *  uniqueness check would catch it on save, but bumping up front avoids the
  *  papercut of having to manually rename every time). */
+/**
+ * Per-kind copy for the "Add harness" home-override field: the field label,
+ * the slug used to build the suggested placeholder path, and the help text
+ * explaining what env var the override sets. Table-driven rather than a
+ * ternary chain because a third kind (gemini) made the binary claude/codex
+ * ternary genuinely hard to read.
+ */
+const HARNESS_HOME_COPY: Record<AgentKind, { label: string; slug: string; help: string }> = {
+  "claude-code": {
+    label: "CLAUDE_CONFIG_DIR override (absolute path; optional)",
+    slug: "claude-2",
+    help: "Sets CLAUDE_CONFIG_DIR on spawn — claude stores config, sessions, and login under this path, so a separate path gives this harness its own account. Authenticate by running: CLAUDE_CONFIG_DIR=<path> claude /login.",
+  },
+  codex: {
+    label: "HOME override (absolute path; optional)",
+    slug: "codex-2",
+    help: "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account.",
+  },
+  gemini: {
+    label: "GEMINI_CLI_HOME override (absolute path; optional)",
+    slug: "gemini-2",
+    help: "Sets GEMINI_CLI_HOME on spawn — gemini stores its login, sessions, and settings under this path (a dedicated override, not the real HOME), so a separate path gives this harness its own account.",
+  },
+};
+
 function uniqueHarnessId(base: string, existing: Set<string>): string {
   if (!base || !existing.has(base)) return base;
   const m = base.match(/^(.*?)(\d+)$/);
@@ -538,7 +563,7 @@ function ListView({
                         disabled
                       </span>
                     )}
-                    {h.kind === "codex" && (
+                    {(h.kind === "codex" || h.kind === "gemini") && (
                       <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
                         experimental
                       </span>
@@ -603,7 +628,7 @@ function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
       </p>
       <div className="space-y-1.5">
         {HARNESS_TEMPLATES.map((t) => {
-          const experimental = t.kind === "codex";
+          const experimental = t.kind === "codex" || t.kind === "gemini";
           return (
             <button
               key={t.id}
@@ -746,9 +771,9 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
-        <div className="grid grid-cols-2 gap-1">
-          {(["claude-code", "codex"] as AgentKind[]).map((k) => {
-            const experimental = k === "codex";
+        <div className="grid grid-cols-3 gap-1">
+          {(["claude-code", "codex", "gemini"] as AgentKind[]).map((k) => {
+            const experimental = k === "codex" || k === "gemini";
             return (
               <Button
                 key={k}
@@ -772,23 +797,19 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">
-          {kind === "claude-code"
-            ? "CLAUDE_CONFIG_DIR override (absolute path; optional)"
-            : "HOME override (absolute path; optional)"}
+          {HARNESS_HOME_COPY[kind].label}
         </label>
         <Input
           value={home}
           onChange={(e) => setHome(e.target.value)}
           placeholder={
             dataDir
-              ? abbreviateHome(`${dataDir}/harnesses/${kind === "codex" ? "codex-2" : "claude-2"}`, homeDir)
+              ? abbreviateHome(`${dataDir}/harnesses/${HARNESS_HOME_COPY[kind].slug}`, homeDir)
               : "~/.agetor/harnesses/claude-2"
           }
         />
         <p className="text-[11px] leading-snug text-muted-foreground">
-          {kind === "claude-code"
-            ? "Sets CLAUDE_CONFIG_DIR on spawn — claude stores config, sessions, and login under this path, so a separate path gives this harness its own account. Authenticate by running: CLAUDE_CONFIG_DIR=<path> claude /login."
-            : "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account."}
+          {HARNESS_HOME_COPY[kind].help}
           {" "}Leave empty to share the default account.
         </p>
       </div>

@@ -266,6 +266,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   const agentCache = useRef<Record<AgentKind, { mode: string; model: string; effort: string | null }>>({
     "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"] },
     "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"] },
+    "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"] },
   });
 
   // Seed mode + model + effort defaults from the last submitted picks,
@@ -305,6 +306,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
       };
       seed("claude-code");
       seed("codex");
+      seed("gemini");
       const active = agentCache.current[kind];
       setMode(active.mode);
       setModel(active.model);
@@ -792,6 +794,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                     title={
                       kind === "codex"
                         ? "Codex has no native plan mode — routed to 'ask' so nothing auto-executes."
+                        : kind === "gemini"
+                        ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
                         : "Plan only — agent describes what it would do without making changes."
                     }
                   >

@@ -18,6 +18,7 @@ let sandbox: string | null = null;
 beforeEach(() => {
   delete process.env.AGETOR_CODEX_BIN;
   delete process.env.AGETOR_CLAUDE_BIN;
+  delete process.env.AGETOR_GEMINI_BIN;
   delete process.env.AGETOR_TMUX_BIN;
   sandbox = null;
 });
@@ -55,6 +56,23 @@ test("returns available=false with install hint when the bin is missing", async 
   expect(status.path).toBeNull();
   expect(status.reason).toContain("not found on PATH");
   expect(status.installHint).toContain("codex");
+});
+
+test("returns available=true with version for a real gemini binary (no tmux dependency, like codex)", async () => {
+  process.env.AGETOR_GEMINI_BIN = "/bin/echo";
+  const status = await checkAgent("gemini");
+  expect(status.available).toBe(true);
+  expect(status.path).toBe("/bin/echo");
+  expect(status.reason).toBeNull();
+});
+
+test("gemini returns available=false with install hint when the bin is missing", async () => {
+  process.env.AGETOR_GEMINI_BIN = "definitely-not-a-real-binary-xyz123";
+  const status = await checkAgent("gemini");
+  expect(status.available).toBe(false);
+  expect(status.path).toBeNull();
+  expect(status.reason).toContain("not found on PATH");
+  expect(status.installHint).toContain("gemini");
 });
 
 /**

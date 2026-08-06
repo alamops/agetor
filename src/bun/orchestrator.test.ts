@@ -438,6 +438,7 @@ test("sendInput to an archived task auto-unarchives it and restores the worktree
       tmuxSession: null,
       claudeSessionId: null,
       codexSessionId: null,
+      geminiSessionId: null,
     });
 
     const archived = await archiveTask(taskId);

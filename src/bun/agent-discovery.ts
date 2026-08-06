@@ -85,6 +85,16 @@ async function discoverClaude(): Promise<DiscoveredModel[]> {
   return [];
 }
 
+/**
+ * Gemini CLI has no documented programmatic model-list command either
+ * (checked `gemini --help` on CLI 0.54.0 — no such flag/subcommand exists).
+ * Same treatment as claude: empty list, UI stays on the hardcoded
+ * AGENT_OPTIONS.gemini.
+ */
+async function discoverGemini(): Promise<DiscoveredModel[]> {
+  return [];
+}
+
 const cache = new Map<AgentKind, DiscoveredModel[]>();
 let inflight: Promise<void> | null = null;
 
@@ -101,9 +111,10 @@ export function getDiscoveredModels(agent: AgentKind): DiscoveredModel[] {
 export async function refreshDiscoveredModels(): Promise<void> {
   if (inflight) return inflight;
   inflight = (async () => {
-    const [codex, claude] = await Promise.all([discoverCodex(), discoverClaude()]);
+    const [codex, claude, gemini] = await Promise.all([discoverCodex(), discoverClaude(), discoverGemini()]);
     cache.set("codex", codex);
     cache.set("claude-code", claude);
+    cache.set("gemini", gemini);
   })().finally(() => { inflight = null; });
   return inflight;
 }

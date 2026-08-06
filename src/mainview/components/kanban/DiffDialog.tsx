@@ -539,7 +539,11 @@ export function DiffDialog({ open, task, onClose }: Props) {
   const liveRunId = task?.runId ?? null;
   // Mirrors RunPanel.tsx's `resumableRunId`: claude-code can resume from its
   // most recent run even once `task.runId` has been cleared (orphan-
-  // reconciled); codex has no resume mechanism.
+  // reconciled); codex and gemini are excluded here — both technically CAN
+  // resume via a taskId-scoped session lookup (codex_session_id /
+  // gemini_session_id), but this affordance intentionally stays claude-only
+  // pending a product decision on whether one-shot-per-turn agents should
+  // offer ad-hoc resume from the diff-compose flow.
   const resumableRunId = liveRunId ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
   const modalPending = interactions.length > 0;
   const archived = task?.archivedAt != null;
