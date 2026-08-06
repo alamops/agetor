@@ -39,6 +39,7 @@ import m030 from "./030_runs_task_id_index.sql" with { type: "text" };
 import m031 from "./031_task_pr_url.sql" with { type: "text" };
 import m032 from "./032_gemini_session_id.sql" with { type: "text" };
 import m033 from "./033_harness_kind_gemini.sql" with { type: "text" };
+import m034 from "./034_reseed_harness_builtins_2.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -76,4 +77,5 @@ export const migrations: Migration[] = [
   { id: "031_task_pr_url", sql: m031 },
   { id: "032_gemini_session_id", sql: m032 },
   { id: "033_harness_kind_gemini", sql: m033 },
+  { id: "034_reseed_harness_builtins_2", sql: m034 },
 ];
