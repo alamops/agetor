@@ -1926,6 +1926,14 @@ interface SessionState {
    * places. Content-triggered adoption arms nothing — real content already
    * arrived, so there's nothing to wait for. Null when not armed. */
   continuationWatchdog: { timer: ReturnType<typeof setTimeout>; slot: TurnSlot } | null;
+  /** True while `collectAskQuestionsFromPane` has grown the detached pane and
+   *  `window-size` is legitimately `manual` for this session — set right before
+   *  the grow, cleared by the SAME `finally` (nested inside it) that restores
+   *  the pane, so a throwing `restore` still clears the flag. Brackets the
+   *  ONLY period a stuck `manual` pin is expected; `healWindowSize` checks
+   *  this so it never races the scraper's own restore (which would fight over
+   *  window-size mid-grow and could strand the pane at the wrong size). */
+  paneGrowInFlight: boolean;
 }
 
 interface TurnSlot {
@@ -2036,6 +2044,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     pendingSlashToken: null,
     subagentWatcher: null,
     continuationWatchdog: null,
+    paneGrowInFlight: false,
   };
 }
 
@@ -2383,19 +2392,87 @@ function paneSize(state: SessionState): { w: number; h: number } | null {
 }
 
 /** Force a detached window to a fixed size (`window-size manual` is required for
- *  `resize-window` to stick on a session no client is attached to). */
+ *  `resize-window` to stick on a session no client is attached to). Chained as a
+ *  SINGLE tmux invocation (`;` as its own argv element — no shell involved, so
+ *  it's a literal semicolon, not a shell-escaped `\;`) so the two commands reach
+ *  the tmux server atomically: if agetor dies mid-call there's no window where
+ *  `window-size` is `manual` but the resize hasn't landed yet. */
 function resizePane(state: SessionState, w: number, h: number): void {
-  tmux(["set-window-option", "-t", state.sessionName, "window-size", "manual"]);
-  tmux(["resize-window", "-t", state.sessionName, "-x", String(w), "-y", String(h)]);
+  tmux([
+    "set-window-option", "-t", "=" + state.sessionName, "window-size", "manual", ";",
+    "resize-window", "-t", "=" + state.sessionName, "-x", String(w), "-y", String(h),
+  ]);
 }
 
-/** Restore the original size and hand sizing back to tmux (`latest`). Best-effort
- *  — if the process dies between the grow and this call the pane is just left
- *  larger, which is harmless (claude's TUI reflows to any size and the next
- *  attach/resize corrects it). */
+/** Restore the original size and hand sizing back to tmux. Chained as a single
+ *  invocation for the same reason as `resizePane`: two separate tmux calls
+ *  left a window where a crash between them stranded the session pinned
+ *  `window-size manual` (potentially at the small grown-then-half-restored
+ *  size) — a client attaching later gets confined to that fixed size instead of
+ *  renegotiating to its own, which is exactly the "minimized" rendering bug.
+ *  Chaining closes that window going forward.
+ *
+ *  BUT tmux aborts a `;`-chain at the first failing command (empirically
+ *  verified) — if `resize-window` fails (bad dims, session gone mid-chain,
+ *  etc.) the trailing `set-window-option … latest` never runs, and the
+ *  session is left pinned `manual`: the exact bug this file fixes, just
+ *  triggered by a failed command instead of a crash. The old two-invocation
+ *  form ran the unpin unconditionally, so a failed resize alone couldn't
+ *  strand the pin. Restore that guarantee: if the chain didn't report ok,
+ *  issue a standalone unpin as a fallback. `-u` (unset) reverts to the
+ *  inherited value rather than forcing `latest` — see the comment on
+ *  `healWindowSize` for why that heal path, unlike this one, deliberately
+ *  forces `latest` instead. */
 function restorePaneSize(state: SessionState, w: number, h: number): void {
-  tmux(["resize-window", "-t", state.sessionName, "-x", String(w), "-y", String(h)]);
-  tmux(["set-window-option", "-t", state.sessionName, "window-size", "latest"]);
+  const r = tmux([
+    "resize-window", "-t", "=" + state.sessionName, "-x", String(w), "-y", String(h), ";",
+    "set-window-option", "-u", "-t", "=" + state.sessionName, "window-size",
+  ]);
+  if (!r.ok) {
+    console.warn(
+      `[claude-tmux] restorePaneSize chain failed for session ${state.sessionName} — ` +
+        `falling back to a standalone unpin: ${r.stderr}`,
+    );
+    tmux(["set-window-option", "-u", "-t", "=" + state.sessionName, "window-size"]);
+  }
+}
+
+/**
+ * Heal a session's `window-size` back to `latest` if a prior crash left it
+ * stuck `manual` (chaining above closes the race going forward, but a pin
+ * from before this fix — or from any other interruption — can still be
+ * sitting on a session that outlived an agetor restart). A `manual` pin
+ * confines every future attach to whatever size it was left at instead of
+ * letting the attaching client's own size win, which is exactly the
+ * "minimized" rendering bug. Best-effort and never throws — called right
+ * before an attach (where failing shouldn't block the user from getting a
+ * terminal) and on reattach (where there's no one to report a failure to).
+ *
+ * Forces the explicit `latest` value rather than `-u` (unset): unlike
+ * `restorePaneSize`'s revert-to-inherited, a stuck-`manual` session's
+ * inherited/global `window-size` setting is exactly what could be `manual`
+ * on the user's tmux (deliberate override) — reverting to it would re-expose
+ * the bug this function exists to heal. This is the one place in the file
+ * that deliberately overrides a user global; don't "simplify" it to `-u`.
+ *
+ * No-ops when the session doesn't exist, or when a pane-grow is legitimately
+ * in flight for it (`paneGrowInFlight`) — healing mid-grow would fight the
+ * scraper's own resize/restore. A taskId with no in-memory `SessionState`
+ * (boot before reattach, or a session that survived a crash with no state
+ * rebuilt yet) can't have a grow in flight — there's no code path that could
+ * be running one without state — so it's safe to heal in that case too.
+ *
+ * `opts.assumeAlive` skips the internal `sessionExists` probe when the
+ * caller already knows the session is live (a duplicate round-trip
+ * otherwise): the `open-tmux` route just checked existence itself, and
+ * `reattachSession` only runs for sessions `reconcileOrphans` already
+ * verified alive.
+ */
+export function healWindowSize(taskId: string, opts: { assumeAlive?: boolean } = {}): void {
+  const state = sessions.get(taskId);
+  if (state?.paneGrowInFlight) return;
+  if (!opts.assumeAlive && !sessionExists(taskId)) return;
+  tmux(["set-window-option", "-t", "=" + sessionNameFor(taskId), "window-size", "latest"]);
 }
 
 /** Full pane capture (NOT the 40-line tail) — a grown preview panel can be much
@@ -2491,12 +2568,19 @@ async function collectAskQuestionsFromPane(
   const collected: Array<ParsedQuestionPane | null> = [];
   await queueTmuxOp(state.taskId, async (stillCurrent) => {
     const orig = io.size();
-    if (orig) {
-      io.resize(Math.max(orig.w, PREVIEW_PANE_MIN_COLS), PREVIEW_PANE_ROWS);
-      await io.sleep(PREVIEW_REFLOW_MS);
-      if (!stillCurrent()) { io.restore(orig.w, orig.h); return; }
-    }
+    // Brackets the ONLY window where `window-size manual` is expected on this
+    // session. ONE `finally` below owns both the restore and the clear (the
+    // clear nested inside it) so a throwing `io.restore` — the injected
+    // `PaneIo` can throw even though the production tmux-backed one can't —
+    // still clears the flag instead of stranding it true forever, which
+    // would permanently disable `healWindowSize` for this session.
+    if (orig) state.paneGrowInFlight = true;
     try {
+      if (orig) {
+        io.resize(Math.max(orig.w, PREVIEW_PANE_MIN_COLS), PREVIEW_PANE_ROWS);
+        await io.sleep(PREVIEW_REFLOW_MS);
+        if (!stillCurrent()) return; // finally below restores + clears
+      }
       for (let t = 0; t < n; t++) {
         if (t > 0) {
           if (!io.send("Right")) return; // entering a tab resets the cursor to option 0
@@ -2528,7 +2612,13 @@ async function collectAskQuestionsFromPane(
         if (!stillCurrent()) break;
       }
     } finally {
-      if (orig) io.restore(orig.w, orig.h);
+      if (orig) {
+        try {
+          io.restore(orig.w, orig.h);
+        } finally {
+          state.paneGrowInFlight = false;
+        }
+      }
     }
   }, state);
 
@@ -4702,6 +4792,13 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
   disposeSessionState(sessions.get(opts.taskId));
   sessions.set(opts.taskId, state);
   attachTailer(state);
+  // A crashed previous process is exactly when a stuck `window-size manual`
+  // pin (see `healWindowSize`) would have been left behind — heal it now so
+  // a subsequent attach isn't confined to whatever size the pin left.
+  // `assumeAlive`: `reattachSession` only runs for sessions `reconcileOrphans`
+  // already verified alive, so the internal `sessionExists` probe would be a
+  // duplicate round-trip.
+  healWindowSize(opts.taskId, { assumeAlive: true });
 
   return {
     kill: () => {

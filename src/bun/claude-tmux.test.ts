@@ -1,5 +1,7 @@
 import { test, expect } from "bun:test";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
 
 // cycleToMode's tmux send-keys call runs `Bun.spawnSync` on the tmux
 // binary; point it at /bin/echo so the per-press spawn is fast and the
@@ -19,6 +21,7 @@ import {
   cycleOrderFor,
   cycleToMode,
   encodeProjectPath,
+  healWindowSize,
   jsonlPathFor,
   mapJsonlEventToChunks,
   parseSessionActivityLine,
@@ -1926,4 +1929,179 @@ test("collectAskQuestionsFromPane: flat no-preview question takes the fast path 
   } finally {
     __forTest.uninstallSession("ask-nopreview");
   }
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * paneGrowInFlight — the flag `collectAskQuestionsFromPane` brackets around
+ * the ONLY window a stuck `window-size manual` pin is legitimate (docs/plans/
+ * fix-minimized-agent-tmux-attach.md §3 I1). `healWindowSize` refuses to heal
+ * while this is true, so the flag must be set for the actual duration of the
+ * grow and reliably cleared afterward — including when the grow is aborted
+ * mid-flight (the session was disposed/respawned out from under it).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("collectAskQuestionsFromPane: paneGrowInFlight is set for the duration of a grow and cleared once it completes", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [{
+    header: "Pick", question: "Which option?", multiSelect: false,
+    options: [{ label: "Alpha", preview: ["a-1"] }],
+  }];
+  const { io: baseIo } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-flag-live", "/tmp/never-read.jsonl");
+  let sawInFlightDuringResize = false;
+  // Peek at the flag from inside the reflow sleep that follows `io.resize` —
+  // this is the one moment production code guarantees it's already true.
+  const io = {
+    ...baseIo,
+    sleep: async (_ms: number) => {
+      if (state.paneGrowInFlight) sawInFlightDuringResize = true;
+      await baseIo.sleep();
+    },
+  };
+  try {
+    expect(state.paneGrowInFlight).toBe(false);
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), io);
+    expect(res).not.toBeNull();
+    expect(sawInFlightDuringResize).toBe(true);
+    // Cleared by the `finally` in the collector once the grow settles.
+    expect(state.paneGrowInFlight).toBe(false);
+  } finally {
+    __forTest.uninstallSession("ask-flag-live");
+  }
+});
+
+test("collectAskQuestionsFromPane: paneGrowInFlight clears via the early-abort path when the session identity changes mid-grow", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const tabs: FakeTab[] = [{
+    header: "Pick", question: "Which option?", multiSelect: false,
+    options: [
+      { label: "Alpha", preview: ["a-1"] },
+      { label: "Beta", preview: ["b-1"] },
+    ],
+  }];
+  const { io: baseIo, log } = makeFakePane(tabs);
+  const state = __forTest.installSession("ask-flag-abort", "/tmp/never-read.jsonl");
+  let swapped = false;
+  // Simulate the session being disposed + respawned mid-grow (e.g. a
+  // concurrent dropSession/reattach racing the scraper). `queueTmuxOp`'s
+  // `stillCurrent()` gate is `sessions.get(taskId) === state` (captured at
+  // schedule time) — replacing the map entry mid-await flips it to false
+  // right after this sleep resolves, driving the collector's early-return
+  // branch (`if (!stillCurrent()) { io.restore(...); paneGrowInFlight =
+  // false; return; }`).
+  const io = {
+    ...baseIo,
+    sleep: async (_ms: number) => {
+      await baseIo.sleep();
+      if (!swapped) {
+        swapped = true;
+        __forTest.installSession("ask-flag-abort", "/tmp/never-read.jsonl");
+      }
+    },
+  };
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, renderFakeModal(tabs, 0, 0), io);
+    // Aborted before any tab was collected.
+    expect(res).toBeNull();
+    expect(state.paneGrowInFlight).toBe(false);
+    // The pane was still restored on the abort path...
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+    // ...but we bailed before ever touching the option cursor.
+    expect(log.filter((l) => l === "Down" || l === "Up")).toEqual([]);
+  } finally {
+    __forTest.uninstallSession("ask-flag-abort");
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * healWindowSize — best-effort heal of a stuck `window-size manual` pin,
+ * called before an `open-tmux` attach and on boot reattach (docs/plans/
+ * fix-minimized-agent-tmux-attach.md §3 I1). Real tmux isn't used here — a
+ * small fake `tmux` (sh script) logs every invocation's argv and answers
+ * `has-session` with a scripted verdict, mirroring the `fakeTmux` helper in
+ * reconcile.test.ts and the `fakeRoutingTmuxBin` helper in
+ * claude-turn-routing.test.ts.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Write an executable fake `tmux` that appends every invocation's argv
+ *  (space-joined, one line per call) to `logPath`, and answers `has-session`
+ *  with `hasSessionExitCode` (0 = "exists", 1 = "doesn't") — anything else
+ *  exits 0. Returns the bin path; caller points AGETOR_TMUX_BIN at it. */
+function fakeHealTmuxBin(hasSessionExitCode: number, logPath: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-heal-faketmux-"));
+  const bin = path.join(dir, "tmux");
+  writeFileSync(
+    bin,
+    "#!/bin/sh\n" +
+      `printf '%s\\n' "$*" >> ${JSON.stringify(logPath)}\n` +
+      'case "$*" in\n' +
+      `  *has-session*) exit ${hasSessionExitCode} ;;\n` +
+      "  *) exit 0 ;;\n" +
+      "esac\n",
+  );
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+/** Swap AGETOR_TMUX_BIN (module-pinned to /bin/echo at the top of this file,
+ *  which would make `has-session` always "succeed" and defeat the
+ *  missing-session case) for the duration of `fn`, restoring afterward. */
+async function withFakeTmuxBin<T>(bin: string, fn: () => T | Promise<T>): Promise<T> {
+  const prev = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = bin;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prev;
+  }
+}
+
+test("healWindowSize issues no tmux call at all when a pane-grow is in flight for the session", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-heal-log-"));
+  const logPath = path.join(dir, "log.txt");
+  // Even a "session exists" verdict must never be reached — the in-flight
+  // check short-circuits before healWindowSize ever calls sessionExists.
+  const bin = fakeHealTmuxBin(0, logPath);
+  const state = __forTest.installSession("heal-inflight", "/tmp/never-read.jsonl");
+  state.paneGrowInFlight = true;
+  try {
+    await withFakeTmuxBin(bin, () => {
+      healWindowSize("heal-inflight");
+    });
+    const log = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+    expect(log).toBe("");
+  } finally {
+    __forTest.uninstallSession("heal-inflight");
+  }
+});
+
+test("healWindowSize probes has-session but issues no set-window-option when the session doesn't exist", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-heal-log-"));
+  const logPath = path.join(dir, "log.txt");
+  const bin = fakeHealTmuxBin(1, logPath); // has-session always "fails"
+  await withFakeTmuxBin(bin, () => {
+    // No installed SessionState for this taskId at all — mirrors the boot
+    // path where a session outlived the process with no state rebuilt yet.
+    healWindowSize("heal-missing-task-id");
+  });
+  const log = readFileSync(logPath, "utf8");
+  expect(log).toContain("has-session");
+  expect(log).not.toContain("set-window-option");
+});
+
+test("healWindowSize resets window-size to latest with a single call when the session exists and no grow is in flight", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-heal-log-"));
+  const logPath = path.join(dir, "log.txt");
+  const bin = fakeHealTmuxBin(0, logPath); // has-session always "succeeds"
+  await withFakeTmuxBin(bin, () => {
+    healWindowSize("heal-live-task-id");
+  });
+  const lines = readFileSync(logPath, "utf8").trim().split("\n");
+  expect(lines.length).toBe(2);
+  expect(lines[0]).toContain("has-session");
+  expect(lines[1]).toContain("set-window-option");
+  expect(lines[1]).toContain("window-size");
+  expect(lines[1]).toContain("latest");
 });
