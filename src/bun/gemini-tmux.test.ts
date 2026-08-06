@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -7,7 +8,7 @@ import path from "node:path";
 // from it. Set a temp dir before importing.
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-gemini-tmux-"));
 
-const { mapGeminiEvent, geminiLogPath } = await import("./gemini-tmux.ts");
+const { mapGeminiEvent, geminiLogPath, spawnGeminiViaTmux } = await import("./gemini-tmux.ts");
 import type { RunEventStream } from "../shared/types.ts";
 
 type Chunk = { stream: RunEventStream; data: string; lineUuid?: string };
@@ -161,4 +162,87 @@ test("unknown event types are silent forward-compat", () => {
 test("geminiLogPath is derivable from runId alone (so reattach can recompute it)", () => {
   const p = geminiLogPath("run-xyz");
   expect(p.endsWith(path.join("gemini-logs", "run-xyz.jsonl"))).toBe(true);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * spawnGeminiViaTmux's `new-session` argv — same regression guard codex-tmux
+ * has (codex-tmux.test.ts: "spawnCodexViaTmux's new-session argv pins -x 200
+ * -y 50"), plus gemini's own real behavioral delta: no stdin redirect, since
+ * the prompt already rides in argv (`-p <prompt>`) rather than a piped
+ * promptfile the way codex's `< promptfile` does. A fake `tmux` (a script
+ * under a `#!` shebang) logs the full argv of every invocation and always
+ * fails `new-session`, which makes spawnGeminiViaTmux bail out synchronously
+ * right after logging (no tailer, no timers to clean up) — same trick
+ * codex-tmux.test.ts and claude-turn-routing.test.ts use for their fake tmux.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+function fakeFailingTmuxBin(): { bin: string; logPath: string } {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-gemini-faketmux-"));
+  const bin = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  writeFileSync(
+    bin,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync } from "node:fs";\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ argv }) + "\\n");\n` +
+      `process.exit(1);\n`,
+  );
+  chmodSync(bin, 0o755);
+  return { bin, logPath };
+}
+
+function readArgvLog(logPath: string): Array<{ argv: string[] }> {
+  return readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
+
+test("spawnGeminiViaTmux's new-session argv pins -x 200 -y 50 and forwards GEMINI_CLI_HOME via -e", () => {
+  const { bin, logPath } = fakeFailingTmuxBin();
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = bin;
+  try {
+    const { chunks, onChunk } = collect();
+    const taskId = `task-geminisize-${randomUUID()}`;
+    const runId = `run-geminisize-${randomUUID()}`;
+    spawnGeminiViaTmux({
+      taskId,
+      runId,
+      argv: ["gemini", "-m", "gemini-3-pro-preview", "--output-format", "stream-json", "--yolo", "--skip-trust", "-p", "hello"],
+      env: { GEMINI_CLI_HOME: "/tmp/gemini-home" },
+      cwd: "/tmp",
+      onChunk,
+    });
+    // Sanity: the deliberately-failing new-session surfaced as a stderr chunk
+    // (proves we exercised the real spawn path, not a short-circuit).
+    expect(chunks.some((c) => c.stream === "stderr")).toBe(true);
+
+    const entries = readArgvLog(logPath);
+    const newSession = entries.find((e) => e.argv.includes("new-session"));
+    expect(newSession).toBeDefined();
+    const argv = newSession!.argv;
+
+    const xIdx = argv.indexOf("-x");
+    const yIdx = argv.indexOf("-y");
+    expect(xIdx).toBeGreaterThan(-1);
+    expect(yIdx).toBeGreaterThan(-1);
+    expect(argv[xIdx + 1]).toBe("200");
+    expect(argv[yIdx + 1]).toBe("50");
+
+    // GEMINI_CLI_HOME forwarded as its own -e flag (harness env), distinct
+    // from the separately-forwarded PATH -e.
+    const envIdx = argv.findIndex((a, i) => a === "-e" && argv[i + 1] === "GEMINI_CLI_HOME=/tmp/gemini-home");
+    expect(envIdx).toBeGreaterThan(-1);
+
+    // The real behavioral delta vs codex: no stdin redirect anywhere in the
+    // inner shell command — gemini's prompt rides in argv (`-p hello` above),
+    // so there's no promptfile to pipe in via `<`.
+    const innerIdx = argv.indexOf("sh") !== -1 ? argv.lastIndexOf("-c") : -1;
+    expect(innerIdx).toBeGreaterThan(-1);
+    const inner = argv[innerIdx + 1]!;
+    expect(inner).not.toContain("<");
+    expect(inner).toContain("'-p' 'hello'");
+  } finally {
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  }
 });

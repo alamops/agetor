@@ -9,7 +9,16 @@ import path from "node:path";
 // tmux is installed on the test host.
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 
-import {
+// claude-tmux.ts imports `tasks` from db.ts, which opens its sqlite
+// connection at module-load time. A plain top-level `import` is hoisted
+// ahead of any code in this file (including the AGETOR_TMUX_BIN line
+// above), so setting AGETOR_DATA_DIR first only works via a dynamic
+// import, which runs in place instead of being hoisted — same pattern as
+// harnesses.test.ts. Without this, this file (or whichever file `bun test`
+// happens to load first) can silently open the real ~/.agetor-dev database.
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-claude-tmux-"));
+
+const {
   buildClaudeSessionEnv,
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_MODE_ACCEPT_EDITS,
@@ -28,7 +37,7 @@ import {
   rebuildEventsFromJsonl,
   sessionNameFor,
   toClaudeModeString,
-} from "./claude-tmux.ts";
+} = await import("./claude-tmux.ts");
 
 test("jsonlPathFor with home=null falls back to the system homedir", () => {
   const p = jsonlPathFor("/a/b", "session-uuid", null);

@@ -2,8 +2,16 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { checkHarness } from "./agent-status.ts";
 import type { AgentKind, Harness } from "../shared/types.ts";
+
+// agent-status.ts imports `harnesses` from db.ts, which opens its sqlite
+// connection at module-load time — a plain top-level `import` is hoisted
+// ahead of any other code in this file, so AGETOR_DATA_DIR must be set
+// before a *dynamic* import instead (same pattern as harnesses.test.ts).
+// Without this, this file (or whichever file `bun test` loads first) can
+// silently open the real ~/.agetor-dev database.
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-db-"));
+const { checkHarness } = await import("./agent-status.ts");
 
 function builtin(kind: AgentKind): Harness {
   return { id: kind, kind, label: kind, isBuiltin: true, home: null, bin: null, env: {}, enabled: true };

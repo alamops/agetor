@@ -1367,7 +1367,14 @@ export type SendInputResult =
  *     messages can't strand surplus run rows in `running`. See
  *     `sendTurnInExistingSession`.
  *
- *   • codex: writes to the active run's stdin (single-run model unchanged).
+ *   • codex: each follow-up is queued and spawned as its own `codex exec
+ *     resume <thread_id>` turn once the active turn resolves — codex `exec`
+ *     is a one-shot process, not a REPL, so there's no live stdin to write
+ *     to mid-turn. See `sendCodexTurn`/`drainCodexQueue`.
+ *
+ *   • gemini: same queue-and-resume shape as codex (`sendGeminiTurn`/
+ *     `drainGeminiQueue`), spawning `gemini --resume <session-id>` for each
+ *     queued follow-up — gemini's CLI is one-shot per turn too.
  *
  * Archived / detached-worktree restore: a message to an archived task
  * auto-unarchives it (sending is an unambiguous signal of continued
