@@ -251,6 +251,7 @@ export interface CreateTaskInput {
   mode?: string | null;
   model?: string | null;
   effort?: string | null;
+  fast?: boolean;
   taskType?: string;
   /** Match the app's "Run task", which creates the task in "ready" before
    *  starting (vs "backlog" when queued). */
@@ -269,6 +270,7 @@ export interface PatchTaskInput {
   mode?: string | null;
   model?: string | null;
   effort?: string | null;
+  fast?: boolean;
   taskType?: string;
 }
 

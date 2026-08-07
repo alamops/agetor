@@ -536,7 +536,7 @@ test("codex throws when effort is missing for a model that supports it", () => {
 // but the prompt is NOT an argv element here — cursor-tmux.ts appends it at
 // spawn time via its own injection-safe quoting. `buildCommand`'s job is just
 // the flags: -p stream-json, --model, the auto/ask force+sandbox posture, and
-// --resume. There is no effort flag at all (cursor-agent has none).
+// --resume. Cursor effort/Fast are composed into the --model id.
 test("cursor with defaults emits -p --output-format stream-json --model auto --force --sandbox disabled", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults });
   expect(cmd).toEqual([
@@ -565,18 +565,56 @@ test("cursor null mode defaults to auto (--force --sandbox disabled), house conv
   expect(cmd[cmd.indexOf("--sandbox") + 1]).toBe("disabled");
 });
 
-test("cursor explicit model 'claude-opus-4.8' passes through verbatim as --model", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, model: "claude-opus-4.8" });
+test("cursor composes a curated model plus effort into Cursor's concrete model id", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "claude-opus-4-8",
+    effort: "max",
+  });
   expect(cmd).toEqual([
     "cursor-agent",
     "-p", "--output-format", "stream-json",
-    "--model", "claude-opus-4.8",
+    "--model", "claude-opus-4-8-max",
     "--force", "--sandbox", "disabled",
   ]);
 });
 
+test("cursor fast toggle selects the Fast model variant when that effort supports it", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gpt-5.6-sol",
+    effort: "max",
+    fast: true,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol-max-fast");
+});
+
+test("cursor fast toggle is ignored for model/effort pairs without a fast variant", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "claude-sonnet-5",
+    effort: "max",
+    fast: true,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("claude-sonnet-5-max");
+});
+
+test("cursor model with no effort levels can still expose a fast variant", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "composer-2.5",
+    fast: true,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("composer-2.5-fast");
+});
+
 test("cursor unknown model id passes through verbatim (house convention: unknown ids just work)", () => {
-  const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, model: "cursor-mystery-9000" });
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "cursor-mystery-9000",
+    effort: "max",
+    fast: true,
+  });
   const i = cmd.indexOf("--model");
   expect(i).toBeGreaterThan(-1);
   expect(cmd[i + 1]).toBe("cursor-mystery-9000");
@@ -585,13 +623,6 @@ test("cursor unknown model id passes through verbatim (house convention: unknown
 test("cursor resumeSessionId adds --resume <id> as the final argv elements (--resume is a flag, no subcommand ordering constraint)", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, resumeSessionId: "sess-99" });
   expect(cmd.slice(-2)).toEqual(["--resume", "sess-99"]);
-});
-
-test("cursor ignores effort entirely — argv and env are identical with or without an effort id", () => {
-  const withEffort = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults, effort: "high" });
-  const withoutEffort = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults });
-  expect(withEffort.cmd).toEqual(withoutEffort.cmd);
-  expect(withEffort.env).toEqual(withoutEffort.env);
 });
 
 test("cursor throws when model is missing", () => {

@@ -20,6 +20,7 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { abbreviateHome, cn } from "@/lib/utils";
 import { iconForRef, refBasename } from "@/lib/file-icons";
@@ -28,6 +29,8 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   EVENTS_WINDOW_MAX,
+  cursorModelIdCoveredByCatalog,
+  cursorModelSupportsFast,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -4688,6 +4691,8 @@ function TaskDetails({
     () => new Set(supportedEffortsForModel.map((o) => o.id)),
     [supportedEffortsForModel],
   );
+  const maxAvailable = kind === "cursor" && allowedEfforts.has("max");
+  const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
   useEffect(() => {
     if (task.effort && allowedEfforts.has(task.effort)) return;
     if (supportedEffortsForModel.length === 0) {
@@ -4700,6 +4705,10 @@ function TaskDetails({
     if (task.effort !== fallback) void save({ effort: fallback });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allowedEfforts, task.effort, supportedEffortsForModel]);
+  useEffect(() => {
+    if (task.fast && !fastAvailable) void save({ fast: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fastAvailable, task.fast]);
 
   const onAgentChange = (nextId: string) => {
     if (nextId === task.agent) return;
@@ -4717,7 +4726,7 @@ function TaskDetails({
       : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
         ? DEFAULT_EFFORT[nextKind]
         : nextEfforts[0]!.id;
-    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort });
+    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false });
   };
 
   return (
@@ -4792,6 +4801,50 @@ function TaskDetails({
               <span>{task.effort ?? "—"}</span>
             )}
           </dd>
+
+          {kind === "cursor" && maxAvailable && (
+            <>
+              <dt className="text-muted-foreground">Max</dt>
+              <dd className="min-w-0">
+                {editable ? (
+                  <Switch
+                    checked={task.effort === "max"}
+                    onCheckedChange={(checked) => {
+                      if (checked) {
+                        void save({ effort: "max" });
+                        return;
+                      }
+                      const fallback = supportedEffortsForModel.find((e) => e.id === DEFAULT_EFFORT.cursor && e.id !== "max")
+                        ?? supportedEffortsForModel.find((e) => e.id !== "max")
+                        ?? null;
+                      void save({ effort: fallback?.id ?? null });
+                    }}
+                    aria-label="Use Cursor max thinking"
+                  />
+                ) : (
+                  <span>{task.effort === "max" ? "on" : "off"}</span>
+                )}
+              </dd>
+            </>
+          )}
+
+          {kind === "cursor" && (fastAvailable || task.fast) && (
+            <>
+              <dt className="text-muted-foreground">Fast</dt>
+              <dd className="min-w-0">
+                {editable ? (
+                  <Switch
+                    checked={task.fast}
+                    onCheckedChange={(fast) => void save({ fast })}
+                    disabled={!fastAvailable}
+                    aria-label="Use Cursor fast variant"
+                  />
+                ) : (
+                  <span>{task.fast ? "on" : "off"}</span>
+                )}
+              </dd>
+            </>
+          )}
 
           <dt className="text-muted-foreground">Project</dt>
           <dd className="min-w-0 truncate font-mono" title={task.workdir}>
@@ -4888,6 +4941,7 @@ function mergedModels(agent: AgentKind, agentModels: AgentModelMap) {
   const known = new Set(stat.map((m) => m.id));
   const extras = (agentModels[agent] ?? [])
     .filter((m) => !known.has(m.id))
+    .filter((m) => agent !== "cursor" || !cursorModelIdCoveredByCatalog(m.id))
     .map((m): typeof stat[number] => ({ id: m.id, label: m.label ?? m.id }));
   return [...stat, ...extras];
 }

@@ -902,7 +902,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
         ? { codexSessionId: sessionId }
         : { cursorSessionId: sessionId });
     },
-    opts: { mode: task.mode, model: task.model, effort: task.effort },
+    opts: { mode: task.mode, model: task.model, effort: task.effort, fast: task.fast },
   });
   registerActiveRun(runId, taskId, task, agent);
   emit({
@@ -1186,7 +1186,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     // alias swaps keep the picks — those ids stay valid.
     if (afterKind && beforeKind !== afterKind) {
       const nextMode = AGENT_OPTIONS[afterKind].modes[0]?.id ?? "auto";
-      tasks.update(taskId, { mode: nextMode, model: null, effort: null });
+      tasks.update(taskId, { mode: nextMode, model: null, effort: null, fast: false });
     }
     return;
   }
@@ -1538,6 +1538,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
       mode: task.mode,
       model: task.model,
       effort: task.effort,
+      fast: task.fast,
       resumeSessionId: priorThreadId,
     },
   });
@@ -1681,6 +1682,7 @@ function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
       mode: task.mode,
       model: task.model,
       effort: task.effort,
+      fast: task.fast,
       // Same generic resume-session field claude-code and codex already
       // thread through `spawnAgent` → `buildCommand` — cursor's `session_id`
       // rides the same `AgentRunOptions.resumeSessionId` contract rather than
@@ -1978,6 +1980,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
       mode: task.mode,
       model: task.model,
       effort: task.effort,
+      fast: task.fast,
       resumeSessionId: priorSessionId,
     },
   });
@@ -2174,6 +2177,7 @@ export async function createTask(
     mode: input.mode ?? null,
     model,
     effort,
+    fast: input.fast === true,
     references: input.references ?? [],
     // Brand-new tasks start with an empty backlog; drafts are added later from
     // the run panel.

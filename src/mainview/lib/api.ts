@@ -1061,6 +1061,7 @@ export const api = {
     mode?: string | null;
     model?: string | null;
     effort?: string | null;
+    fast?: boolean;
     /** Initial column. Defaults to "backlog" if omitted. */
     column?: ColumnId;
     references?: TaskReference[];
