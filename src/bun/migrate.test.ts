@@ -34,6 +34,30 @@ test("applies pending migrations in order, skips already-applied ones", () => {
   expect(tables).toEqual(["_migrations", "bar", "baz", "foo"]);
 });
 
+test("skips a renamed migration when a legacy alias is already applied", () => {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE runs (id TEXT PRIMARY KEY, cursor_session_id TEXT);
+    CREATE TABLE _migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+    INSERT INTO _migrations (id, applied_at) VALUES ('025_cursor_session_id', 1);
+  `);
+
+  const renamed: Migration = {
+    id: "033_cursor_session_id",
+    aliases: ["025_cursor_session_id"],
+    sql: "ALTER TABLE runs ADD COLUMN cursor_session_id TEXT;",
+  };
+
+  expect(migrate(db, [renamed])).toEqual([]);
+  expect(migrate(db, [renamed])).toEqual([]);
+
+  const applied = db
+    .query<{ id: string }, []>(`SELECT id FROM _migrations ORDER BY id`)
+    .all()
+    .map((r) => r.id);
+  expect(applied).toEqual(["025_cursor_session_id", "033_cursor_session_id"]);
+});
+
 test("rolls back a failing migration so it can be retried", () => {
   const db = new Database(":memory:");
   const bad: Migration = {
