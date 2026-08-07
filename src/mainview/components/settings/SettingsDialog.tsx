@@ -341,10 +341,10 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
     <Dialog
       open={open}
       onClose={onClose}
-      className="max-w-2xl"
+      className="flex max-h-[85vh] w-full max-w-2xl flex-col p-0"
       labelledBy="settings-dialog-title"
     >
-      <div className="flex items-center justify-between border-b border-border/60 pb-3">
+      <div className="flex shrink-0 items-center justify-between border-b border-border/60 p-4 pb-3">
         <div className="flex items-center gap-2">
           {view.kind !== "list" && (
             <Button
@@ -375,88 +375,90 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
         </div>
       </div>
 
-      {view.kind === "list" && (
-        <ListView
-          payload={payload}
-          statusByHarness={statusByHarness}
-          defaultHarness={defaultHarness}
-          homeDir={homeDir}
-          onPickDefault={onPickDefault}
-          tmuxSource={tmuxSource}
-          bundledTmuxAvailable={bundledTmuxAvailable}
-          onPickTmuxSource={onPickTmuxSource}
-          canAdd={!!dataDir}
-          onAdd={() => setView({ kind: "templates" })}
-          onEdit={(h) =>
-            setView({
-              kind: "editor",
-              harnessId: h.id,
-              template: {
-                id: "__edit",
-                label: h.label,
-                description: "",
-                kind: h.kind,
-                suggestedHarnessId: h.id,
-                home: h.home,
-                bin: h.bin,
-                env: h.env,
-              },
-            })
-          }
-          onDelete={onDeleteHarness}
-          onToggleEnabled={onToggleEnabled}
-          onOpenTerminal={onOpenTerminal}
-          pendingToggle={pendingToggle}
-        />
-      )}
-
-      {view.kind === "templates" && (
-        <TemplatePicker
-          onPick={(t) =>
-            setView({
-              kind: "editor",
-              harnessId: null,
-              template: resolveTemplate(t, dataDir),
-            })
-          }
-        />
-      )}
-
-      {view.kind === "editor" && (
-        <Editor
-          template={view.template}
-          isEdit={view.harnessId !== null}
-          homeDir={homeDir}
-          dataDir={dataDir}
-          existingIds={new Set(payload.harnesses.map((h) => h.id))}
-          busy={busy}
-          error={formError}
-          onCancel={() => setView({ kind: "list" })}
-          onSubmit={async (input) => {
-            setBusy(true);
-            setFormError(null);
-            try {
-              if (view.harnessId) {
-                await api.updateHarness(view.harnessId, {
-                  label: input.label,
-                  home: input.home,
-                  bin: input.bin,
-                  env: input.env,
-                });
-              } else {
-                await api.createHarness(input);
-              }
-              await refresh();
-              onChange?.();
-              setView({ kind: "list" });
-            } catch (e) {
-              setFormError(e instanceof Error ? e.message : String(e));
-            } finally {
-              setBusy(false);
+      <div className="min-h-0 flex-1 overflow-y-auto p-4 pt-0">
+        {view.kind === "list" && (
+          <ListView
+            payload={payload}
+            statusByHarness={statusByHarness}
+            defaultHarness={defaultHarness}
+            homeDir={homeDir}
+            onPickDefault={onPickDefault}
+            tmuxSource={tmuxSource}
+            bundledTmuxAvailable={bundledTmuxAvailable}
+            onPickTmuxSource={onPickTmuxSource}
+            canAdd={!!dataDir}
+            onAdd={() => setView({ kind: "templates" })}
+            onEdit={(h) =>
+              setView({
+                kind: "editor",
+                harnessId: h.id,
+                template: {
+                  id: "__edit",
+                  label: h.label,
+                  description: "",
+                  kind: h.kind,
+                  suggestedHarnessId: h.id,
+                  home: h.home,
+                  bin: h.bin,
+                  env: h.env,
+                },
+              })
             }
-          }}
-        />
-      )}
+            onDelete={onDeleteHarness}
+            onToggleEnabled={onToggleEnabled}
+            onOpenTerminal={onOpenTerminal}
+            pendingToggle={pendingToggle}
+          />
+        )}
+
+        {view.kind === "templates" && (
+          <TemplatePicker
+            onPick={(t) =>
+              setView({
+                kind: "editor",
+                harnessId: null,
+                template: resolveTemplate(t, dataDir),
+              })
+            }
+          />
+        )}
+
+        {view.kind === "editor" && (
+          <Editor
+            template={view.template}
+            isEdit={view.harnessId !== null}
+            homeDir={homeDir}
+            dataDir={dataDir}
+            existingIds={new Set(payload.harnesses.map((h) => h.id))}
+            busy={busy}
+            error={formError}
+            onCancel={() => setView({ kind: "list" })}
+            onSubmit={async (input) => {
+              setBusy(true);
+              setFormError(null);
+              try {
+                if (view.harnessId) {
+                  await api.updateHarness(view.harnessId, {
+                    label: input.label,
+                    home: input.home,
+                    bin: input.bin,
+                    env: input.env,
+                  });
+                } else {
+                  await api.createHarness(input);
+                }
+                await refresh();
+                onChange?.();
+                setView({ kind: "list" });
+              } catch (e) {
+                setFormError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          />
+        )}
+      </div>
     </Dialog>
   );
 }
