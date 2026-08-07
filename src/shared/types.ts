@@ -912,7 +912,7 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // ($5/$25 per MTok). Fable 5 sits above it in the picker but costs 2x the
   // usage, so the default stays on the most-capable non-premium tier.
   "claude-code": "opus-5",
-  "codex": "gpt-5.5",
+  "codex": "gpt-5.6-sol",
   // Cursor's own "let cursor-agent pick" model — matches its CLI default.
   "cursor": "auto",
 };
@@ -969,8 +969,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  *                   high → "think harder" xhigh → "think very hard"
  *                   max → "ultrathink"
  *
- * `none` is kept in the canonical list for future codex-only "reasoning-off"
- * models — currently no model in our list opts into it, so it never renders.
+ * `none` is currently used only by GPT-5.6-family Codex models.
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "max", label: "Max", hint: "Absolute maximum effort. Slowest, most thorough." },
@@ -990,8 +989,8 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  *     Haiku 4.5 → effort parameter NOT supported
  *   - Codex `model_reasoning_effort`:
  *       https://developers.openai.com/codex/config-advanced
+ *     GPT-5.6 family → none/low/medium/high/xhigh/max
  *     gpt-5.5 / gpt-5 / gpt-5-codex → low/medium/high/xhigh
- *     (minimal kept out of UI)
  *
  * An empty list means "this model does not accept the effort flag at all"
  * (e.g. Haiku 4.5) — the UI collapses the dropdown and `buildCommand` emits
@@ -1021,6 +1020,9 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "haiku-4.5": [],
   },
   codex: {
+    "gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-terra": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.5": ["xhigh", "high", "medium", "low"],
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
@@ -1117,7 +1119,10 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Recommended default — works on ChatGPT plans." },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Recommended default — flagship GPT-5.6 capability." },
+      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model for strong performance at lower cost." },
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model for high-volume workloads." },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous recommended default — works on ChatGPT plans." },
       { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
