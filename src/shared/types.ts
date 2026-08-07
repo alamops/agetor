@@ -628,6 +628,12 @@ export interface Task {
    */
   fast: boolean;
   /**
+   * Cursor Max Mode / large-context toggle. This is intentionally separate
+   * from effort="max", which means maximum reasoning/thinking effort.
+   * Non-Cursor harnesses ignore it.
+   */
+  maxMode: boolean;
+  /**
    * Path-only references the user attached at task creation (files and
    * folders on the user's machine). Empty list when none. Inlined into the
    * launch prompt as text — agetor never copies or uploads these.
@@ -905,6 +911,8 @@ export interface AgentOptions {
 export interface CursorModelSpec {
   label: string;
   hint?: string;
+  /** Whether Cursor accepts a large-context / Max Mode override for this base model. */
+  supportsMaxMode?: boolean;
   /** Cursor's concrete model ids for each thinking level this base model supports. */
   effortIds?: Partial<Record<string, string>>;
   /** Thinking levels that Cursor exposes as a separate Fast variant. */
@@ -946,6 +954,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "gpt-5.3-codex": {
     label: "Codex 5.3",
     hint: "Cursor-hosted Codex 5.3.",
+    supportsMaxMode: true,
     effortIds: {
       xhigh: "gpt-5.3-codex-xhigh",
       high: "gpt-5.3-codex-high",
@@ -972,6 +981,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "claude-opus-5": {
     label: "Opus 5",
     hint: "Anthropic Opus 5 via Cursor.",
+    supportsMaxMode: true,
     effortIds: {
       max: "claude-opus-5-thinking-max",
       xhigh: "claude-opus-5-thinking-xhigh",
@@ -984,6 +994,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "claude-opus-4-8": {
     label: "Opus 4.8",
     hint: "Anthropic Opus 4.8 via Cursor.",
+    supportsMaxMode: true,
     effortIds: {
       max: "claude-opus-4-8-max",
       xhigh: "claude-opus-4-8-xhigh",
@@ -996,6 +1007,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "gpt-5.6-sol": {
     label: "GPT-5.6 Sol",
     hint: "Cursor-hosted GPT-5.6 Sol.",
+    supportsMaxMode: true,
     effortIds: {
       max: "gpt-5.6-sol-max",
       xhigh: "gpt-5.6-sol-xhigh",
@@ -1009,6 +1021,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "gpt-5.5": {
     label: "GPT-5.5",
     hint: "OpenAI GPT-5.5 via Cursor.",
+    supportsMaxMode: true,
     effortIds: {
       xhigh: "gpt-5.5-extra-high",
       high: "gpt-5.5-high",
@@ -1021,6 +1034,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "claude-fable-5": {
     label: "Fable 5",
     hint: "Anthropic Fable 5 via Cursor.",
+    supportsMaxMode: true,
     effortIds: {
       max: "claude-fable-5-max",
       xhigh: "claude-fable-5-xhigh",
@@ -1032,6 +1046,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "claude-sonnet-5": {
     label: "Sonnet 5",
     hint: "Anthropic Sonnet 5 via Cursor.",
+    supportsMaxMode: true,
     effortIds: {
       max: "claude-sonnet-5-max",
       xhigh: "claude-sonnet-5-xhigh",
@@ -1043,6 +1058,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "gpt-5.6-terra": {
     label: "GPT-5.6 Terra",
     hint: "Cursor-hosted GPT-5.6 Terra.",
+    supportsMaxMode: true,
     effortIds: {
       max: "gpt-5.6-terra-max",
       xhigh: "gpt-5.6-terra-xhigh",
@@ -1056,11 +1072,26 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "claude-4.6-sonnet": {
     label: "Sonnet 4.6",
     hint: "Anthropic Sonnet 4.6 via Cursor.",
+    supportsMaxMode: true,
     effortIds: { medium: "claude-4.6-sonnet-medium" },
+  },
+  "claude-opus-4-7": {
+    label: "Opus 4.7",
+    hint: "Anthropic Opus 4.7 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-4-7-max",
+      xhigh: "claude-opus-4-7-xhigh",
+      high: "claude-opus-4-7-high",
+      medium: "claude-opus-4-7-medium",
+      low: "claude-opus-4-7-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
   },
   "gpt-5.4": {
     label: "GPT-5.4",
     hint: "OpenAI GPT-5.4 via Cursor.",
+    supportsMaxMode: true,
     effortIds: {
       xhigh: "gpt-5.4-xhigh",
       high: "gpt-5.4-high",
@@ -1072,11 +1103,13 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "claude-4.6-opus": {
     label: "Opus 4.6",
     hint: "Anthropic Opus 4.6 via Cursor.",
+    supportsMaxMode: true,
     effortIds: { max: "claude-4.6-opus-max", high: "claude-4.6-opus-high" },
   },
   "claude-4.5-opus": {
     label: "Opus 4.5",
     hint: "Anthropic Opus 4.5 via Cursor.",
+    supportsMaxMode: true,
     effortIds: { high: "claude-4.5-opus-high" },
   },
   "gpt-5.2": {
@@ -1093,6 +1126,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "gpt-5.6-luna": {
     label: "GPT-5.6 Luna",
     hint: "Cursor-hosted GPT-5.6 Luna.",
+    supportsMaxMode: true,
     effortIds: {
       max: "gpt-5.6-luna-max",
       xhigh: "gpt-5.6-luna-xhigh",
@@ -1136,7 +1170,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
       none: "gpt-5.4-nano-none",
     },
   },
-  "claude-4.5-sonnet": { label: "Sonnet 4.5", hint: "Anthropic Sonnet 4.5 via Cursor." },
+  "claude-4.5-sonnet": { label: "Sonnet 4.5", hint: "Anthropic Sonnet 4.5 via Cursor.", supportsMaxMode: true },
   "gpt-5.1": {
     label: "GPT-5.1",
     hint: "OpenAI GPT-5.1 via Cursor.",
@@ -1153,6 +1187,7 @@ export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
   "kimi-k3": {
     label: "Kimi K3",
     hint: "Kimi K3 via Cursor.",
+    supportsMaxMode: true,
     effortIds: { max: "kimi-k3-max", high: "kimi-k3-high", low: "kimi-k3-low" },
   },
   "kimi-k2.7-code": { label: "Kimi K2.7 Code", hint: "Kimi K2.7 Code via Cursor." },
@@ -1171,6 +1206,10 @@ export function cursorModelSupportsFast(model: string | null, effort: string | n
   return spec.fastEfforts?.includes(effort) ?? false;
 }
 
+export function cursorModelSupportsMaxMode(model: string | null): boolean {
+  return CURSOR_MODEL_SPECS[model ?? DEFAULT_MODEL.cursor]?.supportsMaxMode === true;
+}
+
 export function cursorModelIdCoveredByCatalog(id: string): boolean {
   if (CURSOR_MODEL_SPECS[id]) return true;
   return Object.values(CURSOR_MODEL_SPECS).some((spec) => {
@@ -1179,10 +1218,13 @@ export function cursorModelIdCoveredByCatalog(id: string): boolean {
   });
 }
 
-export function cursorModelArg(model: string, effort: string | null, fast: boolean): string {
+export function cursorModelArg(model: string, effort: string | null, fast: boolean, maxMode = false): string {
   const spec = CURSOR_MODEL_SPECS[model];
   if (!spec) return model;
-  if (!spec.effortIds) return fast && spec.fastId ? spec.fastId : model;
+  if (!spec.effortIds) {
+    const baseId = fast && spec.fastId ? spec.fastId : model;
+    return maxMode && spec.supportsMaxMode ? `${baseId}[context=1m]` : baseId;
+  }
   const desiredEffort =
     effort && spec.effortIds[effort]
       ? effort
@@ -1191,6 +1233,11 @@ export function cursorModelArg(model: string, effort: string | null, fast: boole
         : Object.keys(spec.effortIds)[0];
   if (!desiredEffort) return model;
   const baseId = spec.effortIds[desiredEffort] ?? model;
+  if (maxMode && spec.supportsMaxMode) {
+    const params = [`context=1m`, `effort=${desiredEffort}`];
+    if (cursorModelSupportsFast(model, desiredEffort)) params.push(`fast=${fast ? "true" : "false"}`);
+    return `${model}[${params.join(",")}]`;
+  }
   return fast && spec.fastEfforts?.includes(desiredEffort) ? `${baseId}-fast` : baseId;
 }
 
@@ -1238,7 +1285,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  * `none` is currently used only by GPT-5.6-family Codex models.
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
-  { id: "max", label: "Max", hint: "Absolute maximum effort. Slowest, most thorough." },
+  { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
   { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },

@@ -43,7 +43,7 @@ function makeTask() {
     mode: null,
     model: null,
     effort: null,
-    fast: false,
+    fast: false, maxMode: false,
     references: [],    backlog: [], draft: null,
     runId: null,
     hasOpenableRun: false,
