@@ -54,7 +54,7 @@ function alias(kind: AgentKind, opts: { home?: string; bin?: string; env?: Recor
 // missing-model / missing-effort guards. Mirrors what the UI + orchestrator
 // will now always pass at runtime.
 const claudeDefaults = { mode: "auto", model: "opus-4.7", effort: "high" } as const;
-const codexDefaults = { mode: "auto", model: "gpt-5-codex", effort: "high" } as const;
+const codexDefaults = { mode: "auto", model: "gpt-5.6-sol", effort: "high" } as const;
 // Cursor has no effort knob — omitted from the defaults object entirely
 // (unlike claude/codex, `buildCommand`'s cursor branch never inspects
 // `opts.effort`, so leaving it unset is the realistic runtime shape).
@@ -409,7 +409,7 @@ test("codex with defaults emits --model + reasoning effort + structured-stream f
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults });
   expect(cmd).toEqual([
     "codex", "exec",
-    "--model", "gpt-5-codex",
+    "--model", "gpt-5.6-sol",
     "-c", "model_reasoning_effort=high",
     "--json", "--color", "never", "--skip-git-repo-check",
     "--sandbox", "workspace-write",
@@ -422,7 +422,7 @@ test("codex 'ask' mode uses --sandbox read-only so codex can't change anything",
   expect(cmd).not.toContain("workspace-write");
   expect(cmd).toEqual([
     "codex", "exec",
-    "--model", "gpt-5-codex",
+    "--model", "gpt-5.6-sol",
     "-c", "model_reasoning_effort=high",
     "--json", "--color", "never", "--skip-git-repo-check",
     "--sandbox", "read-only",
@@ -435,6 +435,18 @@ test("codex model 'gpt-5.5' passes through verbatim as --model", () => {
   expect(cmd).toEqual([
     "codex", "exec",
     "--model", "gpt-5.5",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
+  ]);
+});
+
+test("codex model 'gpt-5.6-sol' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5.6-sol", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-5.6-sol",
     "-c", "model_reasoning_effort=high",
     "--json", "--color", "never", "--skip-git-repo-check",
     "--sandbox", "workspace-write",
