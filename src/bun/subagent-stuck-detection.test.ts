@@ -95,8 +95,7 @@ async function seed() {
   });
   runs.insert({
     id: runId, taskId, agent: "claude-code", status: "succeeded", startedAt: now,
-    endedAt: now, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: null,
-  });
+    endedAt: now, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null,  });
 
   const sessionId = randomUUID();
   const proj = path.join(DATA_DIR, "projects", "encoded");

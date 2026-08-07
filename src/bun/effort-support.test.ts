@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { DEFAULT_MODEL, supportedEfforts } from "../shared/types.ts";
+import { AGENT_OPTIONS, DEFAULT_EFFORT, DEFAULT_MODEL, supportedEfforts, supportedModes } from "../shared/types.ts";
 
 test("claude opus-5 supports xhigh + max", () => {
   const ids = supportedEfforts("claude-code", "opus-5").map((o) => o.id);
@@ -95,4 +95,34 @@ test("ordered highest → lowest (no placeholder at the top)", () => {
   const expectedOrder = ["max", "xhigh", "high", "medium", "low"];
   const filteredExpected = expectedOrder.filter((id) => ids.includes(id));
   expect(ids).toEqual(filteredExpected);
+});
+
+// --- cursor: no reasoning/effort knob at all ---------------------------------
+
+test("cursor DEFAULT_MODEL is 'auto' (cursor-agent's own 'let the CLI pick' default)", () => {
+  expect(DEFAULT_MODEL.cursor).toBe("auto");
+});
+
+test("cursor DEFAULT_EFFORT matches the 'none' sentinel (no effort knob to default)", () => {
+  expect(DEFAULT_EFFORT.cursor).toBe("none");
+});
+
+test.each(AGENT_OPTIONS.cursor.models.map((m) => m.id))(
+  "cursor model '%s' reports zero supported efforts (cursor-agent has no reasoning-effort flag)",
+  (modelId) => {
+    expect(supportedEfforts("cursor", modelId)).toEqual([]);
+  },
+);
+
+test("cursor null model falls back to DEFAULT_MODEL ('auto') and still reports zero efforts", () => {
+  expect(supportedEfforts("cursor", null)).toEqual([]);
+});
+
+test("cursor unknown model id falls back to DEFAULT_MODEL support set (still empty)", () => {
+  expect(supportedEfforts("cursor", "cursor-mystery-9000")).toEqual([]);
+});
+
+test("cursor supportedModes returns the auto/ask pair (no per-model mode carve-outs)", () => {
+  const ids = supportedModes("cursor", null).map((o) => o.id);
+  expect(ids).toEqual(["auto", "ask"]);
 });

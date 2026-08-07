@@ -72,6 +72,10 @@ import {
   reattachCodexSession,
 } from "./codex-tmux.ts";
 import {
+  dropCursorSession,
+  reattachCursorSession,
+} from "./cursor-tmux.ts";
+import {
   setSubagentEmitter,
   setSubagentSettleHook,
   setParkedDiscoveryHandler,
@@ -538,8 +542,8 @@ export function reconcileOrphans(): number {
   // task; only the latest reflects the user's current intent. Older
   // siblings get flipped to orphaned so we never have two SessionState
   // objects fighting for the same tmux session.
-  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; agent: string }, []>(
-    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
+  const stale = db.query<{ id: string; task_id: string; tmux_session: string | null; claude_session_id: string | null; codex_session_id: string | null; cursor_session_id: string | null; agent: string }, []>(
+    `SELECT id, task_id, tmux_session, claude_session_id, codex_session_id, cursor_session_id, agent FROM runs WHERE status = 'running' ORDER BY started_at DESC, id DESC`,
   ).all();
 
   const reattachedTaskIds = new Set<string>();
@@ -549,21 +553,24 @@ export function reconcileOrphans(): number {
     const task = tasks.get(row.task_id);
     const prevColumn: ColumnId | null = task?.column ?? null;
     const kind = resolveHarness(row.agent)?.kind ?? null;
-    // Both claude-code and codex runs can be reattached when their detached
-    // tmux session is still alive. The reattach key differs by kind: claude
-    // needs its JSONL session uuid (`claude_session_id`), codex needs its
-    // thread id (`codex_session_id`) — the per-run log path is derived from
-    // the run id. Note codex's session only lives WHILE its turn is in flight,
-    // so a reattachable codex run is by definition one that was still running
-    // when agetor restarted. Also: if we already reattached a newer sibling
-    // for this task, orphan the older one — only one SessionState can drive a
-    // given tmux session at a time.
+    // claude-code, codex, and cursor runs can all be reattached when their
+    // detached tmux session is still alive. The reattach key differs by
+    // kind: claude needs its JSONL session uuid (`claude_session_id`), codex
+    // needs its thread id (`codex_session_id`), cursor needs its
+    // `session_id` (`cursor_session_id`) — the per-run log path is derived
+    // from the run id in every case. Note codex's and cursor's sessions only
+    // live WHILE their turn is in flight, so a reattachable codex/cursor run
+    // is by definition one that was still running when agetor restarted.
+    // Also: if we already reattached a newer sibling for this task, orphan
+    // the older one — only one SessionState can drive a given tmux session
+    // at a time.
     const reattachKey =
       kind === "claude-code" ? row.claude_session_id
       : kind === "codex" ? row.codex_session_id
+      : kind === "cursor" ? row.cursor_session_id
       : null;
     const canTryReattach =
-      (kind === "claude-code" || kind === "codex")
+      (kind === "claude-code" || kind === "codex" || kind === "cursor")
       && task !== null
       && row.tmux_session !== null
       && reattachKey !== null
@@ -584,7 +591,15 @@ export function reconcileOrphans(): number {
             seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
             mode: task.mode,
           })
-        : reattachCodexSession({
+        : kind === "codex"
+        ? reattachCodexSession({
+            taskId: row.task_id,
+            runId: row.id,
+            sessionName: row.tmux_session as string,
+            onChunk,
+            seenLineUuids: runs.seenLineUuidsForTask(row.task_id),
+          })
+        : reattachCursorSession({
             taskId: row.task_id,
             runId: row.id,
             sessionName: row.tmux_session as string,
@@ -692,8 +707,9 @@ export function reconcileOrphans(): number {
   for (const heldId of heldTaskIds) {
     const task = tasks.get(heldId);
     if (!task) continue;
-    // Only claude-code writes subagent rows; a codex task can never be held, so
-    // it never reaches here. Guard the session probe on kind for clarity.
+    // Only claude-code writes subagent rows; a codex or cursor task can never
+    // be held, so it never reaches here. Guard the session probe on kind for
+    // clarity.
     if (resolveHarness(task.agent)?.kind !== "claude-code") continue;
 
     if (task.column === "running") {
@@ -845,13 +861,15 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
       startedAt: now,
       endedAt: null,
       exitCode: null,
-      // Both kinds now run in a per-task tmux session.
+      // All three kinds now run in a per-task tmux session.
       tmuxSession: sessionNameFor(taskId),
       // Filled in by spawnAgent's onSessionId callback once the session id is
       // known: claude's JSONL uuid → claudeSessionId, codex's thread_id →
-      // codexSessionId. Exactly one is non-null per run.
+      // codexSessionId, cursor's session_id → cursorSessionId. Exactly one is
+      // non-null per run.
       claudeSessionId: null,
       codexSessionId: null,
+      cursorSessionId: null,
     });
   });
   persist();
@@ -880,7 +898,9 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     onSessionId: (sessionId) => {
       runs.update(runId, harness.kind === "claude-code"
         ? { claudeSessionId: sessionId }
-        : { codexSessionId: sessionId });
+        : harness.kind === "codex"
+        ? { codexSessionId: sessionId }
+        : { cursorSessionId: sessionId });
     },
     opts: { mode: task.mode, model: task.model, effort: task.effort },
   });
@@ -1091,8 +1111,9 @@ function attachDoneHandler(
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       }
-      // Spawn the next queued codex follow-up, if any (no-op otherwise).
+      // Spawn the next queued codex/cursor follow-up, if any (no-op otherwise).
       drainCodexQueue(taskId);
+      drainCursorQueue(taskId);
     })
     .catch((err) => {
       const handle = active.get(runId);
@@ -1121,8 +1142,9 @@ function attachDoneHandler(
       if (isTerminalRun) {
         emitGlobal({ kind: "run-status", taskId, runId, status: newStatus, ts: Date.now() });
       }
-      // Spawn the next queued codex follow-up, if any (no-op otherwise).
+      // Spawn the next queued codex/cursor follow-up, if any (no-op otherwise).
       drainCodexQueue(taskId);
+      drainCursorQueue(taskId);
     });
 }
 
@@ -1151,9 +1173,11 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   if (before.agent !== after.agent) {
     if (beforeKind === "claude-code") dropSession(taskId);
     else if (beforeKind === "codex") dropCodexSession(taskId);
-    // Any queued codex follow-ups belong to the old agent — drop them so a
-    // later drain doesn't spawn them against the new harness.
+    else if (beforeKind === "cursor") dropCursorSession(taskId);
+    // Any queued codex/cursor follow-ups belong to the old agent — drop them
+    // so a later drain doesn't spawn them against the new harness.
     codexTurnQueue.delete(taskId);
+    cursorTurnQueue.delete(taskId);
     // Cross-kind switches (e.g. claude-code → codex alias) leave mode/
     // model/effort ids that belong to the old kind's option set; the
     // next spawn would error or fall through to verbatim flags. Reset
@@ -1343,7 +1367,10 @@ export type SendInputResult =
  *     messages can't strand surplus run rows in `running`. See
  *     `sendTurnInExistingSession`.
  *
- *   • codex: writes to the active run's stdin (single-run model unchanged).
+ *   • codex / cursor: one-shot turn per invocation — a follow-up while a turn
+ *     is in flight is queued (`codexTurnQueue` / `cursorTurnQueue`) and spawned
+ *     as a fresh `resume` turn once the active one resolves; otherwise it
+ *     spawns immediately. See `sendCodexTurn` / `sendCursorTurn`.
  *
  * Archived / detached-worktree restore: a message to an archived task
  * auto-unarchives it (sending is an unambiguous signal of continued
@@ -1398,6 +1425,12 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   }
   if (kind === "codex") {
     const result = sendCodexTurn(row.task_id, line);
+    return result
+      ? { delivered: true, runId: result }
+      : { delivered: false, reason: "internal: task lookup failed" };
+  }
+  if (kind === "cursor") {
+    const result = sendCursorTurn(row.task_id, line);
     return result
       ? { delivered: true, runId: result }
       : { delivered: false, reason: "internal: task lookup failed" };
@@ -1466,6 +1499,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
     // before this run's own `thread.started` re-emits it. onSessionId below
     // re-stamps the same value (idempotent).
     codexSessionId: priorThreadId,
+    cursorSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -1545,6 +1579,153 @@ function findLastCodexSessionId(taskId: string): string | null {
      LIMIT 1`,
   ).get(taskId);
   return row?.codex_session_id ?? null;
+}
+
+/**
+ * Per-task queue of follow-up lines received while a cursor turn is in
+ * flight. `cursor-agent -p` is one-shot per invocation (not a REPL), so we
+ * hold the message and spawn a fresh `cursor-agent --resume <session_id>`
+ * turn for it once the active turn resolves (`drainCursorQueue`, called from
+ * `attachDoneHandler`). Structural clone of `codexTurnQueue` — see that
+ * comment for the full rationale.
+ */
+const cursorTurnQueue = new Map<string, string[]>();
+
+/**
+ * Send a follow-up to a cursor task. Each follow-up is its own run row + its
+ * own `cursor-agent --resume <session_id>` turn (sequential-turn model). When
+ * a turn is already running, the message is queued; otherwise it spawns
+ * immediately. Returns the run id the message was attached to, or null on
+ * lookup failure.
+ */
+function sendCursorTurn(taskId: string, line: string): string | null {
+  const task = tasks.get(taskId);
+  if (!task) return null;
+  if (task.runId && active.has(task.runId)) {
+    const q = cursorTurnQueue.get(taskId) ?? [];
+    q.push(line);
+    cursorTurnQueue.set(taskId, q);
+    // Record the user bubble on the active run so the panel reflects it right
+    // away; the queued turn that answers it lands as a later run row.
+    const runId = task.runId;
+    const data = normalizeUserText(line);
+    runs.appendEvent(runId, "user", data);
+    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
+    return runId;
+  }
+  return spawnCursorTurnNow(task, taskId, line);
+}
+
+/**
+ * Spawn a fresh cursor turn that resumes the task's prior conversation via
+ * `cursor-agent --resume <session_id>`. New run row, new tmux session (the
+ * previous turn's exited), same `session_id` carried forward.
+ */
+function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
+  const priorSessionId = findLastCursorSessionId(taskId);
+  const cwd = task.worktreePath ?? task.workdir;
+  const harness = resolveHarness(task.agent);
+
+  const newRunId = randomUUID();
+  const now = Date.now();
+  runs.insert({
+    id: newRunId,
+    taskId,
+    agent: task.agent,
+    status: "running",
+    startedAt: now,
+    endedAt: null,
+    exitCode: null,
+    tmuxSession: sessionNameFor(taskId),
+    claudeSessionId: null,
+    codexSessionId: null,
+    // Carry the session id forward up front so a reattach mid-turn finds it
+    // even before this run's own first event re-emits it. onSessionId below
+    // re-stamps the same value (idempotent).
+    cursorSessionId: priorSessionId,
+  });
+  const prevColumn: ColumnId = task.column;
+  tasks.update(taskId, { column: "running", runId: newRunId });
+  if (prevColumn !== "running") {
+    emitGlobal({ kind: "column", taskId, runId: newRunId, column: "running", prev: prevColumn, ts: now });
+  }
+
+  const kind: AgentKind = harness?.kind ?? "cursor";
+  const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
+  onChunk("user", normalizeUserText(line));
+  onChunk(
+    "status",
+    priorSessionId
+      ? `resuming cursor session ${priorSessionId.slice(0, 8)}…`
+      : "no prior cursor session — starting fresh",
+  );
+
+  if (!harness) {
+    onChunk("stderr", `harness "${task.agent}" not found — cannot resume`);
+    runs.update(newRunId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    tasks.update(taskId, { column: "ready", runId: null });
+    return newRunId;
+  }
+
+  const agent = spawnAgent({
+    taskId,
+    runId: newRunId,
+    harness,
+    prompt: line,
+    cwd,
+    onChunk,
+    onSessionId: (sessionId) => {
+      runs.update(newRunId, { cursorSessionId: sessionId });
+    },
+    opts: {
+      mode: task.mode,
+      model: task.model,
+      effort: task.effort,
+      // Same generic resume-session field claude-code and codex already
+      // thread through `spawnAgent` → `buildCommand` — cursor's `session_id`
+      // rides the same `AgentRunOptions.resumeSessionId` contract rather than
+      // a cursor-specific field name (see this function's file-level header
+      // note on the resume option-field contract).
+      resumeSessionId: priorSessionId,
+    },
+  });
+  registerActiveRun(newRunId, taskId, task, agent);
+  attachDoneHandler(newRunId, taskId, agent);
+  return newRunId;
+}
+
+/**
+ * After a cursor turn resolves, spawn the next queued follow-up (if any) as a
+ * fresh resume turn. No-op for claude/codex tasks (their queue is always
+ * empty) and while a run is still active for the task.
+ */
+function drainCursorQueue(taskId: string): void {
+  const q = cursorTurnQueue.get(taskId);
+  if (!q || q.length === 0) return;
+  const task = tasks.get(taskId);
+  // Task vanished, or its agent was switched away from cursor while a turn
+  // was in flight — abandon the stale queue. Without this guard, draining
+  // after a cursor→claude/codex switch would spawn the follow-up against the
+  // new harness with a cursor session id, which the new harness rejects.
+  if (!task || resolveHarness(task.agent)?.kind !== "cursor") {
+    cursorTurnQueue.delete(taskId);
+    return;
+  }
+  if (task.runId && active.has(task.runId)) return;
+  const next = q.shift();
+  if (q.length === 0) cursorTurnQueue.delete(taskId);
+  if (next !== undefined) spawnCursorTurnNow(task, taskId, next);
+}
+
+/** Most-recent cursor session id across the task's runs (for `--resume`). */
+function findLastCursorSessionId(taskId: string): string | null {
+  const row = db.query<{ cursor_session_id: string }, [string]>(
+    `SELECT cursor_session_id FROM runs
+     WHERE task_id = ? AND cursor_session_id IS NOT NULL
+     ORDER BY started_at DESC
+     LIMIT 1`,
+  ).get(taskId);
+  return row?.cursor_session_id ?? null;
 }
 
 /**
@@ -1632,6 +1813,7 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: inheritedSessionId,
     codexSessionId: null,
+    cursorSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -1699,6 +1881,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: inheritedSessionId,
     codexSessionId: null,
+    cursorSessionId: null,
     origin: "continuation",
   });
   const prevColumn: ColumnId = task.column;
@@ -1756,6 +1939,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
     tmuxSession: sessionNameFor(taskId),
     claudeSessionId: priorSessionId,
     codexSessionId: null,
+    cursorSessionId: null,
   });
   const prevColumn: ColumnId = task.column;
   tasks.update(taskId, { column: "running", runId: newRunId });
@@ -2082,6 +2266,7 @@ function enqueueArchiveTeardown(
     // would hide a regression in claude-tmux from the next reviewer.
     if (kind === "claude-code") dropSession(cur.id);
     else if (kind === "codex") dropCodexSession(cur.id);
+    else if (kind === "cursor") dropCursorSession(cur.id);
     await killTerminalsForTask(cur.id);
     result = await detachWorktree(cur, { force: opts?.force });
   });
@@ -2189,9 +2374,10 @@ export async function archiveTask(
   }
   const updated = tasks.update(taskId, { archivedAt: Date.now() });
   if (!updated) return { error: "task not found" };
-  // codexTurnQueue is cheap in-memory bookkeeping (no I/O), so it's dropped
+  // Turn queues are cheap in-memory bookkeeping (no I/O), so they're dropped
   // inline rather than folded into the deferred job.
   codexTurnQueue.delete(taskId);
+  cursorTurnQueue.delete(taskId);
   // Deferred: the actual teardown (tmux kill, terminal shells, worktree
   // detach) is pushed onto this task's source-workdir teardown queue rather
   // than awaited here, so `archiveTask` can flip the DB column and return in
@@ -2259,10 +2445,12 @@ export async function deleteTask(taskId: string): Promise<void> {
   cancelPendingForTask(taskId, "task deleted");
   // Kill the task's tmux session before tearing down the worktree so we don't
   // leave an orphaned session behind. For claude it outlives individual runs;
-  // for codex it only exists during an in-flight turn — dropCodexSession also
-  // clears any in-memory tailer. No-op when no session exists.
+  // for codex/cursor it only exists during an in-flight turn — dropCodexSession
+  // / dropCursorSession also clear any in-memory tailer. No-op when no session
+  // exists.
   const deleteKind = resolveHarness(task.agent)?.kind;
   codexTurnQueue.delete(taskId);
+  cursorTurnQueue.delete(taskId);
   // Routed through the same per-workdir teardown queue archiveTask uses —
   // DELETE's semantics are unchanged (still awaited before `tasks.delete`
   // below), but this serializes it behind any archive teardown already in
@@ -2272,6 +2460,7 @@ export async function deleteTask(taskId: string): Promise<void> {
   await enqueueTeardown(taskId, task.workdir, async () => {
     if (deleteKind === "claude-code") dropSession(taskId);
     else if (deleteKind === "codex") dropCodexSession(taskId);
+    else if (deleteKind === "cursor") dropCursorSession(taskId);
     // Kill any open terminal tabs before removing the worktree — a live shell
     // sitting in the worktree dir would block `git worktree remove`. Awaited
     // so the shells are actually gone before we tear the directory down.

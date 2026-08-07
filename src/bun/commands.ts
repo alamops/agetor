@@ -148,9 +148,29 @@ const CODEX_BUILTINS: ReadonlyArray<{ name: string; description: string; kind: "
   { name: "/review", description: "Review current changes and find issues", kind: "command" },
 ];
 
+// cursor-agent's slash-command surface is unverified against a real binary
+// (no `--list` flag, no docs page enumerating built-ins as of this writing).
+// v1 ships zero curated built-ins rather than guess wrong; revisit once
+// `mapCursorEvent` has been live-verified against a real cursor-agent run
+// (see plan open question 8).
+const CURSOR_BUILTINS: ReadonlyArray<{ name: string; description: string; kind: "command" | "skill" }> = [];
+
 /** The harness's built-in commands/skills as AvailableCommand rows. */
 function builtinCommands(agent: AgentKind): AvailableCommand[] {
-  const builtins = agent === "claude-code" ? CLAUDE_BUILTINS : CODEX_BUILTINS;
+  let builtins: ReadonlyArray<{ name: string; description: string; kind: "command" | "skill" }>;
+  switch (agent) {
+    case "claude-code":
+      builtins = CLAUDE_BUILTINS;
+      break;
+    case "codex":
+      builtins = CODEX_BUILTINS;
+      break;
+    case "cursor":
+      builtins = CURSOR_BUILTINS;
+      break;
+    default:
+      builtins = [];
+  }
   return builtins.map((b) => ({ name: b.name, description: b.description, source: "builtin", kind: b.kind }));
 }
 
@@ -235,6 +255,10 @@ export async function listAvailableCommands(
     }
     all.push(...builtinCommands(opts.agent));
     all.push(...codexSystemSkills(userCmdRoot));
+  } else if (opts.agent === "cursor") {
+    // No `.cursor/` command/rules discovery in v1 (plan assumption 7) — just
+    // the (currently empty) curated built-ins, no filesystem scanning at all.
+    all.push(...builtinCommands(opts.agent));
   }
 
   // Project overrides user on collision so users can shadow a global command
@@ -544,6 +568,10 @@ function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null
     if (root) {
       all.push(...codexTomlMcpServers(path.join(root, ".codex", "config.toml"), "project"));
     }
+  } else if (opts.agent === "cursor") {
+    // No MCP-config parsing for cursor in v1 (plan §8 assumption) — no
+    // `.cursor/` config format is scanned here; falls through to an empty
+    // extension list rather than throwing or silently mislabeling.
   }
   return all;
 }

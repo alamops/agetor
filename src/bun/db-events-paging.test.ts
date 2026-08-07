@@ -97,8 +97,7 @@ function seedTaskWithEvents(count: number): { taskId: string; runId: string; ids
   runs.insert({
     id: runId, taskId, agent: "claude-code", status: "succeeded",
     startedAt: now, endedAt: now + 1, exitCode: 0,
-    tmuxSession: null, claudeSessionId: null, codexSessionId: null,
-  });
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null,  });
   const insertMany = db.transaction((n: number) => {
     for (let i = 0; i < n; i++) {
       runs.appendEvent(runId, "assistant", `e${i}`);

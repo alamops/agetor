@@ -389,7 +389,7 @@ This is an early-stage project. Things on the near-term list:
 
 - An uninstall flow that strips the `PreToolUse` hook and MCP-server entries from `.claude/settings.local.json` across every repo Agetor touched.
 - First-class Linux and Windows builds (currently configured but untested).
-- More agent kinds: Cursor agents, Aider, Gemini CLI.
+- More agent kinds: Aider, Gemini CLI. (Cursor landed — experimental, disabled by default; enable it in Settings.)
 - Optional Slack / native push notifications on terminal state, not just toasts.
 
 ---

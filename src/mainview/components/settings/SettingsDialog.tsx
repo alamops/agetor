@@ -59,6 +59,47 @@ function parseEnv(raw: string): { env: Record<string, string>; ignored: number }
   return { env, ignored };
 }
 
+/** Kinds still marked "experimental" in the UI — surfaced with the amber
+ *  badge everywhere a harness/template kind is shown. Extend this list (not
+ *  the individual call sites) as a kind graduates out of experimental. */
+function isExperimentalKind(kind: AgentKind): boolean {
+  return kind === "codex" || kind === "cursor";
+}
+
+/** Label above the harness-editor's HOME/config-dir override field. Only
+ *  claude-code has a dedicated config-dir env var — everyone else overrides
+ *  via HOME. */
+function homeOverrideLabel(kind: AgentKind): string {
+  return kind === "claude-code"
+    ? "CLAUDE_CONFIG_DIR override (absolute path; optional)"
+    : "HOME override (absolute path; optional)";
+}
+
+/** Trailing path segment used for the placeholder suggestion
+ *  (`<dataDir>/harnesses/<slug>`) for each kind. */
+function homeOverrideSlug(kind: AgentKind): string {
+  switch (kind) {
+    case "codex": return "codex-2";
+    case "cursor": return "cursor-2";
+    default: return "claude-2";
+  }
+}
+
+/** Explanatory copy under the HOME/config-dir override field — what env var(s)
+ *  it sets and why a separate path gives the harness its own account. */
+function homeOverrideHint(kind: AgentKind): string {
+  switch (kind) {
+    case "claude-code":
+      return "Sets CLAUDE_CONFIG_DIR on spawn — claude stores config, sessions, and login under this path, so a separate path gives this harness its own account. Authenticate by running: CLAUDE_CONFIG_DIR=<path> claude /login.";
+    case "codex":
+      return "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account.";
+    case "cursor":
+      return "HOME override — Cursor has no config-dir env var; the harness home becomes $HOME for the spawned agent, so a separate path gives this harness its own account.";
+    default:
+      return "Sets HOME on spawn, giving this harness its own account.";
+  }
+}
+
 function stringifyEnv(env: Record<string, string>): string {
   return Object.entries(env)
     .map(([k, v]) => `${k}=${v}`)
@@ -538,7 +579,7 @@ function ListView({
                         disabled
                       </span>
                     )}
-                    {h.kind === "codex" && (
+                    {isExperimentalKind(h.kind) && (
                       <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
                         experimental
                       </span>
@@ -603,7 +644,7 @@ function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
       </p>
       <div className="space-y-1.5">
         {HARNESS_TEMPLATES.map((t) => {
-          const experimental = t.kind === "codex";
+          const experimental = isExperimentalKind(t.kind);
           return (
             <button
               key={t.id}
@@ -746,9 +787,9 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
-        <div className="grid grid-cols-2 gap-1">
-          {(["claude-code", "codex"] as AgentKind[]).map((k) => {
-            const experimental = k === "codex";
+        <div className="grid grid-cols-3 gap-1">
+          {(["claude-code", "codex", "cursor"] as AgentKind[]).map((k) => {
+            const experimental = isExperimentalKind(k);
             return (
               <Button
                 key={k}
@@ -772,23 +813,19 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">
-          {kind === "claude-code"
-            ? "CLAUDE_CONFIG_DIR override (absolute path; optional)"
-            : "HOME override (absolute path; optional)"}
+          {homeOverrideLabel(kind)}
         </label>
         <Input
           value={home}
           onChange={(e) => setHome(e.target.value)}
           placeholder={
             dataDir
-              ? abbreviateHome(`${dataDir}/harnesses/${kind === "codex" ? "codex-2" : "claude-2"}`, homeDir)
+              ? abbreviateHome(`${dataDir}/harnesses/${homeOverrideSlug(kind)}`, homeDir)
               : "~/.agetor/harnesses/claude-2"
           }
         />
         <p className="text-[11px] leading-snug text-muted-foreground">
-          {kind === "claude-code"
-            ? "Sets CLAUDE_CONFIG_DIR on spawn — claude stores config, sessions, and login under this path, so a separate path gives this harness its own account. Authenticate by running: CLAUDE_CONFIG_DIR=<path> claude /login."
-            : "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account."}
+          {homeOverrideHint(kind)}
           {" "}Leave empty to share the default account.
         </p>
       </div>
