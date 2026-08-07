@@ -23,6 +23,7 @@ interface AddOpts {
   mode?: string;
   effort?: string;
   fast?: boolean;
+  maxMode?: boolean;
   workdir?: string;
   isolation?: "worktree" | "none";
   baseRef?: string;
@@ -46,6 +47,8 @@ function parseAdd(args: string[]): AddOpts {
       case "--effort": o.effort = val(); break;
       case "--fast": o.fast = true; break;
       case "--no-fast": o.fast = false; break;
+      case "--max-mode": o.maxMode = true; break;
+      case "--no-max-mode": o.maxMode = false; break;
       case "--workdir": o.workdir = val(); break;
       case "--isolation": o.isolation = val() === "none" ? "none" : "worktree"; break;
       case "--base-ref": o.baseRef = val(); break;
@@ -114,6 +117,7 @@ function baseInput(o: AddOpts, title: string, prompt: string): CreateTaskInput {
     mode: o.mode,
     effort: o.effort,
     fast: o.fast,
+    maxMode: o.maxMode,
     workdir: o.workdir,
     isolation: o.isolation,
     baseRef: o.baseRef,

@@ -536,7 +536,7 @@ test("codex throws when effort is missing for a model that supports it", () => {
 // but the prompt is NOT an argv element here — cursor-tmux.ts appends it at
 // spawn time via its own injection-safe quoting. `buildCommand`'s job is just
 // the flags: -p stream-json, --model, the auto/ask force+sandbox posture, and
-// --resume. Cursor effort/Fast are composed into the --model id.
+// --resume. Cursor effort/Fast/Max Mode are composed into the --model id.
 test("cursor with defaults emits -p --output-format stream-json --model auto --force --sandbox disabled", () => {
   const { cmd } = buildCommand(builtin("cursor"), "hi", { ...cursorDefaults });
   expect(cmd).toEqual([
@@ -587,6 +587,27 @@ test("cursor fast toggle selects the Fast model variant when that effort support
     fast: true,
   });
   expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol-max-fast");
+});
+
+test("cursor maxMode selects large context without changing reasoning effort", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "gpt-5.6-sol",
+    effort: "high",
+    fast: true,
+    maxMode: true,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("gpt-5.6-sol[context=1m,effort=high,fast=true]");
+});
+
+test("cursor maxMode is ignored for models without a large-context override", () => {
+  const { cmd } = buildCommand(builtin("cursor"), "hi", {
+    ...cursorDefaults,
+    model: "composer-2.5",
+    fast: true,
+    maxMode: true,
+  });
+  expect(cmd[cmd.indexOf("--model") + 1]).toBe("composer-2.5-fast");
 });
 
 test("cursor fast toggle is ignored for model/effort pairs without a fast variant", () => {

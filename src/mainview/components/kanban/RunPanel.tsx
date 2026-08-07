@@ -31,6 +31,7 @@ import {
   EVENTS_WINDOW_MAX,
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
+  cursorModelSupportsMaxMode,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -4691,7 +4692,7 @@ function TaskDetails({
     () => new Set(supportedEffortsForModel.map((o) => o.id)),
     [supportedEffortsForModel],
   );
-  const maxAvailable = kind === "cursor" && allowedEfforts.has("max");
+  const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(task.model);
   const fastAvailable = kind === "cursor" && cursorModelSupportsFast(task.model, task.effort);
   useEffect(() => {
     if (task.effort && allowedEfforts.has(task.effort)) return;
@@ -4709,6 +4710,10 @@ function TaskDetails({
     if (task.fast && !fastAvailable) void save({ fast: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fastAvailable, task.fast]);
+  useEffect(() => {
+    if (task.maxMode && !maxModeAvailable) void save({ maxMode: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [maxModeAvailable, task.maxMode]);
 
   const onAgentChange = (nextId: string) => {
     if (nextId === task.agent) return;
@@ -4726,7 +4731,7 @@ function TaskDetails({
       : nextEfforts.some((e) => e.id === DEFAULT_EFFORT[nextKind])
         ? DEFAULT_EFFORT[nextKind]
         : nextEfforts[0]!.id;
-    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false });
+    void save({ agent: nextId, mode: nextMode, model: nextModel, effort: nextEffort, fast: false, maxMode: false });
   };
 
   return (
@@ -4802,27 +4807,19 @@ function TaskDetails({
             )}
           </dd>
 
-          {kind === "cursor" && maxAvailable && (
+          {kind === "cursor" && (maxModeAvailable || task.maxMode) && (
             <>
-              <dt className="text-muted-foreground">Max</dt>
+              <dt className="text-muted-foreground">Max Mode</dt>
               <dd className="min-w-0">
                 {editable ? (
                   <Switch
-                    checked={task.effort === "max"}
-                    onCheckedChange={(checked) => {
-                      if (checked) {
-                        void save({ effort: "max" });
-                        return;
-                      }
-                      const fallback = supportedEffortsForModel.find((e) => e.id === DEFAULT_EFFORT.cursor && e.id !== "max")
-                        ?? supportedEffortsForModel.find((e) => e.id !== "max")
-                        ?? null;
-                      void save({ effort: fallback?.id ?? null });
-                    }}
-                    aria-label="Use Cursor max thinking"
+                    checked={task.maxMode}
+                    onCheckedChange={(maxMode) => void save({ maxMode })}
+                    disabled={!maxModeAvailable}
+                    aria-label="Use Cursor Max Mode context"
                   />
                 ) : (
-                  <span>{task.effort === "max" ? "on" : "off"}</span>
+                  <span>{task.maxMode ? "on" : "off"}</span>
                 )}
               </dd>
             </>

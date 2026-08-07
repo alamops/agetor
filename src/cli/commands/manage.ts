@@ -31,6 +31,8 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
       case "--effort": patch.effort = val(); break;
       case "--fast": patch.fast = true; break;
       case "--no-fast": patch.fast = false; break;
+      case "--max-mode": patch.maxMode = true; break;
+      case "--no-max-mode": patch.maxMode = false; break;
       case "--type": patch.taskType = val(); break;
       case "--column": patch.column = val(); break;
       default: break;
@@ -38,7 +40,7 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   }
   if (Object.keys(patch).length === 0) {
     throw new Error(
-      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--fast/--no-fast/--type/--column",
+      "nothing to edit — pass at least one of --title/--prompt/--agent/--workdir/--model/--mode/--effort/--fast/--no-fast/--max-mode/--no-max-mode/--type/--column",
     );
   }
   if (patch.column && !COLUMN_IDS.includes(patch.column as (typeof COLUMN_IDS)[number])) {
