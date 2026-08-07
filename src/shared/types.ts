@@ -622,6 +622,12 @@ export interface Task {
    */
   effort: string | null;
   /**
+   * Fast model variant toggle. Currently only consumed by Cursor, whose CLI
+   * exposes Fast as part of the selected model id rather than as a standalone
+   * flag. Non-Cursor harnesses ignore it.
+   */
+  fast: boolean;
+  /**
    * Path-only references the user attached at task creation (files and
    * folders on the user's machine). Empty list when none. Inlined into the
    * launch prompt as text — agetor never copies or uploads these.
@@ -896,6 +902,17 @@ export interface AgentOptions {
   efforts: AgentOption[];
 }
 
+export interface CursorModelSpec {
+  label: string;
+  hint?: string;
+  /** Cursor's concrete model ids for each thinking level this base model supports. */
+  effortIds?: Partial<Record<string, string>>;
+  /** Thinking levels that Cursor exposes as a separate Fast variant. */
+  fastEfforts?: string[];
+  /** Fast model id for models with a fast toggle but no thinking levels. */
+  fastId?: string;
+}
+
 /**
  * Per-kind default model and effort. These are the values the UI pre-selects
  * for a new task, the migration backfills onto legacy NULL rows, and the
@@ -919,14 +936,263 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
   "codex": "high",
-  // Cursor has no effort/reasoning knob at all — "none" is the canonical
-  // sentinel for "this model doesn't accept an effort flag" (see the "none"
-  // entry in EFFORT_OPTIONS below). MODEL_EFFORT_SUPPORT.cursor keeps every
-  // model's supported-effort list empty, so this value never actually
-  // surfaces in the picker; it's just a well-formed placeholder for legacy
-  // row backfills / createTask defaults.
-  "cursor": "none",
+  // Cursor's default model is still "auto", which declines effort and stores
+  // NULL. When the user chooses a parameterized Cursor model, default to High.
+  "cursor": "high",
 };
+
+export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
+  "auto": { label: "Auto", hint: "Cursor picks the model." },
+  "gpt-5.3-codex": {
+    label: "Codex 5.3",
+    hint: "Cursor-hosted Codex 5.3.",
+    effortIds: {
+      xhigh: "gpt-5.3-codex-xhigh",
+      high: "gpt-5.3-codex-high",
+      medium: "gpt-5.3-codex",
+      low: "gpt-5.3-codex-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
+  "cursor-grok-4.5": {
+    label: "Cursor Grok 4.5",
+    hint: "Cursor-hosted Grok model.",
+    effortIds: {
+      high: "cursor-grok-4.5-high",
+      medium: "cursor-grok-4.5-medium",
+      low: "cursor-grok-4.5-low",
+    },
+    fastEfforts: ["high", "medium", "low"],
+  },
+  "composer-2.5": {
+    label: "Composer 2.5",
+    hint: "Cursor's own fast agentic model.",
+    fastId: "composer-2.5-fast",
+  },
+  "claude-opus-5": {
+    label: "Opus 5",
+    hint: "Anthropic Opus 5 via Cursor.",
+    effortIds: {
+      max: "claude-opus-5-thinking-max",
+      xhigh: "claude-opus-5-thinking-xhigh",
+      high: "claude-opus-5-thinking-high",
+      medium: "claude-opus-5-thinking-medium",
+      low: "claude-opus-5-thinking-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
+  },
+  "claude-opus-4-8": {
+    label: "Opus 4.8",
+    hint: "Anthropic Opus 4.8 via Cursor.",
+    effortIds: {
+      max: "claude-opus-4-8-max",
+      xhigh: "claude-opus-4-8-xhigh",
+      high: "claude-opus-4-8-high",
+      medium: "claude-opus-4-8-medium",
+      low: "claude-opus-4-8-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
+  },
+  "gpt-5.6-sol": {
+    label: "GPT-5.6 Sol",
+    hint: "Cursor-hosted GPT-5.6 Sol.",
+    effortIds: {
+      max: "gpt-5.6-sol-max",
+      xhigh: "gpt-5.6-sol-xhigh",
+      high: "gpt-5.6-sol-high",
+      medium: "gpt-5.6-sol-medium",
+      low: "gpt-5.6-sol-low",
+      none: "gpt-5.6-sol-none",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
+  },
+  "gpt-5.5": {
+    label: "GPT-5.5",
+    hint: "OpenAI GPT-5.5 via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.5-extra-high",
+      high: "gpt-5.5-high",
+      medium: "gpt-5.5-medium",
+      low: "gpt-5.5-low",
+      none: "gpt-5.5-none",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low", "none"],
+  },
+  "claude-fable-5": {
+    label: "Fable 5",
+    hint: "Anthropic Fable 5 via Cursor.",
+    effortIds: {
+      max: "claude-fable-5-max",
+      xhigh: "claude-fable-5-xhigh",
+      high: "claude-fable-5-high",
+      medium: "claude-fable-5-medium",
+      low: "claude-fable-5-low",
+    },
+  },
+  "claude-sonnet-5": {
+    label: "Sonnet 5",
+    hint: "Anthropic Sonnet 5 via Cursor.",
+    effortIds: {
+      max: "claude-sonnet-5-max",
+      xhigh: "claude-sonnet-5-xhigh",
+      high: "claude-sonnet-5-high",
+      medium: "claude-sonnet-5-medium",
+      low: "claude-sonnet-5-low",
+    },
+  },
+  "gpt-5.6-terra": {
+    label: "GPT-5.6 Terra",
+    hint: "Cursor-hosted GPT-5.6 Terra.",
+    effortIds: {
+      max: "gpt-5.6-terra-max",
+      xhigh: "gpt-5.6-terra-xhigh",
+      high: "gpt-5.6-terra-high",
+      medium: "gpt-5.6-terra-medium",
+      low: "gpt-5.6-terra-low",
+      none: "gpt-5.6-terra-none",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
+  },
+  "claude-4.6-sonnet": {
+    label: "Sonnet 4.6",
+    hint: "Anthropic Sonnet 4.6 via Cursor.",
+    effortIds: { medium: "claude-4.6-sonnet-medium" },
+  },
+  "gpt-5.4": {
+    label: "GPT-5.4",
+    hint: "OpenAI GPT-5.4 via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.4-xhigh",
+      high: "gpt-5.4-high",
+      medium: "gpt-5.4-medium",
+      low: "gpt-5.4-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium"],
+  },
+  "claude-4.6-opus": {
+    label: "Opus 4.6",
+    hint: "Anthropic Opus 4.6 via Cursor.",
+    effortIds: { max: "claude-4.6-opus-max", high: "claude-4.6-opus-high" },
+  },
+  "claude-4.5-opus": {
+    label: "Opus 4.5",
+    hint: "Anthropic Opus 4.5 via Cursor.",
+    effortIds: { high: "claude-4.5-opus-high" },
+  },
+  "gpt-5.2": {
+    label: "GPT-5.2",
+    hint: "OpenAI GPT-5.2 via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.2-xhigh",
+      high: "gpt-5.2-high",
+      medium: "gpt-5.2",
+      low: "gpt-5.2-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
+  "gpt-5.6-luna": {
+    label: "GPT-5.6 Luna",
+    hint: "Cursor-hosted GPT-5.6 Luna.",
+    effortIds: {
+      max: "gpt-5.6-luna-max",
+      xhigh: "gpt-5.6-luna-xhigh",
+      high: "gpt-5.6-luna-high",
+      medium: "gpt-5.6-luna-medium",
+      low: "gpt-5.6-luna-low",
+      none: "gpt-5.6-luna-none",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
+  },
+  "gemini-3.6-flash": {
+    label: "Gemini 3.6 Flash",
+    hint: "Google Gemini 3.6 Flash via Cursor.",
+    effortIds: {
+      high: "gemini-3.6-flash-high",
+      medium: "gemini-3.6-flash-medium",
+      low: "gemini-3.6-flash-low",
+      minimal: "gemini-3.6-flash-minimal",
+    },
+  },
+  "gemini-3.1-pro": { label: "Gemini 3.1 Pro", hint: "Google Gemini 3.1 Pro via Cursor." },
+  "gpt-5.4-mini": {
+    label: "GPT-5.4 Mini",
+    hint: "OpenAI GPT-5.4 Mini via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.4-mini-xhigh",
+      high: "gpt-5.4-mini-high",
+      medium: "gpt-5.4-mini-medium",
+      low: "gpt-5.4-mini-low",
+      none: "gpt-5.4-mini-none",
+    },
+  },
+  "gpt-5.4-nano": {
+    label: "GPT-5.4 Nano",
+    hint: "OpenAI GPT-5.4 Nano via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.4-nano-xhigh",
+      high: "gpt-5.4-nano-high",
+      medium: "gpt-5.4-nano-medium",
+      low: "gpt-5.4-nano-low",
+      none: "gpt-5.4-nano-none",
+    },
+  },
+  "claude-4.5-sonnet": { label: "Sonnet 4.5", hint: "Anthropic Sonnet 4.5 via Cursor." },
+  "gpt-5.1": {
+    label: "GPT-5.1",
+    hint: "OpenAI GPT-5.1 via Cursor.",
+    effortIds: { high: "gpt-5.1-high", medium: "gpt-5.1", low: "gpt-5.1-low" },
+  },
+  "gemini-3-flash": { label: "Gemini 3 Flash", hint: "Google Gemini 3 Flash via Cursor." },
+  "gemini-3.5-flash": { label: "Gemini 3.5 Flash", hint: "Google Gemini 3.5 Flash via Cursor." },
+  "claude-4-sonnet": {
+    label: "Sonnet 4",
+    hint: "Anthropic Sonnet 4 via Cursor.",
+    effortIds: { high: "claude-4-sonnet-thinking", none: "claude-4-sonnet" },
+  },
+  "gpt-5-mini": { label: "GPT-5 Mini", hint: "OpenAI GPT-5 Mini via Cursor." },
+  "kimi-k3": {
+    label: "Kimi K3",
+    hint: "Kimi K3 via Cursor.",
+    effortIds: { max: "kimi-k3-max", high: "kimi-k3-high", low: "kimi-k3-low" },
+  },
+  "kimi-k2.7-code": { label: "Kimi K2.7 Code", hint: "Kimi K2.7 Code via Cursor." },
+  "glm-5.2": {
+    label: "GLM 5.2",
+    hint: "GLM 5.2 via Cursor.",
+    effortIds: { max: "glm-5.2-max", high: "glm-5.2-high" },
+  },
+};
+
+export function cursorModelSupportsFast(model: string | null, effort: string | null): boolean {
+  const spec = CURSOR_MODEL_SPECS[model ?? DEFAULT_MODEL.cursor];
+  if (!spec) return false;
+  if (spec.fastId && !spec.effortIds) return true;
+  if (!effort) return false;
+  return spec.fastEfforts?.includes(effort) ?? false;
+}
+
+export function cursorModelIdCoveredByCatalog(id: string): boolean {
+  if (CURSOR_MODEL_SPECS[id]) return true;
+  return Object.values(CURSOR_MODEL_SPECS).some((spec) => {
+    if (spec.fastId === id) return true;
+    return Object.values(spec.effortIds ?? {}).some((variant) => variant === id || `${variant}-fast` === id);
+  });
+}
+
+export function cursorModelArg(model: string, effort: string | null, fast: boolean): string {
+  const spec = CURSOR_MODEL_SPECS[model];
+  if (!spec) return model;
+  if (!spec.effortIds) return fast && spec.fastId ? spec.fastId : model;
+  const desiredEffort =
+    effort && spec.effortIds[effort]
+      ? effort
+      : DEFAULT_EFFORT.cursor && spec.effortIds[DEFAULT_EFFORT.cursor]
+        ? DEFAULT_EFFORT.cursor
+        : Object.keys(spec.effortIds)[0];
+  if (!desiredEffort) return model;
+  const baseId = spec.effortIds[desiredEffort] ?? model;
+  return fast && spec.fastEfforts?.includes(desiredEffort) ? `${baseId}-fast` : baseId;
+}
 
 /**
  * Maps the prominent two-way "Code vs Plan" UI toggle onto a concrete mode id
@@ -978,7 +1244,8 @@ export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
-  { id: "none", label: "None", hint: "Skip reasoning entirely (reasoning-only models)." },
+  { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where Cursor exposes it." },
+  { id: "none", label: "No thinking", hint: "Skip thinking where the model exposes a no-thinking variant." },
 ];
 
 /**
@@ -1025,15 +1292,12 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
   },
-  // cursor-agent has no effort/reasoning flag at all — every model it
-  // exposes gets an empty list, same representation as Haiku 4.5 above.
-  cursor: {
-    "auto": [],
-    "composer-2.5": [],
-    "claude-sonnet-5": [],
-    "claude-opus-4.8": [],
-    "gpt-5.5": [],
-  },
+  cursor: Object.fromEntries(
+    Object.entries(CURSOR_MODEL_SPECS).map(([id, spec]) => [
+      id,
+      spec.effortIds ? EFFORT_OPTIONS.map((o) => o.id).filter((effort) => Boolean(spec.effortIds?.[effort])) : [],
+    ]),
+  ) as Record<string, string[]>,
 };
 
 /**
@@ -1128,13 +1392,11 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     efforts: EFFORT_OPTIONS,
   },
   cursor: {
-    models: [
-      { id: "auto", label: "Auto", hint: "Cursor picks the model." },
-      { id: "composer-2.5", label: "Composer 2.5", hint: "Cursor's own fast agentic model." },
-      { id: "claude-sonnet-5", label: "Claude Sonnet 5", hint: "Anthropic's Sonnet 5, via Cursor." },
-      { id: "claude-opus-4.8", label: "Claude Opus 4.8", hint: "Anthropic's Opus 4.8, via Cursor." },
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "OpenAI's GPT-5.5, via Cursor." },
-    ],
+    models: Object.entries(CURSOR_MODEL_SPECS).map(([id, spec]) => ({
+      id,
+      label: spec.label,
+      hint: spec.hint,
+    })),
     modes: [
       { id: "auto", label: "Auto (force)", hint: "Hands-off — runs with --force, executing edits and commands without approval prompts." },
       { id: "ask", label: "Read-only", hint: "Propose-only — cursor cannot execute unapproved actions headlessly." },

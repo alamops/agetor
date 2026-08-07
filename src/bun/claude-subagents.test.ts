@@ -72,7 +72,8 @@ async function seed() {
   tasks.insert({
     id: taskId, title: "t", prompt: "p", column: "running", agent: "claude-code",
     workdir: "/tmp", isolation: "none", taskType: "task", branch: null, branchSource: "created", worktreePath: null,
-    baseRef: null, mode: null, model: null, effort: null, references: [], backlog: [], draft: null, runId,
+    baseRef: null, mode: null, model: null, effort: null,
+    fast: false, references: [], backlog: [], draft: null, runId,
     prUrl: null,
     hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
     archivedAt: null, createdAt: now, updatedAt: now,

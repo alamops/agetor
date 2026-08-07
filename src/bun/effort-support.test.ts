@@ -1,5 +1,13 @@
 import { test, expect } from "bun:test";
-import { AGENT_OPTIONS, DEFAULT_EFFORT, DEFAULT_MODEL, supportedEfforts, supportedModes } from "../shared/types.ts";
+import {
+  AGENT_OPTIONS,
+  DEFAULT_EFFORT,
+  DEFAULT_MODEL,
+  cursorModelArg,
+  cursorModelSupportsFast,
+  supportedEfforts,
+  supportedModes,
+} from "../shared/types.ts";
 
 test("claude opus-5 supports xhigh + max", () => {
   const ids = supportedEfforts("claude-code", "opus-5").map((o) => o.id);
@@ -97,29 +105,65 @@ test("ordered highest → lowest (no placeholder at the top)", () => {
   expect(ids).toEqual(filteredExpected);
 });
 
-// --- cursor: no reasoning/effort knob at all ---------------------------------
+// --- cursor: model thinking modes + fast variants -----------------------------
 
 test("cursor DEFAULT_MODEL is 'auto' (cursor-agent's own 'let the CLI pick' default)", () => {
   expect(DEFAULT_MODEL.cursor).toBe("auto");
 });
 
-test("cursor DEFAULT_EFFORT matches the 'none' sentinel (no effort knob to default)", () => {
-  expect(DEFAULT_EFFORT.cursor).toBe("none");
+test("cursor DEFAULT_EFFORT is high for parameterized non-Auto models", () => {
+  expect(DEFAULT_EFFORT.cursor).toBe("high");
 });
 
-test.each(AGENT_OPTIONS.cursor.models.map((m) => m.id))(
-  "cursor model '%s' reports zero supported efforts (cursor-agent has no reasoning-effort flag)",
-  (modelId) => {
-    expect(supportedEfforts("cursor", modelId)).toEqual([]);
-  },
-);
+test("cursor model catalog includes the screenshot/default surface", () => {
+  const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
+  expect(ids[0]).toBe("auto");
+  expect(ids).toContain("gpt-5.3-codex");
+  expect(ids).toContain("cursor-grok-4.5");
+  expect(ids).toContain("composer-2.5");
+  expect(ids).toContain("claude-opus-5");
+  expect(ids).toContain("gpt-5.6-sol");
+  expect(ids).toContain("gpt-5.6-terra");
+  expect(ids).toContain("gemini-3.1-pro");
+  expect(ids).toContain("glm-5.2");
+});
 
-test("cursor null model falls back to DEFAULT_MODEL ('auto') and still reports zero efforts", () => {
+test("cursor Auto model reports zero efforts", () => {
   expect(supportedEfforts("cursor", null)).toEqual([]);
+  expect(supportedEfforts("cursor", "auto")).toEqual([]);
 });
 
-test("cursor unknown model id falls back to DEFAULT_MODEL support set (still empty)", () => {
+test("cursor Opus 4.8 and GPT-5.6 Sol expose Max", () => {
+  expect(supportedEfforts("cursor", "claude-opus-4-8").map((o) => o.id)).toContain("max");
+  expect(supportedEfforts("cursor", "gpt-5.6-sol").map((o) => o.id)).toContain("max");
+});
+
+test("cursor GPT-5.4 exposes Extra High but not Max", () => {
+  const ids = supportedEfforts("cursor", "gpt-5.4").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).not.toContain("max");
+});
+
+test("cursor Gemini 3.6 Flash exposes Minimal", () => {
+  expect(supportedEfforts("cursor", "gemini-3.6-flash").map((o) => o.id)).toContain("minimal");
+});
+
+test("cursor unknown model id falls back to DEFAULT_MODEL support set (Auto, no efforts)", () => {
   expect(supportedEfforts("cursor", "cursor-mystery-9000")).toEqual([]);
+});
+
+test("cursor fast support is model and effort specific", () => {
+  expect(cursorModelSupportsFast("gpt-5.6-sol", "max")).toBe(true);
+  expect(cursorModelSupportsFast("gpt-5.4", "low")).toBe(false);
+  expect(cursorModelSupportsFast("composer-2.5", null)).toBe(true);
+  expect(cursorModelSupportsFast("claude-sonnet-5", "max")).toBe(false);
+});
+
+test("cursorModelArg composes known model, effort, and fast variants", () => {
+  expect(cursorModelArg("gpt-5.5", "xhigh", false)).toBe("gpt-5.5-extra-high");
+  expect(cursorModelArg("gpt-5.5", "xhigh", true)).toBe("gpt-5.5-extra-high-fast");
+  expect(cursorModelArg("composer-2.5", null, true)).toBe("composer-2.5-fast");
+  expect(cursorModelArg("unknown-model", "max", true)).toBe("unknown-model");
 });
 
 test("cursor supportedModes returns the auto/ask pair (no per-model mode carve-outs)", () => {

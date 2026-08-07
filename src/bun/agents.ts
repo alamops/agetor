@@ -1,5 +1,5 @@
 import path from "node:path";
-import { MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
+import { cursorModelArg, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
@@ -54,6 +54,8 @@ export interface AgentRunOptions {
   model?: string | null;
   /** Friendly reasoning-effort id (codex: minimal|low|medium|high). */
   effort?: string | null;
+  /** Fast model variant toggle. Currently consumed by cursor only. */
+  fast?: boolean | null;
   /**
    * Existing session id to resume a prior conversation on a follow-up turn.
    * For claude-code: the JSONL session uuid, resumed via `claude --resume
@@ -417,10 +419,9 @@ export function buildCommand(
     if (!opts.model) {
       throw new Error("model is required for cursor");
     }
-    // Passed through verbatim, including the default "auto" id — mirrors
-    // codex, which always emits --model rather than omitting the flag for
-    // its own default.
-    args.push("--model", opts.model);
+    // Cursor exposes thinking level and Fast as model variants. Curated base
+    // model ids are composed here; unknown/discovered ids pass through.
+    args.push("--model", cursorModelArg(opts.model, opts.effort ?? null, opts.fast === true));
 
     // Mode → auto-execute posture. `auto` (also the null default, per house
     // convention) runs with --force --sandbox disabled so cursor executes
@@ -444,10 +445,6 @@ export function buildCommand(
     if (opts.resumeSessionId) {
       args.push("--resume", opts.resumeSessionId);
     }
-
-    // No effort flag: cursor-agent has none. opts.effort is ignored entirely
-    // (MODEL_EFFORT_SUPPORT.cursor keeps every model's supported-effort list
-    // empty, so the picker never even sends one).
 
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
@@ -755,4 +752,3 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
     onSessionId,
   });
 }
-
