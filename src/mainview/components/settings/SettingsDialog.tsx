@@ -59,6 +59,13 @@ function parseEnv(raw: string): { env: Record<string, string>; ignored: number }
   return { env, ignored };
 }
 
+/** Kinds still marked "experimental" in the UI — surfaced with the amber
+ *  badge everywhere a harness/template kind is shown. Extend this list (not
+ *  the individual call sites) as a kind graduates out of experimental. */
+function isExperimentalKind(kind: AgentKind): boolean {
+  return kind === "codex" || kind === "cursor" || kind === "gemini";
+}
+
 function stringifyEnv(env: Record<string, string>): string {
   return Object.entries(env)
     .map(([k, v]) => `${k}=${v}`)
@@ -89,8 +96,9 @@ function resolveTemplate(t: HarnessTemplate, dataDir: string): HarnessTemplate {
  * Per-kind copy for the "Add harness" home-override field: the field label,
  * the slug used to build the suggested placeholder path, and the help text
  * explaining what env var the override sets. Table-driven rather than a
- * ternary chain because a third kind (gemini) made the binary claude/codex
- * ternary genuinely hard to read.
+ * ternary chain because a binary claude/codex ternary can't represent every
+ * kind's env var accurately — codex sets HOME+CODEX_HOME, cursor sets a
+ * plain HOME with no dedicated var, gemini sets its own GEMINI_CLI_HOME.
  */
 const HARNESS_HOME_COPY: Record<AgentKind, { label: string; slug: string; help: string }> = {
   "claude-code": {
@@ -102,6 +110,11 @@ const HARNESS_HOME_COPY: Record<AgentKind, { label: string; slug: string; help: 
     label: "HOME override (absolute path; optional)",
     slug: "codex-2",
     help: "Sets HOME and CODEX_HOME on spawn — codex stores its login under $CODEX_HOME, so a separate path gives this harness its own account.",
+  },
+  cursor: {
+    label: "HOME override (absolute path; optional)",
+    slug: "cursor-2",
+    help: "HOME override — Cursor has no config-dir env var; the harness home becomes $HOME for the spawned agent, so a separate path gives this harness its own account.",
   },
   gemini: {
     label: "GEMINI_CLI_HOME override (absolute path; optional)",
@@ -325,10 +338,10 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
     <Dialog
       open={open}
       onClose={onClose}
-      className="max-w-2xl"
+      className="flex max-h-[85vh] w-full max-w-2xl flex-col p-0"
       labelledBy="settings-dialog-title"
     >
-      <div className="flex items-center justify-between border-b border-border/60 pb-3">
+      <div className="flex shrink-0 items-center justify-between border-b border-border/60 p-4 pb-3">
         <div className="flex items-center gap-2">
           {view.kind !== "list" && (
             <Button
@@ -359,88 +372,90 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
         </div>
       </div>
 
-      {view.kind === "list" && (
-        <ListView
-          payload={payload}
-          statusByHarness={statusByHarness}
-          defaultHarness={defaultHarness}
-          homeDir={homeDir}
-          onPickDefault={onPickDefault}
-          tmuxSource={tmuxSource}
-          bundledTmuxAvailable={bundledTmuxAvailable}
-          onPickTmuxSource={onPickTmuxSource}
-          canAdd={!!dataDir}
-          onAdd={() => setView({ kind: "templates" })}
-          onEdit={(h) =>
-            setView({
-              kind: "editor",
-              harnessId: h.id,
-              template: {
-                id: "__edit",
-                label: h.label,
-                description: "",
-                kind: h.kind,
-                suggestedHarnessId: h.id,
-                home: h.home,
-                bin: h.bin,
-                env: h.env,
-              },
-            })
-          }
-          onDelete={onDeleteHarness}
-          onToggleEnabled={onToggleEnabled}
-          onOpenTerminal={onOpenTerminal}
-          pendingToggle={pendingToggle}
-        />
-      )}
-
-      {view.kind === "templates" && (
-        <TemplatePicker
-          onPick={(t) =>
-            setView({
-              kind: "editor",
-              harnessId: null,
-              template: resolveTemplate(t, dataDir),
-            })
-          }
-        />
-      )}
-
-      {view.kind === "editor" && (
-        <Editor
-          template={view.template}
-          isEdit={view.harnessId !== null}
-          homeDir={homeDir}
-          dataDir={dataDir}
-          existingIds={new Set(payload.harnesses.map((h) => h.id))}
-          busy={busy}
-          error={formError}
-          onCancel={() => setView({ kind: "list" })}
-          onSubmit={async (input) => {
-            setBusy(true);
-            setFormError(null);
-            try {
-              if (view.harnessId) {
-                await api.updateHarness(view.harnessId, {
-                  label: input.label,
-                  home: input.home,
-                  bin: input.bin,
-                  env: input.env,
-                });
-              } else {
-                await api.createHarness(input);
-              }
-              await refresh();
-              onChange?.();
-              setView({ kind: "list" });
-            } catch (e) {
-              setFormError(e instanceof Error ? e.message : String(e));
-            } finally {
-              setBusy(false);
+      <div className="min-h-0 flex-1 overflow-y-auto p-4 pt-0">
+        {view.kind === "list" && (
+          <ListView
+            payload={payload}
+            statusByHarness={statusByHarness}
+            defaultHarness={defaultHarness}
+            homeDir={homeDir}
+            onPickDefault={onPickDefault}
+            tmuxSource={tmuxSource}
+            bundledTmuxAvailable={bundledTmuxAvailable}
+            onPickTmuxSource={onPickTmuxSource}
+            canAdd={!!dataDir}
+            onAdd={() => setView({ kind: "templates" })}
+            onEdit={(h) =>
+              setView({
+                kind: "editor",
+                harnessId: h.id,
+                template: {
+                  id: "__edit",
+                  label: h.label,
+                  description: "",
+                  kind: h.kind,
+                  suggestedHarnessId: h.id,
+                  home: h.home,
+                  bin: h.bin,
+                  env: h.env,
+                },
+              })
             }
-          }}
-        />
-      )}
+            onDelete={onDeleteHarness}
+            onToggleEnabled={onToggleEnabled}
+            onOpenTerminal={onOpenTerminal}
+            pendingToggle={pendingToggle}
+          />
+        )}
+
+        {view.kind === "templates" && (
+          <TemplatePicker
+            onPick={(t) =>
+              setView({
+                kind: "editor",
+                harnessId: null,
+                template: resolveTemplate(t, dataDir),
+              })
+            }
+          />
+        )}
+
+        {view.kind === "editor" && (
+          <Editor
+            template={view.template}
+            isEdit={view.harnessId !== null}
+            homeDir={homeDir}
+            dataDir={dataDir}
+            existingIds={new Set(payload.harnesses.map((h) => h.id))}
+            busy={busy}
+            error={formError}
+            onCancel={() => setView({ kind: "list" })}
+            onSubmit={async (input) => {
+              setBusy(true);
+              setFormError(null);
+              try {
+                if (view.harnessId) {
+                  await api.updateHarness(view.harnessId, {
+                    label: input.label,
+                    home: input.home,
+                    bin: input.bin,
+                    env: input.env,
+                  });
+                } else {
+                  await api.createHarness(input);
+                }
+                await refresh();
+                onChange?.();
+                setView({ kind: "list" });
+              } catch (e) {
+                setFormError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          />
+        )}
+      </div>
     </Dialog>
   );
 }
@@ -563,7 +578,7 @@ function ListView({
                         disabled
                       </span>
                     )}
-                    {(h.kind === "codex" || h.kind === "gemini") && (
+                    {isExperimentalKind(h.kind) && (
                       <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
                         experimental
                       </span>
@@ -628,7 +643,7 @@ function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
       </p>
       <div className="space-y-1.5">
         {HARNESS_TEMPLATES.map((t) => {
-          const experimental = t.kind === "codex" || t.kind === "gemini";
+          const experimental = isExperimentalKind(t.kind);
           return (
             <button
               key={t.id}
@@ -771,9 +786,9 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
-        <div className="grid grid-cols-3 gap-1">
-          {(["claude-code", "codex", "gemini"] as AgentKind[]).map((k) => {
-            const experimental = k === "codex" || k === "gemini";
+        <div className="grid grid-cols-4 gap-1">
+          {(["claude-code", "codex", "cursor", "gemini"] as AgentKind[]).map((k) => {
+            const experimental = isExperimentalKind(k);
             return (
               <Button
                 key={k}

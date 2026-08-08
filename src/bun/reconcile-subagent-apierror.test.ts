@@ -71,6 +71,7 @@ test("priorApiError query ignores a subagent-tagged api-error row (subagent_id s
     mode: null,
     model: null,
     effort: null,
+    fast: false, maxMode: false,
     references: [], backlog: [], draft: null,
     runId,
     hasOpenableRun: false,
@@ -91,7 +92,7 @@ test("priorApiError query ignores a subagent-tagged api-error row (subagent_id s
     tmuxSession: null,
     claudeSessionId: null,
     codexSessionId: null,
-    geminiSessionId: null,
+    cursorSessionId: null, geminiSessionId: null,
   });
 
   // A subagent tailer's own api-error status row, persisted under the
@@ -132,6 +133,7 @@ test("priorApiError query matches a main-tailer api-error row (subagent_id NULL)
     mode: null,
     model: null,
     effort: null,
+    fast: false, maxMode: false,
     references: [], backlog: [], draft: null,
     runId,
     hasOpenableRun: false,
@@ -152,7 +154,7 @@ test("priorApiError query matches a main-tailer api-error row (subagent_id NULL)
     tmuxSession: null,
     claudeSessionId: null,
     codexSessionId: null,
-    geminiSessionId: null,
+    cursorSessionId: null, geminiSessionId: null,
   });
 
   // The main tailer's own api-error status row — subagent_id explicitly

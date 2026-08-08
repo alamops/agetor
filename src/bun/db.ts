@@ -70,6 +70,8 @@ type TaskRow = {
   branch_source: string;
   pr_url: string | null;
   mode: string | null; model: string | null; effort: string | null;
+  fast: number;
+  max_mode: number;
   refs: string;
   backlog: string;
   draft: string | null;
@@ -179,6 +181,8 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   mode: r.mode,
   model: r.model,
   effort: r.effort,
+  fast: r.fast === 1,
+  maxMode: r.max_mode === 1,
   references: parseRefs(r.refs),
   backlog: parseBacklog(r.backlog),
   draft: parseDraft(r.draft),
@@ -230,13 +234,13 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, refs, backlog, draft,
+          branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, fast, max_mode, refs, backlog, draft,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
-        t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.mode, t.model, t.effort,
+        t.branch, t.branchSource, t.worktreePath, t.baseRef, t.prUrl ?? null, t.mode, t.model, t.effort, t.fast ? 1 : 0, t.maxMode ? 1 : 0,
         JSON.stringify(t.references ?? []),
         JSON.stringify(t.backlog ?? []),
         t.draft ? JSON.stringify(t.draft) : null,
@@ -255,13 +259,13 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, refs=?, backlog=?, draft=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
         next.title, next.prompt, next.column, next.agent, next.workdir, next.isolation,
         next.taskType,
-        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.mode, next.model, next.effort,
+        next.branch, next.branchSource, next.worktreePath, next.baseRef, next.prUrl ?? null, next.mode, next.model, next.effort, next.fast ? 1 : 0, next.maxMode ? 1 : 0,
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
         next.draft ? JSON.stringify(next.draft) : null,
@@ -561,8 +565,12 @@ export const harnesses = {
   getByIdOrKind(id: string): Harness | null {
     const direct = this.get(id);
     if (direct) return direct;
-    if (id === "claude-code" || id === "codex" || id === "gemini") {
-      const label = id === "claude-code" ? "Claude Code" : id === "codex" ? "Codex" : "Gemini CLI";
+    if (id === "claude-code" || id === "codex" || id === "cursor" || id === "gemini") {
+      const label =
+        id === "claude-code" ? "Claude Code"
+        : id === "codex" ? "Codex"
+        : id === "cursor" ? "Cursor"
+        : "Gemini CLI";
       return {
         id,
         kind: id,
@@ -582,7 +590,10 @@ export const harnesses = {
         `invalid harness id "${input.id}" — must match ${HARNESS_ID_RE}`,
       );
     }
-    if (input.kind !== "claude-code" && input.kind !== "codex" && input.kind !== "gemini") {
+    if (
+      input.kind !== "claude-code" && input.kind !== "codex" &&
+      input.kind !== "cursor" && input.kind !== "gemini"
+    ) {
       throw new Error(`unknown harness kind: ${input.kind}`);
     }
     const now = Date.now();
@@ -685,6 +696,7 @@ type RunRow = {
   tmux_session: string | null;
   claude_session_id: string | null;
   codex_session_id: string | null;
+  cursor_session_id: string | null;
   gemini_session_id: string | null;
   origin: string | null;
 };
@@ -700,6 +712,7 @@ const toRun = (r: RunRow): Run => ({
   tmuxSession: r.tmux_session,
   claudeSessionId: r.claude_session_id,
   codexSessionId: r.codex_session_id,
+  cursorSessionId: r.cursor_session_id,
   geminiSessionId: r.gemini_session_id,
   origin: (r.origin as Run["origin"]) ?? null,
 });
@@ -720,9 +733,9 @@ export const runs = {
    *  bun:sqlite would otherwise bind. */
   insert(r: Run): Run {
     db.run(
-      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, gemini_session_id, origin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.geminiSessionId, r.origin ?? null],
+      `INSERT INTO runs (id, task_id, agent, status, started_at, ended_at, exit_code, tmux_session, claude_session_id, codex_session_id, cursor_session_id, gemini_session_id, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [r.id, r.taskId, r.agent, r.status, r.startedAt, r.endedAt, r.exitCode, r.tmuxSession, r.claudeSessionId, r.codexSessionId, r.cursorSessionId, r.geminiSessionId, r.origin ?? null],
     );
     return { ...r, origin: r.origin ?? null };
   },
@@ -732,8 +745,8 @@ export const runs = {
     const current = toRun(row);
     const next: Run = { ...current, ...patch, id };
     db.run(
-      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, gemini_session_id=? WHERE id=?`,
-      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.geminiSessionId, id],
+      `UPDATE runs SET status=?, ended_at=?, exit_code=?, claude_session_id=?, codex_session_id=?, cursor_session_id=?, gemini_session_id=? WHERE id=?`,
+      [next.status, next.endedAt, next.exitCode, next.claudeSessionId, next.codexSessionId, next.cursorSessionId, next.geminiSessionId, id],
     );
     return next;
   },

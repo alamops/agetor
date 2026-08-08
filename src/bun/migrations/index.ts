@@ -37,9 +37,19 @@ import m030 from "./030_runs_task_id_index.sql" with { type: "text" };
 // This branch originally used 030 for task_pr_url; renumbered to 031 on merge
 // to avoid the clash with main's 030_runs_task_id_index (same as 026/029 above).
 import m031 from "./031_task_pr_url.sql" with { type: "text" };
-import m032 from "./032_gemini_session_id.sql" with { type: "text" };
-import m033 from "./033_harness_kind_gemini.sql" with { type: "text" };
-import m034 from "./034_reseed_harness_builtins_2.sql" with { type: "text" };
+// The cursor branch originally used 024/025; renumbered to 032/033 on merge to
+// avoid the clash with 024_reseed_harness_builtins/025_task_backlog (same as
+// 026/029/031 above).
+import m032 from "./032_cursor_harness.sql" with { type: "text" };
+import m033 from "./033_cursor_session_id.sql" with { type: "text" };
+import m034 from "./034_task_fast.sql" with { type: "text" };
+import m035 from "./035_task_max_mode.sql" with { type: "text" };
+// The gemini branch originally used 032/033/034; renumbered to 036/037/038 on
+// merge to avoid the clash with the cursor branch's 032-035 above (same
+// renumber-with-alias pattern).
+import m036 from "./036_gemini_session_id.sql" with { type: "text" };
+import m037 from "./037_harness_kind_gemini.sql" with { type: "text" };
+import m038 from "./038_reseed_harness_builtins_2.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -69,13 +79,17 @@ export const migrations: Migration[] = [
   { id: "023_run_origin", sql: m023 },
   { id: "024_reseed_harness_builtins", sql: m024 },
   { id: "025_task_backlog", sql: m025 },
-  { id: "026_project_branch_config", sql: m026 },
+  { id: "026_project_branch_config", sql: m026, aliases: ["024_project_branch_config"] },
   { id: "027_subagent_tool_use_id", sql: m027 },
   { id: "028_branch_source", sql: m028 },
-  { id: "029_task_draft", sql: m029 },
+  { id: "029_task_draft", sql: m029, aliases: ["028_task_draft"] },
   { id: "030_runs_task_id_index", sql: m030 },
-  { id: "031_task_pr_url", sql: m031 },
-  { id: "032_gemini_session_id", sql: m032 },
-  { id: "033_harness_kind_gemini", sql: m033 },
-  { id: "034_reseed_harness_builtins_2", sql: m034 },
+  { id: "031_task_pr_url", sql: m031, aliases: ["030_task_pr_url"] },
+  { id: "032_cursor_harness", sql: m032, aliases: ["024_cursor_harness"] },
+  { id: "033_cursor_session_id", sql: m033, aliases: ["025_cursor_session_id"] },
+  { id: "034_task_fast", sql: m034 },
+  { id: "035_task_max_mode", sql: m035 },
+  { id: "036_gemini_session_id", sql: m036, aliases: ["032_gemini_session_id"] },
+  { id: "037_harness_kind_gemini", sql: m037, aliases: ["033_harness_kind_gemini"] },
+  { id: "038_reseed_harness_builtins_2", sql: m038, aliases: ["034_reseed_harness_builtins_2"] },
 ];

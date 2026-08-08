@@ -97,14 +97,15 @@ test.skipIf(!HAVE_REAL)(
     tasks.insert({
       id: taskId, title: "t", prompt: "p", column: "running", agent: "claude-code",
       workdir: "/tmp", isolation: "none", taskType: "task", branch: null, branchSource: "created", worktreePath: null,
-      baseRef: null, mode: null, model: null, effort: null, references: [], backlog: [], draft: null, runId,
+      baseRef: null, mode: null, model: null, effort: null,
+      fast: false, maxMode: false, references: [], backlog: [], draft: null, runId,
       prUrl: null,
       hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
       archivedAt: null, createdAt: now, updatedAt: now,
     });
     runs.insert({
       id: runId, taskId, agent: "claude-code", status: "succeeded", startedAt: now,
-      endedAt: now, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: null, geminiSessionId: null,
+      endedAt: now, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
     });
 
     // Lay out a real `<sessionId>/subagents/` tree by copying the genuine

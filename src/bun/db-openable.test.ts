@@ -43,6 +43,7 @@ function makeTask() {
     mode: null,
     model: null,
     effort: null,
+    fast: false, maxMode: false,
     references: [],    backlog: [], draft: null,
     runId: null,
     hasOpenableRun: false,
@@ -67,7 +68,7 @@ function makeRun(taskId: string, status: "succeeded" | "running" | "orphaned" | 
     endedAt: status === "running" ? null : Date.now(),
     exitCode: status === "succeeded" ? 0 : status === "failed" ? 1 : null,
     tmuxSession: null,
-    claudeSessionId: null, codexSessionId: null, geminiSessionId: null,
+    claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
   });
   return id;
 }

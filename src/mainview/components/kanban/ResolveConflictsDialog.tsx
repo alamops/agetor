@@ -40,7 +40,7 @@ interface Props {
 export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Props) {
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
-  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], gemini: [] });
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [] });
   const [loadingHarnesses, setLoadingHarnesses] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 

@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { SearchSelect } from "@/components/ui/search-select";
 import { InfoTip } from "@/components/ui/info-tip";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
@@ -19,6 +20,9 @@ import {
   DEFAULT_TASK_TYPE,
   TASK_TYPES,
   branchPattern,
+  cursorModelIdCoveredByCatalog,
+  cursorModelSupportsFast,
+  cursorModelSupportsMaxMode,
   hasBranchTemplateTags,
   supportedEfforts,
   supportedModes,
@@ -72,6 +76,8 @@ interface Props {
       mode: string | null;
       model: string | null;
       effort: string | null;
+      fast: boolean;
+      maxMode: boolean;
       references: TaskReference[];
       taskType: TaskType;
     },
@@ -200,6 +206,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   // `null` is reserved for the Haiku-style "model doesn't accept effort" case.
   // Every other state is a real effort id from EFFORT_OPTIONS.
   const [effort, setEffort] = useState<string | null>(DEFAULT_EFFORT["claude-code"]);
+  const [fast, setFast] = useState(false);
+  const [maxMode, setMaxMode] = useState(false);
   // Auto-select the default harness once it (and the harness list) loads.
   // We only force-switch when the *current* selection isn't valid for the
   // loaded list — so a user mid-edit doesn't get their pick stolen. The
@@ -263,10 +271,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   // picks (mode/model/effort are kind-specific, not alias-specific).
   // Reads/writes happen synchronously inside `switchAgent` — no effects, so
   // no transient wrong-slot writes on render commit.
-  const agentCache = useRef<Record<AgentKind, { mode: string; model: string; effort: string | null }>>({
-    "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"] },
-    "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"] },
-    "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"] },
+  const agentCache = useRef<Record<AgentKind, { mode: string; model: string; effort: string | null; fast: boolean; maxMode: boolean }>>({
+    "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"], fast: false, maxMode: false },
+    "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"], fast: false, maxMode: false },
+    "cursor": { mode: initialMode("cursor"), model: DEFAULT_MODEL["cursor"], effort: DEFAULT_EFFORT["cursor"], fast: false, maxMode: false },
+    "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], fast: false, maxMode: false },
   });
 
   // Seed mode + model + effort defaults from the last submitted picks,
@@ -289,6 +298,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
         const md = prefs[`lastMode:${a}`];
         const m = prefs[`lastModel:${a}`];
         const e = prefs[`lastEffort:${a}`];
+        const f = prefs[`lastFast:${a}`];
+        const mm = prefs[`lastMaxMode:${a}`];
         if (md && AGENT_OPTIONS[a].modes.some((x) => x.id === md)) {
           agentCache.current[a].mode = md;
         }
@@ -303,14 +314,23 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
             agentCache.current[a].effort = null;
           }
         }
+        if (f === "true" || f === "false") {
+          agentCache.current[a].fast = f === "true";
+        }
+        if (mm === "true" || mm === "false") {
+          agentCache.current[a].maxMode = mm === "true";
+        }
       };
       seed("claude-code");
       seed("codex");
+      seed("cursor");
       seed("gemini");
       const active = agentCache.current[kind];
       setMode(active.mode);
       setModel(active.model);
       setEffort(active.effort);
+      setFast(active.fast);
+      setMaxMode(active.maxMode);
     }).catch(() => { /* preferences failure is non-fatal — defaults stay */ });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -323,12 +343,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     // Stash the current picks under the current kind, then restore the
     // next kind's picks. Aliases of the same kind share the cache slot, so
     // a swap claude-work ↔ claude-personal keeps the user's last pick.
-    agentCache.current[kind] = { mode, model, effort };
+    agentCache.current[kind] = { mode, model, effort, fast, maxMode };
     const saved = agentCache.current[nextKind];
     setAgent(nextId);
     setMode(saved.mode);
     setModel(saved.model);
     setEffort(saved.effort);
+    setFast(saved.fast);
+    setMaxMode(saved.maxMode);
   };
 
   const selectedStatus = agents.find((a) => a.harnessId === agent);
@@ -345,6 +367,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     const known = new Set(staticModels.map((m) => m.id));
     const extras = (agentModels[kind] ?? [])
       .filter((m) => !known.has(m.id))
+      .filter((m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id))
       .map((m): typeof staticModels[number] => ({ id: m.id, label: m.label ?? m.id }));
     return [...staticModels, ...extras];
   })();
@@ -354,6 +377,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   // dropdown disables itself. Otherwise we re-pin to the kind's default
   // effort when supported, falling back to the highest available option.
   const efforts = supportedEfforts(kind, model);
+  const maxModeAvailable = kind === "cursor" && cursorModelSupportsMaxMode(model);
+  const fastAvailable = kind === "cursor" && cursorModelSupportsFast(model, effort);
   useEffect(() => {
     if (efforts.length === 0) {
       if (effort !== null) setEffort(null);
@@ -366,6 +391,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     setEffort(fallback);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, model]);
+  useEffect(() => {
+    if (!fastAvailable && fast) setFast(false);
+  }, [fastAvailable, fast]);
+  useEffect(() => {
+    if (!maxModeAvailable && maxMode) setMaxMode(false);
+  }, [maxModeAvailable, maxMode]);
   useEffect(() => {
     if (!modes.some((m) => m.id === mode)) {
       const fallback = modes[0]?.id;
@@ -411,6 +442,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
         mode,
         model,
         effort,
+        fast: kind === "cursor" ? fast : false,
+        maxMode: kind === "cursor" ? maxMode : false,
         references,
         taskType,
       },
@@ -420,10 +453,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     // same kind share cache). Fire-and-forget — preferences failures
     // shouldn't block the user. Also write into the in-memory cache so a
     // same-session agent switch sees the latest pick.
-    agentCache.current[kind] = { mode, model, effort };
+    agentCache.current[kind] = { mode, model, effort, fast, maxMode };
     void api.setPreference(`lastMode:${kind}`, mode).catch(() => {});
     void api.setPreference(`lastModel:${kind}`, model).catch(() => {});
     if (effort !== null) void api.setPreference(`lastEffort:${kind}`, effort).catch(() => {});
+    void api.setPreference(`lastFast:${kind}`, String(kind === "cursor" && fast)).catch(() => {});
+    void api.setPreference(`lastMaxMode:${kind}`, String(kind === "cursor" && maxMode)).catch(() => {});
     setTitle("");
     setPrompt("");
     setBaseRef("");
@@ -794,6 +829,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                     title={
                       kind === "codex"
                         ? "Codex has no native plan mode — routed to 'ask' so nothing auto-executes."
+                        : kind === "cursor"
+                        ? "Cursor has no native plan mode — routed to propose-only 'ask' so nothing auto-executes."
                         : kind === "gemini"
                         ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
                         : "Plan only — agent describes what it would do without making changes."
@@ -856,6 +893,33 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                   </Select>
                 </div>
               </div>
+
+              {kind === "cursor" && (maxModeAvailable || maxMode || fastAvailable || fast) && (
+                <div className="grid grid-cols-2 gap-2">
+                  {(maxModeAvailable || maxMode) && (
+                    <label className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs">
+                      <span>Max Mode</span>
+                      <Switch
+                        checked={maxMode}
+                        onCheckedChange={setMaxMode}
+                        disabled={!maxModeAvailable}
+                        aria-label="Use Cursor Max Mode context"
+                      />
+                    </label>
+                  )}
+                  {(fastAvailable || fast) && (
+                    <label className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs">
+                      <span>Fast</span>
+                      <Switch
+                        checked={fast}
+                        onCheckedChange={setFast}
+                        disabled={!fastAvailable}
+                        aria-label="Use Cursor fast variant"
+                      />
+                    </label>
+                  )}
+                </div>
+              )}
 
               {/* Fable 5 sits above Opus in the picker but bills at 2x the usage —
                   surface that under the model row so the cost is obvious before Create. */}

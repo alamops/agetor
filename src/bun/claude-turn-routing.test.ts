@@ -191,6 +191,8 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
       mode: null,
       model: "claude-opus-4-7",
       effort: "medium",
+      fast: false,
+      maxMode: false,
       references: [], backlog: [], draft: null,
       runId: null, // idle — no in-flight run to fold this follow-up into
       hasOpenableRun: false,
@@ -211,7 +213,7 @@ test("a transient/unreachable tmux probe routes a follow-up through the existing
       tmuxSession: state.sessionName,
       claudeSessionId: null,
       codexSessionId: null,
-      geminiSessionId: null,
+      cursorSessionId: null, geminiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, "still there?");
@@ -298,6 +300,8 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
       // stub-bin path — see claude-followup-restart.test.ts's identical note.
       model: "claude-opus-4-7",
       effort: "medium",
+      fast: false,
+      maxMode: false,
       references: [], backlog: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
@@ -318,7 +322,7 @@ test("an unambiguous 'gone' probe routes a follow-up through the resume path (ki
       tmuxSession: state.sessionName,
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
-      geminiSessionId: null,
+      cursorSessionId: null, geminiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, "please continue");
@@ -408,6 +412,8 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
       mode: null,
       model: "claude-opus-4-7",
       effort: "medium",
+      fast: false,
+      maxMode: false,
       references: [], backlog: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
@@ -428,7 +434,7 @@ test("a large (>4KB) follow-up resume never embeds the prompt in new-session arg
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
-      geminiSessionId: null,
+      cursorSessionId: null, geminiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, largePrompt);
@@ -540,6 +546,8 @@ test("cancelling a run while its large prompt is deferred (composer never confir
       mode: null,
       model: "claude-opus-4-7",
       effort: "medium",
+      fast: false,
+      maxMode: false,
       references: [], backlog: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
@@ -560,7 +568,7 @@ test("cancelling a run while its large prompt is deferred (composer never confir
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
-      geminiSessionId: null,
+      cursorSessionId: null, geminiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, largePrompt);
@@ -700,6 +708,8 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
       mode: null,
       model: "claude-opus-4-7",
       effort: "medium",
+      fast: false,
+      maxMode: false,
       references: [], backlog: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
@@ -720,7 +730,7 @@ test("a failed deferred paste (load-buffer errors) settles the run instead of le
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
-      geminiSessionId: null,
+      cursorSessionId: null, geminiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, largePrompt);
@@ -798,6 +808,8 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
       mode: null,
       model: "claude-opus-4-7",
       effort: "medium",
+      fast: false,
+      maxMode: false,
       references: [], backlog: [], draft: null,
       runId: priorRunId,
       hasOpenableRun: false,
@@ -818,7 +830,7 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
       tmuxSession: "agetor-stale-name",
       claudeSessionId: priorClaudeSessionId,
       codexSessionId: null,
-      geminiSessionId: null,
+      cursorSessionId: null, geminiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, smallPrompt);

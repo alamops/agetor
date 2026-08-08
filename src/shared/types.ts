@@ -66,14 +66,14 @@ export function isApprovalPrompt(text: string): boolean {
   return APPROVAL_PROMPT_PATTERNS.some((re) => re.test(text));
 }
 
-export type AgentKind = "claude-code" | "codex" | "gemini";
+export type AgentKind = "claude-code" | "codex" | "cursor" | "gemini";
 
 /**
  * A "harness" is the user-facing name for an agent configuration. Built-in
- * harnesses (`claude-code`, `codex`) wrap each CLI directly; user-created
- * harnesses are *aliases* that wrap the same underlying `kind` with extra
- * env, an alternate `bin` path, or a per-account `home` override so the
- * CLI's login/config writes to a separate dir (multi-account support).
+ * harnesses (`claude-code`, `codex`, `cursor`, `gemini`) wrap each CLI directly;
+ * user-created harnesses are *aliases* that wrap the same underlying `kind`
+ * with extra env, an alternate `bin` path, or a per-account `home` override
+ * so the CLI's login/config writes to a separate dir (multi-account support).
  *
  * `tasks.agent` (free-form TEXT) stores the harness id — for built-ins the
  * id equals the kind, so legacy rows resolve without any backfill.
@@ -92,6 +92,10 @@ export interface Harness {
    *    "Not logged in" even with valid tokens.
    *  - codex: emitted as HOME=<home> + CODEX_HOME=<home>/.codex (codex doesn't
    *    use the macOS keychain, so re-homing it is safe).
+   *  - cursor: emitted as a plain HOME=<home> override — `cursor-agent` has
+   *    no documented dedicated config-dir env var, so isolating an
+   *    additional account's login/config means re-homing the whole process
+   *    (cursor doesn't touch the macOS keychain either, so this is safe).
    *  - gemini: emitted as GEMINI_CLI_HOME=<home>. Gemini CLI has its own
    *    dedicated home-override env var (verified in its bundled source —
    *    `homedir()` returns `process.env.GEMINI_CLI_HOME || os.homedir()`,
@@ -188,6 +192,17 @@ export const HARNESS_TEMPLATES: HarnessTemplate[] = [
     kind: "codex",
     suggestedHarnessId: "codex-2",
     home: "{dataDir}/harnesses/codex-2",
+    bin: null,
+    env: {},
+  },
+  {
+    id: "cursor-additional",
+    label: "Additional Cursor",
+    description:
+      "Another cursor-agent harness with its own HOME override so login and config are isolated from the built-in — cursor-agent has no dedicated config-dir env var, so a full HOME override is how accounts are separated.",
+    kind: "cursor",
+    suggestedHarnessId: "cursor-2",
+    home: "{dataDir}/harnesses/cursor-2",
     bin: null,
     env: {},
   },
@@ -624,6 +639,18 @@ export interface Task {
    */
   effort: string | null;
   /**
+   * Fast model variant toggle. Currently only consumed by Cursor, whose CLI
+   * exposes Fast as part of the selected model id rather than as a standalone
+   * flag. Non-Cursor harnesses ignore it.
+   */
+  fast: boolean;
+  /**
+   * Cursor Max Mode / large-context toggle. This is intentionally separate
+   * from effort="max", which means maximum reasoning/thinking effort.
+   * Non-Cursor harnesses ignore it.
+   */
+  maxMode: boolean;
+  /**
    * Path-only references the user attached at task creation (files and
    * folders on the user's machine). Empty list when none. Inlined into the
    * launch prompt as text — agetor never copies or uploads these.
@@ -898,6 +925,19 @@ export interface AgentOptions {
   efforts: AgentOption[];
 }
 
+export interface CursorModelSpec {
+  label: string;
+  hint?: string;
+  /** Whether Cursor accepts a large-context / Max Mode override for this base model. */
+  supportsMaxMode?: boolean;
+  /** Cursor's concrete model ids for each thinking level this base model supports. */
+  effortIds?: Partial<Record<string, string>>;
+  /** Thinking levels that Cursor exposes as a separate Fast variant. */
+  fastEfforts?: string[];
+  /** Fast model id for models with a fast toggle but no thinking levels. */
+  fastId?: string;
+}
+
 /**
  * Per-kind default model and effort. These are the values the UI pre-selects
  * for a new task, the migration backfills onto legacy NULL rows, and the
@@ -914,7 +954,9 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // ($5/$25 per MTok). Fable 5 sits above it in the picker but costs 2x the
   // usage, so the default stays on the most-capable non-premium tier.
   "claude-code": "opus-5",
-  "codex": "gpt-5.5",
+  "codex": "gpt-5.6-sol",
+  // Cursor's own "let cursor-agent pick" model — matches its CLI default.
+  "cursor": "auto",
   // gemini-3-pro-preview is the current flagship per google-gemini/gemini-cli
   // docs (verified 2026-08-06). Deliberately NOT the "auto" alias — a spike
   // showed "auto" internally routes across mixed pro/flash-lite models even
@@ -925,6 +967,9 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
   "codex": "high",
+  // Cursor's default model is still "auto", which declines effort and stores
+  // NULL. When the user chooses a parameterized Cursor model, default to High.
+  "cursor": "high",
   // Gemini has no per-invocation effort/thinking-budget flag (verified via
   // `gemini --help` on CLI 0.54.0 — thinkingBudget/thinkingLevel are
   // settings.json-only, not scriptable per-task without a race across
@@ -932,6 +977,298 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   // so the picker collapses; this default is unused but kept for symmetry.
   "gemini": "high",
 };
+
+export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
+  "auto": { label: "Auto", hint: "Cursor picks the model." },
+  "gpt-5.3-codex": {
+    label: "Codex 5.3",
+    hint: "Cursor-hosted Codex 5.3.",
+    supportsMaxMode: true,
+    effortIds: {
+      xhigh: "gpt-5.3-codex-xhigh",
+      high: "gpt-5.3-codex-high",
+      medium: "gpt-5.3-codex",
+      low: "gpt-5.3-codex-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
+  "cursor-grok-4.5": {
+    label: "Cursor Grok 4.5",
+    hint: "Cursor-hosted Grok model.",
+    effortIds: {
+      high: "cursor-grok-4.5-high",
+      medium: "cursor-grok-4.5-medium",
+      low: "cursor-grok-4.5-low",
+    },
+    fastEfforts: ["high", "medium", "low"],
+  },
+  "composer-2.5": {
+    label: "Composer 2.5",
+    hint: "Cursor's own fast agentic model.",
+    fastId: "composer-2.5-fast",
+  },
+  "claude-opus-5": {
+    label: "Opus 5",
+    hint: "Anthropic Opus 5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-5-thinking-max",
+      xhigh: "claude-opus-5-thinking-xhigh",
+      high: "claude-opus-5-thinking-high",
+      medium: "claude-opus-5-thinking-medium",
+      low: "claude-opus-5-thinking-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
+  },
+  "claude-opus-4-8": {
+    label: "Opus 4.8",
+    hint: "Anthropic Opus 4.8 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-4-8-max",
+      xhigh: "claude-opus-4-8-xhigh",
+      high: "claude-opus-4-8-high",
+      medium: "claude-opus-4-8-medium",
+      low: "claude-opus-4-8-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
+  },
+  "gpt-5.6-sol": {
+    label: "GPT-5.6 Sol",
+    hint: "Cursor-hosted GPT-5.6 Sol.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "gpt-5.6-sol-max",
+      xhigh: "gpt-5.6-sol-xhigh",
+      high: "gpt-5.6-sol-high",
+      medium: "gpt-5.6-sol-medium",
+      low: "gpt-5.6-sol-low",
+      none: "gpt-5.6-sol-none",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
+  },
+  "gpt-5.5": {
+    label: "GPT-5.5",
+    hint: "OpenAI GPT-5.5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      xhigh: "gpt-5.5-extra-high",
+      high: "gpt-5.5-high",
+      medium: "gpt-5.5-medium",
+      low: "gpt-5.5-low",
+      none: "gpt-5.5-none",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low", "none"],
+  },
+  "claude-fable-5": {
+    label: "Fable 5",
+    hint: "Anthropic Fable 5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-fable-5-max",
+      xhigh: "claude-fable-5-xhigh",
+      high: "claude-fable-5-high",
+      medium: "claude-fable-5-medium",
+      low: "claude-fable-5-low",
+    },
+  },
+  "claude-sonnet-5": {
+    label: "Sonnet 5",
+    hint: "Anthropic Sonnet 5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-sonnet-5-max",
+      xhigh: "claude-sonnet-5-xhigh",
+      high: "claude-sonnet-5-high",
+      medium: "claude-sonnet-5-medium",
+      low: "claude-sonnet-5-low",
+    },
+  },
+  "gpt-5.6-terra": {
+    label: "GPT-5.6 Terra",
+    hint: "Cursor-hosted GPT-5.6 Terra.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "gpt-5.6-terra-max",
+      xhigh: "gpt-5.6-terra-xhigh",
+      high: "gpt-5.6-terra-high",
+      medium: "gpt-5.6-terra-medium",
+      low: "gpt-5.6-terra-low",
+      none: "gpt-5.6-terra-none",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
+  },
+  "claude-4.6-sonnet": {
+    label: "Sonnet 4.6",
+    hint: "Anthropic Sonnet 4.6 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: { medium: "claude-4.6-sonnet-medium" },
+  },
+  "claude-opus-4-7": {
+    label: "Opus 4.7",
+    hint: "Anthropic Opus 4.7 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "claude-opus-4-7-max",
+      xhigh: "claude-opus-4-7-xhigh",
+      high: "claude-opus-4-7-high",
+      medium: "claude-opus-4-7-medium",
+      low: "claude-opus-4-7-low",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low"],
+  },
+  "gpt-5.4": {
+    label: "GPT-5.4",
+    hint: "OpenAI GPT-5.4 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: {
+      xhigh: "gpt-5.4-xhigh",
+      high: "gpt-5.4-high",
+      medium: "gpt-5.4-medium",
+      low: "gpt-5.4-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium"],
+  },
+  "claude-4.6-opus": {
+    label: "Opus 4.6",
+    hint: "Anthropic Opus 4.6 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: { max: "claude-4.6-opus-max", high: "claude-4.6-opus-high" },
+  },
+  "claude-4.5-opus": {
+    label: "Opus 4.5",
+    hint: "Anthropic Opus 4.5 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: { high: "claude-4.5-opus-high" },
+  },
+  "gpt-5.2": {
+    label: "GPT-5.2",
+    hint: "OpenAI GPT-5.2 via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.2-xhigh",
+      high: "gpt-5.2-high",
+      medium: "gpt-5.2",
+      low: "gpt-5.2-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
+  "gpt-5.6-luna": {
+    label: "GPT-5.6 Luna",
+    hint: "Cursor-hosted GPT-5.6 Luna.",
+    supportsMaxMode: true,
+    effortIds: {
+      max: "gpt-5.6-luna-max",
+      xhigh: "gpt-5.6-luna-xhigh",
+      high: "gpt-5.6-luna-high",
+      medium: "gpt-5.6-luna-medium",
+      low: "gpt-5.6-luna-low",
+      none: "gpt-5.6-luna-none",
+    },
+    fastEfforts: ["max", "xhigh", "high", "medium", "low", "none"],
+  },
+  "gemini-3.6-flash": {
+    label: "Gemini 3.6 Flash",
+    hint: "Google Gemini 3.6 Flash via Cursor.",
+    effortIds: {
+      high: "gemini-3.6-flash-high",
+      medium: "gemini-3.6-flash-medium",
+      low: "gemini-3.6-flash-low",
+      minimal: "gemini-3.6-flash-minimal",
+    },
+  },
+  "gemini-3.1-pro": { label: "Gemini 3.1 Pro", hint: "Google Gemini 3.1 Pro via Cursor." },
+  "gpt-5.4-mini": {
+    label: "GPT-5.4 Mini",
+    hint: "OpenAI GPT-5.4 Mini via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.4-mini-xhigh",
+      high: "gpt-5.4-mini-high",
+      medium: "gpt-5.4-mini-medium",
+      low: "gpt-5.4-mini-low",
+      none: "gpt-5.4-mini-none",
+    },
+  },
+  "gpt-5.4-nano": {
+    label: "GPT-5.4 Nano",
+    hint: "OpenAI GPT-5.4 Nano via Cursor.",
+    effortIds: {
+      xhigh: "gpt-5.4-nano-xhigh",
+      high: "gpt-5.4-nano-high",
+      medium: "gpt-5.4-nano-medium",
+      low: "gpt-5.4-nano-low",
+      none: "gpt-5.4-nano-none",
+    },
+  },
+  "claude-4.5-sonnet": { label: "Sonnet 4.5", hint: "Anthropic Sonnet 4.5 via Cursor.", supportsMaxMode: true },
+  "gpt-5.1": {
+    label: "GPT-5.1",
+    hint: "OpenAI GPT-5.1 via Cursor.",
+    effortIds: { high: "gpt-5.1-high", medium: "gpt-5.1", low: "gpt-5.1-low" },
+  },
+  "gemini-3-flash": { label: "Gemini 3 Flash", hint: "Google Gemini 3 Flash via Cursor." },
+  "gemini-3.5-flash": { label: "Gemini 3.5 Flash", hint: "Google Gemini 3.5 Flash via Cursor." },
+  "claude-4-sonnet": {
+    label: "Sonnet 4",
+    hint: "Anthropic Sonnet 4 via Cursor.",
+    effortIds: { high: "claude-4-sonnet-thinking", none: "claude-4-sonnet" },
+  },
+  "gpt-5-mini": { label: "GPT-5 Mini", hint: "OpenAI GPT-5 Mini via Cursor." },
+  "kimi-k3": {
+    label: "Kimi K3",
+    hint: "Kimi K3 via Cursor.",
+    supportsMaxMode: true,
+    effortIds: { max: "kimi-k3-max", high: "kimi-k3-high", low: "kimi-k3-low" },
+  },
+  "kimi-k2.7-code": { label: "Kimi K2.7 Code", hint: "Kimi K2.7 Code via Cursor." },
+  "glm-5.2": {
+    label: "GLM 5.2",
+    hint: "GLM 5.2 via Cursor.",
+    effortIds: { max: "glm-5.2-max", high: "glm-5.2-high" },
+  },
+};
+
+export function cursorModelSupportsFast(model: string | null, effort: string | null): boolean {
+  const spec = CURSOR_MODEL_SPECS[model ?? DEFAULT_MODEL.cursor];
+  if (!spec) return false;
+  if (spec.fastId && !spec.effortIds) return true;
+  if (!effort) return false;
+  return spec.fastEfforts?.includes(effort) ?? false;
+}
+
+export function cursorModelSupportsMaxMode(model: string | null): boolean {
+  return CURSOR_MODEL_SPECS[model ?? DEFAULT_MODEL.cursor]?.supportsMaxMode === true;
+}
+
+export function cursorModelIdCoveredByCatalog(id: string): boolean {
+  if (CURSOR_MODEL_SPECS[id]) return true;
+  return Object.values(CURSOR_MODEL_SPECS).some((spec) => {
+    if (spec.fastId === id) return true;
+    return Object.values(spec.effortIds ?? {}).some((variant) => variant === id || `${variant}-fast` === id);
+  });
+}
+
+export function cursorModelArg(model: string, effort: string | null, fast: boolean, maxMode = false): string {
+  const spec = CURSOR_MODEL_SPECS[model];
+  if (!spec) return model;
+  if (!spec.effortIds) {
+    const baseId = fast && spec.fastId ? spec.fastId : model;
+    return maxMode && spec.supportsMaxMode ? `${baseId}[context=1m]` : baseId;
+  }
+  const desiredEffort =
+    effort && spec.effortIds[effort]
+      ? effort
+      : DEFAULT_EFFORT.cursor && spec.effortIds[DEFAULT_EFFORT.cursor]
+        ? DEFAULT_EFFORT.cursor
+        : Object.keys(spec.effortIds)[0];
+  if (!desiredEffort) return model;
+  const baseId = spec.effortIds[desiredEffort] ?? model;
+  if (maxMode && spec.supportsMaxMode) {
+    const params = [`context=1m`, `effort=${desiredEffort}`];
+    if (cursorModelSupportsFast(model, desiredEffort)) params.push(`fast=${fast ? "true" : "false"}`);
+    return `${model}[${params.join(",")}]`;
+  }
+  return fast && spec.fastEfforts?.includes(desiredEffort) ? `${baseId}-fast` : baseId;
+}
 
 /**
  * Maps the prominent two-way "Code vs Plan" UI toggle onto a concrete mode id
@@ -956,6 +1293,10 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
 export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> = {
   "claude-code": { code: "auto", plan: "plan" },
   "codex": { code: "auto", plan: "ask" },
+  // Cursor has no first-class plan mode either — same posture as codex:
+  // Plan routes to "ask" (propose-only; cursor cannot execute unapproved
+  // actions headlessly).
+  "cursor": { code: "auto", plan: "ask" },
   // Gemini's `--approval-mode plan` is a real read-only mode (verified via
   // `gemini --help` on CLI 0.54.0), closer to claude's native `plan` than
   // codex's read-only-sandbox stand-in — but reuse codex's "ask" id since
@@ -975,16 +1316,16 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  *                   high → "think harder" xhigh → "think very hard"
  *                   max → "ultrathink"
  *
- * `none` is kept in the canonical list for future codex-only "reasoning-off"
- * models — currently no model in our list opts into it, so it never renders.
+ * `none` is currently used only by GPT-5.6-family Codex models.
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
-  { id: "max", label: "Max", hint: "Absolute maximum effort. Slowest, most thorough." },
+  { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
   { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
-  { id: "none", label: "None", hint: "Skip reasoning entirely (reasoning-only models)." },
+  { id: "minimal", label: "Minimal", hint: "Smallest reasoning budget where Cursor exposes it." },
+  { id: "none", label: "No thinking", hint: "Skip thinking where the model exposes a no-thinking variant." },
 ];
 
 /**
@@ -996,8 +1337,8 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  *     Haiku 4.5 → effort parameter NOT supported
  *   - Codex `model_reasoning_effort`:
  *       https://developers.openai.com/codex/config-advanced
+ *     GPT-5.6 family → none/low/medium/high/xhigh/max
  *     gpt-5.5 / gpt-5 / gpt-5-codex → low/medium/high/xhigh
- *     (minimal kept out of UI)
  *
  * An empty list means "this model does not accept the effort flag at all"
  * (e.g. Haiku 4.5) — the UI collapses the dropdown and `buildCommand` emits
@@ -1027,10 +1368,19 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "haiku-4.5": [],
   },
   codex: {
+    "gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-terra": ["max", "xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.5": ["xhigh", "high", "medium", "low"],
     "gpt-5": ["xhigh", "high", "medium", "low"],
     "gpt-5-codex": ["xhigh", "high", "medium", "low"],
   },
+  cursor: Object.fromEntries(
+    Object.entries(CURSOR_MODEL_SPECS).map(([id, spec]) => [
+      id,
+      spec.effortIds ? EFFORT_OPTIONS.map((o) => o.id).filter((effort) => Boolean(spec.effortIds?.[effort])) : [],
+    ]),
+  ) as Record<string, string[]>,
   // Empty for every model: gemini has no per-invocation effort flag (see
   // DEFAULT_EFFORT.gemini comment above). supportedEfforts() falls back to
   // [] for any model key here, which collapses the effort picker in the UI —
@@ -1083,6 +1433,9 @@ const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
     "haiku-4.5": [],
   },
   codex: {},
+  // No per-model mode carve-outs for cursor either — both modes it exposes
+  // (auto/ask) are universally available across its model list.
+  cursor: {},
   gemini: {},
 };
 
@@ -1123,13 +1476,28 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
-      { id: "gpt-5.5", label: "GPT-5.5", hint: "Recommended default — works on ChatGPT plans." },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Recommended default — flagship GPT-5.6 capability." },
+      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model for strong performance at lower cost." },
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model for high-volume workloads." },
+      { id: "gpt-5.5", label: "GPT-5.5", hint: "Previous recommended default — works on ChatGPT plans." },
       { id: "gpt-5-codex", label: "GPT-5 Codex", hint: "Requires an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5", label: "GPT-5", hint: "Requires an API-key account; rejected on ChatGPT plans." },
     ],
     modes: [
       { id: "auto", label: "Auto (workspace-write)", hint: "Edit files without approval prompts." },
       { id: "ask", label: "Read-only", hint: "Inspect only — codex can't modify files (read-only sandbox)." },
+    ],
+    efforts: EFFORT_OPTIONS,
+  },
+  cursor: {
+    models: Object.entries(CURSOR_MODEL_SPECS).map(([id, spec]) => ({
+      id,
+      label: spec.label,
+      hint: spec.hint,
+    })),
+    modes: [
+      { id: "auto", label: "Auto (force)", hint: "Hands-off — runs with --force, executing edits and commands without approval prompts." },
+      { id: "ask", label: "Read-only", hint: "Propose-only — cursor cannot execute unapproved actions headlessly." },
     ],
     efforts: EFFORT_OPTIONS,
   },
@@ -1192,6 +1560,15 @@ export interface Run {
    * for claude-code and legacy rows.
    */
   codexSessionId: string | null;
+  /**
+   * Cursor's own conversation/session id (the `session_id` carried on every
+   * event in its `--output-format stream-json` NDJSON stream, first seen on
+   * `system/init`). Captured when the cursor tmux driver tails the run's
+   * NDJSON log. Drives `cursor-agent --resume <session_id>` for follow-up
+   * turns and is the reattach key for a mid-turn cursor run. NULL for
+   * claude-code/codex and legacy rows.
+   */
+  cursorSessionId: string | null;
   /**
    * Gemini CLI's own per-session uuid — self-issued by agetor (not
    * discovered from the CLI) and passed as `--session-id` on the first turn,

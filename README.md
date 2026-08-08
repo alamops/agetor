@@ -235,7 +235,7 @@ Add a harness from **Settings → Harnesses**. Templates pre-fill common pattern
 Each task picks:
 
 - a **mode** — how much permission the agent has (`auto`, `ask`, `acceptEdits`, `plan`, `bypass` — exposed per agent),
-- a **model** — Opus / Sonnet / Haiku for Claude, GPT-5 / GPT-5 Codex for Codex,
+- a **model** — Opus / Sonnet / Haiku for Claude, GPT-5.6 Sol / Terra / Luna and earlier GPT-5 options for Codex,
 - an **effort** level — reasoning depth, where the model supports it.
 
 The picker filters incompatible combinations (e.g. effort is hidden on Haiku 4.5 because Anthropic's API doesn't accept it there).
@@ -389,7 +389,7 @@ This is an early-stage project. Things on the near-term list:
 
 - An uninstall flow that strips the `PreToolUse` hook and MCP-server entries from `.claude/settings.local.json` across every repo Agetor touched.
 - First-class Linux and Windows builds (currently configured but untested).
-- More agent kinds: Cursor agents, Aider, Gemini CLI.
+- More agent kinds: Aider, Gemini CLI. (Cursor landed — experimental, disabled by default; enable it in Settings.)
 - Optional Slack / native push notifications on terminal state, not just toasts.
 
 ---

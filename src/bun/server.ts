@@ -294,7 +294,7 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
 
 /** Fields callers may patch on a task. Everything else is server-managed. */
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
-  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "taskType",
+  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "fast", "maxMode", "taskType",
 ]);
 
 /** The 8 reaction contents GitHub's API accepts — validated here before the
@@ -306,6 +306,14 @@ function filterPatch(raw: unknown): Partial<Task> {
   if (!raw || typeof raw !== "object") return {};
   const patch: Partial<Task> = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (k === "fast") {
+      patch.fast = v === true;
+      continue;
+    }
+    if (k === "maxMode") {
+      patch.maxMode = v === true;
+      continue;
+    }
     if (ALLOWED_PATCH_FIELDS.has(k as keyof Task)) (patch as Record<string, unknown>)[k] = v;
   }
   return patch;
@@ -2697,9 +2705,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof body.id !== "string" || !body.id.trim()) {
             return json({ error: "id required" }, { status: 400, headers: corsHeaders(req) });
           }
-          if (body.kind !== "claude-code" && body.kind !== "codex" && body.kind !== "gemini") {
+          if (
+            body.kind !== "claude-code" && body.kind !== "codex" &&
+            body.kind !== "cursor" && body.kind !== "gemini"
+          ) {
             return json(
-              { error: "kind must be 'claude-code', 'codex', or 'gemini'" },
+              { error: "kind must be 'claude-code', 'codex', 'cursor', or 'gemini'" },
               { status: 400, headers: corsHeaders(req) },
             );
           }
@@ -2954,6 +2965,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             {
               "claude-code": getDiscoveredModels("claude-code"),
               "codex": getDiscoveredModels("codex"),
+              "cursor": getDiscoveredModels("cursor"),
               "gemini": getDiscoveredModels("gemini"),
             },
             { headers: corsHeaders(req) },
@@ -2964,6 +2976,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             {
               "claude-code": getDiscoveredModels("claude-code"),
               "codex": getDiscoveredModels("codex"),
+              "cursor": getDiscoveredModels("cursor"),
               "gemini": getDiscoveredModels("gemini"),
             },
             { headers: corsHeaders(req) },

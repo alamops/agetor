@@ -60,6 +60,45 @@ function parseCodexModels(stdout: string): DiscoveredModel[] {
   return out;
 }
 
+/**
+ * Parse `cursor-agent --list-models` output. Like codex, the exact format
+ * isn't formally specified (and the binary isn't installed on this
+ * machine to verify against), so we lean on the same loose heuristic:
+ * any line whose first whitespace-separated token looks like a model id
+ * (`<word>-<word>...`, lowercase, alphanumeric + dashes/dots, at least one
+ * dash) is taken as a model. Header rows / banner chatter are dropped.
+ */
+function parseCursorModels(stdout: string): DiscoveredModel[] {
+  const out: DiscoveredModel[] = [];
+  const seen = new Set<string>();
+  for (const raw of stdout.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^(available|models|model\s+id|---|=+)/i.test(line)) continue;
+    const first = line.split(/\s+/)[0]!;
+    if (!/^[a-z0-9][a-z0-9.\-_]*[a-z0-9]$/i.test(first)) continue;
+    if (!first.includes("-")) continue;
+    if (seen.has(first)) continue;
+    seen.add(first);
+    out.push({ id: first });
+  }
+  return out;
+}
+
+async function discoverCursor(): Promise<DiscoveredModel[]> {
+  // Resolve against the rehydrated PATH explicitly — see discoverCodex's
+  // comment above (and agent-status.ts) for why Bun.spawn's implicit lookup
+  // can't be trusted on a packaged .app.
+  const fallback = process.env.AGETOR_CURSOR_BIN ?? "cursor-agent";
+  const bin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+  // Best-effort only: cursor-agent may not support --list-models at all, or
+  // may not be installed. Either way we fall back to the hardcoded
+  // AGENT_OPTIONS list — never throw, never block app boot.
+  const probe = await runProbe([bin, "--list-models"]);
+  if (!probe.ok || !probe.stdout) return [];
+  return parseCursorModels(probe.stdout);
+}
+
 async function discoverCodex(): Promise<DiscoveredModel[]> {
   // Resolve against the rehydrated PATH explicitly — Bun.spawn (and the
   // implicit lookup inside it) uses Bun's startup PATH cache, which on a
@@ -111,13 +150,19 @@ export function getDiscoveredModels(agent: AgentKind): DiscoveredModel[] {
 export async function refreshDiscoveredModels(): Promise<void> {
   if (inflight) return inflight;
   inflight = (async () => {
-    const [codex, claude, gemini] = await Promise.all([discoverCodex(), discoverClaude(), discoverGemini()]);
+    const [codex, claude, cursor, gemini] = await Promise.all([
+      discoverCodex(),
+      discoverClaude(),
+      discoverCursor(),
+      discoverGemini(),
+    ]);
     cache.set("codex", codex);
     cache.set("claude-code", claude);
+    cache.set("cursor", cursor);
     cache.set("gemini", gemini);
   })().finally(() => { inflight = null; });
   return inflight;
 }
 
 // Exposed for tests that want to feed in synthetic CLI output.
-export const __testing = { parseCodexModels };
+export const __testing = { parseCodexModels, parseCursorModels };

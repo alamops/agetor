@@ -181,6 +181,7 @@ export interface AvailableExtension {
 export interface AgentModelMap {
   "claude-code": { id: string; label?: string }[];
   "codex": { id: string; label?: string }[];
+  "cursor": { id: string; label?: string }[];
   "gemini": { id: string; label?: string }[];
 }
 
@@ -1061,6 +1062,8 @@ export const api = {
     mode?: string | null;
     model?: string | null;
     effort?: string | null;
+    fast?: boolean;
+    maxMode?: boolean;
     /** Initial column. Defaults to "backlog" if omitted. */
     column?: ColumnId;
     references?: TaskReference[];
