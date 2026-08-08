@@ -119,6 +119,12 @@ async function rewriteLoadCommands(target: string): Promise<void> {
 
 async function main() {
   if (process.platform !== "darwin") {
+    // electrobun's dev watcher fs.watch()es every `copy` source dir in
+    // electrobun.config.ts unconditionally, including vendor/tmux/arm64 —
+    // if it doesn't exist on disk, `bun run dev` crashes with ENOENT before
+    // the app even launches. Create the (empty) dir so non-macOS dev works;
+    // resolveTmuxBin() falls back to the system tmux on PATH regardless.
+    await mkdir(VENDOR_DIR, { recursive: true });
     console.log(`[fetch-tmux] skipped on ${process.platform} (macOS-only step)`);
     return;
   }

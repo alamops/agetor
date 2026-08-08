@@ -114,6 +114,8 @@ test.skipIf(!HAVE_TMUX)("follow-up to a task whose session outlived the process 
       // inert here since AGETOR_CLAUDE_BIN=/bin/echo makes the launch a no-op.
       model: "claude-opus-4-7",
       effort: "medium",
+      fast: false,
+      maxMode: false,
       references: [],
       backlog: [], draft: null,
       runId: priorRunId,
@@ -135,7 +137,7 @@ test.skipIf(!HAVE_TMUX)("follow-up to a task whose session outlived the process 
       tmuxSession: sessionName,
       claudeSessionId: "prior-claude-session-id",
       codexSessionId: null,
-      cursorSessionId: null,
+      cursorSessionId: null, geminiSessionId: null,
     });
 
     const result = await sendInput(priorRunId, "please continue");

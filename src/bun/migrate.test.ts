@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
-import { migrate, type Migration } from "./migrate.ts";
+import { migrate, splitSqlStatements, type Migration } from "./migrate.ts";
 import reseedBuiltins from "./migrations/024_reseed_harness_builtins.sql" with { type: "text" };
 
 // Minimal harnesses table matching the shape after 013 + 014 (adds `enabled`).
@@ -73,6 +73,55 @@ test("rolls back a failing migration so it can be retried", () => {
     `SELECT name FROM sqlite_master WHERE name='ok'`,
   ).all();
   expect(hasOk).toEqual([]);
+});
+
+test("a CHECK-constraint failure mid-migration rolls back statements that ran before AND after it", () => {
+  // Regression: `Database.exec()`/`.run()` given a multi-statement string
+  // does NOT stop at a failing statement the way the "rolls back a failing
+  // migration" test above might suggest — that test's failure ("no such
+  // table") is a different SQLite error class than a CHECK-constraint
+  // violation, and only the former aborts the batch. Verified directly
+  // against bun:sqlite: a 3-statement string where statement 2 violates a
+  // CHECK constraint throws no error at all, and statement 3 (which would
+  // succeed on its own) still runs. For the table-rebuild recipe several
+  // migrations use (CREATE new / INSERT...SELECT / DROP old / RENAME), that
+  // silently no-ops the row copy on a CHECK violation while the DROP and
+  // RENAME after it still execute — permanently replacing the old table
+  // with an empty one, with no thrown error to catch. This is why
+  // `migrate()` runs each statement through its own `db.run()` call
+  // (`splitSqlStatements`) instead of one `db.exec()` per file.
+  const db = new Database(":memory:");
+  const bad: Migration = {
+    id: "001_bad_check",
+    sql: `
+      CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL CHECK (v IN ('a', 'b')));
+      INSERT INTO t (id, v) VALUES (1, 'z');
+      INSERT INTO t (id, v) VALUES (2, 'b');
+    `,
+  };
+  expect(() => migrate(db, [bad])).toThrow(/CHECK constraint failed/);
+
+  // Whole migration rolled back — not just the table create, but also the
+  // second INSERT that would have succeeded on its own.
+  const tables = db.query<{ name: string }, []>(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='t'`,
+  ).all();
+  expect(tables).toEqual([]);
+  const applied = db.query<{ id: string }, []>(`SELECT id FROM _migrations`).all();
+  expect(applied).toEqual([]);
+});
+
+test("splitSqlStatements respects semicolons inside string literals and comments", () => {
+  const sql = `
+    -- a comment; with a semicolon
+    INSERT INTO t (v) VALUES ('has; a semicolon'' and '' quotes');
+    /* block; comment */
+    INSERT INTO t (v) VALUES ('second');
+  `;
+  const statements = splitSqlStatements(sql);
+  expect(statements).toHaveLength(2);
+  expect(statements[0]).toContain("has; a semicolon");
+  expect(statements[1]).toContain("second");
 });
 
 test("024_reseed_harness_builtins restores wiped builtins, is idempotent, and preserves enabled", () => {
