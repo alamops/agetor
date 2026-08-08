@@ -276,7 +276,7 @@ export interface PatchTaskInput {
   taskType?: string;
 }
 
-/** Body for POST /harnesses (kind: claude-code | codex | gemini). */
+/** Body for POST /harnesses (kind: claude-code | codex | cursor | gemini). */
 export interface CreateHarnessInput {
   id: string;
   kind: AgentKind;
