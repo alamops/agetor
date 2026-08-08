@@ -18,6 +18,17 @@ import {
   type Harness,
   type HarnessTemplate,
 } from "../../../shared/types.ts";
+import {
+  SETTINGS_SECTIONS,
+  activeSection,
+  backFromSubview,
+  initialView,
+  openEditor,
+  openSection,
+  openTemplates,
+  resolveEscape,
+  type SettingsView,
+} from "@/lib/settings-dialog-view";
 
 interface Props {
   open: boolean;
@@ -31,11 +42,6 @@ interface Props {
    *  (~/.agetor for the .app, ~/.agetor-dev for `bun run dev`). */
   dataDir: string;
 }
-
-type View =
-  | { kind: "list" }
-  | { kind: "templates" }
-  | { kind: "editor"; harnessId: string | null; template: HarnessTemplate };
 
 /**
  * Parse a textarea of `KEY=value` lines into a record. Blank lines and
@@ -167,7 +173,7 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
   const [tmuxSource, setTmuxSource] = useState<"system" | "bundled">("system");
   const [bundledTmuxAvailable, setBundledTmuxAvailable] = useState(false);
-  const [view, setView] = useState<View>({ kind: "list" });
+  const [view, setView] = useState<SettingsView>(initialView());
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   // Optimistic toggle map: harness id → the value the user *clicked toward*.
@@ -223,9 +229,9 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
   useEffect(() => {
     if (!open) return;
     void refresh();
-    // Reset to list view on every open so a half-filled editor doesn't
-    // greet the user next time.
-    setView({ kind: "list" });
+    // Reset to the General section on every open so a half-filled editor
+    // doesn't greet the user next time.
+    setView(initialView());
     setFormError(null);
   }, [open]);
 
@@ -258,8 +264,8 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
       await refresh();
       onChange?.();
     } catch (e) {
-      // ListView doesn't render `formError` (only the Editor does), so a
-      // failed delete would otherwise be invisible. Surface it as a toast.
+      // HarnessesSection doesn't render `formError` (only the Editor does),
+      // so a failed delete would otherwise be invisible. Surface it as a toast.
       const message = e instanceof Error ? e.message : String(e);
       const description = await describeHarnessInUse(e) ?? message;
       toast.error(`Couldn't delete "${h.label}"`, {
@@ -337,27 +343,35 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
     }
   };
 
+  const currentSection = activeSection(view);
+
   return (
     <Dialog
       open={open}
-      onClose={onClose}
-      className="flex max-h-[85vh] w-full max-w-2xl flex-col p-0"
+      onClose={() => {
+        if (resolveEscape(view) === "pop") {
+          setView(backFromSubview());
+          return;
+        }
+        onClose();
+      }}
+      className="flex max-h-[85vh] w-full max-w-4xl flex-col p-0"
       labelledBy="settings-dialog-title"
     >
       <div className="flex shrink-0 items-center justify-between border-b border-border/60 p-4 pb-3">
         <div className="flex items-center gap-2">
-          {view.kind !== "list" && (
+          {view.kind !== "section" && (
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => setView({ kind: "list" })}
+              onClick={() => setView(backFromSubview())}
               aria-label="Back"
             >
               <ChevronLeft className="size-4" />
             </Button>
           )}
           <h2 id="settings-dialog-title" className="text-base font-semibold">
-            {view.kind === "list" && "Settings"}
+            {view.kind === "section" && "Settings"}
             {view.kind === "templates" && "Add harness"}
             {view.kind === "editor" && (view.harnessId ? "Edit harness" : "Add harness")}
           </h2>
@@ -375,134 +389,125 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-4 pt-0">
-        {view.kind === "list" && (
-          <ListView
-            payload={payload}
-            statusByHarness={statusByHarness}
-            defaultHarness={defaultHarness}
-            homeDir={homeDir}
-            onPickDefault={onPickDefault}
-            tmuxSource={tmuxSource}
-            bundledTmuxAvailable={bundledTmuxAvailable}
-            onPickTmuxSource={onPickTmuxSource}
-            canAdd={!!dataDir}
-            onAdd={() => setView({ kind: "templates" })}
-            onEdit={(h) =>
-              setView({
-                kind: "editor",
-                harnessId: h.id,
-                template: {
-                  id: "__edit",
-                  label: h.label,
-                  description: "",
-                  kind: h.kind,
-                  suggestedHarnessId: h.id,
-                  home: h.home,
-                  bin: h.bin,
-                  env: h.env,
-                },
-              })
-            }
-            onDelete={onDeleteHarness}
-            onToggleEnabled={onToggleEnabled}
-            onOpenTerminal={onOpenTerminal}
-            pendingToggle={pendingToggle}
-          />
-        )}
+      <div className="flex min-h-0 flex-1">
+        <nav className="w-44 shrink-0 overflow-y-auto border-r border-border/60 p-2">
+          {SETTINGS_SECTIONS.map((s) => (
+            <Button
+              key={s.id}
+              size="sm"
+              variant={currentSection === s.id ? "secondary" : "ghost"}
+              className="w-full justify-start"
+              aria-current={currentSection === s.id ? "true" : undefined}
+              onClick={() => setView(openSection(s.id))}
+            >
+              {s.label}
+            </Button>
+          ))}
+        </nav>
 
-        {view.kind === "templates" && (
-          <TemplatePicker
-            onPick={(t) =>
-              setView({
-                kind: "editor",
-                harnessId: null,
-                template: resolveTemplate(t, dataDir),
-              })
-            }
-          />
-        )}
+        <div className="min-h-0 flex-1 overflow-y-auto p-4 pt-0">
+          {view.kind === "section" && view.section === "general" && (
+            <GeneralSection
+              defaultHarness={defaultHarness}
+              payload={payload}
+              onPickDefault={onPickDefault}
+              tmuxSource={tmuxSource}
+              bundledTmuxAvailable={bundledTmuxAvailable}
+              onPickTmuxSource={onPickTmuxSource}
+            />
+          )}
 
-        {view.kind === "editor" && (
-          <Editor
-            template={view.template}
-            isEdit={view.harnessId !== null}
-            homeDir={homeDir}
-            dataDir={dataDir}
-            existingIds={new Set(payload.harnesses.map((h) => h.id))}
-            busy={busy}
-            error={formError}
-            onCancel={() => setView({ kind: "list" })}
-            onSubmit={async (input) => {
-              setBusy(true);
-              setFormError(null);
-              try {
-                if (view.harnessId) {
-                  await api.updateHarness(view.harnessId, {
-                    label: input.label,
-                    home: input.home,
-                    bin: input.bin,
-                    env: input.env,
-                  });
-                } else {
-                  await api.createHarness(input);
-                }
-                await refresh();
-                onChange?.();
-                setView({ kind: "list" });
-              } catch (e) {
-                setFormError(e instanceof Error ? e.message : String(e));
-              } finally {
-                setBusy(false);
+          {view.kind === "section" && view.section === "harnesses" && (
+            <HarnessesSection
+              payload={payload}
+              statusByHarness={statusByHarness}
+              homeDir={homeDir}
+              canAdd={!!dataDir}
+              onAdd={() => setView(openTemplates())}
+              onEdit={(h) =>
+                setView(
+                  openEditor(h.id, {
+                    id: "__edit",
+                    label: h.label,
+                    description: "",
+                    kind: h.kind,
+                    suggestedHarnessId: h.id,
+                    home: h.home,
+                    bin: h.bin,
+                    env: h.env,
+                  }),
+                )
               }
-            }}
-          />
-        )}
+              onDelete={onDeleteHarness}
+              onToggleEnabled={onToggleEnabled}
+              onOpenTerminal={onOpenTerminal}
+              pendingToggle={pendingToggle}
+            />
+          )}
+
+          {view.kind === "section" && view.section === "git" && <GitHubTokensSection />}
+
+          {view.kind === "templates" && (
+            <TemplatePicker
+              onPick={(t) => setView(openEditor(null, resolveTemplate(t, dataDir)))}
+            />
+          )}
+
+          {view.kind === "editor" && (
+            <Editor
+              template={view.template}
+              isEdit={view.harnessId !== null}
+              homeDir={homeDir}
+              dataDir={dataDir}
+              existingIds={new Set(payload.harnesses.map((h) => h.id))}
+              busy={busy}
+              error={formError}
+              onCancel={() => setView(backFromSubview())}
+              onSubmit={async (input) => {
+                setBusy(true);
+                setFormError(null);
+                try {
+                  if (view.harnessId) {
+                    await api.updateHarness(view.harnessId, {
+                      label: input.label,
+                      home: input.home,
+                      bin: input.bin,
+                      env: input.env,
+                    });
+                  } else {
+                    await api.createHarness(input);
+                  }
+                  await refresh();
+                  onChange?.();
+                  setView(backFromSubview());
+                } catch (e) {
+                  setFormError(e instanceof Error ? e.message : String(e));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            />
+          )}
+        </div>
       </div>
     </Dialog>
   );
 }
 
-function ListView({
+function GeneralSection({
   payload,
-  statusByHarness,
   defaultHarness,
-  homeDir,
   onPickDefault,
   tmuxSource,
   bundledTmuxAvailable,
   onPickTmuxSource,
-  canAdd,
-  onAdd,
-  onEdit,
-  onDelete,
-  onToggleEnabled,
-  onOpenTerminal,
-  pendingToggle,
 }: {
   payload: HarnessesPayload;
-  statusByHarness: Map<string, HarnessesPayload["statuses"][number]>;
   defaultHarness: string;
-  homeDir: string;
   onPickDefault: (id: string) => void;
   tmuxSource: "system" | "bundled";
   bundledTmuxAvailable: boolean;
   onPickTmuxSource: (source: "system" | "bundled") => void;
-  /** False while `dataDir` is still loading from `GET /defaults`. Adding a
-   *  harness with an unresolved data dir would persist a broken HOME path
-   *  (`/harnesses/claude-2` instead of `<dataDir>/harnesses/claude-2`). */
-  canAdd: boolean;
-  onAdd: () => void;
-  onEdit: (h: Harness) => void;
-  onDelete: (h: Harness) => void;
-  onToggleEnabled: (h: Harness) => void;
-  /** Open a new Terminal.app window with this harness's env loaded so the
-   *  user can authenticate or inspect it (e.g. `claude /login`). */
-  onOpenTerminal: (h: Harness) => void;
-  /** Optimistic toggle state — keyed by harness id, value is what the user
-   *  clicked toward. Lets the Switch animate before the confirm/round-trip
-   *  resolves. Missing keys mean "use the server's `h.enabled`". */
-  pendingToggle: Record<string, boolean>;
 }) {
   // Disabled harnesses are excluded from the default-harness picker so a
   // soft-deleted harness can't silently become the default for new tasks.
@@ -539,9 +544,43 @@ function ListView({
           binary if you don't want to install tmux system-wide.
         </p>
       </section>
+    </div>
+  );
+}
 
-      <GitHubTokensSection />
-
+function HarnessesSection({
+  payload,
+  statusByHarness,
+  homeDir,
+  canAdd,
+  onAdd,
+  onEdit,
+  onDelete,
+  onToggleEnabled,
+  onOpenTerminal,
+  pendingToggle,
+}: {
+  payload: HarnessesPayload;
+  statusByHarness: Map<string, HarnessesPayload["statuses"][number]>;
+  homeDir: string;
+  /** False while `dataDir` is still loading from `GET /defaults`. Adding a
+   *  harness with an unresolved data dir would persist a broken HOME path
+   *  (`/harnesses/claude-2` instead of `<dataDir>/harnesses/claude-2`). */
+  canAdd: boolean;
+  onAdd: () => void;
+  onEdit: (h: Harness) => void;
+  onDelete: (h: Harness) => void;
+  onToggleEnabled: (h: Harness) => void;
+  /** Open a new Terminal.app window with this harness's env loaded so the
+   *  user can authenticate or inspect it (e.g. `claude /login`). */
+  onOpenTerminal: (h: Harness) => void;
+  /** Optimistic toggle state — keyed by harness id, value is what the user
+   *  clicked toward. Lets the Switch animate before the confirm/round-trip
+   *  resolves. Missing keys mean "use the server's `h.enabled`". */
+  pendingToggle: Record<string, boolean>;
+}) {
+  return (
+    <div className="space-y-4 pt-3 text-sm">
       <section className="space-y-2">
         <div className="flex items-center justify-between">
           <label className="text-xs text-muted-foreground">Harnesses</label>
