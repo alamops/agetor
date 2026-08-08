@@ -7,7 +7,31 @@
  */
 import { mkdirSync } from "node:fs";
 
-const OUT = "artifacts/agetor-arm64";
+/**
+ * Target resolution: `AGETOR_CLI_TARGET` (a bun `--target` value, e.g.
+ * `bun-linux-x64`) wins if set; otherwise infer from the host running the
+ * build. Defaulting to the host means the maintainer's mac laptop keeps
+ * producing exactly `artifacts/agetor-arm64` (the filename upload-release.ts
+ * and install.sh hardcode) with no env var needed, while `bun run build:cli`
+ * on a Linux box now produces a Linux binary instead of failing/mis-targeting.
+ */
+const HOST_TARGETS: Record<string, string> = {
+  "darwin-arm64": "bun-darwin-arm64",
+  "darwin-x64": "bun-darwin-x64",
+  "linux-x64": "bun-linux-x64",
+  "linux-arm64": "bun-linux-arm64",
+};
+const hostKey = `${process.platform}-${process.arch}`;
+const TARGET = process.env.AGETOR_CLI_TARGET ?? HOST_TARGETS[hostKey];
+if (!TARGET) {
+  console.error(`[build:cli] no default target for host ${hostKey} — set AGETOR_CLI_TARGET explicitly.`);
+  process.exit(1);
+}
+// Asset name mirrors the bun target, e.g. "agetor-arm64" (mac, unchanged —
+// existing release tooling hardcodes this name) or "agetor-linux-x64".
+const ASSET_NAME = TARGET === "bun-darwin-arm64" ? "agetor-arm64" : `agetor-${TARGET.replace(/^bun-/, "")}`;
+const OUT = `artifacts/${ASSET_NAME}`;
+const IS_DARWIN = TARGET.startsWith("bun-darwin");
 
 async function run(cmd: string[], opts: { allowFail?: boolean } = {}): Promise<number> {
   console.log(`$ ${cmd.join(" ")}`);
@@ -75,19 +99,19 @@ async function notarize(): Promise<void> {
 
 mkdirSync("artifacts", { recursive: true });
 
-console.log("[build:cli] compiling standalone binary…");
+console.log(`[build:cli] compiling standalone binary (${TARGET})…`);
 await run([
   "bun",
   "build",
   "--compile",
-  "--target=bun-darwin-arm64",
+  `--target=${TARGET}`,
   "src/cli/index.ts",
   "--outfile",
   OUT,
 ]);
 
 const devId = process.env.ELECTROBUN_DEVELOPER_ID;
-if (devId) {
+if (devId && IS_DARWIN) {
   console.log("[build:cli] codesigning (Developer ID, hardened runtime)…");
   await run([
     "codesign",
@@ -100,11 +124,13 @@ if (devId) {
     OUT,
   ]);
   await notarize();
-} else {
+} else if (IS_DARWIN) {
   console.warn(
     "[build:cli] ELECTROBUN_DEVELOPER_ID not set — shipping the ad-hoc signature " +
       "(fine for local builds; set it for releases).",
   );
+} else {
+  console.log("[build:cli] non-darwin target — codesigning/notarization skipped.");
 }
 
 console.log("[build:cli] writing SHA256…");
@@ -114,7 +140,7 @@ await sha.exited;
 // Normalize the path in the checksum file to just the basename so `shasum -c`
 // works from the download dir.
 const digest = shaText.trim().split(/\s+/)[0] ?? "";
-await Bun.write(`${OUT}.sha256`, `${digest}  agetor-arm64\n`);
+await Bun.write(`${OUT}.sha256`, `${digest}  ${ASSET_NAME}\n`);
 
 // Stage the installer next to the binary so the release uploader ships it as a
 // stable asset: …/releases/latest/download/install.sh

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ClipboardList, Code2, GitBranch, SlidersHorizontal } from "lucide-react";
+import { ChevronLeft, ChevronRight, ClipboardList, Code2, GitBranch, SlidersHorizontal } from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type BranchNamingConfig } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -47,6 +47,11 @@ import {
 import { SlashAutocomplete } from "./SlashAutocomplete";
 import { ExtensionPicker } from "./ExtensionPicker";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
+import {
+  NEW_TASK_PANEL_COLLAPSED_KEY,
+  readCollapsed,
+  writeCollapsed,
+} from "@/lib/panel-collapse";
 
 const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
 
@@ -88,6 +93,16 @@ interface Props {
 }
 
 export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props) {
+  // Collapsed = thin icon rail; the board's `flex-1` <main> takes the freed
+  // width on its own. Seeded synchronously from localStorage (lazy initial
+  // state) so a restart repaints in the state the user left it in — an async
+  // read would flash the full-width sidebar first.
+  const [collapsed, setCollapsed] = useState(() =>
+    readCollapsed(NEW_TASK_PANEL_COLLAPSED_KEY),
+  );
+  useEffect(() => {
+    writeCollapsed(NEW_TASK_PANEL_COLLAPSED_KEY, collapsed);
+  }, [collapsed]);
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [taskType, setTaskType] = useState<TaskType>(DEFAULT_TASK_TYPE);
@@ -260,6 +275,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     "claude-code": { mode: initialMode("claude-code"), model: DEFAULT_MODEL["claude-code"], effort: DEFAULT_EFFORT["claude-code"], fast: false, maxMode: false },
     "codex": { mode: initialMode("codex"), model: DEFAULT_MODEL["codex"], effort: DEFAULT_EFFORT["codex"], fast: false, maxMode: false },
     "cursor": { mode: initialMode("cursor"), model: DEFAULT_MODEL["cursor"], effort: DEFAULT_EFFORT["cursor"], fast: false, maxMode: false },
+    "gemini": { mode: initialMode("gemini"), model: DEFAULT_MODEL["gemini"], effort: DEFAULT_EFFORT["gemini"], fast: false, maxMode: false },
   });
 
   // Seed mode + model + effort defaults from the last submitted picks,
@@ -308,6 +324,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
       seed("claude-code");
       seed("codex");
       seed("cursor");
+      seed("gemini");
       const active = agentCache.current[kind];
       setMode(active.mode);
       setModel(active.model);
@@ -462,7 +479,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   // Sidebar-wide drag/drop — anything dropped on the form (not just the
   // ReferencesPicker) gets added to the references list. The inner picker
   // also accepts drops and calls e.stopPropagation, so we don't double up.
+  // While collapsed there is no references list (or prompt caret) on screen to
+  // drop into, so the rail is not a drop target: we skip preventDefault, the
+  // browser keeps its "no drop" cursor, and the drop falls through instead of
+  // silently swallowing the user's file. Expand first, then drop.
   const onAsideDragOver = (e: React.DragEvent) => {
+    if (collapsed) return;
     if (!e.dataTransfer.types.includes("Files")) return;
     e.preventDefault();
     setDragging(true);
@@ -496,6 +518,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
     else setDropHint(null);
   };
   const onAsideDrop = async (e: React.DragEvent) => {
+    if (collapsed) return;
     e.preventDefault();
     setDragging(false);
     setDropHint(null);
@@ -524,377 +547,431 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
       onDragLeave={onAsideDragLeave}
       onDrop={onAsideDrop}
       className={cn(
-        "relative flex h-full w-80 shrink-0 flex-col border-r border-border/60 bg-card text-card-foreground",
-        dragging && "ring-2 ring-inset ring-primary",
+        // Width is the only animated property — <main> next door is flex-1,
+        // so the board reclaims the space in the same frame with no resize
+        // logic on that side.
+        "relative flex h-full shrink-0 flex-col border-r border-border/60 bg-card text-card-foreground",
+        "transition-[width] duration-200 ease-out motion-reduce:transition-none",
+        collapsed ? "w-11" : "w-80",
+        // `!collapsed` is belt-and-braces: onAsideDragOver already refuses to
+        // arm `dragging` on the rail, this also drops a stale ring if the
+        // panel is collapsed while one is showing.
+        dragging && !collapsed && "ring-2 ring-inset ring-primary",
       )}
     >
-      <div className="flex shrink-0 items-center justify-between border-b border-border/60 px-4 py-3">
-        <span className="text-sm font-semibold">New task</span>
-        {selectedStatus?.available && selectedStatus.version && (
-          <span className="text-[11px] text-muted-foreground">
-            {selectedStatus.version}
-          </span>
-        )}
-      </div>
+      {/* VS Code-style collapse control: straddles the border between the
+          sidebar and the board (half of it overhangs into the board's p-4
+          gutter, so it never covers a card). z-20 keeps it above the board
+          and below dialogs/overlays (z-50). */}
+      <button
+        type="button"
+        onClick={() => setCollapsed((c) => !c)}
+        aria-expanded={!collapsed}
+        aria-label={collapsed ? "Expand new task panel" : "Collapse new task panel"}
+        title={collapsed ? "Expand new task panel" : "Collapse new task panel"}
+        className="absolute -right-2.5 top-1/2 z-20 flex size-5 -translate-y-1/2 items-center justify-center rounded-full border border-border/60 bg-card text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground"
+      >
+        {collapsed
+          ? <ChevronRight className="size-3.5" />
+          : <ChevronLeft className="size-3.5" />}
+      </button>
 
-      <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3 text-xs">
-        <div className="space-y-1">
-          <label className="text-muted-foreground">Type</label>
-          <div className="grid grid-cols-3 gap-1">
-            {TASK_TYPES.map((t) => {
-              const Icon = taskTypeIcon(t.icon);
-              const selected = taskType === t.id;
-              return (
-                <Button
-                  key={t.id}
-                  size="sm"
-                  variant={selected ? "default" : "outline"}
-                  onClick={() => setTaskType(t.id)}
-                  title={t.hint}
-                  className="justify-start"
-                >
-                  <Icon className={cn("mr-1 size-3.5", !selected && t.iconClass)} />
-                  <span className="truncate">{t.label}</span>
-                </Button>
-              );
-            })}
-          </div>
-        </div>
-
-        <div className="space-y-1">
-          <label className="text-muted-foreground">Title</label>
-          <Input
-            placeholder="Short description"
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-          />
-        </div>
-
-        <div className="space-y-1">
-          <div className="flex items-center justify-between gap-2">
-            <label className="text-muted-foreground">Prompt</label>
-            <ExtensionPicker
-              extensions={agentExtensions}
-              value={prompt}
-              onChange={setPrompt}
-              textareaRef={promptRef}
-              placement="below"
-              align="right"
-              disabled={!workdir.trim()}
-            />
-          </div>
-          <div className="relative">
-            <Textarea
-              ref={promptRef}
-              placeholder="What should the agent do? Type / for commands."
-              value={prompt}
-              onChange={(e) => { setPrompt(e.target.value); if (dropHint) setDropHint(null); }}
-              onPaste={onPromptPaste}
-              rows={6}
-              className="resize-none"
-            />
-            <SlashAutocomplete
-              commands={agentCommands}
-              value={prompt}
-              onChange={setPrompt}
-              textareaRef={promptRef}
-            />
-          </div>
-          {dropHint && (
-            <p className="text-[10px] text-muted-foreground">{dropHint}</p>
-          )}
-        </div>
-
-        <ReferencesPicker
-          variant="expandable"
-          label="Files / Folders"
-          refs={references}
-          onChange={setReferences}
-          startingFolder={workdir || undefined}
-        />
-
-        {/* Project + Branch each get their own full-width row. Side-by-side in
-            the ~140px-per-column grid clipped all but the shortest names; full
-            width lets the picker triggers render the full project/branch name. */}
-        <div className="min-w-0 space-y-1">
-          <label className="text-muted-foreground">Project</label>
-          <ProjectPicker
-            value={workdir}
-            onChange={(p) => {
-              setWorkdir(p);
-              // The previously-picked branch likely doesn't exist on the new
-              // project — drop back to HEAD so the picker shows a valid default.
-              setBaseRef("");
-            }}
-            autoSelectFirst
-            placement="bottom"
-            title="Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list."
-          />
-        </div>
-        <BranchPicker
-          label="Branch"
-          workdir={workdir}
-          value={baseRef}
-          onChange={setBaseRef}
-          placement="bottom"
-          title={
-            isolate
-              ? "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start."
-              : "Isolation is off — the value is recorded but the agent will run directly in the project workdir."
-          }
-        />
-
-        <label
-          className="flex cursor-pointer items-center gap-1.5"
-          title={isolateTitle}
-        >
-          <input
-            type="checkbox"
-            checked={isolate}
-            onChange={(e) => setIsolate(e.target.checked)}
-          />
-          <GitBranch className="size-3" />
-          <span>Isolate (worktree)</span>
-        </label>
-
-        {isolate && (
-          <div className="space-y-1">
-            <label className="text-muted-foreground">Branch name</label>
-            <div className="relative">
-              <Input
-                value={branchField.displayValue}
-                onChange={(e) => { setBranchOverride(e.target.value); setBranchDirty(true); }}
-                spellCheck={false}
-                placeholder="feature/my-task"
-                className={cn(
-                  "pr-9 font-mono text-[11px]",
-                  !branchValidation.ok && "border-destructive focus-visible:ring-destructive",
-                )}
-                title="Git branch the worktree will use. Live-resolved from this project's nomenclature (title, type, project name); edit to override, or use the settings button to change the pattern."
-              />
-              <button
-                type="button"
-                onClick={() => setBranchSettingsOpen(true)}
-                disabled={!workdir.trim()}
-                title="Branch naming settings for this project"
-                aria-label="Configure branch naming"
-                className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
-              >
-                <SlidersHorizontal className="size-3.5" />
-              </button>
-            </div>
-            {!branchValidation.ok ? (
-              <p className="text-[10px] text-destructive">{branchValidation.reason}</p>
-            ) : branchDirty && hasBranchTemplateTags(branchOverride) ? (
-              <p
-                className="text-[10px] font-mono text-muted-foreground truncate"
-                title={branchField.resolved}
-              >
-                → {branchField.resolved}
-              </p>
-            ) : null}
-            {branchDirty && (
-              <button
-                type="button"
-                onClick={() => setBranchDirty(false)}
-                className="text-[10px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
-              >
-                Reset to pattern
-              </button>
-            )}
-          </div>
-        )}
-
-        <div className="space-y-1">
-          <label className="text-muted-foreground">Harness</label>
-          <div className="grid grid-cols-2 gap-1">
-            {availableHarnesses.map((h) => {
-              const status = agents.find((s) => s.harnessId === h.id);
-              const available = status?.available ?? true;
-              return (
-                <Button
-                  key={h.id}
-                  size="sm"
-                  variant={agent === h.id ? "default" : "outline"}
-                  onClick={() => switchAgent(h.id)}
-                  title={
-                    [status?.reason, status?.path, status?.version]
-                      .filter(Boolean)
-                      .join(" — ") || h.id
-                  }
-                  className="justify-start"
-                >
-                  <AgentIcon kind={h.kind} className="mr-1" />
-                  <span className="truncate">{h.label}</span>
-                  <span
-                    className={cn(
-                      "ml-auto inline-block size-1.5 rounded-full",
-                      available ? "bg-emerald-500" : "bg-red-500",
-                    )}
-                  />
-                </Button>
-              );
-            })}
-          </div>
-        </div>
-
-        <div className="space-y-1">
-          <label className="text-muted-foreground">Mode</label>
-          <div className="grid grid-cols-2 gap-1">
-            <Button
-              size="sm"
-              variant={primary === "code" ? "default" : "outline"}
-              onClick={onClickCode}
-              title="Execute changes (auto / accept edits / ask all live under Code — pick the exact variant below)."
+      {/* Clip layer: the contents keep their natural width (w-11 rail / w-80
+          form) and get cut off by this box while the aside's width animates,
+          instead of reflowing every field through 200ms of intermediate
+          widths. It can't live on the <aside> itself — that would clip the
+          toggle button's overhang. */}
+      <div className="min-h-0 flex-1 overflow-hidden">
+        {collapsed ? (
+          /* Icon rail. Deliberately a plain vertical stack: future quick-action
+             icon buttons get appended below the label without touching any of
+             the collapse plumbing. The form itself is unmounted rather than
+             squeezed — every field's state lives in this component (not its
+             children), so nothing the user typed is lost while collapsed. */
+          <div className="flex h-full w-11 flex-col items-center gap-2 py-3">
+            <button
+              type="button"
+              onClick={() => setCollapsed(false)}
+              title="Expand new task panel"
+              className="rounded-md px-1 py-2 text-[11px] font-semibold tracking-wide text-muted-foreground transition-colors [writing-mode:vertical-rl] hover:text-foreground"
             >
-              <Code2 className="mr-1 size-3.5" />
-              Code
-            </Button>
-            <Button
-              size="sm"
-              variant={primary === "plan" ? "default" : "outline"}
-              onClick={onClickPlan}
-              title={
-                kind === "codex"
-                  ? "Codex has no native plan mode — routed to 'ask' so nothing auto-executes."
-                  : kind === "cursor"
-                    ? "Cursor has no native plan mode — routed to propose-only 'ask' so nothing auto-executes."
-                    : "Plan only — agent describes what it would do without making changes."
-              }
-            >
-              <ClipboardList className="mr-1 size-3.5" />
-              Plan
-            </Button>
+              New task
+            </button>
           </div>
-          <div className="flex items-center gap-1.5">
-            <SearchSelect
-              value={mode}
-              onChange={setMode}
-              items={modes.map((m) => ({ value: m.id, label: m.label, hint: m.hint }))}
-              searchable={false}
-              wrapHints
-              placement="bottom"
-              className="min-w-0 flex-1"
-              triggerClassName="h-8 text-xs"
-            />
-            {selectedModeHint && <InfoTip text={selectedModeHint} label="About this mode" />}
-          </div>
-        </div>
-
-        <div className="grid grid-cols-2 gap-2">
-          <div className="min-w-0 space-y-1">
-            <label className="text-muted-foreground">Model</label>
-            <Select
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="h-8"
-            >
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>{m.label}</option>
-              ))}
-            </Select>
-          </div>
-          <div className="min-w-0 space-y-1">
-            <label className="text-muted-foreground">Effort</label>
-            <Select
-              value={effort ?? ""}
-              onChange={(e) => setEffort(e.target.value)}
-              title={
-                efforts.length === 0
-                  ? "This model doesn't accept a reasoning-effort flag."
-                  : kind === "claude-code"
-                    ? "Appends a thinking keyword (think / think hard / ultrathink) to the prompt."
-                    : "Reasoning effort — higher = slower but more thorough."
-              }
-              className="h-8"
-              disabled={efforts.length === 0}
-            >
-              {efforts.length === 0 ? (
-                <option value="">n/a</option>
-              ) : (
-                efforts.map((m) => (
-                  <option key={m.id} value={m.id}>{m.label}</option>
-                ))
+        ) : (
+          <div className="flex h-full w-80 flex-col">
+            <div className="flex shrink-0 items-center justify-between border-b border-border/60 px-4 py-3">
+              <span className="text-sm font-semibold">New task</span>
+              {selectedStatus?.available && selectedStatus.version && (
+                <span className="text-[11px] text-muted-foreground">
+                  {selectedStatus.version}
+                </span>
               )}
-            </Select>
-          </div>
-        </div>
+            </div>
 
-        {kind === "cursor" && (maxModeAvailable || maxMode || fastAvailable || fast) && (
-          <div className="grid grid-cols-2 gap-2">
-            {(maxModeAvailable || maxMode) && (
-              <label className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs">
-                <span>Max Mode</span>
-                <Switch
-                  checked={maxMode}
-                  onCheckedChange={setMaxMode}
-                  disabled={!maxModeAvailable}
-                  aria-label="Use Cursor Max Mode context"
-                />
-              </label>
-            )}
-            {(fastAvailable || fast) && (
-              <label className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs">
-                <span>Fast</span>
-                <Switch
-                  checked={fast}
-                  onCheckedChange={setFast}
-                  disabled={!fastAvailable}
-                  aria-label="Use Cursor fast variant"
-                />
-              </label>
-            )}
-          </div>
-        )}
-
-        {/* Fable 5 sits above Opus in the picker but bills at 2x the usage —
-            surface that under the model row so the cost is obvious before Create. */}
-        {kind === "claude-code" && model === "fable-5" && (
-          <div className="text-[11px] text-muted-foreground">
-            Fable 5 uses 2x the usage of Opus.
-          </div>
-        )}
-
-        {/* Surfacing a missing-agent error inline so the user sees install
-            guidance before they hit Create and get a delayed failure. */}
-        {selectedStatus && !selectedStatus.available && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
-            <div className="font-medium">{selectedStatus.reason}</div>
-            {selectedStatus.installHint && (
-              <div className="mt-1 font-mono opacity-80">
-                {selectedStatus.installHint}
+            <div className="flex-1 space-y-3 overflow-y-auto px-4 py-3 text-xs">
+              <div className="space-y-1">
+                <label className="text-muted-foreground">Type</label>
+                <div className="grid grid-cols-3 gap-1">
+                  {TASK_TYPES.map((t) => {
+                    const Icon = taskTypeIcon(t.icon);
+                    const selected = taskType === t.id;
+                    return (
+                      <Button
+                        key={t.id}
+                        size="sm"
+                        variant={selected ? "default" : "outline"}
+                        onClick={() => setTaskType(t.id)}
+                        title={t.hint}
+                        className="justify-start"
+                      >
+                        <Icon className={cn("mr-1 size-3.5", !selected && t.iconClass)} />
+                        <span className="truncate">{t.label}</span>
+                      </Button>
+                    );
+                  })}
+                </div>
               </div>
-            )}
+
+              <div className="space-y-1">
+                <label className="text-muted-foreground">Title</label>
+                <Input
+                  placeholder="Short description"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                />
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-muted-foreground">Prompt</label>
+                  <ExtensionPicker
+                    extensions={agentExtensions}
+                    value={prompt}
+                    onChange={setPrompt}
+                    textareaRef={promptRef}
+                    placement="below"
+                    align="right"
+                    disabled={!workdir.trim()}
+                  />
+                </div>
+                <div className="relative">
+                  <Textarea
+                    ref={promptRef}
+                    placeholder="What should the agent do? Type / for commands."
+                    value={prompt}
+                    onChange={(e) => { setPrompt(e.target.value); if (dropHint) setDropHint(null); }}
+                    onPaste={onPromptPaste}
+                    rows={6}
+                    className="resize-none"
+                  />
+                  <SlashAutocomplete
+                    commands={agentCommands}
+                    value={prompt}
+                    onChange={setPrompt}
+                    textareaRef={promptRef}
+                  />
+                </div>
+                {dropHint && (
+                  <p className="text-[10px] text-muted-foreground">{dropHint}</p>
+                )}
+              </div>
+
+              <ReferencesPicker
+                variant="expandable"
+                label="Files / Folders"
+                refs={references}
+                onChange={setReferences}
+                startingFolder={workdir || undefined}
+              />
+
+              {/* Project + Branch each get their own full-width row. Side-by-side in
+                  the ~140px-per-column grid clipped all but the shortest names; full
+                  width lets the picker triggers render the full project/branch name. */}
+              <div className="min-w-0 space-y-1">
+                <label className="text-muted-foreground">Project</label>
+                <ProjectPicker
+                  value={workdir}
+                  onChange={(p) => {
+                    setWorkdir(p);
+                    // The previously-picked branch likely doesn't exist on the new
+                    // project — drop back to HEAD so the picker shows a valid default.
+                    setBaseRef("");
+                  }}
+                  autoSelectFirst
+                  placement="bottom"
+                  title="Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list."
+                />
+              </div>
+              <BranchPicker
+                label="Branch"
+                workdir={workdir}
+                value={baseRef}
+                onChange={setBaseRef}
+                placement="bottom"
+                title={
+                  isolate
+                    ? "Base ref the worktree branches from. Pick the current branch row to use what's checked out at task start."
+                    : "Isolation is off — the value is recorded but the agent will run directly in the project workdir."
+                }
+              />
+
+              <label
+                className="flex cursor-pointer items-center gap-1.5"
+                title={isolateTitle}
+              >
+                <input
+                  type="checkbox"
+                  checked={isolate}
+                  onChange={(e) => setIsolate(e.target.checked)}
+                />
+                <GitBranch className="size-3" />
+                <span>Isolate (worktree)</span>
+              </label>
+
+              {isolate && (
+                <div className="space-y-1">
+                  <label className="text-muted-foreground">Branch name</label>
+                  <div className="relative">
+                    <Input
+                      value={branchField.displayValue}
+                      onChange={(e) => { setBranchOverride(e.target.value); setBranchDirty(true); }}
+                      spellCheck={false}
+                      placeholder="feature/my-task"
+                      className={cn(
+                        "pr-9 font-mono text-[11px]",
+                        !branchValidation.ok && "border-destructive focus-visible:ring-destructive",
+                      )}
+                      title="Git branch the worktree will use. Live-resolved from this project's nomenclature (title, type, project name); edit to override, or use the settings button to change the pattern."
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setBranchSettingsOpen(true)}
+                      disabled={!workdir.trim()}
+                      title="Branch naming settings for this project"
+                      aria-label="Configure branch naming"
+                      className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
+                    >
+                      <SlidersHorizontal className="size-3.5" />
+                    </button>
+                  </div>
+                  {!branchValidation.ok ? (
+                    <p className="text-[10px] text-destructive">{branchValidation.reason}</p>
+                  ) : branchDirty && hasBranchTemplateTags(branchOverride) ? (
+                    <p
+                      className="text-[10px] font-mono text-muted-foreground truncate"
+                      title={branchField.resolved}
+                    >
+                      → {branchField.resolved}
+                    </p>
+                  ) : null}
+                  {branchDirty && (
+                    <button
+                      type="button"
+                      onClick={() => setBranchDirty(false)}
+                      className="text-[10px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                    >
+                      Reset to pattern
+                    </button>
+                  )}
+                </div>
+              )}
+
+              <div className="space-y-1">
+                <label className="text-muted-foreground">Harness</label>
+                <div className="grid grid-cols-2 gap-1">
+                  {availableHarnesses.map((h) => {
+                    const status = agents.find((s) => s.harnessId === h.id);
+                    const available = status?.available ?? true;
+                    return (
+                      <Button
+                        key={h.id}
+                        size="sm"
+                        variant={agent === h.id ? "default" : "outline"}
+                        onClick={() => switchAgent(h.id)}
+                        title={
+                          [status?.reason, status?.path, status?.version]
+                            .filter(Boolean)
+                            .join(" — ") || h.id
+                        }
+                        className="justify-start"
+                      >
+                        <AgentIcon kind={h.kind} className="mr-1" />
+                        <span className="truncate">{h.label}</span>
+                        <span
+                          className={cn(
+                            "ml-auto inline-block size-1.5 rounded-full",
+                            available ? "bg-emerald-500" : "bg-red-500",
+                          )}
+                        />
+                      </Button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-muted-foreground">Mode</label>
+                <div className="grid grid-cols-2 gap-1">
+                  <Button
+                    size="sm"
+                    variant={primary === "code" ? "default" : "outline"}
+                    onClick={onClickCode}
+                    title="Execute changes (auto / accept edits / ask all live under Code — pick the exact variant below)."
+                  >
+                    <Code2 className="mr-1 size-3.5" />
+                    Code
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={primary === "plan" ? "default" : "outline"}
+                    onClick={onClickPlan}
+                    title={
+                      kind === "codex"
+                        ? "Codex has no native plan mode — routed to 'ask' so nothing auto-executes."
+                        : kind === "cursor"
+                        ? "Cursor has no native plan mode — routed to propose-only 'ask' so nothing auto-executes."
+                        : kind === "gemini"
+                        ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
+                        : "Plan only — agent describes what it would do without making changes."
+                    }
+                  >
+                    <ClipboardList className="mr-1 size-3.5" />
+                    Plan
+                  </Button>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <SearchSelect
+                    value={mode}
+                    onChange={setMode}
+                    items={modes.map((m) => ({ value: m.id, label: m.label, hint: m.hint }))}
+                    searchable={false}
+                    wrapHints
+                    placement="bottom"
+                    className="min-w-0 flex-1"
+                    triggerClassName="h-8 text-xs"
+                  />
+                  {selectedModeHint && <InfoTip text={selectedModeHint} label="About this mode" />}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="min-w-0 space-y-1">
+                  <label className="text-muted-foreground">Model</label>
+                  <Select
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    className="h-8"
+                  >
+                    {models.map((m) => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
+                    ))}
+                  </Select>
+                </div>
+                <div className="min-w-0 space-y-1">
+                  <label className="text-muted-foreground">Effort</label>
+                  <Select
+                    value={effort ?? ""}
+                    onChange={(e) => setEffort(e.target.value)}
+                    title={
+                      efforts.length === 0
+                        ? "This model doesn't accept a reasoning-effort flag."
+                        : kind === "claude-code"
+                          ? "Appends a thinking keyword (think / think hard / ultrathink) to the prompt."
+                          : "Reasoning effort — higher = slower but more thorough."
+                    }
+                    className="h-8"
+                    disabled={efforts.length === 0}
+                  >
+                    {efforts.length === 0 ? (
+                      <option value="">n/a</option>
+                    ) : (
+                      efforts.map((m) => (
+                        <option key={m.id} value={m.id}>{m.label}</option>
+                      ))
+                    )}
+                  </Select>
+                </div>
+              </div>
+
+              {kind === "cursor" && (maxModeAvailable || maxMode || fastAvailable || fast) && (
+                <div className="grid grid-cols-2 gap-2">
+                  {(maxModeAvailable || maxMode) && (
+                    <label className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs">
+                      <span>Max Mode</span>
+                      <Switch
+                        checked={maxMode}
+                        onCheckedChange={setMaxMode}
+                        disabled={!maxModeAvailable}
+                        aria-label="Use Cursor Max Mode context"
+                      />
+                    </label>
+                  )}
+                  {(fastAvailable || fast) && (
+                    <label className="flex h-8 items-center justify-between rounded-md border border-border px-2 text-xs">
+                      <span>Fast</span>
+                      <Switch
+                        checked={fast}
+                        onCheckedChange={setFast}
+                        disabled={!fastAvailable}
+                        aria-label="Use Cursor fast variant"
+                      />
+                    </label>
+                  )}
+                </div>
+              )}
+
+              {/* Fable 5 sits above Opus in the picker but bills at 2x the usage —
+                  surface that under the model row so the cost is obvious before Create. */}
+              {kind === "claude-code" && model === "fable-5" && (
+                <div className="text-[11px] text-muted-foreground">
+                  Fable 5 uses 2x the usage of Opus.
+                </div>
+              )}
+
+              {/* Surfacing a missing-agent error inline so the user sees install
+                  guidance before they hit Create and get a delayed failure. */}
+              {selectedStatus && !selectedStatus.available && (
+                <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive-foreground">
+                  <div className="font-medium">{selectedStatus.reason}</div>
+                  {selectedStatus.installHint && (
+                    <div className="mt-1 font-mono opacity-80">
+                      {selectedStatus.installHint}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex shrink-0 gap-2 border-t border-border/60 px-4 py-3">
+              <Button
+                variant="outline"
+                onClick={() => submit({ start: false })}
+                className="flex-1"
+                disabled={!canSubmit}
+                title={
+                  workdir.trim()
+                    ? "Create the task but don't start it — it sits in Backlog until you start it manually."
+                    : "Pick a project first."
+                }
+              >
+                To backlog
+              </Button>
+              <Button
+                onClick={() => submit({ start: true })}
+                className="flex-1"
+                disabled={!canSubmit}
+                title={
+                  workdir.trim()
+                    ? "Create the task in Ready and hand it to the agent — it'll flip to Running once the harness starts executing."
+                    : "Pick a project first."
+                }
+              >
+                Run task
+              </Button>
+            </div>
           </div>
         )}
-      </div>
-
-      <div className="flex shrink-0 gap-2 border-t border-border/60 px-4 py-3">
-        <Button
-          variant="outline"
-          onClick={() => submit({ start: false })}
-          className="flex-1"
-          disabled={!canSubmit}
-          title={
-            workdir.trim()
-              ? "Create the task but don't start it — it sits in Backlog until you start it manually."
-              : "Pick a project first."
-          }
-        >
-          To backlog
-        </Button>
-        <Button
-          onClick={() => submit({ start: true })}
-          className="flex-1"
-          disabled={!canSubmit}
-          title={
-            workdir.trim()
-              ? "Create the task in Ready and hand it to the agent — it'll flip to Running once the harness starts executing."
-              : "Pick a project first."
-          }
-        >
-          Run task
-        </Button>
       </div>
 
       <BranchNamingDialog

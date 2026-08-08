@@ -51,6 +51,10 @@ async function run(cmd: string[], opts: { silent?: boolean } = {}): Promise<stri
 
 async function main() {
   if (process.platform !== "darwin") {
+    // Same reasoning as fetch-tmux.ts: electrobun's dev watcher fs.watch()es
+    // every `copy` source dir (including vendor/notifier) unconditionally,
+    // so a missing dir crashes `bun run dev` with ENOENT on non-macOS.
+    await mkdir(OUT_DIR, { recursive: true });
     console.log(`[build-notifier] skipped on ${process.platform} (macOS-only step)`);
     return;
   }

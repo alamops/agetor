@@ -44,7 +44,16 @@ import m032 from "./032_cursor_harness.sql" with { type: "text" };
 import m033 from "./033_cursor_session_id.sql" with { type: "text" };
 import m034 from "./034_task_fast.sql" with { type: "text" };
 import m035 from "./035_task_max_mode.sql" with { type: "text" };
-import m036 from "./036_run_events_user_history.sql" with { type: "text" };
+// The gemini branch originally used 032/033/034; renumbered to 036/037/038 on
+// merge to avoid the clash with the cursor branch's 032-035 above (same
+// renumber-with-alias pattern).
+import m036 from "./036_gemini_session_id.sql" with { type: "text" };
+import m037 from "./037_harness_kind_gemini.sql" with { type: "text" };
+import m038 from "./038_reseed_harness_builtins_2.sql" with { type: "text" };
+// This branch used 035 then 036 for run_events_user_history across two
+// main-merges (max-mode took 035, gemini took 036); renumbered to 039 with
+// both prior ids as aliases (same renumber-with-alias pattern).
+import m039 from "./039_run_events_user_history.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -84,5 +93,8 @@ export const migrations: Migration[] = [
   { id: "033_cursor_session_id", sql: m033, aliases: ["025_cursor_session_id"] },
   { id: "034_task_fast", sql: m034 },
   { id: "035_task_max_mode", sql: m035 },
-  { id: "036_run_events_user_history", sql: m036, aliases: ["035_run_events_user_history"] },
+  { id: "036_gemini_session_id", sql: m036, aliases: ["032_gemini_session_id"] },
+  { id: "037_harness_kind_gemini", sql: m037, aliases: ["033_harness_kind_gemini"] },
+  { id: "038_reseed_harness_builtins_2", sql: m038, aliases: ["034_reseed_harness_builtins_2"] },
+  { id: "039_run_events_user_history", sql: m039, aliases: ["035_run_events_user_history", "036_run_events_user_history"] },
 ];

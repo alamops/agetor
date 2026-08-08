@@ -13,8 +13,12 @@ import { randomBytes } from "node:crypto";
  *     to the webview via the window URL, and to claude subprocesses via tmux
  *     env so the hook script + MCP server can reach back. Generated once at
  *     module load (a stable per-launch identity is part of the contract).
+ *     `AGETOR_API_TOKEN` overrides it for local debugging (e.g. hitting the
+ *     API directly with curl instead of through the injected webview) — unset
+ *     in normal use, where the random per-launch value is what protects the
+ *     loopback-bound API from other localhost processes.
  */
 export function getApiPort(): number {
   return Number(process.env.AGETOR_API_PORT ?? 4317);
 }
-export const API_TOKEN = randomBytes(32).toString("hex");
+export const API_TOKEN = process.env.AGETOR_API_TOKEN ?? randomBytes(32).toString("hex");

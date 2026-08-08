@@ -1,4 +1,4 @@
-import { ClaudeCode, Codex, Cursor } from "@lobehub/icons";
+import { ClaudeCode, Codex, Cursor, GeminiCLI } from "@lobehub/icons";
 import type { ComponentType } from "react";
 import { cn } from "@/lib/utils";
 import type { AgentKind } from "../../../shared/types.ts";
@@ -12,6 +12,7 @@ const ICONS: Record<AgentKind, ComponentType<IconProps>> = {
   // monochrome by design) — the plain (Mono) export is the closest
   // equivalent to Claude/Codex's colored glyphs here.
   "cursor": Cursor,
+  "gemini": GeminiCLI.Color,
 };
 
 /**

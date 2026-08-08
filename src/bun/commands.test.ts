@@ -2,7 +2,15 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import path from "node:path";
-import { listAvailableCommands, listAgentCapabilities } from "./commands.ts";
+
+// commands.ts imports repoRoot from worktree.ts, which imports dataDir from
+// db.ts — db.ts opens its sqlite connection at module-load time. A plain
+// top-level `import` is hoisted ahead of any other code in this file, so
+// AGETOR_DATA_DIR must be set before a *dynamic* import instead (same
+// pattern as harnesses.test.ts). Without this, this file (or whichever file
+// `bun test` loads first) can silently open the real ~/.agetor-dev database.
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-commands-db-"));
+const { listAvailableCommands, listAgentCapabilities } = await import("./commands.ts");
 
 /** Discover just the extension list via the production path (the picker uses
  *  `listAgentCapabilities`; this keeps the extension assertions pointed at it). */

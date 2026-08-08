@@ -10,6 +10,7 @@ import {
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
 import { spawnCursorViaTmux } from "./cursor-tmux.ts";
+import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { gitWritableRootsSync } from "./worktree.ts";
 
 export type { SpawnedAgent };
@@ -46,6 +47,25 @@ export interface AgentCommand {
  * prompt size.
  */
 export const CLAUDE_PROMPT_ARGV_MAX_BYTES = 4096;
+
+/**
+ * Same tmux-imsg-cap constraint as {@link CLAUDE_PROMPT_ARGV_MAX_BYTES}
+ * (gemini is also hosted in a detached tmux session — see gemini-tmux.ts),
+ * but gemini has no deferred-paste fallback: unlike claude's persistent REPL,
+ * gemini's tmux session is one-shot (dies at end of turn), so there's no
+ * live composer to paste an oversized prompt into after launch the way
+ * `deferredPrompt` does for claude. `buildCommand` throws above this budget
+ * instead of silently mis-delivering a truncated prompt.
+ *
+ * Gemini's `--help` notes `-p`'s value is "Appended to input on stdin (if
+ * any)", which suggests a stdin-based large-prompt path might exist (mirror
+ * codex's stdin delivery, avoiding the argv cap entirely) — but this was
+ * unverified as of this cap's introduction (the live API was returning 503s
+ * during the spike that would have confirmed it). Follow up and remove this
+ * cap in favor of stdin delivery once confirmed; until then, fail loudly
+ * rather than guess at unverified CLI behavior.
+ */
+export const GEMINI_PROMPT_ARGV_MAX_BYTES = 4096;
 
 export interface AgentRunOptions {
   /** Friendly mode id; see AGENT_OPTIONS in shared/types.ts. */
@@ -169,6 +189,10 @@ export function resolveBin(harness: Harness): string {
       fallback = "cursor-agent";
       override = process.env.AGETOR_CURSOR_BIN;
       break;
+    case "gemini":
+      fallback = "gemini";
+      override = process.env.AGETOR_GEMINI_BIN;
+      break;
   }
   if (override) return override;
   return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
@@ -205,8 +229,15 @@ export function harnessEnv(harness: Harness): Record<string, string> {
     } else if (harness.kind === "codex") {
       env.HOME = harness.home;
       env.CODEX_HOME = path.join(harness.home, ".codex");
-    } else {
+    } else if (harness.kind === "cursor") {
       env.HOME = harness.home;
+    } else {
+      // gemini: GEMINI_CLI_HOME is a dedicated home-override env var (verified
+      // in the bundled CLI source — `homedir()` returns
+      // `process.env.GEMINI_CLI_HOME || os.homedir()`, and every gemini state
+      // dir hangs off that), so unlike codex there's no need to also touch
+      // the real HOME.
+      env.GEMINI_CLI_HOME = harness.home;
     }
   }
   // User-provided env wins over the home-derived defaults.
@@ -454,6 +485,76 @@ export function buildCommand(
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
 
+  if (harness.kind === "gemini") {
+    const extra = (process.env.AGETOR_GEMINI_ARGS ?? "").split(/\s+/).filter(Boolean);
+    const args: string[] = [bin];
+
+    if (!opts.model) {
+      throw new Error("model is required for gemini");
+    }
+    args.push("-m", opts.model);
+
+    // Structured streaming: `--output-format stream-json` emits NDJSON
+    // events on stdout (tailed by the driver, same shape claude/codex use).
+    args.push("--output-format", "stream-json");
+
+    // Session flow mirrors claude's pre-generated-uuid pattern (see
+    // AgentRunOptions.sessionId doc): agetor self-issues the uuid via
+    // `--session-id` on the first turn; every follow-up passes the SAME
+    // uuid back via `--resume` — verified empirically (`--resume <uuid> -p
+    // "..."` correctly recalled context established under `--session-id
+    // <uuid>` on a prior turn). Mutually exclusive, like claude.
+    if (opts.resumeSessionId) {
+      args.push("--resume", opts.resumeSessionId);
+    } else if (opts.sessionId) {
+      args.push("--session-id", opts.sessionId);
+    }
+
+    // Approval posture. `auto` → `--yolo` (verified: auto-approves every
+    // tool call). `ask` → `--approval-mode plan` (verified real read-only
+    // mode — closer to claude's native `plan` than codex's read-only-sandbox
+    // stand-in, since gemini has no sandbox at all). `--skip-trust` is
+    // mandatory for BOTH: gemini's headless mode refuses to run tool calls
+    // in an untrusted directory (exit 55) even under `--yolo` — verified —
+    // and every agetor task runs in a fresh worktree path that's inherently
+    // untrusted on first run.
+    const mode = opts.mode ?? "auto";
+    if (mode === "auto") {
+      args.push("--yolo");
+    } else {
+      args.push("--approval-mode", "plan");
+    }
+    args.push("--skip-trust");
+
+    args.push(...extra);
+
+    // Gemini has no per-invocation effort/thinking-budget flag at all
+    // (verified via `gemini --help`) — unlike claude/codex this isn't
+    // model-specific, so `opts.effort` is intentionally ignored here rather
+    // than routed through `modelDeclinesEffort` (which would throw for any
+    // gemini model id absent from `MODEL_EFFORT_SUPPORT.gemini`, e.g. a
+    // user-typed future model — see `DEFAULT_EFFORT.gemini` comment in
+    // shared/types.ts).
+
+    // Prompt rides in argv (`-p <prompt>`) — no confirmed stdin-only
+    // delivery path exists yet (see GEMINI_PROMPT_ARGV_MAX_BYTES). Gemini's
+    // one-shot tmux launch has no deferred-paste fallback the way claude's
+    // persistent REPL does, so fail loudly above the safe budget instead of
+    // silently mis-delivering a truncated prompt.
+    if (!prompt) {
+      throw new Error("prompt is required for gemini");
+    }
+    if (Buffer.byteLength(prompt, "utf8") > GEMINI_PROMPT_ARGV_MAX_BYTES) {
+      throw new Error(
+        `prompt exceeds ${GEMINI_PROMPT_ARGV_MAX_BYTES} bytes — gemini's one-shot tmux launch has no `
+          + `deferred-paste fallback for an oversized prompt (see GEMINI_PROMPT_ARGV_MAX_BYTES)`,
+      );
+    }
+    args.push("-p", prompt);
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
   // codex — hosted in tmux via codex-tmux.ts. The prompt is NOT an argv
   // element: it's delivered on stdin (the trailing `-`), so the driver can
   // pipe a prompt file in and no user text touches the shell wrapper.
@@ -652,11 +753,13 @@ export interface SpawnAgentArgs {
   cwd: string;
   onChunk: ChunkHandler;
   /**
-   * Fires with claude's session uuid. With `--session-id` we generate the
-   * uuid up-front, so this fires synchronously before claude has even
-   * written its first event — useful for persisting the id on the run row
-   * immediately. Only invoked for claude-code; codex doesn't have a
-   * comparable session id.
+   * Fires with the agent's session uuid. For claude-code and gemini, both of
+   * which take a self-issued `--session-id`, this fires synchronously before
+   * the CLI has even written its first event — useful for persisting the id
+   * on the run row immediately. For codex it fires later, once the driver
+   * discovers the `thread_id` from the `thread.started` event (codex has no
+   * pre-generation flag). Not invoked at all pre-gemini for codex-shaped
+   * "no comparable session id" cases — every kind now has one.
    */
   onSessionId?: (sessionId: string) => void;
   opts?: AgentRunOptions;
@@ -725,6 +828,38 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       promptText: prompt,
       onChunk,
       onSessionId,
+    });
+  }
+
+  if (harness.kind === "gemini") {
+    if (process.env.AGETOR_GEMINI_DRIVER === "fake") {
+      buildCommand(harness, prompt, opts);
+      // Unlike claude's fake path (which skips onSessionId entirely — see
+      // above), gemini's real spawn always calls onSessionId synchronously,
+      // so the fake preserves that observable contract with a predictable
+      // value tests can assert on (mirrors codex's fake `thread.started`
+      // stand-in, `fake-codex-thread-${taskId}`).
+      const sessionId = opts.resumeSessionId ?? `fake-gemini-session-${taskId}`;
+      onSessionId?.(sessionId);
+      return makeFakeAgent(taskId, prompt, onChunk);
+    }
+    // Pre-generate a session uuid when we're not resuming — mirrors claude's
+    // pattern (`--session-id` up front) rather than codex's discover-later
+    // pattern, even though the tmux HOSTING strategy below (one-shot per
+    // turn, detached session, reattach-while-in-flight) mirrors codex.
+    const sessionId = opts.resumeSessionId ?? crypto.randomUUID();
+    const built = buildCommand(harness, prompt, {
+      ...opts,
+      sessionId: opts.resumeSessionId ? null : sessionId,
+    });
+    onSessionId?.(sessionId);
+    return spawnGeminiViaTmux({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      onChunk,
     });
   }
 

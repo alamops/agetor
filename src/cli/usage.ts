@@ -75,7 +75,8 @@ export const USAGE: Record<string, string> = {
 
   attach: `usage: agetor attach <task-id>
 
-  Attach your terminal to the task's live tmux session (claude-code only).
+  Attach your terminal to the task's live tmux session (all agent kinds;
+  for codex/gemini this only exists while a turn is in flight).
   Detach with Ctrl-b d.`,
 
   shell: `usage: agetor shell <task-id> [--print]

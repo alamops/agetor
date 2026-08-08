@@ -2,8 +2,16 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { checkHarness } from "./agent-status.ts";
 import type { AgentKind, Harness } from "../shared/types.ts";
+
+// agent-status.ts imports `harnesses` from db.ts, which opens its sqlite
+// connection at module-load time — a plain top-level `import` is hoisted
+// ahead of any other code in this file, so AGETOR_DATA_DIR must be set
+// before a *dynamic* import instead (same pattern as harnesses.test.ts).
+// Without this, this file (or whichever file `bun test` loads first) can
+// silently open the real ~/.agetor-dev database.
+process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-db-"));
+const { checkHarness } = await import("./agent-status.ts");
 
 function builtin(kind: AgentKind): Harness {
   return { id: kind, kind, label: kind, isBuiltin: true, home: null, bin: null, env: {}, enabled: true };
@@ -18,6 +26,7 @@ let sandbox: string | null = null;
 beforeEach(() => {
   delete process.env.AGETOR_CODEX_BIN;
   delete process.env.AGETOR_CLAUDE_BIN;
+  delete process.env.AGETOR_GEMINI_BIN;
   delete process.env.AGETOR_TMUX_BIN;
   sandbox = null;
 });
@@ -55,6 +64,23 @@ test("returns available=false with install hint when the bin is missing", async 
   expect(status.path).toBeNull();
   expect(status.reason).toContain("not found on PATH");
   expect(status.installHint).toContain("codex");
+});
+
+test("returns available=true with version for a real gemini binary (no tmux dependency, like codex)", async () => {
+  process.env.AGETOR_GEMINI_BIN = "/bin/echo";
+  const status = await checkAgent("gemini");
+  expect(status.available).toBe(true);
+  expect(status.path).toBe("/bin/echo");
+  expect(status.reason).toBeNull();
+});
+
+test("gemini returns available=false with install hint when the bin is missing", async () => {
+  process.env.AGETOR_GEMINI_BIN = "definitely-not-a-real-binary-xyz123";
+  const status = await checkAgent("gemini");
+  expect(status.available).toBe(false);
+  expect(status.path).toBeNull();
+  expect(status.reason).toContain("not found on PATH");
+  expect(status.installHint).toContain("gemini");
 });
 
 /**

@@ -68,7 +68,7 @@ function makeRun(taskId: string, status: "succeeded" | "running" | "orphaned" | 
     endedAt: status === "running" ? null : Date.now(),
     exitCode: status === "succeeded" ? 0 : status === "failed" ? 1 : null,
     tmuxSession: null,
-    claudeSessionId: null, codexSessionId: null, cursorSessionId: null,
+    claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
   });
   return id;
 }

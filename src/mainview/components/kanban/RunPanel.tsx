@@ -1469,6 +1469,9 @@ function RunPanelBody({
   // whether a live run row has been polled in yet, so Archive shows up as
   // soon as the board would call this task "active" too.
   const active = task.column === "running" || task.column === "blocked";
+  // codex/gemini excluded from the fallback — see the matching comment in
+  // DiffDialog.tsx for why (both technically support taskId-scoped resume,
+  // but this ad-hoc affordance stays claude-only pending a product call).
   const resumableRunId = liveRunId
     ?? (kind === "claude-code" && runs.length > 0 ? runs[0]!.id : null);
   // Send is enabled whenever the task has ever been run. While a turn is

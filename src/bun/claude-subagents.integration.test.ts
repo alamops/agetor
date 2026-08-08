@@ -105,7 +105,7 @@ test.skipIf(!HAVE_REAL)(
     });
     runs.insert({
       id: runId, taskId, agent: "claude-code", status: "succeeded", startedAt: now,
-      endedAt: now, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null,
+      endedAt: now, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
     });
 
     // Lay out a real `<sessionId>/subagents/` tree by copying the genuine

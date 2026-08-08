@@ -1,4 +1,5 @@
 import { test, expect, beforeEach } from "bun:test";
+import type { SQLQueryBindings } from "bun:sqlite";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -138,10 +139,83 @@ test("usage counts running and total tasks referencing the harness", () => {
 test("getByIdOrKind synthesises a built-in row for legacy kind ids without a matching row", () => {
   // Even if a future migration accidentally dropped the seed, legacy
   // `tasks.agent ∈ {"claude-code","codex"}` rows must keep resolving.
-  db.run(`DELETE FROM harnesses WHERE id = ?`, ["claude-code"]);
-  const synth = harnesses.getByIdOrKind("claude-code");
-  expect(synth?.kind).toBe("claude-code");
-  expect(synth?.isBuiltin).toBe(true);
-  // And unknown ids still return null — no silent fallback to a random kind.
-  expect(harnesses.getByIdOrKind("does-not-exist")).toBeNull();
+  //
+  // Deletes a built-in row, which is normally harmless because this file
+  // runs against its own throwaway mkdtemp db (lines 6-10 above) — but that
+  // isolation only protects a db.ts module instance THIS file is the first
+  // to trigger; if some other file `bun test` happens to load earlier
+  // static-imports its way into db.ts first (module instances are cached
+  // per process, and bun test runs every file in one process), this DELETE
+  // runs against whatever db.ts actually opened — which could be the real
+  // ~/.agetor-dev. Capture + restore in `finally` so this test can never
+  // leave a builtin permanently missing even in that case.
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("claude-code");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["claude-code"]);
+    const synth = harnesses.getByIdOrKind("claude-code");
+    expect(synth?.kind).toBe("claude-code");
+    expect(synth?.isBuiltin).toBe(true);
+    // And unknown ids still return null — no silent fallback to a random kind.
+    expect(harnesses.getByIdOrKind("does-not-exist")).toBeNull();
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+test("gemini is a built-in row (carve-out setEnabled toggle works like every other built-in)", () => {
+  // 033_harness_kind_gemini.sql seeds gemini with enabled=0 (mirrors codex's
+  // 016 disabled-by-default rollout) — verified directly against a fresh
+  // migrate() run in the migrations smoke check, not re-asserted here since
+  // this file's beforeEach unconditionally re-enables every built-in for
+  // test isolation (`UPDATE harnesses SET enabled = 1 WHERE is_builtin = 1`),
+  // which would make a "seeds disabled" assertion here just test the
+  // beforeEach, not the migration.
+  const h = harnesses.get("gemini")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("gemini");
+  expect(harnesses.setEnabled("gemini", false).enabled).toBe(false);
+  expect(harnesses.get("gemini")!.enabled).toBe(false);
+  expect(() => harnesses.update("gemini", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'gemini' and round-trips a gemini alias", () => {
+  const inserted = harnesses.insert({
+    id: "gemini-work",
+    kind: "gemini",
+    label: "Gemini (work)",
+    home: "/tmp/agetor-test-gemini-home",
+    bin: null,
+    env: {},
+  });
+  expect(inserted.kind).toBe("gemini");
+  expect(harnesses.get("gemini-work")!.home).toBe("/tmp/agetor-test-gemini-home");
+});
+
+test("getByIdOrKind synthesises a built-in gemini row for legacy id without a matching row", () => {
+  // Same capture/restore rationale as the claude-code version of this test
+  // above — belt-and-braces against this file's isolation being defeated.
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("gemini");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["gemini"]);
+    const synth = harnesses.getByIdOrKind("gemini");
+    expect(synth?.kind).toBe("gemini");
+    expect(synth?.isBuiltin).toBe(true);
+    expect(synth?.label).toBe("Gemini CLI");
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled] as SQLQueryBindings[],
+      );
+    }
+  }
 });

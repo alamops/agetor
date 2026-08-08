@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
@@ -25,7 +26,9 @@ export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
         break;
       }
       case "--agent": patch.agent = val(); break;
-      case "--workdir": patch.workdir = val(); break;
+      // Resolve relative to the CLI's cwd, matching `add`/`projects add` —
+      // the daemon that ultimately runs git ops may have a different cwd.
+      case "--workdir": patch.workdir = path.resolve(val()); break;
       case "--model": patch.model = val(); break;
       case "--mode": patch.mode = val(); break;
       case "--effort": patch.effort = val(); break;

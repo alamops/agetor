@@ -260,6 +260,13 @@ export async function listAvailableCommands(
     // the (currently empty) curated built-ins, no filesystem scanning at all.
     all.push(...builtinCommands(opts.agent));
   }
+  // Gemini intentionally falls through with no discovery yet: it stores
+  // custom commands as `.toml` files under `<geminiDir>/commands/` (verified
+  // in the bundled CLI source), a different format from claude/codex's
+  // markdown-with-frontmatter that `discoverCommands`/`discoverSkills` parse
+  // — reusing them here would silently mis-parse or drop every gemini
+  // command. Left as a documented gap rather than a half-correct TOML
+  // parser; `all` stays empty for gemini until that's built properly.
 
   // Project overrides user on collision so users can shadow a global command
   // with a repo-specific one (same precedence the CLIs use at runtime).
@@ -573,6 +580,11 @@ function discoverMcpAndPluginExtensions(opts: DiscoveryOpts, root: string | null
     // `.cursor/` config format is scanned here; falls through to an empty
     // extension list rather than throwing or silently mislabeling.
   }
+  // Gemini has its own `gemini mcp add/list/remove` surface, so it almost
+  // certainly stores MCP config somewhere under GEMINI_CLI_HOME/`.gemini/` —
+  // not yet reverse-engineered. Same documented-gap treatment as commands
+  // above: falls through with `all` empty rather than guessing at a config
+  // shape and mis-parsing it.
   return all;
 }
 
