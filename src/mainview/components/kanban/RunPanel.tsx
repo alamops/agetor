@@ -2836,7 +2836,17 @@ function RunPanelBody({
                 disabled={sending || backlogBusy}
                 onPick={(text) => {
                   setInput(text);
-                  requestAnimationFrame(() => sendRef.current?.focus());
+                  requestAnimationFrame(() => {
+                    const el = sendRef.current;
+                    if (!el) return;
+                    el.focus();
+                    // Pin the caret to the end of the inserted text — without
+                    // this the textarea keeps its stale prior caret offset,
+                    // which can land inside a `/command` token and pop
+                    // SlashAutocomplete (whose keydown handler then swallows
+                    // the next Enter).
+                    el.setSelectionRange(text.length, text.length);
+                  });
                 }}
                 className="absolute right-1.5 top-1.5 z-10"
               />

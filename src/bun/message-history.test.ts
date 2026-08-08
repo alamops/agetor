@@ -165,20 +165,21 @@ test("excludes non-user streams, subagent rows, and blank/space-only data", asyn
   expect(body.messages.map((m) => m.text)).toEqual(["real user message"]);
 });
 
-test("implementation quirk: SQLite's bare `trim()` strips only ASCII spaces, so tab/newline-only data is NOT excluded", async () => {
-  // `userMessageHistory`'s WHERE clause is `trim(run_events.data) != ''`.
-  // SQLite's single-argument `trim()` only strips 0x20 space characters —
-  // NOT tabs or newlines — so a message consisting solely of "\t\n" survives
-  // the filter. This test pins that actual (surprising) behavior rather than
-  // the "whitespace-only" behavior one might assume from the doc comment;
-  // see the test-run report for the full note.
+test("whitespace-only data (spaces, tabs, newlines, CR) is excluded", async () => {
+  // `userMessageHistory`'s WHERE clause is
+  // `trim(run_events.data, char(32,9,10,13)) != ''` — trimming the explicit
+  // space/tab/newline/CR character set, not SQLite's bare single-argument
+  // `trim()` (which only strips 0x20 spaces). A message consisting solely of
+  // any mix of those four whitespace characters must be excluded.
   const { taskId, runId } = seedTask("claude-code");
   appendUserEvent(runId, "real user message");
   appendUserEvent(runId, "\t\n");
+  appendUserEvent(runId, "\r\r");
+  appendUserEvent(runId, " \t\n\r ");
 
   const res = await authedFetch(`/tasks/${taskId}/messages/history`);
   const body = await res.json() as { messages: Array<{ text: string }> };
-  expect(body.messages.map((m) => m.text).sort()).toEqual(["\t\n", "real user message"].sort());
+  expect(body.messages.map((m) => m.text)).toEqual(["real user message"]);
 });
 
 test("exact-duplicate texts collapse to one entry carrying the newest occurrence's id/ts", async () => {
@@ -240,12 +241,44 @@ test("limit: values above 200 clamp to 200 rather than erroring or returning mor
   expect(body.messages.length).toBe(3);
 });
 
-test("limit: a non-numeric limit 400s with the exact error string", async () => {
-  const { taskId } = seedTask("claude-code");
+test("limit: a non-numeric limit falls back to the default rather than erroring", async () => {
+  const { taskId, runId } = seedTask("claude-code");
+  appendUserEvent(runId, "only message");
+
   const res = await authedFetch(`/tasks/${taskId}/messages/history?limit=not-a-number`);
-  expect(res.status).toBe(400);
-  const body = await res.json();
-  expect(body).toEqual({ error: "invalid limit" });
+  expect(res.status).toBe(200);
+  const body = await res.json() as { messages: Array<{ text: string }> };
+  expect(body.messages.map((m) => m.text)).toEqual(["only message"]);
+});
+
+test("limit: an empty `?limit=` falls back to the default", async () => {
+  const { taskId, runId } = seedTask("claude-code");
+  appendUserEvent(runId, "only message");
+
+  const res = await authedFetch(`/tasks/${taskId}/messages/history?limit=`);
+  expect(res.status).toBe(200);
+  const body = await res.json() as { messages: Array<{ text: string }> };
+  expect(body.messages.map((m) => m.text)).toEqual(["only message"]);
+});
+
+test("limit: `?limit=0` falls back to the default rather than returning zero rows", async () => {
+  const { taskId, runId } = seedTask("claude-code");
+  appendUserEvent(runId, "only message");
+
+  const res = await authedFetch(`/tasks/${taskId}/messages/history?limit=0`);
+  expect(res.status).toBe(200);
+  const body = await res.json() as { messages: Array<{ text: string }> };
+  expect(body.messages.map((m) => m.text)).toEqual(["only message"]);
+});
+
+test("limit: a negative limit falls back to the default", async () => {
+  const { taskId, runId } = seedTask("claude-code");
+  appendUserEvent(runId, "only message");
+
+  const res = await authedFetch(`/tasks/${taskId}/messages/history?limit=-5`);
+  expect(res.status).toBe(200);
+  const body = await res.json() as { messages: Array<{ text: string }> };
+  expect(body.messages.map((m) => m.text)).toEqual(["only message"]);
 });
 
 test("response shape: { messages: [{ id, text, ts, taskId, taskTitle }] } mirroring run_events.data and the correct task title", async () => {

@@ -70,7 +70,7 @@ Wave 1 = {A, B} (disjoint files). Wave 2 = {C}.
 - New route is purely additive; no schema migration needed (read-only query over existing tables).
 - RunPanel composer edit risks: draft-autosave interplay (setInput flips pristine — same as typing, acceptable); Escape layering (must set `data-popover-open`); no-remount task switch (picker resets on taskId); tray-clipping gotcha does not apply (popover is absolutely positioned, not a capped tray).
 - Cross-task data exposure: none — single-user local app, API already token-gated.
-- Perf: no index on `run_events.stream`; query scans events of matching tasks only via `idx_runs_task`; acceptable at local-app scale (same class as existing eventsForTask), revisit with an index if slow.
+- Perf: review's EXPLAIN QUERY PLAN showed the original query full-scanned `run_events` (the `idx_runs_task` assumption did not hold — the plan drives from `run_events`, not `runs`). Fixed in Phase 8 with migration `035_run_events_user_history.sql` (partial covering index on `(stream, id DESC) WHERE subagent_id IS NULL`); verified the query now uses it.
 
 ## 8. Open questions / assumptions (autonomous mode — owner to audit)
 

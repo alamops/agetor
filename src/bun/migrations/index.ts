@@ -43,6 +43,7 @@ import m031 from "./031_task_pr_url.sql" with { type: "text" };
 import m032 from "./032_cursor_harness.sql" with { type: "text" };
 import m033 from "./033_cursor_session_id.sql" with { type: "text" };
 import m034 from "./034_task_fast.sql" with { type: "text" };
+import m035 from "./035_run_events_user_history.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -81,4 +82,5 @@ export const migrations: Migration[] = [
   { id: "032_cursor_harness", sql: m032, aliases: ["024_cursor_harness"] },
   { id: "033_cursor_session_id", sql: m033, aliases: ["025_cursor_session_id"] },
   { id: "034_task_fast", sql: m034 },
+  { id: "035_run_events_user_history", sql: m035 },
 ];

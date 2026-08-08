@@ -4370,12 +4370,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const url = new URL(req.url);
-          const limitParam = url.searchParams.get("limit");
-          const limitRaw = limitParam === null ? 50 : Number(limitParam);
-          if (!Number.isFinite(limitRaw)) {
-            return json({ error: "invalid limit" }, { status: 400, headers: corsHeaders(req) });
-          }
-          const limit = Math.max(1, Math.min(Math.floor(limitRaw), 200));
+          const limitRaw = Number(url.searchParams.get("limit"));
+          const limit = Number.isFinite(limitRaw) && limitRaw > 0
+            ? Math.max(1, Math.min(Math.floor(limitRaw), 200))
+            : 50;
           const harness = harnesses.getByIdOrKind(task.agent);
           const agentIds = harness
             ? Array.from(new Set([harness.kind, ...harnesses.list().filter((h) => h.kind === harness.kind).map((h) => h.id)]))

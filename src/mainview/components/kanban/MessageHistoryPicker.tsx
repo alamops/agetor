@@ -2,7 +2,15 @@ import { useEffect, useRef, useState } from "react";
 import { History } from "lucide-react";
 import { api, type SentMessageItem } from "@/lib/api";
 import { parseUserMessage, splitReferences } from "@/lib/command-message";
+import { canonicalizeAttachmentText } from "../../../shared/attachments.ts";
 import { cn } from "@/lib/utils";
+
+/** Server-side fetch clamp is 200 (see `api.fetchMessageHistory`); the list
+ *  itself displays only the most recent `DISPLAY_LIMIT` after cleaning, since
+ *  dedup/empty/command-output filtering can otherwise silently under-fill a
+ *  server-LIMIT-50 fetch. */
+const DISPLAY_LIMIT = 50;
+const FETCH_LIMIT = 200;
 
 interface Props {
   taskId: string;
@@ -19,12 +27,18 @@ interface CleanedItem {
 }
 
 /** Reduce a raw sent-message payload to display text: normalize CR newlines,
- *  unwrap a slash-command XML expansion back to its plain "/cmd args" echo
- *  (same shape `parseUserMessage`/`canonicalizeUserText` use elsewhere for
- *  the run stream), then strip a trailing "Referenced files" block via the
- *  shared splitter so its heading text never gets re-typed here. */
+ *  canonicalize the image-attachment twin shapes (shared with
+ *  `eventDedupKey` in `lib/event-dedup.ts`) BEFORE parsing so an
+ *  image-attached send's live copy and its JSONL twin — which otherwise
+ *  diverge via a `[Image #N]` prefix and a blanked reference-bullet path —
+ *  reduce to identical text and collapse under the caller's dedup-by-text
+ *  loop, then unwrap a slash-command XML expansion back to its plain
+ *  "/cmd args" echo (same shape `parseUserMessage`/`canonicalizeUserText`
+ *  use elsewhere for the run stream), then strip a trailing "Referenced
+ *  files" block via the shared splitter so its heading text never gets
+ *  re-typed here. */
 function cleanMessageText(raw: string): string {
-  const text = raw.replace(/\r\n?/g, "\n");
+  const text = canonicalizeAttachmentText(raw.replace(/\r\n?/g, "\n"));
   const parsed = parseUserMessage(text);
   let display: string;
   if (parsed?.kind === "command") {
@@ -34,7 +48,9 @@ function cleanMessageText(raw: string): string {
     return display.trim();
   }
   if (parsed?.kind === "command-output") {
-    return parsed.output.trim();
+    // Local-command stdout is not a user-authored message — drop it (the
+    // caller's `if (!text) continue` filter relies on the empty string).
+    return "";
   }
   const { args } = splitReferences(text);
   return args.trim();
@@ -94,12 +110,23 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
     };
   }, [open]);
 
+  // Refetch on every open — no items-cache guard. A previous version bailed
+  // once `items !== null`, which fetched the list once per task selection
+  // and never refreshed, so messages sent after the first open never showed
+  // up. Previous items are left in place while the refetch is in flight (no
+  // clearing here) purely to avoid a loading flicker; fresh data replaces
+  // them once the fetch lands.
   useEffect(() => {
-    if (!open || items !== null) return;
+    if (!open) return;
     let cancelled = false;
+    // Reset at effect start (not just in `.finally`) so a fetch cancelled
+    // mid-flight (e.g. the popover closes and reopens before the previous
+    // fetch resolves) can never leave `loading` stuck true — the next open
+    // always gets its own fresh `true`→settle cycle regardless of how the
+    // prior one ended.
     setLoading(true);
     setError(null);
-    api.fetchMessageHistory(taskId)
+    api.fetchMessageHistory(taskId, FETCH_LIMIT)
       .then((res: { messages: SentMessageItem[] }) => {
         if (cancelled) return;
         const seen = new Set<string>();
@@ -111,7 +138,11 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
           seen.add(text);
           cleaned.push({ key: String(m.id), text, ts: m.ts, taskTitle: m.taskTitle });
         }
-        setItems(cleaned);
+        // Cap AFTER cleaning/dedup — the server's own LIMIT (FETCH_LIMIT) is
+        // taken before dedup/empty/command-output filtering can drop rows,
+        // so capping the raw response at DISPLAY_LIMIT would silently
+        // under-fill the list.
+        setItems(cleaned.slice(0, DISPLAY_LIMIT));
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -121,7 +152,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [open, items, taskId]);
+  }, [open, taskId]);
 
   return (
     <div ref={rootRef} className={cn("relative", className)}>
@@ -130,6 +161,9 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
         title="Insert a past message"
+        aria-label="Insert a past message"
+        aria-haspopup="listbox"
+        aria-expanded={open}
         className={cn(
           "inline-flex items-center justify-center rounded-md p-1 text-muted-foreground",
           "hover:bg-accent hover:text-foreground disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-muted-foreground",
@@ -144,7 +178,12 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
           // Marker for RunPanel's global Escape handler so it yields to this
           // popover instead of closing the whole panel underneath it.
           data-popover-open=""
-          className="absolute bottom-full right-0 z-50 mb-1 w-80 max-h-64 overflow-y-auto rounded-md border border-border bg-popover text-popover-foreground shadow-xl"
+          // This repo defines no `bg-popover`/`text-popover-foreground`
+          // tokens (see tailwind.config.js / index.css) — those classes emit
+          // no CSS and rendered the dropdown transparent. `bg-card` /
+          // `text-card-foreground` is the actual popover convention used
+          // elsewhere (see search-select.tsx).
+          className="absolute bottom-full right-0 z-50 mb-1 w-80 max-h-64 overflow-y-auto rounded-md border border-border bg-card text-card-foreground shadow-xl"
         >
           {loading && (
             <p className="px-3 py-2 text-xs text-muted-foreground">Loading…</p>
@@ -158,9 +197,9 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
             </p>
           )}
           {!loading && !error && items !== null && items.length > 0 && (
-            <ul className="py-1">
+            <ul className="py-1" role="listbox">
               {items.map((item) => (
-                <li key={item.key}>
+                <li key={item.key} role="option" aria-selected={false}>
                   <button
                     type="button"
                     onClick={() => {

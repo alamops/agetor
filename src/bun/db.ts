@@ -837,7 +837,7 @@ export const runs = {
        JOIN tasks ON tasks.id = runs.task_id
        WHERE run_events.stream = 'user'
          AND run_events.subagent_id IS NULL
-         AND trim(run_events.data) != ''
+         AND trim(run_events.data, char(32,9,10,13)) != ''
          AND tasks.agent IN (${placeholders})
        GROUP BY run_events.data
        ORDER BY id DESC
