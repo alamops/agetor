@@ -3287,6 +3287,16 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
             {loading ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
           </Button>
           )}
+          <Button
+            variant="ghost"
+            size="icon"
+            title="Close"
+            aria-label="Close"
+            disabled={isComposeView && (newPullSubmitting || newIssueSubmitting)}
+            onClick={onClose}
+          >
+            <X className="size-4" />
+          </Button>
         </div>
       </header>
 
