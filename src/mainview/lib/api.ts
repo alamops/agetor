@@ -325,6 +325,19 @@ export interface TaskEventsPage {
   hasMore: boolean;
 }
 
+/** One previously-sent message, as returned by
+ *  `GET /tasks/:id/messages/history` — drives `MessageHistoryPicker`. Newest
+ *  first, already coarsely deduped server-side (client still re-dedups after
+ *  its own slash-command-XML/refs-block cleaning — see that component). */
+export interface SentMessageItem {
+  id: number;
+  text: string;
+  ts: number;
+  taskId: string;
+  taskTitle: string;
+  project: string;
+}
+
 export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
 export interface HarnessInput {
   id: string;
@@ -1158,6 +1171,12 @@ export const api = {
     const q = new URLSearchParams({ beforeId: String(beforeId) });
     if (limit) q.set("limit", String(limit));
     return j<TaskEventsPage>(`/tasks/${taskId}/events/page?${q.toString()}`);
+  },
+  /** Past sent messages for a task, newest first — backs
+   *  `MessageHistoryPicker`'s "insert a past message" dropdown. */
+  fetchMessageHistory: (taskId: string, limit?: number) => {
+    const q = limit ? `?${new URLSearchParams({ limit: String(limit) }).toString()}` : "";
+    return j<{ messages: SentMessageItem[] }>(`/tasks/${taskId}/messages/history${q}`);
   },
   /** Background/sub agents tracked for a task — drives the run panel's
    *  read-only per-subagent tab strip. Polled like `listRuns`; live deltas

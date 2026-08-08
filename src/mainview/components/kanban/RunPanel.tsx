@@ -67,6 +67,7 @@ import {
 } from "./ReferencesPicker";
 import { spliceAtSelection, readCaret, restoreCaret } from "@/lib/textarea-insert";
 import { SlashAutocomplete } from "./SlashAutocomplete";
+import { MessageHistoryPicker } from "./MessageHistoryPicker";
 import { ExtensionPicker } from "./ExtensionPicker";
 import { TerminalView } from "./TerminalView";
 import { deriveTodoProgress } from "@/lib/todo-progress";
@@ -2818,7 +2819,7 @@ function RunPanelBody({
                 // `canSend` / `modalPending` guards inside `send()` — so a
                 // keystroke can never leak into a live tmux modal.
                 disabled={sending || backlogBusy}
-                className="h-16 min-h-0 w-full resize-none text-xs"
+                className="h-16 min-h-0 w-full resize-none text-xs pr-8"
               />
               <SlashAutocomplete
                 commands={sendCommands}
@@ -2829,6 +2830,29 @@ function RunPanelBody({
                 // the popover above the textarea so it doesn't render below
                 // the visible window.
                 placement="above"
+              />
+              <MessageHistoryPicker
+                taskId={task.id}
+                // Deliberately mirrors the textarea's own disabled condition
+                // (not `!canSend`/`modalPending`) — composing is decoupled
+                // from sending, so the history trigger stays usable before
+                // the first run and while a native prompt is pending.
+                disabled={sending || backlogBusy}
+                onPick={(text) => {
+                  setInput(text);
+                  requestAnimationFrame(() => {
+                    const el = sendRef.current;
+                    if (!el) return;
+                    el.focus();
+                    // Pin the caret to the end of the inserted text — without
+                    // this the textarea keeps its stale prior caret offset,
+                    // which can land inside a `/command` token and pop
+                    // SlashAutocomplete (whose keydown handler then swallows
+                    // the next Enter).
+                    el.setSelectionRange(text.length, text.length);
+                  });
+                }}
+                className="absolute right-1.5 top-1.5 z-10"
               />
             </div>
             <Button
