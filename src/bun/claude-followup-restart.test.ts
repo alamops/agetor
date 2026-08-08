@@ -104,6 +104,7 @@ test.skipIf(!HAVE_TMUX)("follow-up to a task whose session outlived the process 
       workdir,
       isolation: "none",
       taskType: "task",
+      fast: false,
       branch: null,
       branchSource: "created",
       worktreePath: null,
