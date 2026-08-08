@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, ArrowDown, ArrowUp, FolderGit2, Loader2, RefreshCw, Search, Trash2 } from "lucide-react";
+import { AlertCircle, ArrowDown, ArrowUp, FolderGit2, Loader2, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
@@ -389,8 +389,8 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
           >
             {refreshing ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
           </Button>
-          <Button size="sm" variant="outline" onClick={onClose}>
-            Close
+          <Button variant="ghost" size="icon" title="Close" aria-label="Close" onClick={onClose}>
+            <X className="size-4" />
           </Button>
         </div>
       </header>
