@@ -902,7 +902,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
         ? { codexSessionId: sessionId }
         : { cursorSessionId: sessionId });
     },
-    opts: { mode: task.mode, model: task.model, effort: task.effort, fast: task.fast },
+    opts: { mode: task.mode, model: task.model, effort: task.effort, fast: task.fast, maxMode: task.maxMode },
   });
   registerActiveRun(runId, taskId, task, agent);
   emit({
@@ -1186,7 +1186,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     // alias swaps keep the picks — those ids stay valid.
     if (afterKind && beforeKind !== afterKind) {
       const nextMode = AGENT_OPTIONS[afterKind].modes[0]?.id ?? "auto";
-      tasks.update(taskId, { mode: nextMode, model: null, effort: null, fast: false });
+      tasks.update(taskId, { mode: nextMode, model: null, effort: null, fast: false, maxMode: false });
     }
     return;
   }
@@ -1539,6 +1539,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
       model: task.model,
       effort: task.effort,
       fast: task.fast,
+      maxMode: task.maxMode,
       resumeSessionId: priorThreadId,
     },
   });
@@ -1683,6 +1684,7 @@ function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
       model: task.model,
       effort: task.effort,
       fast: task.fast,
+      maxMode: task.maxMode,
       // Same generic resume-session field claude-code and codex already
       // thread through `spawnAgent` → `buildCommand` — cursor's `session_id`
       // rides the same `AgentRunOptions.resumeSessionId` contract rather than
@@ -1981,6 +1983,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
       model: task.model,
       effort: task.effort,
       fast: task.fast,
+      maxMode: task.maxMode,
       resumeSessionId: priorSessionId,
     },
   });
@@ -2178,6 +2181,7 @@ export async function createTask(
     model,
     effort,
     fast: input.fast === true,
+    maxMode: input.maxMode === true,
     references: input.references ?? [],
     // Brand-new tasks start with an empty backlog; drafts are added later from
     // the run panel.

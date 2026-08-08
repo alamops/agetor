@@ -294,7 +294,7 @@ function authed<F extends (req: any) => Response | Promise<Response>>(fn: F): F 
 
 /** Fields callers may patch on a task. Everything else is server-managed. */
 const ALLOWED_PATCH_FIELDS = new Set<keyof Task>([
-  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "fast", "taskType",
+  "title", "prompt", "agent", "workdir", "column", "mode", "model", "effort", "fast", "maxMode", "taskType",
 ]);
 
 /** The 8 reaction contents GitHub's API accepts — validated here before the
@@ -308,6 +308,10 @@ function filterPatch(raw: unknown): Partial<Task> {
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     if (k === "fast") {
       patch.fast = v === true;
+      continue;
+    }
+    if (k === "maxMode") {
+      patch.maxMode = v === true;
       continue;
     }
     if (ALLOWED_PATCH_FIELDS.has(k as keyof Task)) (patch as Record<string, unknown>)[k] = v;

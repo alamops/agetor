@@ -5,6 +5,7 @@ import {
   DEFAULT_MODEL,
   cursorModelArg,
   cursorModelSupportsFast,
+  cursorModelSupportsMaxMode,
   supportedEfforts,
   supportedModes,
 } from "../shared/types.ts";
@@ -137,6 +138,7 @@ test("cursor model catalog includes the screenshot/default surface", () => {
   expect(ids).toContain("cursor-grok-4.5");
   expect(ids).toContain("composer-2.5");
   expect(ids).toContain("claude-opus-5");
+  expect(ids).toContain("claude-opus-4-7");
   expect(ids).toContain("gpt-5.6-sol");
   expect(ids).toContain("gpt-5.6-terra");
   expect(ids).toContain("gemini-3.1-pro");
@@ -174,10 +176,20 @@ test("cursor fast support is model and effort specific", () => {
   expect(cursorModelSupportsFast("claude-sonnet-5", "max")).toBe(false);
 });
 
+test("cursor Max Mode support is a context-level model capability", () => {
+  expect(cursorModelSupportsMaxMode("gpt-5.6-sol")).toBe(true);
+  expect(cursorModelSupportsMaxMode("claude-opus-4-8")).toBe(true);
+  expect(cursorModelSupportsMaxMode("claude-opus-4-7")).toBe(true);
+  expect(cursorModelSupportsMaxMode("composer-2.5")).toBe(false);
+  expect(cursorModelSupportsMaxMode("auto")).toBe(false);
+});
+
 test("cursorModelArg composes known model, effort, and fast variants", () => {
   expect(cursorModelArg("gpt-5.5", "xhigh", false)).toBe("gpt-5.5-extra-high");
   expect(cursorModelArg("gpt-5.5", "xhigh", true)).toBe("gpt-5.5-extra-high-fast");
   expect(cursorModelArg("composer-2.5", null, true)).toBe("composer-2.5-fast");
+  expect(cursorModelArg("gpt-5.6-sol", "high", true, true)).toBe("gpt-5.6-sol[context=1m,effort=high,fast=true]");
+  expect(cursorModelArg("gpt-5.6-sol", "high", false, true)).toBe("gpt-5.6-sol[context=1m,effort=high,fast=false]");
   expect(cursorModelArg("unknown-model", "max", true)).toBe("unknown-model");
 });
 

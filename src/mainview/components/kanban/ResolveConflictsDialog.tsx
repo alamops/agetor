@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, GitMerge, Loader2 } from "lucide-react";
+import { AlertCircle, GitMerge, Loader2, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
@@ -235,6 +235,17 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
             </div>
           )}
         </div>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="shrink-0"
+          title="Close"
+          aria-label="Close"
+          disabled={submitting}
+          onClick={onClose}
+        >
+          <X className="size-4" />
+        </Button>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3 text-xs">

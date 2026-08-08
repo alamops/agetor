@@ -56,6 +56,8 @@ export interface AgentRunOptions {
   effort?: string | null;
   /** Fast model variant toggle. Currently consumed by cursor only. */
   fast?: boolean | null;
+  /** Cursor Max Mode / large-context toggle. Currently consumed by cursor only. */
+  maxMode?: boolean | null;
   /**
    * Existing session id to resume a prior conversation on a follow-up turn.
    * For claude-code: the JSONL session uuid, resumed via `claude --resume
@@ -357,7 +359,10 @@ export function buildCommand(
     const mode = opts.mode ?? "auto";
     if (mode === "bypass") {
       args.push("--dangerously-skip-permissions");
-    } else if (mode !== "ask") {
+    } else {
+      // `ask` must be EXPLICIT: omitting the flag inherits the user-level
+      // `defaultMode` (e.g. `auto` in ~/.claude/settings.json), silently
+      // running the task in a looser mode than the one stored on it.
       args.push("--permission-mode", toClaudeModeString(mode));
     }
 
@@ -421,7 +426,7 @@ export function buildCommand(
     }
     // Cursor exposes thinking level and Fast as model variants. Curated base
     // model ids are composed here; unknown/discovered ids pass through.
-    args.push("--model", cursorModelArg(opts.model, opts.effort ?? null, opts.fast === true));
+    args.push("--model", cursorModelArg(opts.model, opts.effort ?? null, opts.fast === true, opts.maxMode === true));
 
     // Mode → auto-execute posture. `auto` (also the null default, per house
     // convention) runs with --force --sandbox disabled so cursor executes
