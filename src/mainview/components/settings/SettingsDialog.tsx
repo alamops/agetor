@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, Plus, Terminal, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError, api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
@@ -13,12 +13,6 @@ import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
-  HARNESS_TEMPLATES,
-  type AgentKind,
-  type Harness,
-  type HarnessTemplate,
-} from "../../../shared/types.ts";
-import {
   SETTINGS_SECTIONS,
   activeSection,
   backFromSubview,
@@ -29,6 +23,12 @@ import {
   resolveEscape,
   type SettingsView,
 } from "@/lib/settings-dialog-view";
+import {
+  HARNESS_TEMPLATES,
+  type AgentKind,
+  type Harness,
+  type HarnessTemplate,
+} from "../../../shared/types.ts";
 
 interface Props {
   open: boolean;
@@ -174,6 +174,11 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
   const [tmuxSource, setTmuxSource] = useState<"system" | "bundled">("system");
   const [bundledTmuxAvailable, setBundledTmuxAvailable] = useState(false);
   const [view, setView] = useState<SettingsView>(initialView());
+  // Mirrors `view` for use inside async callbacks (e.g. the Editor's
+  // onSubmit) so they can tell, after an await, whether the user navigated
+  // away in the meantime — see Fix 3 in the settings-sidebar review.
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   // Optimistic toggle map: harness id → the value the user *clicked toward*.
@@ -390,62 +395,94 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
       </div>
 
       <div className="flex min-h-0 flex-1">
-        <nav className="w-44 shrink-0 overflow-y-auto border-r border-border/60 p-2">
-          {SETTINGS_SECTIONS.map((s) => (
-            <Button
-              key={s.id}
-              size="sm"
-              variant={currentSection === s.id ? "secondary" : "ghost"}
-              className="w-full justify-start"
-              aria-current={currentSection === s.id ? "true" : undefined}
-              onClick={() => setView(openSection(s.id))}
-            >
-              {s.label}
-            </Button>
-          ))}
+        <nav
+          aria-label="Settings sections"
+          className="flex w-44 shrink-0 flex-col gap-1 overflow-y-auto border-r border-border/60 p-2"
+        >
+          {SETTINGS_SECTIONS.map((s) => {
+            const active = currentSection === s.id;
+            return (
+              <Button
+                key={s.id}
+                size="sm"
+                variant={active ? "secondary" : "ghost"}
+                className="w-full justify-start"
+                aria-current={active ? "page" : undefined}
+                onClick={() => setView(openSection(s.id))}
+              >
+                {s.label}
+              </Button>
+            );
+          })}
         </nav>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4 pt-0">
-          {view.kind === "section" && view.section === "general" && (
-            <GeneralSection
-              defaultHarness={defaultHarness}
-              payload={payload}
-              onPickDefault={onPickDefault}
-              tmuxSource={tmuxSource}
-              bundledTmuxAvailable={bundledTmuxAvailable}
-              onPickTmuxSource={onPickTmuxSource}
-            />
-          )}
-
-          {view.kind === "section" && view.section === "harnesses" && (
-            <HarnessesSection
-              payload={payload}
-              statusByHarness={statusByHarness}
-              homeDir={homeDir}
-              canAdd={!!dataDir}
-              onAdd={() => setView(openTemplates())}
-              onEdit={(h) =>
-                setView(
-                  openEditor(h.id, {
-                    id: "__edit",
-                    label: h.label,
-                    description: "",
-                    kind: h.kind,
-                    suggestedHarnessId: h.id,
-                    home: h.home,
-                    bin: h.bin,
-                    env: h.env,
-                  }),
-                )
+          {view.kind === "section" &&
+            (() => {
+              switch (view.section) {
+                case "general":
+                  return (
+                    <GeneralSection
+                      defaultHarness={defaultHarness}
+                      payload={payload}
+                      onPickDefault={onPickDefault}
+                      tmuxSource={tmuxSource}
+                      bundledTmuxAvailable={bundledTmuxAvailable}
+                      onPickTmuxSource={onPickTmuxSource}
+                    />
+                  );
+                case "harnesses":
+                  return (
+                    <HarnessesSection
+                      payload={payload}
+                      statusByHarness={statusByHarness}
+                      homeDir={homeDir}
+                      canAdd={!!dataDir}
+                      onAdd={() => setView(openTemplates())}
+                      onEdit={(h) =>
+                        setView(
+                          openEditor(h.id, {
+                            id: "__edit",
+                            label: h.label,
+                            description: "",
+                            kind: h.kind,
+                            suggestedHarnessId: h.id,
+                            home: h.home,
+                            bin: h.bin,
+                            env: h.env,
+                          }),
+                        )
+                      }
+                      onDelete={onDeleteHarness}
+                      onToggleEnabled={onToggleEnabled}
+                      onOpenTerminal={onOpenTerminal}
+                      pendingToggle={pendingToggle}
+                    />
+                  );
+                case "git":
+                  // Rendered by the always-mounted div below instead.
+                  return null;
+                default: {
+                  const _exhaustive: never = view.section;
+                  void _exhaustive;
+                  return null;
+                }
               }
-              onDelete={onDeleteHarness}
-              onToggleEnabled={onToggleEnabled}
-              onOpenTerminal={onOpenTerminal}
-              pendingToggle={pendingToggle}
-            />
-          )}
+            })()}
 
-          {view.kind === "section" && view.section === "git" && <GitHubTokensSection />}
+          {/* Kept mounted regardless of the active section (unlike the
+              switch above) so an unsaved host/label/token draft in
+              GitHubTokensSection survives switching sections — matches the
+              pre-sidebar flat-layout lifetime, where this pane never
+              unmounted while the dialog was open. */}
+          <div
+            className={cn(
+              "space-y-4 pt-3 text-sm",
+              !(view.kind === "section" && view.section === "git") && "hidden",
+            )}
+          >
+            <GitHubTokensSection />
+          </div>
 
           {view.kind === "templates" && (
             <TemplatePicker
@@ -479,9 +516,23 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
                   }
                   await refresh();
                   onChange?.();
-                  setView(backFromSubview());
+                  // The user may have navigated away (rail click, Escape-pop)
+                  // while this round-trip was in flight — only pop the view
+                  // if the Editor is still the one showing.
+                  if (viewRef.current.kind === "editor") setView(backFromSubview());
                 } catch (e) {
-                  setFormError(e instanceof Error ? e.message : String(e));
+                  const message = e instanceof Error ? e.message : String(e);
+                  if (viewRef.current.kind === "editor") {
+                    setFormError(message);
+                  } else {
+                    // Editor is unmounted — setFormError would target nothing
+                    // and the failure would be silent. Surface it as a toast
+                    // instead, mirroring the delete-failure toast above.
+                    toast.error("Couldn't save harness", {
+                      description: message,
+                      duration: Infinity,
+                    });
+                  }
                 } finally {
                   setBusy(false);
                 }

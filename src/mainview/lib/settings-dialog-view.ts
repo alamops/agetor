@@ -57,7 +57,17 @@ export function backFromSubview(): SettingsView {
  * entry of their own, so they highlight Harnesses.
  */
 export function activeSection(view: SettingsView): SettingsSectionId {
-  return view.kind === "section" ? view.section : "harnesses";
+  switch (view.kind) {
+    case "section":
+      return view.section;
+    case "templates":
+    case "editor":
+      return "harnesses";
+    default: {
+      const _exhaustive: never = view;
+      return _exhaustive;
+    }
+  }
 }
 
 /**
@@ -66,5 +76,15 @@ export function activeSection(view: SettingsView): SettingsSectionId {
  * a section view closes the modal — templates/editor pop first.
  */
 export function resolveEscape(view: SettingsView): "pop" | "close" {
-  return view.kind === "section" ? "close" : "pop";
+  switch (view.kind) {
+    case "section":
+      return "close";
+    case "templates":
+    case "editor":
+      return "pop";
+    default: {
+      const _exhaustive: never = view;
+      return _exhaustive;
+    }
+  }
 }
