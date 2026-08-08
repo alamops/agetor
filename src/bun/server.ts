@@ -4362,6 +4362,36 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      "/tasks/:id/messages/history": {
+        GET: authed((req) => {
+          const taskId = req.params.id;
+          const task = tasks.get(taskId);
+          if (!task) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const url = new URL(req.url);
+          const limitParam = url.searchParams.get("limit");
+          const limitRaw = limitParam === null ? 50 : Number(limitParam);
+          if (!Number.isFinite(limitRaw)) {
+            return json({ error: "invalid limit" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const limit = Math.max(1, Math.min(Math.floor(limitRaw), 200));
+          const harness = harnesses.getByIdOrKind(task.agent);
+          const agentIds = harness
+            ? Array.from(new Set([harness.kind, ...harnesses.list().filter((h) => h.kind === harness.kind).map((h) => h.id)]))
+            : [task.agent];
+          const rows = runs.userMessageHistory(agentIds, limit);
+          const messages = rows.map((row) => ({
+            id: row.id,
+            text: row.data,
+            ts: row.ts,
+            taskId: row.taskId,
+            taskTitle: row.taskTitle,
+          }));
+          return json({ messages }, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/events": authed((req) => {
         const taskId = req.params.id;
         const stream = new ReadableStream({
