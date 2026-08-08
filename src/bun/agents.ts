@@ -359,7 +359,10 @@ export function buildCommand(
     const mode = opts.mode ?? "auto";
     if (mode === "bypass") {
       args.push("--dangerously-skip-permissions");
-    } else if (mode !== "ask") {
+    } else {
+      // `ask` must be EXPLICIT: omitting the flag inherits the user-level
+      // `defaultMode` (e.g. `auto` in ~/.claude/settings.json), silently
+      // running the task in a looser mode than the one stored on it.
       args.push("--permission-mode", toClaudeModeString(mode));
     }
 

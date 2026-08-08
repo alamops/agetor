@@ -250,9 +250,14 @@ test("claude-code 'plan' mode emits --permission-mode plan", () => {
   expect(cmd).not.toContain("--print");
 });
 
-test("claude-code 'ask' mode emits no permission flag", () => {
+test("claude-code 'ask' mode emits an EXPLICIT --permission-mode default", () => {
+  // Omitting the flag would inherit the user-level `defaultMode` from
+  // ~/.claude/settings.json (e.g. `auto`), silently running the task in a
+  // looser mode than the one stored on it.
   const { cmd } = buildCommand(builtin("claude-code"), "p", { ...claudeDefaults, mode: "ask" });
-  expect(cmd).not.toContain("--permission-mode");
+  const i = cmd.indexOf("--permission-mode");
+  expect(i).toBeGreaterThan(-1);
+  expect(cmd[i + 1]).toBe("default");
   expect(cmd).not.toContain("--dangerously-skip-permissions");
   expect(cmd).not.toContain("--print");
 });
