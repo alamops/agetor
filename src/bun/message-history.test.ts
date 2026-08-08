@@ -44,6 +44,7 @@ afterEach(async () => {
   db.run(`DELETE FROM runs`);
   db.run(`DELETE FROM tasks`);
   db.run(`DELETE FROM harnesses WHERE is_builtin = 0`);
+  db.run(`DELETE FROM projects`);
 });
 
 const BASE = () => `http://127.0.0.1:${server.port}`;
@@ -281,7 +282,7 @@ test("limit: a negative limit falls back to the default", async () => {
   expect(body.messages.map((m) => m.text)).toEqual(["only message"]);
 });
 
-test("response shape: { messages: [{ id, text, ts, taskId, taskTitle }] } mirroring run_events.data and the correct task title", async () => {
+test("response shape: { messages: [{ id, text, ts, taskId, taskTitle, project }] } mirroring run_events.data and the correct task title", async () => {
   const { taskId, runId } = seedTask("claude-code", { title: "My Special Task Title" });
   appendUserEvent(runId, "shape check message");
 
@@ -289,12 +290,29 @@ test("response shape: { messages: [{ id, text, ts, taskId, taskTitle }] } mirror
   const body = await res.json() as { messages: Array<Record<string, unknown>> };
   expect(body.messages.length).toBe(1);
   const msg = body.messages[0]!;
-  expect(Object.keys(msg).sort()).toEqual(["id", "taskId", "taskTitle", "text", "ts"]);
+  expect(Object.keys(msg).sort()).toEqual(["id", "project", "taskId", "taskTitle", "text", "ts"]);
   expect(typeof msg.id).toBe("number");
   expect(msg.text).toBe("shape check message");
   expect(typeof msg.ts).toBe("number");
   expect(msg.taskId).toBe(taskId);
   expect(msg.taskTitle).toBe("My Special Task Title");
+});
+
+test("project: registered projects row supplies the name; unregistered workdirs fall back to the path basename", async () => {
+  db.run(
+    `INSERT INTO projects (path, name, added_at) VALUES (?, ?, ?)`,
+    ["/Users/someone/code/acme-app", "Acme App", Date.now()],
+  );
+  const registered = seedTask("claude-code", { workdir: "/Users/someone/code/acme-app" });
+  appendUserEvent(registered.runId, "from registered project");
+  const unregistered = seedTask("claude-code", { workdir: "/Users/someone/code/side-project/" });
+  appendUserEvent(unregistered.runId, "from unregistered workdir");
+
+  const res = await authedFetch(`/tasks/${registered.taskId}/messages/history`);
+  const body = await res.json() as { messages: Array<{ text: string; project: string }> };
+  const byText = new Map(body.messages.map((m) => [m.text, m.project]));
+  expect(byText.get("from registered project")).toBe("Acme App");
+  expect(byText.get("from unregistered workdir")).toBe("side-project");
 });
 
 test("404 for an unknown task id", async () => {

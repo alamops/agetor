@@ -826,15 +826,17 @@ export const runs = {
   userMessageHistory(
     agentIds: string[],
     limit: number,
-  ): Array<{ id: number; data: string; ts: number; taskId: string; taskTitle: string }> {
+  ): Array<{ id: number; data: string; ts: number; taskId: string; taskTitle: string; taskWorkdir: string; projectName: string | null }> {
     if (agentIds.length === 0) return [];
-    type Row = { id: number; data: string; ts: number; taskId: string; taskTitle: string };
+    type Row = { id: number; data: string; ts: number; taskId: string; taskTitle: string; taskWorkdir: string; projectName: string | null };
     const placeholders = agentIds.map(() => "?").join(", ");
     return db.query<Row, Array<string | number>>(
-      `SELECT MAX(run_events.id) as id, run_events.data as data, ts, tasks.id as taskId, tasks.title as taskTitle
+      `SELECT MAX(run_events.id) as id, run_events.data as data, ts, tasks.id as taskId, tasks.title as taskTitle,
+              tasks.workdir as taskWorkdir, projects.name as projectName
        FROM run_events
        JOIN runs ON runs.id = run_events.run_id
        JOIN tasks ON tasks.id = runs.task_id
+       LEFT JOIN projects ON projects.path = tasks.workdir
        WHERE run_events.stream = 'user'
          AND run_events.subagent_id IS NULL
          AND trim(run_events.data, char(32,9,10,13)) != ''

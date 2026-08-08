@@ -4385,6 +4385,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             ts: row.ts,
             taskId: row.taskId,
             taskTitle: row.taskTitle,
+            project: row.projectName ?? (row.taskWorkdir.split("/").filter(Boolean).pop() ?? row.taskWorkdir),
           }));
           return json({ messages }, { headers: corsHeaders(req) });
         }),

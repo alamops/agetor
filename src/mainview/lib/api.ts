@@ -334,6 +334,7 @@ export interface SentMessageItem {
   ts: number;
   taskId: string;
   taskTitle: string;
+  project: string;
 }
 
 export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
