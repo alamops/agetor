@@ -162,7 +162,23 @@ Specs: default launch resolves a theme without a flash; selecting Light in Setti
 
 Rollback: the feature is additive. Reverting the branch restores hardcoded `class="dark"`. There is no migration and no schema change, so a rolled-back build simply ignores an orphaned `theme` row in `preferences`.
 
-## 8. Open questions / assumptions
+## 8. Outcome (filled in after delivery)
+
+Delivered across five commits off `ce9a842`: `80495a8` (foundation), `fde38a4` (visual pass), `799bf68` (`--merged` + themed pulse), `96d9591` (tests), `df4b560` (review fixes).
+
+**Where reality differed from this plan — each corrected during delivery:**
+
+1. **D1 was wrong about the boot channel.** The plan assumed `views://` carried a URL hash like the dev path. It does not — the bundled path rejects fragments, so `src/bun/index.ts` injects `window.__AGETOR` through a preload WKUserScript, and only the Vite dev path uses a hash. Both channels now carry the theme. Review then found the deeper issue: whether that preload runs *before* `index.html`'s inline script is decided by a prebuilt native wrapper this repo doesn't control, so the preload string now **applies** the theme itself rather than exposing a value to be read back. Verified against a real packaged launch, which is the check §7 flagged as missing.
+2. **The light token values in §3/T1 were too light.** Measured contrast on white: emerald-600 3.76:1, amber-600 3.19:1, sky-600 4.10:1 — all below AA. Final values are `-700` (`-600` for danger), and `--warning` went further to amber-800 after the 15% tint behind the 9–10px "experimental" pills was measured at 4.07:1.
+3. **Two token families the plan didn't anticipate.** `--merged` (GitHub's purple PR state — no status token fits it, and violet-400 measured 2.6:1 on white) and `--spike` (a task *category*, not a status). Plus `--success-solid`/`--danger-solid`: saturated indicator dots read correctly on both backgrounds, so they are deliberately theme-invariant. Without them, the `-500`-origin availability dot drifted onto the `-400` status token and turned red into salmon-pink — a dark-mode regression the conversion had promised not to cause.
+4. **`buildWindowHash` was unreachable from a test** because `src/bun/index.ts` boots the whole app on import. Extracted to `src/bun/window-url.ts`.
+5. **The plan's "no visual change in dark mode" acceptance criterion was too strong as written.** It holds for the ~150 `-400`-origin sites, but `-500`-origin sites shifted. Fixed where visible (the dots); the residual text/tint deltas (~42–64 RGB at ≤15% alpha) are accepted.
+
+**Verification:** `bun run typecheck` green; `bun test` 2368 pass / 3 skip / 0 fail; `bunx playwright test` 6/6. The one intermittent failure seen in `src/bun/claude-tmux-queue.test.ts` is a pre-existing wall-clock timing assertion — the same file fails *two* tests at the untouched base commit `ce9a842`.
+
+**Known-remaining, deliberately not fixed:** `TaskCard.tsx:152`'s solid `bg-amber-500 text-amber-950` chip (background-independent; tokenizing would visibly change it); hover states on the two banner action buttons dip below 4.5:1 (resting-state audit only).
+
+## 9. Open questions / assumptions
 
 - **Assumed** the light palette already in `:root` (`index.css:6-24`) is a good starting point and needs only the new status tokens, not a redesign. If it looks wrong once rendered, tuning those values is in scope for Phase 8.
 - **Assumed** no native window `backgroundColor` change is needed — `src/bun/index.ts:427-434` passes none today, and the splash covers the pre-paint window. Revisit only if a light-mode launch shows a dark frame.
