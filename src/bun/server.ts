@@ -16,6 +16,7 @@ import {
   harnesses,
   HarnessBuiltinError,
   HarnessInUseError,
+  savedPrompts,
   dataDir,
 } from "./db.ts";
 import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
@@ -2857,6 +2858,57 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             }
             return json({ error: (e as Error).message }, { status: 400, headers: corsHeaders(req) });
           }
+        }),
+      },
+
+      // User-global reusable prompt snippets — not tied to any task/project.
+      "/saved-prompts": {
+        GET: authed((req) => json(savedPrompts.list(), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as {
+            name?: unknown;
+            content?: unknown;
+          };
+          const name = typeof body.name === "string" ? body.name.trim() : "";
+          const content = typeof body.content === "string" ? body.content.trim() : "";
+          if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+          if (!content) return json({ error: "content required" }, { status: 400, headers: corsHeaders(req) });
+          const created = savedPrompts.insert({ name, content });
+          return json(created, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/saved-prompts/:id": {
+        PATCH: authed(async (req) => {
+          const current = savedPrompts.get(req.params.id);
+          if (!current) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const body = (await req.json().catch(() => ({}))) as {
+            name?: unknown;
+            content?: unknown;
+          };
+          const patch: Parameters<typeof savedPrompts.update>[1] = {};
+          if ("name" in body) {
+            const name = typeof body.name === "string" ? body.name.trim() : "";
+            if (!name) return json({ error: "name required" }, { status: 400, headers: corsHeaders(req) });
+            patch.name = name;
+          }
+          if ("content" in body) {
+            const content = typeof body.content === "string" ? body.content.trim() : "";
+            if (!content) return json({ error: "content required" }, { status: 400, headers: corsHeaders(req) });
+            patch.content = content;
+          }
+          const updated = savedPrompts.update(req.params.id, patch);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+        DELETE: authed((req) => {
+          const removed = savedPrompts.delete(req.params.id);
+          return removed
+            ? json({ ok: true }, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
         }),
       },
 
