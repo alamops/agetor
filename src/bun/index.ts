@@ -2,9 +2,10 @@ import { writeFileSync, existsSync } from "node:fs";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
-import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
+import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
-import { SESSION_REAP_SWEEP_MS, type ThemePreference } from "../shared/types.ts";
+import { SESSION_REAP_SWEEP_MS } from "../shared/types.ts";
+import { resolveThemePreference, buildWindowHash } from "./window-url.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
@@ -379,32 +380,6 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
 // that the UI subscribes to via SSE to render the "update ready" banner.
 // Defers its first probe 5s past boot so it doesn't slow window open.
 startUpdaterLoop();
-
-/**
- * Resolve the persisted theme preference for the boot payload. Falls back to
- * "auto" for a missing key or any value that isn't one of the three known
- * preferences — same default `parseThemePreference` (src/mainview/lib/theme.ts)
- * applies client-side, reimplemented here rather than imported since
- * src/bun and src/mainview are separate processes that only share
- * src/shared (see CLAUDE.md).
- */
-function resolveThemePreference(): ThemePreference {
-  const stored = preferences.get("theme");
-  return stored === "dark" || stored === "light" ? stored : "auto";
-}
-
-/**
- * Pure builder for the URL hash fragment carrying the per-launch boot
- * payload to the dev (Vite `http://`) window URL — `#api=<port>&token=<token>&theme=<pref>`.
- * Exported so a bun-side test can assert on the exact fragment shape without
- * constructing a BrowserWindow. This only backs the `isHttpUrl` branch below;
- * the bundled `views://` path threads the same three fields through
- * `bootGlobals` (`window.__AGETOR`) instead, since that scheme handler
- * rejects URLs carrying a fragment (see the comment on `buildWindow` below).
- */
-export function buildWindowHash(input: { port: string; token: string; theme: ThemePreference }): string {
-  return `#api=${input.port}&token=${input.token}&theme=${input.theme}`;
-}
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),

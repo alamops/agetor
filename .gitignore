@@ -38,6 +38,11 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # MCP / browser-automation dumps from local debugging sessions
 .playwright-mcp
 
+# Playwright e2e output (playwright.config.ts / e2e/*.spec.ts)
+/test-results
+/playwright-report
+/playwright/.cache
+
 # Claude Code local settings
 .claude/settings.local.json
 
