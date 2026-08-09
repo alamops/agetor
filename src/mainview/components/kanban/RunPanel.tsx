@@ -18,7 +18,7 @@ import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
+import { Badge, badgeVariants } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
@@ -376,6 +376,14 @@ function RunPanelBody({
   // (imperatively toggled, not driven by a React prop/memo dep — see the
   // effect below). `null` when nothing is highlighted.
   const highlightedElRef = useRef<HTMLElement | null>(null);
+  // Set by explicit match navigation (Enter / Shift+Enter / the ↑↓ nav
+  // buttons — see `stepSearch`) and consumed by the highlight effect below.
+  // Typing re-resolves the active match on every keystroke too (the resolve
+  // effect above), which would otherwise dispatch `EXPAND_EVENT` on every
+  // character typed and leave a trail of force-expanded cards behind as the
+  // query narrows — gating the dispatch on "the user actually asked to jump"
+  // keeps auto-expand tied to intentional navigation only.
+  const jumpIntentRef = useRef(false);
   // Tracks whether the log was scrolled near the bottom at the last user
   // interaction. Auto-scroll-to-bottom on new events only fires when this is
   // true, so a user who scrolls up to read history isn't yanked back down on
@@ -1310,18 +1318,39 @@ function RunPanelBody({
       prev.classList.remove(...HIGHLIGHT_CLASSES);
       highlightedElRef.current = null;
     }
-    if (activeMatchId === null) return;
+    if (activeMatchId === null) {
+      jumpIntentRef.current = false;
+      return;
+    }
     const el = logRef.current?.querySelector<HTMLElement>(`[data-evid="${activeMatchId}"]`);
-    if (!el) return;
+    if (!el) {
+      jumpIntentRef.current = false;
+      return;
+    }
     el.classList.add(...HIGHLIGHT_CLASSES);
     highlightedElRef.current = el;
-    el.scrollIntoView({ block: "center" });
-    // The scrollIntoView above can land the log outside the "near bottom"
+    // The scrollIntoView below can land the log outside the "near bottom"
     // band (or an SSE flush landing in the same tick could otherwise yank
     // the view back to the bottom before the browser paints the scroll) —
     // clear it immediately so neither auto-scroll path fights the jump.
     nearBottomRef.current = false;
-    el.dispatchEvent(new CustomEvent(EXPAND_EVENT, { bubbles: true }));
+    // Only an explicit jump (Enter / Shift+Enter / the ↑↓ nav buttons — see
+    // `jumpIntentRef`) auto-expands a collapsed tool-call card; a keystroke
+    // re-resolving the active match while typing gets the highlight + scroll
+    // below but not the dispatch, so narrowing a query doesn't leave a trail
+    // of force-expanded cards.
+    const isExplicitJump = jumpIntentRef.current;
+    jumpIntentRef.current = false;
+    if (isExplicitJump) el.dispatchEvent(new CustomEvent(EXPAND_EVENT, { bubbles: true }));
+    el.scrollIntoView({ block: "center" });
+    if (isExplicitJump) {
+      // The dispatch above can expand a collapsed card AFTER this
+      // scrollIntoView already centered it at its collapsed height — the
+      // newly revealed body then pushes the matched text below the fold.
+      // Re-center on the next frame, once the expand's re-render has
+      // committed and the browser has laid out the taller card.
+      requestAnimationFrame(() => el.scrollIntoView({ block: "center" }));
+    }
   }, [activeMatchId]);
 
   const closeSearch = useCallback(() => {
@@ -1331,6 +1360,7 @@ function RunPanelBody({
   }, []);
 
   const stepSearch = useCallback((dir: 1 | -1) => {
+    jumpIntentRef.current = true;
     setActiveMatchId((cur) => {
       const idx = matches.indexOf(cur ?? -1);
       const next = stepMatchIndex(matches.length, idx, dir);
@@ -4170,6 +4200,11 @@ const ThinkingBlock = memo(function ThinkingBlock({ text }: { text: string }) {
   );
 });
 
+// `<Badge>` renders a `<div>`, invalid inside the `<button>` header below
+// (button only permits phrasing content) — these two spots use a plain
+// `<span>` styled via `badgeVariants` instead.
+const SECONDARY_BADGE_CLASS = badgeVariants({ variant: "secondary" });
+
 /** Tool-call card with input rendered per-tool, plus the matched result
  *  collapsed underneath (expand to read full output). Special-cases:
  *  AskUserQuestion + ExitPlanMode get prominent styling because the user
@@ -4186,7 +4221,17 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
     setResultOpenSignal((s) => s + 1);
   }, []);
   useExpandOnJump(rootRef, expand);
-  const expanded = open || (isInteractive && !result);
+  // `resultOpenSignal` only means anything for the ONE `ToolResultBody` mount
+  // that follows the jump that set it — since it's conditionally mounted
+  // (only while `expanded`), a stale signal ≥1 would force-open the result
+  // fold on every future expand of this same card (collapse → re-expand)
+  // even without a fresh jump. Clearing it back to 0 on collapse makes it
+  // one-shot per jump.
+  useEffect(() => {
+    if (!open) setResultOpenSignal(0);
+  }, [open]);
+  const forcedOpen = isInteractive && !result;
+  const expanded = open || forcedOpen;
   // MCP convention: `mcp__<server>__<tool>`. The server name is always the
   // first segment after the `mcp__` prefix; everything after the next `__`
   // is the literal tool name (which itself may contain `__`). We rebuild
@@ -4203,25 +4248,31 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
     >
       <button
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        disabled={forcedOpen}
+        onClick={() => {
+          if (window.getSelection()?.toString()) return;
+          setOpen((o) => !o);
+        }}
         aria-expanded={expanded}
         className={cn(
-          "flex w-full items-center gap-2 px-2 py-1.5 text-left text-[11px]",
+          "flex w-full select-text items-center gap-2 px-2 py-1.5 text-left text-[11px] hover:bg-muted/30",
           expanded && "border-b border-border/40",
         )}
       >
-        <span className="shrink-0 text-muted-foreground">{expanded ? "▼" : "▶"}</span>
+        {!forcedOpen && (
+          <span className="shrink-0 text-muted-foreground" aria-hidden>{expanded ? "▼" : "▶"}</span>
+        )}
         <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
         {mcpParts && mcpParts.length >= 2 ? (
           <span className="flex items-center gap-1 font-mono">
-            <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">mcp · {mcpParts[0]}</Badge>
+            <span className={cn(SECONDARY_BADGE_CLASS, "px-1.5 py-0 text-[10px]")}>mcp · {mcpParts[0]}</span>
             <span className="font-medium">{mcpParts.slice(1).join("__")}</span>
           </span>
         ) : (
           <span className="font-mono font-medium">{call.name}</span>
         )}
         {call.serverSide && (
-          <Badge variant="secondary" className="px-1 py-0 text-[9px] uppercase">server</Badge>
+          <span className={cn(SECONDARY_BADGE_CLASS, "px-1 py-0 text-[9px] uppercase")}>server</span>
         )}
         {summary && <span className="truncate text-muted-foreground">· {summary}</span>}
         {!expanded && result?.isError && <span className="shrink-0 text-destructive">· error</span>}
