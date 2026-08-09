@@ -6260,7 +6260,7 @@ function GitHubItemRow({
   const stateClass = item.state === "open"
     ? "text-success"
     : merged
-      ? "text-violet-400"
+      ? "text-merged"
       : "text-danger";
   return (
     <div className="rounded-md border border-border/60 bg-card">
@@ -7504,7 +7504,7 @@ function PullActions({
           </Button>
         )}
         {item.state !== "open" && item.mergedAt && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-violet-400">
+          <span className="inline-flex items-center gap-1 text-[11px] text-merged">
             <GitMerge className="size-3.5" />
             Merged
           </span>

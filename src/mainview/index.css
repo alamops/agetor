@@ -38,6 +38,10 @@
     --info-foreground: 0 0% 98%;
     --danger: 346.8 77.2% 49.8%; /* rose-600 */
     --danger-foreground: 0 0% 98%;
+    /* GitHub's own convention for a merged PR — purple, deliberately distinct
+       from success/info so "merged" never reads as "open" or "passing". */
+    --merged: 263.4 69.3% 42.2%; /* violet-700 */
+    --merged-foreground: 0 0% 98%;
   }
 
   .dark {
@@ -69,6 +73,8 @@
     --info-foreground: 240 5.9% 10%;
     --danger: 351.3 94.5% 71.4%; /* rose-400 */
     --danger-foreground: 240 5.9% 10%;
+    --merged: 255.1 91.7% 76.3%; /* violet-400 */
+    --merged-foreground: 240 5.9% 10%;
   }
 
   * { @apply border-border; }

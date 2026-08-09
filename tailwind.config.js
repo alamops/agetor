@@ -57,6 +57,10 @@ export default {
           DEFAULT: "hsl(var(--danger))",
           foreground: "hsl(var(--danger-foreground))",
         },
+        merged: {
+          DEFAULT: "hsl(var(--merged))",
+          foreground: "hsl(var(--merged-foreground))",
+        },
       },
       borderRadius: {
         lg: "var(--radius)",
@@ -73,8 +77,10 @@ export default {
         // cleanly on top of Tailwind's `ring-*` utilities (which themselves
         // compile to box-shadow and would otherwise be clobbered).
         "awaiting-pulse": {
-          "0%, 100%": { filter: "drop-shadow(0 0 6px rgba(245, 158, 11, 0.55))" },
-          "50%":      { filter: "drop-shadow(0 0 14px rgba(245, 158, 11, 0.85))" },
+          // Driven by --warning so the glow tracks the theme alongside the
+          // ring-warning it sits behind (amber-400 dark / amber-700 light).
+          "0%, 100%": { filter: "drop-shadow(0 0 6px hsl(var(--warning) / 0.55))" },
+          "50%":      { filter: "drop-shadow(0 0 14px hsl(var(--warning) / 0.85))" },
         },
       },
       animation: {
