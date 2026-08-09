@@ -242,30 +242,39 @@ export interface TaskTypeMeta {
   borderClass: string;
 }
 
+// Task-type coloring rides the shared semantic tokens (index.css /
+// tailwind.config.js) rather than literal palette classes, per the UI
+// convention below. "bug" maps cleanly onto --danger (both are "something's
+// wrong", same red/rose family as the literal it replaces) and "task" maps
+// cleanly onto --info (its original literal was already sky, --info's own
+// hue family) — genuine status-token reuse, not a stretch. "spike" has no
+// clean status-token equivalent (it's a category, not a status), so it gets
+// its own --spike token (violet) rather than being forced onto an existing
+// one — see the --spike comment in index.css for why that isn't --merged.
 export const TASK_TYPES: TaskTypeMeta[] = [
   {
     id: "task",
     label: "Task",
     hint: "Standard work item.",
     icon: "Inbox",
-    iconClass: "text-sky-500",
-    borderClass: "border-l-sky-500",
+    iconClass: "text-info",
+    borderClass: "border-l-info",
   },
   {
     id: "bug",
     label: "Bug",
     hint: "Defect to investigate or fix.",
     icon: "Bug",
-    iconClass: "text-red-500",
-    borderClass: "border-l-red-500",
+    iconClass: "text-danger",
+    borderClass: "border-l-danger",
   },
   {
     id: "spike",
     label: "Spike",
     hint: "Exploratory / research task.",
     icon: "FlaskConical",
-    iconClass: "text-violet-500",
-    borderClass: "border-l-violet-500",
+    iconClass: "text-spike",
+    borderClass: "border-l-spike",
   },
 ];
 

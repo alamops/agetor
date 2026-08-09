@@ -711,7 +711,7 @@ function HarnessesSection({
                     <span
                       className={cn(
                         "inline-block size-1.5 rounded-full",
-                        available ? "bg-success" : "bg-danger",
+                        available ? "bg-success-solid" : "bg-danger-solid",
                       )}
                       title={status?.reason ?? status?.path ?? ""}
                     />

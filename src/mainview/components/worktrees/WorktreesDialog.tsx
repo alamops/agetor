@@ -574,7 +574,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                         </>
                       )}
                       {w.stale && (
-                        <span className="text-danger/80">
+                        <span className="text-muted-foreground">
                           {w.staleReasons.map((r) => STALE_REASON_LABEL[r]).join(", ")}
                         </span>
                       )}

@@ -6196,7 +6196,7 @@ function DiscussionCommentRow({
         <span className="font-medium text-foreground">{comment.author ?? "unknown"}</span>
         <span>{fmtDate(comment.createdAt)}</span>
         {comment.isAnswer && (
-          <span className="flex items-center gap-0.5 rounded bg-success/15 px-1.5 py-0.5 text-[10px] font-medium text-success">
+          <span className="flex items-center gap-0.5 rounded bg-success/10 px-1.5 py-0.5 text-[10px] font-medium text-success">
             <Check className="size-3" /> Answer
           </span>
         )}
@@ -9073,13 +9073,12 @@ function DiffBody({
               <span className="w-10 shrink-0 select-none border-r border-border/40 px-1 text-right text-muted-foreground/60">
                 {r.neu ?? ""}
               </span>
-              <span
-                className={cn(
-                  "shrink-0 select-none px-1 text-center",
-                  r.kind === "add" && "text-success",
-                  r.kind === "del" && "text-danger",
-                )}
-              >
+              {/* No color override here: the row's own bg-success/10 / bg-danger/10
+                  tint already carries the add/del signal, and re-coloring this
+                  glyph with the same token on top of that tint drops the
+                  composite below 4.5:1 in light mode. Inheriting the row's
+                  default text color keeps it legible in both themes. */}
+              <span className="shrink-0 select-none px-1 text-center">
                 {r.kind === "add" ? "+" : r.kind === "del" ? "-" : " "}
               </span>
               <span className="min-w-0 flex-1 whitespace-pre px-1">{r.text || " "}</span>

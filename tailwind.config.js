@@ -61,6 +61,12 @@ export default {
           DEFAULT: "hsl(var(--merged))",
           foreground: "hsl(var(--merged-foreground))",
         },
+        spike: {
+          DEFAULT: "hsl(var(--spike))",
+          foreground: "hsl(var(--spike-foreground))",
+        },
+        "success-solid": "hsl(var(--success-solid))",
+        "danger-solid": "hsl(var(--danger-solid))",
       },
       borderRadius: {
         lg: "var(--radius)",
@@ -78,7 +84,7 @@ export default {
         // compile to box-shadow and would otherwise be clobbered).
         "awaiting-pulse": {
           // Driven by --warning so the glow tracks the theme alongside the
-          // ring-warning it sits behind (amber-400 dark / amber-700 light).
+          // ring-warning it sits behind (amber-400 dark / amber-800 light).
           "0%, 100%": { filter: "drop-shadow(0 0 6px hsl(var(--warning) / 0.55))" },
           "50%":      { filter: "drop-shadow(0 0 14px hsl(var(--warning) / 0.85))" },
         },

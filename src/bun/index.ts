@@ -399,18 +399,43 @@ const windowLifecycle = makeWindowLifecycle({
     // so `views://mainview/index.html#api=…` resolves to a non-existent file
     // and returns "empty response". Instead, ship the per-launch API
     // coordinates (now including the resolved theme preference) through a
-    // WKUserScript injection (BrowserWindow's `preload` option), which runs
-    // before any page script — including index.html's inline boot-theme
-    // script, so `window.__AGETOR.theme` is readable synchronously there.
-    // The webview reads the rest off `window.__AGETOR` too (see api.ts).
+    // WKUserScript injection (BrowserWindow's `preload` option). The webview
+    // reads the rest off `window.__AGETOR` too (see api.ts).
     // For Vite HMR mode the URL is plain http://, which DOES support hash,
     // so we keep the legacy hash payload (now theme-carrying too, via
     // buildWindowHash) as a fallback there.
-    const bootGlobals = `window.__AGETOR=${JSON.stringify({
-      port: String(API_PORT),
-      token: API_TOKEN,
-      theme,
-    })};`;
+    //
+    // themeApplyScript below APPLIES the theme itself, rather than only
+    // exposing it for index.html's inline <head> script to read back.
+    // Electrobun's `preload` is documented to run before page scripts, but
+    // the exact injection point (WKUserScript's `.atDocumentStart` vs.
+    // `.atDocumentEnd`) is decided by the native wrapper — a prebuilt binary
+    // this repo doesn't control — so relying on "preload always beats
+    // index.html's inline script" is exactly the kind of ordering
+    // assumption that only breaks in a packaged build (`bun run dev:hmr`
+    // never hits this path: it loads http:// + hash, not views://). Doing
+    // the class/color-scheme application right here removes the dependency
+    // on that ordering: whichever of this script and index.html's inline
+    // script runs first "wins" the paint, and the other is a no-op re-run
+    // of the identical computation from the identical `theme` value — both
+    // derive `dark` the same way, so there is nothing to fight over
+    // regardless of which fires first. `document.documentElement` is
+    // expected to exist even at document-start in WebKit, but the `r &&`
+    // guard and try/catch keep this best-effort defensive against a WKWebView
+    // that injects later than documented, or an environment lacking
+    // `matchMedia`.
+    const themeApplyScript =
+      `try{var p=${JSON.stringify(theme)};` +
+      `var d=p==="dark"||(p==="auto"&&(!window.matchMedia||window.matchMedia("(prefers-color-scheme: dark)").matches));` +
+      `var r=document.documentElement;` +
+      `if(r){r.classList.toggle("dark",d);r.style.colorScheme=d?"dark":"light";}` +
+      `}catch(e){}`;
+    const bootGlobals =
+      `window.__AGETOR=${JSON.stringify({
+        port: String(API_PORT),
+        token: API_TOKEN,
+        theme,
+      })};` + themeApplyScript;
     const isHttpUrl = url.startsWith("http://") || url.startsWith("https://");
     // `remembered` (window-lifecycle.ts) is in-memory only, updated live from
     // "move"/"resize" events — it's never validated against the display

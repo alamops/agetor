@@ -750,7 +750,7 @@ function AppInner() {
                   <span
                     className={
                       "inline-block size-1.5 rounded-full " +
-                      (a.available ? "bg-success" : "bg-danger")
+                      (a.available ? "bg-success-solid" : "bg-danger-solid")
                     }
                   />
                 </span>

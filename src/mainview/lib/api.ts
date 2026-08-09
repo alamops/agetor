@@ -251,7 +251,7 @@ export interface GitHubTokensResult {
 // Fall back to URL hash for the Vite HMR path, which loads from a plain
 // http:// URL where the hash payload still works.
 declare global {
-  interface Window { __AGETOR?: { port: string; token: string } }
+  interface Window { __AGETOR?: { port: string; token: string; theme?: string } }
 }
 // Guard `window` access for the test runtime (`bun test` runs this module
 // outside a browser). Production paths always have a real window, so the

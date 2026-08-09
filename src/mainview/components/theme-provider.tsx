@@ -1,4 +1,5 @@
 import * as React from "react";
+import { toast } from "sonner";
 import type { ResolvedTheme, ThemePreference } from "../../shared/types.ts";
 import { api } from "@/lib/api";
 import { parseThemePreference, readThemeFromHash, resolveTheme } from "@/lib/theme";
@@ -46,10 +47,15 @@ function readInjectedTheme(): string | undefined {
  * chrome (scrollbars, form controls) that no CSS variable reaches.
  *
  * `setPreference` updates local state immediately (optimistic UI), then
- * best-effort persists via `api.setPreference("theme", pref)` — mirroring
- * `onPickDefault`/`onPickTmuxSource` in SettingsDialog.tsx: a persistence
- * failure is swallowed rather than reverted, since the next reconcile from
- * `/preferences` (done by the App.tsx consumer, not here) will catch drift.
+ * persists via `api.setPreference("theme", pref)`. Unlike `onPickDefault`/
+ * `onPickTmuxSource` in SettingsDialog.tsx — where a failed save really is
+ * safe to swallow, because that dialog's `refresh()` re-fetches the
+ * persisted value on every open — theme has no such reconcile: App.tsx's
+ * preferences fetch runs once at boot (`[]` deps) and SettingsDialog's
+ * `refresh()` never touches `theme`. So a failed save here is reported via
+ * a toast and the optimistic update is rolled back: the UI would otherwise
+ * keep showing a preference that silently isn't what persisted, only to
+ * disagree with itself on the next launch.
  */
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [preference, setPreferenceState] = React.useState<ThemePreference>(() => {
@@ -80,12 +86,25 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     root.style.colorScheme = resolved;
   }, [resolved]);
 
+  // Mirrors TerminalPane's `resolvedRef` pattern: read via a ref inside the
+  // stable-identity `setPreference` callback below so a failed save can roll
+  // back to whatever was current *at the moment of that call*, without
+  // making `setPreference` depend on (and be re-created by) `preference`.
+  const preferenceRef = React.useRef(preference);
+  preferenceRef.current = preference;
+
   const setPreference = React.useCallback((pref: ThemePreference) => {
     const next = parseThemePreference(pref);
+    const previous = preferenceRef.current;
     setPreferenceState(next);
     void api.setPreference("theme", next).catch(() => {
-      // Best-effort — matches SettingsDialog's onPickDefault/onPickTmuxSource.
-      // A reload re-derives from the boot hash / a later /preferences fetch.
+      // Roll back the optimistic update and tell the user — see the class
+      // doc comment above for why silently swallowing this (as
+      // SettingsDialog's onPickDefault/onPickTmuxSource do) isn't safe here.
+      setPreferenceState(previous);
+      toast.error("Couldn't save theme preference", {
+        description: "Reverted to the previous setting — try again.",
+      });
     });
   }, []);
 

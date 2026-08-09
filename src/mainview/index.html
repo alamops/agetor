@@ -16,9 +16,18 @@
       // ("theme")) and threads it through TWO paths depending on how this
       // page was loaded: the bundled `views://` scheme rejects URLs with a
       // fragment, so that path injects `window.__AGETOR.theme` via a
-      // WKUserScript (`preload`) that runs before this script; the Vite dev
-      // (`http://localhost:5173`) path appends `&theme=<pref>` to the URL
-      // hash instead (`buildWindowHash` in index.ts). Check both, hash last.
+      // WKUserScript (`preload`) — the same preload string ALSO applies the
+      // `dark` class + `color-scheme` itself before this script ever runs,
+      // because the native wrapper's exact injection point (document-start
+      // vs document-end) isn't something this repo controls. This script is
+      // therefore a backstop, not the only line of defense: it re-derives
+      // the identical `dark` value from the identical `theme` source and
+      // re-applies it, which is a harmless no-op if the preload script
+      // already got there first. The Vite dev (`http://localhost:5173`)
+      // path has no preload step at all — there this script IS the only
+      // application, reading `&theme=<pref>` off the URL hash instead
+      // (`buildWindowHash` in index.ts). Check window.__AGETOR first, hash
+      // second, so the bundled path prefers its own value over a stale hash.
       (function () {
         try {
           var injected = window.__AGETOR && window.__AGETOR.theme;
@@ -30,19 +39,25 @@
             pref = params.get("theme");
           }
           if (pref !== "dark" && pref !== "light") pref = "auto";
+          // "auto" with no matchMedia support is an unknown-environment
+          // case, same family as the catch below — fall back to dark for
+          // the same reason: don't guess light when we can't ask the OS.
           var dark =
             pref === "dark" ||
             (pref === "auto" &&
-              window.matchMedia &&
-              window.matchMedia("(prefers-color-scheme: dark)").matches);
+              (!window.matchMedia ||
+                window.matchMedia("(prefers-color-scheme: dark)").matches));
           var root = document.documentElement;
           if (dark) root.classList.add("dark");
           else root.classList.remove("dark");
           root.style.colorScheme = dark ? "dark" : "light";
         } catch (e) {
-          // Parsing failed for some reason (malformed hash, matchMedia
-          // unavailable, …) — fall back to dark, today's only theme, rather
-          // than leaving the app unstyled.
+          // Parsing failed for some reason (malformed hash, an unexpected
+          // exception in the branches above, …) — fall back to dark rather
+          // than leaving the app unstyled. Dark, not light: every existing
+          // install predates the Light theme and has only ever rendered
+          // dark, so it's the safer guess when something has gone wrong,
+          // not "today's only theme" (Light is a real, supported option now).
           document.documentElement.classList.add("dark");
           document.documentElement.style.colorScheme = "dark";
         }

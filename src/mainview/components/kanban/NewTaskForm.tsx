@@ -801,7 +801,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                         <span
                           className={cn(
                             "ml-auto inline-block size-1.5 rounded-full",
-                            available ? "bg-success" : "bg-danger",
+                            available ? "bg-success-solid" : "bg-danger-solid",
                           )}
                         />
                       </Button>

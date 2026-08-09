@@ -90,7 +90,7 @@ export function UpdateBanner({ snapshot, onChange }: Props) {
         type="button"
         onClick={() => setDismissedVersion(snapshot.version ?? "")}
         aria-label="Dismiss"
-        className="rounded p-0.5 text-success/70 hover:bg-success/10 hover:text-success"
+        className="rounded p-0.5 text-muted-foreground hover:bg-success/10 hover:text-success"
       >
         <X className="size-3.5" />
       </button>

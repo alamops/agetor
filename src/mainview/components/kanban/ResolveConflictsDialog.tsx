@@ -311,7 +311,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
                       <span
                         className={cn(
                           "ml-auto inline-block size-1.5 rounded-full",
-                          available ? "bg-success" : "bg-danger",
+                          available ? "bg-success-solid" : "bg-danger-solid",
                         )}
                       />
                     </Button>

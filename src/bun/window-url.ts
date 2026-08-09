@@ -8,9 +8,21 @@ import type { ThemePreference } from "../shared/types.ts";
  * applies client-side, reimplemented here rather than imported since
  * src/bun and src/mainview are separate processes that only share
  * src/shared (see CLAUDE.md).
+ *
+ * This is the first DB read in the window-build path (`buildWindow` in
+ * `index.ts` calls it before constructing the `BrowserWindow`) — previously
+ * that path did no DB I/O at all. A locked or corrupt SQLite file throwing
+ * here must not reject the caller's promise and prevent the main window from
+ * ever opening, so a throw is swallowed and treated the same as "nothing
+ * stored": fall back to "auto".
  */
 export function resolveThemePreference(): ThemePreference {
-  const stored = preferences.get("theme");
+  let stored: string | null;
+  try {
+    stored = preferences.get("theme");
+  } catch {
+    return "auto";
+  }
   return stored === "dark" || stored === "light" ? stored : "auto";
 }
 

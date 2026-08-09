@@ -23,6 +23,14 @@ const XTERM_THEME_DARK: ITheme = {
   background: "#09090b", // zinc-950, matches --background
   foreground: "#e4e4e7", // zinc-200
   cursor: "#e4e4e7",
+  // xterm's DOM renderer paints the cursor cell as `background: cursor;
+  // color: cursorAccent`, and defaults cursorAccent to black when unset.
+  // Setting it explicitly (rather than relying on the default happening to
+  // match) keeps the glyph under the block cursor legible: #09090b is this
+  // theme's own background, so it's the same relationship as normal text
+  // (foreground-on-background) just inverted for the cursor cell — ~15.7:1
+  // against `cursor` (#e4e4e7).
+  cursorAccent: "#09090b",
   selectionBackground: "#3f3f46",
 };
 
@@ -48,6 +56,13 @@ const XTERM_THEME_LIGHT: ITheme = {
   background: "#ffffff",
   foreground: "#09090b",
   cursor: "#09090b",
+  // Without this, xterm defaults cursorAccent (the glyph color painted under
+  // the block cursor) to black — indistinguishable from this theme's
+  // near-black `cursor` (#09090b), so the character under a blinking cursor
+  // measured ~1.05:1 and was effectively invisible. #ffffff is this theme's
+  // own background, mirroring the dark theme's choice below; contrast
+  // against `cursor` is ~19.9:1.
+  cursorAccent: "#ffffff",
   selectionBackground: "#d4d4d8",
   white: "#52525b", // zinc-600 — default #d3d7cf is ~1.5:1 on white, unreadable
   brightWhite: "#18181b", // zinc-900 — default #eeeeec is ~1.1:1 on white, unreadable

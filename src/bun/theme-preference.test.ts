@@ -206,6 +206,28 @@ test("resolveThemePreference passes through 'dark' and 'light' exactly, and norm
   expect(resolveThemePreference()).toBe("auto");
 });
 
+test("resolveThemePreference falls back to 'auto' (instead of throwing) when the DB read itself throws", () => {
+  // Regression coverage for the window-build path: buildWindow in
+  // src/bun/index.ts awaits resolveThemePreference() before constructing
+  // the BrowserWindow — an uncaught throw here (e.g. a locked/corrupt
+  // SQLite file) would reject that promise and the main window would never
+  // open. Simulate the throw at the `preferences.get` boundary rather than
+  // actually corrupting the on-disk DB (which would poison every other test
+  // in this file that shares AGETOR_DATA_DIR).
+  const realGet = preferences.get;
+  preferences.get = () => {
+    throw new Error("simulated: database disk image is malformed");
+  };
+  try {
+    expect(resolveThemePreference()).toBe("auto");
+  } finally {
+    preferences.get = realGet;
+  }
+  // The store itself is unaffected — restoring the stub didn't lose data.
+  preferences.set("theme", "dark");
+  expect(resolveThemePreference()).toBe("dark");
+});
+
 test("buildWindowHash includes api, token, and theme as a hash fragment (not a query string)", () => {
   const hash = buildWindowHash({ port: "4317", token: "sekrit-token", theme: "dark" });
   expect(hash).toBe("#api=4317&token=sekrit-token&theme=dark");

@@ -56,7 +56,7 @@ export function TmuxMissingBanner({ show, onResolve }: Props) {
         type="button"
         onClick={() => setDismissed(true)}
         aria-label="Dismiss"
-        className="rounded p-0.5 text-warning/70 hover:bg-warning/10 hover:text-warning"
+        className="rounded p-0.5 text-muted-foreground hover:bg-warning/10 hover:text-warning"
       >
         <X className="size-3.5" />
       </button>
