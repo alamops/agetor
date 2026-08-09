@@ -2746,3 +2746,28 @@ export const PROVIDER_CAPS: Record<GitProvider, ProviderCaps> = {
     pullAbbrevPlural: "PRs",
   },
 };
+
+// ───────────────────────────────────────────────────────────────────────────
+// Theme (Auto / Dark / Light)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * The user-facing theme choice, persisted as the `theme` key in the
+ * `preferences` table (see `src/bun/db.ts`) and round-tripped through
+ * `GET/PUT /preferences`. "auto" follows the OS appearance
+ * (`prefers-color-scheme`) and live-reacts to it changing while the app is
+ * open; "dark"/"light" pin an explicit choice. Unset/invalid persisted values
+ * resolve to "auto" — see `parseThemePreference` in `src/mainview/lib/theme.ts`.
+ */
+export type ThemePreference = "auto" | "dark" | "light";
+
+/** The concrete theme actually painted — what `preference` resolves to once
+ *  "auto" has been settled against the OS/system appearance. */
+export type ResolvedTheme = "dark" | "light";
+
+/** Options for the Settings → General theme picker, in display order. */
+export const THEME_PREFERENCES: readonly { id: ThemePreference; label: string }[] = [
+  { id: "auto", label: "Auto" },
+  { id: "dark", label: "Dark" },
+  { id: "light", label: "Light" },
+];

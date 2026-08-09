@@ -2,9 +2,9 @@ import { writeFileSync, existsSync } from "node:fs";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
-import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
+import { db, harnesses, pidFilePath, tasks, dataDir, preferences } from "./db.ts";
 import { reconcileOrphans, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
-import { SESSION_REAP_SWEEP_MS } from "../shared/types.ts";
+import { SESSION_REAP_SWEEP_MS, type ThemePreference } from "../shared/types.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
@@ -380,6 +380,32 @@ Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) =
 // Defers its first probe 5s past boot so it doesn't slow window open.
 startUpdaterLoop();
 
+/**
+ * Resolve the persisted theme preference for the boot payload. Falls back to
+ * "auto" for a missing key or any value that isn't one of the three known
+ * preferences — same default `parseThemePreference` (src/mainview/lib/theme.ts)
+ * applies client-side, reimplemented here rather than imported since
+ * src/bun and src/mainview are separate processes that only share
+ * src/shared (see CLAUDE.md).
+ */
+function resolveThemePreference(): ThemePreference {
+  const stored = preferences.get("theme");
+  return stored === "dark" || stored === "light" ? stored : "auto";
+}
+
+/**
+ * Pure builder for the URL hash fragment carrying the per-launch boot
+ * payload to the dev (Vite `http://`) window URL — `#api=<port>&token=<token>&theme=<pref>`.
+ * Exported so a bun-side test can assert on the exact fragment shape without
+ * constructing a BrowserWindow. This only backs the `isHttpUrl` branch below;
+ * the bundled `views://` path threads the same three fields through
+ * `bootGlobals` (`window.__AGETOR`) instead, since that scheme handler
+ * rejects URLs carrying a fragment (see the comment on `buildWindow` below).
+ */
+export function buildWindowHash(input: { port: string; token: string; theme: ThemePreference }): string {
+  return `#api=${input.port}&token=${input.token}&theme=${input.theme}`;
+}
+
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),
  *   - frame memory (remembered position/size survives close → reopen so
@@ -392,18 +418,23 @@ const windowLifecycle = makeWindowLifecycle({
   setMainWindow,
   buildWindow: async (frame: Frame) => {
     const url = await getMainViewUrl();
+    const theme = resolveThemePreference();
     // The native views:// scheme handler refuses URLs that carry a fragment
     // or query — it treats the part after the scheme as a literal file path,
     // so `views://mainview/index.html#api=…` resolves to a non-existent file
     // and returns "empty response". Instead, ship the per-launch API
-    // coordinates through a WKUserScript injection (BrowserWindow's
-    // `preload` option), which runs before any page script. The webview
-    // reads them off `window.__AGETOR`. For Vite HMR mode the URL is plain
-    // http://, which DOES support hash, so we keep the legacy hash payload
-    // as a fallback there.
+    // coordinates (now including the resolved theme preference) through a
+    // WKUserScript injection (BrowserWindow's `preload` option), which runs
+    // before any page script — including index.html's inline boot-theme
+    // script, so `window.__AGETOR.theme` is readable synchronously there.
+    // The webview reads the rest off `window.__AGETOR` too (see api.ts).
+    // For Vite HMR mode the URL is plain http://, which DOES support hash,
+    // so we keep the legacy hash payload (now theme-carrying too, via
+    // buildWindowHash) as a fallback there.
     const bootGlobals = `window.__AGETOR=${JSON.stringify({
       port: String(API_PORT),
       token: API_TOKEN,
+      theme,
     })};`;
     const isHttpUrl = url.startsWith("http://") || url.startsWith("https://");
     // `remembered` (window-lifecycle.ts) is in-memory only, updated live from
@@ -428,7 +459,7 @@ const windowLifecycle = makeWindowLifecycle({
       title: "Agetor",
       titleBarStyle: "hiddenInset",
       trafficLightOffset: { x: 8, y: 8 },
-      url: isHttpUrl ? `${url}#api=${API_PORT}&token=${API_TOKEN}` : url,
+      url: isHttpUrl ? `${url}${buildWindowHash({ port: String(API_PORT), token: API_TOKEN, theme })}` : url,
       preload: bootGlobals,
       frame: safeFrame,
     });

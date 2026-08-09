@@ -22,6 +22,22 @@
     --input: 240 5.9% 90%;
     --ring: 240 5.9% 10%;
     --radius: 0.5rem;
+    /* Semantic status tokens (theme feature). Used primarily as text/icon
+       color (text-success) and low-alpha backgrounds (bg-success/10), so
+       these must independently clear ~4.5:1 contrast on --background above.
+       Tailwind's *-600 shades were the plan's starting point, but emerald-600
+       (3.76:1), amber-600 (3.19:1), and sky-600 (4.10:1) on white all fall
+       short of AA for normal text — bumped those three to *-700 (5.0-5.9:1).
+       rose-600 already clears (4.70:1) so danger stays at *-600. See the
+       .dark block below for the *-400 shades these replace as literals. */
+    --success: 162.9 93.5% 24.3%; /* emerald-700 */
+    --success-foreground: 0 0% 98%;
+    --warning: 26 90.5% 37.1%; /* amber-700 */
+    --warning-foreground: 0 0% 98%;
+    --info: 201.3 96.3% 32.2%; /* sky-700 */
+    --info-foreground: 0 0% 98%;
+    --danger: 346.8 77.2% 49.8%; /* rose-600 */
+    --danger-foreground: 0 0% 98%;
   }
 
   .dark {
@@ -42,6 +58,17 @@
     --border: 240 3.7% 15.9%;
     --input: 240 3.7% 15.9%;
     --ring: 240 4.9% 83.9%;
+    /* Mirror the literal Tailwind *-400 colors these tokens are replacing
+       throughout the app (text-rose-400, text-emerald-400, text-amber-400,
+       text-sky-400) so the conversion is visually a no-op in dark mode. */
+    --success: 158.1 64.4% 51.6%; /* emerald-400 */
+    --success-foreground: 240 5.9% 10%;
+    --warning: 43.3 96.4% 56.3%; /* amber-400 */
+    --warning-foreground: 240 5.9% 10%;
+    --info: 198.4 93.2% 59.6%; /* sky-400 */
+    --info-foreground: 240 5.9% 10%;
+    --danger: 351.3 94.5% 71.4%; /* rose-400 */
+    --danger-foreground: 240 5.9% 10%;
   }
 
   * { @apply border-border; }

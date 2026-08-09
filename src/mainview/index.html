@@ -1,13 +1,60 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agetor</title>
+    <script>
+      // Blocking + synchronous so the `dark` class (or its absence) and
+      // `color-scheme` land on <html> before the browser paints anything —
+      // this is what prevents a flash of the wrong theme, including on the
+      // splash screen below, whose CSS is theme-conditional on this class.
+      // Must run before the splash <style> block. Duplicates (rather than
+      // imports) the parsing/resolution logic in src/mainview/lib/theme.ts
+      // (readThemeFromHash / resolveTheme) since no module can load yet.
+      // `src/bun/index.ts` resolves the persisted theme (preferences.get
+      // ("theme")) and threads it through TWO paths depending on how this
+      // page was loaded: the bundled `views://` scheme rejects URLs with a
+      // fragment, so that path injects `window.__AGETOR.theme` via a
+      // WKUserScript (`preload`) that runs before this script; the Vite dev
+      // (`http://localhost:5173`) path appends `&theme=<pref>` to the URL
+      // hash instead (`buildWindowHash` in index.ts). Check both, hash last.
+      (function () {
+        try {
+          var injected = window.__AGETOR && window.__AGETOR.theme;
+          var pref = injected;
+          if (pref !== "dark" && pref !== "light") {
+            var hash = window.location.hash || "";
+            if (hash.charAt(0) === "#") hash = hash.slice(1);
+            var params = new URLSearchParams(hash);
+            pref = params.get("theme");
+          }
+          if (pref !== "dark" && pref !== "light") pref = "auto";
+          var dark =
+            pref === "dark" ||
+            (pref === "auto" &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          var root = document.documentElement;
+          if (dark) root.classList.add("dark");
+          else root.classList.remove("dark");
+          root.style.colorScheme = dark ? "dark" : "light";
+        } catch (e) {
+          // Parsing failed for some reason (malformed hash, matchMedia
+          // unavailable, …) — fall back to dark, today's only theme, rather
+          // than leaving the app unstyled.
+          document.documentElement.classList.add("dark");
+          document.documentElement.style.colorScheme = "dark";
+        }
+      })();
+    </script>
     <style>
       /* Inline so the splash paints at HTML-parse time — before main.tsx or
-         index.css load. HSL value mirrors the .dark `--background` token in
-         index.css; the Tailwind layer hasn't applied yet at this point. */
+         index.css load. The two rules below mirror the `.dark`/`:root`
+         `--background` tokens in index.css (Tailwind hasn't applied yet at
+         this point); which one is active is decided by the blocking script
+         above, which sets the `dark` class before this stylesheet is even
+         parsed. */
       #splash {
         position: fixed;
         inset: 0;
@@ -15,8 +62,13 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        background: #000;
         transition: opacity 300ms ease;
+      }
+      html.dark #splash {
+        background: #09090b;
+      }
+      html:not(.dark) #splash {
+        background: #ffffff;
       }
       #splash img {
         width: 128px;
