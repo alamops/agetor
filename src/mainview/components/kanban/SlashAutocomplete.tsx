@@ -1,11 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Sparkles, Terminal } from "lucide-react";
+import { BookText, Sparkles, Terminal } from "lucide-react";
 import type { AvailableCommand } from "@/lib/api";
+import type { SavedPrompt } from "../../../shared/types.ts";
+import { filterPromptsForSlash } from "@/lib/prompt-picker";
 import { cn } from "@/lib/utils";
 
 interface Props {
   /** Available `/…` entries to suggest. Empty list disables the popover. */
   commands: AvailableCommand[];
+  /** User-global reusable prompt snippets, matched by name and shown as a
+   *  distinct "Saved Prompts" group below the command/skill results. */
+  savedPrompts?: SavedPrompt[];
   /** Current textarea value. */
   value: string;
   /** Setter for the textarea value. */
@@ -18,6 +23,9 @@ interface Props {
    *  the popover renders off-screen and the user never sees it. */
   placement?: "above" | "below";
 }
+
+/** A row in the combined popover: a command/skill, or a saved prompt. */
+type Row = { tag: "cmd"; cmd: AvailableCommand } | { tag: "prompt"; prompt: SavedPrompt };
 
 /**
  * The slice of text we treat as the active query: everything from a `/` that
@@ -56,13 +64,15 @@ function findActiveQuery(text: string, caret: number): {
 
 /**
  * Lightweight slash-command picker for the new-task prompt textarea. Opens when
- * the caret is in a `/<query>` slice, filters by fuzzy substring match, and
- * inserts the selected command back into the textarea on Enter / Tab / click.
+ * the caret is in a `/<query>` slice, filters commands/skills by substring
+ * match and saved prompts by name, and inserts the selection back into the
+ * textarea on Enter / Tab / click — command names insert as-is, saved
+ * prompts insert their content.
  *
  * Designed to live next to the textarea — it doesn't render the textarea
  * itself, so the form keeps full control over styling, placeholder, etc.
  */
-export function SlashAutocomplete({ commands, value, onChange, textareaRef, placement = "below" }: Props) {
+export function SlashAutocomplete({ commands, savedPrompts, value, onChange, textareaRef, placement = "below" }: Props) {
   const [caret, setCaret] = useState<number>(0);
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLUListElement>(null);
@@ -84,40 +94,44 @@ export function SlashAutocomplete({ commands, value, onChange, textareaRef, plac
   }, [textareaRef]);
 
   const slice = useMemo(() => findActiveQuery(value, caret), [value, caret]);
-  const open = slice !== null && commands.length > 0;
+  const open = slice !== null && (commands.length > 0 || (savedPrompts?.length ?? 0) > 0);
 
-  const filtered = useMemo(() => {
+  // Commands first, saved prompts second — the render groups them under a
+  // "Saved Prompts" label so the combined list stays visually distinct while
+  // ↑/↓/Enter treat it as one flat sequence.
+  const filtered = useMemo<Row[]>(() => {
     if (!slice) return [];
     const q = slice.query.toLowerCase();
-    if (!q) return commands;
-    return commands.filter((c) => {
+    const cmdRows: Row[] = (q ? commands.filter((c) => {
       const hay = (c.name.slice(1) + " " + c.description).toLowerCase();
       return hay.includes(q);
-    });
-  }, [commands, slice]);
+    }) : commands).map((cmd) => ({ tag: "cmd", cmd }));
+    const promptRows: Row[] = filterPromptsForSlash(savedPrompts ?? [], slice.query).map((prompt) => ({ tag: "prompt", prompt }));
+    return [...cmdRows, ...promptRows];
+  }, [commands, savedPrompts, slice]);
 
   // Reset highlight when the filtered list changes (avoid a stale index that
   // points past the new list's length).
   useEffect(() => { setActive(0); }, [slice?.query, filtered.length]);
 
-  // Keep the highlighted row scrolled into view.
+  // Keep the highlighted row scrolled into view. `data-idx` (not positional
+  // children) since the "Saved Prompts" group label is itself a list child.
   useEffect(() => {
     if (!open) return;
-    const list = listRef.current;
-    if (!list) return;
-    const item = list.children[active] as HTMLElement | undefined;
-    item?.scrollIntoView({ block: "nearest" });
+    const row = listRef.current?.querySelector<HTMLElement>(`[data-idx="${active}"]`);
+    row?.scrollIntoView({ block: "nearest" });
   }, [active, open]);
 
-  const insert = (cmd: AvailableCommand) => {
+  const insert = (row: Row) => {
     if (!slice) return;
     const before = value.slice(0, slice.start);
     const after = value.slice(slice.end);
-    // Trailing space so the user can immediately type arguments after `/cmd`.
-    const next = before + cmd.name + " " + after;
+    const text = row.tag === "cmd" ? row.cmd.name : row.prompt.content;
+    // Trailing space so the user can immediately type arguments / keep typing.
+    const next = before + text + " " + after;
     onChange(next);
-    // Restore caret right after the inserted command + space.
-    const newCaret = before.length + cmd.name.length + 1;
+    // Restore caret right after the inserted text + space.
+    const newCaret = before.length + text.length + 1;
     requestAnimationFrame(() => {
       const el = textareaRef.current;
       if (!el) return;
@@ -174,48 +188,74 @@ export function SlashAutocomplete({ commands, value, onChange, textareaRef, plac
       )}
     >
       <ul ref={listRef} className="py-1">
-        {filtered.map((c, i) => (
-          <li key={`${c.kind}:${c.name}`}>
+        {filtered.map((row, i) => {
+          // Group label right before the first prompt row — commands (if any)
+          // always come first, so this fires at most once.
+          const showPromptLabel = row.tag === "prompt" && filtered[i - 1]?.tag !== "prompt";
+          return (
+          <li key={row.tag === "cmd" ? `${row.cmd.kind}:${row.cmd.name}` : `prompt:${row.prompt.id}`}>
+            {showPromptLabel && (
+              <div className="flex items-center gap-1.5 px-3 pb-0.5 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                <BookText className="size-3 opacity-70" />
+                Saved Prompts
+              </div>
+            )}
             <button
               type="button"
+              data-idx={i}
               // `onMouseDown` instead of `onClick` so the textarea doesn't lose
               // focus before the insertion runs (the popover handles its own
               // focus internally).
-              onMouseDown={(e) => { e.preventDefault(); insert(c); }}
+              onMouseDown={(e) => { e.preventDefault(); insert(row); }}
               onMouseEnter={() => setActive(i)}
               className={cn(
                 "flex w-full items-start gap-2 px-3 py-1.5 text-left text-[11px]",
                 i === active ? "bg-accent text-accent-foreground" : "hover:bg-accent/40",
               )}
             >
-              {c.kind === "skill" ? (
-                <Sparkles className="mt-0.5 size-3 shrink-0 opacity-70" />
-              ) : (
-                <Terminal className="mt-0.5 size-3 shrink-0 opacity-70" />
-              )}
-              <span className="min-w-0 flex-1">
-                <span className="flex items-center gap-1.5">
-                  <span className="font-mono">{c.name}</span>
-                  <span
-                    className={cn(
-                      "rounded px-1 py-px text-[10px] uppercase tracking-wide",
-                      c.source === "project"
-                        ? "bg-primary/20 text-primary"
-                        : "bg-muted text-muted-foreground",
+              {row.tag === "cmd" ? (
+                <>
+                  {row.cmd.kind === "skill" ? (
+                    <Sparkles className="mt-0.5 size-3 shrink-0 opacity-70" />
+                  ) : (
+                    <Terminal className="mt-0.5 size-3 shrink-0 opacity-70" />
+                  )}
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5">
+                      <span className="font-mono">{row.cmd.name}</span>
+                      <span
+                        className={cn(
+                          "rounded px-1 py-px text-[10px] uppercase tracking-wide",
+                          row.cmd.source === "project"
+                            ? "bg-primary/20 text-primary"
+                            : "bg-muted text-muted-foreground",
+                        )}
+                      >
+                        {row.cmd.source}
+                      </span>
+                    </span>
+                    {row.cmd.description && (
+                      <span className="mt-0.5 block truncate text-muted-foreground">
+                        {row.cmd.description}
+                      </span>
                     )}
-                  >
-                    {c.source}
                   </span>
-                </span>
-                {c.description && (
-                  <span className="mt-0.5 block truncate text-muted-foreground">
-                    {c.description}
+                </>
+              ) : (
+                <>
+                  <BookText className="mt-0.5 size-3 shrink-0 opacity-70" />
+                  <span className="min-w-0 flex-1">
+                    <span className="font-medium">{row.prompt.name}</span>
+                    <span className="mt-0.5 block truncate text-muted-foreground">
+                      {row.prompt.content}
+                    </span>
                   </span>
-                )}
-              </span>
+                </>
+              )}
             </button>
           </li>
-        ))}
+          );
+        })}
       </ul>
     </div>
   );

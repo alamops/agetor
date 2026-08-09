@@ -31,6 +31,7 @@ import {
   type AgentStatus,
   type Harness,
   type Isolation,
+  type SavedPrompt,
   type TaskReference,
   type TaskType,
 } from "../../../shared/types.ts";
@@ -243,6 +244,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   const [dropHint, setDropHint] = useState<string | null>(null);
   const [agentCommands, setAgentCommands] = useState<AvailableCommand[]>([]);
   const [agentExtensions, setAgentExtensions] = useState<AvailableExtension[]>([]);
+  // User-global saved prompts — not keyed on agent/workdir, unlike the two
+  // lists above. Loaded once on mount; refetched when the Extensions popover
+  // opens so an edit made in Settings mid-session shows up.
+  const [savedPrompts, setSavedPrompts] = useState<SavedPrompt[]>([]);
+  const loadSavedPrompts = () => {
+    void api.listSavedPrompts().then(setSavedPrompts).catch(() => setSavedPrompts([]));
+  };
+  useEffect(() => { loadSavedPrompts(); }, []);
   const promptRef = useRef<HTMLTextAreaElement>(null);
 
   // Refresh both the `/…` autocomplete (commands/skills) and the Extensions
@@ -647,6 +656,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                   <label className="text-muted-foreground">Prompt</label>
                   <ExtensionPicker
                     extensions={agentExtensions}
+                    savedPrompts={savedPrompts}
+                    onPromptsOpen={loadSavedPrompts}
                     value={prompt}
                     onChange={setPrompt}
                     textareaRef={promptRef}
@@ -662,11 +673,17 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                     value={prompt}
                     onChange={(e) => { setPrompt(e.target.value); if (dropHint) setDropHint(null); }}
                     onPaste={onPromptPaste}
+                    // Refetch saved prompts on focus (in addition to the
+                    // popover-open refetch) so a deleted/edited prompt made in
+                    // Settings mid-session doesn't linger in the `/`
+                    // autocomplete indefinitely.
+                    onFocus={loadSavedPrompts}
                     rows={6}
                     className="resize-none"
                   />
                   <SlashAutocomplete
                     commands={agentCommands}
+                    savedPrompts={savedPrompts}
                     value={prompt}
                     onChange={setPrompt}
                     textareaRef={promptRef}
