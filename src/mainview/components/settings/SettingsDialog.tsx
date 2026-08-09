@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, Plus, Terminal, Trash2, X } from "lucide-react";
+import { ChevronLeft, Monitor, Moon, Plus, Sun, Terminal, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError, api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
+import { useTheme } from "@/components/theme-provider";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
   SETTINGS_SECTIONS,
@@ -25,10 +26,19 @@ import {
 } from "@/lib/settings-dialog-view";
 import {
   HARNESS_TEMPLATES,
+  THEME_PREFERENCES,
   type AgentKind,
   type Harness,
   type HarnessTemplate,
+  type ThemePreference,
 } from "../../../shared/types.ts";
+
+/** Icon shown per theme preference in the Settings → General picker. */
+const THEME_PREFERENCE_ICON: Record<ThemePreference, typeof Monitor> = {
+  auto: Monitor,
+  dark: Moon,
+  light: Sun,
+};
 
 interface Props {
   open: boolean;
@@ -65,7 +75,7 @@ function parseEnv(raw: string): { env: Record<string, string>; ignored: number }
   return { env, ignored };
 }
 
-/** Kinds still marked "experimental" in the UI — surfaced with the amber
+/** Kinds still marked "experimental" in the UI — surfaced with the warning
  *  badge everywhere a harness/template kind is shown. Extend this list (not
  *  the individual call sites) as a kind graduates out of experimental. */
 function isExperimentalKind(kind: AgentKind): boolean {
@@ -560,8 +570,33 @@ function GeneralSection({
   // Disabled harnesses are excluded from the default-harness picker so a
   // soft-deleted harness can't silently become the default for new tasks.
   const enabledHarnesses = payload.harnesses.filter((h) => h.enabled);
+  const { preference: themePreference, setPreference: setThemePreference } = useTheme();
   return (
     <div className="space-y-4 pt-3 text-sm">
+      <section className="space-y-1">
+        <label className="text-xs text-muted-foreground">Theme</label>
+        <div className="grid grid-cols-3 gap-1">
+          {THEME_PREFERENCES.map((t) => {
+            const Icon = THEME_PREFERENCE_ICON[t.id];
+            return (
+              <Button
+                key={t.id}
+                size="sm"
+                variant={themePreference === t.id ? "default" : "outline"}
+                onClick={() => setThemePreference(t.id)}
+                className="justify-start"
+              >
+                <Icon className="mr-1.5 size-3.5" />
+                {t.label}
+              </Button>
+            );
+          })}
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Auto follows your system's appearance and switches live if it changes.
+        </p>
+      </section>
+
       <section className="space-y-1">
         <label className="text-xs text-muted-foreground">Default harness for new tasks</label>
         <Select value={defaultHarness} onChange={(e) => onPickDefault(e.target.value)}>
@@ -669,14 +704,14 @@ function HarnessesSection({
                       </span>
                     )}
                     {isExperimentalKind(h.kind) && (
-                      <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
+                      <span className="rounded bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning">
                         experimental
                       </span>
                     )}
                     <span
                       className={cn(
                         "inline-block size-1.5 rounded-full",
-                        available ? "bg-emerald-500" : "bg-red-500",
+                        available ? "bg-success" : "bg-danger",
                       )}
                       title={status?.reason ?? status?.path ?? ""}
                     />
@@ -745,7 +780,7 @@ function TemplatePicker({ onPick }: { onPick: (t: HarnessTemplate) => void }) {
               )}
             >
               {experimental && (
-                <span className="mt-0.5 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-500">
+                <span className="mt-0.5 rounded bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning">
                   Experimental
                 </span>
               )}
@@ -891,7 +926,7 @@ function Editor({
                 <AgentIcon kind={k} className="mr-1.5 size-3.5" />
                 {k}
                 {experimental && (
-                  <span className="ml-1.5 rounded bg-amber-500/15 px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-500">
+                  <span className="ml-1.5 rounded bg-warning/15 px-1 py-0.5 text-[9px] font-medium uppercase tracking-wide text-warning">
                     Exp
                   </span>
                 )}
@@ -935,7 +970,7 @@ function Editor({
           className="font-mono text-xs"
         />
         {parsedEnv.ignored > 0 && (
-          <p className="text-[11px] leading-snug text-amber-500">
+          <p className="text-[11px] leading-snug text-warning">
             {parsedEnv.ignored} line{parsedEnv.ignored === 1 ? "" : "s"} ignored — each entry needs <code className="font-mono">KEY=value</code>.
           </p>
         )}

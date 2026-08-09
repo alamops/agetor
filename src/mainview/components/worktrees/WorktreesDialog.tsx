@@ -303,12 +303,12 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
               </>
             )}
             {copy.showDirtyWarning && (
-              <div className="mt-2 font-medium text-rose-400">
+              <div className="mt-2 font-medium text-danger">
                 This worktree has uncommitted changes — they will be permanently discarded.
               </div>
             )}
             {copy.unknown && (
-              <div className="mt-2 font-medium text-rose-400">
+              <div className="mt-2 font-medium text-danger">
                 agetor couldn't check this worktree for uncommitted changes — its git
                 registration may be broken. Anything uncommitted will be permanently
                 discarded.
@@ -469,7 +469,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
         {!loading && error && (
-          <div className="flex items-center justify-center gap-2 py-12 text-sm text-rose-400">
+          <div className="flex items-center justify-center gap-2 py-12 text-sm text-danger">
             <AlertCircle className="size-4" /> {error}
           </div>
         )}
@@ -539,14 +539,14 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                       <span>{projectLabel(w)}</span>
                       <span className="min-w-0 truncate" title={w.path}>{abbreviateHome(w.path, homeDir)}</span>
                       <span>updated {formatAge(w.taskUpdatedAt)}</span>
-                      {w.runActive && <span className="text-emerald-400">running</span>}
+                      {w.runActive && <span className="text-success">running</span>}
                       {status === "loading" && (
                         <Loader2 className="size-3 animate-spin text-muted-foreground" aria-label="Loading git status" />
                       )}
                       {status && status !== "loading" && !status.ignored && (
                         <>
                           {status.dirty && (
-                            <span className="text-amber-400" title="Has uncommitted changes">
+                            <span className="text-warning" title="Has uncommitted changes">
                               uncommitted
                             </span>
                           )}
@@ -561,7 +561,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                           )}
                           {status.merged === true && (
                             <span
-                              className="text-emerald-400"
+                              className="text-success"
                               title={
                                 status.dirty
                                   ? "Merged into the default branch — committed work is safe to delete, but uncommitted changes would be lost"
@@ -574,7 +574,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                         </>
                       )}
                       {w.stale && (
-                        <span className="text-rose-400/80">
+                        <span className="text-danger/80">
                           {w.staleReasons.map((r) => STALE_REASON_LABEL[r]).join(", ")}
                         </span>
                       )}

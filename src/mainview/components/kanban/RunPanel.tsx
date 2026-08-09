@@ -3244,8 +3244,8 @@ function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean
       {s.spawnDepth > 1 && <CornerDownRight className="size-3 shrink-0 text-muted-foreground/60" />}
       {s.status === "running" ? (
         <span className="relative inline-flex size-2 shrink-0">
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 opacity-75" />
-          <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success/60 opacity-75" />
+          <span className="relative inline-flex size-2 rounded-full bg-success" />
         </span>
       ) : (
         <Check className="size-3 shrink-0 text-muted-foreground" />
@@ -3729,8 +3729,8 @@ function RunningIndicator() {
   return (
     <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
       <span className="relative inline-flex size-2">
-        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 opacity-75" />
-        <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success/60 opacity-75" />
+        <span className="relative inline-flex size-2 rounded-full bg-success" />
       </span>
       <span>Agent is working…</span>
     </div>
@@ -4346,7 +4346,7 @@ function ToolInputBody({ name, input }: { name: string; input: unknown }) {
           <ExpandableBlock
             text={input.new_string}
             prefix="+ "
-            className="bg-green-500/10 text-green-600 dark:text-green-400"
+            className="bg-success/10 text-success"
           />
         )}
         {typeof input.content === "string" && (
@@ -5324,9 +5324,9 @@ function TmuxPromptCard({
   }
 
   return (
-    <div className="rounded-md border border-amber-500/60 bg-card p-3 ring-1 ring-amber-500/40">
+    <div className="rounded-md border border-warning/60 bg-card p-3 ring-1 ring-warning/40">
       <div className="mb-2 flex items-center justify-between">
-        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-amber-500">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-warning">
           <Terminal className="size-3.5" aria-hidden /> Claude is paused on a prompt
         </span>
       </div>

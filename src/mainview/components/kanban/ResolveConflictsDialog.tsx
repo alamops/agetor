@@ -256,7 +256,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
         )}
 
         {!loadingHarnesses && loadError && (
-          <div className="flex items-center justify-center gap-2 py-8 text-sm text-rose-400">
+          <div className="flex items-center justify-center gap-2 py-8 text-sm text-danger">
             <AlertCircle className="size-4" /> {loadError}
           </div>
         )}
@@ -311,7 +311,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
                       <span
                         className={cn(
                           "ml-auto inline-block size-1.5 rounded-full",
-                          available ? "bg-emerald-500" : "bg-red-500",
+                          available ? "bg-success" : "bg-danger",
                         )}
                       />
                     </Button>

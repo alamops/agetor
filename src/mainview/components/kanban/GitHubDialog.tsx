@@ -450,10 +450,10 @@ function LabelAssigneeMilestoneFields({
 }
 
 const STATUS_META: Record<DiffFile["status"], { icon: typeof FilePlus; cls: string }> = {
-  added: { icon: FilePlus, cls: "text-emerald-400" },
-  modified: { icon: FilePen, cls: "text-amber-400" },
-  deleted: { icon: FileMinus, cls: "text-rose-400" },
-  renamed: { icon: FileSymlink, cls: "text-sky-400" },
+  added: { icon: FilePlus, cls: "text-success" },
+  modified: { icon: FilePen, cls: "text-warning" },
+  deleted: { icon: FileMinus, cls: "text-danger" },
+  renamed: { icon: FileSymlink, cls: "text-info" },
 };
 
 interface LineCommentTarget {
@@ -510,7 +510,7 @@ function RateLimitBadge({ rateLimit }: { rateLimit: GitHubRateLimit }) {
   const low = rateLimit.limit > 0 && rateLimit.remaining / rateLimit.limit < 0.1;
   return (
     <span
-      className={cn("shrink-0 text-[11px]", low ? "font-medium text-amber-400" : "text-muted-foreground")}
+      className={cn("shrink-0 text-[11px]", low ? "font-medium text-warning" : "text-muted-foreground")}
       title={`GitHub API rate limit (${rateLimit.resource}): ${rateLimit.remaining} of ${rateLimit.limit} requests remaining`}
     >
       {rateLimit.resource}: {rateLimit.remaining}/{rateLimit.limit}
@@ -3857,7 +3857,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         )}
 
         {transferNotice && (
-          <div className="flex items-center justify-between gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+          <div className="flex items-center justify-between gap-2 rounded-md border border-success/40 bg-success/10 px-3 py-2 text-xs text-success">
             <span className="flex items-center gap-1">
               <CheckCircle2 className="size-3.5" />
               {transferNotice.message}
@@ -3885,10 +3885,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
           isCredentialError(error) ? (
             <div
               role="alert"
-              className="mx-auto my-6 flex max-w-md flex-col gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-4"
+              className="mx-auto my-6 flex max-w-md flex-col gap-3 rounded-md border border-warning/40 bg-warning/5 p-4"
             >
               <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-                <KeyRound className="size-4 text-amber-400" />
+                <KeyRound className="size-4 text-warning" />
                 Can&apos;t reach this repository
               </div>
               <p className="text-xs text-muted-foreground">This is usually a missing or invalid credential.</p>
@@ -3911,7 +3911,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
               )}
             </div>
           ) : (
-            <div className="flex items-center justify-center gap-2 py-12 text-sm text-rose-400">
+            <div className="flex items-center justify-center gap-2 py-12 text-sm text-danger">
               <AlertCircle className="size-4" /> {error}
             </div>
           )
@@ -4027,7 +4027,7 @@ function PullComposer({
           New {caps.pullNoun.toLowerCase()}
         </div>
         {error && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+          <span className="inline-flex items-center gap-1 text-[11px] text-danger">
             <AlertCircle className="size-3.5" />
             {error}
           </span>
@@ -4083,13 +4083,13 @@ function PullComposer({
             Push head
           </Button>
           {pushMessage && (
-            <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+            <span className="inline-flex items-center gap-1 text-[11px] text-success">
               <CheckCircle2 className="size-3.5" />
               {pushMessage}
             </span>
           )}
           {pushError && (
-            <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+            <span className="inline-flex items-center gap-1 text-[11px] text-danger">
               <AlertCircle className="size-3.5" />
               {pushError}
             </span>
@@ -4168,7 +4168,7 @@ function IssueComposer({
           New issue
         </div>
         {error && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+          <span className="inline-flex items-center gap-1 text-[11px] text-danger">
             <AlertCircle className="size-3.5" />
             {error}
           </span>
@@ -4311,7 +4311,7 @@ function LabelManager({
         </Button>
       </div>
       {error && (
-        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -4387,7 +4387,7 @@ function LabelRow({
           <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" className="h-7 text-xs" disabled={busy === "save"} />
         </div>
         {error && (
-          <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
+          <div className="mt-1 flex items-center gap-1 text-[11px] text-danger">
             <AlertCircle className="size-3.5" />
             {error}
           </div>
@@ -4414,7 +4414,7 @@ function LabelRow({
         {label.name}
       </span>
       {label.description && <span className="min-w-0 flex-1 truncate text-muted-foreground">{label.description}</span>}
-      {error && <span className="truncate text-[11px] text-rose-400">{error}</span>}
+      {error && <span className="truncate text-[11px] text-danger">{error}</span>}
       <div className="ml-auto flex shrink-0 items-center gap-1">
         <Button
           size="icon"
@@ -4429,7 +4429,7 @@ function LabelRow({
         </Button>
         {confirm ? (
           <>
-            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-rose-400" disabled={busy === "delete"} onClick={() => { void del(); }}>
+            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-danger" disabled={busy === "delete"} onClick={() => { void del(); }}>
               {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : "Confirm"}
             </Button>
             <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" disabled={busy === "delete"} onClick={() => setConfirm(false)}>
@@ -4440,7 +4440,7 @@ function LabelRow({
           <Button
             size="icon"
             variant="ghost"
-            className="size-6 text-muted-foreground hover:text-rose-400"
+            className="size-6 text-muted-foreground hover:text-danger"
             title={authenticated ? "Delete label" : PUSH_ONLY_TITLE}
             aria-label={`Delete ${label.name}`}
             disabled={!!busy || !authenticated}
@@ -4535,7 +4535,7 @@ function MilestoneManager({
         </Button>
       </div>
       {error && (
-        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -4631,7 +4631,7 @@ function MilestoneRow({
           <Input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" className="h-7 text-xs" disabled={busy === "save"} />
         </div>
         {error && (
-          <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
+          <div className="mt-1 flex items-center gap-1 text-[11px] text-danger">
             <AlertCircle className="size-3.5" />
             {error}
           </div>
@@ -4651,7 +4651,7 @@ function MilestoneRow({
 
   return (
     <div className="flex items-center gap-2 rounded px-1 py-1 text-xs">
-      <Milestone className={cn("size-3.5 shrink-0", milestone.state === "closed" ? "text-muted-foreground" : "text-emerald-400")} />
+      <Milestone className={cn("size-3.5 shrink-0", milestone.state === "closed" ? "text-muted-foreground" : "text-success")} />
       <span className={cn("min-w-0 shrink truncate font-medium", milestone.state === "closed" && "text-muted-foreground line-through")}>
         {milestone.title}
       </span>
@@ -4659,7 +4659,7 @@ function MilestoneRow({
         {milestone.openIssues} open · {milestone.closedIssues} closed
         {milestone.dueOn && ` · due ${dueDateInput(milestone.dueOn)}`}
       </span>
-      {error && <span className="truncate text-[11px] text-rose-400">{error}</span>}
+      {error && <span className="truncate text-[11px] text-danger">{error}</span>}
       <div className="ml-auto flex shrink-0 items-center gap-1">
         <Button
           size="icon"
@@ -4684,7 +4684,7 @@ function MilestoneRow({
         </Button>
         {confirm ? (
           <>
-            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-rose-400" disabled={busy === "delete"} onClick={() => { void del(); }}>
+            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-danger" disabled={busy === "delete"} onClick={() => { void del(); }}>
               {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : "Confirm"}
             </Button>
             <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" disabled={busy === "delete"} onClick={() => setConfirm(false)}>
@@ -4695,7 +4695,7 @@ function MilestoneRow({
           <Button
             size="icon"
             variant="ghost"
-            className="size-6 text-muted-foreground hover:text-rose-400"
+            className="size-6 text-muted-foreground hover:text-danger"
             title={authenticated ? "Delete milestone" : PUSH_ONLY_TITLE}
             aria-label={`Delete ${milestone.title}`}
             disabled={!!busy || !authenticated}
@@ -4823,7 +4823,7 @@ function ReleasesManager({
         </Button>
       </div>
       {error && (
-        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -4916,7 +4916,7 @@ function ReleaseRow({
           </label>
         </div>
         {error && (
-          <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
+          <div className="mt-1 flex items-center gap-1 text-[11px] text-danger">
             <AlertCircle className="size-3.5" />
             {error}
           </div>
@@ -4936,13 +4936,13 @@ function ReleaseRow({
 
   return (
     <div className="flex items-center gap-2 rounded px-1 py-1 text-xs">
-      <Rocket className="size-3.5 shrink-0 text-emerald-400" />
+      <Rocket className="size-3.5 shrink-0 text-success" />
       <span className="shrink-0 rounded border border-border/60 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">{release.tagName}</span>
       <span className="min-w-0 shrink truncate font-medium">{release.name || release.tagName}</span>
-      {release.draft && <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">Draft</span>}
-      {release.prerelease && <span className="shrink-0 rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-400">Pre-release</span>}
+      {release.draft && <span className="shrink-0 rounded bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium text-warning">Draft</span>}
+      {release.prerelease && <span className="shrink-0 rounded bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info">Pre-release</span>}
       <span className="shrink-0 text-[11px] text-muted-foreground">{releaseDateLabel(release)}</span>
-      {error && <span className="truncate text-[11px] text-rose-400">{error}</span>}
+      {error && <span className="truncate text-[11px] text-danger">{error}</span>}
       <div className="ml-auto flex shrink-0 items-center gap-1">
         <Button
           size="icon"
@@ -4967,7 +4967,7 @@ function ReleaseRow({
         </Button>
         {confirm ? (
           <>
-            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-rose-400" disabled={busy === "delete"} onClick={() => { void del(); }}>
+            <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px] text-danger" disabled={busy === "delete"} onClick={() => { void del(); }}>
               {busy === "delete" ? <Loader2 className="size-3 animate-spin" /> : "Confirm"}
             </Button>
             <Button size="sm" variant="ghost" className="h-6 px-1.5 text-[11px]" disabled={busy === "delete"} onClick={() => setConfirm(false)}>
@@ -4978,7 +4978,7 @@ function ReleaseRow({
           <Button
             size="icon"
             variant="ghost"
-            className="size-6 text-muted-foreground hover:text-rose-400"
+            className="size-6 text-muted-foreground hover:text-danger"
             title={authenticated ? "Delete release" : PUSH_ONLY_TITLE}
             aria-label={`Delete ${release.tagName}`}
             disabled={!!busy || !authenticated}
@@ -5069,7 +5069,7 @@ function NotificationsPanel({
         </div>
       </div>
       {error && (
-        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -5121,7 +5121,7 @@ function NotificationRow({
         <span
           className={cn(
             "size-1.5 shrink-0 rounded-full",
-            notification.unread ? "bg-sky-400" : "bg-transparent",
+            notification.unread ? "bg-info" : "bg-transparent",
           )}
           aria-hidden
         />
@@ -5183,7 +5183,7 @@ function NotificationRow({
         )}
       </div>
       {error && (
-        <div className="mt-0.5 flex items-center gap-1 pl-3.5 text-[11px] text-rose-400">
+        <div className="mt-0.5 flex items-center gap-1 pl-3.5 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -5198,11 +5198,11 @@ function NotificationRow({
  *  emerald for a clean conclusion, rose otherwise (failure/cancelled/
  *  timed_out/action_required/…). */
 function workflowRunClass(run: GitHubWorkflowRun): string {
-  if (run.status !== "completed") return "text-sky-400";
+  if (run.status !== "completed") return "text-info";
   if (run.conclusion === "success" || run.conclusion === "neutral" || run.conclusion === "skipped") {
-    return "text-emerald-400";
+    return "text-success";
   }
-  return "text-rose-400";
+  return "text-danger";
 }
 
 /** Label shown on the run's status pill — the conclusion once completed
@@ -5282,7 +5282,7 @@ function ActionsPanel({
         </div>
       </div>
       {error && (
-        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -5377,13 +5377,13 @@ function ActionsPanel({
           </Button>
         </div>
         {dispatchError && (
-          <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+          <div className="mb-2 flex items-center gap-1 text-[11px] text-danger">
             <AlertCircle className="size-3.5" />
             {dispatchError}
           </div>
         )}
         {dispatchMessage && !dispatchError && (
-          <div className="mb-2 flex items-center gap-1 text-[11px] text-emerald-400">
+          <div className="mb-2 flex items-center gap-1 text-[11px] text-success">
             <Check className="size-3.5" />
             {dispatchMessage}
           </div>
@@ -5450,7 +5450,7 @@ function WorkflowRunRow({
             <Button
               size="icon"
               variant="ghost"
-              className="size-6 text-muted-foreground hover:text-rose-400"
+              className="size-6 text-muted-foreground hover:text-danger"
               title={authenticated ? "Cancel run" : PUSH_ONLY_TITLE}
               aria-label={`Cancel run #${run.runNumber}`}
               disabled={isBusy || !authenticated}
@@ -5495,7 +5495,7 @@ function WorkflowRunRow({
         )}
       </div>
       {error && (
-        <div className="mt-0.5 flex items-center gap-1 pl-0.5 text-[11px] text-rose-400">
+        <div className="mt-0.5 flex items-center gap-1 pl-0.5 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -5574,7 +5574,7 @@ function ProjectsPanel({
         </div>
       </div>
       {error && (
-        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -5620,7 +5620,7 @@ function ProjectsPanel({
             </Button>
           </div>
           {itemsError && (
-            <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+            <div className="mb-2 flex items-center gap-1 text-[11px] text-danger">
               <AlertCircle className="size-3.5" />
               {itemsError}
             </div>
@@ -5682,7 +5682,7 @@ function ProjectsPanel({
               </Button>
             </div>
             {addError && (
-              <div className="flex items-center gap-1 text-[11px] text-rose-400">
+              <div className="flex items-center gap-1 text-[11px] text-danger">
                 <AlertCircle className="size-3.5" />
                 {addError}
               </div>
@@ -5714,10 +5714,10 @@ function ProjectItemRow({
   const isBusy = !!busy;
   const Icon = item.contentType === "PullRequest" ? GitPullRequest : item.contentType === "DraftIssue" ? FileText : CircleDot;
   const iconClass = item.contentType === "PullRequest"
-    ? "text-emerald-400"
+    ? "text-success"
     : item.contentType === "DraftIssue"
       ? "text-muted-foreground"
-      : "text-sky-400";
+      : "text-info";
   const label = item.contentType === "DraftIssue"
     ? item.title || "(untitled draft)"
     : item.number != null
@@ -5755,7 +5755,7 @@ function ProjectItemRow({
         <Button
           size="icon"
           variant="ghost"
-          className="size-6 shrink-0 text-muted-foreground hover:text-rose-400"
+          className="size-6 shrink-0 text-muted-foreground hover:text-danger"
           title={authenticated ? "Remove from project" : PUSH_ONLY_TITLE}
           aria-label={`Remove ${label} from project`}
           disabled={isBusy || !authenticated}
@@ -5765,7 +5765,7 @@ function ProjectItemRow({
         </Button>
       </div>
       {error && (
-        <div className="mt-0.5 flex items-center gap-1 pl-0.5 text-[11px] text-rose-400">
+        <div className="mt-0.5 flex items-center gap-1 pl-0.5 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -5887,7 +5887,7 @@ function DiscussionsPanel({
         </div>
       </div>
       {error && (
-        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -5931,7 +5931,7 @@ function DiscussionsPanel({
             </Button>
           </div>
           {createError && (
-            <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
+            <div className="mt-1 flex items-center gap-1 text-[11px] text-danger">
               <AlertCircle className="size-3.5" />
               {createError}
             </div>
@@ -6005,7 +6005,7 @@ function DiscussionRow({
   return (
     <div className="rounded-md border border-border/50 bg-background/30">
       <div className="flex items-center gap-2 px-2 py-1.5 text-xs">
-        <MessagesSquare className="size-3.5 shrink-0 text-sky-400" />
+        <MessagesSquare className="size-3.5 shrink-0 text-info" />
         <span className="min-w-0 flex-1 truncate font-medium" title={discussion.title}>
           #{discussion.number} {discussion.title}
         </span>
@@ -6016,7 +6016,7 @@ function DiscussionRow({
         )}
         {discussion.answered && (
           <span title="Answered">
-            <CheckCircle2 className="size-3.5 shrink-0 text-emerald-400" />
+            <CheckCircle2 className="size-3.5 shrink-0 text-success" />
           </span>
         )}
         <span className="shrink-0 text-[10px] text-muted-foreground">{discussion.author ?? "unknown"}</span>
@@ -6033,7 +6033,7 @@ function DiscussionRow({
         <Button
           size="icon"
           variant="ghost"
-          className="size-6 shrink-0 text-muted-foreground hover:text-rose-400"
+          className="size-6 shrink-0 text-muted-foreground hover:text-danger"
           title={canDelete ? "Delete discussion" : PUSH_ONLY_TITLE}
           aria-label={`Delete discussion #${discussion.number}`}
           disabled={busy || !canDelete}
@@ -6053,7 +6053,7 @@ function DiscussionRow({
         </Button>
       </div>
       {error && (
-        <div className="flex items-center gap-1 px-2 pb-1.5 text-[11px] text-rose-400">
+        <div className="flex items-center gap-1 px-2 pb-1.5 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -6104,7 +6104,7 @@ function DiscussionDetailView({
         </div>
       )}
       {!loading && error && (
-        <div className="flex items-center gap-1 py-2 text-[11px] text-rose-400">
+        <div className="flex items-center gap-1 py-2 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -6145,7 +6145,7 @@ function DiscussionDetailView({
             />
             <div className="mt-1 flex items-center justify-between gap-2">
               {commentError && (
-                <div className="flex items-center gap-1 text-[11px] text-rose-400">
+                <div className="flex items-center gap-1 text-[11px] text-danger">
                   <AlertCircle className="size-3.5" />
                   {commentError}
                 </div>
@@ -6196,7 +6196,7 @@ function DiscussionCommentRow({
         <span className="font-medium text-foreground">{comment.author ?? "unknown"}</span>
         <span>{fmtDate(comment.createdAt)}</span>
         {comment.isAnswer && (
-          <span className="flex items-center gap-0.5 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
+          <span className="flex items-center gap-0.5 rounded bg-success/15 px-1.5 py-0.5 text-[10px] font-medium text-success">
             <Check className="size-3" /> Answer
           </span>
         )}
@@ -6216,7 +6216,7 @@ function DiscussionCommentRow({
           <Button
             size="icon"
             variant="ghost"
-            className="size-5 text-muted-foreground hover:text-rose-400"
+            className="size-5 text-muted-foreground hover:text-danger"
             title={canDelete ? "Delete comment" : PUSH_ONLY_TITLE}
             aria-label="Delete comment"
             disabled={isBusy || !canDelete}
@@ -6230,7 +6230,7 @@ function DiscussionCommentRow({
         <ReactMarkdown remarkPlugins={[remarkGfm]} components={GH_MD_COMPONENTS}>{comment.body}</ReactMarkdown>
       </div>
       {error && (
-        <div className="mt-1 flex items-center gap-1 text-[11px] text-rose-400">
+        <div className="mt-1 flex items-center gap-1 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -6258,10 +6258,10 @@ function GitHubItemRow({
 }) {
   const merged = item.kind === "pulls" && !!item.mergedAt;
   const stateClass = item.state === "open"
-    ? "text-emerald-400"
+    ? "text-success"
     : merged
       ? "text-violet-400"
-      : "text-rose-400";
+      : "text-danger";
   return (
     <div className="rounded-md border border-border/60 bg-card">
       <div className="flex items-start gap-3 p-3">
@@ -6779,27 +6779,27 @@ function GitHubItemDetail({
 }
 
 function checkClass(run: GitHubCheckRun): string {
-  if (run.status !== "completed") return "text-sky-400";
+  if (run.status !== "completed") return "text-info";
   if (run.conclusion === "success" || run.conclusion === "neutral" || run.conclusion === "skipped") {
-    return "text-emerald-400";
+    return "text-success";
   }
-  return "text-rose-400";
+  return "text-danger";
 }
 
 /** Combined-status (F19) state → color, shared by the summary line and each
  *  per-context row. GitHub's states: success/pending/failure/error, plus the
  *  empty string when a ref has no statuses at all. */
 function commitStatusClass(state: string): string {
-  if (state === "success") return "text-emerald-400";
-  if (state === "pending") return "text-sky-400";
-  if (state === "failure" || state === "error") return "text-rose-400";
+  if (state === "success") return "text-success";
+  if (state === "pending") return "text-info";
+  if (state === "failure" || state === "error") return "text-danger";
   return "text-muted-foreground";
 }
 
 const MERGE_TONE_CLASS: Record<MergeTone, string> = {
-  ok: "text-emerald-400",
-  warn: "text-amber-400",
-  bad: "text-rose-400",
+  ok: "text-success",
+  warn: "text-warning",
+  bad: "text-danger",
   muted: "text-muted-foreground",
 };
 
@@ -6889,13 +6889,13 @@ function IssueActions({
           Issue actions
         </div>
         {message && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+          <span className="inline-flex items-center gap-1 text-[11px] text-success">
             <CheckCircle2 className="size-3.5" />
             {message}
           </span>
         )}
         {error && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+          <span className="inline-flex items-center gap-1 text-[11px] text-danger">
             <AlertCircle className="size-3.5" />
             {error}
           </span>
@@ -6977,7 +6977,7 @@ function IssueActions({
           />
           {transferConfirming ? (
             <>
-              <span className="text-[11px] text-amber-400">
+              <span className="text-[11px] text-warning">
                 Transfer #{item.number} to {transferDraft.trim() || "…"}? This can't be undone.
               </span>
               <Button size="sm" variant="destructive" disabled={pushDisabled || !transferDraft.trim()} title={pushTitle} onClick={onTransferIssue}>
@@ -7054,7 +7054,7 @@ function IssuePinToggle({ path, number, canPush }: { path: string; number: numbe
         )}
         {pinned ? "Unpin issue" : "Pin issue"}
       </Button>
-      {error && <span className="text-[11px] text-rose-400">{error}</span>}
+      {error && <span className="text-[11px] text-danger">{error}</span>}
     </div>
   );
 }
@@ -7141,7 +7141,7 @@ function SubIssues({ path, issueNumber, canPush }: { path: string; issueNumber: 
             </div>
           )}
           {error && (
-            <div className="mb-2 flex items-center justify-between gap-2 text-[11px] text-rose-400">
+            <div className="mb-2 flex items-center justify-between gap-2 text-[11px] text-danger">
               <span className="flex items-center gap-1">
                 <AlertCircle className="size-3.5" /> {error}
               </span>
@@ -7165,7 +7165,7 @@ function SubIssues({ path, issueNumber, canPush }: { path: string; issueNumber: 
                     #{child.number} {child.title}
                   </button>
                   <div className="flex shrink-0 items-center gap-2">
-                    <span className={child.state === "open" ? "text-emerald-400" : "text-rose-400"}>{child.state}</span>
+                    <span className={child.state === "open" ? "text-success" : "text-danger"}>{child.state}</span>
                     <Button
                       size="icon"
                       variant="ghost"
@@ -7233,7 +7233,7 @@ function ItemEditor({
   return (
     <div className="rounded-md border border-border/60 bg-card p-3">
       {error && (
-        <div className="mb-2 flex items-center gap-1 text-[11px] text-rose-400">
+        <div className="mb-2 flex items-center gap-1 text-[11px] text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -7331,13 +7331,13 @@ function PullTriage({
           Triage
         </div>
         {message && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+          <span className="inline-flex items-center gap-1 text-[11px] text-success">
             <CheckCircle2 className="size-3.5" />
             {message}
           </span>
         )}
         {error && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+          <span className="inline-flex items-center gap-1 text-[11px] text-danger">
             <AlertCircle className="size-3.5" />
             {error}
           </span>
@@ -7516,13 +7516,13 @@ function PullActions({
           </Button>
         )}
         {message && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+          <span className="inline-flex items-center gap-1 text-[11px] text-success">
             <CheckCircle2 className="size-3.5" />
             {message}
           </span>
         )}
         {error && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-rose-400">
+          <span className="inline-flex items-center gap-1 text-[11px] text-danger">
             <AlertCircle className="size-3.5" />
             {error}
           </span>
@@ -7536,7 +7536,7 @@ function PullActions({
               <Loader2 className="size-3.5 animate-spin" /> Checking mergeability…
             </span>
           ) : mergeabilityError ? (
-            <span className="inline-flex items-center gap-1.5 text-[11px] text-rose-400">
+            <span className="inline-flex items-center gap-1.5 text-[11px] text-danger">
               <AlertCircle className="size-3.5" /> {mergeabilityError}
             </span>
           ) : view ? (
@@ -7552,7 +7552,7 @@ function PullActions({
                 </Button>
               )}
               {resolveConfirmed && (
-                <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+                <span className="inline-flex items-center gap-1 text-[11px] text-success">
                   <CheckCircle2 className="size-3.5" />
                   Task created and started — check the board
                 </span>
@@ -7588,7 +7588,7 @@ function PullActions({
           <div className="mb-1 flex items-center justify-between gap-2">
             <span className="text-[11px] font-medium uppercase text-muted-foreground">Review</span>
             {pendingCount > 0 && (
-              <span className="inline-flex items-center gap-1 text-[11px] text-sky-400">
+              <span className="inline-flex items-center gap-1 text-[11px] text-info">
                 <MessageSquare className="size-3 shrink-0" />
                 {pendingCount} inline comment{pendingCount === 1 ? "" : "s"} queued
               </span>
@@ -7664,7 +7664,7 @@ function PullActions({
             <div className="mt-2 flex items-center gap-2">
               {mergeability?.autoMerge ? (
                 <>
-                  <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400">
+                  <span className="inline-flex items-center gap-1 text-[11px] text-success">
                     <CheckCircle2 className="size-3.5" /> Auto-merge enabled
                   </span>
                   <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onToggleAutoMerge}>
@@ -7712,7 +7712,7 @@ function PullActions({
       </div>
 
       {pendingCount > 0 && (
-        <div className="mt-3 flex items-start gap-1.5 text-[11px] text-amber-400">
+        <div className="mt-3 flex items-start gap-1.5 text-[11px] text-warning">
           <AlertCircle className="mt-px size-3.5 shrink-0" />
           {pendingCount} review comment{pendingCount === 1 ? "" : "s"} queued — submit via Approve / Comment / Request; merging or closing won't post {pendingCount === 1 ? "it" : "them"}.
         </div>
@@ -7791,7 +7791,7 @@ function PullCommits({
             </div>
           )}
           {!loading && error && (
-            <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-rose-400">
+            <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-danger">
               <div className="flex items-center gap-2">
                 <AlertCircle className="size-4" /> {error}
               </div>
@@ -7879,7 +7879,7 @@ function CheckRuns({
         </div>
       )}
       {!loading && error && (
-        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-rose-400">
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-danger">
           <div className="flex items-center gap-2">
             <AlertCircle className="size-4" /> {error}
           </div>
@@ -7981,7 +7981,7 @@ function CommitStatus({
         </div>
       )}
       {!loading && error && (
-        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-rose-400">
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-danger">
           <div className="flex items-center gap-2">
             <AlertCircle className="size-4" /> {error}
           </div>
@@ -8069,8 +8069,8 @@ function PullDiff({
             <div className="shrink-0 font-mono text-[11px] text-muted-foreground">
               {diff.files.length} {diff.files.length === 1 ? "file" : "files"}
               {" "}
-              <span className="text-emerald-400">+{totals.additions}</span>{" "}
-              <span className="text-rose-400">-{totals.deletions}</span>
+              <span className="text-success">+{totals.additions}</span>{" "}
+              <span className="text-danger">-{totals.deletions}</span>
             </div>
           )}
           <Button
@@ -8093,7 +8093,7 @@ function PullDiff({
         </div>
       )}
       {!loading && error && (
-        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-8 text-center text-sm text-rose-400">
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-8 text-center text-sm text-danger">
           <div className="flex items-center gap-2">
             <AlertCircle className="size-4" /> {error}
           </div>
@@ -8142,7 +8142,7 @@ function PendingReview({
         Pending review ({comments.length})
       </div>
       {stale && (
-        <div className="mb-2 flex items-start gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-400">
+        <div className="mb-2 flex items-start gap-1.5 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-[11px] text-warning">
           <AlertCircle className="mt-px size-3.5 shrink-0" />
           The diff changed since these were queued — their line numbers may be stale, and GitHub rejects the whole review if any line no longer matches. Re-queue them against the current diff before submitting.
         </div>
@@ -8262,7 +8262,7 @@ function ReviewComments({
       </div>
 
       {threadsTruncated && (
-        <div className="mb-2 flex items-start gap-1.5 text-[11px] text-amber-400">
+        <div className="mb-2 flex items-start gap-1.5 text-[11px] text-warning">
           <AlertCircle className="mt-px size-3.5 shrink-0" />
           This pull request has more than 100 review threads — resolve controls cover only the first 100.
         </div>
@@ -8274,7 +8274,7 @@ function ReviewComments({
         </div>
       )}
       {!loading && error && (
-        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-rose-400">
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-danger">
           <div className="flex items-center gap-2">
             <AlertCircle className="size-4" /> {error}
           </div>
@@ -8302,7 +8302,7 @@ function ReviewComments({
                   <span>{comment.side === "LEFT" ? "old" : "new"} side</span>
                   <span>{fmtDate(comment.createdAt)}</span>
                   {thread?.isResolved && (
-                    <span className="inline-flex items-center gap-1 text-emerald-400">
+                    <span className="inline-flex items-center gap-1 text-success">
                       <CheckCircle2 className="size-3" />
                       resolved
                     </span>
@@ -8329,7 +8329,7 @@ function ReviewComments({
                   )}
                 </div>
                 {thread && threadError?.id === thread.threadId && (
-                  <div className="flex items-center gap-1 border-b border-border/50 px-3 py-1.5 text-[11px] text-rose-400">
+                  <div className="flex items-center gap-1 border-b border-border/50 px-3 py-1.5 text-[11px] text-danger">
                     <AlertCircle className="size-3.5" />
                     {threadError.msg}
                   </div>
@@ -8425,7 +8425,7 @@ function Conversation({
       )}
 
       {!loading && error && (
-        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-rose-400">
+        <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-border/60 py-6 text-center text-sm text-danger">
           <div className="flex items-center gap-2">
             <AlertCircle className="size-4" /> {error}
           </div>
@@ -8583,7 +8583,7 @@ function EditableCommentBody({
           disabled={busy === "save"}
         />
         {error && (
-          <div className="mt-2 flex items-center gap-1 text-xs text-rose-400">
+          <div className="mt-2 flex items-center gap-1 text-xs text-danger">
             <AlertCircle className="size-3.5" />
             {error}
           </div>
@@ -8611,9 +8611,9 @@ function EditableCommentBody({
             code({ className, children }) {
               if (typeof className === "string" && /language-suggestion/.test(className)) {
                 return (
-                  <span className="my-2 block overflow-hidden rounded-md border border-emerald-500/40 bg-emerald-500/10">
-                    <span className="flex items-center justify-between gap-2 border-b border-emerald-500/30 px-2 py-1">
-                      <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-400">
+                  <span className="my-2 block overflow-hidden rounded-md border border-success/40 bg-success/10">
+                    <span className="flex items-center justify-between gap-2 border-b border-success/30 px-2 py-1">
+                      <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-success">
                         <Sparkles className="size-3" />
                         Suggested change
                       </span>
@@ -8649,7 +8649,7 @@ function EditableCommentBody({
         <span className="italic text-muted-foreground">Empty comment.</span>
       )}
       {error && (
-        <div className="mt-2 flex items-center gap-1 text-xs text-rose-400">
+        <div className="mt-2 flex items-center gap-1 text-xs text-danger">
           <AlertCircle className="size-3.5" />
           {error}
         </div>
@@ -8672,7 +8672,7 @@ function EditableCommentBody({
               <Button
                 size="sm"
                 variant="ghost"
-                className="h-6 px-2 text-[11px] text-rose-400"
+                className="h-6 px-2 text-[11px] text-danger"
                 disabled={busy === "delete"}
                 onClick={() => { void del(); }}
               >
@@ -8693,7 +8693,7 @@ function EditableCommentBody({
             <Button
               size="sm"
               variant="ghost"
-              className="h-6 px-2 text-[11px] text-muted-foreground hover:text-rose-400"
+              className="h-6 px-2 text-[11px] text-muted-foreground hover:text-danger"
               disabled={!!busy}
               onClick={() => setConfirmDelete(true)}
             >
@@ -8887,7 +8887,7 @@ function Reactions({
           <Plus className="size-3.5" />
         </Button>
         {pickerOpen && (
-          <div className="absolute left-0 top-7 z-10 flex gap-0.5 rounded-md border border-border/60 bg-popover p-1 shadow-md">
+          <div className="absolute left-0 top-7 z-10 flex gap-0.5 rounded-md border border-border bg-card text-card-foreground p-1 shadow-xl">
             {REACTION_CONTENTS.map((content) => (
               <button
                 key={content}
@@ -8907,7 +8907,7 @@ function Reactions({
         )}
       </div>
       {error && (
-        <span className="text-[11px] text-rose-400" title={error}>
+        <span className="text-[11px] text-danger" title={error}>
           {error}
         </span>
       )}
@@ -8956,7 +8956,7 @@ function DiffFileBlock({
             {file.path}
           </span>
           <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
-            {file.binary ? "binary" : <><span className="text-emerald-400">+{file.additions}</span> <span className="text-rose-400">-{file.deletions}</span></>}
+            {file.binary ? "binary" : <><span className="text-success">+{file.additions}</span> <span className="text-danger">-{file.deletions}</span></>}
           </span>
         </button>
       </div>
@@ -9061,9 +9061,9 @@ function DiffBody({
             <div
               className={cn(
                 "group flex",
-                r.kind === "add" && "bg-emerald-500/10",
-                r.kind === "del" && "bg-rose-500/10",
-                r.kind === "hunk" && "bg-sky-500/10 text-sky-300",
+                r.kind === "add" && "bg-success/10",
+                r.kind === "del" && "bg-danger/10",
+                r.kind === "hunk" && "bg-info/10 text-info",
                 r.kind === "meta" && "text-muted-foreground",
               )}
             >
@@ -9076,8 +9076,8 @@ function DiffBody({
               <span
                 className={cn(
                   "shrink-0 select-none px-1 text-center",
-                  r.kind === "add" && "text-emerald-400",
-                  r.kind === "del" && "text-rose-400",
+                  r.kind === "add" && "text-success",
+                  r.kind === "del" && "text-danger",
                 )}
               >
                 {r.kind === "add" ? "+" : r.kind === "del" ? "-" : " "}
@@ -9100,10 +9100,10 @@ function DiffBody({
                 </button>
               )}
               {postedKey === rowKey && (
-                <span className="sticky right-0 shrink-0 bg-card/90 px-1 text-[11px] text-emerald-400">commented</span>
+                <span className="sticky right-0 shrink-0 bg-card/90 px-1 text-[11px] text-success">commented</span>
               )}
               {allowBatchReview && queued && postedKey !== rowKey && (
-                <span className="sticky right-0 shrink-0 bg-card/90 px-1 text-[11px] text-sky-400">queued</span>
+                <span className="sticky right-0 shrink-0 bg-card/90 px-1 text-[11px] text-info">queued</span>
               )}
             </div>
             {selected && target && (
@@ -9135,7 +9135,7 @@ function DiffBody({
                     Suggest change
                   </label>
                   {error && (
-                    <div className="flex items-center gap-1 text-xs text-rose-400">
+                    <div className="flex items-center gap-1 text-xs text-danger">
                       <AlertCircle className="size-3.5" />
                       {error}
                     </div>

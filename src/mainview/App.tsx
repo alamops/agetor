@@ -12,6 +12,7 @@ import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
+import { ThemeProvider, useTheme } from "@/components/theme-provider";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
 import { UpdateBanner } from "@/components/updater/UpdateBanner";
@@ -23,6 +24,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { dismissPending, notifyWaitingInput, toastApiError, toastError, toastPending, toastSessionEnded, toastSuccess, toastUnknownCommand } from "@/lib/toasts";
 import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
+import { parseThemePreference } from "@/lib/theme";
 import { parsePullNumber } from "@/lib/pr-url";
 import { cn } from "@/lib/utils";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
@@ -135,7 +137,13 @@ function reconcileById<T>(
   return merged;
 }
 
-export default function App() {
+/**
+ * The actual app tree. Split out from the default-exported `App` so it can
+ * live *inside* `<ThemeProvider>` and call `useTheme()` — the provider must
+ * wrap this component, not be called from within it.
+ */
+function AppInner() {
+  const { preference: themePreference, setPreference: setThemePreference } = useTheme();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
@@ -186,6 +194,21 @@ export default function App() {
     const hideTimer = setTimeout(() => splash.classList.add("is-hidden"), remaining);
     const removeTimer = setTimeout(() => splash.remove(), remaining + FADE_MS);
     return () => { clearTimeout(hideTimer); clearTimeout(removeTimer); };
+  }, []);
+
+  // Reconcile the theme preference from the server once at boot. The boot
+  // hash (read by ThemeProvider before this component even mounts) is
+  // authoritative for first paint — this only catches the DB having been
+  // edited out-of-band since then, so on the normal path `themePreference`
+  // already matches and this is a silent no-op (no flash).
+  useEffect(() => {
+    api.listPreferences().then((prefs) => {
+      const dbTheme = parseThemePreference(prefs.theme);
+      if (dbTheme !== themePreference) setThemePreference(dbTheme);
+    }).catch(() => { /* keep the boot-seeded preference */ });
+    // Run once at boot only — intentionally not re-run when the local
+    // preference changes (that would fight the user's own picker clicks).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Per-task serialized-form cache for `reconcileById` below — see that
@@ -727,7 +750,7 @@ export default function App() {
                   <span
                     className={
                       "inline-block size-1.5 rounded-full " +
-                      (a.available ? "bg-emerald-500" : "bg-red-500")
+                      (a.available ? "bg-success" : "bg-danger")
                     }
                   />
                 </span>
@@ -931,5 +954,15 @@ export default function App() {
         onResolved={refreshAgents}
       />
     </div>
+  );
+}
+
+/** Root export — mounts `ThemeProvider` above everything so `AppInner` (and,
+ *  transitively, `SettingsDialog`'s Theme picker) can call `useTheme()`. */
+export default function App() {
+  return (
+    <ThemeProvider>
+      <AppInner />
+    </ThemeProvider>
   );
 }

@@ -220,7 +220,7 @@ export function BranchPicker({ workdir, value, onChange, className, label, title
         {behind > 0 && (
           diverged ? (
             <span
-              className="ml-auto inline-flex items-center gap-0.5 text-xs font-medium text-amber-500"
+              className="ml-auto inline-flex items-center gap-0.5 text-xs font-medium text-warning"
               title={`${selected?.name} has diverged from ${selected?.upstream ?? "the remote"} (${ahead} ahead, ${behind} behind) — fast-forward not possible`}
             >
               <ArrowDownUp className="size-3" aria-hidden />
@@ -228,7 +228,7 @@ export function BranchPicker({ workdir, value, onChange, className, label, title
             </span>
           ) : (
             <span
-              className="ml-auto inline-flex items-center gap-0.5 text-xs font-medium text-amber-500"
+              className="ml-auto inline-flex items-center gap-0.5 text-xs font-medium text-warning"
               title={`${behind} commit${behind === 1 ? "" : "s"} behind ${selected?.upstream ?? "the remote"} — pull to fast-forward`}
             >
               <ArrowDownToLine className="size-3" aria-hidden />

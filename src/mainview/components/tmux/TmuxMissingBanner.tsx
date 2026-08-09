@@ -34,13 +34,13 @@ export function TmuxMissingBanner({ show, onResolve }: Props) {
     <div
       role="status"
       className={cn(
-        "flex items-center gap-3 border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-200",
+        "flex items-center gap-3 border-b border-warning/30 bg-warning/10 px-4 py-2 text-xs text-foreground",
       )}
     >
-      <AlertTriangle className="size-3.5 shrink-0 text-amber-400" aria-hidden />
+      <AlertTriangle className="size-3.5 shrink-0 text-warning" aria-hidden />
       <span className="min-w-0 flex-1">
-        <span className="font-medium text-amber-100">tmux not installed.</span>{" "}
-        <span className="text-amber-200/80">
+        <span className="font-medium text-foreground">tmux not installed.</span>{" "}
+        <span className="text-muted-foreground">
           Claude Code tasks need tmux to run.
         </span>
       </span>
@@ -48,7 +48,7 @@ export function TmuxMissingBanner({ show, onResolve }: Props) {
         variant="outline"
         size="sm"
         onClick={onResolve}
-        className="h-7 border-amber-400/40 bg-amber-500/10 text-amber-100 hover:bg-amber-500/20"
+        className="h-7 border-warning/40 bg-warning/10 text-warning hover:bg-warning/20"
       >
         Resolve
       </Button>
@@ -56,7 +56,7 @@ export function TmuxMissingBanner({ show, onResolve }: Props) {
         type="button"
         onClick={() => setDismissed(true)}
         aria-label="Dismiss"
-        className="rounded p-0.5 text-amber-300/70 hover:bg-amber-500/10 hover:text-amber-100"
+        className="rounded p-0.5 text-warning/70 hover:bg-warning/10 hover:text-warning"
       >
         <X className="size-3.5" />
       </button>

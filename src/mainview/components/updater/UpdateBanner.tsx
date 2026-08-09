@@ -62,24 +62,24 @@ export function UpdateBanner({ snapshot, onChange }: Props) {
     <div
       role="status"
       className={cn(
-        "flex items-center gap-3 border-b border-emerald-500/30 bg-emerald-500/10 px-4 py-2 text-xs text-emerald-200",
+        "flex items-center gap-3 border-b border-success/30 bg-success/10 px-4 py-2 text-xs text-foreground",
       )}
     >
-      <Download className="size-3.5 shrink-0 text-emerald-400" aria-hidden />
+      <Download className="size-3.5 shrink-0 text-success" aria-hidden />
       <span className="min-w-0 flex-1">
-        <span className="font-medium text-emerald-100">
+        <span className="font-medium text-foreground">
           {snapshot.version
             ? `Agetor v${snapshot.version} is ready to install.`
             : "An update is ready to install."}
         </span>{" "}
-        <span className="text-emerald-200/80">Restart Agetor to apply.</span>
+        <span className="text-muted-foreground">Restart Agetor to apply.</span>
       </span>
       <Button
         variant="outline"
         size="sm"
         onClick={apply}
         disabled={busy}
-        className="h-7 border-emerald-400/40 bg-emerald-500/10 text-emerald-100 hover:bg-emerald-500/20"
+        className="h-7 border-success/40 bg-success/10 text-success hover:bg-success/20"
       >
         {busy ? (
           <RefreshCw className="mr-1 size-3 animate-spin" />
@@ -90,7 +90,7 @@ export function UpdateBanner({ snapshot, onChange }: Props) {
         type="button"
         onClick={() => setDismissedVersion(snapshot.version ?? "")}
         aria-label="Dismiss"
-        className="rounded p-0.5 text-emerald-300/70 hover:bg-emerald-500/10 hover:text-emerald-100"
+        className="rounded p-0.5 text-success/70 hover:bg-success/10 hover:text-success"
       >
         <X className="size-3.5" />
       </button>

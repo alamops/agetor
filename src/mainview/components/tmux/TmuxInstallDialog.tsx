@@ -109,7 +109,7 @@ export function TmuxInstallDialog({ open, onClose, onResolved }: Props) {
               <ChevronLeft className="size-4" />
             </Button>
           )}
-          <div className="rounded-md bg-amber-500/10 p-1.5 text-amber-500">
+          <div className="rounded-md bg-warning/10 p-1.5 text-warning">
             <Terminal className="size-4" />
           </div>
           <h2 id="tmux-install-title" className="text-base font-semibold">
