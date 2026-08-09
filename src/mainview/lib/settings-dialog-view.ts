@@ -1,10 +1,11 @@
 import type { HarnessTemplate } from "../../shared/types.ts";
 
-/** The three left-sidebar sections in the Settings dialog. */
+/** The left-sidebar sections in the Settings dialog. */
 export const SETTINGS_SECTIONS = [
   { id: "general", label: "General" },
   { id: "harnesses", label: "Harnesses" },
   { id: "git", label: "Git Integration" },
+  { id: "prompts", label: "Saved Prompts" },
 ] as const;
 
 export type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];

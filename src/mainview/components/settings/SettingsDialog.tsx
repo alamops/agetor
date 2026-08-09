@@ -11,6 +11,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
+import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { useTheme } from "@/components/theme-provider";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
@@ -469,6 +470,9 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
                 case "git":
                   // Rendered by the always-mounted div below instead.
                   return null;
+                case "prompts":
+                  // Rendered by the always-mounted div below instead.
+                  return null;
                 default: {
                   const _exhaustive: never = view.section;
                   void _exhaustive;
@@ -489,6 +493,17 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
             )}
           >
             <GitHubTokensSection />
+          </div>
+
+          {/* Same treatment as GitHubTokensSection above — kept mounted
+              regardless of the active section so an in-progress
+              name/content draft in SavedPromptsSection survives switching
+              sections instead of being destroyed on unmount. No wrapper
+              spacing classes here (unlike the GitHubTokensSection div
+              above) since SavedPromptsSection's own root already applies
+              "space-y-4 pt-3 text-sm". */}
+          <div className={cn(!(view.kind === "section" && view.section === "prompts") && "hidden")}>
+            <SavedPromptsSection />
           </div>
 
           {view.kind === "templates" && (

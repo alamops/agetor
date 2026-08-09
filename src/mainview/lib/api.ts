@@ -68,6 +68,7 @@ import type {
   Project,
   Run,
   RunEvent,
+  SavedPrompt,
   Subagent,
   Task,
   TaskDiff,
@@ -390,6 +391,16 @@ export const api = {
     j<{ ok: true }>(`/harnesses/${encodeURIComponent(id)}/open-terminal`, {
       method: "POST",
     }),
+  listSavedPrompts: () => j<SavedPrompt[]>("/saved-prompts"),
+  createSavedPrompt: (input: { name: string; content: string }) =>
+    j<SavedPrompt>("/saved-prompts", { method: "POST", body: JSON.stringify(input) }),
+  updateSavedPrompt: (id: string, patch: { name?: string; content?: string }) =>
+    j<SavedPrompt>(`/saved-prompts/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteSavedPrompt: (id: string) =>
+    j<{ ok: true }>(`/saved-prompts/${encodeURIComponent(id)}`, { method: "DELETE" }),
   listAgentModels: () => j<AgentModelMap>("/agent-models"),
   refreshAgentModels: () => j<AgentModelMap>("/agent-models", { method: "POST" }),
   listProjects: () => j<Project[]>("/projects"),

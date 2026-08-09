@@ -54,6 +54,7 @@ import m038 from "./038_reseed_harness_builtins_2.sql" with { type: "text" };
 // main-merges (max-mode took 035, gemini took 036); renumbered to 039 with
 // both prior ids as aliases (same renumber-with-alias pattern).
 import m039 from "./039_run_events_user_history.sql" with { type: "text" };
+import m040 from "./040_saved_prompts.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -97,4 +98,5 @@ export const migrations: Migration[] = [
   { id: "037_harness_kind_gemini", sql: m037, aliases: ["033_harness_kind_gemini"] },
   { id: "038_reseed_harness_builtins_2", sql: m038, aliases: ["034_reseed_harness_builtins_2"] },
   { id: "039_run_events_user_history", sql: m039, aliases: ["035_run_events_user_history", "036_run_events_user_history"] },
+  { id: "040_saved_prompts", sql: m040 },
 ];

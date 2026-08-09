@@ -119,6 +119,15 @@ export interface Harness {
   enabled: boolean;
 }
 
+/** A user-global reusable prompt snippet — not tied to any task or project. */
+export interface SavedPrompt {
+  id: string;
+  name: string;
+  content: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface HarnessUsage {
   /** Harness id this usage report is for. */
   harnessId: string;
