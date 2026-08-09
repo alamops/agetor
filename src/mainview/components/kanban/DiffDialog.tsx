@@ -22,10 +22,10 @@ interface Props {
 }
 
 const STATUS_META: Record<DiffFile["status"], { label: string; icon: typeof FilePlus; cls: string }> = {
-  added: { label: "added", icon: FilePlus, cls: "text-emerald-400" },
-  modified: { label: "modified", icon: FilePen, cls: "text-amber-400" },
-  deleted: { label: "deleted", icon: FileMinus, cls: "text-rose-400" },
-  renamed: { label: "renamed", icon: FileSymlink, cls: "text-sky-400" },
+  added: { label: "added", icon: FilePlus, cls: "text-success" },
+  modified: { label: "modified", icon: FilePen, cls: "text-warning" },
+  deleted: { label: "deleted", icon: FileMinus, cls: "text-danger" },
+  renamed: { label: "renamed", icon: FileSymlink, cls: "text-info" },
 };
 
 /**
@@ -635,8 +635,8 @@ export function DiffDialog({ open, task, onClose }: Props) {
               <span className="font-mono">
                 {diff.files.length} {diff.files.length === 1 ? "file" : "files"}
                 {" "}
-                <span className="text-emerald-400">+{totals.additions}</span>{" "}
-                <span className="text-rose-400">−{totals.deletions}</span>
+                <span className="text-success">+{totals.additions}</span>{" "}
+                <span className="text-danger">−{totals.deletions}</span>
               </span>
               <Button size="sm" variant="ghost" onClick={() => setAll(!allOpen)}>
                 {allOpen ? "Collapse all" : "Expand all"}
@@ -660,7 +660,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
         )}
 
         {!loading && error && (
-          <div className="flex items-center justify-center gap-2 py-12 text-sm text-rose-400">
+          <div className="flex items-center justify-center gap-2 py-12 text-sm text-danger">
             <AlertCircle className="size-4" /> {error}
           </div>
         )}
@@ -821,7 +821,7 @@ function FileBlock({
           {file.path}
         </span>
         <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
-          {file.binary ? "binary" : <><span className="text-emerald-400">+{file.additions}</span> <span className="text-rose-400">−{file.deletions}</span></>}
+          {file.binary ? "binary" : <><span className="text-success">+{file.additions}</span> <span className="text-danger">−{file.deletions}</span></>}
         </span>
       </button>
       {open && (
@@ -895,9 +895,9 @@ const DiffBody = memo(function DiffBody({
             onClick={selectable ? (e) => onRowClick(path, i, rows, e.shiftKey) : undefined}
             className={cn(
               "flex border-l-2 border-transparent",
-              r.kind === "add" && "bg-emerald-500/10",
-              r.kind === "del" && "bg-rose-500/10",
-              r.kind === "hunk" && "bg-sky-500/10 text-sky-300",
+              r.kind === "add" && "bg-success/10",
+              r.kind === "del" && "bg-danger/10",
+              r.kind === "hunk" && "bg-info/10 text-info",
               r.kind === "meta" && "text-muted-foreground",
               selectable && "cursor-pointer hover:bg-muted/40",
               isSelected && "border-primary bg-primary/15",
@@ -909,13 +909,12 @@ const DiffBody = memo(function DiffBody({
             <span className="w-10 shrink-0 select-none border-r border-border/40 px-1 text-right text-muted-foreground/60">
               {r.neu ?? ""}
             </span>
-            <span
-              className={cn(
-                "shrink-0 select-none px-1 text-center",
-                r.kind === "add" && "text-emerald-400",
-                r.kind === "del" && "text-rose-400",
-              )}
-            >
+            {/* No color override here: the row's own bg-success/10 / bg-danger/10
+                tint already carries the add/del signal, and re-coloring this
+                glyph with the same token on top of that tint drops the
+                composite below 4.5:1 in light mode. Inheriting the row's
+                default text color keeps it legible in both themes. */}
+            <span className="shrink-0 select-none px-1 text-center">
               {r.kind === "add" ? "+" : r.kind === "del" ? "−" : " "}
             </span>
             <span className="whitespace-pre px-1">{r.text || " "}</span>

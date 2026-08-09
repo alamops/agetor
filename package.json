@@ -22,6 +22,7 @@
     "test": "bun test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/bun": "latest",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",

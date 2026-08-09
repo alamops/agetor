@@ -22,6 +22,49 @@
     --input: 240 5.9% 90%;
     --ring: 240 5.9% 10%;
     --radius: 0.5rem;
+    /* Semantic status tokens (theme feature). Used primarily as text/icon
+       color (text-success) and low-alpha backgrounds (bg-success/10), so
+       these must independently clear ~4.5:1 contrast on --background above.
+       Tailwind's *-600 shades were the plan's starting point, but emerald-600
+       (3.76:1), amber-600 (3.19:1), and sky-600 (4.10:1) on white all fall
+       short of AA for normal text — bumped those three to *-700 (5.0-5.9:1).
+       rose-600 already clears (4.70:1) so danger stays at *-600. See the
+       .dark block below for the *-400 shades these replace as literals. */
+    --success: 162.9 93.5% 24.3%; /* emerald-700 */
+    --success-foreground: 0 0% 98%;
+    /* amber-700 (26 90.5% 37.1%, 5.01:1 on white) still failed AA when
+       composited under the low-alpha "experimental" pill tint (bg-warning/15
+       → effective bg ~#f4e5da → only 4.07:1). Bumped one step darker to
+       amber-800, which clears both the plain-text case (7.09:1) and the
+       tinted-pill case (5.77:1). Dark mode's --warning below is untouched. */
+    --warning: 22.7 82.5% 31.4%; /* amber-800 */
+    --warning-foreground: 0 0% 98%;
+    --info: 201.3 96.3% 32.2%; /* sky-700 */
+    --info-foreground: 0 0% 98%;
+    --danger: 346.8 77.2% 49.8%; /* rose-600 */
+    --danger-foreground: 0 0% 98%;
+    /* GitHub's own convention for a merged PR — purple, deliberately distinct
+       from success/info so "merged" never reads as "open" or "passing". */
+    --merged: 263.4 69.3% 42.2%; /* violet-800 */
+    --merged-foreground: 0 0% 98%;
+    /* Task-type category color (TASK_TYPES "spike") — not a status, so it
+       lives alongside --merged rather than stretching success/warning/info/
+       danger onto a meaning they don't carry. Mirrors violet-500's hue
+       family (same as --merged) but is a distinct token because "merged" is
+       a GitHub PR-state concept, not a task category. Bumped to violet-700
+       for light-mode text contrast (7.10:1 on white vs violet-500's 4.23:1);
+       dark keeps the original violet-500 literal (4.70:1) unchanged. */
+    --spike: 263.4 70% 50.4%; /* violet-700 */
+    --spike-foreground: 0 0% 98%;
+    /* Solid, saturated indicator-dot tokens (agent-availability dot etc.).
+       Unlike the four status tokens above, these are NOT text/icon colors —
+       they're small filled circles that must read correctly on both a
+       near-black and a near-white surface, so (unusually) they carry the
+       *same* value in :root and .dark: Tailwind's own emerald-500 / red-500,
+       reproducing today's dark-mode dot exactly instead of drifting onto the
+       *-400 status-token shades (which would turn the red dot salmon-pink). */
+    --success-solid: 160.1 84.1% 39.4%; /* emerald-500 */
+    --danger-solid: 0 84.2% 60.2%; /* red-500 */
   }
 
   .dark {
@@ -42,6 +85,28 @@
     --border: 240 3.7% 15.9%;
     --input: 240 3.7% 15.9%;
     --ring: 240 4.9% 83.9%;
+    /* Mirror the literal Tailwind *-400 colors these tokens are replacing
+       throughout the app (text-rose-400, text-emerald-400, text-amber-400,
+       text-sky-400) so the conversion is visually a no-op in dark mode. */
+    --success: 158.1 64.4% 51.6%; /* emerald-400 */
+    --success-foreground: 240 5.9% 10%;
+    --warning: 43.3 96.4% 56.3%; /* amber-400 */
+    --warning-foreground: 240 5.9% 10%;
+    --info: 198.4 93.2% 59.6%; /* sky-400 */
+    --info-foreground: 240 5.9% 10%;
+    --danger: 351.3 94.5% 71.4%; /* rose-400 */
+    --danger-foreground: 240 5.9% 10%;
+    --merged: 255.1 91.7% 76.3%; /* violet-400 */
+    --merged-foreground: 240 5.9% 10%;
+    /* Reproduces TASK_TYPES' original literal (text-violet-500) exactly —
+       see the :root block above for why this is a separate token from
+       --merged. */
+    --spike: 258.3 89.5% 66.3%; /* violet-500 */
+    --spike-foreground: 240 5.9% 10%;
+    /* Same value as :root — see the :root comment for why these two are
+       theme-invariant. */
+    --success-solid: 160.1 84.1% 39.4%; /* emerald-500 */
+    --danger-solid: 0 84.2% 60.2%; /* red-500 */
   }
 
   * { @apply border-border; }

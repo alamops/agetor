@@ -22,5 +22,5 @@
       "@/*": ["./src/mainview/*"]
     }
   },
-  "include": ["src", "electrobun.config.ts", "vite.config.ts"]
+  "include": ["src", "e2e", "electrobun.config.ts", "vite.config.ts", "playwright.config.ts"]
 }

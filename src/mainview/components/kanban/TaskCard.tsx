@@ -73,7 +73,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         "cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
         type.borderClass,
         isDragging && "opacity-50",
-        awaiting && "ring-2 ring-amber-500/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
+        awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
         archived && "cursor-default opacity-60",
       )}
       onClick={() => onOpen(task)}

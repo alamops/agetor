@@ -251,30 +251,39 @@ export interface TaskTypeMeta {
   borderClass: string;
 }
 
+// Task-type coloring rides the shared semantic tokens (index.css /
+// tailwind.config.js) rather than literal palette classes, per the UI
+// convention below. "bug" maps cleanly onto --danger (both are "something's
+// wrong", same red/rose family as the literal it replaces) and "task" maps
+// cleanly onto --info (its original literal was already sky, --info's own
+// hue family) — genuine status-token reuse, not a stretch. "spike" has no
+// clean status-token equivalent (it's a category, not a status), so it gets
+// its own --spike token (violet) rather than being forced onto an existing
+// one — see the --spike comment in index.css for why that isn't --merged.
 export const TASK_TYPES: TaskTypeMeta[] = [
   {
     id: "task",
     label: "Task",
     hint: "Standard work item.",
     icon: "Inbox",
-    iconClass: "text-sky-500",
-    borderClass: "border-l-sky-500",
+    iconClass: "text-info",
+    borderClass: "border-l-info",
   },
   {
     id: "bug",
     label: "Bug",
     hint: "Defect to investigate or fix.",
     icon: "Bug",
-    iconClass: "text-red-500",
-    borderClass: "border-l-red-500",
+    iconClass: "text-danger",
+    borderClass: "border-l-danger",
   },
   {
     id: "spike",
     label: "Spike",
     hint: "Exploratory / research task.",
     icon: "FlaskConical",
-    iconClass: "text-violet-500",
-    borderClass: "border-l-violet-500",
+    iconClass: "text-spike",
+    borderClass: "border-l-spike",
   },
 ];
 
@@ -2755,3 +2764,28 @@ export const PROVIDER_CAPS: Record<GitProvider, ProviderCaps> = {
     pullAbbrevPlural: "PRs",
   },
 };
+
+// ───────────────────────────────────────────────────────────────────────────
+// Theme (Auto / Dark / Light)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * The user-facing theme choice, persisted as the `theme` key in the
+ * `preferences` table (see `src/bun/db.ts`) and round-tripped through
+ * `GET/PUT /preferences`. "auto" follows the OS appearance
+ * (`prefers-color-scheme`) and live-reacts to it changing while the app is
+ * open; "dark"/"light" pin an explicit choice. Unset/invalid persisted values
+ * resolve to "auto" — see `parseThemePreference` in `src/mainview/lib/theme.ts`.
+ */
+export type ThemePreference = "auto" | "dark" | "light";
+
+/** The concrete theme actually painted — what `preference` resolves to once
+ *  "auto" has been settled against the OS/system appearance. */
+export type ResolvedTheme = "dark" | "light";
+
+/** Options for the Settings → General theme picker, in display order. */
+export const THEME_PREFERENCES: readonly { id: ThemePreference; label: string }[] = [
+  { id: "auto", label: "Auto" },
+  { id: "dark", label: "Dark" },
+  { id: "light", label: "Light" },
+];

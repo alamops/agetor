@@ -182,7 +182,7 @@ export function GitHubSetupDialog({ open, onClose }: { open: boolean; onClose: (
             ))}
           </div>
           <div className="space-y-1 rounded-md border border-border/60 px-3 py-2">
-            <p className="text-[11px] font-medium uppercase tracking-wide text-amber-500">
+            <p className="text-[11px] font-medium uppercase tracking-wide text-warning">
               Not available with fine-grained tokens
             </p>
             <ul className="list-disc space-y-1 pl-4 text-[11px] leading-snug text-muted-foreground">

@@ -6,15 +6,66 @@ import { Plus, X, TerminalSquare } from "lucide-react";
 import { toast } from "sonner";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { useTheme } from "../theme-provider.tsx";
 import { macEditSequence } from "./terminal-keys.ts";
 import type { TerminalTab } from "../../../shared/types.ts";
+import type { ITheme } from "@xterm/xterm";
 
-/** xterm theme tuned to the app's dark zinc palette. */
-const XTERM_THEME = {
+/**
+ * xterm renders to its own canvas and can't read CSS custom properties, so it
+ * needs a real parallel palette per resolved theme rather than tokens.
+ *
+ * Dark tuned to the app's dark zinc palette (`.dark` block in index.css):
+ * background matches `--background` (240 10% 3.9% = #09090b, zinc-950),
+ * foreground approximates zinc-200.
+ */
+const XTERM_THEME_DARK: ITheme = {
   background: "#09090b", // zinc-950, matches --background
   foreground: "#e4e4e7", // zinc-200
   cursor: "#e4e4e7",
+  // xterm's DOM renderer paints the cursor cell as `background: cursor;
+  // color: cursorAccent`, and defaults cursorAccent to black when unset.
+  // Setting it explicitly (rather than relying on the default happening to
+  // match) keeps the glyph under the block cursor legible: #09090b is this
+  // theme's own background, so it's the same relationship as normal text
+  // (foreground-on-background) just inverted for the cursor cell — ~15.7:1
+  // against `cursor` (#e4e4e7).
+  cursorAccent: "#09090b",
   selectionBackground: "#3f3f46",
+};
+
+/**
+ * Light palette derived from index.css's `:root` block: `--background`
+ * (0 0% 100%) is white, `--foreground` (240 10% 3.9%) converts to #09090b —
+ * the same near-black used as the *dark* theme's background, which is the
+ * expected mirror-image relationship between the two palettes. Cursor
+ * matches foreground (same pattern as the dark theme). selectionBackground
+ * isn't a CSS token (xterm has no equivalent to read), so it's set to
+ * Tailwind's zinc-300 (#d4d4d8) — enough contrast to be obvious against
+ * white without obscuring the selected text (foreground stays #09090b).
+ *
+ * `white`/`brightWhite` are the only default ANSI colors overridden: xterm's
+ * built-in Tango-ish palette uses #d3d7cf/#eeeeec for those two, which are
+ * both light grays with <1.5:1 contrast against a white background —
+ * genuinely unreadable, not just dim. The other 14 default ANSI colors were
+ * checked against #ffffff and, while some (yellow, green, cyan) are dimmer
+ * than ideal (~2.5-3.5:1), they remain legible, so they're left as xterm
+ * defaults rather than replaced with a hand-built 16-color palette.
+ */
+const XTERM_THEME_LIGHT: ITheme = {
+  background: "#ffffff",
+  foreground: "#09090b",
+  cursor: "#09090b",
+  // Without this, xterm defaults cursorAccent (the glyph color painted under
+  // the block cursor) to black — indistinguishable from this theme's
+  // near-black `cursor` (#09090b), so the character under a blinking cursor
+  // measured ~1.05:1 and was effectively invisible. #ffffff is this theme's
+  // own background, mirroring the dark theme's choice below; contrast
+  // against `cursor` is ~19.9:1.
+  cursorAccent: "#ffffff",
+  selectionBackground: "#d4d4d8",
+  white: "#52525b", // zinc-600 — default #d3d7cf is ~1.5:1 on white, unreadable
+  brightWhite: "#18181b", // zinc-900 — default #eeeeec is ~1.1:1 on white, unreadable
 };
 
 /**
@@ -40,6 +91,13 @@ function TerminalPane({
   const hostRef = useRef<HTMLDivElement>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const { resolved } = useTheme();
+  // Read via a ref inside the mount effect below so the effect's own
+  // dependency array doesn't need `resolved` — recreating the terminal (and
+  // its WebSocket) on every theme flip would drop the connection. The
+  // separate effect further down re-applies the theme in place instead.
+  const resolvedRef = useRef(resolved);
+  resolvedRef.current = resolved;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -49,7 +107,7 @@ function TerminalPane({
       fontFamily: "var(--font-mono, ui-monospace, monospace)",
       fontSize: 12,
       cursorBlink: true,
-      theme: XTERM_THEME,
+      theme: resolvedRef.current === "light" ? XTERM_THEME_LIGHT : XTERM_THEME_DARK,
       scrollback: 5000,
       // Treat the macOS Option key as Meta so Alt-prefixed bindings work
       // (Opt+B/Opt+F word nav, Opt+D kill-word, Opt+. last-arg, etc.). Without
@@ -106,10 +164,14 @@ function TerminalPane({
         // bounded reconnect restores the session instead of freezing silently.
         if (attempts < 3) {
           attempts++;
-          term.write("\r\n\x1b[90m[disconnected — reconnecting…]\x1b[0m\r\n");
+          // SGR 2 (faint) rather than a fixed ANSI color code (was 90,
+          // bright-black): faint dims the terminal's own theme-tuned
+          // foreground instead of a hardcoded gray, so it stays legible
+          // without needing a light/dark-specific escape sequence.
+          term.write("\r\n\x1b[2m[disconnected — reconnecting…]\x1b[22m\r\n");
           reconnectTimer = setTimeout(connect, 1000);
         } else {
-          term.write("\r\n\x1b[90m[disconnected]\x1b[0m\r\n");
+          term.write("\r\n\x1b[2m[disconnected]\x1b[22m\r\n");
         }
       };
     };
@@ -152,6 +214,16 @@ function TerminalPane({
       fitRef.current = null;
     };
   }, [terminalId, onExit]);
+
+  // Re-apply the xterm theme in place when the resolved theme changes, so an
+  // already-open terminal repaints without remounting (which would tear down
+  // and reconnect its WebSocket). xterm exposes `options.theme` as settable
+  // on a live instance for exactly this.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.theme = resolved === "light" ? XTERM_THEME_LIGHT : XTERM_THEME_DARK;
+  }, [resolved]);
 
   // Refit + focus when this pane becomes the active one (its size is stable
   // because the host is absolutely positioned, but the fit on a freshly-shown
@@ -269,7 +341,7 @@ export function TerminalView({ taskId }: { taskId: string }) {
         </button>
       </div>
 
-      <div className="relative min-h-0 flex-1 bg-[#09090b]">
+      <div className="relative min-h-0 flex-1 bg-background">
         {tabs.length === 0 ? (
           <button
             type="button"

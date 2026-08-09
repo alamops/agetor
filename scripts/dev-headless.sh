@@ -46,6 +46,35 @@ pid_alive() {
   [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null
 }
 
+# Resolve the persisted theme preference the same way the packaged app's
+# boot path does, so the URL this script prints carries `&theme=<pref>` and
+# the browser-driven (Playwright) path actually exercises the boot-theme
+# channel it exists to guard — see docs/plans/auto-dark-light-theme.md §3 D1
+# and src/bun/window-url.ts's resolveThemePreference/buildWindowHash. There
+# is no Bun-side entry point importable from a shell script other than
+# spawning `bun` itself, so this shells out to a one-off `bun -e` that
+# imports window-url.ts directly against the same AGETOR_DATA_DIR this
+# script already uses — reusing the real resolution logic (including its
+# fallback-to-"auto" on a DB error) rather than re-deriving it here. Bun's
+# migration-log line (and anything else module-load prints to stdout) is
+# swallowed by `2>/dev/null | tail -n1`, keeping only the last line, which is
+# always the bare theme string written via `process.stdout.write`. Falls
+# back to "auto" if the bun invocation fails for any reason (e.g. bun not on
+# PATH in a stripped-down shell) — matching resolveThemePreference's own
+# default and never blocking the script on a theme lookup.
+resolve_theme() {
+  local theme
+  theme="$(cd "$REPO_ROOT" && AGETOR_DATA_DIR="$DATA_DIR" bun -e '
+    import("./src/bun/window-url.ts").then((m) => {
+      process.stdout.write(m.resolveThemePreference());
+    });
+  ' 2>/dev/null | tail -n1)"
+  case "$theme" in
+    dark|light|auto) echo "$theme" ;;
+    *) echo "auto" ;;
+  esac
+}
+
 read_pid_file() {
   [ -f "$1" ] && cat "$1" || true
 }
@@ -89,13 +118,14 @@ wait_for_health() {
 
 print_access_info() {
   local token="$1"
+  local theme; theme="$(resolve_theme)"
   echo
   grn "agetor dev (headless) is up"
   echo "  backend:  http://127.0.0.1:$API_PORT  (log: $BACKEND_LOG)"
   echo "  frontend: http://127.0.0.1:$VITE_PORT  (log: $VITE_LOG)"
   echo
   echo "Open in a browser (tunnel both ports first if this is a remote host):"
-  grn "  http://localhost:$VITE_PORT/#api=$API_PORT&token=$token"
+  grn "  http://localhost:$VITE_PORT/#api=$API_PORT&token=$token&theme=$theme"
   echo
   dim "  curl -H \"Authorization: Bearer $token\" http://127.0.0.1:$API_PORT/tasks"
   echo

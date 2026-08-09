@@ -1,4 +1,5 @@
 import { Toaster as Sonner, type ToasterProps } from "sonner";
+import { useTheme } from "../theme-provider.tsx";
 
 // 520px RunPanel + 16px gap. When the panel is open, push toasts left of it
 // so they don't sit on top of the panel header (where the X button lives) —
@@ -11,12 +12,11 @@ interface Props extends ToasterProps {
   panelOpen?: boolean;
 }
 
-// Dark-only — agetor's index.html hardcodes `<html class="dark">`. If we ever
-// add a light mode, swap this for `next-themes` and read the active theme.
 export function Toaster({ panelOpen = false, ...props }: Props) {
+  const { resolved } = useTheme();
   return (
     <Sonner
-      theme="dark"
+      theme={resolved}
       position="top-right"
       // Clears the 40px header so toasts don't sit on top of the Settings
       // button (anchored top-right). Sonner's default offset is ~32px which
