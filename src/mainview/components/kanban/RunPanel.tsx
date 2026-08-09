@@ -41,6 +41,7 @@ import {
   type GitHubPullMergeability,
   type Run,
   type RunEvent,
+  type SavedPrompt,
   type Subagent,
   type SubagentEvent,
   type Task,
@@ -1715,6 +1716,14 @@ function RunPanelBody({
   const [sendCommands, setSendCommands] = useState<AvailableCommand[]>([]);
   // MCP / skill / plugin entries for the Extensions picker above the send box.
   const [sendExtensions, setSendExtensions] = useState<AvailableExtension[]>([]);
+  // User-global saved prompts — not keyed on agent/workdir like the two lists
+  // above. Loaded once on mount; refetched when the Extensions popover opens
+  // so an edit made in Settings mid-session shows up.
+  const [savedPrompts, setSavedPrompts] = useState<SavedPrompt[]>([]);
+  const loadSavedPrompts = () => {
+    void api.listSavedPrompts().then(setSavedPrompts).catch(() => setSavedPrompts([]));
+  };
+  useEffect(() => { loadSavedPrompts(); }, []);
   const sendRef = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
     if (!task.workdir.trim()) { setSendCommands([]); setSendExtensions([]); return; }
@@ -2662,6 +2671,8 @@ function RunPanelBody({
               {canSend ? (
                 <ExtensionPicker
                   extensions={sendExtensions}
+                  savedPrompts={savedPrompts}
+                  onPromptsOpen={loadSavedPrompts}
                   value={input}
                   onChange={setInput}
                   textareaRef={sendRef}
@@ -2823,6 +2834,7 @@ function RunPanelBody({
               />
               <SlashAutocomplete
                 commands={sendCommands}
+                savedPrompts={savedPrompts}
                 value={input}
                 onChange={setInput}
                 textareaRef={sendRef}

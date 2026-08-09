@@ -11,6 +11,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
+import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
   SETTINGS_SECTIONS,
@@ -459,6 +460,8 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
                 case "git":
                   // Rendered by the always-mounted div below instead.
                   return null;
+                case "prompts":
+                  return <SavedPromptsSection />;
                 default: {
                   const _exhaustive: never = view.section;
                   void _exhaustive;
