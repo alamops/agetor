@@ -2668,23 +2668,21 @@ function RunPanelBody({
             // Picker on the left; "Save for later" / "Commit & push" pushed to
             // the right so they aren't stacked directly on top of the picker.
             <div className="flex items-center justify-between gap-2">
-              {canSend ? (
-                <ExtensionPicker
-                  extensions={sendExtensions}
-                  savedPrompts={savedPrompts}
-                  onPromptsOpen={loadSavedPrompts}
-                  value={input}
-                  onChange={setInput}
-                  textareaRef={sendRef}
-                  placement="above"
-                  // Only the in-flight send needs to disable the trigger here.
-                  disabled={sending}
-                />
-              ) : (
-                // Keep `justify-between` pushing the buttons right when the
-                // picker isn't offered (pre-run).
-                <span />
-              )}
+              <ExtensionPicker
+                extensions={sendExtensions}
+                savedPrompts={savedPrompts}
+                onPromptsOpen={loadSavedPrompts}
+                value={input}
+                onChange={setInput}
+                textareaRef={sendRef}
+                placement="above"
+                // Deliberately mirrors MessageHistoryPicker's disabled
+                // condition below (not `!canSend`/`modalPending`) — composing
+                // is decoupled from sending, so the picker stays usable
+                // before the task's first run and while a native prompt is
+                // pending.
+                disabled={sending || backlogBusy}
+              />
               <div className="flex items-center gap-2">
                 {/* Backlog mutations are frozen server-side while archived
                     (`backlogGuard`) — only Send (which auto-unarchives) is
@@ -2782,6 +2780,11 @@ function RunPanelBody({
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onPaste={onSendPaste}
+                // Refetch saved prompts on focus (in addition to the
+                // popover-open refetch) so a deleted/edited prompt made in
+                // Settings mid-session doesn't linger in the `/` autocomplete
+                // indefinitely.
+                onFocus={loadSavedPrompts}
                 onKeyDown={(e) => {
                   // Enter to send; Shift+Enter for a newline. SlashAutocomplete
                   // attaches a native keydown listener that calls preventDefault

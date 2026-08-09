@@ -2865,7 +2865,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       "/saved-prompts": {
         GET: authed((req) => json(savedPrompts.list(), { headers: corsHeaders(req) })),
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as {
+          const raw = await req.json().catch(() => null);
+          const body = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as {
             name?: unknown;
             content?: unknown;
           };
@@ -2884,7 +2885,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (!current) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
-          const body = (await req.json().catch(() => ({}))) as {
+          const raw = await req.json().catch(() => null);
+          const body = (raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}) as {
             name?: unknown;
             content?: unknown;
           };

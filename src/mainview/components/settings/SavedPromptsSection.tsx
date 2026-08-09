@@ -126,6 +126,7 @@ export function SavedPromptsSection() {
                 size="sm"
                 variant="ghost"
                 onClick={() => setForm({ id: p.id, name: p.name, content: p.content })}
+                disabled={form !== null}
               >
                 Edit
               </Button>

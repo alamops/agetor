@@ -673,6 +673,11 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                     value={prompt}
                     onChange={(e) => { setPrompt(e.target.value); if (dropHint) setDropHint(null); }}
                     onPaste={onPromptPaste}
+                    // Refetch saved prompts on focus (in addition to the
+                    // popover-open refetch) so a deleted/edited prompt made in
+                    // Settings mid-session doesn't linger in the `/`
+                    // autocomplete indefinitely.
+                    onFocus={loadSavedPrompts}
                     rows={6}
                     className="resize-none"
                   />

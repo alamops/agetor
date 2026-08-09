@@ -151,8 +151,12 @@ export function ExtensionPicker({
     requestAnimationFrame(() => {
       const t = textareaRef.current;
       if (!t) return;
-      t.focus();
+      // Set the caret BEFORE focusing — SlashAutocomplete syncs its tracked
+      // caret on the native `focus` event, so focusing first would make it
+      // read the stale pre-insert offset (which can land inside a `/token`,
+      // pop the slash menu, and swallow the next Enter via preventDefault).
       t.setSelectionRange(newCaret, newCaret);
+      t.focus();
     });
   };
 
@@ -164,7 +168,7 @@ export function ExtensionPicker({
         type="button"
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
-        title="Insert an MCP server, skill, or plugin reference"
+        title="Insert an MCP server, skill, plugin reference, or saved prompt"
         className={cn(
           "inline-flex items-center gap-1 rounded-md border border-border/60 bg-card/40 px-2 py-1 text-[11px] text-muted-foreground",
           "hover:bg-accent/40 hover:text-foreground disabled:opacity-50 disabled:hover:bg-card/40 disabled:hover:text-muted-foreground",
@@ -172,7 +176,7 @@ export function ExtensionPicker({
         )}
       >
         <Blocks className="size-3" />
-        <span>MCP · Skills · Plugins</span>
+        <span>MCP · Skills · Plugins · Prompts</span>
         <ChevronDown className={cn("size-3 transition-transform", open && "rotate-180")} />
       </button>
 
@@ -203,7 +207,7 @@ export function ExtensionPicker({
                   if (choice) insert(choice);
                 }
               }}
-              placeholder="Search extensions…"
+              placeholder="Search…"
               className="w-full rounded bg-muted/40 px-2 py-1 text-[11px] outline-none placeholder:text-muted-foreground"
             />
           </div>
@@ -211,7 +215,7 @@ export function ExtensionPicker({
             {grouped.length === 0 ? (
               <p className="px-3 py-2 text-[11px] text-muted-foreground">
                 {extensions.length === 0 && (savedPrompts?.length ?? 0) === 0
-                  ? "No MCP servers, skills, plugins, or saved prompts found for this project."
+                  ? "No MCP servers, skills, or plugins found for this project, and no saved prompts."
                   : "No matches."}
               </p>
             ) : (
