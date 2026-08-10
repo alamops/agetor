@@ -20,6 +20,7 @@ import {
   dataDir,
 } from "./db.ts";
 import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -333,6 +334,23 @@ function backlogGuard(req: { params: { id: string } } & Request): Response | nul
   if (task.archivedAt != null) {
     return json(
       { error: "task is archived — unarchive it before editing the backlog" },
+      { status: 400, headers: corsHeaders(req) },
+    );
+  }
+  return null;
+}
+
+/** Shared precondition for the cursor-plan-mutation routes (PATCH edit,
+ *  approve): the task must exist and not be archived. Mirrors `backlogGuard`
+ *  — same archived-freeze policy applied to the `plans` JSON column. */
+function planGuard(req: { params: { id: string } } & Request): Response | null {
+  const task = tasks.get(req.params.id);
+  if (!task) {
+    return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+  }
+  if (task.archivedAt != null) {
+    return json(
+      { error: "task is archived — unarchive it before editing plans" },
       { status: 400, headers: corsHeaders(req) },
     );
   }
@@ -3960,6 +3978,134 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const blocked = backlogGuard(req);
           if (blocked) return blocked;
           const updated = backlog.remove(req.params.id, req.params.itemId);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Cursor plan approval (see task-plans.ts + docs/plans/cursor-plan-approval.md).
+      // Plans are detected server-side in `attachDoneHandler`; these two
+      // routes are the only writers of `editedContent`/`status` thereafter.
+      "/tasks/:id/plans/:planId": {
+        PATCH: authed(async (req) => {
+          const blocked = planGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as { editedContent?: unknown };
+          if (body.editedContent !== null && typeof body.editedContent !== "string") {
+            return json(
+              { error: "editedContent must be a string or null" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const task = tasks.get(req.params.id);
+          if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          const nextPlans = setEditedContent(task.plans, req.params.planId, body.editedContent ?? null);
+          if (!nextPlans) {
+            return json(
+              { error: "plan not found or not pending" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const updated = tasks.update(req.params.id, { plans: nextPlans });
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/plans/:planId/approve": {
+        POST: authed(async (req) => {
+          const blocked = planGuard(req);
+          if (blocked) return blocked;
+          const task = tasks.get(req.params.id);
+          if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+
+          const kind = harnesses.getByIdOrKind(task.agent)?.kind;
+          if (kind !== "cursor") {
+            return json(
+              { error: "plan approval is only supported for cursor tasks" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const plan = task.plans.find((p) => p.id === req.params.planId);
+          if (!plan || plan.status !== "pending") {
+            return json(
+              { error: "plan not found or not pending" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // `task.runId` survives a normal run completion (only nulled by
+          // orphan-reconciliation / a harness-not-found spawn failure — see
+          // orchestrator.ts), so the run that produced this plan is still the
+          // one `sendInput` needs to resume. No fallback-to-newest-run: if
+          // it's null the task genuinely has nothing live to resume.
+          if (!task.runId) {
+            return json(
+              { error: "task has no resumable run — approval cannot be delivered" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+
+          const content = effectiveContent(plan);
+          const cwd = task.worktreePath ?? task.workdir;
+          const relDir = ".cursor/plans";
+          const filename = `${planSlug(plan.name)}_${plan.id}.plan.md`;
+          const relPath = path.join(relDir, filename);
+          try {
+            mkdirSync(path.join(cwd, relDir), { recursive: true });
+            await Bun.write(path.join(cwd, relPath), content);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            // Plan stays pending, no message sent — the user can retry.
+            return json(
+              { error: `failed to write plan file: ${msg}` },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
+
+          const edited = plan.editedContent !== null;
+          let message = edited
+            ? `The plan is approved with edits by the user — the approved version is saved at ${relPath}. Read it and follow that version; it supersedes your original plan. Good to go.`
+            : `The plan is approved — proceed with the implementation. It is also saved at ${relPath} for reference.`;
+          // ask-mode is propose-only and may not be able to read the file back
+          // off disk headlessly — embed the full effective content inline so
+          // the agent has it regardless. `null` mode means auto (buildCommand's
+          // convention).
+          if (task.mode === "ask") {
+            message += `\n\n--- Approved plan ---\n\n${content}`;
+          }
+
+          const sendResult = await sendInput(task.runId, message);
+          if (!sendResult.delivered) {
+            // The file is already written but nothing was sent — leave the
+            // plan pending so the user can retry the approve action.
+            return json(
+              { error: `approval message not delivered: ${sendResult.reason}` },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+
+          // Re-fetch: the message send may have taken long enough (worktree
+          // restore, etc.) for a concurrent request to have changed `plans`.
+          // `approvePlan` re-validates `status === "pending"` against
+          // whatever it's handed, so this can't silently clobber a racing
+          // edit/approve — it 409s instead, with the message already sent.
+          const freshTask = tasks.get(req.params.id);
+          const result = freshTask
+            ? approvePlan(freshTask.plans, req.params.planId, { now: Date.now(), filePath: relPath })
+            : null;
+          if (!freshTask || !result) {
+            return json(
+              {
+                error:
+                  "approval message was sent, but the plan record could not be updated "
+                  + "(it may have changed state concurrently) — check the run panel",
+              },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          const updated = tasks.update(req.params.id, { plans: result.plans });
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });

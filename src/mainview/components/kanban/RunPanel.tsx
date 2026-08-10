@@ -48,6 +48,7 @@ import {
   type Task,
   type TaskDraft,
   type TaskEventsReplayMeta,
+  type TaskPlan,
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
@@ -74,6 +75,7 @@ import { ExtensionPicker } from "./ExtensionPicker";
 import { TerminalView } from "./TerminalView";
 import { deriveTodoProgress } from "@/lib/todo-progress";
 import { TodoProgressCard } from "./TodoProgressCard";
+import { PlanDialog } from "./PlanDialog";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -1731,6 +1733,19 @@ function RunPanelBody({
   // "Send now" from the tray can't race a composer send).
   const [backlogBusy, setBacklogBusy] = useState(false);
   useEffect(() => { setBacklogItems(task.backlog); }, [task.backlog]);
+  // Cursor plans — same local-mirror-resynced-from-prop pattern as
+  // `backlogItems` above: seeded from `task.plans`, kept in sync as the 2s
+  // task poll refreshes it, and updated immediately from the Task returned
+  // by the plan edit/approve endpoints so the dialog (and the plan card)
+  // reflect an approval/edit without waiting for the next poll.
+  const [plans, setPlans] = useState<TaskPlan[]>(task.plans);
+  useEffect(() => { setPlans(task.plans); }, [task.plans]);
+  // Which plan's modal is open, by id (not the object) — see PlanDialog's
+  // doc comment for why the live plan is resolved from `plans` on every
+  // render instead of being captured at open time.
+  const [planDialogId, setPlanDialogId] = useState<string | null>(null);
+  const openPlan = planDialogId ? plans.find((p) => p.id === planDialogId) ?? null : null;
+  const onOpenPlan = useCallback((planId: string) => setPlanDialogId(planId), []);
   // The task's live git status (uncommitted changes / unpushed commits).
   // Drives the "Commit & push" action chip above the textarea via
   // `shouldOfferCommitPush`. Deliberately independent of run status —
@@ -1757,6 +1772,13 @@ function RunPanelBody({
   };
   useEffect(() => { loadSavedPrompts(); }, []);
   const sendRef = useRef<HTMLTextAreaElement>(null);
+  // "Chat about it" affordance for a plan modal — same `requestAnimationFrame`
+  // + focus idiom as `MessageHistoryPicker`'s insert-and-focus above. No
+  // caret placement needed here (unlike the picker) since we're not inserting
+  // text, just moving focus into the already-composed (or empty) textarea.
+  const focusComposer = useCallback(() => {
+    requestAnimationFrame(() => { sendRef.current?.focus(); });
+  }, []);
   useEffect(() => {
     if (!task.workdir.trim()) { setSendCommands([]); setSendExtensions([]); return; }
     let cancelled = false;
@@ -2603,6 +2625,8 @@ function RunPanelBody({
                 runStatus={activeRunStatus}
                 indicatorMode={indicatorMode}
                 taskId={task.id}
+                plans={plans}
+                onOpenPlan={onOpenPlan}
               />
             </>
           )}
@@ -2926,6 +2950,20 @@ function RunPanelBody({
             <p className="mt-1 text-[10px] text-muted-foreground">{sendHint}</p>
           )}
         </div>
+      )}
+      {/* Keyed by plan id (stable across in-place status/edit updates as
+          `plans` refreshes from the poll or a mutation's returned Task) so
+          the dialog's internal text/mode state resets on genuine plan
+          switches but survives its own plan being updated in place. */}
+      {openPlan && (
+        <PlanDialog
+          key={openPlan.id}
+          task={task}
+          plan={openPlan}
+          onClose={() => setPlanDialogId(null)}
+          onPlanUpdated={(updated) => setPlans(updated.plans)}
+          focusComposer={focusComposer}
+        />
       )}
     </>
   );
@@ -3565,6 +3603,8 @@ function RunEventList({
   runStatus,
   indicatorMode = "off",
   taskId,
+  plans = [],
+  onOpenPlan,
 }: {
   events: RunEvent[];
   interactions?: PendingInteraction[];
@@ -3575,6 +3615,14 @@ function RunEventList({
    *  relative attachment ref can resolve against the task's worktree/workdir
    *  when the user clicks it. */
   taskId?: string;
+  /** Cursor plans detected on this task (`task.plans`). Empty for every
+   *  non-Cursor task. Matched against each `tool_use` event's parsed id via
+   *  `planByToolCallId` below to swap in a `PlanCard` for the matched event. */
+  plans?: TaskPlan[];
+  /** Opens the plan modal for the given plan id — wired to `RunPanelBody`'s
+   *  `planDialogId` state exactly like `onInteractionResolved` is wired to
+   *  `dismissInteraction`. */
+  onOpenPlan?: (planId: string) => void;
 }) {
   // Index tool_results by their tool_use_id so the tool-use card can show
   // Normalise legacy `[tool: Name] {...}` / `[thinking] ...` / `[result] ...`
@@ -3597,6 +3645,16 @@ function RunEventList({
     }
     return map;
   }, [normalised]);
+
+  // Index plans by their raw (possibly-`\n`-containing) toolCallId so the
+  // `tool_use` case below can do an O(1) lookup instead of a per-render scan
+  // over `plans` — same perf rationale as `resultByToolId` above; this map
+  // is one of the `sections` memo's deps, not recomputed inside its loop.
+  const planByToolCallId = useMemo(() => {
+    const map = new Map<string, TaskPlan>();
+    for (const p of plans) map.set(p.toolCallId, p);
+    return map;
+  }, [plans]);
 
   // Interleave events and interaction cards by timestamp. Interactions
   // already carry a `createdAt`; pair each with the first event-index
@@ -3633,8 +3691,8 @@ function RunEventList({
   // the identical element references and bails out of the whole subtree —
   // without this, the O(n) loop + every block's markdown re-parsed on each
   // poll is what made long conversations lag. `renderEvent`/`renderInteraction`
-  // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`)
-  // are tracked explicitly.
+  // live inside so their captured deps (`resultByToolId`, `onInteractionResolved`,
+  // `planByToolCallId`, `onOpenPlan`) are tracked explicitly.
   const sections = useMemo(() => {
     // Wrap a rendered block in the `data-evid` carrier the search bar scrolls
     // to and imperatively highlights (`logRef.current?.querySelector('[data-
@@ -3684,6 +3742,15 @@ function RunEventList({
         case "tool_use": {
           const parsed = safeParse<ParsedToolUse>(e.data);
           if (!parsed) return [wrap(key, evid, <RawText text={e.data} muted />)];
+          // A detected Cursor plan replaces the generic tool-call card
+          // entirely — this is the "finished after planning" moment the
+          // user needs to act on, so it gets the same prominence
+          // AskUserQuestion/ExitPlanMode get in `ToolUseBlock`, but as its
+          // own dedicated card + modal rather than an expand-to-read block.
+          const plan = planByToolCallId.get(parsed.id);
+          if (plan) {
+            return [wrap(key, evid, <PlanCard plan={plan} onOpen={() => onOpenPlan?.(plan.id)} />)];
+          }
           const result = resultByToolId.get(parsed.id);
           return [wrap(key, evid, <ToolUseBlock call={parsed} result={result} />)];
         }
@@ -3748,7 +3815,7 @@ function RunEventList({
     current.body.push(...tail);
     if (current.header !== null || current.body.length > 0) out.push(current);
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -3929,7 +3996,10 @@ const USER_MD_COMPONENTS: MdComponents = {
   pre: ({ children }) => <CodeBlock bgClassName="bg-background/60">{children}</CodeBlock>,
 };
 
-const ASSISTANT_MD_COMPONENTS: MdComponents = {
+// Exported so `PlanDialog` can render plan markdown with the exact same
+// link/code-block treatment as an assistant message, instead of duplicating
+// the `mdRenderLink`/`mdRenderCode`/`CodeBlock` wiring.
+export const ASSISTANT_MD_COMPONENTS: MdComponents = {
   a: mdRenderLink,
   code: mdRenderCode,
   pre: ({ children }) => <CodeBlock bgClassName="bg-muted/40">{children}</CodeBlock>,
@@ -4306,6 +4376,60 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
         </div>
       )}
     </div>
+  );
+});
+
+/** Status pill for a plan card / the PlanDialog header — same three-state
+ *  vocabulary throughout (`pending` / `approved` / `superseded`), styled with
+ *  semantic tokens only. Exported for `PlanDialog` to reuse verbatim rather
+ *  than re-deriving the label/color mapping. */
+export function PlanStatusBadge({ status }: { status: TaskPlan["status"] }) {
+  switch (status) {
+    case "pending":
+      return (
+        <Badge variant="outline" className="border-primary/50 text-primary">
+          Awaiting approval
+        </Badge>
+      );
+    case "approved":
+      return (
+        <Badge variant="outline" className="border-success/50 text-success">
+          Approved
+        </Badge>
+      );
+    case "superseded":
+      return (
+        <Badge variant="outline" className="border-muted-foreground/40 text-muted-foreground">
+          Superseded
+        </Badge>
+      );
+  }
+}
+
+/** Highlighted card standing in for the generic `ToolUseBlock` whenever a
+ *  `tool_use` event's id matches a detected Cursor plan — replaces the
+ *  collapsed "createPlanToolCall" tool call entirely rather than nesting
+ *  inside it, since the plan IS the notable event here, not incidental tool
+ *  output. Same `border-primary/60 ring-1 ring-primary/40` prominence
+ *  `ToolUseBlock` gives AskUserQuestion/ExitPlanMode while `pending` — a
+ *  resolved plan (approved/superseded) keeps the ring so the card stays
+ *  findable when scrolling back through history, but drops the "needs you"
+ *  urgency via the badge alone. */
+const PlanCard = memo(function PlanCard({ plan, onOpen }: { plan: TaskPlan; onOpen: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className={cn(
+        "flex w-full items-center gap-2 rounded-md border bg-card px-2 py-1.5 text-left text-[11px] hover:bg-muted/30",
+        plan.status === "pending" ? "border-primary/60 ring-1 ring-primary/40" : "border-border/60",
+      )}
+    >
+      <ClipboardList className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+      <span className="min-w-0 flex-1 truncate font-medium">{plan.name ?? "Implementation plan"}</span>
+      <PlanStatusBadge status={plan.status} />
+      <span className="shrink-0 text-muted-foreground">View plan →</span>
+    </button>
   );
 });
 
@@ -4744,6 +4868,7 @@ function toolIcon(name: string): ComponentType<{ className?: string; "aria-hidde
     case "AskUserQuestion":
       return HelpCircle;
     case "ExitPlanMode":
+    case "createPlanToolCall":
       return ClipboardList;
     case "WebFetch":
     case "WebSearch":
@@ -4775,7 +4900,7 @@ function formatToolInputSummary(name: string, input: unknown): string {
     const q0 = input.questions[0] as Record<string, unknown>;
     return typeof q0?.question === "string" ? truncateString(q0.question, 80) : `${input.questions.length} question(s)`;
   }
-  if (name === "ExitPlanMode") return "plan ready for approval";
+  if (name === "ExitPlanMode" || name === "createPlanToolCall") return "plan ready for approval";
   if (name === "TodoWrite" && Array.isArray(input.todos)) {
     const todos = input.todos as Array<Record<string, unknown>>;
     const done = todos.filter((t) => t.status === "completed").length;
