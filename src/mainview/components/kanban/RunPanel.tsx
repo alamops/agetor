@@ -3,7 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, Copy, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
   GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, RefreshCw, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
@@ -75,7 +75,8 @@ import { ExtensionPicker } from "./ExtensionPicker";
 import { TerminalView } from "./TerminalView";
 import { deriveTodoProgress } from "@/lib/todo-progress";
 import { TodoProgressCard } from "./TodoProgressCard";
-import { PlanDialog } from "./PlanDialog";
+import { PlanDialog, PlanStatusBadge } from "./PlanDialog";
+import { ASSISTANT_MD_COMPONENTS, USER_MD_COMPONENTS, ExternalLink } from "./md-components";
 
 /**
  * Resolve a task's harness id to its underlying kind. Falls back to
@@ -86,6 +87,13 @@ import { PlanDialog } from "./PlanDialog";
 function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
   return harnesses.find((h) => h.id === harnessId)?.kind ?? "claude-code";
 }
+
+/** Stable empty-array reference for `RunEventList`'s `plans` prop on a
+ *  non-cursor task (plan cards are a cursor-only feature — see
+ *  docs/plans/cursor-plan-approval.md §3). Reused instead of an inline `[]`
+ *  literal so a re-render doesn't hand `RunEventList` a fresh identity for
+ *  no reason. */
+const NO_PLANS: TaskPlan[] = [];
 
 /**
  * `RunEvent` as held in the panel's local `events` state, tagged with a
@@ -1746,6 +1754,15 @@ function RunPanelBody({
   const [planDialogId, setPlanDialogId] = useState<string | null>(null);
   const openPlan = planDialogId ? plans.find((p) => p.id === planDialogId) ?? null : null;
   const onOpenPlan = useCallback((planId: string) => setPlanDialogId(planId), []);
+  // Clear a `planDialogId` that no longer resolves to a plan (e.g. `plans`
+  // refreshed mid-close and the id vanished) instead of leaving it set with
+  // the dialog merely closed for lack of a matching `openPlan` — a stale id
+  // left in state would silently reopen the dialog if it ever reappeared in
+  // a later poll (e.g. an id gets reused, or the same plan comes back after
+  // a transient sync gap).
+  useEffect(() => {
+    if (planDialogId && !plans.some((p) => p.id === planDialogId)) setPlanDialogId(null);
+  }, [planDialogId, plans]);
   // The task's live git status (uncommitted changes / unpushed commits).
   // Drives the "Commit & push" action chip above the textarea via
   // `shouldOfferCommitPush`. Deliberately independent of run status —
@@ -2625,7 +2642,7 @@ function RunPanelBody({
                 runStatus={activeRunStatus}
                 indicatorMode={indicatorMode}
                 taskId={task.id}
-                plans={plans}
+                plans={kind === "cursor" ? plans : NO_PLANS}
                 onOpenPlan={onOpenPlan}
               />
             </>
@@ -3650,11 +3667,24 @@ function RunEventList({
   // `tool_use` case below can do an O(1) lookup instead of a per-render scan
   // over `plans` — same perf rationale as `resultByToolId` above; this map
   // is one of the `sections` memo's deps, not recomputed inside its loop.
+  //
+  // Keyed on a content signature (`plansKey`), not `plans` itself: the
+  // `plans` state mirror in `RunPanelBody` gets a fresh array identity on
+  // every genuine task-object change (each 2s poll), even when no plan on
+  // this task actually changed. `PlanCard` (the only consumer of this map)
+  // only renders `id`/`name`/`toolCallId`/`status` — `toolCallId` never
+  // changes for a given plan record and `name` is fixed at creation, so
+  // `id:status` is the only content that can invalidate what gets rendered.
+  // Without this, `sections` (a dep-of-`planByToolCallId` memo) recomputed
+  // — and re-parsed every markdown block in a long conversation — on every
+  // poll tick regardless of whether a plan changed.
+  const plansKey = plans.map((p) => `${p.id}:${p.status}`).join("|");
   const planByToolCallId = useMemo(() => {
     const map = new Map<string, TaskPlan>();
     for (const p of plans) map.set(p.toolCallId, p);
     return map;
-  }, [plans]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally keyed on `plansKey` (id+status), not `plans` — see comment above.
+  }, [plansKey]);
 
   // Interleave events and interaction cards by timestamp. Interactions
   // already carry a `createdAt`; pair each with the first event-index
@@ -3957,53 +3987,11 @@ function findScrollParent(el: HTMLElement | null): HTMLElement | null {
   return null;
 }
 
-// Hoisted ReactMarkdown `components` maps. Defined once at module scope so the
-// prop identity is stable across renders. The previous shape built a fresh
-// `components={{…}}` object inside every render of every markdown block, which
-// forced ReactMarkdown to re-parse/re-render — the dominant cost once a run log
-// is long. The two maps differ only in the code-block background.
-type MdComponents = NonNullable<React.ComponentProps<typeof ReactMarkdown>["components"]>;
-
-// External links open in the system browser via the OS handler.
-const mdRenderLink: NonNullable<MdComponents["a"]> = ({ href, children, ...rest }) => (
-  <ExternalLink {...rest} href={href}>
-    {children}
-  </ExternalLink>
-);
-
-const mdRenderCode: NonNullable<MdComponents["code"]> = ({ className, children, ...props }) => {
-  const isBlock = /language-/.test(className ?? "");
-  if (isBlock) {
-    return (
-      <code className={cn(className, "font-mono text-[11px]")} {...props}>
-        {children}
-      </code>
-    );
-  }
-  return (
-    <code
-      className="rounded bg-muted/60 px-1 py-0.5 font-mono text-[11px] text-foreground"
-      {...props}
-    >
-      {children}
-    </code>
-  );
-};
-
-const USER_MD_COMPONENTS: MdComponents = {
-  a: mdRenderLink,
-  code: mdRenderCode,
-  pre: ({ children }) => <CodeBlock bgClassName="bg-background/60">{children}</CodeBlock>,
-};
-
-// Exported so `PlanDialog` can render plan markdown with the exact same
-// link/code-block treatment as an assistant message, instead of duplicating
-// the `mdRenderLink`/`mdRenderCode`/`CodeBlock` wiring.
-export const ASSISTANT_MD_COMPONENTS: MdComponents = {
-  a: mdRenderLink,
-  code: mdRenderCode,
-  pre: ({ children }) => <CodeBlock bgClassName="bg-muted/40">{children}</CodeBlock>,
-};
+// ReactMarkdown `components` maps (ASSISTANT_MD_COMPONENTS / USER_MD_COMPONENTS)
+// live in ./md-components.tsx — hoisted there (not just to module scope here)
+// so `PlanDialog` can share the exact same link/code-block treatment without
+// importing back from this file (that used to be a circular import: PlanDialog
+// -> RunPanel -> PlanDialog). See md-components.tsx's doc comment.
 
 const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text: string; taskId?: string }) {
   const [expanded, setExpanded] = useState(false);
@@ -4162,58 +4150,6 @@ const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) 
     </div>
   );
 });
-
-function nodeToText(node: unknown): string {
-  if (node === null || node === undefined) return "";
-  if (typeof node === "string") return node;
-  if (typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(nodeToText).join("");
-  if (typeof node === "object" && "props" in (node as Record<string, unknown>)) {
-    return nodeToText((node as { props: { children: unknown } }).props.children);
-  }
-  return "";
-}
-
-function CodeBlock({
-  children,
-  bgClassName,
-}: {
-  children: React.ReactNode;
-  bgClassName: string;
-}) {
-  const [copied, setCopied] = useState(false);
-  const onCopy = async () => {
-    const text = nodeToText(children).replace(/\n$/, "");
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      toast.error("Couldn't copy to clipboard");
-    }
-  };
-  return (
-    <div className="group relative my-2">
-      <pre
-        className={cn(
-          "overflow-auto rounded-md border border-border/40 p-2 pr-9 font-mono text-[11px] leading-relaxed",
-          bgClassName,
-        )}
-      >
-        {children}
-      </pre>
-      <button
-        type="button"
-        onClick={onCopy}
-        aria-label={copied ? "Copied" : "Copy code"}
-        title={copied ? "Copied" : "Copy"}
-        className="absolute right-1.5 top-1.5 inline-flex h-6 w-6 items-center justify-center rounded border border-border/60 bg-background/80 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
-      >
-        {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-      </button>
-    </div>
-  );
-}
 
 const RawText = memo(function RawText({ text, muted }: { text: string; muted?: boolean }) {
   return (
@@ -4379,32 +4315,9 @@ const ToolUseBlock = memo(function ToolUseBlock({ call, result }: { call: Parsed
   );
 });
 
-/** Status pill for a plan card / the PlanDialog header — same three-state
- *  vocabulary throughout (`pending` / `approved` / `superseded`), styled with
- *  semantic tokens only. Exported for `PlanDialog` to reuse verbatim rather
- *  than re-deriving the label/color mapping. */
-export function PlanStatusBadge({ status }: { status: TaskPlan["status"] }) {
-  switch (status) {
-    case "pending":
-      return (
-        <Badge variant="outline" className="border-primary/50 text-primary">
-          Awaiting approval
-        </Badge>
-      );
-    case "approved":
-      return (
-        <Badge variant="outline" className="border-success/50 text-success">
-          Approved
-        </Badge>
-      );
-    case "superseded":
-      return (
-        <Badge variant="outline" className="border-muted-foreground/40 text-muted-foreground">
-          Superseded
-        </Badge>
-      );
-  }
-}
+// `PlanStatusBadge` lives in ./PlanDialog.tsx (imported above) — same
+// three-state vocabulary (`pending` / `approved` / `superseded`) shared by
+// `PlanCard` below and the PlanDialog header, defined once so both agree.
 
 /** Highlighted card standing in for the generic `ToolUseBlock` whenever a
  *  `tool_use` event's id matches a detected Cursor plan — replaces the
@@ -4445,36 +4358,8 @@ const ToolResultBlock = memo(function ToolResultBlock({ result }: { result: Pars
   );
 });
 
-/**
- * Anchor that hands off http(s)/mailto navigation to the OS default browser
- * via Electrobun's `Utils.openExternal`. The webview is sandboxed —
- * `target="_blank"` is a no-op there — so every link in agent output has to
- * round-trip through the main process to reach a real browser.
- */
-function ExternalLink({
-  href,
-  className,
-  children,
-  ...rest
-}: React.AnchorHTMLAttributes<HTMLAnchorElement>) {
-  const safe = typeof href === "string" && /^(https?|mailto):/i.test(href) ? href : null;
-  return (
-    <a
-      {...rest}
-      href={safe ?? "#"}
-      onClick={(e) => {
-        e.preventDefault();
-        if (!safe) return;
-        void api.openExternal(safe).catch((err: unknown) => {
-          toast.error(err instanceof Error ? err.message : "Could not open link");
-        });
-      }}
-      className={cn("text-primary underline-offset-2 hover:underline", className)}
-    >
-      {children}
-    </a>
-  );
-}
+// `ExternalLink` lives in ./md-components.tsx (imported above) — shared by
+// the markdown link renderer there and the two direct uses in this file.
 
 /** Tiny labeled-row helper for tool input bodies. Keeps the markup terse. */
 function Field({ label, children }: { label: string; children: React.ReactNode }) {

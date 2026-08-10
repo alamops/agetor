@@ -1053,10 +1053,7 @@ function registerActiveRun(
 function detectCursorPlan(task: Task, runId: string): void {
   if (resolveHarness(task.agent)?.kind !== "cursor") return;
 
-  let lastToolUse: string | null = null;
-  for (const e of runs.events(runId)) {
-    if (e.stream === "tool_use") lastToolUse = e.data;
-  }
+  const lastToolUse = runs.lastToolUseData(runId);
   if (lastToolUse === null) return;
 
   let parsed: unknown;

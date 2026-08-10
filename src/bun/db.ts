@@ -167,9 +167,18 @@ const parsePlans = (raw: string): TaskPlan[] => {
         name: typeof name === "string" ? name : null,
         content,
         editedContent: typeof editedContent === "string" ? editedContent : null,
+        // An unknown/corrupt status must never coerce to "pending" — that
+        // would resurrect an already-approved (or superseded) plan as
+        // actionable again, and `approvePlan`/the approve route are
+        // non-idempotent (a second approval re-sends the message). Fall
+        // back on whether `approvedAt` is set: a numeric timestamp means it
+        // really was approved, so keep it "approved"; otherwise treat the
+        // corrupt row as history that's no longer actionable.
         status: typeof status === "string" && PLAN_STATUSES.has(status)
           ? (status as TaskPlan["status"])
-          : "pending",
+          : typeof approvedAt === "number"
+            ? "approved"
+            : "superseded",
         createdAt: typeof createdAt === "number" ? createdAt : 0,
         approvedAt: typeof approvedAt === "number" ? approvedAt : null,
         approvedEdited: approvedEdited === true,
@@ -898,6 +907,22 @@ export const runs = {
   lastEventData(runId: string): string | null {
     const row = db.query<{ data: string }, [string]>(
       `SELECT data FROM run_events WHERE run_id = ? AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
+    ).get(runId);
+    return row ? row.data : null;
+  },
+  /** The most recently persisted MAIN-stream `tool_use` event's raw `data`
+   *  for a run (`subagent_id IS NULL`, same rationale as `lastEventData`: a
+   *  subagent's tool call must not be mistaken for the main run's), or
+   *  `null` if the run has none.
+   *
+   *  Backs `detectCursorPlan`'s "is the run's last tool call a
+   *  `createPlanToolCall`?" check. That used to be a full `runs.events(runId)`
+   *  scan keeping only the last `tool_use` row — correct, but O(run length)
+   *  on every settlement of every cursor run, even long ones with no plan at
+   *  all. This is the same lookup expressed as a targeted, indexed query. */
+  lastToolUseData(runId: string): string | null {
+    const row = db.query<{ data: string }, [string]>(
+      `SELECT data FROM run_events WHERE run_id = ? AND stream = 'tool_use' AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
     ).get(runId);
     return row ? row.data : null;
   },

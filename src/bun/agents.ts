@@ -755,7 +755,15 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
  * The call_id deliberately embeds a newline — real Cursor call_ids do this
  * (plan §2) — so detection/persistence code that only exercises this path in
  * tests still gets coverage for the newline-safety requirement.
+ *
+ * `fakePlanCallCounter` makes the call_id unique per spawn (i.e. per turn):
+ * without it, a `--resume` turn issued right after approving a plan would
+ * emit the exact same call_id as the first turn, and `upsertDetectedPlan`'s
+ * dedup-by-toolCallId would treat the second plan as a no-op re-detection of
+ * the first instead of a genuinely new plan — which is exactly the
+ * supersede transition tests need to exercise.
  */
+let fakePlanCallCounter = 0;
 function makeFakeCursorPlanAgent(taskId: string, prompt: string, onChunk: ChunkHandler): SpawnedAgent {
   const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
@@ -763,7 +771,8 @@ function makeFakeCursorPlanAgent(taskId: string, prompt: string, onChunk: ChunkH
   const timers: ReturnType<typeof setTimeout>[] = [];
   const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
 
-  const callId = "call-fake-plan-1\nfc_fake_0";
+  const n = ++fakePlanCallCounter;
+  const callId = `call-fake-plan-${n}\nfc_fake_${n}`;
   const planArgs = {
     plan: "# Fake Plan\n\n- step one\n- step two",
     name: "Fake Plan",
@@ -785,11 +794,15 @@ function makeFakeCursorPlanAgent(taskId: string, prompt: string, onChunk: ChunkH
     );
   });
   after(10, () => {
+    // `mapCursorEvent`'s `completed` branch forwards the WHOLE `tool_call`
+    // envelope as `content` (cursor-tmux.ts's `evt.tool_call ?? {}`), not
+    // just its result payload — match that shape here so a test asserting
+    // on `tool_result.content` sees exactly what a real run would produce.
     onChunk(
       "tool_result",
       JSON.stringify({
         toolUseId: callId,
-        content: { success: {}, planUri: "" },
+        content: { createPlanToolCall: { args: planArgs, result: { success: {}, planUri: "" } } },
         isError: false,
       }),
       `tool_call:${callId}:completed`,

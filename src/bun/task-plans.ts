@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { TaskPlan } from "../shared/types.ts";
 
 /**
@@ -13,19 +14,17 @@ import type { TaskPlan } from "../shared/types.ts";
  * Derive a filesystem/URL-safe plan id from Cursor's raw `call_id`. Cursor's
  * call_ids contain embedded newlines (confirmed against real runs — see
  * plan §2), so the raw value can never be used directly in a filename or a
- * route param. FNV-1a 32-bit over the UTF-8 bytes, rendered as 8 lowercase
- * hex chars — deterministic (same call_id always yields the same plan id,
- * which is what makes `upsertDetectedPlan`'s dedup-by-toolCallId reattach-safe)
- * and short enough to read comfortably in a URL or `.plan.md` filename.
+ * route param. SHA-256 over the UTF-8 bytes, truncated to the first 16 hex
+ * chars — deterministic (same call_id always yields the same plan id, which
+ * is what makes `upsertDetectedPlan`'s dedup-by-toolCallId reattach-safe)
+ * and short enough to read comfortably in a URL or `.plan.md` filename. 16
+ * hex chars (64 bits) rather than a 32-bit hash: a 32-bit FNV hash collides
+ * with non-negligible probability across enough plans over a long-lived
+ * task's history, and a collision here silently misroutes an edit/approve
+ * to the wrong plan — worth the few extra bytes.
  */
 export function planIdFromCallId(callId: string): string {
-  const bytes = new TextEncoder().encode(callId);
-  let hash = 0x811c9dc5; // FNV offset basis
-  for (const b of bytes) {
-    hash ^= b;
-    hash = Math.imul(hash, 0x01000193); // FNV prime, 32-bit wraparound via Math.imul
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0");
+  return createHash("sha256").update(callId, "utf8").digest("hex").slice(0, 16);
 }
 
 /**
@@ -50,6 +49,46 @@ export function planSlug(name: string | null): string {
  */
 export function effectiveContent(plan: TaskPlan): string {
   return plan.editedContent ?? plan.content;
+}
+
+/** Retention cap for `task.plans` — a long-lived task can accumulate one
+ *  `createPlanToolCall` per turn indefinitely, and the JSON column round-trips
+ *  through every `/tasks` poll (2s) and every task-row read, so unbounded
+ *  growth is a real cost, not just a cosmetic one. */
+const MAX_RETAINED_PLANS = 10;
+
+/**
+ * Prune `plans` down to at most `MAX_RETAINED_PLANS`, oldest-first, but never
+ * drop the two entries that still matter operationally: the most recent plan
+ * (always kept regardless of status — this is what `upsertDetectedPlan` just
+ * appended) and the most recent `approved` plan (still the operative record
+ * of what the agent was told to build). Everything else — overwhelmingly
+ * `superseded` history the user never acted on — is fair game, oldest first.
+ * A pure transform: never touches status/content, only which entries survive.
+ */
+function pruneRetainedPlans(plans: TaskPlan[]): TaskPlan[] {
+  if (plans.length <= MAX_RETAINED_PLANS) return plans;
+  const lastIdx = plans.length - 1;
+  let latestApprovedIdx = -1;
+  for (let i = plans.length - 1; i >= 0; i--) {
+    if (plans[i]!.status === "approved") {
+      latestApprovedIdx = i;
+      break;
+    }
+  }
+  const protectedIdx = new Set<number>([lastIdx]);
+  if (latestApprovedIdx !== -1) protectedIdx.add(latestApprovedIdx);
+
+  let toDrop = plans.length - MAX_RETAINED_PLANS;
+  const kept: TaskPlan[] = [];
+  for (let i = 0; i < plans.length; i++) {
+    if (toDrop > 0 && !protectedIdx.has(i)) {
+      toDrop--;
+      continue;
+    }
+    kept.push(plans[i]!);
+  }
+  return kept;
 }
 
 /**
@@ -82,16 +121,23 @@ export function upsertDetectedPlan(
     approvedEdited: false,
     filePath: null,
   };
-  return [...superseded, next];
+  return pruneRetainedPlans([...superseded, next]);
 }
 
 /**
  * Persist (or clear) a draft edit on a pending plan. Returns `null` when the
  * plan is missing or no longer `pending` — the caller (the PATCH route)
  * turns that into a 4xx rather than silently writing to a frozen/approved
- * plan. Setting `editedContent` back to the original `content`, or to
- * empty/whitespace-only text, normalizes to `null` (no draft) so a no-op
- * edit doesn't linger as a phantom "dirty" state in the UI.
+ * plan. Setting `editedContent` back to the original `content` normalizes to
+ * `null` (no draft) so a no-op edit doesn't linger as a phantom "dirty"
+ * state in the UI.
+ *
+ * Whitespace-only text is deliberately NOT normalized to `null` here — the
+ * PATCH route rejects it outright (400 "plan edit cannot be empty") before
+ * this is ever called, because silently discarding it would let approve
+ * ship the *original* plan content while the UI still showed the user's
+ * (whitespace) edit as accepted. This helper only handles the "same as
+ * original" no-op case; the "empty" case is a route-level validation error.
  */
 export function setEditedContent(
   plans: TaskPlan[],
@@ -103,9 +149,7 @@ export function setEditedContent(
   const plan = plans[idx]!;
   if (plan.status !== "pending") return null;
   const normalized =
-    editedContent !== null && editedContent.trim() !== "" && editedContent !== plan.content
-      ? editedContent
-      : null;
+    editedContent !== null && editedContent !== plan.content ? editedContent : null;
   const next = [...plans];
   next[idx] = { ...plan, editedContent: normalized };
   return next;

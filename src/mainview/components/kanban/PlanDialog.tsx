@@ -1,14 +1,44 @@
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { AlertCircle, ClipboardList, Loader2, X } from "lucide-react";
+import { AlertCircle, ClipboardList, Info, Loader2, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import { api } from "@/lib/api";
-import { ASSISTANT_MD_COMPONENTS, PlanStatusBadge } from "./RunPanel";
+import { api, ApiError } from "@/lib/api";
+import { ASSISTANT_MD_COMPONENTS } from "./md-components";
 import type { Task, TaskPlan } from "../../../shared/types.ts";
+
+/** Status pill for a plan card / the PlanDialog header — same three-state
+ *  vocabulary throughout (`pending` / `approved` / `superseded`), styled with
+ *  semantic tokens only. Exported so `RunPanel`'s `PlanCard` can reuse it
+ *  verbatim rather than re-deriving the label/color mapping — a one-way
+ *  import (RunPanel -> PlanDialog) since RunPanel already imports the
+ *  `PlanDialog` component from this module. */
+export function PlanStatusBadge({ status }: { status: TaskPlan["status"] }) {
+  switch (status) {
+    case "pending":
+      return (
+        <Badge variant="outline" className="border-primary/50 text-primary">
+          Awaiting approval
+        </Badge>
+      );
+    case "approved":
+      return (
+        <Badge variant="outline" className="border-success/50 text-success">
+          Approved
+        </Badge>
+      );
+    case "superseded":
+      return (
+        <Badge variant="outline" className="border-muted-foreground/40 text-muted-foreground">
+          Superseded
+        </Badge>
+      );
+  }
+}
 
 interface Props {
   task: Task;
@@ -61,12 +91,32 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
     if (!pending && mode === "edit") setMode("preview");
   }, [pending, mode]);
 
-  const edited = pending && text !== plan.content;
-  const dirty = pending && text !== (plan.editedContent ?? plan.content);
-  const effectiveContent = approved ? (plan.editedContent ?? plan.content) : plan.content;
+  // Whitespace-only edits don't count as "edited" — the server rejects a
+  // whitespace-only `editedContent` with 400, so an emptied textarea should
+  // fall back to approving the original plan (plain "Approve Plan") rather
+  // than offering "Save & Approve" against text that will just bounce.
+  const edited = pending && text !== plan.content && text.trim() !== "";
+  // NOT gated on `pending`: a plan can supersede while the textarea still
+  // holds unsaved text (see the effect above that drops out of Edit mode),
+  // and closing should still prompt to save-or-discard that draft even
+  // though the plan is no longer pending. The button set shown below is
+  // still driven by `status` + `edited`, not `dirty`.
+  const dirty = text !== (plan.editedContent ?? plan.content);
+  // Read-only views (approved OR superseded) show the persisted edit when
+  // there is one — previously this only applied to `approved`, so a
+  // superseded plan silently hid an `editedContent` draft behind the
+  // original `content`.
+  const effectiveContent = plan.editedContent ?? plan.content;
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Set once an approve call fails AFTER the approval message was already
+  // delivered to the agent (`ApiError.body.messageSent === true` — the
+  // server writes the plan file / auto-sends the message before persisting
+  // the `approved` status, so that ordering can fail independently). Once
+  // set, Approve/Save & Approve are disabled permanently for this dialog
+  // instance — retrying would send a SECOND approval message to the agent.
+  const [sentButUnconfirmed, setSentButUnconfirmed] = useState(false);
 
   // Dirty-close interception: Escape / backdrop / the header X all route
   // through this. `afterClose`, when set, runs once the user has actually
@@ -125,8 +175,25 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
     }
   };
 
+  // Shared by both approve variants below. A 409/404 whose body carries
+  // `messageSent: true` means the approval message already reached the
+  // live agent session even though the server couldn't persist the plan's
+  // `approved` status — that's not a retryable failure (re-clicking Approve
+  // would send a second approval message), so it latches
+  // `sentButUnconfirmed` instead of leaving the button re-enabled.
+  const handleApproveError = (e: unknown) => {
+    if (
+      e instanceof ApiError &&
+      e.body && typeof e.body === "object" &&
+      (e.body as { messageSent?: boolean }).messageSent === true
+    ) {
+      setSentButUnconfirmed(true);
+    }
+    setError(e instanceof Error ? e.message : String(e));
+  };
+
   const doApprove = async () => {
-    if (saving) return;
+    if (saving || sentButUnconfirmed) return;
     setSaving(true);
     setError(null);
     try {
@@ -134,14 +201,14 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
       const updated = await api.approvePlan(task.id, plan.id);
       onPlanUpdated(updated);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      handleApproveError(e);
     } finally {
       setSaving(false);
     }
   };
 
   const doSaveAndApprove = async () => {
-    if (saving) return;
+    if (saving || sentButUnconfirmed) return;
     setSaving(true);
     setError(null);
     try {
@@ -150,7 +217,7 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
       const updated = await api.approvePlan(task.id, plan.id);
       onPlanUpdated(updated);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      handleApproveError(e);
     } finally {
       setSaving(false);
     }
@@ -245,7 +312,12 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
       </div>
 
       <div className="shrink-0 border-t border-border/60 p-3">
-        {error && (
+        {sentButUnconfirmed ? (
+          <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+            <Info className="size-3.5 shrink-0" /> The approval was delivered to the agent, but the plan record
+            could not be updated — it may refresh shortly.
+          </div>
+        ) : error && (
           <div className="mb-2 flex items-center gap-2 text-xs text-danger">
             <AlertCircle className="size-3.5 shrink-0" /> {error}
           </div>
@@ -260,7 +332,11 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
             Chat about it
           </Button>
           {pending && (
-            <Button size="sm" onClick={() => void (edited ? doSaveAndApprove() : doApprove())} disabled={busy}>
+            <Button
+              size="sm"
+              onClick={() => void (edited ? doSaveAndApprove() : doApprove())}
+              disabled={busy || sentButUnconfirmed}
+            >
               {saving && <Loader2 className="mr-1 size-3 animate-spin" />}
               {edited ? "Save & Approve" : "Approve Plan"}
             </Button>
