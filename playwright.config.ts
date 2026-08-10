@@ -62,6 +62,23 @@ export default defineConfig({
       AGETOR_DATA_DIR: E2E_DATA_DIR,
       AGETOR_API_PORT: String(E2E_API_PORT),
       AGETOR_API_TOKEN: E2E_API_TOKEN,
+      // Added for e2e/quote.spec.ts (docs/plans/quote-messages-list.md §5
+      // TT2). Same fake-driver combo `orchestrator.test.ts` uses: with
+      // AGETOR_CLAUDE_DRIVER=fake, spawnAgent's claude-code branch returns an
+      // in-process fake agent instead of shelling out to tmux, so a run can
+      // be driven end to end without a real `claude` CLI or tmux session.
+      // `checkHarness` (the start-task pre-flight) is a separate code path
+      // that doesn't know about the driver override — it still resolves a
+      // `claude`-shaped binary AND a tmux binary regardless — so
+      // AGETOR_CLAUDE_BIN/AGETOR_TMUX_BIN point both at `/bin/echo` (always
+      // present) purely to satisfy that probe; AGETOR_CLAUDE_ARGS is cleared
+      // so buildCommand's argv (recorded by the fake but never executed)
+      // isn't polluted by an inherited shell override. Inert for
+      // theme.spec.ts, which never starts a run.
+      AGETOR_CLAUDE_DRIVER: "fake",
+      AGETOR_CLAUDE_BIN: "/bin/echo",
+      AGETOR_TMUX_BIN: "/bin/echo",
+      AGETOR_CLAUDE_ARGS: "",
     },
   },
 });
