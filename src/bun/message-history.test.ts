@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll, afterEach } from "bun:test";
+import { test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -37,15 +37,21 @@ afterAll(() => {
 // that count rows across the shared `tasks`/`runs`/`run_events`/`harnesses`
 // tables rely on a clean slate between suites, so wipe everything we
 // inserted after every test — same pattern as db-events-paging.test.ts.
+// Wiping BEFORE each test matters too: `userMessageHistory` is global (no
+// task/harness scoping), and this file asserts exact result sets, so user
+// events leaked by sibling files that ran earlier in the same `bun test`
+// process would otherwise surface in our responses.
 // Custom harness rows are scoped to ids we control (never touch the seeded
 // built-ins `claude-code`/`codex`/`cursor`).
-afterEach(async () => {
+const wipe = () => {
   db.run(`DELETE FROM run_events`);
   db.run(`DELETE FROM runs`);
   db.run(`DELETE FROM tasks`);
   db.run(`DELETE FROM harnesses WHERE is_builtin = 0`);
   db.run(`DELETE FROM projects`);
-});
+};
+beforeEach(wipe);
+afterEach(wipe);
 
 const BASE = () => `http://127.0.0.1:${server.port}`;
 const authedFetch = (p: string, init: RequestInit = {}) =>
