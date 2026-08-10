@@ -73,7 +73,7 @@ function makeTaskRow(taskId: string): Task {
     effort: null,
     fast: false, maxMode: false,
     references: [],
-    backlog: [],
+    backlog: [], plans: [],
     draft: null,
     column: "ready",
     runId: null,

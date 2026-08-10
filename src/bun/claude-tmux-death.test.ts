@@ -296,7 +296,7 @@ function baseTask(id: string): Task {
     model: null,
     effort: null,
     fast: false, maxMode: false,
-    references: [], backlog: [], draft: null,
+    references: [], backlog: [], plans: [], draft: null,
     runId: null,
     hasOpenableRun: false,
     pendingInteractionCount: 0,

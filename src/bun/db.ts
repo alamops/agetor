@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, SavedPrompt, Task, TaskDraft, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, SavedPrompt, Task, TaskDraft, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -75,6 +75,7 @@ type TaskRow = {
   refs: string;
   backlog: string;
   draft: string | null;
+  plans: string;
   run_id: string | null; created_at: number; updated_at: number;
   archived_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
@@ -126,6 +127,53 @@ const parseBacklog = (raw: string): BacklogMessage[] => {
         text: typeof text === "string" ? text : "",
         references: sanitizeRefs((m as { references?: unknown }).references),
         createdAt: typeof createdAt === "number" ? createdAt : 0,
+      }];
+    });
+  } catch { return []; }
+};
+
+/** Every status a {@link TaskPlan} may carry. A row with an unrecognized
+ *  status (future/foreign build, hand-edited DB) coerces to "pending" rather
+ *  than being dropped — losing a plan record entirely is worse than briefly
+ *  misjudging its lifecycle stage, and the approve/edit routes re-validate
+ *  status before acting on it anyway. */
+const PLAN_STATUSES = new Set<string>(["pending", "approved", "superseded"]);
+
+const parsePlans = (raw: string): TaskPlan[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((p): TaskPlan[] => {
+      if (!p || typeof p !== "object") return [];
+      const id = (p as { id?: unknown }).id;
+      const toolCallId = (p as { toolCallId?: unknown }).toolCallId;
+      const runId = (p as { runId?: unknown }).runId;
+      const content = (p as { content?: unknown }).content;
+      if (typeof id !== "string" || !id) return [];
+      if (typeof toolCallId !== "string" || !toolCallId) return [];
+      if (typeof runId !== "string" || !runId) return [];
+      if (typeof content !== "string") return [];
+      const name = (p as { name?: unknown }).name;
+      const editedContent = (p as { editedContent?: unknown }).editedContent;
+      const status = (p as { status?: unknown }).status;
+      const createdAt = (p as { createdAt?: unknown }).createdAt;
+      const approvedAt = (p as { approvedAt?: unknown }).approvedAt;
+      const approvedEdited = (p as { approvedEdited?: unknown }).approvedEdited;
+      const filePath = (p as { filePath?: unknown }).filePath;
+      return [{
+        id,
+        toolCallId,
+        runId,
+        name: typeof name === "string" ? name : null,
+        content,
+        editedContent: typeof editedContent === "string" ? editedContent : null,
+        status: typeof status === "string" && PLAN_STATUSES.has(status)
+          ? (status as TaskPlan["status"])
+          : "pending",
+        createdAt: typeof createdAt === "number" ? createdAt : 0,
+        approvedAt: typeof approvedAt === "number" ? approvedAt : null,
+        approvedEdited: approvedEdited === true,
+        filePath: typeof filePath === "string" ? filePath : null,
       }];
     });
   } catch { return []; }
@@ -186,6 +234,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   references: parseRefs(r.refs),
   backlog: parseBacklog(r.backlog),
   draft: parseDraft(r.draft),
+  plans: parsePlans(r.plans),
   runId: r.run_id,
   // `has_openable_run` comes back as SQLite's 0/1; missing means we didn't
   // join (e.g. insert/update returning the freshly-written shape, where
@@ -234,9 +283,9 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, fast, max_mode, refs, backlog, draft,
+          branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -244,6 +293,7 @@ export const tasks = {
         JSON.stringify(t.references ?? []),
         JSON.stringify(t.backlog ?? []),
         t.draft ? JSON.stringify(t.draft) : null,
+        JSON.stringify(t.plans ?? []),
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
       ],
     );
@@ -259,7 +309,7 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
@@ -269,6 +319,7 @@ export const tasks = {
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
         next.draft ? JSON.stringify(next.draft) : null,
+        JSON.stringify(next.plans ?? []),
         next.runId, next.updatedAt, next.archivedAt ?? null, id,
       ],
     );

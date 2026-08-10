@@ -693,6 +693,15 @@ export interface Task {
    * or emptied by the user.
    */
   draft: TaskDraft | null;
+  /**
+   * Cursor plans detected from a run ending on `createPlanToolCall` (the
+   * agent wrote a plan and stopped). Server-managed — detected in
+   * `attachDoneHandler`, mutated only via the plan edit/approve routes, never
+   * patchable through the generic task PATCH. Empty for every non-Cursor
+   * task and for Cursor tasks that haven't produced a plan yet. At most one
+   * entry is ever `pending` at a time (see {@link TaskPlan.status}).
+   */
+  plans: TaskPlan[];
   runId: string | null;
   /**
    * True when this task has at least one run whose status is
@@ -927,6 +936,56 @@ export type TaskDraft = {
   /** File/folder references currently attached in the composer. */
   references: TaskReference[];
 };
+
+/**
+ * A plan Cursor wrote via its `createPlanToolCall` tool and then stopped on
+ * (the common "finished after planning" behavior). Detected server-side in
+ * `attachDoneHandler` when a run resolves `succeeded` and its last `tool_use`
+ * event is `createPlanToolCall`; persisted on `task.plans` so it survives the
+ * 2s `/tasks` poll and restarts. Approving writes the effective content to a
+ * `.plan.md` file inside the task's worktree and auto-sends an approval
+ * message that resumes the agent.
+ */
+export interface TaskPlan {
+  /** 8-char lowercase hex hash of `toolCallId` — safe for filenames/URLs,
+   *  since Cursor's raw call_ids contain embedded newlines. */
+  id: string;
+  /** Raw call_id from the `createPlanToolCall` tool_use event (may contain
+   *  `\n`) — matches the event so the UI can pair a plan record to its card. */
+  toolCallId: string;
+  /** Run whose terminal `tool_use` produced this plan. */
+  runId: string;
+  /** `args.name` from the tool call, or null when Cursor didn't supply one. */
+  name: string | null;
+  /** Original plan markdown, verbatim from `args.plan`. Never mutated after
+   *  creation — edits live in `editedContent` so "Revert Changes" has
+   *  something to revert to. */
+  content: string;
+  /** Unapproved user edits, persisted on explicit Save actions only (no
+   *  autosave — see the StrictMode/flush-on-unmount hazard this sidesteps).
+   *  Null when there is no draft, or when a draft was cleared back to the
+   *  original. The effective plan content is `editedContent ?? content`. */
+  editedContent: string | null;
+  /**
+   * `pending` — awaiting approval, editable, the one plan a task can act on.
+   * `approved` — terminal; the modal becomes read-only.
+   * `superseded` — a newer `createPlanToolCall` run landed while this one was
+   * still pending. Chat turns do NOT supersede a pending plan — only another
+   * detected plan does.
+   */
+  status: "pending" | "approved" | "superseded";
+  /** Unix ms timestamp when the plan was detected. */
+  createdAt: number;
+  /** Unix ms timestamp when approved, or null while pending/superseded. */
+  approvedAt: number | null;
+  /** True when the approved content came from `editedContent` rather than
+   *  the original `content` — drives the approval message wording. */
+  approvedEdited: boolean;
+  /** Worktree-relative path the effective plan was written to at approval
+   *  time (e.g. `.cursor/plans/<slug>_<id>.plan.md`), or null before
+   *  approval. */
+  filePath: string | null;
+}
 
 export interface AgentOption {
   /** Stored on the task and passed to `buildCommand`. */

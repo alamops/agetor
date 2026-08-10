@@ -2381,6 +2381,9 @@ export async function createTask(
     backlog: [],
     // Composer draft starts empty; autosaved from the run panel thereafter.
     draft: null,
+    // Brand-new tasks have no detected Cursor plans yet — populated later by
+    // `attachDoneHandler` when a run ends on `createPlanToolCall`.
+    plans: [],
     runId: null,
     // Derived at fetch time via SQL EXISTS — supply `false` here so the
     // `Task` shape is complete; `tasks.insert` re-fetches and the real
