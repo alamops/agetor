@@ -1,4 +1,4 @@
-import { test, expect, beforeAll, afterAll, afterEach } from "bun:test";
+import { test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -37,15 +37,21 @@ afterAll(() => {
 // that count rows across the shared `tasks`/`runs`/`run_events`/`harnesses`
 // tables rely on a clean slate between suites, so wipe everything we
 // inserted after every test — same pattern as db-events-paging.test.ts.
+// Wiping BEFORE each test matters too: `userMessageHistory` is global (no
+// task/harness scoping), and this file asserts exact result sets, so user
+// events leaked by sibling files that ran earlier in the same `bun test`
+// process would otherwise surface in our responses.
 // Custom harness rows are scoped to ids we control (never touch the seeded
 // built-ins `claude-code`/`codex`/`cursor`).
-afterEach(async () => {
+const wipe = () => {
   db.run(`DELETE FROM run_events`);
   db.run(`DELETE FROM runs`);
   db.run(`DELETE FROM tasks`);
   db.run(`DELETE FROM harnesses WHERE is_builtin = 0`);
   db.run(`DELETE FROM projects`);
-});
+};
+beforeEach(wipe);
+afterEach(wipe);
 
 const BASE = () => `http://127.0.0.1:${server.port}`;
 const authedFetch = (p: string, init: RequestInit = {}) =>
@@ -115,7 +121,7 @@ function appendUserEvent(runId: string, text: string) {
 // GET /tasks/:id/messages/history
 // ---------------------------------------------------------------------------
 
-test("cross-task same-kind collection: bare-kind task and custom-harness task of the same kind share history; a different kind is excluded both ways", async () => {
+test("cross-harness collection: messages from every harness kind are shared across all tasks", async () => {
   // Task A: legacy bare-kind agent string "claude-code".
   const a = seedTask("claude-code");
   appendUserEvent(a.runId, "hello from A");
@@ -125,31 +131,36 @@ test("cross-task same-kind collection: bare-kind task and custom-harness task of
   const b = seedTask("my-claude-harness");
   appendUserEvent(b.runId, "hello from B");
 
-  // Task C: agent "codex" — a different kind entirely.
+  // Task C: agent "codex" — a different kind entirely, no longer excluded.
   const c = seedTask("codex");
   appendUserEvent(c.runId, "hello from C");
 
   const resA = await authedFetch(`/tasks/${a.taskId}/messages/history`);
   expect(resA.status).toBe(200);
-  const bodyA = await resA.json() as { messages: Array<{ text: string; taskId: string }> };
+  const bodyA = await resA.json() as { messages: Array<{ text: string; taskId: string; agent: string }> };
   const textsA = bodyA.messages.map((m) => m.text);
-  expect(textsA).toContain("hello from A");
-  expect(textsA).toContain("hello from B");
-  expect(textsA).not.toContain("hello from C");
+  expect(textsA.slice().sort()).toEqual(["hello from A", "hello from B", "hello from C"]);
 
+  // The response is identical regardless of which task's endpoint is hit —
+  // `:id` only gates existence, it never scopes the payload.
   const resB = await authedFetch(`/tasks/${b.taskId}/messages/history`);
   const bodyB = await resB.json() as { messages: Array<{ text: string }> };
   const textsB = bodyB.messages.map((m) => m.text);
-  expect(textsB).toContain("hello from A");
-  expect(textsB).toContain("hello from B");
-  expect(textsB).not.toContain("hello from C");
+  expect(textsB).toEqual(textsA);
 
   const resC = await authedFetch(`/tasks/${c.taskId}/messages/history`);
   const bodyC = await resC.json() as { messages: Array<{ text: string }> };
   const textsC = bodyC.messages.map((m) => m.text);
-  expect(textsC).toContain("hello from C");
-  expect(textsC).not.toContain("hello from A");
-  expect(textsC).not.toContain("hello from B");
+  expect(textsC).toEqual(textsA);
+
+  // Codex's message carries a different harness label than the claude-flavored
+  // tasks (bare kind "claude-code" and custom-harness-id "my-claude-harness").
+  const byText = new Map(bodyA.messages.map((m) => [m.text, m.agent]));
+  expect(byText.get("hello from A")).toBe(harnesses.getByIdOrKind("claude-code")!.label);
+  expect(byText.get("hello from B")).toBe("My Claude");
+  expect(byText.get("hello from C")).toBe(harnesses.getByIdOrKind("codex")!.label);
+  expect(byText.get("hello from C")).not.toBe(byText.get("hello from A"));
+  expect(byText.get("hello from C")).not.toBe(byText.get("hello from B"));
 });
 
 test("excludes non-user streams, subagent rows, and blank/space-only data", async () => {
@@ -283,7 +294,7 @@ test("limit: a negative limit falls back to the default", async () => {
   expect(body.messages.map((m) => m.text)).toEqual(["only message"]);
 });
 
-test("response shape: { messages: [{ id, text, ts, taskId, taskTitle, project }] } mirroring run_events.data and the correct task title", async () => {
+test("response shape: { messages: [{ id, text, ts, taskId, taskTitle, project, agent }] } mirroring run_events.data and the correct task title", async () => {
   const { taskId, runId } = seedTask("claude-code", { title: "My Special Task Title" });
   appendUserEvent(runId, "shape check message");
 
@@ -291,12 +302,15 @@ test("response shape: { messages: [{ id, text, ts, taskId, taskTitle, project }]
   const body = await res.json() as { messages: Array<Record<string, unknown>> };
   expect(body.messages.length).toBe(1);
   const msg = body.messages[0]!;
-  expect(Object.keys(msg).sort()).toEqual(["id", "project", "taskId", "taskTitle", "text", "ts"]);
+  expect(Object.keys(msg).sort()).toEqual(["agent", "id", "project", "taskId", "taskTitle", "text", "ts"]);
   expect(typeof msg.id).toBe("number");
   expect(msg.text).toBe("shape check message");
   expect(typeof msg.ts).toBe("number");
   expect(msg.taskId).toBe(taskId);
   expect(msg.taskTitle).toBe("My Special Task Title");
+  // "agent" is the resolved harness *label*, not the raw agent id stored on
+  // the task row.
+  expect(msg.agent).toBe(harnesses.getByIdOrKind("claude-code")!.label);
 });
 
 test("project: registered projects row supplies the name; unregistered workdirs fall back to the path basename", async () => {
@@ -333,7 +347,7 @@ test("401 without a bearer token, and 401 with the wrong one", async () => {
   expect(wrongAuth.status).toBe(401);
 });
 
-test("unknown-harness fallback: an agent id with no harnesses row and not a bare kind only matches the identical agent string", async () => {
+test("unknown-agent tasks are not isolated: unrecognized agent strings share history with every other task", async () => {
   const UNKNOWN_AGENT = "totally-unknown-agent-xyz";
   const OTHER_UNKNOWN_AGENT = "another-unknown-agent-abc";
 
@@ -343,14 +357,19 @@ test("unknown-harness fallback: an agent id with no harnesses row and not a bare
   const e = seedTask(UNKNOWN_AGENT);
   appendUserEvent(e.runId, "message from E");
 
-  // F has a *different* unrecognized agent string — must not leak in.
+  // F has a *different* unrecognized agent string — no longer excluded.
   const f = seedTask(OTHER_UNKNOWN_AGENT);
   appendUserEvent(f.runId, "message from F");
 
   const resD = await authedFetch(`/tasks/${d.taskId}/messages/history`);
   const bodyD = await resD.json() as { messages: Array<{ text: string }> };
   const textsD = bodyD.messages.map((m) => m.text);
-  expect(textsD).toContain("message from D");
-  expect(textsD).toContain("message from E");
-  expect(textsD).not.toContain("message from F");
+  expect(textsD.slice().sort()).toEqual(["message from D", "message from E", "message from F"]);
+
+  // Same invariant as the cross-harness test: the payload doesn't depend on
+  // which task's endpoint served it, even for an unrecognized agent string.
+  const resF = await authedFetch(`/tasks/${f.taskId}/messages/history`);
+  const bodyF = await resF.json() as { messages: Array<{ text: string }> };
+  const textsF = bodyF.messages.map((m) => m.text);
+  expect(textsF).toEqual(textsD);
 });

@@ -337,6 +337,7 @@ export interface SentMessageItem {
   taskId: string;
   taskTitle: string;
   project: string;
+  agent: string;
 }
 
 export interface HarnessesPayload { harnesses: Harness[]; statuses: HarnessStatus[] }
@@ -1183,8 +1184,10 @@ export const api = {
     if (limit) q.set("limit", String(limit));
     return j<TaskEventsPage>(`/tasks/${taskId}/events/page?${q.toString()}`);
   },
-  /** Past sent messages for a task, newest first — backs
-   *  `MessageHistoryPicker`'s "insert a past message" dropdown. */
+  /** Past sent messages across every task and harness, newest first — backs
+   *  `MessageHistoryPicker`'s "insert a past message" dropdown. `taskId` only
+   *  selects which task's endpoint is called (and gates 404-on-unknown-task);
+   *  it does not scope the returned payload. */
   fetchMessageHistory: (taskId: string, limit?: number) => {
     const q = limit ? `?${new URLSearchParams({ limit: String(limit) }).toString()}` : "";
     return j<{ messages: SentMessageItem[] }>(`/tasks/${taskId}/messages/history${q}`);

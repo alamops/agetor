@@ -25,6 +25,7 @@ interface CleanedItem {
   ts: number;
   taskTitle: string;
   project: string;
+  agent: string;
 }
 
 /** Reduce a raw sent-message payload to display text: normalize CR newlines,
@@ -68,8 +69,9 @@ function formatTime(ts: number): string {
 
 /**
  * Small popover, triggered by a `History` icon button, listing past sent
- * messages for the current task (server-provided, coarsely deduped) so the
- * user can re-insert one into the composer instead of retyping it.
+ * messages across all tasks and harnesses (server-provided, coarsely
+ * deduped) so the user can re-insert one into the composer instead of
+ * retyping it.
  *
  * Client-side cleaning collapses the remaining duplicate shapes the server
  * can't see cheaply: a slash-command send shows up twice in claude-code's
@@ -137,7 +139,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
           if (!text) continue;
           if (seen.has(text)) continue;
           seen.add(text);
-          cleaned.push({ key: String(m.id), text, ts: m.ts, taskTitle: m.taskTitle, project: m.project });
+          cleaned.push({ key: String(m.id), text, ts: m.ts, taskTitle: m.taskTitle, project: m.project, agent: m.agent });
         }
         // Cap AFTER cleaning/dedup — the server's own LIMIT (FETCH_LIMIT) is
         // taken before dedup/empty/command-output filtering can drop rows,
@@ -194,7 +196,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
           )}
           {!loading && !error && items !== null && items.length === 0 && (
             <p className="px-3 py-2 text-xs text-muted-foreground">
-              No past messages for this agent yet.
+              No past messages yet.
             </p>
           )}
           {!loading && !error && items !== null && items.length > 0 && (
@@ -211,7 +213,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
                   >
                     <span className="line-clamp-2 text-xs text-foreground">{item.text}</span>
                     <span className="text-[11px] text-muted-foreground">
-                      {item.project} · {item.taskTitle} · {formatTime(item.ts)}
+                      {item.project} · {item.taskTitle} · {item.agent} · {formatTime(item.ts)}
                     </span>
                   </button>
                 </li>

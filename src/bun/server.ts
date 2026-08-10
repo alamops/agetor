@@ -4683,6 +4683,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // `:id` is only a 404-on-unknown-task existence gate — the payload
+      // itself is global (every task, every harness), not scoped to `:id`.
       "/tasks/:id/messages/history": {
         GET: authed((req) => {
           const taskId = req.params.id;
@@ -4695,11 +4697,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const limit = Number.isFinite(limitRaw) && limitRaw > 0
             ? Math.max(1, Math.min(Math.floor(limitRaw), 200))
             : 50;
-          const harness = harnesses.getByIdOrKind(task.agent);
-          const agentIds = harness
-            ? Array.from(new Set([harness.kind, ...harnesses.list().filter((h) => h.kind === harness.kind).map((h) => h.id)]))
-            : [task.agent];
-          const rows = runs.userMessageHistory(agentIds, limit);
+          const rows = runs.userMessageHistory(limit);
+          // Resolve each distinct agent id/kind to its human harness label
+          // once per request rather than per row.
+          const agentLabels = new Map<string, string>();
+          for (const row of rows) {
+            if (agentLabels.has(row.taskAgent)) continue;
+            agentLabels.set(row.taskAgent, harnesses.getByIdOrKind(row.taskAgent)?.label ?? row.taskAgent);
+          }
           const messages = rows.map((row) => ({
             id: row.id,
             text: row.data,
@@ -4707,6 +4712,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             taskId: row.taskId,
             taskTitle: row.taskTitle,
             project: row.projectName ?? (row.taskWorkdir.split("/").filter(Boolean).pop() ?? row.taskWorkdir),
+            agent: agentLabels.get(row.taskAgent)!,
           }));
           return json({ messages }, { headers: corsHeaders(req) });
         }),

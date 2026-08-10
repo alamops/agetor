@@ -1,5 +1,7 @@
 # Plan — Composer message-history dropdown (past sent messages across same-harness tasks)
 
+> Superseded in part by docs/plans/last-messages-all-harnesses.md — the harness-kind scoping described here was removed; userMessageHistory now takes only (limit).
+
 | Field | Value |
 | --- | --- |
 | Date | 2026-08-08 |
