@@ -68,8 +68,9 @@ function formatTime(ts: number): string {
 
 /**
  * Small popover, triggered by a `History` icon button, listing past sent
- * messages for the current task (server-provided, coarsely deduped) so the
- * user can re-insert one into the composer instead of retyping it.
+ * messages across all tasks and harnesses (server-provided, coarsely
+ * deduped) so the user can re-insert one into the composer instead of
+ * retyping it.
  *
  * Client-side cleaning collapses the remaining duplicate shapes the server
  * can't see cheaply: a slash-command send shows up twice in claude-code's
@@ -194,7 +195,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
           )}
           {!loading && !error && items !== null && items.length === 0 && (
             <p className="px-3 py-2 text-xs text-muted-foreground">
-              No past messages for this agent yet.
+              No past messages yet.
             </p>
           )}
           {!loading && !error && items !== null && items.length > 0 && (

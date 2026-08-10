@@ -4695,11 +4695,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const limit = Number.isFinite(limitRaw) && limitRaw > 0
             ? Math.max(1, Math.min(Math.floor(limitRaw), 200))
             : 50;
-          const harness = harnesses.getByIdOrKind(task.agent);
-          const agentIds = harness
-            ? Array.from(new Set([harness.kind, ...harnesses.list().filter((h) => h.kind === harness.kind).map((h) => h.id)]))
-            : [task.agent];
-          const rows = runs.userMessageHistory(agentIds, limit);
+          const rows = runs.userMessageHistory(limit);
           const messages = rows.map((row) => ({
             id: row.id,
             text: row.data,

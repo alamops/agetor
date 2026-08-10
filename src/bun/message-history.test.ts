@@ -115,7 +115,7 @@ function appendUserEvent(runId: string, text: string) {
 // GET /tasks/:id/messages/history
 // ---------------------------------------------------------------------------
 
-test("cross-task same-kind collection: bare-kind task and custom-harness task of the same kind share history; a different kind is excluded both ways", async () => {
+test("cross-harness collection: messages from every harness kind are shared across all tasks", async () => {
   // Task A: legacy bare-kind agent string "claude-code".
   const a = seedTask("claude-code");
   appendUserEvent(a.runId, "hello from A");
@@ -125,7 +125,7 @@ test("cross-task same-kind collection: bare-kind task and custom-harness task of
   const b = seedTask("my-claude-harness");
   appendUserEvent(b.runId, "hello from B");
 
-  // Task C: agent "codex" — a different kind entirely.
+  // Task C: agent "codex" — a different kind entirely, no longer excluded.
   const c = seedTask("codex");
   appendUserEvent(c.runId, "hello from C");
 
@@ -135,21 +135,21 @@ test("cross-task same-kind collection: bare-kind task and custom-harness task of
   const textsA = bodyA.messages.map((m) => m.text);
   expect(textsA).toContain("hello from A");
   expect(textsA).toContain("hello from B");
-  expect(textsA).not.toContain("hello from C");
+  expect(textsA).toContain("hello from C");
 
   const resB = await authedFetch(`/tasks/${b.taskId}/messages/history`);
   const bodyB = await resB.json() as { messages: Array<{ text: string }> };
   const textsB = bodyB.messages.map((m) => m.text);
   expect(textsB).toContain("hello from A");
   expect(textsB).toContain("hello from B");
-  expect(textsB).not.toContain("hello from C");
+  expect(textsB).toContain("hello from C");
 
   const resC = await authedFetch(`/tasks/${c.taskId}/messages/history`);
   const bodyC = await resC.json() as { messages: Array<{ text: string }> };
   const textsC = bodyC.messages.map((m) => m.text);
+  expect(textsC).toContain("hello from A");
+  expect(textsC).toContain("hello from B");
   expect(textsC).toContain("hello from C");
-  expect(textsC).not.toContain("hello from A");
-  expect(textsC).not.toContain("hello from B");
 });
 
 test("excludes non-user streams, subagent rows, and blank/space-only data", async () => {
@@ -333,7 +333,7 @@ test("401 without a bearer token, and 401 with the wrong one", async () => {
   expect(wrongAuth.status).toBe(401);
 });
 
-test("unknown-harness fallback: an agent id with no harnesses row and not a bare kind only matches the identical agent string", async () => {
+test("unknown-agent tasks are not isolated: unrecognized agent strings share history with every other task", async () => {
   const UNKNOWN_AGENT = "totally-unknown-agent-xyz";
   const OTHER_UNKNOWN_AGENT = "another-unknown-agent-abc";
 
@@ -343,7 +343,7 @@ test("unknown-harness fallback: an agent id with no harnesses row and not a bare
   const e = seedTask(UNKNOWN_AGENT);
   appendUserEvent(e.runId, "message from E");
 
-  // F has a *different* unrecognized agent string — must not leak in.
+  // F has a *different* unrecognized agent string — no longer excluded.
   const f = seedTask(OTHER_UNKNOWN_AGENT);
   appendUserEvent(f.runId, "message from F");
 
@@ -352,5 +352,5 @@ test("unknown-harness fallback: an agent id with no harnesses row and not a bare
   const textsD = bodyD.messages.map((m) => m.text);
   expect(textsD).toContain("message from D");
   expect(textsD).toContain("message from E");
-  expect(textsD).not.toContain("message from F");
+  expect(textsD).toContain("message from F");
 });
