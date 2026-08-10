@@ -1814,6 +1814,12 @@ function RunPanelBody({
         if (!el) return;
         el.setSelectionRange(caret, caret);
         el.focus();
+        // A textarea doesn't scroll to reveal a programmatically-set caret —
+        // when the composer already overflows, the appended quote (and the
+        // caret, which appendQuote always lands at the very end) sits below
+        // the fold until the user scrolls. Bottom IS the caret here, so
+        // pinning scrollTop to scrollHeight is exact, not approximate.
+        el.scrollTop = el.scrollHeight;
       });
     },
     [input],
