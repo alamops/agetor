@@ -16,6 +16,8 @@ import { latestPrProposal } from "@/lib/pr-proposal";
 import { parsePrUrl, parsePullNumber, canOfferResolveConflicts } from "@/lib/pr-url";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 import { eventWindowKeepCount } from "@/lib/event-window";
+import { appendQuote } from "@/lib/quote-selection";
+import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { GitHubPullPrefill } from "./GitHubDialog";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge, badgeVariants } from "@/components/ui/badge";
@@ -229,9 +231,11 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
   // Escape closes the panel — but only when no higher-priority dismissable
   // layer is up: a modal Dialog (confirm, edit, settings, tmux-missing —
   // each renders `[role="dialog"][aria-modal="true"]`), an open search-select
-  // / multi-search-select popover (marked with `[data-popover-open]`), or the
-  // in-panel message search bar (marked with `[data-search-open]` — see
-  // RunPanelBody). Esc peels one layer at a time, top down.
+  // / multi-search-select popover (marked with `[data-popover-open]`), the
+  // floating quote pill (marked with `[data-quote-open]` — see
+  // QuoteSelectionButton), or the in-panel message search bar (marked with
+  // `[data-search-open]` — see RunPanelBody). Esc peels one layer at a time,
+  // top down.
   //
   // Note: stopPropagation/stopImmediatePropagation can't help here because
   // both the panel and the popovers attach to `document`, so DOM markers
@@ -246,7 +250,7 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-search-open]')) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open], [data-search-open]')) return;
       e.preventDefault();
       onCloseRef.current();
     };
@@ -1420,15 +1424,15 @@ function RunPanelBody({
   // within the panel (not just while the input itself is focused) — matching
   // "Escape peels one layer at a time" from the panel's own listener. Gated
   // on `searchOpen` so it's only attached while there's something to close,
-  // and bails on the same higher-priority dismissable layer (modal dialog /
-  // open search-select popover) as every other document-level listener here
-  // so Escape closes the topmost layer first instead of skipping straight to
-  // the search bar underneath it.
+  // and bails on the same higher-priority dismissable layers (modal dialog /
+  // open search-select popover / floating quote pill) as every other
+  // document-level listener here so Escape closes the topmost layer first
+  // instead of skipping straight to the search bar underneath it.
   useEffect(() => {
     if (!searchOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
-      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open]')) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"], [data-popover-open], [data-quote-open]')) return;
       e.preventDefault();
       closeSearch();
     };
@@ -1796,6 +1800,24 @@ function RunPanelBody({
   const focusComposer = useCallback(() => {
     requestAnimationFrame(() => { sendRef.current?.focus(); });
   }, []);
+  // Append a quoted selection (see QuoteSelectionButton) to the composer and
+  // land the caret at its end. Caret BEFORE focus — SlashAutocomplete syncs
+  // its tracked caret on the native `focus` event, so focusing first would
+  // read the stale pre-insert offset (same fix as ExtensionPicker's `insert`,
+  // commit bcf0d07).
+  const handleQuote = useCallback(
+    (quoted: string) => {
+      const { text, caret } = appendQuote(input, quoted);
+      setInput(text);
+      requestAnimationFrame(() => {
+        const el = sendRef.current;
+        if (!el) return;
+        el.setSelectionRange(caret, caret);
+        el.focus();
+      });
+    },
+    [input],
+  );
   useEffect(() => {
     if (!task.workdir.trim()) { setSendCommands([]); setSendExtensions([]); return; }
     let cancelled = false;
@@ -2931,13 +2953,15 @@ function RunPanelBody({
                   requestAnimationFrame(() => {
                     const el = sendRef.current;
                     if (!el) return;
-                    el.focus();
-                    // Pin the caret to the end of the inserted text — without
-                    // this the textarea keeps its stale prior caret offset,
-                    // which can land inside a `/command` token and pop
-                    // SlashAutocomplete (whose keydown handler then swallows
-                    // the next Enter).
+                    // Pin the caret to the end of the inserted text, and do it
+                    // BEFORE focus() — SlashAutocomplete syncs its tracked
+                    // caret on the native `focus` event, so focusing first
+                    // reads the stale prior offset, which can land inside a
+                    // `/command` token and pop SlashAutocomplete (whose
+                    // keydown handler then swallows the next Enter). Same fix
+                    // as ExtensionPicker's `insert` (commit bcf0d07).
                     el.setSelectionRange(text.length, text.length);
+                    el.focus();
                   });
                 }}
                 className="absolute right-1.5 top-1.5 z-10"
@@ -2967,6 +2991,18 @@ function RunPanelBody({
             <p className="mt-1 text-[10px] text-muted-foreground">{sendHint}</p>
           )}
         </div>
+      )}
+      {/* Same gate as the composer dock above (`archived && !canSend` ? static
+          notice, `activeStream !== "main"` ? read-only footer, else the live
+          composer) — the quote pill only makes sense where there's an
+          editable composer to insert into. `position: fixed`, so it doesn't
+          need to live inside the composer's own JSX branch. `disabled` mirrors
+          how ExtensionPicker/MessageHistoryPicker/Save-for-later gate
+          themselves (`sending || backlogBusy`) — a quote clicked while a send
+          is in flight would otherwise get wiped by the resolving
+          `setInput("")` + `clearTaskDraft`. */}
+      {!(archived && !canSend) && activeStream === "main" && (
+        <QuoteSelectionButton containerRef={logRef} disabled={sending || backlogBusy} onQuote={handleQuote} />
       )}
       {/* Keyed by plan id (stable across in-place status/edit updates as
           `plans` refreshes from the poll or a mutation's returned Task) so
