@@ -589,30 +589,6 @@ function GeneralSection({
   return (
     <div className="space-y-4 pt-3 text-sm">
       <section className="space-y-1">
-        <label className="text-xs text-muted-foreground">Theme</label>
-        <div className="grid grid-cols-3 gap-1">
-          {THEME_PREFERENCES.map((t) => {
-            const Icon = THEME_PREFERENCE_ICON[t.id];
-            return (
-              <Button
-                key={t.id}
-                size="sm"
-                variant={themePreference === t.id ? "default" : "outline"}
-                onClick={() => setThemePreference(t.id)}
-                className="justify-start"
-              >
-                <Icon className="mr-1.5 size-3.5" />
-                {t.label}
-              </Button>
-            );
-          })}
-        </div>
-        <p className="text-[11px] text-muted-foreground">
-          Auto follows your system's appearance and switches live if it changes.
-        </p>
-      </section>
-
-      <section className="space-y-1">
         <label className="text-xs text-muted-foreground">Default harness for new tasks</label>
         <Select value={defaultHarness} onChange={(e) => onPickDefault(e.target.value)}>
           {enabledHarnesses.map((h) => (
@@ -640,6 +616,30 @@ function GeneralSection({
         <p className="text-[11px] text-muted-foreground">
           Claude Code runs through a tmux session per task. Switch to the bundled
           binary if you don't want to install tmux system-wide.
+        </p>
+      </section>
+
+      <section className="space-y-1">
+        <label className="text-xs text-muted-foreground">Theme</label>
+        <div className="grid grid-cols-3 gap-1">
+          {THEME_PREFERENCES.map((t) => {
+            const Icon = THEME_PREFERENCE_ICON[t.id];
+            return (
+              <Button
+                key={t.id}
+                size="sm"
+                variant={themePreference === t.id ? "default" : "outline"}
+                onClick={() => setThemePreference(t.id)}
+                className="justify-start"
+              >
+                <Icon className="mr-1.5 size-3.5" />
+                {t.label}
+              </Button>
+            );
+          })}
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Auto follows your system's appearance and switches live if it changes.
         </p>
       </section>
     </div>
