@@ -1234,6 +1234,25 @@ export const api = {
       body: JSON.stringify({ order }),
     }),
 
+  // Cursor plans — detected `createPlanToolCall` records on `task.plans`.
+  // Every mutation returns the full updated Task so the caller can re-sync.
+  /** Persist (or clear, with `null`) unapproved edits to a pending plan.
+   *  Rejected (400) once the plan is no longer `pending`. */
+  savePlanEdit: (taskId: string, planId: string, editedContent: string | null) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/plans/${encodeURIComponent(planId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ editedContent }),
+    }),
+  /** Approve a pending plan: the server writes the effective content
+   *  (edited ?? original) to a `.plan.md` file in the task's worktree and
+   *  auto-sends an approval message that resumes the agent.
+   *  `retry: false` — like `sendRunInput`, a replay would re-send a
+   *  duplicate approval message to a live agent session. */
+  approvePlan: (taskId: string, planId: string) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/plans/${encodeURIComponent(planId)}/approve`, {
+      method: "POST",
+    }, { retry: false }),
+
   // Composer draft — the single unsent text+refs autosaved from the task
   // details modal. Every mutation returns the full updated Task.
   setTaskDraft: (taskId: string, draft: { text: string; references: TaskReference[] }) =>

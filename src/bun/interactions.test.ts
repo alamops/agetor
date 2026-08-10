@@ -37,7 +37,7 @@ async function makeTaskWithCwd(id: string): Promise<string> {
     model: "opus-4.7",
     effort: null,
     fast: false, maxMode: false,
-    references: [],    backlog: [], draft: null,
+    references: [],    backlog: [], plans: [], draft: null,
     runId: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),

@@ -1,0 +1,6 @@
+# Scope `bun test` discovery to src/ — e2e/*.spec.ts are Playwright specs
+# (playwright.config.ts testDir "e2e", run via `bunx playwright test`) and
+# crash under bun's runner: test.describe.configure() only works inside the
+# Playwright harness. Every bun-runner test lives under src/.
+[test]
+root = "src"

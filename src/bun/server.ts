@@ -20,6 +20,7 @@ import {
   dataDir,
 } from "./db.ts";
 import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -338,6 +339,48 @@ function backlogGuard(req: { params: { id: string } } & Request): Response | nul
   }
   return null;
 }
+
+/** Shared precondition for the cursor-plan-mutation routes (PATCH edit,
+ *  approve): the task must exist and not be archived. Mirrors `backlogGuard`
+ *  — same archived-freeze policy applied to the `plans` JSON column. */
+function planGuard(req: { params: { id: string } } & Request): Response | null {
+  const task = tasks.get(req.params.id);
+  if (!task) {
+    return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+  }
+  if (task.archivedAt != null) {
+    return json(
+      { error: "task is archived — unarchive it before editing plans" },
+      { status: 400, headers: corsHeaders(req) },
+    );
+  }
+  return null;
+}
+
+/** Shared precondition for both cursor-plan-mutation routes: plan
+ *  approval/editing only makes sense for a cursor-harness task (the whole
+ *  detect/approve flow is keyed on cursor's `createPlanToolCall`). Identical
+ *  check, identical 400 shape, in both the PATCH edit route and the approve
+ *  route — factored out so they can't drift. */
+function planCursorKindGuard(req: Request, task: Task): Response | null {
+  const kind = harnesses.getByIdOrKind(task.agent)?.kind;
+  if (kind !== "cursor") {
+    return json(
+      { error: "plan approval is only supported for cursor tasks" },
+      { status: 400, headers: corsHeaders(req) },
+    );
+  }
+  return null;
+}
+
+/** Concurrent-approve guard for `/tasks/:id/plans/:planId/approve`: claimed
+ *  synchronously (no `await` between the `.has` check and the `.add`) before
+ *  any async work, so two POSTs racing in on the same plan can't both pass
+ *  the `status === "pending"` check and both send the approval message —
+ *  the second is rejected with 409 before it does anything. Keyed on
+ *  `taskId:planId` (not just `planId`, though plan ids are already unique)
+ *  to read unambiguously in isolation. */
+const approvalsInFlight = new Set<string>();
 
 /**
  * Coerce an untrusted request body into a well-formed BranchNamingConfig,
@@ -3963,6 +4006,221 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Cursor plan approval (see task-plans.ts + docs/plans/cursor-plan-approval.md).
+      // Plans are detected server-side in `attachDoneHandler`; these two
+      // routes are the only writers of `editedContent`/`status` thereafter.
+      "/tasks/:id/plans/:planId": {
+        PATCH: authed(async (req) => {
+          const blocked = planGuard(req);
+          if (blocked) return blocked;
+          const body = (await req.json().catch(() => ({}))) as { editedContent?: unknown };
+          if (body.editedContent !== null && typeof body.editedContent !== "string") {
+            return json(
+              { error: "editedContent must be a string or null" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // 256 KB — a plan edit is bounded prose, not a file upload. Same
+          // budget as the composer draft cap (`DRAFT_TEXT_MAX_LENGTH` below):
+          // the draft rides the 2s `/tasks` poll same as `plans` does, so an
+          // unbounded edit would bloat every poll response the same way.
+          const EDITED_CONTENT_MAX_LENGTH = 256 * 1024;
+          if (
+            typeof body.editedContent === "string"
+            && body.editedContent.length > EDITED_CONTENT_MAX_LENGTH
+          ) {
+            return json(
+              { error: `editedContent exceeds ${EDITED_CONTENT_MAX_LENGTH} characters` },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          // A non-null edit that's whitespace-only must be rejected outright
+          // rather than silently normalized to "no draft" — that used to let
+          // approve silently ship the ORIGINAL plan while the UI still showed
+          // the user's edit as accepted. `setEditedContent` no longer does
+          // that normalization itself; this is the only place it's enforced.
+          if (typeof body.editedContent === "string" && body.editedContent.trim() === "") {
+            return json(
+              { error: "plan edit cannot be empty" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const task = tasks.get(req.params.id);
+          if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          const kindBlocked = planCursorKindGuard(req, task);
+          if (kindBlocked) return kindBlocked;
+          const nextPlans = setEditedContent(task.plans, req.params.planId, body.editedContent ?? null);
+          if (!nextPlans) {
+            return json(
+              { error: "plan not found or not pending" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const updated = tasks.update(req.params.id, { plans: nextPlans });
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Approve-route ordering: claim (`approvalsInFlight`) → checks (task /
+      // kind / plan-pending / runId / worktree-presence, all read from ONE
+      // fresh `task` snapshot) → write (plan file to disk) → send (the
+      // approval message into the live session) → persist (`approvePlan` +
+      // `tasks.update`, still against that same snapshot) → release the claim
+      // in `finally`. See the finding-by-finding notes below for why each
+      // step is where it is.
+      "/tasks/:id/plans/:planId/approve": {
+        POST: authed(async (req) => {
+          const key = `${req.params.id}:${req.params.planId}`;
+          // Claimed synchronously, before any `await` in this handler — two
+          // POSTs racing in on the same plan must not both observe
+          // `status === "pending"` and both send the approval message. The
+          // loser gets a 409 here, before touching anything else.
+          if (approvalsInFlight.has(key)) {
+            return json(
+              { error: "an approval is already in flight for this plan" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+          }
+          approvalsInFlight.add(key);
+          try {
+            const blocked = planGuard(req);
+            if (blocked) return blocked;
+
+            // Single fresh snapshot for the whole request: `content`, the
+            // message wording, and the `approvedEdited` persisted at the end
+            // must all derive from the SAME read of `task`/`plan`, or a
+            // concurrent PATCH edit landing between two separate fetches
+            // could make the written file, the message text, and the final
+            // `approvedEdited` flag disagree with each other. (The
+            // `approvalsInFlight` claim above only serializes concurrent
+            // *approves* of this plan; it doesn't need to also block a
+            // concurrent PATCH, because PATCH never touches `status`, so
+            // `approvePlan`'s pending-check below still holds against this
+            // snapshot even if a PATCH races in.)
+            const task = tasks.get(req.params.id);
+            if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+
+            const kindBlocked = planCursorKindGuard(req, task);
+            if (kindBlocked) return kindBlocked;
+
+            const plan = task.plans.find((p) => p.id === req.params.planId);
+            if (!plan || plan.status !== "pending") {
+              return json(
+                { error: "plan not found or not pending" },
+                { status: 400, headers: corsHeaders(req) },
+              );
+            }
+            // `task.runId` survives a normal run completion (only nulled by
+            // orphan-reconciliation / a harness-not-found spawn failure —
+            // see orchestrator.ts), so the run that produced this plan is
+            // still the one `sendInput` needs to resume. No
+            // fallback-to-newest-run: if it's null the task genuinely has
+            // nothing live to resume.
+            if (!task.runId) {
+              return json(
+                { error: "task has no resumable run — approval cannot be delivered" },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            // A missing worktree must 409 here, BEFORE `mkdirSync` below can
+            // recreate it as an empty stub. `mkdirSync(..., {recursive:
+            // true})` would happily materialize an empty directory at
+            // `task.worktreePath`, which then satisfies `existsSync` and
+            // defeats `sendInput`'s own restore trigger (orchestrator.ts,
+            // `!existsSync(worktreePath)`) — the agent would resume into an
+            // empty directory instead of the real worktree being restored.
+            if (task.worktreePath && !existsSync(task.worktreePath)) {
+              return json(
+                {
+                  error:
+                    "task worktree is missing — send a message to restore it, then approve the plan",
+                },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+
+            const content = effectiveContent(plan);
+            const cwd = task.worktreePath ?? task.workdir;
+            const relDir = ".cursor/plans";
+            const filename = `${planSlug(plan.name)}_${plan.id}.plan.md`;
+            const relPath = path.join(relDir, filename);
+            try {
+              mkdirSync(path.join(cwd, relDir), { recursive: true });
+              await Bun.write(path.join(cwd, relPath), content);
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              // Plan stays pending, no message sent — the user can retry.
+              return json(
+                { error: `failed to write plan file: ${msg}` },
+                { status: 500, headers: corsHeaders(req) },
+              );
+            }
+
+            const edited = plan.editedContent !== null;
+            let message = edited
+              ? `The plan is approved with edits by the user — the approved version is saved at ${relPath}. Read it and follow that version; it supersedes your original plan. Good to go.`
+              : `The plan is approved — proceed with the implementation. It is also saved at ${relPath} for reference.`;
+            // ask-mode is propose-only and may not be able to read the file
+            // back off disk headlessly — embed the full effective content
+            // inline so the agent has it regardless. `null` mode means auto
+            // (buildCommand's convention).
+            if (task.mode === "ask") {
+              message += `\n\n--- Approved plan ---\n\n${content}`;
+            }
+
+            const sendResult = await sendInput(task.runId, message);
+            if (!sendResult.delivered) {
+              // The file is already written but nothing was sent — leave the
+              // plan pending so the user can retry the approve action.
+              return json(
+                { error: `approval message not delivered: ${sendResult.reason}` },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+
+            // The message is now delivered and cannot be un-sent — every
+            // branch from here on must report `messageSent: true` so the
+            // webview knows not to let the user retry the approve action
+            // (a retry would double-send). `approvePlan` re-validates
+            // `status === "pending"` against the same snapshot captured
+            // above, so a `null` result here is a defensive check for an
+            // in-memory-shape surprise rather than a real race — the
+            // `approvalsInFlight` claim already rules out a concurrent
+            // approve of this exact plan.
+            const result = approvePlan(task.plans, req.params.planId, {
+              now: Date.now(),
+              filePath: relPath,
+            });
+            if (!result) {
+              return json(
+                {
+                  error:
+                    "approval message was sent, but the plan record could not be updated "
+                    + "— check the run panel",
+                  messageSent: true,
+                },
+                { status: 409, headers: corsHeaders(req) },
+              );
+            }
+            const updated = tasks.update(req.params.id, { plans: result.plans });
+            if (!updated) {
+              return json(
+                {
+                  error: "approval message was sent, but the task could not be found to persist it",
+                  messageSent: true,
+                },
+                { status: 404, headers: corsHeaders(req) },
+              );
+            }
+            return json(updated, { headers: corsHeaders(req) });
+          } finally {
+            approvalsInFlight.delete(key);
+          }
         }),
       },
 

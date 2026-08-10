@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, SavedPrompt, Task, TaskDraft, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, SavedPrompt, Task, TaskDraft, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -75,6 +75,7 @@ type TaskRow = {
   refs: string;
   backlog: string;
   draft: string | null;
+  plans: string;
   run_id: string | null; created_at: number; updated_at: number;
   archived_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
@@ -126,6 +127,63 @@ const parseBacklog = (raw: string): BacklogMessage[] => {
         text: typeof text === "string" ? text : "",
         references: sanitizeRefs((m as { references?: unknown }).references),
         createdAt: typeof createdAt === "number" ? createdAt : 0,
+      }];
+    });
+  } catch { return []; }
+};
+
+/** Every status a {@link TaskPlan} may carry. A row with an unrecognized
+ *  status (future/foreign build, hand-edited DB) coerces to a NON-actionable
+ *  state — "approved" when approvedAt proves an approval happened, else
+ *  "superseded" — never "pending": approve is non-idempotent (writes a file,
+ *  messages a live agent), so corruption must not resurrect an approve button.
+ *  Losing the record entirely would still be worse, so it is kept. */
+const PLAN_STATUSES = new Set<string>(["pending", "approved", "superseded"]);
+
+const parsePlans = (raw: string): TaskPlan[] => {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((p): TaskPlan[] => {
+      if (!p || typeof p !== "object") return [];
+      const id = (p as { id?: unknown }).id;
+      const toolCallId = (p as { toolCallId?: unknown }).toolCallId;
+      const runId = (p as { runId?: unknown }).runId;
+      const content = (p as { content?: unknown }).content;
+      if (typeof id !== "string" || !id) return [];
+      if (typeof toolCallId !== "string" || !toolCallId) return [];
+      if (typeof runId !== "string" || !runId) return [];
+      if (typeof content !== "string") return [];
+      const name = (p as { name?: unknown }).name;
+      const editedContent = (p as { editedContent?: unknown }).editedContent;
+      const status = (p as { status?: unknown }).status;
+      const createdAt = (p as { createdAt?: unknown }).createdAt;
+      const approvedAt = (p as { approvedAt?: unknown }).approvedAt;
+      const approvedEdited = (p as { approvedEdited?: unknown }).approvedEdited;
+      const filePath = (p as { filePath?: unknown }).filePath;
+      return [{
+        id,
+        toolCallId,
+        runId,
+        name: typeof name === "string" ? name : null,
+        content,
+        editedContent: typeof editedContent === "string" ? editedContent : null,
+        // An unknown/corrupt status must never coerce to "pending" — that
+        // would resurrect an already-approved (or superseded) plan as
+        // actionable again, and `approvePlan`/the approve route are
+        // non-idempotent (a second approval re-sends the message). Fall
+        // back on whether `approvedAt` is set: a numeric timestamp means it
+        // really was approved, so keep it "approved"; otherwise treat the
+        // corrupt row as history that's no longer actionable.
+        status: typeof status === "string" && PLAN_STATUSES.has(status)
+          ? (status as TaskPlan["status"])
+          : typeof approvedAt === "number"
+            ? "approved"
+            : "superseded",
+        createdAt: typeof createdAt === "number" ? createdAt : 0,
+        approvedAt: typeof approvedAt === "number" ? approvedAt : null,
+        approvedEdited: approvedEdited === true,
+        filePath: typeof filePath === "string" ? filePath : null,
       }];
     });
   } catch { return []; }
@@ -186,6 +244,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   references: parseRefs(r.refs),
   backlog: parseBacklog(r.backlog),
   draft: parseDraft(r.draft),
+  plans: parsePlans(r.plans),
   runId: r.run_id,
   // `has_openable_run` comes back as SQLite's 0/1; missing means we didn't
   // join (e.g. insert/update returning the freshly-written shape, where
@@ -234,9 +293,9 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, fast, max_mode, refs, backlog, draft,
+          branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -244,6 +303,7 @@ export const tasks = {
         JSON.stringify(t.references ?? []),
         JSON.stringify(t.backlog ?? []),
         t.draft ? JSON.stringify(t.draft) : null,
+        JSON.stringify(t.plans ?? []),
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
       ],
     );
@@ -259,7 +319,7 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
@@ -269,6 +329,7 @@ export const tasks = {
         JSON.stringify(next.references ?? []),
         JSON.stringify(next.backlog ?? []),
         next.draft ? JSON.stringify(next.draft) : null,
+        JSON.stringify(next.plans ?? []),
         next.runId, next.updatedAt, next.archivedAt ?? null, id,
       ],
     );
@@ -847,6 +908,22 @@ export const runs = {
   lastEventData(runId: string): string | null {
     const row = db.query<{ data: string }, [string]>(
       `SELECT data FROM run_events WHERE run_id = ? AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
+    ).get(runId);
+    return row ? row.data : null;
+  },
+  /** The most recently persisted MAIN-stream `tool_use` event's raw `data`
+   *  for a run (`subagent_id IS NULL`, same rationale as `lastEventData`: a
+   *  subagent's tool call must not be mistaken for the main run's), or
+   *  `null` if the run has none.
+   *
+   *  Backs `detectCursorPlan`'s "is the run's last tool call a
+   *  `createPlanToolCall`?" check. That used to be a full `runs.events(runId)`
+   *  scan keeping only the last `tool_use` row — correct, but O(run length)
+   *  on every settlement of every cursor run, even long ones with no plan at
+   *  all. This is the same lookup expressed as a targeted, indexed query. */
+  lastToolUseData(runId: string): string | null {
+    const row = db.query<{ data: string }, [string]>(
+      `SELECT data FROM run_events WHERE run_id = ? AND stream = 'tool_use' AND subagent_id IS NULL ORDER BY id DESC LIMIT 1`,
     ).get(runId);
     return row ? row.data : null;
   },

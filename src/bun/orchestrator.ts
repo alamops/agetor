@@ -5,6 +5,7 @@ import { basename, join } from "node:path";
 import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
+import { upsertDetectedPlan } from "./task-plans.ts";
 import {
   AGENT_OPTIONS,
   DEFAULT_BRANCH_CONFIG,
@@ -1030,6 +1031,67 @@ function registerActiveRun(
 }
 
 /**
+ * Cursor-only: when a run resolves `succeeded`, check whether its LAST
+ * `tool_use` event is `createPlanToolCall` — cursor's "finished after
+ * planning" signature (plan §2, confirmed 5/5 on real runs) — and if so,
+ * persist a `TaskPlan` record on the task. Kind is resolved the same way
+ * `sendInput`'s cursor branch resolves it (`resolveHarness(task.agent)?.kind`)
+ * so an aliased harness (multi-account) is still recognized as cursor.
+ *
+ * Re-reads `tasks.get` rather than trusting the `task` snapshot the caller
+ * already has — `attachDoneHandler`'s two call sites for a given task can in
+ * principle race a concurrent `plans` write (e.g. a PATCH edit landing
+ * between the caller's fetch and this running), and `upsertDetectedPlan` is
+ * a pure transform over whatever `plans` array it's given, so reading fresh
+ * avoids clobbering that write.
+ *
+ * Never throws — the caller wraps this in try/catch too (belt-and-braces),
+ * but every internal failure mode (malformed JSON, missing/empty plan text,
+ * unexpected shapes) already resolves to a silent no-op here, matching plan
+ * §7: a detection failure must never break run settlement.
+ */
+function detectCursorPlan(task: Task, runId: string): void {
+  if (resolveHarness(task.agent)?.kind !== "cursor") return;
+
+  const lastToolUse = runs.lastToolUseData(runId);
+  if (lastToolUse === null) return;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(lastToolUse);
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  const chunk = parsed as Record<string, unknown>;
+  if (chunk.name !== "createPlanToolCall") return;
+
+  const callId = chunk.id;
+  if (typeof callId !== "string" || callId.length === 0) return;
+  const input = chunk.input;
+  if (!input || typeof input !== "object") return;
+  const createPlanToolCall = (input as Record<string, unknown>).createPlanToolCall;
+  if (!createPlanToolCall || typeof createPlanToolCall !== "object") return;
+  const args = (createPlanToolCall as Record<string, unknown>).args;
+  if (!args || typeof args !== "object") return;
+  const plan = (args as Record<string, unknown>).plan;
+  if (typeof plan !== "string" || plan.trim() === "") return;
+  const nameRaw = (args as Record<string, unknown>).name;
+  const name = typeof nameRaw === "string" ? nameRaw : null;
+
+  const fresh = tasks.get(task.id);
+  if (!fresh) return;
+  const nextPlans = upsertDetectedPlan(fresh.plans, {
+    toolCallId: callId,
+    runId,
+    name,
+    content: plan,
+    now: Date.now(),
+  });
+  if (nextPlans !== fresh.plans) tasks.update(task.id, { plans: nextPlans });
+}
+
+/**
  * Wire the per-run `done` promise to its terminal DB / event side-effects.
  * Pulled out so `startTask` and `sendInput` (which also creates run rows for
  * claude-code) can share the lifecycle handling.
@@ -1066,6 +1128,19 @@ function attachDoneHandler(
       // hook doesn't fire "succeeded" mid-conversation for a turn the
       // user has already moved past.
       const task = tasks.get(taskId);
+      // Cursor plan detection: runs whenever THIS run resolved `succeeded`,
+      // not gated on `isTerminalRun` — a folded/superseded run's tool_use
+      // history is just as real, and `upsertDetectedPlan`'s supersede
+      // transition already handles a newer plan landing while an older one
+      // is still pending. Wrapped so a detection bug can never break run
+      // settlement (plan §7 blast radius).
+      if (newStatus === "succeeded" && task) {
+        try {
+          detectCursorPlan(task, runId);
+        } catch {
+          // Never let plan detection break run settlement.
+        }
+      }
       const isTerminalRun = !!task && task.runId === runId;
       if (isTerminalRun) {
         // A clean success with background agents still in flight is HELD in
@@ -2381,6 +2456,9 @@ export async function createTask(
     backlog: [],
     // Composer draft starts empty; autosaved from the run panel thereafter.
     draft: null,
+    // Brand-new tasks have no detected Cursor plans yet — populated later by
+    // `attachDoneHandler` when a run ends on `createPlanToolCall`.
+    plans: [],
     runId: null,
     // Derived at fetch time via SQL EXISTS — supply `false` here so the
     // `Task` shape is complete; `tasks.insert` re-fetches and the real

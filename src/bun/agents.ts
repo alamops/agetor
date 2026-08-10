@@ -742,6 +742,88 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
   return inst;
 }
 
+/**
+ * Test hook: when `AGETOR_FAKE_CURSOR_PLAN=1`, the cursor fake driver emits a
+ * `createPlanToolCall` tool_use/tool_result pair instead of the generic fake
+ * response, so orchestrator tests can drive `attachDoneHandler`'s cursor plan
+ * detection (`orchestrator.ts:detectCursorPlan`) end to end without a real
+ * `cursor-agent` CLI. Chunk shapes match exactly what `mapCursorEvent`
+ * produces (`cursor-tmux.ts`): the `tool_use` chunk's `data` is
+ * `{id, name, input, serverSide}` with `input` = the raw `tool_call` payload
+ * (so `input.createPlanToolCall.args.plan` round-trips the same way a real
+ * run's does), and the `tool_result` chunk is `{toolUseId, content, isError}`.
+ * The call_id deliberately embeds a newline — real Cursor call_ids do this
+ * (plan §2) — so detection/persistence code that only exercises this path in
+ * tests still gets coverage for the newline-safety requirement.
+ *
+ * `fakePlanCallCounter` makes the call_id unique per spawn (i.e. per turn):
+ * without it, a `--resume` turn issued right after approving a plan would
+ * emit the exact same call_id as the first turn, and `upsertDetectedPlan`'s
+ * dedup-by-toolCallId would treat the second plan as a no-op re-detection of
+ * the first instead of a genuinely new plan — which is exactly the
+ * supersede transition tests need to exercise.
+ */
+let fakePlanCallCounter = 0;
+function makeFakeCursorPlanAgent(taskId: string, prompt: string, onChunk: ChunkHandler): SpawnedAgent {
+  const record: string[] = [`spawn:${prompt}`];
+  let resolveDone!: (code: number) => void;
+  const done = new Promise<number>((res) => { resolveDone = res; });
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
+
+  const n = ++fakePlanCallCounter;
+  const callId = `call-fake-plan-${n}\nfc_fake_${n}`;
+  const planArgs = {
+    plan: "# Fake Plan\n\n- step one\n- step two",
+    name: "Fake Plan",
+    todos: [] as unknown[],
+    overview: "",
+    isProject: false,
+    phases: [] as unknown[],
+  };
+  after(5, () => {
+    onChunk(
+      "tool_use",
+      JSON.stringify({
+        id: callId,
+        name: "createPlanToolCall",
+        input: { createPlanToolCall: { args: planArgs } },
+        serverSide: false,
+      }),
+      `tool_call:${callId}:started`,
+    );
+  });
+  after(10, () => {
+    // `mapCursorEvent`'s `completed` branch forwards the WHOLE `tool_call`
+    // envelope as `content` (cursor-tmux.ts's `evt.tool_call ?? {}`), not
+    // just its result payload — match that shape here so a test asserting
+    // on `tool_result.content` sees exactly what a real run would produce.
+    onChunk(
+      "tool_result",
+      JSON.stringify({
+        toolUseId: callId,
+        content: { createPlanToolCall: { args: planArgs, result: { success: {}, planUri: "" } } },
+        isError: false,
+      }),
+      `tool_call:${callId}:completed`,
+    );
+  });
+  after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });
+
+  const inst: FakeDriverInstance = {
+    _record: record,
+    kill: () => {
+      record.push("kill");
+      for (const t of timers) clearTimeout(t);
+      resolveDone(0);
+    },
+    writeInput: (line) => { record.push(`write:${line}`); return true; },
+    done,
+  };
+  fakeDrivers.set(taskId, inst);
+  return inst;
+}
+
 export interface SpawnAgentArgs {
   taskId: string;
   /** The run row this spawn belongs to. Used by the codex driver to key its
@@ -816,6 +898,11 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       // and can route follow-ups through `--resume` — mirrors what a real
       // `system/init` event would deliver.
       onSessionId?.(`fake-cursor-session-${taskId}`);
+      // Test hook, additive: without the env var this is unreachable and
+      // behavior is unchanged (see `makeFakeCursorPlanAgent`'s header).
+      if (process.env.AGETOR_FAKE_CURSOR_PLAN === "1") {
+        return makeFakeCursorPlanAgent(taskId, prompt, onChunk);
+      }
       return makeFakeAgent(taskId, prompt, onChunk);
     }
     const built = buildCommand(harness, prompt, opts);

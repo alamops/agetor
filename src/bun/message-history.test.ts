@@ -74,7 +74,7 @@ function makeTaskRow(taskId: string, overrides: Partial<Task> = {}): Task {
     fast: false,
     maxMode: false,
     references: [],
-    backlog: [],
+    backlog: [], plans: [],
     draft: null,
     column: "ready",
     runId: null,
