@@ -4889,7 +4889,9 @@ function TaskDetails({
 
   return (
     <details className="border-b border-border/60 px-3 py-2 text-xs">
-      <summary className="cursor-pointer text-muted-foreground">Task details</summary>
+      <summary className="cursor-pointer text-muted-foreground">
+        <span className="text-[10px] uppercase tracking-wide">Task details</span>
+      </summary>
       <div className="mt-2 space-y-2">
         <div>
           <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
