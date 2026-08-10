@@ -571,14 +571,15 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
       {/* VS Code-style collapse control: straddles the border between the
           sidebar and the board (half of it overhangs into the board's p-4
           gutter, so it never covers a card). z-20 keeps it above the board
-          and below dialogs/overlays (z-50). */}
+          and below dialogs/overlays (z-50). top-3 centers it on the 44px
+          header row ("New task" title) so it's found where users look. */}
       <button
         type="button"
         onClick={() => setCollapsed((c) => !c)}
         aria-expanded={!collapsed}
         aria-label={collapsed ? "Expand new task panel" : "Collapse new task panel"}
         title={collapsed ? "Expand new task panel" : "Collapse new task panel"}
-        className="absolute -right-2.5 top-1/2 z-20 flex size-5 -translate-y-1/2 items-center justify-center rounded-full border border-border/60 bg-card text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground"
+        className="absolute -right-2.5 top-3 z-20 flex size-5 items-center justify-center rounded-full border border-border/60 bg-card text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground"
       >
         {collapsed
           ? <ChevronRight className="size-3.5" />
