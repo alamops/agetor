@@ -133,10 +133,11 @@ const parseBacklog = (raw: string): BacklogMessage[] => {
 };
 
 /** Every status a {@link TaskPlan} may carry. A row with an unrecognized
- *  status (future/foreign build, hand-edited DB) coerces to "pending" rather
- *  than being dropped — losing a plan record entirely is worse than briefly
- *  misjudging its lifecycle stage, and the approve/edit routes re-validate
- *  status before acting on it anyway. */
+ *  status (future/foreign build, hand-edited DB) coerces to a NON-actionable
+ *  state — "approved" when approvedAt proves an approval happened, else
+ *  "superseded" — never "pending": approve is non-idempotent (writes a file,
+ *  messages a live agent), so corruption must not resurrect an approve button.
+ *  Losing the record entirely would still be worse, so it is kept. */
 const PLAN_STATUSES = new Set<string>(["pending", "approved", "superseded"]);
 
 const parsePlans = (raw: string): TaskPlan[] => {
