@@ -25,6 +25,7 @@ interface CleanedItem {
   ts: number;
   taskTitle: string;
   project: string;
+  agent: string;
 }
 
 /** Reduce a raw sent-message payload to display text: normalize CR newlines,
@@ -138,7 +139,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
           if (!text) continue;
           if (seen.has(text)) continue;
           seen.add(text);
-          cleaned.push({ key: String(m.id), text, ts: m.ts, taskTitle: m.taskTitle, project: m.project });
+          cleaned.push({ key: String(m.id), text, ts: m.ts, taskTitle: m.taskTitle, project: m.project, agent: m.agent });
         }
         // Cap AFTER cleaning/dedup — the server's own LIMIT (FETCH_LIMIT) is
         // taken before dedup/empty/command-output filtering can drop rows,
@@ -212,7 +213,7 @@ export function MessageHistoryPicker({ taskId, disabled, onPick, className }: Pr
                   >
                     <span className="line-clamp-2 text-xs text-foreground">{item.text}</span>
                     <span className="text-[11px] text-muted-foreground">
-                      {item.project} · {item.taskTitle} · {formatTime(item.ts)}
+                      {item.project} · {item.taskTitle} · {item.agent} · {formatTime(item.ts)}
                     </span>
                   </button>
                 </li>

@@ -983,11 +983,11 @@ export const runs = {
    *  selected columns come from that same max-id row. */
   userMessageHistory(
     limit: number,
-  ): Array<{ id: number; data: string; ts: number; taskId: string; taskTitle: string; taskWorkdir: string; projectName: string | null }> {
-    type Row = { id: number; data: string; ts: number; taskId: string; taskTitle: string; taskWorkdir: string; projectName: string | null };
+  ): Array<{ id: number; data: string; ts: number; taskId: string; taskTitle: string; taskWorkdir: string; projectName: string | null; taskAgent: string }> {
+    type Row = { id: number; data: string; ts: number; taskId: string; taskTitle: string; taskWorkdir: string; projectName: string | null; taskAgent: string };
     return db.query<Row, [number]>(
       `SELECT MAX(run_events.id) as id, run_events.data as data, ts, tasks.id as taskId, tasks.title as taskTitle,
-              tasks.workdir as taskWorkdir, projects.name as projectName
+              tasks.workdir as taskWorkdir, projects.name as projectName, tasks.agent as taskAgent
        FROM run_events
        JOIN runs ON runs.id = run_events.run_id
        JOIN tasks ON tasks.id = runs.task_id

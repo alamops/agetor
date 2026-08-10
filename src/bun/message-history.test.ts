@@ -131,25 +131,30 @@ test("cross-harness collection: messages from every harness kind are shared acro
 
   const resA = await authedFetch(`/tasks/${a.taskId}/messages/history`);
   expect(resA.status).toBe(200);
-  const bodyA = await resA.json() as { messages: Array<{ text: string; taskId: string }> };
+  const bodyA = await resA.json() as { messages: Array<{ text: string; taskId: string; agent: string }> };
   const textsA = bodyA.messages.map((m) => m.text);
-  expect(textsA).toContain("hello from A");
-  expect(textsA).toContain("hello from B");
-  expect(textsA).toContain("hello from C");
+  expect(textsA.slice().sort()).toEqual(["hello from A", "hello from B", "hello from C"]);
 
+  // The response is identical regardless of which task's endpoint is hit —
+  // `:id` only gates existence, it never scopes the payload.
   const resB = await authedFetch(`/tasks/${b.taskId}/messages/history`);
   const bodyB = await resB.json() as { messages: Array<{ text: string }> };
   const textsB = bodyB.messages.map((m) => m.text);
-  expect(textsB).toContain("hello from A");
-  expect(textsB).toContain("hello from B");
-  expect(textsB).toContain("hello from C");
+  expect(textsB).toEqual(textsA);
 
   const resC = await authedFetch(`/tasks/${c.taskId}/messages/history`);
   const bodyC = await resC.json() as { messages: Array<{ text: string }> };
   const textsC = bodyC.messages.map((m) => m.text);
-  expect(textsC).toContain("hello from A");
-  expect(textsC).toContain("hello from B");
-  expect(textsC).toContain("hello from C");
+  expect(textsC).toEqual(textsA);
+
+  // Codex's message carries a different harness label than the claude-flavored
+  // tasks (bare kind "claude-code" and custom-harness-id "my-claude-harness").
+  const byText = new Map(bodyA.messages.map((m) => [m.text, m.agent]));
+  expect(byText.get("hello from A")).toBe(harnesses.getByIdOrKind("claude-code")!.label);
+  expect(byText.get("hello from B")).toBe("My Claude");
+  expect(byText.get("hello from C")).toBe(harnesses.getByIdOrKind("codex")!.label);
+  expect(byText.get("hello from C")).not.toBe(byText.get("hello from A"));
+  expect(byText.get("hello from C")).not.toBe(byText.get("hello from B"));
 });
 
 test("excludes non-user streams, subagent rows, and blank/space-only data", async () => {
@@ -283,7 +288,7 @@ test("limit: a negative limit falls back to the default", async () => {
   expect(body.messages.map((m) => m.text)).toEqual(["only message"]);
 });
 
-test("response shape: { messages: [{ id, text, ts, taskId, taskTitle, project }] } mirroring run_events.data and the correct task title", async () => {
+test("response shape: { messages: [{ id, text, ts, taskId, taskTitle, project, agent }] } mirroring run_events.data and the correct task title", async () => {
   const { taskId, runId } = seedTask("claude-code", { title: "My Special Task Title" });
   appendUserEvent(runId, "shape check message");
 
@@ -291,12 +296,15 @@ test("response shape: { messages: [{ id, text, ts, taskId, taskTitle, project }]
   const body = await res.json() as { messages: Array<Record<string, unknown>> };
   expect(body.messages.length).toBe(1);
   const msg = body.messages[0]!;
-  expect(Object.keys(msg).sort()).toEqual(["id", "project", "taskId", "taskTitle", "text", "ts"]);
+  expect(Object.keys(msg).sort()).toEqual(["agent", "id", "project", "taskId", "taskTitle", "text", "ts"]);
   expect(typeof msg.id).toBe("number");
   expect(msg.text).toBe("shape check message");
   expect(typeof msg.ts).toBe("number");
   expect(msg.taskId).toBe(taskId);
   expect(msg.taskTitle).toBe("My Special Task Title");
+  // "agent" is the resolved harness *label*, not the raw agent id stored on
+  // the task row.
+  expect(msg.agent).toBe(harnesses.getByIdOrKind("claude-code")!.label);
 });
 
 test("project: registered projects row supplies the name; unregistered workdirs fall back to the path basename", async () => {
@@ -350,7 +358,12 @@ test("unknown-agent tasks are not isolated: unrecognized agent strings share his
   const resD = await authedFetch(`/tasks/${d.taskId}/messages/history`);
   const bodyD = await resD.json() as { messages: Array<{ text: string }> };
   const textsD = bodyD.messages.map((m) => m.text);
-  expect(textsD).toContain("message from D");
-  expect(textsD).toContain("message from E");
-  expect(textsD).toContain("message from F");
+  expect(textsD.slice().sort()).toEqual(["message from D", "message from E", "message from F"]);
+
+  // Same invariant as the cross-harness test: the payload doesn't depend on
+  // which task's endpoint served it, even for an unrecognized agent string.
+  const resF = await authedFetch(`/tasks/${f.taskId}/messages/history`);
+  const bodyF = await resF.json() as { messages: Array<{ text: string }> };
+  const textsF = bodyF.messages.map((m) => m.text);
+  expect(textsF).toEqual(textsD);
 });
