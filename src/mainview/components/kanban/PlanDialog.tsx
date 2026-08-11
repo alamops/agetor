@@ -128,6 +128,11 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
   const [closeError, setCloseError] = useState<string | null>(null);
 
   const requestClose = (afterClose?: () => void) => {
+    // Never close mid-mutation: unmounting while `approvePlan` is in flight
+    // would lose the `sentButUnconfirmed` latch, and a reopened dialog (fresh
+    // mount, plan still `pending`) would let a second approval message reach
+    // the live agent — exactly what the latch exists to prevent.
+    if (saving || closeSaving) return;
     if (dirty) {
       setCloseError(null);
       setConfirmClose({ afterClose });
@@ -198,8 +203,22 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
     setError(null);
     try {
       await checkNoPendingInteractions();
+      // The preview shows `text` (the original content on this path), but the
+      // server approves `editedContent ?? content` — a stale persisted draft
+      // can still exist here (e.g. a revert whose server-side clear failed),
+      // and approving it would deliver text the user isn't looking at. Clear
+      // it first so what's approved is what's on screen.
+      if (plan.editedContent !== null && text === plan.content) {
+        onPlanUpdated(await api.savePlanEdit(task.id, plan.id, null));
+      }
       const updated = await api.approvePlan(task.id, plan.id);
       onPlanUpdated(updated);
+      // Approval succeeded and the message reached the agent — the dialog's
+      // job is done. Close directly (not `requestClose`): any persisted draft
+      // was reconciled above, so the only local divergence left is a
+      // whitespace-only edit that was never saved — an "unsaved edits" prompt
+      // after approving would be noise.
+      onClose();
     } catch (e) {
       handleApproveError(e);
     } finally {
@@ -213,9 +232,14 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
     setError(null);
     try {
       await checkNoPendingInteractions();
-      await api.savePlanEdit(task.id, plan.id, text);
+      // Publish the save result immediately — if the approve below fails, the
+      // parent's `plans` mirror already carries the persisted edit, so the
+      // dialog doesn't read falsely dirty until the next poll catches up.
+      onPlanUpdated(await api.savePlanEdit(task.id, plan.id, text));
       const updated = await api.approvePlan(task.id, plan.id);
       onPlanUpdated(updated);
+      // Same as doApprove — the edit was just persisted, so nothing is dirty.
+      onClose();
     } catch (e) {
       handleApproveError(e);
     } finally {
