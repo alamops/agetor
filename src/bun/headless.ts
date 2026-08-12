@@ -12,7 +12,8 @@ import {
   probeLiveCore,
 } from "./core-creds.ts";
 import { daemonLog } from "./daemon-log.ts";
-import { SESSION_REAP_SWEEP_MS } from "../shared/types.ts";
+import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS } from "../shared/types.ts";
+import { pollAllUsage } from "./usage/poller.ts";
 
 /**
  * Headless Agetor core — the same Bun server + orchestrator the desktop app
@@ -91,6 +92,23 @@ export async function runDaemon(): Promise<void> {
     });
   }, SESSION_REAP_SWEEP_MS);
   reapIntervalTimer.unref();
+
+  // Per-harness usage poller (docs/plans/harness-usage-tracker.md §7): mirrors
+  // index.ts's wiring so the headless daemon also keeps quota snapshots fresh.
+  // Both timers are `.unref()`'d — usage polling stops the moment the daemon
+  // idle-shuts, by design, since there's no attached UI left to update.
+  const usagePostBootTimer = setTimeout(() => {
+    pollAllUsage().catch((err) => {
+      daemonLog(`usage poll (post-boot) failed: ${(err as Error)?.message ?? String(err)}`);
+    });
+  }, 20_000);
+  usagePostBootTimer.unref();
+  const usageIntervalTimer = setInterval(() => {
+    pollAllUsage().catch((err) => {
+      daemonLog(`usage poll sweep failed: ${(err as Error)?.message ?? String(err)}`);
+    });
+  }, USAGE_POLL_SWEEP_MS);
+  usageIntervalTimer.unref();
 
   let server: ReturnType<typeof startApiServer>;
   try {

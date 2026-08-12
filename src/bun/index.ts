@@ -4,7 +4,8 @@ import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
-import { SESSION_REAP_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
+import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
+import { pollAllUsage } from "./usage/poller.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -145,6 +146,24 @@ setInterval(() => {
     console.error("[agetor] idle-session reap (interval) failed:", err);
   });
 }, SESSION_REAP_SWEEP_MS);
+
+// Per-harness usage poller (docs/plans/harness-usage-tracker.md §7): fetches
+// quota/usage snapshots for every enabled harness on a background cadence, so
+// the topbar meters stay fresh without the webview driving the fetches. A
+// 20s post-boot delay (offset from the reaper's 30s so the two sweeps don't
+// both fire in the same tick) lets boot settle first. Errors are swallowed —
+// `pollAllUsage` already never throws, but the `.catch` matches the reaper's
+// belt-and-suspenders shape.
+setTimeout(() => {
+  pollAllUsage().catch((err) => {
+    console.error("[agetor] usage poll (post-boot) failed:", err);
+  });
+}, 20_000);
+setInterval(() => {
+  pollAllUsage().catch((err) => {
+    console.error("[agetor] usage poll sweep failed", err);
+  });
+}, USAGE_POLL_SWEEP_MS);
 
 installNativeMenu();
 
