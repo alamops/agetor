@@ -947,6 +947,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
                 </div>
               )}
 
+              {/* Mythos 5 is Fable 5's access-gated twin — same 2x usage, plus the
+                  Project Glasswing requirement, so both need calling out here. */}
+              {kind === "claude-code" && model === "mythos-5" && (
+                <div className="text-[11px] text-muted-foreground">
+                  Mythos 5 uses 2x the usage of Opus and requires approved-org (Project Glasswing) access.
+                </div>
+              )}
+
               {/* Surfacing a missing-agent error inline so the user sees install
                   guidance before they hit Create and get a delayed failure. */}
               {selectedStatus && !selectedStatus.available && (

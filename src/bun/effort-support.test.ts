@@ -76,6 +76,12 @@ test("claude fable-5 supports xhigh + max", () => {
   expect(ids).toContain("max");
 });
 
+test("claude mythos-5 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "mythos-5").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+});
+
 test("codex DEFAULT_MODEL is GPT-5.6 Sol", () => {
   expect(DEFAULT_MODEL.codex).toBe("gpt-5.6-sol");
 });

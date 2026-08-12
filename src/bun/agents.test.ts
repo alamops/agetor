@@ -213,6 +213,16 @@ test("claude-code 'fable-5' maps to --model claude-fable-5", () => {
   ]);
 });
 
+test("claude-code 'mythos-5' maps to --model claude-mythos-5", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "mythos-5", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-mythos-5",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
 test("claude-code 'sonnet-5' maps to --model claude-sonnet-5", () => {
   const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "sonnet-5", mode: "auto" });
   expect(cmd).toEqual([
