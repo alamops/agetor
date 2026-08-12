@@ -1,4 +1,10 @@
-import { clampFontSizePercent, FONT_SIZE_DEFAULT, FONT_SIZE_STEP } from "../../shared/types.ts";
+import {
+  clampFontSizePercent,
+  FONT_SIZE_BASE_PX,
+  FONT_SIZE_DEFAULT,
+  FONT_SIZE_STEP,
+  TERMINAL_FONT_SIZE_BASE_PX,
+} from "../../shared/types.ts";
 
 /**
  * Pure font-size logic — no DOM, no React. Mirrors `theme.ts`'s split:
@@ -26,14 +32,14 @@ export function stepFontSize(pct: number, action: FontSizeAction): number {
  *  pristine, matching the boot-channel contract in `src/shared/types.ts`. */
 export function rootFontSizeStyle(pct: number): string | null {
   if (pct === FONT_SIZE_DEFAULT) return null;
-  return `${(16 * pct) / 100}px`;
+  return `${(FONT_SIZE_BASE_PX * pct) / 100}px`;
 }
 
 /** xterm's `fontSize` option scales off its own 12px baseline (unrelated to
  *  the 16px root rem baseline — see `TerminalView.tsx`, which reads CSS
  *  variables for everything else but sets this as an absolute pixel value). */
 export function terminalFontSize(pct: number): number {
-  return Math.round((12 * pct) / 100);
+  return Math.round((TERMINAL_FONT_SIZE_BASE_PX * pct) / 100);
 }
 
 /**
@@ -46,7 +52,14 @@ export function terminalFontSize(pct: number): number {
  */
 export function readFontSizeFromBoot(agetorGlobal: unknown, hash: string): number {
   const injected = (agetorGlobal as { fontSize?: unknown } | null | undefined)?.fontSize;
-  if (injected !== undefined && injected !== null) return clampFontSizePercent(injected);
+  // Only a number or string counts as "present" — matches index.html's inline
+  // boot script, which falls through to the hash param unless __AGETOR.fontSize
+  // is one of those two types. Without this, an unexpected shape (object,
+  // boolean, …) would resolve via clampFontSizePercent's NaN fallback (100)
+  // instead of consulting the hash the way the boot script does.
+  if (typeof injected === "number" || typeof injected === "string") {
+    return clampFontSizePercent(injected);
+  }
 
   const stripped = hash.startsWith("#") ? hash.slice(1) : hash;
   if (!stripped) return FONT_SIZE_DEFAULT;
@@ -61,19 +74,21 @@ export function readFontSizeFromBoot(agetorGlobal: unknown, hash: string): numbe
 
 /**
  * Map a keydown to a font-size action, or `null` if the combo isn't one we
- * handle. The primary modifier is `metaKey` on macOS, `ctrlKey` elsewhere
- * (same `isMac` sniff convention as `RunPanel.tsx`'s `IS_MAC_PLATFORM`) —
- * the *other* modifier being also held doesn't disqualify (mirrors how
- * physical keyboards can report both during a fast chord), but `altKey` does,
- * since Option/Alt-modified punctuation produces different glyphs on some
- * layouts and isn't part of this shortcut's contract.
+ * handle. The primary modifier is `metaKey` on macOS, `ctrlKey` elsewhere,
+ * matching `RunPanel.tsx`'s Cmd/Ctrl+F convention exactly: the *other*
+ * modifier being also held disqualifies (Mac wants meta-without-ctrl, other
+ * platforms want ctrl-without-meta) so a combo like Ctrl+Cmd+= — which some
+ * window managers or IMEs can report — doesn't ambiguously fire both this
+ * and a platform-native binding. `altKey` also disqualifies, since
+ * Option/Alt-modified punctuation produces different glyphs on some layouts
+ * and isn't part of this shortcut's contract.
  */
 export function fontSizeShortcutAction(
   e: { key: string; metaKey: boolean; ctrlKey: boolean; altKey: boolean },
   isMac: boolean,
 ): FontSizeAction | null {
   if (e.altKey) return null;
-  const primaryDown = isMac ? e.metaKey : e.ctrlKey;
+  const primaryDown = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
   if (!primaryDown) return null;
   switch (e.key) {
     case "=":

@@ -245,16 +245,29 @@ function TerminalPane({
   // terminal rescales without remounting (which would drop its WebSocket).
   // Changing glyph cell size changes cols/rows, so a refit + PTY resize
   // notification must follow — same sequence the ResizeObserver callback in
-  // the mount effect above uses for a host-size change.
+  // the mount effect above uses for a host-size change. The fit + resize are
+  // deferred one frame via rAF: `term.options.fontSize` writes synchronously,
+  // but FontSizeProvider's own effect (a sibling, mounted higher up the
+  // tree) hasn't necessarily written the new `documentElement.style.fontSize`
+  // yet when *this* effect runs — React flushes child effects before parent
+  // effects, but siblings run in tree order, and this component doesn't
+  // control which mounts first. Fitting synchronously here could measure the
+  // host box before the root rem size (and therefore the host's pixel size)
+  // has actually changed, shipping stale cols/rows to the PTY. One rAF is
+  // enough since the root font-size write happens in a plain effect, which
+  // (like this one) resolves before the next paint.
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
     term.options.fontSize = terminalFontSize(fontSizePercent);
-    try { fitRef.current?.fit(); } catch { /* not visible yet */ }
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ t: "resize", cols: term.cols, rows: term.rows }));
-    }
+    const id = requestAnimationFrame(() => {
+      try { fitRef.current?.fit(); } catch { /* not visible yet */ }
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ t: "resize", cols: term.cols, rows: term.rows }));
+      }
+    });
+    return () => cancelAnimationFrame(id);
   }, [fontSizePercent]);
 
   // Refit + focus when this pane becomes the active one (its size is stable

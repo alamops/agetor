@@ -2871,6 +2871,17 @@ export const FONT_SIZE_MAX = 170;
 export const FONT_SIZE_STEP = 10;
 export const FONT_SIZE_DEFAULT = 100;
 
+/** Root `<html>` font size at 100% (px) — the rem baseline every percent is
+ *  scaled against (`FONT_SIZE_BASE_PX * pct/100`). Consumed by `src/bun/index.ts`
+ *  (preload apply-script) and duplicated inline in `src/mainview/index.html`'s
+ *  blocking boot script, which can't import a module before first paint. */
+export const FONT_SIZE_BASE_PX = 16;
+
+/** xterm terminal pane font size at 100% (px) — the separate baseline
+ *  `TerminalView.tsx` scales against, since xterm renders to canvas outside
+ *  the CSS/rem cascade `FONT_SIZE_BASE_PX` drives. */
+export const TERMINAL_FONT_SIZE_BASE_PX = 12;
+
 /**
  * Parse anything (a persisted preference string, a hash-fragment param, a
  * `window.__AGETOR` global, …) into a valid integer font-size percent,

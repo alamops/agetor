@@ -4,7 +4,7 @@ import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
-import { SESSION_REAP_SWEEP_MS, FONT_SIZE_DEFAULT } from "../shared/types.ts";
+import { SESSION_REAP_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
@@ -446,7 +446,7 @@ const windowLifecycle = makeWindowLifecycle({
       fontSize === FONT_SIZE_DEFAULT
         ? ""
         : `try{var r2=document.documentElement;` +
-          `if(r2){r2.style.fontSize=${JSON.stringify(`${(16 * fontSize) / 100}px`)};}` +
+          `if(r2){r2.style.fontSize=${JSON.stringify(`${(FONT_SIZE_BASE_PX * fontSize) / 100}px`)};}` +
           `}catch(e){}`;
     const bootGlobals =
       `window.__AGETOR=${JSON.stringify({

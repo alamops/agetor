@@ -145,7 +145,7 @@ function reconcileById<T>(
  */
 function AppInner() {
   const { preference: themePreference, setPreference: setThemePreference } = useTheme();
-  const { percent: fontSizePercent, setPercent: setFontSizePercent } = useFontSize();
+  const { setPercent: setFontSizePercent, percentRef: fontSizePercentRef, hasUserAdjustedRef: fontSizeUserAdjustedRef } = useFontSize();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
@@ -207,13 +207,22 @@ function AppInner() {
   // reason as theme above: the boot channel (window.__AGETOR / hash, read
   // synchronously by FontSizeProvider before this component even mounts) is
   // authoritative for first paint — this only catches the DB having been
-  // edited out-of-band since then.
+  // edited out-of-band since then. Unlike theme, this compares against a
+  // *live* ref (`fontSizePercentRef`) rather than the `fontSizePercent`
+  // value this effect's closure would otherwise capture at mount — by the
+  // time this async `.then()` resolves, a fast Cmd+= press could already
+  // have moved the real state past that stale snapshot. It also bails
+  // entirely once the user has touched the shortcut at all
+  // (`fontSizeUserAdjustedRef`), since at that point a possibly-stale DB
+  // read racing the user's own change should never win.
   useEffect(() => {
     api.listPreferences().then((prefs) => {
       const dbTheme = parseThemePreference(prefs.theme);
       if (dbTheme !== themePreference) setThemePreference(dbTheme);
-      const dbFontSize = clampFontSizePercent(prefs.fontSize);
-      if (dbFontSize !== fontSizePercent) setFontSizePercent(dbFontSize);
+      if (!fontSizeUserAdjustedRef.current) {
+        const dbFontSize = clampFontSizePercent(prefs.fontSize);
+        if (dbFontSize !== fontSizePercentRef.current) setFontSizePercent(dbFontSize);
+      }
     }).catch(() => { /* keep the boot-seeded preferences */ });
     // Run once at boot only — intentionally not re-run when either local
     // preference changes (that would fight the user's own picker/shortcut).
