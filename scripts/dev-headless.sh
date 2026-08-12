@@ -75,6 +75,25 @@ resolve_theme() {
   esac
 }
 
+# Same idea as resolve_theme above, for the `fontSize` boot channel
+# (src/bun/window-url.ts's resolveFontSizePreference) — without this the
+# browser-driven (Playwright) path would boot at the default 100% regardless
+# of what's persisted, showing a size-jump flash once main.tsx's React tree
+# reconciles the real preference. Falls back to 100 (FONT_SIZE_DEFAULT) on
+# any failure, matching resolveFontSizePreference's own default.
+resolve_font_size() {
+  local fs
+  fs="$(cd "$REPO_ROOT" && AGETOR_DATA_DIR="$DATA_DIR" bun -e '
+    import("./src/bun/window-url.ts").then((m) => {
+      process.stdout.write(String(m.resolveFontSizePreference()));
+    });
+  ' 2>/dev/null | tail -n1)"
+  case "$fs" in
+    ''|*[!0-9]*) echo 100 ;;
+    *) echo "$fs" ;;
+  esac
+}
+
 read_pid_file() {
   [ -f "$1" ] && cat "$1" || true
 }
@@ -119,13 +138,19 @@ wait_for_health() {
 print_access_info() {
   local token="$1"
   local theme; theme="$(resolve_theme)"
+  local fs; fs="$(resolve_font_size)"
+  local font_size_param=""
+  # Omit the param at the 100 default, matching buildWindowHash's own
+  # omit-at-default rule (src/bun/window-url.ts) so this printed URL is
+  # byte-identical to the pre-font-size shape for the common case.
+  [ "$fs" != "100" ] && font_size_param="&fontSize=$fs"
   echo
   grn "agetor dev (headless) is up"
   echo "  backend:  http://127.0.0.1:$API_PORT  (log: $BACKEND_LOG)"
   echo "  frontend: http://127.0.0.1:$VITE_PORT  (log: $VITE_LOG)"
   echo
   echo "Open in a browser (tunnel both ports first if this is a remote host):"
-  grn "  http://localhost:$VITE_PORT/#api=$API_PORT&token=$token&theme=$theme"
+  grn "  http://localhost:$VITE_PORT/#api=$API_PORT&token=$token&theme=$theme$font_size_param"
   echo
   dim "  curl -H \"Authorization: Bearer $token\" http://127.0.0.1:$API_PORT/tasks"
   echo

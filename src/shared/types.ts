@@ -2848,3 +2848,51 @@ export const THEME_PREFERENCES: readonly { id: ThemePreference; label: string }[
   { id: "dark", label: "Dark" },
   { id: "light", label: "Light" },
 ];
+
+// ───────────────────────────────────────────────────────────────────────────
+// Font size (Cmd+= / Cmd+- global UI zoom)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * The current root font size (16px) is both the DEFAULT and the MINIMUM —
+ * Cmd+- has nowhere to go below "what it looks like today". FONT_SIZE_MAX
+ * (170%) and FONT_SIZE_STEP (10%) are the generous-but-layout-safe bounds
+ * chosen in docs/plans/cmd-font-size-controller.md §8. Persisted as the
+ * `fontSize` key in the `preferences` table (see `src/bun/db.ts`) as a plain
+ * percent string ("100"–"170"), round-tripped through `GET/PUT /preferences`
+ * exactly like `theme`. Applied as
+ * `document.documentElement.style.fontSize = (16 * pct/100) + "px"`; at
+ * exactly FONT_SIZE_DEFAULT the inline style is omitted entirely so the
+ * default state stays pristine (and the boot no-flash channels can skip the
+ * write).
+ */
+export const FONT_SIZE_MIN = 100;
+export const FONT_SIZE_MAX = 170;
+export const FONT_SIZE_STEP = 10;
+export const FONT_SIZE_DEFAULT = 100;
+
+/** Root `<html>` font size at 100% (px) — the rem baseline every percent is
+ *  scaled against (`FONT_SIZE_BASE_PX * pct/100`). Consumed by `src/bun/index.ts`
+ *  (preload apply-script) and duplicated inline in `src/mainview/index.html`'s
+ *  blocking boot script, which can't import a module before first paint. */
+export const FONT_SIZE_BASE_PX = 16;
+
+/** xterm terminal pane font size at 100% (px) — the separate baseline
+ *  `TerminalView.tsx` scales against, since xterm renders to canvas outside
+ *  the CSS/rem cascade `FONT_SIZE_BASE_PX` drives. */
+export const TERMINAL_FONT_SIZE_BASE_PX = 12;
+
+/**
+ * Parse anything (a persisted preference string, a hash-fragment param, a
+ * `window.__AGETOR` global, …) into a valid integer font-size percent,
+ * clamped to [FONT_SIZE_MIN, FONT_SIZE_MAX]. Accepts a string ("120",
+ * "120.5") or a number; floats are rounded to the nearest integer before
+ * clamping. Anything else — null/undefined, an empty/non-numeric string,
+ * NaN, ±Infinity — falls back to FONT_SIZE_DEFAULT. Never throws.
+ */
+export function clampFontSizePercent(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : typeof raw === "string" ? parseFloat(raw) : NaN;
+  if (!Number.isFinite(n)) return FONT_SIZE_DEFAULT;
+  const rounded = Math.round(n);
+  return Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, rounded));
+}

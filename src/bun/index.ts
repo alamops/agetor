@@ -4,8 +4,8 @@ import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
 import { reconcileOrphans, sweepArchivedTeardowns, reapIdleSessions } from "./orchestrator.ts";
-import { SESSION_REAP_SWEEP_MS } from "../shared/types.ts";
-import { resolveThemePreference, buildWindowHash } from "./window-url.ts";
+import { SESSION_REAP_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
+import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshDiscoveredModels } from "./agent-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
@@ -394,6 +394,7 @@ const windowLifecycle = makeWindowLifecycle({
   buildWindow: async (frame: Frame) => {
     const url = await getMainViewUrl();
     const theme = resolveThemePreference();
+    const fontSize = resolveFontSizePreference();
     // The native views:// scheme handler refuses URLs that carry a fragment
     // or query — it treats the part after the scheme as a literal file path,
     // so `views://mainview/index.html#api=…` resolves to a non-existent file
@@ -430,12 +431,30 @@ const windowLifecycle = makeWindowLifecycle({
       `var r=document.documentElement;` +
       `if(r){r.classList.toggle("dark",d);r.style.colorScheme=d?"dark":"light";}` +
       `}catch(e){}`;
+    // Same rationale as themeApplyScript above: applies the resolved
+    // font-size percent itself, rather than only exposing it for
+    // index.html's inline <head> script to read back, so neither script has
+    // to win a race against the other — both derive the identical px value
+    // from the identical `fontSize` number. At FONT_SIZE_DEFAULT (100) this
+    // is the empty string: no inline style is written, matching the
+    // "pristine at default" contract (there's nothing to clear, since
+    // nothing was ever set). The px value is computed once here in Bun and
+    // inlined as a literal — re-running this script (e.g. if the preload
+    // and index.html's script both fire) just re-assigns the same value, an
+    // idempotent no-op.
+    const fontSizeApplyScript =
+      fontSize === FONT_SIZE_DEFAULT
+        ? ""
+        : `try{var r2=document.documentElement;` +
+          `if(r2){r2.style.fontSize=${JSON.stringify(`${(FONT_SIZE_BASE_PX * fontSize) / 100}px`)};}` +
+          `}catch(e){}`;
     const bootGlobals =
       `window.__AGETOR=${JSON.stringify({
         port: String(API_PORT),
         token: API_TOKEN,
         theme,
-      })};` + themeApplyScript;
+        fontSize,
+      })};` + themeApplyScript + fontSizeApplyScript;
     const isHttpUrl = url.startsWith("http://") || url.startsWith("https://");
     // `remembered` (window-lifecycle.ts) is in-memory only, updated live from
     // "move"/"resize" events — it's never validated against the display
@@ -459,7 +478,9 @@ const windowLifecycle = makeWindowLifecycle({
       title: "Agetor",
       titleBarStyle: "hiddenInset",
       trafficLightOffset: { x: 8, y: 8 },
-      url: isHttpUrl ? `${url}${buildWindowHash({ port: String(API_PORT), token: API_TOKEN, theme })}` : url,
+      url: isHttpUrl
+        ? `${url}${buildWindowHash({ port: String(API_PORT), token: API_TOKEN, theme, fontSize })}`
+        : url,
       preload: bootGlobals,
       frame: safeFrame,
     });

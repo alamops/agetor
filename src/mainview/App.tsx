@@ -3,7 +3,7 @@ import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } f
 import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
@@ -12,6 +12,7 @@ import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
+import { FontSizeProvider, useFontSize } from "@/components/font-size-provider";
 import { ThemeProvider, useTheme } from "@/components/theme-provider";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
@@ -144,6 +145,7 @@ function reconcileById<T>(
  */
 function AppInner() {
   const { preference: themePreference, setPreference: setThemePreference } = useTheme();
+  const { setPercent: setFontSizePercent, percentRef: fontSizePercentRef, hasUserAdjustedRef: fontSizeUserAdjustedRef } = useFontSize();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
@@ -201,13 +203,29 @@ function AppInner() {
   // authoritative for first paint — this only catches the DB having been
   // edited out-of-band since then, so on the normal path `themePreference`
   // already matches and this is a silent no-op (no flash).
+  // Reconcile the font-size preference from the same fetch, for the same
+  // reason as theme above: the boot channel (window.__AGETOR / hash, read
+  // synchronously by FontSizeProvider before this component even mounts) is
+  // authoritative for first paint — this only catches the DB having been
+  // edited out-of-band since then. Unlike theme, this compares against a
+  // *live* ref (`fontSizePercentRef`) rather than the `fontSizePercent`
+  // value this effect's closure would otherwise capture at mount — by the
+  // time this async `.then()` resolves, a fast Cmd+= press could already
+  // have moved the real state past that stale snapshot. It also bails
+  // entirely once the user has touched the shortcut at all
+  // (`fontSizeUserAdjustedRef`), since at that point a possibly-stale DB
+  // read racing the user's own change should never win.
   useEffect(() => {
     api.listPreferences().then((prefs) => {
       const dbTheme = parseThemePreference(prefs.theme);
       if (dbTheme !== themePreference) setThemePreference(dbTheme);
-    }).catch(() => { /* keep the boot-seeded preference */ });
-    // Run once at boot only — intentionally not re-run when the local
-    // preference changes (that would fight the user's own picker clicks).
+      if (!fontSizeUserAdjustedRef.current) {
+        const dbFontSize = clampFontSizePercent(prefs.fontSize);
+        if (dbFontSize !== fontSizePercentRef.current) setFontSizePercent(dbFontSize);
+      }
+    }).catch(() => { /* keep the boot-seeded preferences */ });
+    // Run once at boot only — intentionally not re-run when either local
+    // preference changes (that would fight the user's own picker/shortcut).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -957,12 +975,15 @@ function AppInner() {
   );
 }
 
-/** Root export — mounts `ThemeProvider` above everything so `AppInner` (and,
- *  transitively, `SettingsDialog`'s Theme picker) can call `useTheme()`. */
+/** Root export — mounts `ThemeProvider` and `FontSizeProvider` above
+ *  everything so `AppInner` (and, transitively, `SettingsDialog`'s Theme
+ *  picker) can call `useTheme()` / `useFontSize()`. */
 export default function App() {
   return (
     <ThemeProvider>
-      <AppInner />
+      <FontSizeProvider>
+        <AppInner />
+      </FontSizeProvider>
     </ThemeProvider>
   );
 }

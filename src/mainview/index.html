@@ -62,6 +62,43 @@
           document.documentElement.style.colorScheme = "dark";
         }
       })();
+      // Font size (Cmd+=/Cmd+-): same precedence + duplication rationale as
+      // the theme block above — window.__AGETOR.fontSize first (bundled
+      // views:// path, whose preload script already applied it too — a
+      // harmless idempotent re-run), then the hash `fontSize` param (Vite
+      // dev path). Order relative to the theme IIFE above doesn't matter —
+      // both only need to run before the splash <style> below. Inline-duplicates
+      // the minimal parse+clamp from clampFontSizePercent (src/shared/types.ts)
+      // since no module import is possible before first paint: the clamp bounds
+      // (100 and 170, i.e. FONT_SIZE_MIN/FONT_SIZE_MAX) and the rem baseline
+      // (16, i.e. FONT_SIZE_BASE_PX) are copied literals — keep them in sync
+      // with src/shared/types.ts if those constants ever change. Invalid/absent
+      // → 100 (FONT_SIZE_DEFAULT, the default AND minimum). At exactly 100
+      // nothing is written — the inline style stays omitted, matching the
+      // "pristine at default" contract.
+      (function () {
+        var fontSize = 100;
+        try {
+          var injectedSize = window.__AGETOR && window.__AGETOR.fontSize;
+          var rawSize = injectedSize;
+          if (typeof rawSize !== "number" && typeof rawSize !== "string") {
+            var sizeHash = window.location.hash || "";
+            if (sizeHash.charAt(0) === "#") sizeHash = sizeHash.slice(1);
+            var sizeParams = new URLSearchParams(sizeHash);
+            rawSize = sizeParams.get("fontSize");
+          }
+          var parsed = typeof rawSize === "number" ? rawSize : parseFloat(rawSize);
+          if (isFinite(parsed)) {
+            fontSize = Math.min(170, Math.max(100, Math.round(parsed)));
+          }
+          if (fontSize !== 100) {
+            document.documentElement.style.fontSize = (16 * fontSize) / 100 + "px";
+          }
+        } catch (e) {
+          // Parsing failed — leave the root at its default (unset) size
+          // rather than risk an unreadable or wildly-scaled UI.
+        }
+      })();
     </script>
     <style>
       /* Inline so the splash paints at HTML-parse time — before main.tsx or
