@@ -6592,11 +6592,13 @@ function GitHubItemDetail({
   // labels/milestones, reviewers, auto-merge) stay on `canPush` alone.
   const canModifyOwn = canPush || (!!viewerLogin && item.author?.login === viewerLogin);
   // Identifies the (repo dir, PR number) a binary diff blob request needs.
-  // Null gates PullDiff back to the plain placeholder for a non-PR item or a
-  // non-GitHub provider — GitLab/Bitbucket blob fetch is unsupported in v1
-  // (git-host.ts `pullBlob` returns 501 for them).
+  // Null gates PullDiff back to the plain placeholder for a non-PR item, or
+  // when `provider` isn't a single concrete provider (`"mixed"` — a batch
+  // view spanning repos on different hosts — or `null`, not yet resolved).
+  // All three git hosts (github/gitlab/bitbucket) are supported here:
+  // git-host.ts `pullBlob` dispatches by the repo dir's remote.
   const blobCtx = useMemo(
-    () => (provider === "github" && item.kind === "pulls" ? { repoDir: itemPath, number: item.number } : null),
+    () => (provider !== "mixed" && provider !== null && item.kind === "pulls" ? { repoDir: itemPath, number: item.number } : null),
     [provider, item.kind, item.number, itemPath],
   );
   return (
@@ -8931,10 +8933,10 @@ function Reactions({
 }
 
 /** Binary-file branch of a `DiffFileBlock` — renders an old/new image or PDF
- *  preview for a GitHub PR when `file.path` is a kind `BinaryFilePreview`
- *  knows how to render, else falls back to the plain placeholder.
- *  `blobCtx === null` (non-GitHub provider, or the item isn't a PR) also
- *  falls back to the placeholder — `/github/pull-blob` is GitHub-only in v1.
+ *  preview for a github/gitlab/bitbucket PR when `file.path` is a kind
+ *  `BinaryFilePreview` knows how to render, else falls back to the plain
+ *  placeholder. `blobCtx === null` (a `"mixed"`/unresolved provider, or the
+ *  item isn't a PR) also falls back to the placeholder.
  *  Deliberately outside `DiffBody`'s row machinery — no
  *  `data-diff-path`/`data-diff-index`, no selection. */
 function PullBinaryPreview({ blobCtx, file }: { blobCtx: { repoDir: string; number: number } | null; file: DiffFile }) {
