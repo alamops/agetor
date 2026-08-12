@@ -157,6 +157,74 @@ export interface HarnessStatus {
 }
 
 /**
+ * Where a `HarnessQuota` snapshot's data came from:
+ *  - "api"    — fetched live from the provider's (undocumented) usage endpoint.
+ *  - "cache"  — read from an on-disk file the CLI itself maintains (e.g.
+ *               `.claude.json`'s `cachedUsageUtilization`, a codex sessions
+ *               JSONL's `rate_limits`), used when the live fetch is unavailable.
+ *  - "scrape" — reconstructed from a browser/IDE session (e.g. Cursor's web
+ *               cookie), the most fragile source.
+ */
+export type QuotaSource = "api" | "cache" | "scrape";
+
+/**
+ * Outcome of the most recent attempt to fetch a harness's quota:
+ *  - "ok"          — we have live or cached meters to show.
+ *  - "unavailable" — the provider has no obtainable usage data for this
+ *                     harness/account (e.g. no Cursor cookie, a Gemini
+ *                     individual-tier account) — not an error, just nothing
+ *                     to show.
+ *  - "error"       — a fetch or parse attempt failed (network, auth, shape
+ *                     change). `HarnessQuota.reason` carries detail for the UI.
+ */
+export type QuotaStatus = "ok" | "error" | "unavailable";
+
+/**
+ * One usage bar within a `HarnessQuota` snapshot — e.g. "5-hour session",
+ * "weekly", "Opus", "credits". Providers report different meters, so this
+ * shape is deliberately minimal and provider-agnostic.
+ */
+export interface QuotaMeter {
+  /** Stable id within the snapshot (e.g. "five_hour", "seven_day_opus"). */
+  id: string;
+  /** User-facing label for the meter. */
+  label: string;
+  /** 0..100, how much of this meter's allotment has been used. */
+  usedPercent: number;
+  /** Epoch ms when this meter resets, or null if the provider didn't report one. */
+  resetsAtMs: number | null;
+  /** Optional model/window scope this meter applies to (e.g. "Opus", "Sonnet"). */
+  scope?: string;
+}
+
+/**
+ * Normalized per-harness usage/quota snapshot, as surfaced by the topbar
+ * usage tracker (`GET /usage`, `harness_usage` AppEvent). Distinct from
+ * `HarnessUsage` above — that type is task-count blast radius for the
+ * disable-confirmation dialog and is unrelated to this feature.
+ *
+ * `meters` is intentionally dynamic: each provider returns a different set
+ * (Claude may report session/weekly/Opus/Sonnet/routines/extra-credit;
+ * Codex session/weekly/credits; Cursor plan/on-demand) and the UI renders
+ * whatever's present rather than assuming a fixed list.
+ */
+export interface HarnessQuota {
+  /** Harness id this snapshot is for. */
+  harnessId: string;
+  /** Underlying CLI kind — useful for the UI to render the right icon. */
+  kind: AgentKind;
+  /** Provider-reported plan/tier name, when known (e.g. "Pro", "Team"). */
+  planType: string | null;
+  status: QuotaStatus;
+  source: QuotaSource;
+  /** Epoch ms when this snapshot was produced (fetched or read from cache). */
+  fetchedAtMs: number;
+  meters: QuotaMeter[];
+  /** User-facing explanation when `status` isn't "ok" — null when it is. */
+  reason: string | null;
+}
+
+/**
  * Pre-canned configurations the Add-harness form offers as starting points.
  * Templates live in code (not the DB) — picking one only pre-fills the form;
  * the user can tweak any field before save. The `id` here is the template's
@@ -767,6 +835,19 @@ export const IDLE_SESSION_REAP_MS = 30 * 60 * 1000; // 30 minutes
 
 /** Cadence of the orchestrator's idle-session reap sweep. */
 export const SESSION_REAP_SWEEP_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Cadence of the background per-harness usage/quota poll sweep. */
+export const USAGE_POLL_SWEEP_MS = 10 * 60 * 1000; // 10 minutes
+
+/** Per-harness floor: skip re-fetching a usage snapshot fresher than this.
+ *  A force-refresh (e.g. the popover's Refresh button) bypasses the floor. */
+export const USAGE_MIN_REFRESH_MS = 60 * 1000; // 1 minute
+
+/** `QuotaMeter.usedPercent` at/above which the UI renders amber ("warn"). */
+export const USAGE_WARN_PERCENT = 70;
+
+/** `QuotaMeter.usedPercent` at/above which the UI renders red ("crit"). */
+export const USAGE_CRIT_PERCENT = 90;
 
 /**
  * A git worktree materialized on disk under `dataDir/worktrees/`, as surfaced
@@ -2472,6 +2553,9 @@ export type GlobalEvent =
  *                  user picks Quit-anyway (POST /app/force-quit) or stays.
  *   open_task    — a native notification deep-link (`agetor://task/<id>`)
  *                  was clicked. Webview opens that task's RunPanel.
+ *   harness_usage — the background usage poller (or a force-refresh) produced
+ *                  a fresh `HarnessQuota` snapshot for one harness. Webview
+ *                  updates that harness's topbar chip in place.
  */
 export type AppEvent =
   | {
@@ -2483,6 +2567,11 @@ export type AppEvent =
   | {
       type: "open_task";
       taskId: string;
+      ts: number;
+    }
+  | {
+      type: "harness_usage";
+      quota: HarnessQuota;
       ts: number;
     };
 
