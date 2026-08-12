@@ -69,6 +69,8 @@ import { cn } from "@/lib/utils";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
 import { mergeabilityView, type MergeTone } from "@/lib/mergeability";
 import { isCredentialError } from "@/lib/credential-error";
+import { BinaryFilePreview } from "./BinaryFilePreview";
+import { binaryPreviewKind } from "../../../shared/attachments.ts";
 import { ResolveConflictsDialog, type ResolveConflictsContext } from "./ResolveConflictsDialog";
 import {
   backToList,
@@ -6589,6 +6591,14 @@ function GitHubItemDetail({
   // wider flag, while genuinely push-only actions (merge, lock, pin, transfer,
   // labels/milestones, reviewers, auto-merge) stay on `canPush` alone.
   const canModifyOwn = canPush || (!!viewerLogin && item.author?.login === viewerLogin);
+  // Identifies the (repo dir, PR number) a binary diff blob request needs.
+  // Null gates PullDiff back to the plain placeholder for a non-PR item or a
+  // non-GitHub provider — GitLab/Bitbucket blob fetch is unsupported in v1
+  // (git-host.ts `pullBlob` returns 501 for them).
+  const blobCtx = useMemo(
+    () => (provider === "github" && item.kind === "pulls" ? { repoDir: itemPath, number: item.number } : null),
+    [provider, item.kind, item.number, itemPath],
+  );
   return (
     <div>
       <div className="mb-2 flex items-center justify-between gap-2">
@@ -6698,7 +6708,7 @@ function GitHubItemDetail({
             <CommitStatus status={commitStatus} loading={commitStatusLoading} error={commitStatusError} onRetry={onRetryCommitStatus} onRefresh={onRefreshCommitStatus} />
           )}
           <PullCommits commits={commits} loading={commitsLoading} error={commitsError} onRetry={onRetryCommits} />
-          <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} allowBatchReview={provider === "github"} />
+          <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} allowBatchReview={provider === "github"} blobCtx={blobCtx} />
           {provider === "github" && (
             <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
           )}
@@ -8027,6 +8037,7 @@ function PullDiff({
   onAddToReview,
   pending,
   allowBatchReview,
+  blobCtx,
 }: {
   diff?: TaskDiff;
   loading: boolean;
@@ -8043,6 +8054,9 @@ function PullDiff({
   // Hide the batch affordance entirely on those providers; a single inline
   // comment still posts immediately via `onLineComment`.
   allowBatchReview: boolean;
+  // (repo dir, PR number) for binary-blob preview requests; null keeps the
+  // plain placeholder (non-GitHub provider or a non-PR item).
+  blobCtx: { repoDir: string; number: number } | null;
 }) {
   const totals = useMemo(() => {
     const files = diff?.files ?? [];
@@ -8117,6 +8131,7 @@ function PullDiff({
               onAddToReview={onAddToReview}
               queuedKeys={queuedKeys}
               allowBatchReview={allowBatchReview}
+              blobCtx={blobCtx}
             />
           ))}
         </div>
@@ -8915,18 +8930,46 @@ function Reactions({
   );
 }
 
+/** Binary-file branch of a `DiffFileBlock` — renders an old/new image or PDF
+ *  preview for a GitHub PR when `file.path` is a kind `BinaryFilePreview`
+ *  knows how to render, else falls back to the plain placeholder.
+ *  `blobCtx === null` (non-GitHub provider, or the item isn't a PR) also
+ *  falls back to the placeholder — `/github/pull-blob` is GitHub-only in v1.
+ *  Deliberately outside `DiffBody`'s row machinery — no
+ *  `data-diff-path`/`data-diff-index`, no selection. */
+function PullBinaryPreview({ blobCtx, file }: { blobCtx: { repoDir: string; number: number } | null; file: DiffFile }) {
+  const kind = binaryPreviewKind(file.path);
+  if (kind === null || !blobCtx) {
+    return <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>;
+  }
+  const fileName = file.path.slice(file.path.lastIndexOf("/") + 1);
+  return (
+    <div className="px-3 py-2">
+      <BinaryFilePreview
+        kind={kind}
+        status={file.status}
+        fileName={fileName}
+        oldUrl={file.status === "added" ? null : api.pullBlobUrl({ path: blobCtx.repoDir, number: blobCtx.number, filePath: file.oldPath ?? file.path, side: "old" })}
+        newUrl={file.status === "deleted" ? null : api.pullBlobUrl({ path: blobCtx.repoDir, number: blobCtx.number, filePath: file.path, side: "new" })}
+      />
+    </div>
+  );
+}
+
 function DiffFileBlock({
   file,
   onLineComment,
   onAddToReview,
   queuedKeys,
   allowBatchReview,
+  blobCtx,
 }: {
   file: DiffFile;
   onLineComment: (target: LineCommentTarget) => Promise<void>;
   onAddToReview: (target: LineCommentTarget) => void;
   queuedKeys: Set<string>;
   allowBatchReview: boolean;
+  blobCtx: { repoDir: string; number: number } | null;
 }) {
   const meta = STATUS_META[file.status];
   const Icon = meta.icon;
@@ -8963,7 +9006,7 @@ function DiffFileBlock({
       {open && (
         <div id={bodyId}>
           {file.binary ? (
-            <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>
+            <PullBinaryPreview blobCtx={blobCtx} file={file} />
           ) : (
             <>
               <DiffBody file={file} hunks={file.hunks} onLineComment={onLineComment} onAddToReview={onAddToReview} queuedKeys={queuedKeys} allowBatchReview={allowBatchReview} />
