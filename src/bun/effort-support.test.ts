@@ -123,8 +123,8 @@ test("ordered highest → lowest (no placeholder at the top)", () => {
 
 // --- cursor: model thinking modes + fast variants -----------------------------
 
-test("cursor DEFAULT_MODEL is 'auto' (cursor-agent's own 'let the CLI pick' default)", () => {
-  expect(DEFAULT_MODEL.cursor).toBe("auto");
+test("cursor DEFAULT_MODEL is Grok 4.6 (explicit flagship pin, not cursor-agent's 'auto')", () => {
+  expect(DEFAULT_MODEL.cursor).toBe("cursor-grok-4.6");
 });
 
 test("cursor DEFAULT_EFFORT is high for parameterized non-Auto models", () => {
@@ -133,7 +133,9 @@ test("cursor DEFAULT_EFFORT is high for parameterized non-Auto models", () => {
 
 test("cursor model catalog includes the screenshot/default surface", () => {
   const ids = AGENT_OPTIONS.cursor.models.map((m) => m.id);
-  expect(ids[0]).toBe("auto");
+  // The recommended default tops the list (same convention as codex/gemini).
+  expect(ids[0]).toBe("cursor-grok-4.6");
+  expect(ids).toContain("auto");
   expect(ids).toContain("gpt-5.3-codex");
   expect(ids).toContain("cursor-grok-4.5");
   expect(ids).toContain("composer-2.5");
@@ -146,8 +148,17 @@ test("cursor model catalog includes the screenshot/default surface", () => {
 });
 
 test("cursor Auto model reports zero efforts", () => {
-  expect(supportedEfforts("cursor", null)).toEqual([]);
   expect(supportedEfforts("cursor", "auto")).toEqual([]);
+});
+
+test("cursor null model resolves to the Grok 4.6 default effort surface", () => {
+  expect(supportedEfforts("cursor", null).map((o) => o.id)).toEqual(["xhigh", "high", "medium", "low"]);
+});
+
+test("cursor Grok 4.6 exposes Extra High but no Max (ids verified via `cursor-agent models`)", () => {
+  const ids = supportedEfforts("cursor", "cursor-grok-4.6").map((o) => o.id);
+  expect(ids).toEqual(["xhigh", "high", "medium", "low"]);
+  expect(cursorModelSupportsMaxMode("cursor-grok-4.6")).toBe(false);
 });
 
 test("cursor Opus 4.8 and GPT-5.6 Sol expose Max", () => {
@@ -165,7 +176,7 @@ test("cursor Gemini 3.6 Flash exposes Minimal", () => {
   expect(supportedEfforts("cursor", "gemini-3.6-flash").map((o) => o.id)).toContain("minimal");
 });
 
-test("cursor unknown model id falls back to DEFAULT_MODEL support set (Auto, no efforts)", () => {
+test("cursor unknown model id reports zero efforts (effort rides in the id, so a pick would be inert)", () => {
   expect(supportedEfforts("cursor", "cursor-mystery-9000")).toEqual([]);
 });
 
@@ -191,6 +202,11 @@ test("cursorModelArg composes known model, effort, and fast variants", () => {
   expect(cursorModelArg("gpt-5.6-sol", "high", true, true)).toBe("gpt-5.6-sol[context=1m,effort=high,fast=true]");
   expect(cursorModelArg("gpt-5.6-sol", "high", false, true)).toBe("gpt-5.6-sol[context=1m,effort=high,fast=false]");
   expect(cursorModelArg("unknown-model", "max", true)).toBe("unknown-model");
+  // Grok 4.6: DEFAULT_EFFORT ("high") fills a null effort; fast suffixes apply
+  // across the whole ladder; no Max-Mode bracket syntax (no 1M variant).
+  expect(cursorModelArg("cursor-grok-4.6", null, false)).toBe("cursor-grok-4.6-high");
+  expect(cursorModelArg("cursor-grok-4.6", "xhigh", true)).toBe("cursor-grok-4.6-xhigh-fast");
+  expect(cursorModelArg("cursor-grok-4.6", "low", false)).toBe("cursor-grok-4.6-low");
 });
 
 test("cursor supportedModes returns the auto/ask pair (no per-model mode carve-outs)", () => {

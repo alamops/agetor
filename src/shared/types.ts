@@ -1032,8 +1032,9 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // usage, so the default stays on the most-capable non-premium tier.
   "claude-code": "opus-5",
   "codex": "gpt-5.6-sol",
-  // Cursor's own "let cursor-agent pick" model — matches its CLI default.
-  "cursor": "auto",
+  // Grok 4.6 (high effort via DEFAULT_EFFORT) — replaces cursor-agent's own
+  // "auto" as agetor's default so new tasks pin an explicit flagship model.
+  "cursor": "cursor-grok-4.6",
   // gemini-3-pro-preview is the current flagship per google-gemini/gemini-cli
   // docs (verified 2026-08-06). Deliberately NOT the "auto" alias — a spike
   // showed "auto" internally routes across mixed pro/flash-lite models even
@@ -1044,8 +1045,10 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
   "codex": "high",
-  // Cursor's default model is still "auto", which declines effort and stores
-  // NULL. When the user chooses a parameterized Cursor model, default to High.
+  // Models with `effortIds` default to High where they expose it (else their
+  // first available level — e.g. claude-4.6-sonnet only exposes medium).
+  // Models without `effortIds` ("auto", composer-2.5, the Gemini rows, …)
+  // decline effort and store NULL.
   "cursor": "high",
   // Gemini has no per-invocation effort/thinking-budget flag (verified via
   // `gemini --help` on CLI 0.54.0 — thinkingBudget/thinkingLevel are
@@ -1056,6 +1059,21 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
 };
 
 export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
+  // Ids verified against `cursor-agent models` (CLI 2026.08.11): grok 4.6 ships
+  // as cursor-grok-4.6-{low,medium,high,xhigh} plus -fast variants of all four —
+  // no bare id, no max tier, no 1M/Max-Mode variant. The unsuffixed "Cursor
+  // Grok 4.6" label is the high tier, same convention as 4.5.
+  "cursor-grok-4.6": {
+    label: "Cursor Grok 4.6",
+    hint: "Recommended default — Cursor-hosted Grok 4.6.",
+    effortIds: {
+      xhigh: "cursor-grok-4.6-xhigh",
+      high: "cursor-grok-4.6-high",
+      medium: "cursor-grok-4.6-medium",
+      low: "cursor-grok-4.6-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
   "auto": { label: "Auto", hint: "Cursor picks the model." },
   "gpt-5.3-codex": {
     label: "Codex 5.3",
@@ -1475,10 +1493,14 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
  * Effort options the picker should show for a given (agent, model). Returns
  * an empty list when the model doesn't accept the effort flag (Haiku 4.5).
  * Unknown model ids fall back to the agent's `DEFAULT_MODEL` support set so a
- * user-pasted future model still gets a sensible picker. Returned in the
- * EFFORT_OPTIONS order (highest → lowest).
+ * user-pasted future model still gets a sensible picker — except for cursor,
+ * where effort is encoded in the model id itself (`cursorModelArg`): an
+ * unknown cursor id passes through verbatim, so any effort picked for it
+ * would silently never reach the CLI. Those report no efforts instead.
+ * Returned in the EFFORT_OPTIONS order (highest → lowest).
  */
 export function supportedEfforts(agent: AgentKind, model: string | null): AgentOption[] {
+  if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
   const key = model ?? DEFAULT_MODEL[agent];
   const ids =
     MODEL_EFFORT_SUPPORT[agent][key]
