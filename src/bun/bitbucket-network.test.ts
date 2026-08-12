@@ -5,16 +5,18 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll, beforeEach, afterAll } from "bun:test";
 import { makeBitbucketPrJson, makeBitbucketRepo, mockGitHubFetch } from "./bitbucket-test-util.ts";
 import type { MockRoute } from "./bitbucket-test-util.ts";
 import { setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
+  __bitbucketInternals,
   closeBitbucketPull,
   createBitbucketComment,
   createBitbucketIssue,
   createBitbucketPull,
   createBitbucketPullLineComment,
+  getBitbucketPullBlob,
   getBitbucketPullDefaults,
   getBitbucketPullDiff,
   getBitbucketPullMergeability,
@@ -59,6 +61,17 @@ afterAll(() => {
 });
 
 const REPO = makeBitbucketRepo("acme", "app");
+
+// getBitbucketPullBlob caches PR detail (source/dest sha + repo full names)
+// and resolved merge-base shas across calls — bun test shares one process
+// across every *.test.ts file, and git-host.test.ts's own bitbucket pullBlob
+// dispatch test touches bitbucket.org/acme/app#1. Reset before every test in
+// this file so no test here can observe a stale entry left by another file,
+// regardless of run order. The tests below also use PR numbers (41+) distinct
+// from git-host.test.ts's #1 as defense in depth.
+beforeEach(() => {
+  __bitbucketInternals.resetBitbucketPullBlobCaches();
+});
 
 // ---------------------------------------------------------------------------
 // listBitbucketItems
@@ -343,6 +356,232 @@ test("getBitbucketPullDiff fetches the /diff endpoint as raw text and parses it 
     expect(res.files).toHaveLength(1);
     expect(res.files[0]!.path).toBe("src/a.ts");
     expect(res.files[0]!.status).toBe("modified");
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// getBitbucketPullBlob
+// ---------------------------------------------------------------------------
+
+test("getBitbucketPullBlob new side: reads source.commit.hash from the source repo, encoding a subdir+space path (slashes preserved, space as %20)", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/41$/,
+      json: {
+        id: 41,
+        source: { commit: { hash: "srcsha1" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha1" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    {
+      match: "/2.0/repositories/acme/app/src/srcsha1/assets/sub/my%20file.png",
+      text: "NEWBYTES",
+      headers: { "content-type": "application/octet-stream" },
+    },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 41, "assets/sub/my file.png", "new");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("srcsha1");
+    expect(res.contentType).toBe("image/png");
+    expect(new TextDecoder().decode(res.bytes)).toBe("NEWBYTES");
+    // Unlike gitlab.ts (which %2F-encodes the whole path), bitbucket.ts's
+    // srcUrl encodes each path segment individually and rejoins with literal
+    // `/` — so a subdirectory does NOT show up as %2F here.
+    expect(mock.calls.some((c) => c.url.includes("/src/srcsha1/assets/sub/my%20file.png"))).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob old side: uses the official merge-base endpoint (sourceSha..destSha) and reads from the destination repo", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/42$/,
+      json: {
+        id: 42,
+        source: { commit: { hash: "srcsha2" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha2" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/merge-base/srcsha2..destsha2", json: { hash: "mbsha2" } },
+    { match: "/2.0/repositories/acme/app/src/mbsha2/readme.png", text: "OLDBYTES" },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 42, "readme.png", "old");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("mbsha2");
+    expect(new TextDecoder().decode(res.bytes)).toBe("OLDBYTES");
+    expect(mock.calls.some((c) => c.url.includes("/merge-base/srcsha2..destsha2"))).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob old side: merge-base endpoint failure (500) falls back to destination.commit.hash", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/43$/,
+      json: {
+        id: 43,
+        source: { commit: { hash: "srcsha3" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha3" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/merge-base/srcsha3..destsha3", status: 500, json: { error: { message: "Internal Server Error" } } },
+    { match: "/2.0/repositories/acme/app/src/destsha3/readme.png", text: "FALLBACK" },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 43, "readme.png", "old");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("destsha3");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob old side: a stale/wrong merge base 404s on /src, is evicted, and retried once at destSha", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/44$/,
+      json: {
+        id: 44,
+        source: { commit: { hash: "srcsha4" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha4" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/merge-base/srcsha4..destsha4", json: { hash: "mbsha4" } },
+    { match: "/2.0/repositories/acme/app/src/mbsha4/readme.png", status: 404, json: { error: { message: "Not Found" } } },
+    { match: "/2.0/repositories/acme/app/src/destsha4/readme.png", text: "RETRIED_OK" },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 44, "readme.png", "old");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("destsha4");
+    expect(new TextDecoder().decode(res.bytes)).toBe("RETRIED_OK");
+    expect(mock.calls.some((c) => c.url.includes("/src/mbsha4/readme.png"))).toBe(true);
+    expect(mock.calls.some((c) => c.url.includes("/src/destsha4/readme.png"))).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob fork PR new side: uses the source repo parsed from source.repository.full_name; 404s with 'fork may have been deleted' wording when full_name is absent", async () => {
+  const forkMock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/45$/,
+      json: {
+        id: 45,
+        source: { commit: { hash: "forksha5" }, repository: { full_name: "forker/app2" } },
+        destination: { commit: { hash: "destsha5" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/2.0/repositories/forker/app2/src/forksha5/img.png", text: "FORKBYTES" },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 45, "img.png", "new");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("forksha5");
+    expect(forkMock.calls.some((c) => c.url.includes("/2.0/repositories/forker/app2/src/forksha5/img.png"))).toBe(true);
+  } finally {
+    forkMock.restore();
+  }
+
+  const deletedForkMock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/46$/,
+      json: {
+        id: 46,
+        source: { commit: { hash: "forksha6" } }, // no `repository` key at all — full_name absent
+        destination: { commit: { hash: "destsha6" }, repository: { full_name: "acme/app" } },
+      },
+    },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 46, "img.png", "new");
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.status).toBe(404);
+    expect(res.error).toContain("fork may have been deleted");
+    expect(deletedForkMock.calls).toHaveLength(1); // only the PR-detail fetch — no /src attempt
+  } finally {
+    deletedForkMock.restore();
+  }
+});
+
+test("getBitbucketPullBlob detail-cache: two blob calls for the same PR only issue ONE detail fetch", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/47$/,
+      json: {
+        id: 47,
+        source: { commit: { hash: "csrc" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "cdest" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/merge-base/csrc..cdest", json: { hash: "cmb" } },
+    { match: "/2.0/repositories/acme/app/src/cmb/a.png", text: "A" },
+    { match: "/2.0/repositories/acme/app/src/csrc/a.png", text: "B" },
+  ]);
+  try {
+    const res1 = await getBitbucketPullBlob(REPO, 47, "a.png", "old");
+    const res2 = await getBitbucketPullBlob(REPO, 47, "a.png", "new");
+    expect(res1.ok).toBe(true);
+    expect(res2.ok).toBe(true);
+    expect(mock.calls.filter((c) => /\/pullrequests\/47$/.test(c.url))).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob returns 413 from content-length alone, without needing to read a large body", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/48$/,
+      json: {
+        id: 48,
+        source: { commit: { hash: "srcsha8" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha8" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    // Tiny body, huge content-length header — the 413 must come purely from
+    // the header check, before `.arrayBuffer()` is ever called.
+    { match: "/2.0/repositories/acme/app/src/srcsha8/huge.png", text: "x", headers: { "content-length": "21000000" } },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 48, "huge.png", "new");
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.status).toBe(413);
+    expect(res.error).toContain("21 MB");
+    expect(mock.calls.filter((c) => c.url.includes("/src/srcsha8/huge.png"))).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob 404 from /src on a non-merge-base path (new side) -> {ok:false, status:404, error contains 'not present'}", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/49$/,
+      json: {
+        id: 49,
+        source: { commit: { hash: "srcsha9" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha9" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/2.0/repositories/acme/app/src/srcsha9/missing.png", status: 404, json: { error: { message: "Not Found" } } },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 49, "missing.png", "new");
+    expect(res).toEqual({ ok: false, error: "file not present on this side", status: 404 });
   } finally {
     mock.restore();
   }

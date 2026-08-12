@@ -5,14 +5,16 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
 import { gitlabMergeRequest, mockGitLabFetch, sampleRepo } from "./gitlab-test-util.ts";
 import {
+  __gitlabInternals,
   closeGitLabPull,
   createGitLabComment,
   createGitLabIssue,
   createGitLabPull,
   createGitLabPullLineComment,
+  getGitLabPullBlob,
   getGitLabPullChecks,
   getGitLabPullDefaults,
   getGitLabPullDiff,
@@ -30,6 +32,18 @@ import {
 } from "./gitlab.ts";
 
 const REPO = sampleRepo();
+
+// getGitLabPullBlob caches an MR's resolved base/head sha + source/target
+// project ids across calls (pullBlobDetailCache, 60s TTL) — bun test shares
+// one process across every *.test.ts file, and git-host.test.ts's own
+// pull-blob happy-path test primes that cache with gitlab.com/acme/app#1.
+// Reset before every test in this file (not just the getGitLabPullBlob
+// section) so no test here can observe a stale entry left by another file,
+// regardless of run order. The tests below also use MR numbers (21-27+)
+// distinct from git-host.test.ts's #1 as defense in depth.
+beforeEach(() => {
+  __gitlabInternals.resetGitLabPullBlobCaches();
+});
 
 // gitlab.ts resolves its token via github-tokens.ts's raw-host-keyed store
 // first, falling back to GITLAB_TOKEN env (see git-provider.ts's
@@ -281,6 +295,190 @@ test("getGitLabPullDiff hits raw_diffs and parses the plain-text unified diff in
     expect(res.ok).toBe(true);
     if (!res.ok) throw new Error(res.error);
     expect(res.files.map((f) => f.path)).toEqual(["foo.ts"]);
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// getGitLabPullBlob
+// ---------------------------------------------------------------------------
+
+test("getGitLabPullBlob old side: reads diff_refs.base_sha from the target project, encoding a subdir+space path as %2F/%20", async () => {
+  const mock = mockGitLabFetch([
+    {
+      match: /\/merge_requests\/21$/,
+      json: { iid: 21, diff_refs: { base_sha: "base-old-1", head_sha: "head-new-1" }, source_project_id: 55, target_project_id: 55 },
+    },
+    {
+      match: /\/projects\/acme%2Fapp\/repository\/files\/assets%2Fsub%2Fmy%20file\.png\/raw\?ref=base-old-1$/,
+      text: "OLDBYTES",
+      headers: { "content-type": "application/octet-stream" },
+    },
+  ]);
+  try {
+    const res = await getGitLabPullBlob(REPO, 21, "assets/sub/my file.png", "old");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("base-old-1");
+    expect(res.contentType).toBe("image/png");
+    expect(new TextDecoder().decode(res.bytes)).toBe("OLDBYTES");
+    expect(mock.calls.some((c) => c.url.includes("/repository/files/assets%2Fsub%2Fmy%20file.png/raw?ref=base-old-1"))).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullBlob new side: reads diff_refs.head_sha", async () => {
+  const mock = mockGitLabFetch([
+    {
+      match: /\/merge_requests\/21$/,
+      json: { iid: 21, diff_refs: { base_sha: "base-old-1", head_sha: "head-new-1" }, source_project_id: 55, target_project_id: 55 },
+    },
+    {
+      match: /\/repository\/files\/assets%2Fsub%2Fmy%20file\.png\/raw\?ref=head-new-1$/,
+      text: "NEWBYTES",
+    },
+  ]);
+  try {
+    const res = await getGitLabPullBlob(REPO, 21, "assets/sub/my file.png", "new");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("head-new-1");
+    expect(new TextDecoder().decode(res.bytes)).toBe("NEWBYTES");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullBlob falls back to /versions when diff_refs is missing, using the latest version's shas", async () => {
+  const mock = mockGitLabFetch([
+    { match: /\/merge_requests\/22$/, json: { iid: 22, source_project_id: 9, target_project_id: 9 } },
+    {
+      match: "/merge_requests/22/versions",
+      json: [
+        { base_commit_sha: "vbase-latest", head_commit_sha: "vhead-latest" },
+        { base_commit_sha: "vbase-older", head_commit_sha: "vhead-older" },
+      ],
+    },
+    { match: /\/raw\?ref=vbase-latest$/, text: "VERSIONED" },
+  ]);
+  try {
+    const res = await getGitLabPullBlob(REPO, 22, "readme.png", "old");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("vbase-latest");
+    expect(mock.calls.some((c) => c.url.includes("/merge_requests/22/versions"))).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullBlob fork MR: new side fetches the numeric source_project_id, old side still fetches the target project", async () => {
+  const mock = mockGitLabFetch([
+    {
+      match: /\/merge_requests\/23$/,
+      json: { iid: 23, diff_refs: { base_sha: "fbase", head_sha: "fhead" }, source_project_id: 777, target_project_id: 888 },
+    },
+    { match: /\/projects\/777\/repository\/files\/.*\/raw\?ref=fhead$/, text: "FORKBYTES" },
+    { match: /\/projects\/acme%2Fapp\/repository\/files\/.*\/raw\?ref=fbase$/, text: "TARGETBYTES" },
+  ]);
+  try {
+    const newRes = await getGitLabPullBlob(REPO, 23, "img.png", "new");
+    expect(newRes.ok).toBe(true);
+    if (!newRes.ok) throw new Error(newRes.error);
+    expect(newRes.ref).toBe("fhead");
+    expect(mock.calls.some((c) => c.url.includes("/projects/777/repository/files/"))).toBe(true);
+
+    const oldRes = await getGitLabPullBlob(REPO, 23, "img.png", "old");
+    expect(oldRes.ok).toBe(true);
+    if (!oldRes.ok) throw new Error(oldRes.error);
+    expect(oldRes.ref).toBe("fbase");
+    expect(mock.calls.some((c) => c.url.includes("/projects/acme%2Fapp/repository/files/"))).toBe(true);
+
+    // Only one MR detail fetch across both calls — the detail cache is warm
+    // after the first call.
+    expect(mock.calls.filter((c) => /\/merge_requests\/23$/.test(c.url))).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullBlob fork 404 retry: a 404 on the fork's raw file is retried once against the target project", async () => {
+  const mock = mockGitLabFetch([
+    {
+      match: /\/merge_requests\/24$/,
+      json: { iid: 24, diff_refs: { base_sha: "fbase2", head_sha: "fhead2" }, source_project_id: 777, target_project_id: 888 },
+    },
+    { match: /\/projects\/777\/repository\/files\/.*\/raw\?ref=fhead2$/, status: 404, json: { message: "404 Project Not Found" } },
+    { match: /\/projects\/acme%2Fapp\/repository\/files\/.*\/raw\?ref=fhead2$/, text: "RETRIED_OK" },
+  ]);
+  try {
+    const res = await getGitLabPullBlob(REPO, 24, "img.png", "new");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("fhead2");
+    expect(new TextDecoder().decode(res.bytes)).toBe("RETRIED_OK");
+    expect(mock.calls.some((c) => c.url.includes("/projects/777/repository/files/"))).toBe(true);
+    expect(mock.calls.some((c) => c.url.includes("/projects/acme%2Fapp/repository/files/"))).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullBlob detail-cache: two blob calls for the same MR only issue ONE detail fetch", async () => {
+  const mock = mockGitLabFetch([
+    {
+      match: /\/merge_requests\/25$/,
+      json: { iid: 25, diff_refs: { base_sha: "cbase", head_sha: "chead" }, source_project_id: 3, target_project_id: 3 },
+    },
+    { match: /\/raw\?ref=cbase$/, text: "A" },
+    { match: /\/raw\?ref=chead$/, text: "B" },
+  ]);
+  try {
+    const res1 = await getGitLabPullBlob(REPO, 25, "a.png", "old");
+    const res2 = await getGitLabPullBlob(REPO, 25, "a.png", "new");
+    expect(res1.ok).toBe(true);
+    expect(res2.ok).toBe(true);
+    expect(mock.calls.filter((c) => /\/merge_requests\/25$/.test(c.url))).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullBlob returns {ok:false, status:404} when the raw file is not present (non-fork)", async () => {
+  const mock = mockGitLabFetch([
+    {
+      match: /\/merge_requests\/26$/,
+      json: { iid: 26, diff_refs: { base_sha: "dbase", head_sha: "dhead" }, source_project_id: 4, target_project_id: 4 },
+    },
+    { match: /\/raw\?ref=dhead$/, status: 404, json: { message: "404 File Not Found" } },
+  ]);
+  try {
+    const res = await getGitLabPullBlob(REPO, 26, "missing.png", "new");
+    expect(res).toEqual({ ok: false, error: "file not present on this side", status: 404 });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabPullBlob returns 413 from content-length alone, without needing to read a large body", async () => {
+  const mock = mockGitLabFetch([
+    {
+      match: /\/merge_requests\/27$/,
+      json: { iid: 27, diff_refs: { base_sha: "ebase", head_sha: "ehead" }, source_project_id: 6, target_project_id: 6 },
+    },
+    // The response body itself is tiny — the 413 must come purely from the
+    // content-length header check, before `.arrayBuffer()` is ever called.
+    { match: /\/raw\?ref=ehead$/, text: "x", headers: { "content-length": "21000000" } },
+  ]);
+  try {
+    const res = await getGitLabPullBlob(REPO, 27, "huge.png", "new");
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.status).toBe(413);
+    expect(res.error).toContain("21 MB");
+    expect(mock.calls.filter((c) => c.url.includes("/raw?ref=ehead"))).toHaveLength(1);
   } finally {
     mock.restore();
   }
