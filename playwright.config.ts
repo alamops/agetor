@@ -28,6 +28,12 @@ export const E2E_BASE_URL = `http://localhost:${E2E_VITE_PORT}`;
 export default defineConfig({
   testDir: "e2e",
   fullyParallel: false,
+  // `fullyParallel: false` only serializes tests WITHIN a file — Playwright
+  // still gives each spec file its own worker, and every worker hits the one
+  // shared headless backend + SQLite data dir. Cross-file races on shared
+  // preference state (theme, fontSize) flake the suite; one worker keeps it
+  // deterministic.
+  workers: 1,
   retries: 0,
   reporter: process.env.CI ? [["list"]] : [["list"], ["html", { open: "never" }]],
   use: {

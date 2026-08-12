@@ -1,4 +1,4 @@
-import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
+import { test, expect, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 import { E2E_API_PORT, E2E_API_TOKEN, E2E_BASE_URL } from "../playwright.config";
 
 /**
@@ -16,8 +16,13 @@ import { E2E_API_PORT, E2E_API_TOKEN, E2E_BASE_URL } from "../playwright.config"
  * Tests share one headless server + SQLite DB and run serially — each test
  * still starts from a known preference via the direct `PUT
  * /preferences/fontSize` call in `setFontSizePreference`, so ordering never
- * has to be inferred from UI state (mirrors theme.spec.ts exactly; there is
- * no font-size Settings-dialog control in this slice, only the shortcut).
+ * has to be inferred from UI state (mirrors theme.spec.ts exactly).
+ *
+ * The Settings → General "Font size" stepper (docs/plans/font-size-settings
+ * -stepper.md, commit 68bc973) is a thin UI layer over the same
+ * `useFontSize()` context the shortcut drives — same debounced persist, same
+ * clamp — so its coverage below reuses the same state-cleanup and polling
+ * conventions as the shortcut tests above.
  */
 
 const API_BASE = `http://127.0.0.1:${E2E_API_PORT}`;
@@ -81,6 +86,31 @@ async function pressZoomOut(page: Page, mod: "Meta" | "Control"): Promise<void> 
 
 async function pressReset(page: Page, mod: "Meta" | "Control"): Promise<void> {
   await page.keyboard.press(`${mod}+Digit0`);
+}
+
+/** Opens Settings → General (the default section on open — no tab click
+ *  needed), mirroring theme.spec.ts's `openSettingsGeneral` exactly. */
+async function openSettingsGeneral(page: Page) {
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
+  return dialog;
+}
+
+/** Locates the "Font size" `role="group"` row inside an already-open
+ *  Settings dialog and returns its four addressable parts, per the markup
+ *  pinned in SettingsDialog.tsx's `GeneralSection` (docs/plans/font-size-
+ *  settings-stepper.md §2): a `role="group" aria-label="Font size"`
+ *  container holding Decrease/readout/Increase/Reset. */
+function fontSizeStepper(dialog: Locator) {
+  const group = dialog.getByRole("group", { name: "Font size", exact: true });
+  return {
+    group,
+    readout: group.getByRole("status"),
+    decrease: group.getByRole("button", { name: "Decrease font size", exact: true }),
+    increase: group.getByRole("button", { name: "Increase font size", exact: true }),
+    reset: group.getByRole("button", { name: "Reset font size", exact: true }),
+  };
 }
 
 test.describe("font-size: boot resolution (no flash)", () => {
@@ -255,6 +285,130 @@ test.describe("font-size: persists across reload", () => {
     await page.reload();
     await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
     await expect.poll(() => rootFontSizePx(page)).toBe("19.2px");
+
+    await setFontSizePreference(request, "100");
+  });
+});
+
+test.describe("font-size: Settings stepper", () => {
+  test("clicking Increase steps the readout and the computed root size, and persists after the debounce", async ({
+    page,
+    request,
+  }) => {
+    await setFontSizePreference(request, "100");
+    await gotoApp(page);
+    const dialog = await openSettingsGeneral(page);
+    const { readout, increase } = fontSizeStepper(dialog);
+
+    await expect(readout).toHaveText("100%");
+    await increase.click();
+    await expect(readout).toHaveText("110%");
+    await increase.click();
+    await expect(readout).toHaveText("120%");
+
+    // The dialog doesn't block root scaling — the stepper drives the same
+    // `useFontSize()` context the shortcut does.
+    expect(await rootFontSizePx(page)).toBe("19.2px");
+
+    await expect
+      .poll(() => getPersistedFontSize(request), {
+        message: "expected the settled 120% to persist to the server",
+        timeout: 5_000,
+      })
+      .toBe("120");
+
+    await setFontSizePreference(request, "100");
+  });
+
+  test("clicking Reset returns to 100%, clears the inline style, and persists", async ({ page, request }) => {
+    await setFontSizePreference(request, "140");
+    await gotoApp(page, 140);
+    const dialog = await openSettingsGeneral(page);
+    const { readout, reset } = fontSizeStepper(dialog);
+
+    await expect(readout).toHaveText("140%");
+    expect(await rootFontSizePx(page)).toBe("22.4px");
+
+    await reset.click();
+
+    await expect(readout).toHaveText("100%");
+    await expect.poll(() => rootFontSizePx(page)).toBe("16px");
+    expect(await rootInlineFontSize(page)).toBe("");
+
+    await expect
+      .poll(() => getPersistedFontSize(request), {
+        message: "expected the reset 100% to persist to the server",
+        timeout: 5_000,
+      })
+      .toBe("100");
+  });
+
+  test("Decrease/Reset are aria-disabled at the 100% floor (and a click on Decrease is a no-op); Increase is aria-disabled at the 170% ceiling", async ({
+    page,
+    request,
+  }) => {
+    await setFontSizePreference(request, "100");
+    await gotoApp(page);
+    const dialog = await openSettingsGeneral(page);
+    const { readout, decrease, increase, reset } = fontSizeStepper(dialog);
+
+    await expect(decrease).toHaveAttribute("aria-disabled", "true");
+    await expect(reset).toHaveAttribute("aria-disabled", "true");
+    await expect(increase).toHaveAttribute("aria-disabled", "false");
+
+    // aria-disabled (not the `disabled` DOM property) leaves the button in
+    // the DOM as a clickable element — the onClick handler guard is what
+    // makes this a no-op, per docs/plans/font-size-settings-stepper.md's
+    // contract. Playwright's own actionability check treats aria-disabled
+    // the same as the native `disabled` attribute and refuses a plain
+    // `.click()` (it waits for "enabled", timing out), so `force: true` is
+    // required here to actually dispatch the click and exercise the
+    // handler's own guard rather than Playwright's unrelated guard.
+    await decrease.click({ force: true });
+    await page.waitForTimeout(400);
+    await expect(readout).toHaveText("100%");
+    expect(await rootFontSizePx(page)).toBe("16px");
+    const persistedAtFloor = await getPersistedFontSize(request);
+    expect(persistedAtFloor === undefined || persistedAtFloor === "100").toBe(true);
+
+    // 7 clicks reach the 170% ceiling (100 -> 170 in steps of 10).
+    for (let i = 0; i < 7; i++) {
+      await increase.click();
+    }
+
+    await expect(readout).toHaveText("170%");
+    await expect(increase).toHaveAttribute("aria-disabled", "true");
+    expect(await rootFontSizePx(page)).toBe("27.2px");
+
+    await setFontSizePreference(request, "100");
+  });
+});
+
+test.describe("font-size: Settings ↔ shortcut coherence", () => {
+  test("pressing the keyboard shortcut while Settings is open updates the live readout", async ({
+    page,
+    request,
+  }) => {
+    await setFontSizePreference(request, "100");
+    await gotoApp(page);
+    const dialog = await openSettingsGeneral(page);
+    const { readout } = fontSizeStepper(dialog);
+    await expect(readout).toHaveText("100%");
+
+    const mod = await shortcutModifier(page);
+    await pressZoomIn(page, mod);
+    await expect(readout).toHaveText("110%");
+    await pressZoomIn(page, mod);
+    await expect(readout).toHaveText("120%");
+
+    expect(await rootFontSizePx(page)).toBe("19.2px");
+
+    await expect
+      .poll(() => getPersistedFontSize(request), {
+        message: "expected the settled 120% to persist to the server",
+        timeout: 5_000,
+      })
+      .toBe("120");
 
     await setFontSizePreference(request, "100");
   });
