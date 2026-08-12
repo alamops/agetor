@@ -24,6 +24,7 @@ import {
   createGitHubIssue,
   createGitHubPull,
   createGitHubPullLineComment,
+  getGitHubPullBlob,
   getGitHubPullChecks,
   getGitHubPullDefaults,
   getGitHubPullDetail,
@@ -384,6 +385,39 @@ export async function pullDiff(input: { dir: string; number: number }): Promise<
   if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
   if (repoInfo.provider === "github") return getGitHubPullDiff(input);
   return repoInfo.provider === "gitlab" ? getGitLabPullDiff(repoInfo, input.number) : getBitbucketPullDiff(repoInfo, input.number);
+}
+
+/** Same identifying fields `pullDiff` takes (`dir`, `number`), plus which
+ *  file and which side of the diff to fetch bytes for. `path` is
+ *  repo-relative, matching the `path` field on `TaskDiff`'s `DiffFile`
+ *  entries the UI already has in hand from a prior `pullDiff` call. */
+export interface PullBlobOpts {
+  dir: string;
+  number: number;
+  path: string;
+  side: "old" | "new";
+}
+
+export type PullBlobResult =
+  | { ok: true; bytes: Uint8Array; contentType: string }
+  // status: 404 missing, 413 too large, 501 unsupported provider, 502 upstream
+  | { ok: false; error: string; status?: number };
+
+/**
+ * Fetches the raw bytes of one side (old/new) of a binary file in a pull
+ * request's diff, for the binary-diff-preview UI (`BinaryFilePreview`).
+ * GitHub is implemented (`getGitHubPullBlob` — resolves head/base repo and
+ * anchors the old side at the PR's merge base, since the diff the UI shows
+ * is merge-base-anchored, not `base.sha`-anchored). GitLab and Bitbucket
+ * previews are deferred to a follow-up (see docs/plans/binary-diff-previews.md
+ * §8) — both return `501 unsupported` rather than attempting a fetch, so the
+ * UI's binary placeholder degrades gracefully instead of erroring.
+ */
+export async function pullBlob(input: PullBlobOpts): Promise<PullBlobResult> {
+  const repoInfo = await providerRepoForDir(input.dir);
+  if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
+  if (repoInfo.provider === "github") return getGitHubPullBlob(input);
+  return { ok: false, status: 501, error: "binary preview not supported for this provider yet" };
 }
 
 /**

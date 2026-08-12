@@ -59,6 +59,30 @@ export function isImagePath(path: string): boolean {
   return IMAGE_EXT_RE.test(basename(path));
 }
 
+const PDF_EXT_RE = /\.pdf$/i;
+
+/** True iff `path`'s basename ends in `.pdf` (case-insensitive). Same
+ *  path-parsing rule as `isImagePath` — a path ending in `/` is a directory
+ *  ref and is never a PDF, regardless of what precedes the trailing slash. */
+export function isPdfPath(path: string): boolean {
+  if (path.endsWith("/")) return false;
+  return PDF_EXT_RE.test(basename(path));
+}
+
+/** Binary file kinds the diff-preview UI knows how to render inline
+ *  (old-vs-new side by side) instead of the plain "binary file — no textual
+ *  diff" placeholder. */
+export type BinaryPreviewKind = "image" | "pdf";
+
+/** Classify `path` for the binary-diff-preview UI, or `null` if it's a
+ *  binary kind we don't have a preview renderer for (falls back to the
+ *  placeholder). */
+export function binaryPreviewKind(path: string): BinaryPreviewKind | null {
+  if (isImagePath(path)) return "image";
+  if (isPdfPath(path)) return "pdf";
+  return null;
+}
+
 /** Matches claude's `[Image #<digits>]` placeholder token. `N` is a
  *  session-wide attachment counter, not a per-message index — don't attempt
  *  to correlate the number to anything positional. Module-private — callers

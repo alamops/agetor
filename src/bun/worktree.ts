@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./db.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
@@ -43,6 +44,38 @@ async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Pro
       proc.exited,
     ]);
     return { ok: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Like `git`, but for reading raw blob bytes (e.g. `git show <sha>:<path>`)
+ * whose content may not be valid UTF-8 — images and PDFs, in particular.
+ * `git`'s `text()` collection would mangle those bytes via replacement-
+ * character substitution, so this variant collects stdout as an
+ * `ArrayBuffer` instead. Same never-throws contract and 30s default timeout
+ * as `git`.
+ */
+async function gitRaw(
+  args: string[],
+  cwd: string,
+  timeoutMs = GIT_TIMEOUT_MS,
+): Promise<{ ok: boolean; exitCode: number; bytes: Uint8Array<ArrayBuffer>; stderr: string }> {
+  const proc = Bun.spawn(["git", ...args], {
+    cwd,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const timer = setTimeout(() => proc.kill(), timeoutMs);
+  try {
+    const [buf, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).arrayBuffer(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { ok: exitCode === 0, exitCode, bytes: new Uint8Array(buf), stderr: stderr.trim() };
   } finally {
     clearTimeout(timer);
   }
@@ -912,6 +945,123 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
     };
   }
   return { base: shortBase, files };
+}
+
+// Above this many bytes, a diff-preview blob (image/PDF) is refused rather
+// than read into memory whole — these routes serve the webview's inline
+// old-vs-new preview, not a general-purpose file reader.
+export const MAX_BLOB_PREVIEW_BYTES = 20_000_000;
+
+/**
+ * True iff `relPath` is safe to `path.join` onto a trusted `cwd`: non-empty,
+ * free of null bytes, not itself absolute, and whose normalized form
+ * doesn't escape `cwd` (no leading `..` segment once normalized). This is a
+ * stricter contract than `/files/preview`'s (which trusts an already-
+ * absolute, already-existing path) — `getTaskDiffBlob` takes a
+ * repo-relative path from the client, so traversal must be rejected before
+ * it ever touches the filesystem or a `git` invocation.
+ */
+function isSafeRelPath(relPath: string): boolean {
+  if (!relPath) return false;
+  if (relPath.includes("\0")) return false;
+  if (path.isAbsolute(relPath)) return false;
+  const normalized = path.normalize(relPath);
+  if (path.isAbsolute(normalized)) return false;
+  if (normalized === ".." || normalized.startsWith(`..${path.sep}`)) return false;
+  return true;
+}
+
+/**
+ * Read the raw bytes of one file, on one side of a task's diff, for the
+ * binary-preview UI (images/PDFs get an old-vs-new inline preview instead of
+ * the plain "binary file — no textual diff" placeholder). Mirrors
+ * `getTaskDiff`'s cwd/base selection exactly, so "old"/"new" here are
+ * literally the two sides `git diff <base>` compared:
+ *
+ *  - "new" reads the on-disk file in the task's cwd (the working tree).
+ *  - "old" resolves `base` to a commit sha and reads the blob via
+ *    `git show <sha>:<relPath>` — raw bytes (`gitRaw`), never text, since
+ *    images/PDFs aren't valid UTF-8 and must never round-trip through a
+ *    string.
+ *
+ * Never throws. `relPath` must pass `isSafeRelPath` — this route is
+ * repo-dir-relative, not an arbitrary-path reader like `/files/preview`.
+ * Renamed files: the caller is responsible for passing whichever path
+ * applies to the requested side (e.g. `oldPath` for `side: "old"` on a
+ * rename) — this function has no rename awareness of its own.
+ */
+export async function getTaskDiffBlob(
+  task: Task,
+  relPath: string,
+  side: "old" | "new",
+): Promise<{ ok: true; bytes: Uint8Array<ArrayBuffer>; etag: string } | { ok: false; error: string; status: number }> {
+  let cwd: string;
+  let base: string;
+
+  if (task.isolation === "worktree") {
+    if (!task.worktreePath || !existsSync(task.worktreePath)) {
+      return { ok: false, error: "this task hasn't created a worktree yet", status: 404 };
+    }
+    cwd = task.worktreePath;
+    base = task.baseRef ?? "HEAD";
+  } else {
+    if (!existsSync(task.workdir) || !(await isGitRepo(task.workdir))) {
+      return { ok: false, error: "the task's workdir isn't a git repo", status: 404 };
+    }
+    cwd = task.workdir;
+    base = "HEAD";
+  }
+
+  if (!isSafeRelPath(relPath)) {
+    return { ok: false, error: "invalid path", status: 400 };
+  }
+
+  if (side === "new") {
+    const abs = path.join(cwd, relPath);
+    let st;
+    try {
+      st = statSync(abs);
+    } catch {
+      return { ok: false, error: "not found", status: 404 };
+    }
+    // Only regular files: a FIFO/device named `*.png` would otherwise hang
+    // the read forever (same guard as /files/preview).
+    if (!st.isFile()) {
+      return { ok: false, error: "not found", status: 404 };
+    }
+    if (st.size > MAX_BLOB_PREVIEW_BYTES) {
+      return { ok: false, error: "too large to preview", status: 413 };
+    }
+    const bytes = new Uint8Array(await Bun.file(abs).arrayBuffer());
+    return { ok: true, bytes, etag: `"${st.size}-${st.mtimeMs}"` };
+  }
+
+  // side === "old"
+  const rev = await git(["rev-parse", "--verify", `${base}^{commit}`], cwd, 10_000);
+  if (!rev.ok || !rev.stdout) {
+    return { ok: false, error: "could not resolve base", status: 404 };
+  }
+  const sha = rev.stdout;
+
+  // Check the blob's size before reading it whole into memory.
+  const sizeRes = await git(["cat-file", "-s", `${sha}:${relPath}`], cwd, 10_000);
+  if (!sizeRes.ok) {
+    return { ok: false, error: "not present at base", status: 404 };
+  }
+  const size = Number(sizeRes.stdout);
+  if (Number.isFinite(size) && size > MAX_BLOB_PREVIEW_BYTES) {
+    return { ok: false, error: "too large to preview", status: 413 };
+  }
+
+  const blob = await gitRaw(["show", `${sha}:${relPath}`], cwd);
+  if (!blob.ok) {
+    return { ok: false, error: "not present at base", status: 404 };
+  }
+  // Stable hash (not Bun.hash — see claude-tmux.ts's note on its algorithm
+  // not being a cross-version stability contract) of the resolved sha+path,
+  // so this etag stays valid for the lifetime of the pinned base.
+  const etag = `"${createHash("sha1").update(`${sha}:${relPath}`).digest("hex")}"`;
+  return { ok: true, bytes: blob.bytes, etag };
 }
 
 /**

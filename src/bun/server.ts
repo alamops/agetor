@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { WebSocketHandler } from "bun";
@@ -56,6 +57,7 @@ import { planAskAnswers } from "./claude-questions.ts";
 import {
   getAheadCount,
   getTaskDiff,
+  getTaskDiffBlob,
   gitFetch,
   gitPull,
   gitPush,
@@ -174,7 +176,7 @@ import type {
 } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
-import { isImagePath } from "../shared/attachments.ts";
+import { binaryPreviewKind, isImagePath } from "../shared/attachments.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -206,14 +208,28 @@ const json = (data: unknown, init?: ResponseInit) =>
     status: init?.status,
   });
 
-// Content-type map for GET /files/preview. Module-scope so it isn't
-// reallocated on every request.
+// Content-type map for GET /files/preview and the binary-diff-blob routes
+// below. Module-scope so it isn't reallocated on every request. `pdf` is
+// used by the blob routes only (/files/preview is image-only, gated by
+// isImagePath) — the extension→mimetype fallback below (`image/<ext>`)
+// only ever applies to image kinds, so pdf must be listed explicitly.
 const PREVIEW_CONTENT_TYPES: Record<string, string> = {
   jpg: "image/jpeg",
   jpeg: "image/jpeg",
   svg: "image/svg+xml",
   ico: "image/x-icon",
+  pdf: "application/pdf",
 };
+
+// Content-type for a binary-diff-blob response (/tasks/:id/diff/blob,
+// /github/pull-blob). `kind` comes from `binaryPreviewKind`'s allowlist, so
+// the `image/<ext>` fallback below only ever applies to an image extension
+// — never to `pdf`, which is always the explicit map entry.
+function blobContentType(relPath: string, kind: "image" | "pdf"): string {
+  const ext = relPath.slice(relPath.lastIndexOf(".") + 1).toLowerCase();
+  if (kind === "pdf") return PREVIEW_CONTENT_TYPES.pdf ?? "application/pdf";
+  return PREVIEW_CONTENT_TYPES[ext] ?? `image/${ext}`;
+}
 
 // Derived, never-persisted count of this task's still-`running` subagent
 // rows — drives the kanban card's "N background agents" badge. Single-task
@@ -840,6 +856,74 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
           return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Serve the raw bytes of one file, on one side of a PR's diff, for the
+      // Git Integration modal's binary (image/PDF) preview. Mirrors
+      // /github/pull-diff's identifying params (`path` = the local repo dir
+      // used to resolve host/repo/number, `number` = the PR number) — the
+      // *blob's* repo-relative path is a distinct concept from that `path`
+      // param, so it's carried as `filePath` here to avoid a name collision
+      // with pull-diff's `path` (a deviation from the plan's literal
+      // `?path=<repo-rel>` shape, which would have shadowed the existing
+      // `path` meaning). Dispatches through git-host.ts's `pullBlob`, which
+      // resolves the PR's head/merge-base and fetches blob bytes via the
+      // provider's Contents API; unsupported providers (GitLab/Bitbucket in
+      // v1) return `{ ok: false, status: 501 }` from `pullBlob` itself.
+      "/github/pull-blob": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          const filePath = url.searchParams.get("filePath") ?? "";
+          const side = url.searchParams.get("side");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!filePath) {
+            return json({ error: "filePath required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (side !== "old" && side !== "new") {
+            return json({ error: "side must be 'old' or 'new'" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const kind = binaryPreviewKind(filePath);
+          if (!kind) {
+            return json(
+              { error: `no preview available for: ${filePath}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+
+          const result = await gitHost.pullBlob({ dir, number, path: filePath, side });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: result.status ?? 502, headers: corsHeaders(req) });
+          }
+
+          // pullBlob's result carries bytes + contentType but no etag of its
+          // own — synthesize a weak one from byte length + path, stable
+          // enough for the modal-scoped 1h cache below (a PR blob at a given
+          // sha doesn't change; the merge-base can move, hence "weak" and a
+          // short ttl rather than the task-diff route's immutable one).
+          const etag = `W/"${result.bytes.byteLength}-${createHash("sha1").update(filePath).digest("hex").slice(0, 16)}"`;
+          if (req.headers.get("if-none-match") === etag) {
+            return new Response(null, { status: 304, headers: { ...corsHeaders(req), etag } });
+          }
+          // `new Uint8Array(bytes)` (copy, not a re-view) resolves the type
+          // to `Uint8Array<ArrayBuffer>` — `pullBlob`'s unparametrized
+          // `Uint8Array` return type defaults to `Uint8Array<ArrayBufferLike>`
+          // under TS 5.7+, which `BodyInit`'s `ArrayBufferView<ArrayBuffer>`
+          // constraint rejects.
+          return new Response(new Uint8Array(result.bytes), {
+            headers: {
+              ...corsHeaders(req),
+              "content-type": result.contentType,
+              "x-content-type-options": "nosniff",
+              "cache-control": "private, max-age=3600",
+              etag,
+            },
+          });
         }),
       },
 
@@ -3395,6 +3479,61 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const t = tasks.get(req.params.id);
           if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           return json(await getTaskDiff(t), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Serve the raw bytes of one file, on one side of a task's diff, so the
+      // Diff Modal can render an old-vs-new preview for binary files it knows
+      // how to display (images, PDFs) instead of the plain "binary file — no
+      // textual diff" placeholder. Same trust posture as /files/preview:
+      // token-gated + loopback-only is the real boundary, the extension
+      // allowlist (`binaryPreviewKind`) just keeps this from doubling as a
+      // generic blob reader, and `getTaskDiffBlob` independently rejects any
+      // path that would escape the task's cwd.
+      "/tasks/:id/diff/blob": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+
+          const url = new URL(req.url);
+          const relPath = url.searchParams.get("path") ?? "";
+          const side = url.searchParams.get("side");
+          if (!relPath) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (side !== "old" && side !== "new") {
+            return json({ error: "side must be 'old' or 'new'" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const kind = binaryPreviewKind(relPath);
+          if (!kind) {
+            return json(
+              { error: `no preview available for: ${relPath}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+
+          const result = await getTaskDiffBlob(t, relPath, side);
+          if (!result.ok) {
+            return json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
+          }
+
+          if (req.headers.get("if-none-match") === result.etag) {
+            return new Response(null, { status: 304, headers: { ...corsHeaders(req), etag: result.etag } });
+          }
+          return new Response(result.bytes, {
+            headers: {
+              ...corsHeaders(req),
+              "content-type": blobContentType(relPath, kind),
+              "x-content-type-options": "nosniff",
+              // "new" is the working tree — it can change under the user's
+              // feet, so revalidate every time. "old" is pinned to a resolved
+              // commit sha, so it never changes for a given etag.
+              "cache-control": side === "new"
+                ? "private, max-age=0, must-revalidate"
+                : "private, max-age=31536000, immutable",
+              etag: result.etag,
+            },
+          });
         }),
       },
 

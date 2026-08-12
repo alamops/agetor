@@ -1308,6 +1308,53 @@ export const api = {
   filePreviewUrl: (path: string): string =>
     `${BASE}/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(API_TOKEN)}`,
 
+  /** Absolute URL for a task's worktree-diff binary blob (old or new side of
+   *  a binary file), for `<img src>` use in `BinaryFilePreview`. Same
+   *  `?token=` pattern as `filePreviewUrl` — `<img>` can't set an
+   *  `Authorization` header. Backed by `GET /tasks/:id/diff/blob`, which
+   *  resolves `side: "old"` via `git show <baseRef>:<path>` and `side:
+   *  "new"` from the on-disk file in the task's cwd (worktree or workdir),
+   *  mirroring what `getTaskDiff`'s underlying `git diff` compared. */
+  taskDiffBlobUrl: (taskId: string, path: string, side: "old" | "new"): string =>
+    `${BASE}/tasks/${taskId}/diff/blob?path=${encodeURIComponent(path)}&side=${side}&token=${encodeURIComponent(API_TOKEN)}`,
+
+  /** Absolute URL for a GitHub PR's binary blob (old or new side), for
+   *  `<img src>` use in `BinaryFilePreview`. Identifying params mirror
+   *  `getGitHubPullDiff` (`path`, `number`) exactly, plus the blob-specific
+   *  `filePath` (repo-relative file path — carried as a distinct param name
+   *  from `path`, which is the local repo dir used to resolve the GitHub
+   *  remote) and `side`. Backed by `GET /github/pull-blob`: the old side
+   *  anchors at the PR's merge base (the `.diff` shown is a three-dot
+   *  diff), the new side at the PR head sha. */
+  pullBlobUrl: (opts: { path: string; number: number; filePath: string; side: "old" | "new" }): string => {
+    const q = new URLSearchParams({
+      path: opts.path,
+      number: String(opts.number),
+      filePath: opts.filePath,
+      side: opts.side,
+      token: API_TOKEN,
+    });
+    return `${BASE}/github/pull-blob?${q.toString()}`;
+  },
+
+  /** Fetch binary blob bytes via `Authorization: Bearer` (no token in the
+   *  URL — used for PDF panes, which go through `fetch`/pdf.js rather than
+   *  an `<img>` tag). Throws an `Error` whose message distinguishes a
+   *  missing blob ("missing", 404) from one over the server's size cap
+   *  ("too-large", 413) from any other failure, so callers can render a
+   *  matching empty state. */
+  fetchBlobBytes: async (url: string): Promise<ArrayBuffer> => {
+    const res = await fetch(url, {
+      headers: { "authorization": `Bearer ${API_TOKEN}` },
+    });
+    if (!res.ok) {
+      if (res.status === 404) throw new Error("missing");
+      if (res.status === 413) throw new Error("too-large");
+      throw new Error(`${res.status} ${res.statusText}`);
+    }
+    return res.arrayBuffer();
+  },
+
   /** Persist an in-memory image (clipboard paste or macOS floating-thumbnail
    *  drag) to disk and get back its absolute path. Bypasses `j()` because the
    *  body is raw bytes, not JSON. */
