@@ -2,13 +2,14 @@
 // path (URL, method, headers, body, pagination, error mapping) via the
 // fetch-mock harness in bitbucket-test-util.ts. Complements bitbucket.test.ts,
 // which unit-tests the pure helpers in isolation.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test, expect, beforeAll, beforeEach, afterAll } from "bun:test";
+import { test, expect, beforeAll, beforeEach, afterEach, afterAll } from "bun:test";
 import { makeBitbucketPrJson, makeBitbucketRepo, mockGitHubFetch } from "./bitbucket-test-util.ts";
 import type { MockRoute } from "./bitbucket-test-util.ts";
 import { setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
+import { __clearApiHostCacheForTest } from "./git-provider.ts";
 import {
   __bitbucketInternals,
   closeBitbucketPull,
@@ -18,6 +19,7 @@ import {
   createBitbucketPullLineComment,
   getBitbucketPullBlob,
   getBitbucketPullDefaults,
+  getBitbucketPullDetail,
   getBitbucketPullDiff,
   getBitbucketPullMergeability,
   getBitbucketViewer,
@@ -72,6 +74,40 @@ const REPO = makeBitbucketRepo("acme", "app");
 beforeEach(() => {
   __bitbucketInternals.resetBitbucketPullBlobCaches();
 });
+
+// Every exported entry point now opens with a `bitbucketServerError` guard
+// (docs/plans/per-host-git-api-bases.md) that resolves `repo.remoteHost`
+// through `apiHostForRemote` (git-provider.ts, `ssh -G` under the hood).
+// `AGETOR_SSH_BIN` and `apiHostForRemote`'s module-level cache are reset
+// after every test in this file so a Server-host stub set by one test can
+// never leak a stale resolution into another test — this file's own tests,
+// or a sibling *.test.ts file sharing the same `bun test` process.
+const ORIGINAL_SSH_BIN = process.env.AGETOR_SSH_BIN;
+let sshStubDirs: string[] = [];
+
+afterEach(() => {
+  __clearApiHostCacheForTest();
+  if (ORIGINAL_SSH_BIN === undefined) delete process.env.AGETOR_SSH_BIN;
+  else process.env.AGETOR_SSH_BIN = ORIGINAL_SSH_BIN;
+  for (const dir of sshStubDirs) rmSync(dir, { recursive: true, force: true });
+  sshStubDirs = [];
+});
+
+/** Writes an executable stub standing in for `ssh`, mirroring
+ *  git-provider.test.ts's `writeSshStub` — `apiHostForRemote` invokes it as
+ *  `<stub> -G -- <host>`, so `$3` is the (lowercased) host argument. */
+function writeSshStub(script: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-bb-ssh-stub-"));
+  sshStubDirs.push(dir);
+  const binPath = path.join(dir, "ssh");
+  writeFileSync(binPath, script, { mode: 0o755 });
+  return binPath;
+}
+
+/** ssh stub that always echoes its input back as the resolved hostname —
+ *  the "identity" case (a genuine Server/DC domain, or a plain non-aliased
+ *  host, has no `~/.ssh/config` entry to redirect it). */
+const IDENTITY_SSH_STUB = '#!/bin/sh\necho "hostname $3"\n';
 
 // ---------------------------------------------------------------------------
 // listBitbucketItems
@@ -158,6 +194,13 @@ test("listBitbucketItems (issues) with NO credential at all surfaces the enriche
   const priorEmail = process.env.BITBUCKET_EMAIL;
   delete process.env.BITBUCKET_TOKEN;
   delete process.env.BITBUCKET_EMAIL;
+  // "bitbucket-work.com" is this suite's stand-in for a real `~/.ssh/config`
+  // multi-identity alias whose `HostName` is bitbucket.org (per the module
+  // doc comment above) — stub ssh to resolve it that way so the
+  // `bitbucketServerError` guard passes and this test still exercises what
+  // it's actually about: alias-host credential resolution, not API-host
+  // rejection.
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname bitbucket.org'\n");
   const aliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work.com");
   const mock = mockGitHubFetch([
     {
@@ -238,6 +281,7 @@ test("email:token credentials send Authorization: Basic base64(email:token)", as
 // ---------------------------------------------------------------------------
 
 test("a stored credential for the alias host authenticates the outgoing request with Basic email:api_token", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname bitbucket.org'\n");
   setGitHubToken("bitbucket-work.com", "user@example.com:storedtoken456");
   const aliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work.com");
   const mock = mockGitHubFetch([{ match: "/2.0/user", json: { nickname: "octo" } }]);
@@ -257,6 +301,7 @@ test("no credential at all (alias host, no stored entry, no env) sends an unauth
   const priorEmail = process.env.BITBUCKET_EMAIL;
   delete process.env.BITBUCKET_TOKEN;
   delete process.env.BITBUCKET_EMAIL;
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname bitbucket.org'\n");
   const aliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work.com");
   const bitbucketBody = {
     type: "error",
@@ -1116,6 +1161,100 @@ test("updateBitbucketIssue maps state:'closed' to 'resolved' and state:'open' pa
 
     await updateBitbucketIssue(REPO, 3, { state: "open" });
     expect(JSON.parse(mock.calls[1]!.body!)).toEqual({ state: "open" });
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Bitbucket Server / Data Center rejection (docs/plans/per-host-git-api-bases.md)
+//
+// Bitbucket Server/DC speaks a structurally different REST API
+// (`/rest/api/1.0`) than Bitbucket Cloud — this module is Cloud-only, so
+// every exported entry point now rejects a repo whose remote resolves (via
+// `apiHostForRemote`) to anything other than `bitbucket.org`, before making
+// any network call. These tests exercise four representative entry points
+// (a read, a blob fetch with its own `status` field, a detail fetch, and a
+// mutation) plus the alias-resolves-to-cloud happy path; every other
+// exported function is guarded identically (see bitbucket.ts).
+// ---------------------------------------------------------------------------
+
+const SERVER_REPO = makeBitbucketRepo("acme", "app", "bitbucket.mycompany.com");
+const ALIAS_TO_CLOUD_REPO = makeBitbucketRepo("acme", "app", "bb-work");
+
+test("getBitbucketPullDiff rejects a Bitbucket Server/DC remote host with zero fetch calls", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketPullDiff(SERVER_REPO, 1);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toBe(
+      "Bitbucket Server / Data Center is not supported — only Bitbucket Cloud (bitbucket.org). This repo's remote points at bitbucket.mycompany.com.",
+    );
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob rejects a Bitbucket Server/DC remote host (status 501) with zero fetch calls", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketPullBlob(SERVER_REPO, 1, "README.md", "new");
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("Bitbucket Server / Data Center is not supported");
+    expect(res.status).toBe(501);
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullDetail rejects a Bitbucket Server/DC remote host with zero fetch calls", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketPullDetail(SERVER_REPO, 1);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("Bitbucket Server / Data Center is not supported");
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("mergeBitbucketPull (a mutation) rejects a Bitbucket Server/DC remote host with zero fetch calls", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await mergeBitbucketPull(SERVER_REPO, 1, "merge");
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("Bitbucket Server / Data Center is not supported");
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("an ssh-alias host that resolves to bitbucket.org proceeds normally (alias-to-cloud)", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname bitbucket.org'\n");
+  const mock = mockGitHubFetch([
+    {
+      match: "/pullrequests/41",
+      json: { id: 41, title: "PR", state: "OPEN", links: { html: { href: "https://bitbucket.org/acme/app/pull-requests/41" } } },
+    },
+  ]);
+  try {
+    const res = await getBitbucketPullDetail(ALIAS_TO_CLOUD_REPO, 41);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.item.number).toBe(41);
+    expect(mock.calls).toHaveLength(1);
   } finally {
     mock.restore();
   }

@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -9,6 +9,8 @@ import {
   __clearRemoteHostsCacheForTest,
   gitlabToken,
   bitbucketCreds,
+  apiHostForRemote,
+  __clearApiHostCacheForTest,
 } from "./git-provider.ts";
 import { setGitHubToken, tokenForHost } from "./github-tokens.ts";
 import { makeAliasGitHubRepo } from "./github-test-util.ts";
@@ -16,12 +18,13 @@ import { makeAliasGitHubRepo } from "./github-test-util.ts";
 // git-provider.ts resolves AGETOR_DATA_DIR lazily at call time (via
 // github-tokens.ts's resolveDataDir), so — like github-tokens.test.ts — it's
 // safe to swap the env var per-test. Each test gets its own mkdtemp token
-// store dir; GITLAB_TOKEN/BITBUCKET_TOKEN/BITBUCKET_EMAIL are saved/cleared
-// before every test and restored after so no test can leak env into another,
-// and so gitlabToken/bitbucketCreds's env-fallback tier only ever sees what a
-// given test explicitly sets.
+// store dir; GITLAB_TOKEN/BITBUCKET_TOKEN/BITBUCKET_EMAIL/AGETOR_SSH_BIN are
+// saved/cleared before every test and restored after so no test can leak env
+// into another, and so gitlabToken/bitbucketCreds's env-fallback tier and
+// apiHostForRemote's binary override only ever see what a given test
+// explicitly sets.
 const ORIGINAL_DATA_DIR = process.env.AGETOR_DATA_DIR;
-const ENV_KEYS = ["GITLAB_TOKEN", "BITBUCKET_TOKEN", "BITBUCKET_EMAIL"] as const;
+const ENV_KEYS = ["GITLAB_TOKEN", "BITBUCKET_TOKEN", "BITBUCKET_EMAIL", "AGETOR_SSH_BIN"] as const;
 let dataDir: string;
 let savedEnv: Record<string, string | undefined> = {};
 let createdDirs: string[] = [];
@@ -39,6 +42,11 @@ beforeEach(() => {
   // clearing up front keeps every test's cache behavior self-contained and
   // independent of suite run order.
   __clearRemoteHostsCacheForTest();
+  // Same reasoning for apiHostForRemote's cache, keyed by raw remoteHost —
+  // without this, a host string reused across tests (unlikely but not
+  // guaranteed unique) could read a stale resolution from an earlier test's
+  // stub instead of exercising the current test's.
+  __clearApiHostCacheForTest();
 });
 
 afterEach(() => {
@@ -333,6 +341,89 @@ test("bitbucketCreds: a stored github.com entry is not leaked to a bitbucket hos
 test("bitbucketCreds: null when nothing is stored and no env is set", async () => {
   expect(await bitbucketCreds("bitbucket-work.org")).toBeNull();
   expect(await bitbucketCreds(null)).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// apiHostForRemote — ssh-config-aware hostname resolution
+// (docs/plans/per-host-git-api-bases.md). Every test below points
+// AGETOR_SSH_BIN at a throwaway stub script instead of touching the real
+// `ssh` or any real ~/.ssh/config, so these are deterministic regardless of
+// the machine running them.
+// ---------------------------------------------------------------------------
+
+/** Writes an executable stub standing in for `ssh` and returns its path.
+ *  `apiHostForRemote` invokes it as `<stub> -G -- <host>`, so `$3` is the
+ *  (lowercase-trimmed) host argument when a stub cares to inspect it. */
+function writeSshStub(script: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-git-provider-ssh-stub-"));
+  createdDirs.push(dir);
+  const binPath = path.join(dir, "ssh");
+  writeFileSync(binPath, script, { mode: 0o755 });
+  return binPath;
+}
+
+test("apiHostForRemote: a host with no ssh-config alias echoes the input (identity)", () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub('#!/bin/sh\necho "hostname $3"\n');
+  expect(apiHostForRemote("gitlab.mycompany.com")).toBe("gitlab.mycompany.com");
+});
+
+test("apiHostForRemote: an ssh-config alias resolves to the aliased HostName, regardless of the raw input", () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname gitlab.com'\n");
+  expect(apiHostForRemote("gitlab-work")).toBe("gitlab.com");
+  expect(apiHostForRemote("some-other-alias.example")).toBe("gitlab.com");
+});
+
+test("apiHostForRemote: falls back to the input on ssh failure (non-zero exit)", () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\nexit 1\n");
+  expect(apiHostForRemote("gitlab-work.io")).toBe("gitlab-work.io");
+});
+
+test("apiHostForRemote: falls back to the input when the ssh binary itself can't be spawned", () => {
+  process.env.AGETOR_SSH_BIN = path.join(tmpdir(), "agetor-does-not-exist-ssh-binary-xyz");
+  expect(apiHostForRemote("gitlab-work.io")).toBe("gitlab-work.io");
+});
+
+test("apiHostForRemote: falls back to the input when ssh's output has no parseable hostname line", () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'user someone'\n");
+  expect(apiHostForRemote("gitlab-work.io")).toBe("gitlab-work.io");
+});
+
+test("apiHostForRemote caches by raw input: a second call for the same host reuses the first resolution even after the stub changes, and __clearApiHostCacheForTest() bypasses it", () => {
+  const stub = writeSshStub("#!/bin/sh\necho 'hostname first-resolved.example'\n");
+  process.env.AGETOR_SSH_BIN = stub;
+
+  const first = apiHostForRemote("gitlab-cache-test.example");
+  expect(first).toBe("first-resolved.example");
+
+  // Flip the stub's resolution after the first call. Within the cache, a
+  // second call for the exact same raw host must reuse the first result
+  // rather than re-spawning ssh.
+  writeFileSync(stub, "#!/bin/sh\necho 'hostname second-resolved.example'\n", { mode: 0o755 });
+  const second = apiHostForRemote("gitlab-cache-test.example");
+  expect(second).toBe("first-resolved.example");
+
+  // Bypassing the cache observes the stub's new resolution immediately.
+  __clearApiHostCacheForTest();
+  const third = apiHostForRemote("gitlab-cache-test.example");
+  expect(third).toBe("second-resolved.example");
+});
+
+test("apiHostForRemote: empty or option-injecting (leading '-') input is returned as-is without ever spawning ssh", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-git-provider-ssh-stub-"));
+  createdDirs.push(dir);
+  const marker = path.join(dir, "invoked");
+  const stub = path.join(dir, "ssh");
+  writeFileSync(
+    stub,
+    `#!/bin/sh\ntouch "${marker}"\necho 'hostname should-not-be-used.example'\n`,
+    { mode: 0o755 },
+  );
+  process.env.AGETOR_SSH_BIN = stub;
+
+  expect(apiHostForRemote("")).toBe("");
+  expect(apiHostForRemote("   ")).toBe("   ");
+  expect(apiHostForRemote("-oProxyCommand=touch /tmp/pwned")).toBe("-oProxyCommand=touch /tmp/pwned");
+  expect(existsSync(marker)).toBe(false);
 });
 
 // ---------------------------------------------------------------------------

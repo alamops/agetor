@@ -25,7 +25,7 @@ import type {
 import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
 import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
-import { gitlabToken } from "./git-provider.ts";
+import { apiHostForRemote, gitlabToken } from "./git-provider.ts";
 
 /**
  * GitLab Cloud (gitlab.com, REST API v4) adapter (T2,
@@ -49,9 +49,38 @@ import { gitlabToken } from "./git-provider.ts";
  * a working directory (see its doc comment).
  */
 
-const GITLAB_API_BASE = "https://gitlab.com/api/v4";
+/** GitLab's cloud hostname — kept as a named constant for the handful of
+ *  display-only fallbacks (e.g. `authHint`'s `repo.remoteHost || GITLAB_CLOUD_HOST`)
+ *  that aren't API-base URLs. Every actual request/URL site derives its host
+ *  via `gitlabHost`/`gitlabApiBase` below, not this constant directly. */
+const GITLAB_CLOUD_HOST = "gitlab.com";
 const GITLAB_FETCH_TIMEOUT_MS = 30_000;
 const GITLAB_DIFF_BODY_CAP_BYTES = 8_000_000;
+
+/** Resolves the real host to address for `repo`'s GitLab API/web requests.
+ *  `repo.remoteHost` is the raw host from the git remote — often an
+ *  `~/.ssh/config` alias used to pin a per-identity SSH key (see
+ *  git-provider.ts's module doc comment), not necessarily the provider's
+ *  actual hostname. `apiHostForRemote` (git-provider.ts) resolves that alias
+ *  to its configured `HostName` via `ssh -G` (falling back to the input
+ *  verbatim on any failure), so a multi-identity alias whose HostName is
+ *  gitlab.com round-trips to gitlab.com, while a genuine self-hosted domain
+ *  (`gitlab.mycompany.com`, no matching alias) round-trips to itself. */
+function gitlabHost(repo: ProviderRepoInfo): string {
+  return apiHostForRemote(repo.remoteHost);
+}
+
+/** `https://<host>/api/v4` for `repo`'s real GitLab host (see `gitlabHost`).
+ *  For gitlab.com and any ssh alias whose HostName points at gitlab.com, this
+ *  reproduces the old hard-coded `https://gitlab.com/api/v4` constant
+ *  exactly — byte-identical behavior, zero regression. For a genuine
+ *  self-hosted domain, it targets that instance's own `/api/v4`, which is
+ *  what makes self-hosted GitLab work at all. Called once per exported
+ *  function (every call site has `repo` in scope) rather than memoized here —
+ *  `apiHostForRemote` already caches the ssh resolution itself. */
+function gitlabApiBase(repo: ProviderRepoInfo): string {
+  return `https://${gitlabHost(repo)}/api/v4`;
+}
 
 export interface GitLabError {
   ok: false;
@@ -80,8 +109,10 @@ function fetchErrorMessage(e: unknown): string {
 
 /** `PRIVATE-TOKEN` (GitLab's own auth header, not `Authorization: Bearer`) when
  *  a token is present; 30s abort; `user-agent: agetor` — same shape as
- *  `fetchGitHub` in github.ts. `url` must be an absolute `https://gitlab.com/api/v4/...`
- *  URL (every call site below builds one) so pagination helpers can re-derive
+ *  `fetchGitHub` in github.ts. `url` must be an absolute `https://<host>/api/v4/...`
+ *  URL (every call site below builds one via `gitlabApiBase(repo)`, so `<host>`
+ *  is gitlab.com for cloud/alias repos and the real domain for self-hosted
+ *  ones — see `gitlabHost`'s doc comment) so pagination helpers can re-derive
  *  a next-page URL without having to know a base path convention. */
 async function fetchGitLab(
   url: string,
@@ -134,7 +165,7 @@ function apiError(body: unknown, status: number, statusText: string): string {
  *  unit-tested via `__gitlabInternals`. */
 function authHint(status: number, message: string, repo: ProviderRepoInfo, hadToken: boolean): string {
   if (status !== 401 && status !== 404) return message;
-  const host = repo.remoteHost || "gitlab.com";
+  const host = repo.remoteHost || GITLAB_CLOUD_HOST;
   const base = `${repo.owner}/${repo.name} was not found on GitLab — if the project is private, add a token for ${host} in Settings → ${GIT_HOST_TOKENS_SECTION}`;
   return hadToken
     ? `${base} (the configured token cannot access it — check it belongs to the right account)`
@@ -261,7 +292,7 @@ function normalizeItem(kind: GitHubItemKind, raw: unknown, sourcePath: string | 
  *  doesn't carry its parent MR/issue iid. */
 function noteHtmlUrl(repo: ProviderRepoInfo, kind: GitHubItemKind, number: number, noteId: number): string {
   const seg = kind === "pulls" ? "merge_requests" : "issues";
-  return `https://gitlab.com/${repo.owner}/${repo.name}/-/${seg}/${number}#note_${noteId}`;
+  return `https://${gitlabHost(repo)}/${repo.owner}/${repo.name}/-/${seg}/${number}#note_${noteId}`;
 }
 
 function normalizeComment(raw: unknown, repo: ProviderRepoInfo, kind: GitHubItemKind, number: number): GitHubComment | null {
@@ -448,6 +479,7 @@ const GITLAB_PER_PAGE = 30;
  *  `closed` for issues) is a single direct request with normal pagination. */
 export async function listGitLabItems(repo: ProviderRepoInfo, opts: ListGitLabItemsOptions): Promise<GitLabListResponse> {
   const token = await gitlabToken(repo.remoteHost);
+  const apiBase = gitlabApiBase(repo);
   const projectId = encodeProjectId(repo.owner, repo.name);
   const endpoint = opts.kind === "pulls" ? "merge_requests" : "issues";
   const page = Number.isInteger(opts.page) && (opts.page as number) > 0 ? (opts.page as number) : 1;
@@ -457,7 +489,7 @@ export async function listGitLabItems(repo: ProviderRepoInfo, opts: ListGitLabIt
   const combinedClosed = states.length > 1;
 
   const buildUrl = (stateParam: string, sourcePage: number): string => {
-    const url = new URL(`${GITLAB_API_BASE}/projects/${projectId}/${endpoint}`);
+    const url = new URL(`${apiBase}/projects/${projectId}/${endpoint}`);
     // "all" is expressed by omitting `state` — the MR list documents
     // `state=all` but the issues list doesn't, and omission means "all"
     // uniformly on both endpoints.
@@ -500,7 +532,7 @@ export async function listGitLabItems(repo: ProviderRepoInfo, opts: ListGitLabIt
   return {
     ok: true,
     repo: `${repo.owner}/${repo.name}`,
-    webUrl: `https://gitlab.com/${repo.owner}/${repo.name}`,
+    webUrl: `https://${gitlabHost(repo)}/${repo.owner}/${repo.name}`,
     auth: token ? "token" : "none",
     items: sliced,
     page,
@@ -525,7 +557,7 @@ export async function listGitLabItems(repo: ProviderRepoInfo, opts: ListGitLabIt
 export async function getGitLabPullDefaults(repo: ProviderRepoInfo): Promise<GitLabPullDefaultsResponse> {
   const token = await gitlabToken(repo.remoteHost);
   const projectId = encodeProjectId(repo.owner, repo.name);
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}`, token);
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}`, token);
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
@@ -561,7 +593,7 @@ export async function createGitLabPull(repo: ProviderRepoInfo, input: CreateGitL
   if (!token) return { ok: false, error: "GitLab authentication required to create a merge request" };
   const projectId = encodeProjectId(repo.owner, repo.name);
   const finalTitle = input.draft ? `Draft: ${title}` : title;
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests`, token, {
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}/merge_requests`, token, {
     method: "POST",
     body: JSON.stringify({
       title: finalTitle,
@@ -590,7 +622,7 @@ export async function getGitLabPullDiff(repo: ProviderRepoInfo, number: number):
   const token = await gitlabToken(repo.remoteHost);
   const projectId = encodeProjectId(repo.owner, repo.name);
   const res = await fetchGitLab(
-    `${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}/raw_diffs`,
+    `${gitlabApiBase(repo)}/projects/${projectId}/merge_requests/${number}/raw_diffs`,
     token,
     { accept: "text/plain" },
   );
@@ -723,6 +755,7 @@ export async function getGitLabPullBlob(
   if (!path) return { ok: false, error: "file path is required", status: 400 };
 
   const token = await gitlabToken(repo.remoteHost);
+  const apiBase = gitlabApiBase(repo);
   const projectId = encodeProjectId(repo.owner, repo.name);
   const detailKey = `${repo.remoteHost}/${repo.owner}/${repo.name}#${number}`;
 
@@ -735,7 +768,7 @@ export async function getGitLabPullBlob(
   if (cached && Date.now() - cached.fetchedAt < PULL_BLOB_DETAIL_CACHE_TTL_MS) {
     ({ baseSha, headSha, sourceProjectId, targetProjectId } = cached);
   } else {
-    const mrRes = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}`, token);
+    const mrRes = await fetchGitLab(`${apiBase}/projects/${projectId}/merge_requests/${number}`, token);
     if (!("status" in mrRes)) return { ok: false, error: mrRes.error, status: 502 };
     const mrJson = await mrRes.json().catch(() => null);
     if (!mrRes.ok) {
@@ -753,7 +786,7 @@ export async function getGitLabPullBlob(
     if (!resolvedBaseSha || !resolvedHeadSha) {
       // diff_refs populates async after the MR is created/pushed to — fall
       // back to the latest diff version, same as createGitLabPullLineComment.
-      const versionsRes = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}/versions`, token);
+      const versionsRes = await fetchGitLab(`${apiBase}/projects/${projectId}/merge_requests/${number}/versions`, token);
       if (!("status" in versionsRes)) return { ok: false, error: versionsRes.error, status: 502 };
       const versions = await versionsRes.json().catch(() => null);
       if (!versionsRes.ok) {
@@ -790,7 +823,7 @@ export async function getGitLabPullBlob(
   }
 
   const buildFileUrl = (pid: string): string =>
-    `${GITLAB_API_BASE}/projects/${pid}/repository/files/${encodeURIComponent(path)}/raw?ref=${encodeURIComponent(ref)}`;
+    `${apiBase}/projects/${pid}/repository/files/${encodeURIComponent(path)}/raw?ref=${encodeURIComponent(ref)}`;
 
   let fileRes = await fetchGitLab(buildFileUrl(blobProjectId), token, { accept: "*/*" });
   if (!("status" in fileRes)) return { ok: false, error: fileRes.error, status: 502 };
@@ -846,7 +879,7 @@ export async function listGitLabComments(repo: ProviderRepoInfo, number: number,
   const projectId = encodeProjectId(repo.owner, repo.name);
   const endpoint = kind === "pulls" ? "merge_requests" : "issues";
   const comments: GitHubComment[] = [];
-  let url: string | null = `${GITLAB_API_BASE}/projects/${projectId}/${endpoint}/${number}/notes?sort=asc&order_by=created_at&per_page=100`;
+  let url: string | null = `${gitlabApiBase(repo)}/projects/${projectId}/${endpoint}/${number}/notes?sort=asc&order_by=created_at&per_page=100`;
   for (let page = 0; url && page < 5; page++) {
     const res = await fetchGitLab(url, token);
     if (!("status" in res)) return res;
@@ -871,7 +904,7 @@ export async function createGitLabComment(repo: ProviderRepoInfo, number: number
   if (!token) return { ok: false, error: "GitLab authentication required to comment" };
   const projectId = encodeProjectId(repo.owner, repo.name);
   const endpoint = kind === "pulls" ? "merge_requests" : "issues";
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/${endpoint}/${number}/notes`, token, {
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}/${endpoint}/${number}/notes`, token, {
     method: "POST",
     body: JSON.stringify({ body: text }),
   });
@@ -896,7 +929,7 @@ export async function listGitLabPullReviewComments(repo: ProviderRepoInfo, numbe
   const token = await gitlabToken(repo.remoteHost);
   const projectId = encodeProjectId(repo.owner, repo.name);
   const comments: GitHubPullLineComment[] = [];
-  let url: string | null = `${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}/discussions?per_page=100`;
+  let url: string | null = `${gitlabApiBase(repo)}/projects/${projectId}/merge_requests/${number}/discussions?per_page=100`;
   for (let page = 0; url && page < 5; page++) {
     const res = await fetchGitLab(url, token);
     if (!("status" in res)) return res;
@@ -944,9 +977,10 @@ export async function createGitLabPullLineComment(
 
   const token = await gitlabToken(repo.remoteHost);
   if (!token) return { ok: false, error: "GitLab authentication required to comment on a line" };
+  const apiBase = gitlabApiBase(repo);
   const projectId = encodeProjectId(repo.owner, repo.name);
 
-  const versionsRes = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}/versions`, token);
+  const versionsRes = await fetchGitLab(`${apiBase}/projects/${projectId}/merge_requests/${number}/versions`, token);
   if (!("status" in versionsRes)) return versionsRes;
   const versions = await versionsRes.json().catch(() => null);
   if (!versionsRes.ok) return { ok: false, error: errorFrom(versionsRes, versions, repo, !!token) };
@@ -971,7 +1005,7 @@ export async function createGitLabPullLineComment(
   if (input.side === "RIGHT") position.new_line = input.line;
   else position.old_line = input.line;
 
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}/discussions`, token, {
+  const res = await fetchGitLab(`${apiBase}/projects/${projectId}/merge_requests/${number}/discussions`, token, {
     method: "POST",
     body: JSON.stringify({ body, position }),
   });
@@ -998,7 +1032,7 @@ async function findDiscussionIdForNote(
   token: string | null,
 ): Promise<{ ok: true; id: string | null } | GitLabError> {
   const projectId = encodeProjectId(repo.owner, repo.name);
-  let url: string | null = `${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}/discussions?per_page=100`;
+  let url: string | null = `${gitlabApiBase(repo)}/projects/${projectId}/merge_requests/${number}/discussions?per_page=100`;
   for (let page = 0; url && page < 5; page++) {
     const res = await fetchGitLab(url, token);
     if (!("status" in res)) return res;
@@ -1031,7 +1065,7 @@ export async function replyGitLabLineComment(repo: ProviderRepoInfo, number: num
   if (!discussion.id) return { ok: false, error: "Could not find the discussion for that comment." };
 
   const res = await fetchGitLab(
-    `${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}/discussions/${discussion.id}/notes`,
+    `${gitlabApiBase(repo)}/projects/${projectId}/merge_requests/${number}/discussions/${discussion.id}/notes`,
     token,
     { method: "POST", body: JSON.stringify({ body: text }) },
   );
@@ -1156,7 +1190,7 @@ export async function getGitLabPullMergeability(repo: ProviderRepoInfo, number: 
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "merge request number must be positive" };
   const token = await gitlabToken(repo.remoteHost);
   const projectId = encodeProjectId(repo.owner, repo.name);
-  const url = `${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}`;
+  const url = `${gitlabApiBase(repo)}/projects/${projectId}/merge_requests/${number}`;
 
   let last: GitHubPullMergeability | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -1184,9 +1218,10 @@ export async function getGitLabPullMergeability(repo: ProviderRepoInfo, number: 
 export async function getGitLabPullChecks(repo: ProviderRepoInfo, number: number): Promise<GitLabChecksResponse> {
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "merge request number must be positive" };
   const token = await gitlabToken(repo.remoteHost);
+  const apiBase = gitlabApiBase(repo);
   const projectId = encodeProjectId(repo.owner, repo.name);
 
-  const mrRes = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}`, token);
+  const mrRes = await fetchGitLab(`${apiBase}/projects/${projectId}/merge_requests/${number}`, token);
   if (!("status" in mrRes)) return mrRes;
   const mr = await mrRes.json().catch(() => null);
   if (!mrRes.ok) return { ok: false, error: errorFrom(mrRes, mr, repo, !!token) };
@@ -1195,7 +1230,7 @@ export async function getGitLabPullChecks(repo: ProviderRepoInfo, number: number
   if (!sha) return { ok: false, error: "GitLab returned a merge request without a head sha" };
   const pipeline = obj.head_pipeline && typeof obj.head_pipeline === "object" ? obj.head_pipeline as Record<string, unknown> : null;
 
-  const statusesRes = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/repository/commits/${sha}/statuses?per_page=100`, token);
+  const statusesRes = await fetchGitLab(`${apiBase}/projects/${projectId}/repository/commits/${sha}/statuses?per_page=100`, token);
   if (!("status" in statusesRes)) return statusesRes;
   const statuses = await statusesRes.json().catch(() => null);
   if (!statusesRes.ok) return { ok: false, error: errorFrom(statusesRes, statuses, repo, !!token) };
@@ -1217,7 +1252,7 @@ export async function getGitLabPullDetail(repo: ProviderRepoInfo, number: number
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "merge request number must be positive" };
   const token = await gitlabToken(repo.remoteHost);
   const projectId = encodeProjectId(repo.owner, repo.name);
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}`, token);
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}/merge_requests/${number}`, token);
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
@@ -1239,7 +1274,7 @@ export async function mergeGitLabPull(repo: ProviderRepoInfo, number: number, me
   const token = await gitlabToken(repo.remoteHost);
   if (!token) return { ok: false, error: "GitLab authentication required to merge" };
   const projectId = encodeProjectId(repo.owner, repo.name);
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}/merge`, token, {
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}/merge_requests/${number}/merge`, token, {
     method: "PUT",
     body: JSON.stringify({ squash: method === "squash" }),
   });
@@ -1275,7 +1310,7 @@ export async function closeGitLabPull(repo: ProviderRepoInfo, number: number): P
   const token = await gitlabToken(repo.remoteHost);
   if (!token) return { ok: false, error: "GitLab authentication required to close a merge request" };
   const projectId = encodeProjectId(repo.owner, repo.name);
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}`, token, {
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}/merge_requests/${number}`, token, {
     method: "PUT",
     body: JSON.stringify({ state_event: "close" }),
   });
@@ -1292,7 +1327,7 @@ export async function reopenGitLabPull(repo: ProviderRepoInfo, number: number): 
   const token = await gitlabToken(repo.remoteHost);
   if (!token) return { ok: false, error: "GitLab authentication required to reopen a merge request" };
   const projectId = encodeProjectId(repo.owner, repo.name);
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}`, token, {
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}/merge_requests/${number}`, token, {
     method: "PUT",
     body: JSON.stringify({ state_event: "reopen" }),
   });
@@ -1322,7 +1357,7 @@ export async function reviewGitLabPull(repo: ProviderRepoInfo, number: number, v
   const text = body?.trim() ?? "";
 
   if (verdict === "APPROVE") {
-    const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}/approve`, token, {
+    const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}/merge_requests/${number}/approve`, token, {
       method: "POST",
       body: "{}",
     });
@@ -1351,12 +1386,12 @@ export async function reviewGitLabPull(repo: ProviderRepoInfo, number: number, v
  *  per the plan's decision — the alternative (rejecting the entire
  *  create/update over one bad assignee) is worse UX for a field the user
  *  likely won't double-check immediately. */
-async function resolveAssigneeIds(projectId: string, usernames: string[], token: string | null): Promise<number[]> {
+async function resolveAssigneeIds(apiBase: string, projectId: string, usernames: string[], token: string | null): Promise<number[]> {
   const trimmed = usernames.map((s) => s.trim()).filter(Boolean);
   if (trimmed.length === 0) return [];
   const ids: number[] = [];
   for (const username of trimmed) {
-    const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/users?search=${encodeURIComponent(username)}`, token);
+    const res = await fetchGitLab(`${apiBase}/projects/${projectId}/users?search=${encodeURIComponent(username)}`, token);
     if (!("status" in res) || !res.ok) continue;
     const body = await res.json().catch(() => null);
     if (!Array.isArray(body)) continue;
@@ -1378,11 +1413,12 @@ export async function createGitLabIssue(repo: ProviderRepoInfo, input: CreateGit
   if (!title) return { ok: false, error: "issue title required" };
   const token = await gitlabToken(repo.remoteHost);
   if (!token) return { ok: false, error: "GitLab authentication required to create an issue" };
+  const apiBase = gitlabApiBase(repo);
   const projectId = encodeProjectId(repo.owner, repo.name);
   const labels = input.labels?.map((s) => s.trim()).filter(Boolean) ?? [];
-  const assigneeIds = await resolveAssigneeIds(projectId, input.assignees ?? [], token);
+  const assigneeIds = await resolveAssigneeIds(apiBase, projectId, input.assignees ?? [], token);
 
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/issues`, token, {
+  const res = await fetchGitLab(`${apiBase}/projects/${projectId}/issues`, token, {
     method: "POST",
     body: JSON.stringify({
       title,
@@ -1418,6 +1454,7 @@ export async function updateGitLabIssue(repo: ProviderRepoInfo, number: number, 
   const kind: GitHubItemKind = input.kind === "pulls" ? "pulls" : "issues";
   const endpoint = kind === "pulls" ? "merge_requests" : "issues";
   const noun = kind === "pulls" ? "merge request" : "issue";
+  const apiBase = gitlabApiBase(repo);
   const projectId = encodeProjectId(repo.owner, repo.name);
 
   const patch: Record<string, unknown> = {};
@@ -1426,9 +1463,9 @@ export async function updateGitLabIssue(repo: ProviderRepoInfo, number: number, 
   if (input.state === "closed") patch.state_event = "close";
   else if (input.state === "open") patch.state_event = "reopen";
   if (input.labels) patch.labels = input.labels.map((s) => s.trim()).filter(Boolean).join(",");
-  if (input.assignees) patch.assignee_ids = await resolveAssigneeIds(projectId, input.assignees, token);
+  if (input.assignees) patch.assignee_ids = await resolveAssigneeIds(apiBase, projectId, input.assignees, token);
 
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/${endpoint}/${number}`, token, {
+  const res = await fetchGitLab(`${apiBase}/projects/${projectId}/${endpoint}/${number}`, token, {
     method: "PUT",
     body: JSON.stringify(patch),
   });
@@ -1445,7 +1482,7 @@ export async function updateGitLabIssue(repo: ProviderRepoInfo, number: number, 
 export async function getGitLabViewer(repo: ProviderRepoInfo): Promise<GitLabViewerResponse> {
   const token = await gitlabToken(repo.remoteHost);
   if (!token) return { ok: true, login: "" };
-  const res = await fetchGitLab(`${GITLAB_API_BASE}/user`, token);
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/user`, token);
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
@@ -1461,7 +1498,7 @@ export async function listGitLabLabels(repo: ProviderRepoInfo): Promise<GitLabLa
   const token = await gitlabToken(repo.remoteHost);
   const projectId = encodeProjectId(repo.owner, repo.name);
   const labels: GitHubRepoLabel[] = [];
-  let url: string | null = `${GITLAB_API_BASE}/projects/${projectId}/labels?per_page=100`;
+  let url: string | null = `${gitlabApiBase(repo)}/projects/${projectId}/labels?per_page=100`;
   for (let page = 0; url && page < 3; page++) {
     const res = await fetchGitLab(url, token);
     if (!("status" in res)) return res;
@@ -1482,6 +1519,8 @@ export async function listGitLabLabels(repo: ProviderRepoInfo): Promise<GitLabLa
  *  `gitlab.test.ts`) — mirrors github.ts's `__githubInternals`. */
 export const __gitlabInternals = {
   encodeProjectId,
+  gitlabHost,
+  gitlabApiBase,
   apiError,
   authHint,
   pageLinks,

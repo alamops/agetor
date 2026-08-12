@@ -10,6 +10,9 @@
 // `mockGitHubFetch` (github-test-util.ts) is host-agnostic — it just matches
 // on the request URL/method against a route table over `globalThis.fetch` —
 // so it is reused directly here rather than re-implemented.
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { ProviderRepoInfo } from "../shared/types.ts";
 
 export { mockGitHubFetch as mockGitLabFetch } from "./github-test-util.ts";
@@ -34,6 +37,29 @@ export function sampleRepo(overrides: Partial<ProviderRepoInfo> = {}): ProviderR
  *  token-routing path the same way `makeAliasGitHubRepo` does for GitHub. */
 export function sampleAliasRepo(aliasHost = "gitlab-work.io", overrides: Partial<ProviderRepoInfo> = {}): ProviderRepoInfo {
   return sampleRepo({ remoteHost: aliasHost, ...overrides });
+}
+
+/** Same as `sampleRepo`, but pointed at a genuine self-hosted GitLab domain
+ *  (docs/plans/per-host-git-api-bases.md) — both `host` and `remoteHost` are
+ *  the self-hosted domain itself (no ssh alias involved), exercising
+ *  `gitlabApiBase`'s per-host routing in gitlab-network.test.ts. */
+export function sampleSelfHostedRepo(selfHostedHost = "gitlab.mycompany.com", overrides: Partial<ProviderRepoInfo> = {}): ProviderRepoInfo {
+  return sampleRepo({ host: selfHostedHost, remoteHost: selfHostedHost, ...overrides });
+}
+
+/** Writes an executable stub standing in for `ssh`, for pointing
+ *  `AGETOR_SSH_BIN` (git-provider.ts's `apiHostForRemote` override) at
+ *  deterministic, network-free hostname resolution — mirrors
+ *  git-provider.test.ts's own `writeSshStub`. `apiHostForRemote` invokes it
+ *  as `<stub> -G -- <host>`, so `$3` is the (lowercased, trimmed) host
+ *  argument when a stub cares to inspect it. Each call gets its own
+ *  throwaway mkdtemp dir under the OS tmp root, which the OS reclaims —
+ *  callers don't need to track it for cleanup. */
+export function writeSshStub(script: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-gitlab-ssh-stub-"));
+  const binPath = path.join(dir, "ssh");
+  writeFileSync(binPath, script, { mode: 0o755 });
+  return binPath;
 }
 
 /** A minimal-but-valid GitLab merge-request JSON object (REST v4 shape), as

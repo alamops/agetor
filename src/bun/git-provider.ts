@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import type { GitProvider, ProviderRepoInfo } from "../shared/types.ts";
 import { canonicalGitHost, parseGitRemote, run } from "./github.ts";
@@ -37,6 +38,97 @@ import { tokenForHost } from "./github-tokens.ts";
  */
 
 const GITLAB_FETCH_TIMEOUT_MS = 5_000;
+const SSH_RESOLVE_TIMEOUT_MS = 4_000;
+
+/** Module-level cache for `apiHostForRemote`, keyed by the raw (as-given)
+ *  `remoteHost` argument — no TTL, unlike `remoteHostsCache` above.
+ *  `remoteHostsCache` is TTL'd because its *source* (a project dir's git
+ *  remotes) can change mid-session; `~/.ssh/config` for a fixed host
+ *  effectively can't, so there's nothing to expire — a user hand-editing
+ *  their ssh config mid-session and expecting agetor to notice without a
+ *  restart isn't a supported flow. */
+const apiHostCache = new Map<string, string>();
+
+/** Test-only escape hatch: clears `apiHostForRemote`'s cache, mirroring
+ *  `__clearRemoteHostsCacheForTest` below for the same reason (deterministic,
+ *  order-independent tests). */
+export function __clearApiHostCacheForTest(): void {
+  apiHostCache.clear();
+}
+
+/**
+ * Resolve the hostname API calls to a git-forge remote should target, given
+ * that remote's RAW host (`ProviderRepoInfo.remoteHost` /
+ * `parseGitRemote(...).rawHost` — see the module doc comment above).
+ *
+ * WHY this exists: a raw remote host is ambiguous. It's either a genuine
+ * self-hosted domain (`gitlab.mycompany.com`, used verbatim as the API host)
+ * or an `~/.ssh/config` multi-identity alias
+ * (docs/plans/github-remote-host-aliases.md) whose `HostName` is the
+ * provider's real cloud domain — e.g. `Host gitlab-work` / `HostName
+ * gitlab.com`, so the remote URL says `gitlab-work` but the API lives at
+ * `gitlab.com/api/v4`, not the nonexistent `gitlab-work/api/v4`. Nothing in
+ * the remote URL itself distinguishes the two cases: `ssh -G <host>` is the
+ * only local authority that can, because it performs the exact same
+ * Include/Match/Host-pattern resolution a real `ssh` invocation for that
+ * remote would, without opening a network connection (`-G` just prints the
+ * fully-resolved client configuration and exits).
+ *
+ * Parses the `hostname <value>` line `ssh -G` always emits: for an alias
+ * this is the resolved `HostName` (e.g. `gitlab.com`); for a plain domain
+ * with no matching config entry, ssh's default behavior is to echo the
+ * input back (lowercased — ssh lowercases hostnames during config
+ * resolution, which is harmless here since DNS/HTTP hostnames are
+ * case-insensitive).
+ *
+ * Never throws and never blocks longer than `SSH_RESOLVE_TIMEOUT_MS`: any
+ * failure (missing `ssh` binary, non-zero exit, timeout, unparseable
+ * output, empty resolved hostname) falls back to returning `remoteHost`
+ * unchanged — today's behavior. Synchronous and cached (see `apiHostCache`
+ * above) because this feeds `gitlabApiBase` (H2, gitlab.ts), which is called
+ * inline from ~25 template-literal call sites that have no reason to become
+ * async just for this.
+ *
+ * Binary overridable via `AGETOR_SSH_BIN` (house pattern — `AGETOR_TMUX_BIN`
+ * in tmux-resolution.ts, `AGETOR_CLAUDE_BIN`/`AGETOR_CODEX_BIN`/… in
+ * agents.ts) so tests can point at a stub script instead of the real `ssh`.
+ */
+export function apiHostForRemote(remoteHost: string): string {
+  const cached = apiHostCache.get(remoteHost);
+  if (cached !== undefined) return cached;
+
+  const normalized = remoteHost.trim().toLowerCase();
+  // Guard rather than spawn: an empty host is nothing to resolve, and a
+  // leading "-" could otherwise be misread by ssh as an option. The `--`
+  // passed to ssh below is belt-and-suspenders for every other input; this
+  // guard is the cheap first line of defense that also sidesteps ever
+  // spawning a process for garbage input.
+  if (!normalized || normalized.startsWith("-")) {
+    apiHostCache.set(remoteHost, remoteHost);
+    return remoteHost;
+  }
+
+  const sshBin = process.env.AGETOR_SSH_BIN || "ssh";
+  let resolved = remoteHost;
+  try {
+    // No shell involved (argv array, not a command string) and `--` marks
+    // the end of options, so `normalized` can't be reinterpreted as an ssh
+    // flag even if the leading-dash guard above were somehow bypassed.
+    const res = spawnSync(sshBin, ["-G", "--", normalized], {
+      encoding: "utf8",
+      timeout: SSH_RESOLVE_TIMEOUT_MS,
+    });
+    if (res.status === 0 && typeof res.stdout === "string") {
+      const match = res.stdout.match(/^hostname\s+(\S+)\s*$/m);
+      if (match && match[1]) resolved = match[1];
+    }
+  } catch {
+    // Missing binary, spawn error, etc. — resolved stays remoteHost.
+  }
+
+  apiHostCache.set(remoteHost, resolved);
+  return resolved;
+}
 
 /** Map a canonical provider host (as produced by `canonicalGitHost`) to the
  *  `GitProvider` it identifies, or null when it's none of the three supported

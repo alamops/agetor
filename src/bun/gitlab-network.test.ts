@@ -5,8 +5,9 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
-import { gitlabMergeRequest, mockGitLabFetch, sampleRepo } from "./gitlab-test-util.ts";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
+import { __clearApiHostCacheForTest } from "./git-provider.ts";
+import { gitlabMergeRequest, mockGitLabFetch, sampleAliasRepo, sampleRepo, sampleSelfHostedRepo, writeSshStub } from "./gitlab-test-util.ts";
 import {
   __gitlabInternals,
   closeGitLabPull,
@@ -41,8 +42,37 @@ const REPO = sampleRepo();
 // section) so no test here can observe a stale entry left by another file,
 // regardless of run order. The tests below also use MR numbers (21-27+)
 // distinct from git-host.test.ts's #1 as defense in depth.
+//
+// gitlabApiBase (docs/plans/per-host-git-api-bases.md) resolves every call's
+// host via apiHostForRemote (git-provider.ts), which spawns `ssh -G` unless
+// AGETOR_SSH_BIN points elsewhere and caches by raw remoteHost — same
+// process-sharing hazard as pullBlobDetailCache, plus a second one: an
+// un-stubbed `ssh -G -- gitlab.com` would depend on whatever real
+// ~/.ssh/config the machine running the suite happens to have. An identity
+// stub (echoes its input back as `hostname <input>`) is installed as the
+// default AGETOR_SSH_BIN for every test in this file — it reproduces
+// production's plain-domain behavior (no matching alias → echo) for every
+// existing test's `sampleRepo()`/`sampleSelfHostedRepo()` fixtures without
+// depending on the real `ssh` binary or config, and is overridden locally by
+// the alias-to-cloud regression test below, which needs a stub that resolves
+// to gitlab.com regardless of input. `__clearApiHostCacheForTest` is called
+// both before (so a previous test's resolution can't leak in) and after (so
+// this file's own resolutions can't leak into a later file — git-host.test.ts
+// primes gitlab caches too) each test, mirroring the pullBlobDetailCache
+// hygiene above. AGETOR_SSH_BIN itself is saved/restored per test for the
+// same cross-file reason.
+const ORIGINAL_SSH_BIN = process.env.AGETOR_SSH_BIN;
+
 beforeEach(() => {
   __gitlabInternals.resetGitLabPullBlobCaches();
+  __clearApiHostCacheForTest();
+  process.env.AGETOR_SSH_BIN = writeSshStub('#!/bin/sh\necho "hostname $3"\n');
+});
+
+afterEach(() => {
+  __clearApiHostCacheForTest();
+  if (ORIGINAL_SSH_BIN === undefined) delete process.env.AGETOR_SSH_BIN;
+  else process.env.AGETOR_SSH_BIN = ORIGINAL_SSH_BIN;
 });
 
 // gitlab.ts resolves its token via github-tokens.ts's raw-host-keyed store
@@ -1110,6 +1140,88 @@ test("normalizeGitLabMergeability: headSha falls back to the top-level sha when 
 test("normalizeGitLabMergeability: autoMerge:true from merge_when_pipeline_succeeds", () => {
   const result = normalizeGitLabMergeability(REPO, 5, gitlabMergeRequest({ merge_when_pipeline_succeeds: true }));
   expect(result?.autoMerge).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// gitlabApiBase — per-host routing (docs/plans/per-host-git-api-bases.md)
+// ---------------------------------------------------------------------------
+
+test("self-hosted GitLab: getGitLabPullDiff, getGitLabPullBlob, and getGitLabPullDefaults all hit https://gitlab.mycompany.com/api/v4/...", async () => {
+  const repo = sampleSelfHostedRepo();
+  // The file-wide beforeEach installs an identity AGETOR_SSH_BIN stub (echoes
+  // its input), so this self-hosted domain — no ssh alias involved — resolves
+  // to itself, exactly like production's fallback for an unrecognized host.
+
+  const diffMock = mockGitLabFetch([{ match: "/merge_requests/90/raw_diffs", text: "" }]);
+  try {
+    const res = await getGitLabPullDiff(repo, 90);
+    expect(res.ok).toBe(true);
+    expect(diffMock.calls).toHaveLength(1);
+    expect(diffMock.calls[0]!.url.startsWith("https://gitlab.mycompany.com/api/v4/")).toBe(true);
+  } finally {
+    diffMock.restore();
+  }
+
+  const defaultsMock = mockGitLabFetch([{ match: "/api/v4/projects/acme%2Fapp", json: { default_branch: "main" } }]);
+  try {
+    const res = await getGitLabPullDefaults(repo);
+    expect(res).toEqual({ ok: true, repo: "acme/app", head: "", base: "main" });
+    expect(defaultsMock.calls[0]!.url.startsWith("https://gitlab.mycompany.com/api/v4/")).toBe(true);
+  } finally {
+    defaultsMock.restore();
+  }
+
+  const blobMock = mockGitLabFetch([
+    {
+      match: /\/merge_requests\/91$/,
+      json: { iid: 91, diff_refs: { base_sha: "base-91", head_sha: "head-91" }, source_project_id: 55, target_project_id: 55 },
+    },
+    {
+      match: /\/repository\/files\/img\.png\/raw\?ref=head-91$/,
+      text: "BYTES",
+      headers: { "content-type": "application/octet-stream" },
+    },
+  ]);
+  try {
+    const res = await getGitLabPullBlob(repo, 91, "img.png", "new");
+    expect(res.ok).toBe(true);
+    for (const call of blobMock.calls) {
+      expect(call.url.startsWith("https://gitlab.mycompany.com/api/v4/")).toBe(true);
+    }
+  } finally {
+    blobMock.restore();
+  }
+});
+
+test("alias-to-cloud regression guard: an ssh alias whose HostName resolves to gitlab.com keeps hitting https://gitlab.com/api/v4/... (byte-identical to today)", async () => {
+  // Overrides the file-wide identity stub with one that always resolves to
+  // gitlab.com, regardless of the input host — modeling a `~/.ssh/config`
+  // multi-identity alias (`Host gitlab-work.io` / `HostName gitlab.com`).
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname gitlab.com'\n");
+  __clearApiHostCacheForTest();
+  const repo = sampleAliasRepo("gitlab-work.io");
+
+  const mock = mockGitLabFetch([{ match: "/merge_requests/92/raw_diffs", text: "" }]);
+  try {
+    const res = await getGitLabPullDiff(repo, 92);
+    expect(res.ok).toBe(true);
+    expect(mock.calls[0]!.url.startsWith("https://gitlab.com/api/v4/")).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("self-hosted GitLab: listGitLabItems' synthesized webUrl uses the self-hosted host, not gitlab.com", async () => {
+  const repo = sampleSelfHostedRepo();
+  const mock = mockGitLabFetch([{ match: "merge_requests", json: [] }]);
+  try {
+    const res = await listGitLabItems(repo, { kind: "pulls", state: "open" });
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.webUrl).toBe("https://gitlab.mycompany.com/acme/app");
+  } finally {
+    mock.restore();
+  }
 });
 
 // ---------------------------------------------------------------------------
