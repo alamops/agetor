@@ -2848,3 +2848,40 @@ export const THEME_PREFERENCES: readonly { id: ThemePreference; label: string }[
   { id: "dark", label: "Dark" },
   { id: "light", label: "Light" },
 ];
+
+// ───────────────────────────────────────────────────────────────────────────
+// Font size (Cmd+= / Cmd+- global UI zoom)
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * The current root font size (16px) is both the DEFAULT and the MINIMUM —
+ * Cmd+- has nowhere to go below "what it looks like today". FONT_SIZE_MAX
+ * (170%) and FONT_SIZE_STEP (10%) are the generous-but-layout-safe bounds
+ * chosen in docs/plans/cmd-font-size-controller.md §8. Persisted as the
+ * `fontSize` key in the `preferences` table (see `src/bun/db.ts`) as a plain
+ * percent string ("100"–"170"), round-tripped through `GET/PUT /preferences`
+ * exactly like `theme`. Applied as
+ * `document.documentElement.style.fontSize = (16 * pct/100) + "px"`; at
+ * exactly FONT_SIZE_DEFAULT the inline style is omitted entirely so the
+ * default state stays pristine (and the boot no-flash channels can skip the
+ * write).
+ */
+export const FONT_SIZE_MIN = 100;
+export const FONT_SIZE_MAX = 170;
+export const FONT_SIZE_STEP = 10;
+export const FONT_SIZE_DEFAULT = 100;
+
+/**
+ * Parse anything (a persisted preference string, a hash-fragment param, a
+ * `window.__AGETOR` global, …) into a valid integer font-size percent,
+ * clamped to [FONT_SIZE_MIN, FONT_SIZE_MAX]. Accepts a string ("120",
+ * "120.5") or a number; floats are rounded to the nearest integer before
+ * clamping. Anything else — null/undefined, an empty/non-numeric string,
+ * NaN, ±Infinity — falls back to FONT_SIZE_DEFAULT. Never throws.
+ */
+export function clampFontSizePercent(raw: unknown): number {
+  const n = typeof raw === "number" ? raw : typeof raw === "string" ? parseFloat(raw) : NaN;
+  if (!Number.isFinite(n)) return FONT_SIZE_DEFAULT;
+  const rounded = Math.round(n);
+  return Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, rounded));
+}

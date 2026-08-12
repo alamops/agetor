@@ -229,7 +229,7 @@ test("resolveThemePreference falls back to 'auto' (instead of throwing) when the
 });
 
 test("buildWindowHash includes api, token, and theme as a hash fragment (not a query string)", () => {
-  const hash = buildWindowHash({ port: "4317", token: "sekrit-token", theme: "dark" });
+  const hash = buildWindowHash({ port: "4317", token: "sekrit-token", theme: "dark", fontSize: 100 });
   expect(hash).toBe("#api=4317&token=sekrit-token&theme=dark");
   expect(hash.startsWith("#")).toBe(true);
   expect(hash.includes("?")).toBe(false);
@@ -244,6 +244,15 @@ test("buildWindowHash passes an unknown/garbage theme value through verbatim (it
     port: "4317",
     token: "tok",
     theme: "not-a-real-theme" as unknown as "auto",
+    fontSize: 100,
   });
   expect(hash).toBe("#api=4317&token=tok&theme=not-a-real-theme");
+});
+
+test("buildWindowHash appends &fontSize=<n> only when fontSize is not the 100 default", () => {
+  const atDefault = buildWindowHash({ port: "4317", token: "tok", theme: "auto", fontSize: 100 });
+  expect(atDefault).toBe("#api=4317&token=tok&theme=auto");
+
+  const scaled = buildWindowHash({ port: "4317", token: "tok", theme: "auto", fontSize: 140 });
+  expect(scaled).toBe("#api=4317&token=tok&theme=auto&fontSize=140");
 });

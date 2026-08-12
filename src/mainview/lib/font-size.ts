@@ -1,0 +1,97 @@
+import { clampFontSizePercent, FONT_SIZE_DEFAULT, FONT_SIZE_STEP } from "../../shared/types.ts";
+
+/**
+ * Pure font-size logic — no DOM, no React. Mirrors `theme.ts`'s split:
+ * `font-size-provider.tsx` and the boot-time inline script in `index.html`
+ * (owned by the boot-channel side of this feature) are thin DOM-touching
+ * wrappers around these functions.
+ */
+
+export type FontSizeAction = "increase" | "decrease" | "reset";
+
+/** Step `pct` by one `FONT_SIZE_STEP` increment (or jump straight to
+ *  `FONT_SIZE_DEFAULT` on "reset"), clamped to [FONT_SIZE_MIN, FONT_SIZE_MAX].
+ *  `pct` is assumed already-valid (callers hold clamped state); the result is
+ *  re-clamped anyway so a caller passing a stray out-of-range value can't
+ *  escape the bounds. */
+export function stepFontSize(pct: number, action: FontSizeAction): number {
+  if (action === "reset") return FONT_SIZE_DEFAULT;
+  const delta = action === "increase" ? FONT_SIZE_STEP : -FONT_SIZE_STEP;
+  return clampFontSizePercent(pct + delta);
+}
+
+/** The `documentElement.style.fontSize` value for a given percent, or `null`
+ *  at exactly `FONT_SIZE_DEFAULT` — callers must *remove* the inline property
+ *  in that case (not set it to the computed 16px) so the default state stays
+ *  pristine, matching the boot-channel contract in `src/shared/types.ts`. */
+export function rootFontSizeStyle(pct: number): string | null {
+  if (pct === FONT_SIZE_DEFAULT) return null;
+  return `${(16 * pct) / 100}px`;
+}
+
+/** xterm's `fontSize` option scales off its own 12px baseline (unrelated to
+ *  the 16px root rem baseline — see `TerminalView.tsx`, which reads CSS
+ *  variables for everything else but sets this as an absolute pixel value). */
+export function terminalFontSize(pct: number): number {
+  return Math.round((12 * pct) / 100);
+}
+
+/**
+ * Read the boot-seeded font size: `window.__AGETOR.fontSize` first (the
+ * WKUserScript `preload` payload for the bundled `views://` path), the
+ * `fontSize` URL-hash param second (Vite dev path — see `buildWindowHash` in
+ * `src/bun/window-url.ts`), `FONT_SIZE_DEFAULT` when neither is present.
+ * `agetorGlobal` is passed in (rather than read from `window` directly) so
+ * this stays testable without a DOM.
+ */
+export function readFontSizeFromBoot(agetorGlobal: unknown, hash: string): number {
+  const injected = (agetorGlobal as { fontSize?: unknown } | null | undefined)?.fontSize;
+  if (injected !== undefined && injected !== null) return clampFontSizePercent(injected);
+
+  const stripped = hash.startsWith("#") ? hash.slice(1) : hash;
+  if (!stripped) return FONT_SIZE_DEFAULT;
+  try {
+    const params = new URLSearchParams(stripped);
+    const fromHash = params.get("fontSize");
+    return fromHash === null ? FONT_SIZE_DEFAULT : clampFontSizePercent(fromHash);
+  } catch {
+    return FONT_SIZE_DEFAULT;
+  }
+}
+
+/**
+ * Map a keydown to a font-size action, or `null` if the combo isn't one we
+ * handle. The primary modifier is `metaKey` on macOS, `ctrlKey` elsewhere
+ * (same `isMac` sniff convention as `RunPanel.tsx`'s `IS_MAC_PLATFORM`) —
+ * the *other* modifier being also held doesn't disqualify (mirrors how
+ * physical keyboards can report both during a fast chord), but `altKey` does,
+ * since Option/Alt-modified punctuation produces different glyphs on some
+ * layouts and isn't part of this shortcut's contract.
+ */
+export function fontSizeShortcutAction(
+  e: { key: string; metaKey: boolean; ctrlKey: boolean; altKey: boolean },
+  isMac: boolean,
+): FontSizeAction | null {
+  if (e.altKey) return null;
+  const primaryDown = isMac ? e.metaKey : e.ctrlKey;
+  if (!primaryDown) return null;
+  switch (e.key) {
+    case "=":
+    case "+":
+      return "increase";
+    case "-":
+    case "_":
+      return "decrease";
+    case "0":
+      return "reset";
+    default:
+      return null;
+  }
+}
+
+/** Same platform-sniff convention as `RunPanel.tsx`'s `IS_MAC_PLATFORM`,
+ *  duplicated here rather than imported — that constant isn't exported, and
+ *  this module intentionally stays DOM-adjacent-but-standalone like `theme.ts`. */
+export function isMacPlatform(): boolean {
+  return typeof navigator !== "undefined" && /mac/i.test(navigator.platform || navigator.userAgent || "");
+}

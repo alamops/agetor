@@ -6,7 +6,9 @@ import { Plus, X, TerminalSquare } from "lucide-react";
 import { toast } from "sonner";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { useFontSize } from "../font-size-provider.tsx";
 import { useTheme } from "../theme-provider.tsx";
+import { terminalFontSize } from "@/lib/font-size";
 import { macEditSequence } from "./terminal-keys.ts";
 import type { TerminalTab } from "../../../shared/types.ts";
 import type { ITheme } from "@xterm/xterm";
@@ -91,13 +93,24 @@ function TerminalPane({
   const hostRef = useRef<HTMLDivElement>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  // Mirrors the mount effect's local `ws` so the font-size reactivity effect
+  // below can send a resize frame after a live refit without needing its own
+  // WebSocket plumbing.
+  const wsRef = useRef<WebSocket | null>(null);
   const { resolved } = useTheme();
+  const { percent: fontSizePercent } = useFontSize();
   // Read via a ref inside the mount effect below so the effect's own
   // dependency array doesn't need `resolved` — recreating the terminal (and
   // its WebSocket) on every theme flip would drop the connection. The
   // separate effect further down re-applies the theme in place instead.
   const resolvedRef = useRef(resolved);
   resolvedRef.current = resolved;
+  // Same pattern for font size — the mount effect must not depend on
+  // `fontSizePercent`, or every Cmd+=/− would tear down and reconnect the
+  // WebSocket. The reactivity effect below re-applies it to the live
+  // instance instead.
+  const fontSizePercentRef = useRef(fontSizePercent);
+  fontSizePercentRef.current = fontSizePercent;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -105,7 +118,7 @@ function TerminalPane({
 
     const term = new Terminal({
       fontFamily: "var(--font-mono, ui-monospace, monospace)",
-      fontSize: 12,
+      fontSize: terminalFontSize(fontSizePercentRef.current),
       cursorBlink: true,
       theme: resolvedRef.current === "light" ? XTERM_THEME_LIGHT : XTERM_THEME_DARK,
       scrollback: 5000,
@@ -142,6 +155,7 @@ function TerminalPane({
       const sock = new WebSocket(api.terminalSocketUrl(terminalId));
       sock.binaryType = "arraybuffer";
       ws = sock;
+      wsRef.current = sock;
       sock.onopen = () => { attempts = 0; sendResize(); };
       sock.onmessage = (ev) => {
         if (typeof ev.data === "string") {
@@ -209,6 +223,7 @@ function TerminalPane({
         ws.onmessage = null;
         ws.close();
       }
+      wsRef.current = null;
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -224,6 +239,23 @@ function TerminalPane({
     if (!term) return;
     term.options.theme = resolved === "light" ? XTERM_THEME_LIGHT : XTERM_THEME_DARK;
   }, [resolved]);
+
+  // Re-apply the xterm font size in place when the whole-app font-size
+  // preference changes (Cmd+=/−/0 — see FontSizeProvider), so an already-open
+  // terminal rescales without remounting (which would drop its WebSocket).
+  // Changing glyph cell size changes cols/rows, so a refit + PTY resize
+  // notification must follow — same sequence the ResizeObserver callback in
+  // the mount effect above uses for a host-size change.
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.fontSize = terminalFontSize(fontSizePercent);
+    try { fitRef.current?.fit(); } catch { /* not visible yet */ }
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ t: "resize", cols: term.cols, rows: term.rows }));
+    }
+  }, [fontSizePercent]);
 
   // Refit + focus when this pane becomes the active one (its size is stable
   // because the host is absolutely positioned, but the fit on a freshly-shown
