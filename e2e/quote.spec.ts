@@ -32,11 +32,13 @@ import { gotoApp } from "./helpers";
  * pill's `data-quote-open` marker + accessible name, and the composer
  * textarea's value/caret.
  *
- * Serial within this file since both tests below would otherwise race the
- * one task/composer they share; `theme.spec.ts` runs as a separate file (its
- * own worker, browser context, and — since e2e/fixtures.ts — its own
- * headless backend) and never starts a run, so the two specs don't observe
- * each other's state.
+ * `test.describe.configure({ mode: "serial" })` below is future-proofing:
+ * this file currently has one test, but a second test added later would
+ * share the same worker's backend/DB (per e2e/fixtures.ts) and could race
+ * this one's task/composer state without serial mode. `theme.spec.ts` runs
+ * as a separate file (its own worker, browser context, and its own headless
+ * backend) and never starts a run, so the two specs don't observe each
+ * other's state regardless.
  */
 
 test.describe.configure({ mode: "serial" });
@@ -134,9 +136,10 @@ test.describe("quote-on-select", () => {
     const prompt = `quote-e2e ${randomUUID()}`;
     await createAndStartFakeClaudeTask(request, backend, prompt);
     // The fake driver's canned reply — see the fake-response comment atop
-    // this file. Unique per test run via the prompt's uuid, so the
-    // tree-walking text search below can never match stale content from a
-    // prior run sharing the disposable e2e data dir.
+    // this file. Unique per test via the prompt's uuid — this worker's
+    // backend/DB is shared across every test in the file for the whole run
+    // (per e2e/fixtures.ts), so if this file gains more tests the uuid keeps
+    // the tree-walking text search below from matching another test's task.
     const responseMarker = `fake response to: ${prompt}`;
 
     await gotoApp(page, backend.bootBase);
