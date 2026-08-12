@@ -10,7 +10,7 @@
 // `mockGitHubFetch` (github-test-util.ts) is host-agnostic — it just matches
 // on the request URL/method against a route table over `globalThis.fetch` —
 // so it is reused directly here rather than re-implemented.
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ProviderRepoInfo } from "../shared/types.ts";
@@ -47,19 +47,36 @@ export function sampleSelfHostedRepo(selfHostedHost = "gitlab.mycompany.com", ov
   return sampleRepo({ host: selfHostedHost, remoteHost: selfHostedHost, ...overrides });
 }
 
+/** Every mkdtemp dir `writeSshStub` has created, in creation order — drained
+ *  by `cleanupSshStubs()`. Module-level (not per-call cleanup) because the
+ *  stub's path is handed to callers via `AGETOR_SSH_BIN` and may outlive the
+ *  call that created it for the rest of a test. */
+const createdSshStubDirs: string[] = [];
+
 /** Writes an executable stub standing in for `ssh`, for pointing
  *  `AGETOR_SSH_BIN` (git-provider.ts's `apiHostForRemote` override) at
  *  deterministic, network-free hostname resolution — mirrors
  *  git-provider.test.ts's own `writeSshStub`. `apiHostForRemote` invokes it
  *  as `<stub> -G -- <host>`, so `$3` is the (lowercased, trimmed) host
  *  argument when a stub cares to inspect it. Each call gets its own
- *  throwaway mkdtemp dir under the OS tmp root, which the OS reclaims —
- *  callers don't need to track it for cleanup. */
+ *  throwaway mkdtemp dir under the OS tmp root; the dir is tracked
+ *  module-internally and only removed when the caller invokes
+ *  `cleanupSshStubs()` (e.g. from an `afterEach`/`afterAll`) — mirroring
+ *  git-provider.test.ts's own `createdDirs` pattern. */
 export function writeSshStub(script: string): string {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-gitlab-ssh-stub-"));
+  createdSshStubDirs.push(dir);
   const binPath = path.join(dir, "ssh");
   writeFileSync(binPath, script, { mode: 0o755 });
   return binPath;
+}
+
+/** Removes every mkdtemp dir created by `writeSshStub` so far and clears the
+ *  tracking list. Consumers should call this from an `afterEach`/`afterAll`
+ *  to avoid leaking one throwaway dir per `writeSshStub` call. */
+export function cleanupSshStubs(): void {
+  for (const dir of createdSshStubDirs) rmSync(dir, { recursive: true, force: true });
+  createdSshStubDirs.length = 0;
 }
 
 /** A minimal-but-valid GitLab merge-request JSON object (REST v4 shape), as

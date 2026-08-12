@@ -38,15 +38,51 @@ import { tokenForHost } from "./github-tokens.ts";
  */
 
 const GITLAB_FETCH_TIMEOUT_MS = 5_000;
-const SSH_RESOLVE_TIMEOUT_MS = 4_000;
+// The ssh -G fallback is correct-by-default (worst case: today's raw-host
+// behavior). An ssh config that takes longer than this to resolve isn't
+// worth blocking on — spawnSync is synchronous and blocks Bun's single event
+// loop for its entire duration, so this budget is deliberately tight rather
+// than generous.
+const SSH_RESOLVE_TIMEOUT_MS = 750;
 
-/** Module-level cache for `apiHostForRemote`, keyed by the raw (as-given)
- *  `remoteHost` argument — no TTL, unlike `remoteHostsCache` above.
- *  `remoteHostsCache` is TTL'd because its *source* (a project dir's git
- *  remotes) can change mid-session; `~/.ssh/config` for a fixed host
- *  effectively can't, so there's nothing to expire — a user hand-editing
- *  their ssh config mid-session and expecting agetor to notice without a
- *  restart isn't a supported flow. */
+/** The three cloud-forge hostnames `apiHostForRemote` short-circuits on
+ *  before ever spawning `ssh -G` — see the WHY block in `apiHostForRemote`
+ *  above its cloud-host guard. */
+const CLOUD_HOSTS = new Set(["github.com", "gitlab.com", "bitbucket.org"]);
+
+/** Maps an ssh-transport-only hostname (a vendor-documented "connect over
+ *  443 via ssh" endpoint — `altssh.gitlab.com`, `ssh.github.com`,
+ *  `altssh.bitbucket.org`, …) to the real cloud API host it's a transport
+ *  stand-in for. These are SSH transport overrides, not API hosts — none of
+ *  the three cloud forges serve a REST API from them. Built generically as
+ *  `altssh.<cloud>` and `ssh.<cloud>` for each cloud host rather than
+ *  hardcoding only the one pattern each vendor happens to document today, so
+ *  a raw host that RESOLVES (via `ssh -G`) to one of these still ends up at
+ *  the real cloud API host instead of a dead one. */
+const SSH_TRANSPORT_ALIASES = new Map<string, string>(
+  Array.from(CLOUD_HOSTS).flatMap((cloud) => [
+    [`altssh.${cloud}`, cloud],
+    [`ssh.${cloud}`, cloud],
+  ]),
+);
+
+/** Legal hostname charset, checked post-lowercase. Anything outside this
+ *  (embedded whitespace, control characters, a newline smuggling a second
+ *  "line" into the string, …) can't be a real hostname; guarding on it
+ *  before ever building a URL out of the value protects downstream `new
+ *  URL(...)` calls (gitlab.ts's `gitlabApiBase`, primarily) from malformed
+ *  input rather than letting them throw or silently misparse. */
+const HOSTNAME_CHARSET_RE = /^[a-z0-9.-]+$/;
+
+/** Module-level cache for `apiHostForRemote`, keyed by the NORMALIZED
+ *  (trimmed + lowercased) `remoteHost` argument (NTH-6 — this is what makes
+ *  two different-cased spellings of the same host share one resolution) —
+ *  no TTL, unlike `remoteHostsCache` above. `remoteHostsCache` is TTL'd
+ *  because its *source* (a project dir's git remotes) can change
+ *  mid-session; `~/.ssh/config` for a fixed host effectively can't, so
+ *  there's nothing to expire — a user hand-editing their ssh config
+ *  mid-session and expecting agetor to notice without a restart isn't a
+ *  supported flow. */
 const apiHostCache = new Map<string, string>();
 
 /** Test-only escape hatch: clears `apiHostForRemote`'s cache, mirroring
@@ -94,22 +130,51 @@ export function __clearApiHostCacheForTest(): void {
  * agents.ts) so tests can point at a stub script instead of the real `ssh`.
  */
 export function apiHostForRemote(remoteHost: string): string {
-  const cached = apiHostCache.get(remoteHost);
+  const normalized = remoteHost.trim().toLowerCase();
+
+  // Cache (and every guard/failure path below) is keyed by `normalized`, not
+  // the raw `remoteHost` argument — this is what makes two different-cased
+  // spellings of the same host share one resolution/cache slot, and what
+  // guarantees every return value (success or fallback) is consistently the
+  // normalized form rather than leaking raw casing/whitespace back out to a
+  // caller that may feed it straight into a `new URL(...)`.
+  const cached = apiHostCache.get(normalized);
   if (cached !== undefined) return cached;
 
-  const normalized = remoteHost.trim().toLowerCase();
-  // Guard rather than spawn: an empty host is nothing to resolve, and a
-  // leading "-" could otherwise be misread by ssh as an option. The `--`
-  // passed to ssh below is belt-and-suspenders for every other input; this
-  // guard is the cheap first line of defense that also sidesteps ever
+  // Cloud-host short-circuit, BEFORE any ssh -G spawn. WHY: several forges
+  // document an "ssh-over-443" transport workaround for users behind a
+  // firewall that blocks port 22 — e.g. GitLab's `Host gitlab.com` /
+  // `HostName altssh.gitlab.com`, GitHub's `ssh.github.com`. That's an SSH
+  // TRANSPORT override: it exists so `git clone git@gitlab.com:...`
+  // succeeds over port 443, and has nothing to do with which host serves
+  // the REST API. If we resolved a plain `gitlab.com` remote through the
+  // user's `~/.ssh/config` and that config happens to carry this (common,
+  // vendor-recommended) workaround, `ssh -G` would report `hostname
+  // altssh.gitlab.com` — and using that as the API host would redirect
+  // every API call to a host with no REST API at all. A raw remote host
+  // that already IS exactly one of the three cloud domains is unambiguous
+  // (there's no legitimate alias resolution that could improve on it), so
+  // short-circuit before ever spawning ssh.
+  if (CLOUD_HOSTS.has(normalized)) {
+    apiHostCache.set(normalized, normalized);
+    return normalized;
+  }
+
+  // Guard rather than spawn: an empty host is nothing to resolve, a leading
+  // "-" could otherwise be misread by ssh as an option, and a hostname
+  // charset violation (anything outside `[a-z0-9.-]` post-lowercase — e.g.
+  // embedded whitespace or a newline) can never be a real hostname and
+  // would otherwise reach a downstream `new URL(...)` call unguarded. The
+  // `--` passed to ssh below is belt-and-suspenders for every other input;
+  // this guard is the cheap first line of defense that also sidesteps ever
   // spawning a process for garbage input.
-  if (!normalized || normalized.startsWith("-")) {
-    apiHostCache.set(remoteHost, remoteHost);
-    return remoteHost;
+  if (!normalized || normalized.startsWith("-") || !HOSTNAME_CHARSET_RE.test(normalized)) {
+    apiHostCache.set(normalized, normalized);
+    return normalized;
   }
 
   const sshBin = process.env.AGETOR_SSH_BIN || "ssh";
-  let resolved = remoteHost;
+  let resolved = normalized;
   try {
     // No shell involved (argv array, not a command string) and `--` marks
     // the end of options, so `normalized` can't be reinterpreted as an ssh
@@ -123,10 +188,15 @@ export function apiHostForRemote(remoteHost: string): string {
       if (match && match[1]) resolved = match[1];
     }
   } catch {
-    // Missing binary, spawn error, etc. — resolved stays remoteHost.
+    // Missing binary, spawn error, etc. — resolved stays normalized.
   }
 
-  apiHostCache.set(remoteHost, resolved);
+  // An ssh alias can resolve to an SSH-over-443 transport endpoint rather
+  // than a real API host (see the cloud short-circuit's WHY above) — map it
+  // back to the cloud domain it's a transport stand-in for.
+  resolved = SSH_TRANSPORT_ALIASES.get(resolved) ?? resolved;
+
+  apiHostCache.set(normalized, resolved);
   return resolved;
 }
 
@@ -286,22 +356,74 @@ export async function remoteHostsForDirs(dirs: string[]): Promise<string[]> {
 /**
  * Resolve the token to authenticate a GitLab request with, for a repo whose
  * raw remote host is `remoteHost` (null when there's no repo in scope).
- * Resolution order mirrors `githubToken` in github.ts:
- *   1. A stored token for `remoteHost` (the raw-host-keyed store in
- *      `github-tokens.ts` — works for a gitlab alias host as-is, no schema
- *      change; falls back to a `gitlab.com`-labeled entry the same way
- *      `tokenForHost` falls back to `github.com` for GitHub).
- *   2. `GITLAB_TOKEN` env.
- *   3. Best-effort `glab config get token --host gitlab.com` shellout
- *      (5s timeout; any failure — missing binary, non-zero exit, timeout —
- *      swallowed to null, same as `githubToken`'s `gh auth token` fallback).
+ *
+ * Credential resolution is scoped to the **resolved** API host
+ * (`apiHostForRemote(remoteHost)`), not the raw host, and the two cases get
+ * different tiers:
+ *
+ *   - **Cloud** (`resolved === "gitlab.com"`, or `remoteHost === null` —
+ *     treated as cloud since that's `glab`'s own default `--host`): today's
+ *     three-tier order, unchanged — see `gitlabCloudToken` below.
+ *   - **Self-hosted** (`resolved` is anything else): exact host-keyed store
+ *     entry ONLY — see `gitlabSelfHostedToken` below for why the cloud
+ *     tiers (gitlab.com store fallback, `GITLAB_TOKEN` env, glab-cloud) must
+ *     NOT apply here.
+ *
+ * WHY the scoping matters (review finding, fix wave): before per-host API
+ * bases, every GitLab call's URL was hardcoded to `gitlab.com`, so a stored
+ * `gitlab.com` token (or `GITLAB_TOKEN`, or `glab`'s own cloud account)
+ * could only ever be sent to `gitlab.com` — falling back to it for an
+ * unrecognized host was harmless. Now that the API base is resolved
+ * per-host, the same fallback would transmit a `gitlab.com` personal-access
+ * token to an arbitrary third-party host whose name merely happens to
+ * contain "gitlab" — a credential-disclosure bug, not a convenience.
  */
 export async function gitlabToken(remoteHost: string | null): Promise<string | null> {
+  if (remoteHost === null) return gitlabCloudToken(null);
+  const resolved = apiHostForRemote(remoteHost);
+  if (resolved === "gitlab.com") return gitlabCloudToken(remoteHost);
+  return gitlabSelfHostedToken(remoteHost, resolved);
+}
+
+/** Cloud (gitlab.com) resolution order, unchanged from before per-host API
+ *  bases: stored token for `remoteHost` (falling back to a `gitlab.com`
+ *  -labeled store entry) → `GITLAB_TOKEN` env → best-effort `glab config get
+ *  token --host gitlab.com` shellout (5s timeout; any failure — missing
+ *  binary, non-zero exit, timeout — swallowed to null, same as
+ *  `githubToken`'s `gh auth token` fallback in github.ts). */
+async function gitlabCloudToken(remoteHost: string | null): Promise<string | null> {
   const stored = tokenForHost(remoteHost, "gitlab.com");
   if (stored) return stored;
   const envToken = process.env.GITLAB_TOKEN;
   if (envToken) return envToken;
   const glab = await run(["glab", "config", "get", "token", "--host", "gitlab.com"], undefined, GITLAB_FETCH_TIMEOUT_MS);
+  return glab.ok && glab.stdout ? glab.stdout : null;
+}
+
+/**
+ * Self-hosted resolution order — deliberately narrower than the cloud path
+ * (see the credential-disclosure WHY on `gitlabToken` above): only an EXACT
+ * host-keyed store entry, tried under both the raw remote host and (if it
+ * differs, e.g. an ssh alias resolving to a self-hosted domain) the resolved
+ * host. `tokenForHost(host, host)` — passing the host itself as the
+ * fallback — is how an exact-only lookup is expressed against a helper
+ * whose second parameter is normally a cross-host fallback: the exact-match
+ * branch already covers `host`, so the "fallback" branch degenerates to a
+ * no-op default-store leak. No `gitlab.com` store fallback, no
+ * `GITLAB_TOKEN` env, no glab-cloud-account shellout — none of those are
+ * scoped to this self-hosted target. As a last, still host-scoped tier,
+ * `glab config get token --host <resolved>` is attempted (glab supports
+ * `--host` for self-managed GitLab instances the same way it does for
+ * gitlab.com).
+ */
+async function gitlabSelfHostedToken(remoteHost: string, resolved: string): Promise<string | null> {
+  const byRemoteHost = tokenForHost(remoteHost, remoteHost);
+  if (byRemoteHost) return byRemoteHost;
+  if (resolved !== remoteHost) {
+    const byResolvedHost = tokenForHost(resolved, resolved);
+    if (byResolvedHost) return byResolvedHost;
+  }
+  const glab = await run(["glab", "config", "get", "token", "--host", resolved], undefined, GITLAB_FETCH_TIMEOUT_MS);
   return glab.ok && glab.stdout ? glab.stdout : null;
 }
 

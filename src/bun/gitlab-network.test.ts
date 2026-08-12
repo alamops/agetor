@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { __clearApiHostCacheForTest } from "./git-provider.ts";
-import { gitlabMergeRequest, mockGitLabFetch, sampleAliasRepo, sampleRepo, sampleSelfHostedRepo, writeSshStub } from "./gitlab-test-util.ts";
+import { cleanupSshStubs, gitlabMergeRequest, mockGitLabFetch, sampleAliasRepo, sampleRepo, sampleSelfHostedRepo, writeSshStub } from "./gitlab-test-util.ts";
 import {
   __gitlabInternals,
   closeGitLabPull,
@@ -71,6 +71,7 @@ beforeEach(() => {
 
 afterEach(() => {
   __clearApiHostCacheForTest();
+  cleanupSshStubs();
   if (ORIGINAL_SSH_BIN === undefined) delete process.env.AGETOR_SSH_BIN;
   else process.env.AGETOR_SSH_BIN = ORIGINAL_SSH_BIN;
 });

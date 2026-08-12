@@ -85,22 +85,51 @@ const BITBUCKET_PAGELEN = 30;
  * today's failure mode.
  *
  * `apiHostForRemote` (git-provider.ts) resolves `repo.remoteHost` through
- * `~/.ssh/config` the same way `gitlabApiHost` does in gitlab.ts: an alias
- * whose `HostName` is `bitbucket.org` (the documented multi-identity setup)
- * resolves to `bitbucket.org` and passes; a real Server/DC domain (or an
- * alias pointing at one) echoes back unchanged and is rejected. It's sync,
- * never throws, and caches its own resolution per host, so calling this at
- * the top of every entry point below costs nothing beyond the first `ssh -G`
- * shellout for a given remote host.
+ * `~/.ssh/config` the same way `gitlabHost`/`gitlabApiBase` do in gitlab.ts:
+ * `bitbucket.org` itself short-circuits to itself, and an alias whose
+ * `HostName` is `bitbucket.org` (or one of Bitbucket's alternate SSH
+ * hostnames, `altssh.bitbucket.org`/`ssh.bitbucket.org`) also resolves to
+ * `bitbucket.org` — both pass. It's sync, never throws, and caches its own
+ * resolution per host, so calling this at the top of every entry point below
+ * costs nothing beyond the first `ssh -G` shellout for a given remote host.
  *
- * Returns `null` (no error — proceed) when the resolved host is
- * `bitbucket.org`; otherwise the rejection message every call site returns
- * verbatim in its own error shape, before making any network call.
+ * This function only ever *rejects* on positive evidence of a distinct,
+ * dotted Server/DC domain — it fails open whenever ssh can't tell us
+ * anything useful:
+ *  - Resolved host is `bitbucket.org` → allow.
+ *  - Resolved host has no dot at all (e.g. a bare alias like
+ *    `bitbucket-work` with no matching `~/.ssh/config` entry) → allow. A
+ *    dotless string can never be a Server/DC FQDN, so this is ssh actively
+ *    telling us nothing, not evidence of a different product. The request
+ *    proceeds to `api.bitbucket.org` keyed by the alias's own credentials —
+ *    the same multi-identity behavior this module has always supported.
+ *  - Resolved host is a dotted domain other than `bitbucket.org` → reject.
+ *    ssh either actively redirected the raw remote host elsewhere (a real
+ *    alias-to-Server/DC mapping) or simply echoed the raw host back
+ *    unchanged (no `~/.ssh/config` entry at all) — either way this is
+ *    positive evidence of a distinct domain, so the request is rejected
+ *    before any network call, with a hint to add a `HostName bitbucket.org`
+ *    entry when the echoed-back case is actually a not-yet-configured cloud
+ *    alias.
+ *
+ * Host comparisons are case-insensitive (the resolved host is lowercased
+ * before every comparison) as a defensive measure against a future
+ * `ProviderRepoInfo` producer that doesn't already lowercase.
+ *
+ * Returns `null` (no error — proceed) on either allow path above; otherwise
+ * the rejection message every call site returns verbatim in its own error
+ * shape, before making any network call.
  */
 function bitbucketServerError(repo: ProviderRepoInfo): string | null {
-  const resolvedHost = apiHostForRemote(repo.remoteHost);
-  if (resolvedHost === "bitbucket.org") return null;
-  return `Bitbucket Server / Data Center is not supported — only Bitbucket Cloud (bitbucket.org). This repo's remote points at ${resolvedHost}.`;
+  const resolved = apiHostForRemote(repo.remoteHost).toLowerCase();
+  if (resolved === "bitbucket.org") return null;
+  // Dotless: ssh has nothing to tell us (no matching config entry, no dot to
+  // even suggest a domain) — cannot be a Server/DC FQDN. Fail open.
+  if (!resolved.includes(".")) return null;
+  const raw = repo.remoteHost.toLowerCase();
+  const base = `Bitbucket Server / Data Center is not supported — only Bitbucket Cloud (bitbucket.org). This repo's remote resolves to ${resolved}.`;
+  if (resolved !== raw) return base;
+  return `${base} If ${resolved} is actually an SSH alias for Bitbucket Cloud, add a ~/.ssh/config entry with "HostName bitbucket.org" for it.`;
 }
 
 interface BitbucketError {

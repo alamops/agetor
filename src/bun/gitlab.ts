@@ -28,8 +28,10 @@ import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { apiHostForRemote, gitlabToken } from "./git-provider.ts";
 
 /**
- * GitLab Cloud (gitlab.com, REST API v4) adapter (T2,
- * docs/plans/multi-provider-git-modal.md §4). Mirrors `src/bun/github.ts`'s
+ * GitLab adapter (T2, docs/plans/multi-provider-git-modal.md §4) — gitlab.com
+ * as well as self-hosted instances, both addressed via
+ * `apiHostForRemote`-derived `https://<host>/api/v4` (see
+ * docs/plans/per-host-git-api-bases.md). Mirrors `src/bun/github.ts`'s
  * conventions closely enough that the facade (`git-host.ts`, T4) can dispatch
  * to either module transparently: same `{ok:true}&Result | {ok:false,error}`
  * result-union style, a 30s AbortController fetch timeout, `user-agent:

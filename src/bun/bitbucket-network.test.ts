@@ -1190,7 +1190,8 @@ test("getBitbucketPullDiff rejects a Bitbucket Server/DC remote host with zero f
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("expected failure");
     expect(res.error).toBe(
-      "Bitbucket Server / Data Center is not supported — only Bitbucket Cloud (bitbucket.org). This repo's remote points at bitbucket.mycompany.com.",
+      "Bitbucket Server / Data Center is not supported — only Bitbucket Cloud (bitbucket.org). This repo's remote resolves to bitbucket.mycompany.com. "
+        + 'If bitbucket.mycompany.com is actually an SSH alias for Bitbucket Cloud, add a ~/.ssh/config entry with "HostName bitbucket.org" for it.',
     );
     expect(mock.calls).toHaveLength(0);
   } finally {
@@ -1255,6 +1256,62 @@ test("an ssh-alias host that resolves to bitbucket.org proceeds normally (alias-
     if (!res.ok) throw new Error(res.error);
     expect(res.item.number).toBe(41);
     expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+// SF-3 (docs/plans/per-host-git-api-bases.md §8.1b): `bitbucketServerError`
+// rejects only on positive evidence of a distinct, dotted Server/DC domain —
+// it fails open whenever ssh can't actually tell us anything useful.
+
+test("a dotless ssh alias with no ~/.ssh/config mapping (ssh echoes it back unchanged) is allowed — a dotless string can never be a Server/DC FQDN", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const dotlessAliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work");
+  const mock = mockGitHubFetch([
+    { match: "/2.0/repositories/acme/app", json: { mainbranch: { name: "main" } } },
+  ]);
+  try {
+    const res = await getBitbucketPullDefaults(dotlessAliasRepo);
+    expect(res.ok).toBe(true);
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toContain("api.bitbucket.org");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("a dotted self-hosted domain with no ~/.ssh/config mapping (ssh echoes it back unchanged) is rejected with the ssh-config HostName hint", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const selfHostedRepo = makeBitbucketRepo("acme", "app", "bitbucket.mycompany.com");
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketPullDefaults(selfHostedRepo);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("This repo's remote resolves to bitbucket.mycompany.com.");
+    expect(res.error).toContain(
+      'If bitbucket.mycompany.com is actually an SSH alias for Bitbucket Cloud, add a ~/.ssh/config entry with "HostName bitbucket.org" for it.',
+    );
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("an ssh alias actively resolved to a distinct dotted domain is rejected with the 'resolves to' variant and no ssh-config hint", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname bitbucket.corp.example'\n");
+  const redirectedAliasRepo = makeBitbucketRepo("acme", "app", "bb-corp.example");
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketPullDefaults(redirectedAliasRepo);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toBe(
+      "Bitbucket Server / Data Center is not supported — only Bitbucket Cloud (bitbucket.org). This repo's remote resolves to bitbucket.corp.example.",
+    );
+    expect(res.error).not.toContain("HostName bitbucket.org");
+    expect(mock.calls).toHaveLength(0);
   } finally {
     mock.restore();
   }

@@ -84,7 +84,17 @@ a separate wave — logged deviation from the default pipeline.
   (assume standard /api/v4).
 
 ## 8. Open questions / assumptions (autonomous mode)
-1. Standard `/api/v4` path prefix assumed for self-hosted GitLab (no custom-prefix field). — assumption
+1. Standard `/api/v4` path prefix assumed for self-hosted GitLab (no custom-prefix field). Also
+   assumed: https scheme and default port — a self-hosted instance on :8443 or plain http is not
+   supported this pass (parseGitRemote discards ports; ProviderRepoInfo carries no scheme/port).
+   Review-added limitations, recorded per finding NTH-8. — assumption
+1b. Review corrections applied (fix wave): canonical cloud hosts (github.com/gitlab.com/
+   bitbucket.org) short-circuit BEFORE any ssh -G spawn — the vendor-documented altssh
+   (SSH-over-443) HostName override must not redirect API traffic; gitlab token resolution is
+   scoped to the resolved host (exact store entry only for non-gitlab.com hosts — no cloud-PAT
+   fallback to third-party hosts); Bitbucket guard only rejects on positive evidence (dotted
+   non-cloud resolved host), passes dotless aliases through, and hints at ssh-config HostName in
+   its message; ssh -G timeout 750ms; fallbacks return normalized hosts + charset guard. — decision
 2. Hostname-substring provider detection retained; `git.mycompany.com` still unsupported. — assumption
 3. ssh -G resolution treated as authoritative when it succeeds. — decision
 4. GitHub Enterprise: follow-up, not this pass. — decision
