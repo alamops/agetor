@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  binaryPreviewKind,
   canonicalizeAttachmentText,
+  contentTypeForPreviewPath,
   imageSourceMetaPath,
   isImagePath,
   isImageSourceMetaBreadcrumb,
+  isPdfPath,
+  MAX_BLOB_PREVIEW_BYTES,
   stripImagePlaceholders,
 } from "./attachments.ts";
 
@@ -53,6 +57,114 @@ describe("isImagePath", () => {
   test("a non-image extension does not match", () => {
     expect(isImagePath("/a/b/file.ts")).toBe(false);
     expect(isImagePath("/a/b/README.md")).toBe(false);
+  });
+});
+
+describe("isPdfPath", () => {
+  test("matches .pdf case-insensitively", () => {
+    expect(isPdfPath("/a/b/report.pdf")).toBe(true);
+    expect(isPdfPath("/a/b/report.PDF")).toBe(true);
+    expect(isPdfPath("/a/b/report.Pdf")).toBe(true);
+  });
+
+  test("bare filename with no directory still matches", () => {
+    expect(isPdfPath("report.pdf")).toBe(true);
+  });
+
+  test("a directory path (trailing slash) is never a pdf, even with a pdf-like name", () => {
+    expect(isPdfPath("/a/b/foo.pdf/")).toBe(false);
+  });
+
+  test("a non-pdf extension does not match", () => {
+    expect(isPdfPath("/a/b/file.png")).toBe(false);
+    expect(isPdfPath("/a/b/README.md")).toBe(false);
+  });
+
+  test("extension-less path does not match", () => {
+    expect(isPdfPath("/a/b/README")).toBe(false);
+  });
+});
+
+describe("binaryPreviewKind", () => {
+  test("every canonical image extension classifies as 'image', case-insensitively", () => {
+    for (const ext of ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif", "heic"]) {
+      expect(binaryPreviewKind(`/a/file.${ext}`)).toBe("image");
+      expect(binaryPreviewKind(`/a/file.${ext.toUpperCase()}`)).toBe("image");
+    }
+  });
+
+  test("pdf classifies as 'pdf', case-insensitively", () => {
+    expect(binaryPreviewKind("/a/doc.pdf")).toBe("pdf");
+    expect(binaryPreviewKind("/a/doc.PDF")).toBe("pdf");
+  });
+
+  test("a non-previewable binary extension classifies as null", () => {
+    expect(binaryPreviewKind("/a/archive.zip")).toBeNull();
+    expect(binaryPreviewKind("/a/data.bin")).toBeNull();
+  });
+
+  test("a textual extension classifies as null", () => {
+    expect(binaryPreviewKind("/a/file.ts")).toBeNull();
+  });
+
+  test("an extension-less path classifies as null", () => {
+    expect(binaryPreviewKind("/a/README")).toBeNull();
+  });
+
+  test("a directory path (trailing slash) classifies as null even with an image-like name", () => {
+    expect(binaryPreviewKind("/a/foo.png/")).toBeNull();
+  });
+});
+
+describe("contentTypeForPreviewPath", () => {
+  test("png maps to image/png", () => {
+    expect(contentTypeForPreviewPath("/a/shot.png")).toBe("image/png");
+  });
+
+  test("svg maps to image/svg+xml", () => {
+    expect(contentTypeForPreviewPath("/a/icon.svg")).toBe("image/svg+xml");
+  });
+
+  test("pdf maps to application/pdf", () => {
+    expect(contentTypeForPreviewPath("/a/report.pdf")).toBe("application/pdf");
+  });
+
+  test("every canonical image extension has a mapped content-type", () => {
+    const expected: Record<string, string> = {
+      png: "image/png",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      gif: "image/gif",
+      webp: "image/webp",
+      svg: "image/svg+xml",
+      bmp: "image/bmp",
+      ico: "image/x-icon",
+      avif: "image/avif",
+      heic: "image/heic",
+    };
+    for (const [ext, mime] of Object.entries(expected)) {
+      expect(contentTypeForPreviewPath(`/a/file.${ext}`)).toBe(mime);
+    }
+  });
+
+  test("case-insensitive on the extension", () => {
+    expect(contentTypeForPreviewPath("/a/shot.PNG")).toBe("image/png");
+    expect(contentTypeForPreviewPath("/a/report.PDF")).toBe("application/pdf");
+  });
+
+  test("an unrecognized extension maps to null", () => {
+    expect(contentTypeForPreviewPath("/a/archive.zip")).toBeNull();
+    expect(contentTypeForPreviewPath("/a/notes.txt")).toBeNull();
+  });
+
+  test("an extension-less path maps to null", () => {
+    expect(contentTypeForPreviewPath("/a/README")).toBeNull();
+  });
+});
+
+describe("MAX_BLOB_PREVIEW_BYTES", () => {
+  test("is exported as the documented 20MB cap", () => {
+    expect(MAX_BLOB_PREVIEW_BYTES).toBe(20_000_000);
   });
 });
 

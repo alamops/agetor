@@ -8,6 +8,7 @@ import {
   pullDefaults,
   labels,
   pullReopen,
+  pullBlob,
 } from "./git-host.ts";
 import { makeGitHubRepo } from "./github-test-util.ts";
 import { mockGitHubFetch, type FetchMock } from "./github-test-util.ts";
@@ -294,5 +295,68 @@ test("pullReopen on a bitbucket repo surfaces the 'cannot be reopened' error", a
   expect(res.ok).toBe(false);
   if (res.ok) return;
   expect(res.error).toContain("cannot be reopened");
+  expect(fetchMock.calls).toHaveLength(0);
+});
+
+// ---------------------------------------------------------------------------
+// pullBlob
+// ---------------------------------------------------------------------------
+
+test("pullBlob on a gitlab repo returns 501 unsupported without any fetch", async () => {
+  const dir = await makeRepo("https://gitlab.com/acme/app.git");
+  fetchMock = mockGitHubFetch([]); // gitlab/bitbucket previews aren't implemented — asserting no fetch happens
+
+  const res = await pullBlob({ dir, number: 1, path: "assets/logo.png", side: "new" });
+  expect(res).toEqual({
+    ok: false,
+    status: 501,
+    error: "binary preview not supported for this provider yet",
+  });
+  expect(fetchMock.calls).toHaveLength(0);
+});
+
+test("pullBlob on a bitbucket repo returns 501 unsupported without any fetch", async () => {
+  const dir = await makeRepo("https://bitbucket.org/acme/app.git");
+  fetchMock = mockGitHubFetch([]);
+
+  const res = await pullBlob({ dir, number: 1, path: "assets/logo.png", side: "old" });
+  expect(res).toEqual({
+    ok: false,
+    status: 501,
+    error: "binary preview not supported for this provider yet",
+  });
+  expect(fetchMock.calls).toHaveLength(0);
+});
+
+test("pullBlob rejects an unsafe (path-traversal) filePath with 400 before dispatching to any provider — even github", async () => {
+  const dir = await makeGitHubRepo("acme", "app");
+  createdDirs.push(dir);
+  fetchMock = mockGitHubFetch([]); // a safe dispatch would fetch the Contents API — asserting it never gets there
+
+  const res = await pullBlob({ dir, number: 1, path: "../../etc/passwd", side: "new" });
+  expect(res).toEqual({ ok: false, status: 400, error: "invalid path" });
+  expect(fetchMock.calls).toHaveLength(0);
+});
+
+test("pullBlob rejects an absolute filePath with 400", async () => {
+  const dir = await makeGitHubRepo("acme", "app");
+  createdDirs.push(dir);
+  fetchMock = mockGitHubFetch([]);
+
+  const res = await pullBlob({ dir, number: 1, path: "/etc/passwd", side: "new" });
+  expect(res).toEqual({ ok: false, status: 400, error: "invalid path" });
+  expect(fetchMock.calls).toHaveLength(0);
+});
+
+test("pullBlob on a repo with no supported git remote returns 400 without a path/provider check", async () => {
+  const dir = await makeRepo("git@example.com:acme/app.git");
+  fetchMock = mockGitHubFetch([]);
+
+  const res = await pullBlob({ dir, number: 1, path: "assets/logo.png", side: "new" });
+  expect(res).toEqual({
+    ok: false,
+    status: 400,
+    error: "project does not have a supported git remote (GitHub, GitLab, or Bitbucket)",
+  });
   expect(fetchMock.calls).toHaveLength(0);
 });

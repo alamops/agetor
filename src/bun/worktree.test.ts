@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, describe } from "bun:test";
-import { mkdtempSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -550,6 +550,226 @@ test("parseGitDiff keeps the path for binary-only file sections", async () => {
   expect(files[0]?.path).toBe("assets/logo.png");
   expect(files[0]?.binary).toBe(true);
 });
+
+// ---------------------------------------------------------------------------
+// getTaskDiffBlob
+// ---------------------------------------------------------------------------
+
+// Two distinct "binary" fixtures (PNG magic + filler bytes) — content only
+// needs to differ byte-for-byte between "old" (committed at base) and "new"
+// (working tree); getTaskDiffBlob never interprets the bytes.
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const BLOB_V1 = Buffer.concat([PNG_MAGIC, Buffer.from("version-one-content")]);
+const BLOB_V2 = Buffer.concat([PNG_MAGIC, Buffer.from("version-two-content-different")]);
+
+// Old-side etags are a sha1 hex digest of "<resolved-sha>:<relPath>",
+// quoted — 40 hex chars. New-side etags are `"<size>-<mtimeMs>"` — a
+// completely different shape, since the "new" side isn't content-addressed
+// (it's the live working tree).
+const OLD_ETAG_RE = /^"[0-9a-f]{40}"$/;
+const NEW_ETAG_RE = /^"\d+-\d+(\.\d+)?"$/;
+
+test("getTaskDiffBlob: modified binary — old side reads the committed blob, new side reads the working-tree file, etags differ in shape", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "logo.png"), BLOB_V1);
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "add logo"], repo);
+  const base = await resolveRef(repo, "HEAD");
+
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // Uncommitted working-tree modification — this is exactly what `git diff
+  // <base>` would show as the binary file's "new" side.
+  writeFileSync(path.join(prepared.cwd, "logo.png"), BLOB_V2);
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const oldSide = await getTaskDiffBlob(live, "logo.png", "old");
+  expect(oldSide.ok).toBe(true);
+  if (!oldSide.ok) return;
+  expect(Buffer.from(oldSide.bytes)).toEqual(BLOB_V1);
+  expect(oldSide.etag).toMatch(OLD_ETAG_RE);
+
+  const newSide = await getTaskDiffBlob(live, "logo.png", "new");
+  expect(newSide.ok).toBe(true);
+  if (!newSide.ok) return;
+  expect(Buffer.from(newSide.bytes)).toEqual(BLOB_V2);
+  expect(newSide.etag).toMatch(NEW_ETAG_RE);
+
+  expect(oldSide.etag).not.toBe(newSide.etag);
+});
+
+test("getTaskDiffBlob: added (untracked) file — new side ok, old side 404", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // Untracked — never added, never committed, on either side of the base.
+  writeFileSync(path.join(prepared.cwd, "fresh.png"), BLOB_V1);
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const newSide = await getTaskDiffBlob(live, "fresh.png", "new");
+  expect(newSide.ok).toBe(true);
+  if (!newSide.ok) return;
+  expect(Buffer.from(newSide.bytes)).toEqual(BLOB_V1);
+
+  const oldSide = await getTaskDiffBlob(live, "fresh.png", "old");
+  expect(oldSide).toMatchObject({ ok: false, status: 404 });
+});
+
+test("getTaskDiffBlob: deleted file — old side ok, new side 404", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "gone.png"), BLOB_V1);
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "add gone.png"], repo);
+  const base = await resolveRef(repo, "HEAD");
+
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // Delete from the working tree without committing — same shape `getTaskDiff`
+  // would report as a "deleted" file vs base.
+  rmSync(path.join(prepared.cwd, "gone.png"));
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const oldSide = await getTaskDiffBlob(live, "gone.png", "old");
+  expect(oldSide.ok).toBe(true);
+  if (!oldSide.ok) return;
+  expect(Buffer.from(oldSide.bytes)).toEqual(BLOB_V1);
+
+  const newSide = await getTaskDiffBlob(live, "gone.png", "new");
+  expect(newSide).toMatchObject({ ok: false, status: 404 });
+});
+
+test("getTaskDiffBlob: renamed file — old side is still served at the pre-rename (oldPath) path; new side only resolves at the new path", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "before.png"), BLOB_V1);
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "add before.png"], repo);
+  const base = await resolveRef(repo, "HEAD");
+
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // Rename in the working tree (uncommitted) — old content lives only at the
+  // base commit's `before.png`; the working tree now only has `after.png`.
+  await git(["mv", "before.png", "after.png"], prepared.cwd);
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+  const oldSide = await getTaskDiffBlob(live, "before.png", "old");
+  expect(oldSide.ok).toBe(true);
+  if (!oldSide.ok) return;
+  expect(Buffer.from(oldSide.bytes)).toEqual(BLOB_V1);
+
+  const newAtNewPath = await getTaskDiffBlob(live, "after.png", "new");
+  expect(newAtNewPath.ok).toBe(true);
+  if (!newAtNewPath.ok) return;
+  expect(Buffer.from(newAtNewPath.bytes)).toEqual(BLOB_V1);
+
+  const newAtOldPath = await getTaskDiffBlob(live, "before.png", "new");
+  expect(newAtOldPath).toMatchObject({ ok: false, status: 404 });
+});
+
+test("getTaskDiffBlob: isolation=none task whose workdir is a repo SUBDIRECTORY resolves the new side via the repo root, not cwd + relPath", async () => {
+  // Regression test: `git diff`/`git ls-files` report paths root-relative,
+  // not cwd-relative. A naive `path.join(task.workdir, relPath)` for an
+  // isolation=none task whose workdir is `<repo>/sub` would double-prefix
+  // the subdirectory (`<repo>/sub/sub/assets/x.bin`) and 404.
+  const { getTaskDiffBlob } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const assetsDir = path.join(repo, "sub", "assets");
+  mkdirSync(assetsDir, { recursive: true });
+  writeFileSync(path.join(assetsDir, "x.bin"), BLOB_V1);
+  await git(["add", "."], repo);
+  await git(["commit", "-m", "add sub/assets/x.bin"], repo);
+
+  const task = fakeTask({ workdir: path.join(repo, "sub"), isolation: "none" });
+
+  // Root-relative, exactly as `git diff` (run from the subdirectory) would
+  // report it — NOT relative to task.workdir.
+  const result = await getTaskDiffBlob(task, "sub/assets/x.bin", "new");
+  expect(result.ok).toBe(true);
+  if (!result.ok) return;
+  expect(Buffer.from(result.bytes)).toEqual(BLOB_V1);
+});
+
+describe("getTaskDiffBlob: path traversal rejections", () => {
+  test("rejects a '../' escaping relative path with 400", async () => {
+    const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const base = await resolveRef(repo, "HEAD");
+    const task = fakeTask({ workdir: repo, baseRef: base });
+    const prepared = await prepareWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+    const result = await getTaskDiffBlob(live, "../x.png", "new");
+    expect(result).toMatchObject({ ok: false, status: 400 });
+  });
+
+  test("rejects an absolute path with 400", async () => {
+    const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const base = await resolveRef(repo, "HEAD");
+    const task = fakeTask({ workdir: repo, baseRef: base });
+    const prepared = await prepareWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+    const result = await getTaskDiffBlob(live, "/etc/passwd.png", "new");
+    expect(result).toMatchObject({ ok: false, status: 400 });
+  });
+
+  test("rejects a path containing a null byte with 400", async () => {
+    const { prepareWorkdir, getTaskDiffBlob, resolveRef } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    const base = await resolveRef(repo, "HEAD");
+    const task = fakeTask({ workdir: repo, baseRef: base });
+    const prepared = await prepareWorkdir(task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+
+    const result = await getTaskDiffBlob(live, "a\0b.png", "new");
+    expect(result).toMatchObject({ ok: false, status: 400 });
+  });
+});
+
+test("getTaskDiffBlob: a new-side file over MAX_BLOB_PREVIEW_BYTES 413s instead of being read into memory", async () => {
+  const { prepareWorkdir, getTaskDiffBlob, resolveRef, MAX_BLOB_PREVIEW_BYTES } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const base = await resolveRef(repo, "HEAD");
+  const task = fakeTask({ workdir: repo, baseRef: base });
+  const prepared = await prepareWorkdir(task);
+  if ("error" in prepared) throw new Error(prepared.error);
+
+  // Working-tree file (untracked is fine — the "new" side is a plain stat +
+  // read of whatever's on disk, no git involved) just over the cap.
+  const big = new Uint8Array(MAX_BLOB_PREVIEW_BYTES + 1);
+  await Bun.write(path.join(prepared.cwd, "huge.png"), big);
+
+  const live = { ...task, worktreePath: prepared.worktreePath, branch: prepared.branch };
+  const result = await getTaskDiffBlob(live, "huge.png", "new");
+  expect(result).toMatchObject({ ok: false, status: 413 });
+
+  // Old-side 413 would require committing a >20MB blob into the temp repo's
+  // history — noticeably slower for marginal extra coverage of the same
+  // `size > MAX_BLOB_PREVIEW_BYTES` check (the old-side code path applies
+  // the identical cap, just sourced from `git cat-file -s` instead of
+  // `fs.statSync`). Skipped here; the check itself is exercised above.
+}, 20_000);
 
 test("removeWorktree tears down both the worktree and the branch", async () => {
   const { prepareWorkdir, removeWorktree } = await import("./worktree.ts");
