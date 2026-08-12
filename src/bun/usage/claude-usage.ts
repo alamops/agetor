@@ -141,21 +141,30 @@ export function parseClaudeUsage(
 
   const meters = new Map<string, QuotaMeter>();
 
-  for (const field of SCALAR_FIELDS) {
-    const meter = mapScalarField(json[field.key], field.id, field.label, field.scope);
-    if (meter) meters.set(meter.id, meter);
-  }
-  for (const meter of mapExtraUsage(json.extra_usage)) {
-    meters.set(meter.id, meter);
-  }
-
-  // `limits[]` is the newer, model-scoped shape — prefer it over the scalar
-  // fields above when both are present, deduped by the same stable id.
-  if (Array.isArray(json.limits) && json.limits.length > 0) {
+  // `limits[]` is the newer, model-scoped shape and fully supersedes the flat
+  // scalar fields when present. Prefer it EXCLUSIVELY (rather than merging by
+  // id) so a `limits[]` entry whose id doesn't happen to match a scalar id
+  // can't produce a duplicate meter for the same underlying window. `extra_usage`
+  // (a distinct credit meter, not a rate window) is still included either way.
+  const limitMeters: QuotaMeter[] = [];
+  if (Array.isArray(json.limits)) {
     json.limits.forEach((entry, index) => {
       const meter = mapLimitEntry(entry, index);
-      if (meter) meters.set(meter.id, meter);
+      if (meter) limitMeters.push(meter);
     });
+  }
+
+  if (limitMeters.length > 0) {
+    for (const meter of limitMeters) meters.set(meter.id, meter);
+  } else {
+    for (const field of SCALAR_FIELDS) {
+      const meter = mapScalarField(json[field.key], field.id, field.label, field.scope);
+      if (meter) meters.set(meter.id, meter);
+    }
+  }
+
+  for (const meter of mapExtraUsage(json.extra_usage)) {
+    meters.set(meter.id, meter);
   }
 
   return Array.from(meters.values());

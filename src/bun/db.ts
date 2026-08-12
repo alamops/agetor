@@ -713,6 +713,9 @@ export const harnesses = {
       throw new HarnessInUseError(inUse.map((r) => r.id));
     }
     db.run(`DELETE FROM harnesses WHERE id = ?`, [id]);
+    // Drop any cached usage snapshot so a deleted alias doesn't leave an
+    // orphaned harness_usage row (the table has no FK cascade by design).
+    db.run(`DELETE FROM harness_usage WHERE harness_id = ?`, [id]);
   },
   /**
    * Soft delete / re-enable. Carve-out from `HarnessBuiltinError` — toggling
@@ -799,6 +802,9 @@ export const harnessUsage = {
        ON CONFLICT(harness_id) DO UPDATE SET snapshot_json = excluded.snapshot_json, updated_at = excluded.updated_at`,
       [quota.harnessId, JSON.stringify(quota), Date.now()],
     );
+  },
+  delete(harnessId: string): void {
+    db.run(`DELETE FROM harness_usage WHERE harness_id = ?`, [harnessId]);
   },
 };
 

@@ -64,7 +64,17 @@ const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
  * throws — any failure (denied prompt, missing entry, malformed JSON,
  * non-macOS) resolves to `null` and arms a cooldown so repeated callers
  * don't retrigger a Keychain prompt every poll cycle.
+ *
+ * The spawn is raced against a hard timeout: reading this item from a
+ * binary other than the `claude` CLI that created it triggers a *blocking*
+ * macOS ACL dialog that never resolves until the user clicks. Without the
+ * timeout that hang would propagate up through the poller's in-flight guard
+ * and wedge every future sweep (the `finally` that clears `pollInFlight`
+ * would never run). On timeout we kill the process, arm the cooldown, and
+ * return null so the caller falls through to the `.claude.json` cache.
  */
+const KEYCHAIN_SPAWN_TIMEOUT_MS = 3000;
+
 export async function readKeychainClaudeToken(): Promise<string | null> {
   const now = Date.now();
   if (keychainCooldownUntilMs !== null && now < keychainCooldownUntilMs) {
@@ -75,11 +85,26 @@ export async function readKeychainClaudeToken(): Promise<string | null> {
       ["security", "find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"],
       { stdout: "pipe", stderr: "pipe" },
     );
-    const [stdout, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      proc.exited,
-    ]);
-    if (exitCode !== 0) {
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill();
+      } catch {
+        /* already gone */
+      }
+    }, KEYCHAIN_SPAWN_TIMEOUT_MS);
+    let stdout: string;
+    let exitCode: number;
+    try {
+      [stdout, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        proc.exited,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (timedOut || exitCode !== 0) {
       keychainCooldownUntilMs = now + KEYCHAIN_COOLDOWN_MS;
       return null;
     }

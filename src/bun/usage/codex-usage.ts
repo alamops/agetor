@@ -103,7 +103,10 @@ function meterFromSecondsWindow(
 ): QuotaMeter | null {
   const usedPercentRaw = window.used_percent;
   if (typeof usedPercentRaw !== "number" || !Number.isFinite(usedPercentRaw)) return null;
-  const resetAt = window.reset_at;
+  // The `wham/usage` window field name is reverse-engineered; accept both the
+  // `reset_at` spelling and the `resets_at` spelling the session-JSONL shape
+  // uses, so a field rename on either surface doesn't silently drop reset times.
+  const resetAt = typeof window.reset_at === "number" ? window.reset_at : window.resets_at;
   const resetsAtMs = typeof resetAt === "number" && resetAt > 0 ? resetAt * 1000 : null;
   const meter: QuotaMeter = {
     id,
@@ -263,6 +266,33 @@ function collectRolloutFiles(dir: string, depth: number, out: RolloutCandidate[]
 }
 
 /**
+ * Descend the lexically-greatest subdirectory at each level to reach the
+ * newest `YYYY/MM/DD` day directory that actually holds rollout files. The
+ * codex `sessions/YYYY/MM/DD/` layout sorts lexically by date, so this avoids
+ * `stat`-ing the entire (potentially thousands-of-files) tree on every poll
+ * sweep — we only walk one day's worth of files. Returns the directory that
+ * directly contains `rollout-*.jsonl`, or `null` if none is found within a
+ * few levels. Never throws.
+ */
+function newestRolloutDir(root: string): string | null {
+  let dir = root;
+  for (let level = 0; level <= MAX_WALK_DEPTH; level++) {
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+    if (entries.some((e) => e.isFile() && ROLLOUT_FILE_RE.test(e.name))) return dir;
+    const subdirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+    const next = subdirs[subdirs.length - 1];
+    if (!next) return null;
+    dir = path.join(dir, next);
+  }
+  return null;
+}
+
+/**
  * Find the newest `rollout-*.jsonl` under `<codexHome>/sessions/` (falling
  * back to `<codexHome>/archived_sessions/` when `sessions/` has nothing),
  * and pull the last `token_count` event's `rate_limits` blob out of it.
@@ -273,9 +303,22 @@ export function readNewestCodexRateLimits(harness: Harness): { rateLimits: unkno
   try {
     const home = codexHome(harness);
     const candidates: RolloutCandidate[] = [];
+    // Fast path: only scan the newest day directory (cheap — one day's files).
     for (const sub of ["sessions", "archived_sessions"]) {
-      const dir = path.join(home, sub);
-      if (existsSync(dir)) collectRolloutFiles(dir, 0, candidates);
+      const root = path.join(home, sub);
+      if (!existsSync(root)) continue;
+      const dayDir = newestRolloutDir(root);
+      if (dayDir) collectRolloutFiles(dayDir, MAX_WALK_DEPTH, candidates);
+      if (candidates.length > 0) break;
+    }
+    // Safety net: if the lexical-newest-day heuristic found nothing (empty or
+    // unexpected layout), fall back to the bounded full walk so real data
+    // in an oddly-structured tree isn't missed.
+    if (candidates.length === 0) {
+      for (const sub of ["sessions", "archived_sessions"]) {
+        const dir = path.join(home, sub);
+        if (existsSync(dir)) collectRolloutFiles(dir, 0, candidates);
+      }
     }
     if (candidates.length === 0) return null;
 
