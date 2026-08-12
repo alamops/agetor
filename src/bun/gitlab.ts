@@ -669,6 +669,14 @@ function cachePullBlobDetail(key: string, entry: GitLabPullBlobDetailCacheEntry)
   pullBlobDetailCache.set(key, entry);
 }
 
+/** Test-only: clears `pullBlobDetailCache`. bun test shares a process across
+ *  files, so a test that primes the cache (e.g. git-host.test.ts's happy-path
+ *  pull-blob test) would otherwise leak a stale entry into a later network
+ *  test in this module — network tests should call this from `beforeEach`. */
+function resetGitLabPullBlobCaches(): void {
+  pullBlobDetailCache.clear();
+}
+
 /** Content-type for a binary diff preview, from the shared canonical
  *  extension→MIME map — mirrors github.ts's `contentTypeForBlobPath`. Pure —
  *  unit-tested via `__gitlabInternals`. */
@@ -768,21 +776,34 @@ export async function getGitLabPullBlob(
 
   let ref: string;
   let blobProjectId: string;
+  let isFork = false;
   if (side === "new") {
     ref = headSha;
     // Fail closed to the target project (the one we have an owner/name slug
     // for) unless both ids are confirmed numbers and actually differ — an
     // unconfirmed id is not a safe basis for routing to a different project.
-    const isFork = sourceProjectId !== null && targetProjectId !== null && sourceProjectId !== targetProjectId;
+    isFork = sourceProjectId !== null && targetProjectId !== null && sourceProjectId !== targetProjectId;
     blobProjectId = isFork ? String(sourceProjectId) : projectId;
   } else {
     ref = baseSha;
     blobProjectId = projectId;
   }
 
-  const fileUrl = `${GITLAB_API_BASE}/projects/${blobProjectId}/repository/files/${encodeURIComponent(path)}/raw?ref=${encodeURIComponent(ref)}`;
-  const fileRes = await fetchGitLab(fileUrl, token, { accept: "*/*" });
+  const buildFileUrl = (pid: string): string =>
+    `${GITLAB_API_BASE}/projects/${pid}/repository/files/${encodeURIComponent(path)}/raw?ref=${encodeURIComponent(ref)}`;
+
+  let fileRes = await fetchGitLab(buildFileUrl(blobProjectId), token, { accept: "*/*" });
   if (!("status" in fileRes)) return { ok: false, error: fileRes.error, status: 502 };
+  if (fileRes.status === 404 && side === "new" && isFork) {
+    // A private/deleted fork can 404 on its own numeric project id even
+    // though the MR's head commit is still reachable — GitLab keeps a
+    // cross-project MR's head commit available in the *target* project via
+    // `refs/merge-requests/:iid/head`, so a same-`headSha` read against the
+    // target project usually succeeds where the fork read failed. Retry
+    // exactly once before giving up.
+    fileRes = await fetchGitLab(buildFileUrl(projectId), token, { accept: "*/*" });
+    if (!("status" in fileRes)) return { ok: false, error: fileRes.error, status: 502 };
+  }
   if (fileRes.status === 404) return { ok: false, error: "file not present on this side", status: 404 };
   if (!fileRes.ok) {
     const raw = await fileRes.text().catch(() => "");
@@ -1478,4 +1499,5 @@ export const __gitlabInternals = {
   sortItems,
   gitlabStateParams,
   contentTypeForGitLabBlobPath,
+  resetGitLabPullBlobCaches,
 };

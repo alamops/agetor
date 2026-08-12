@@ -187,23 +187,18 @@ function fetchErrorMessage(e: unknown): string {
 /** Internal fetch wrapper: absolute-URL passthrough (for pagination `next`
  *  links), 30s abort, `user-agent: agetor`, and the resolved
  *  Basic/Bearer auth header. `accept` is caller-supplied since the diff
- *  endpoint wants a permissive/plain accept rather than `application/json`.
- *  `init.redirect` defaults to the platform default (`"follow"`) when
- *  omitted; `getBitbucketPullBlob`'s merge-base redirect-sniff is the only
- *  caller that passes `"manual"`, to read a 30x `Location` header instead of
- *  transparently following it. */
+ *  endpoint wants a permissive/plain accept rather than `application/json`. */
 async function fetchBitbucket(
   pathOrUrl: string,
   creds: BitbucketCreds | null,
   accept: string,
-  init?: { method?: string; body?: string; redirect?: "follow" | "manual" },
+  init?: { method?: string; body?: string },
 ): Promise<Response | BitbucketError> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), BITBUCKET_FETCH_TIMEOUT_MS);
   try {
     return await fetch(resolveUrl(pathOrUrl), {
       method: init?.method,
-      redirect: init?.redirect,
       signal: controller.signal,
       headers: {
         accept,
@@ -803,14 +798,21 @@ function cacheBitbucketPullDetail(key: string, entry: BitbucketPullDetailCacheEn
 }
 
 /** Merge-base sha cache for the "old" side of a PR blob fetch, keyed
- *  `${remoteHost}/${owner}/${name}#${number}@${sourceSha}` — mirrors
+ *  `${remoteHost}/${owner}/${name}@${sourceSha}..${destSha}` — mirrors
  *  github.ts's `mergeBaseCache` (no TTL: a resolved merge-base commit is
- *  immutable once computed, unlike the PR detail above). Only successful
- *  resolutions are cached; a failed redirect-sniff (see
- *  `extractMergeBaseFromDiffLocation`) is re-attempted on the next request
- *  rather than being cached as a permanent miss. */
+ *  immutable once computed, unlike the PR detail above). Keyed on the sha
+ *  pair rather than the PR number since the merge-base of two commits is a
+ *  pure function of the commit graph, not of which PR asked for it — lets a
+ *  re-request for the same PR (or a different PR between the same two
+ *  branches) reuse the same cache entry. Only successful resolutions are
+ *  cached; a failed lookup is re-attempted on the next request rather than
+ *  being cached as a permanent miss. */
 const bitbucketMergeBaseCache = new Map<string, string>();
 const BITBUCKET_MERGE_BASE_CACHE_LIMIT = 200;
+
+function bitbucketMergeBaseCacheKey(repo: ProviderRepoInfo, sourceSha: string, destSha: string): string {
+  return `${repo.remoteHost}/${repo.owner}/${repo.name}@${sourceSha}..${destSha}`;
+}
 
 function cacheBitbucketMergeBase(key: string, sha: string): void {
   if (bitbucketMergeBaseCache.size >= BITBUCKET_MERGE_BASE_CACHE_LIMIT && !bitbucketMergeBaseCache.has(key)) {
@@ -820,63 +822,56 @@ function cacheBitbucketMergeBase(key: string, sha: string): void {
 }
 
 /**
- * Extracts a merge-base sha candidate from the `Location` header of a
- * `.../pullrequests/:id/diff` response fetched with `redirect: "manual"`.
- * Bitbucket 30x-redirects that endpoint to a fully-resolved diff spec that
- * embeds both the source and destination commits it computed the (merge-base
- * -anchored, three-dot) diff against — the exact shape isn't documented
- * (something like `.../diff/{workspace}/{slug}:{sourceSha}%0D{destSpec}` or a
- * `{source}..{dest}`-style path segment), so this parses defensively: pull
- * every 7-40 char hex run out of the Location, drop any that match the known
- * `sourceSha` (by exact match or hex-prefix, either direction — Bitbucket may
- * echo an abbreviated hash), and de-duplicate what's left. Exactly one
- * surviving candidate is treated as the merge base; zero or two-or-more means
- * the heuristic can't tell which one it is (nothing recognizable, or an
- * ambiguous Location shape), so it gives up and returns null rather than
- * guessing wrong — the caller falls back to `destination.commit.hash` in
- * that case. Pure — exported via `__bitbucketInternals` for unit testing.
+ * Resolves the merge-base sha for the "old" side of a PR blob fetch via
+ * Bitbucket Cloud's documented merge-base endpoint (REST api-group-commits):
+ * `GET {repoBasePath}/merge-base/{sourceSha}..{destSha}` (accept:
+ * application/json) → `{ hash: string, ... }`, where `hash` is the best
+ * common ancestor of the two commits. Returns null — never `destSha` itself —
+ * on any transport failure, non-2xx response, or unparseable/missing `hash`,
+ * so the caller applies the documented `destination.commit.hash`
+ * approximation itself and can tell resolver success from fallback. This also
+ * covers cross-repo PRs where the destination repo may not hold the source
+ * commit at all (a fork that's since diverged or been deleted) — the
+ * merge-base lookup simply fails and the caller falls back the same way.
+ * Cached only on success — see `bitbucketMergeBaseCache`. The response body
+ * is always consumed (via `.json()`) before returning, on both the success
+ * and the parse-failure path, so no fetch ever leaves an unconsumed body
+ * behind.
  */
-function extractMergeBaseFromDiffLocation(location: string, sourceSha: string): string | null {
-  const hexRun = /\b[0-9a-f]{7,40}\b/gi;
-  const matches = location.match(hexRun) ?? [];
-  const sourceLower = sourceSha.toLowerCase();
-  const candidates = new Set(
-    matches
-      .map((m) => m.toLowerCase())
-      .filter((m) => m !== sourceLower && !m.startsWith(sourceLower) && !sourceLower.startsWith(m)),
-  );
-  return candidates.size === 1 ? [...candidates][0] ?? null : null;
-}
-
-/** Resolves the merge-base sha for the "old" side of a PR blob fetch:
- *  primary strategy is the redirect-sniff (`extractMergeBaseFromDiffLocation`)
- *  against the `.../diff` endpoint's 30x `Location`; returns null (not the
- *  fallback sha) when the sniff fails so the caller can apply the documented
- *  `destination.commit.hash` approximation itself and know which path was
- *  taken. Cached only on success — see `bitbucketMergeBaseCache`. */
 async function resolveBitbucketMergeBase(
   repo: ProviderRepoInfo,
-  number: number,
   sourceSha: string,
+  destSha: string,
   creds: BitbucketCreds | null,
 ): Promise<string | null> {
-  const cacheKey = `${repo.remoteHost}/${repo.owner}/${repo.name}#${number}@${sourceSha}`;
+  const cacheKey = bitbucketMergeBaseCacheKey(repo, sourceSha, destSha);
   const cached = bitbucketMergeBaseCache.get(cacheKey);
   if (cached) return cached;
 
   const res = await fetchBitbucket(
-    `${repoBasePath(repo)}/pullrequests/${number}/diff`,
+    `${repoBasePath(repo)}/merge-base/${encodeURIComponent(`${sourceSha}..${destSha}`)}`,
     creds,
-    "*/*",
-    { redirect: "manual" },
+    "application/json",
   );
   if (!("status" in res)) return null;
-  const location = res.headers.get("location");
-  if (!location) return null;
-  const candidate = extractMergeBaseFromDiffLocation(location, sourceSha);
-  if (!candidate) return null;
-  cacheBitbucketMergeBase(cacheKey, candidate);
-  return candidate;
+  if (!res.ok) {
+    await res.json().catch(() => null); // consume body; error is non-actionable here, caller falls back
+    return null;
+  }
+  const json = await res.json().catch(() => null);
+  const hash = json && typeof json === "object" ? (json as Record<string, unknown>).hash : null;
+  if (typeof hash !== "string" || !hash) return null;
+  cacheBitbucketMergeBase(cacheKey, hash);
+  return hash;
+}
+
+/** Clears both `getBitbucketPullBlob` caches (PR detail + merge base).
+ *  Test-only affordance — exported via `__bitbucketInternals` so network
+ *  tests can `beforeEach` a clean slate rather than relying on distinct
+ *  fixture shas per test to dodge cross-test cache hits. */
+function resetBitbucketPullBlobCaches(): void {
+  bitbucketPullDetailCache.clear();
+  bitbucketMergeBaseCache.clear();
 }
 
 /** Builds a `ProviderRepoInfo` for a PR side's `full_name` (`"workspace/
@@ -913,19 +908,24 @@ function srcUrl(repo: ProviderRepoInfo, ref: string, filePath: string): string {
  * through `git-host.ts`'s `pullBlob`.
  *
  * - `side: "new"` reads the file at `source.commit.hash`, from the *source*
- *   repository (a fork for a cross-repo PR).
- * - `side: "old"` reads the file at the PR's merge-base commit — Bitbucket's
- *   PR diff (`getBitbucketPullDiff`, same `.../diff` endpoint) is three-dot
- *   (merge-base-anchored), and there is no official merge-base endpoint to
- *   resolve it directly. This fetches it two ways: primary is a
- *   redirect-sniff against the diff endpoint itself
- *   (`resolveBitbucketMergeBase`); when that fails (no Location header, or
- *   an ambiguous/unparseable one), it falls back to
- *   `destination.commit.hash` — an **approximation** that drifts if the
- *   destination branch has moved (and touched the same file) since the PR
- *   diverged from it, the same "approximated" tone this module already uses
- *   for `mergedAt`/`closedAt`. The old side is read from the *destination*
- *   repository either way.
+ *   repository (a fork for a cross-repo PR). If the source repository's
+ *   `full_name` is missing/unparseable — the fork was deleted, or the API
+ *   simply omitted it — this returns 404 rather than silently falling back to
+ *   the destination repo: the destination almost certainly does not contain
+ *   the file at the fork-only commit, so a silent fallback would either 404
+ *   anyway or, worse, return the *wrong* file's bytes under the right path.
+ * - `side: "old"` reads the file at the PR's merge-base commit, resolved via
+ *   Bitbucket Cloud's documented merge-base endpoint
+ *   (`resolveBitbucketMergeBase`, `GET .../merge-base/{sourceSha}..{destSha}`
+ *   → `{hash}`). When the resolver fails (network error, non-2xx, or a
+ *   missing/unparseable `hash` — including the cross-repo case where the
+ *   destination repo doesn't share history with a since-diverged fork), this
+ *   falls back to `destination.commit.hash` — an **approximation** that
+ *   drifts if the destination branch has moved (and touched the same file)
+ *   since the PR diverged from it, the same "approximated" tone this module
+ *   already uses for `mergedAt`/`closedAt`. The old side is read from the
+ *   *destination* repository either way (`?? repo` fallback is fine here —
+ *   destination is the correct default when `destRepoFullName` is missing).
  *
  * Bytes come from the Source API (`GET .../src/{ref}/{path}`), which returns
  * raw file content directly (no base64 envelope). Size is checked twice: from
@@ -935,6 +935,14 @@ function srcUrl(repo: ProviderRepoInfo, ref: string, filePath: string): string {
  * `content-length`) — same double-guard as `getGitHubPullBlob`, against
  * `MAX_BLOB_PREVIEW_BYTES` (not `BITBUCKET_DIFF_BODY_CAP_BYTES`, which bounds
  * the unified diff text, a different budget from a single file's bytes).
+ *
+ * On the "old" side, a resolved (and possibly cached) merge base is never
+ * trusted blindly: if the `/src/{ref}/{path}` fetch 404s with `ref` set to a
+ * resolver-supplied sha (not `destSha`), the merge-base cache entry for this
+ * sha pair is evicted and the fetch is retried exactly once against
+ * `destSha` before surfacing a 404 to the caller. This keeps a stale or
+ * simply-wrong cached/resolved merge base from permanently breaking every
+ * old-side preview of a PR — a subsequent request re-resolves from scratch.
  *
  * No short-circuit on missing credentials: like every other read in this
  * module (`getBitbucketPullDiff`, `getBitbucketPullChecks`, …), a public
@@ -1004,18 +1012,36 @@ export async function getBitbucketPullBlob(
   let blobRepo: ProviderRepoInfo;
   let ref: string;
   if (side === "new") {
-    blobRepo = bitbucketRepoFromFullName(sourceRepoFullName, repo) ?? repo;
+    const sourceRepo = bitbucketRepoFromFullName(sourceRepoFullName, repo);
+    if (!sourceRepo) {
+      return {
+        ok: false,
+        error: "the source repository for this pull request is unavailable (the fork may have been deleted)",
+        status: 404,
+      };
+    }
+    blobRepo = sourceRepo;
     ref = sourceSha;
   } else {
     blobRepo = bitbucketRepoFromFullName(destRepoFullName, repo) ?? repo;
-    const mergeBase = await resolveBitbucketMergeBase(repo, number, sourceSha, creds);
+    const mergeBase = await resolveBitbucketMergeBase(repo, sourceSha, destSha, creds);
     // Fallback: `destination.commit.hash` approximation — see this
     // function's doc comment.
     ref = mergeBase ?? destSha;
   }
 
-  const fileRes = await fetchBitbucket(srcUrl(blobRepo, ref, path), creds, "*/*");
+  let fileRes = await fetchBitbucket(srcUrl(blobRepo, ref, path), creds, "*/*");
   if (!("status" in fileRes)) return { ok: false, error: fileRes.error, status: 502 };
+  if (fileRes.status === 404 && side === "old" && ref !== destSha) {
+    // The resolved (and possibly cached) merge base doesn't actually have
+    // this file — evict the stale/wrong cache entry and retry once against
+    // the documented destSha approximation before giving up. See this
+    // function's doc comment.
+    bitbucketMergeBaseCache.delete(bitbucketMergeBaseCacheKey(repo, sourceSha, destSha));
+    ref = destSha;
+    fileRes = await fetchBitbucket(srcUrl(blobRepo, ref, path), creds, "*/*");
+    if (!("status" in fileRes)) return { ok: false, error: fileRes.error, status: 502 };
+  }
   if (fileRes.status === 404) return { ok: false, error: "file not present on this side", status: 404 };
   if (!fileRes.ok) {
     const raw = await fileRes.text().catch(() => "");
@@ -1708,7 +1734,6 @@ export const __bitbucketInternals = {
   normalizeBitbucketLineComment,
   normalizeBitbucketCheckRun,
   normalizeBitbucketMergeability,
-  extractMergeBaseFromDiffLocation,
   bitbucketRepoFromFullName,
   scanBitbucketDiffstatConflicts,
   escapeBBQLString,
@@ -1718,6 +1743,7 @@ export const __bitbucketInternals = {
   buildIssuesBBQL,
   sortParam,
   bitbucketViewerUuid,
+  resetBitbucketPullBlobCaches,
   BITBUCKET_OPEN_ISSUE_STATES,
   BITBUCKET_CHECK_STATE_MAP,
   BITBUCKET_MERGE_STRATEGY,

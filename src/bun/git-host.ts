@@ -433,10 +433,20 @@ export async function pullBlob(input: PullBlobOpts): Promise<PullBlobResult> {
   if (!isSafeRelPath(input.path)) {
     return { ok: false, error: "invalid path", status: 400 };
   }
-  if (repoInfo.provider === "github") return getGitHubPullBlob(input);
-  return repoInfo.provider === "gitlab"
-    ? getGitLabPullBlob(repoInfo, input.number, input.path, input.side)
-    : getBitbucketPullBlob(repoInfo, input.number, input.path, input.side);
+  switch (repoInfo.provider) {
+    case "github":
+      return getGitHubPullBlob(input);
+    case "gitlab":
+      return getGitLabPullBlob(repoInfo, input.number, input.path, input.side);
+    case "bitbucket":
+      return getBitbucketPullBlob(repoInfo, input.number, input.path, input.side);
+    default: {
+      // Exhaustiveness check: a future fourth provider fails typecheck here
+      // instead of silently falling through to bitbucket.
+      const _exhaustive: never = repoInfo.provider;
+      return { ok: false, status: 501, error: "binary preview not supported for this provider yet" };
+    }
+  }
 }
 
 /**

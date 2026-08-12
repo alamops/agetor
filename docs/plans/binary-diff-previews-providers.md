@@ -26,7 +26,11 @@ so one `TaskDiff` no longer mixes path namespaces. Typecheck + unit + e2e stay g
   lives in `source_project_id` (numeric id valid as :id).
 - Bitbucket: auth Basic/Bearer via fetchBitbucket (bitbucket.ts:190-215); raw file: GET /2.0/
   repositories/{ws}/{slug}/src/{commit}/{path} returns raw bytes (docs confirmed). PR diff is
-  merge-base-anchored (three-dot; Atlassian blog confirmed) but NO official merge-base endpoint.
+  merge-base-anchored (three-dot; Atlassian blog confirmed). CORRECTION (Phase-5 review): an
+  official merge-base endpoint DOES exist — GET /2.0/repositories/{ws}/{slug}/merge-base/
+  {sha1..sha2} returns the best common ancestor commit (api-group-commits docs). The original
+  "no endpoint" fact was an investigation miss; §3.2's redirect-sniff was rebuilt on the
+  documented endpoint in the review-fix wave.
   PR detail carries source.commit.hash / destination.commit.hash (source read at :953, :1093).
   Cross-repo: source/destination repository full_names read in normalizeBitbucketMergeability.
 - github.ts getGitHubPullBlob (:1710-1940) is the structural template (pullDetailCache 60s TTL,
@@ -95,7 +99,13 @@ Wave 1: A, B, C (disjoint). Wave 2: D. Review (opus) → test task E → full ru
 - GitLab raw-file rate limit (5/min for >10MB blobs) — acceptable for modal-scoped fetches.
 
 ## 8. Open questions / assumptions (autonomous mode)
-1. Bitbucket redirect-Location parse is best-effort; destination-tip fallback accepted. — decision
+1. ~~Bitbucket redirect-Location parse~~ SUPERSEDED by review: merge base resolved via the
+   official /merge-base/{revspec} endpoint; destination-tip fallback retained for resolver
+   failure (incl. cross-repo edge cases); cache validated by retry-on-404. — decision (revised)
+1b. `/github/pull-blob` route name now serves all three providers — kept deliberately (renaming
+   would churn the URL builder + tests for a cosmetic win); recorded here so it reads as a
+   decision, not a bug. The GitHubDialog "mixed"-provider exclusion is conservative, not
+   required (itemPath is per-item) — left as-is. — decision
 2. Bitbucket commit-hash length unverified in docs; we pass through whatever the API returns
    (src/{commit}/ accepts either). — assumption
 3. GitLab fork-MR new-side routing via numeric source_project_id. — assumption (doc-supported)

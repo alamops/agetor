@@ -920,6 +920,7 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
   // full additions via --no-index (which exits 1 when content differs).
   const listed = await git(["ls-files", "--others", "--exclude-standard", "-z"], cwd);
   if (listed.ok) {
+    const rels = listed.stdout.split("\0").filter(Boolean).slice(0, MAX_UNTRACKED);
     // `ls-files` (and the `--no-index` diff below) run in `cwd`, so `rel` is
     // CWD-relative — but tracked entries from `git diff <base>` above are
     // repo-ROOT-relative. For an isolation=none task whose workdir is a repo
@@ -928,20 +929,33 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
     // Normalize by prefixing the root→cwd path segment onto the emitted
     // DiffFile.path only; the `--no-index` invocation itself keeps using the
     // cwd-relative `rel`, since that's what exists relative to the cwd git
-    // runs in. `path.relative` already returns forward-slash segments on
-    // POSIX (this app is macOS-only per CLAUDE.md), so no join-separator
-    // normalization is needed beyond a defensive backslash guard.
+    // runs in. `path.sep` is "/" here (this app is macOS-only per
+    // CLAUDE.md), so the split/join below is a no-op — kept only for
+    // symmetry with the `path.relative` call it normalizes, not because it
+    // does any actual backslash conversion (a backslash is a legal macOS
+    // filename char, so it must never be rewritten).
     //
     // `repoRoot` reports git's canonicalized path (symlinks resolved, e.g.
     // `/tmp` → `/private/tmp` on macOS — see `gitWritableRootsSync`'s doc
     // comment for the same gotcha), so diffing it against a non-canonical
     // `cwd` would spuriously produce a non-empty prefix even when cwd IS the
-    // root. Realpath `cwd` first to compare like-for-like.
-    const root = await repoRoot(cwd);
-    let realCwd = cwd;
-    try { realCwd = realpathSync(cwd); } catch { /* cwd missing — compare as-is */ }
-    const prefix = root ? path.relative(root, realCwd).split(path.sep).join("/") : "";
-    const rels = listed.stdout.split("\0").filter(Boolean).slice(0, MAX_UNTRACKED);
+    // root. Realpath `cwd` first to compare like-for-like. Skipped entirely
+    // when there are no untracked files to prefix — avoids paying a git
+    // spawn + realpathSync in the common zero-untracked case.
+    let prefix = "";
+    if (rels.length > 0) {
+      const root = await repoRoot(cwd);
+      let realCwd = cwd;
+      try { realCwd = realpathSync(cwd); } catch { /* cwd missing — compare as-is */ }
+      const rawPrefix = root ? path.relative(root, realCwd).split(path.sep).join("/") : "";
+      // GIT_WORK_TREE/bind-mount exotics can leave git's toplevel not a
+      // prefix of realpath(cwd), in which case `path.relative` returns a
+      // `..`-leading escape. A `../`-prefixed DiffFile.path would be
+      // rejected by isSafeRelPath downstream and permanently break that
+      // file's preview with no diagnostic — fall back to the old no-prefix
+      // behavior instead of emitting an escaping path.
+      prefix = rawPrefix.startsWith("..") ? "" : rawPrefix;
+    }
     for (const rel of rels) {
       const res = await git(["diff", "--no-color", "--no-index", "--", "/dev/null", rel], cwd);
       if (res.exitCode !== 0 && res.exitCode !== 1) continue;
