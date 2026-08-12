@@ -33,6 +33,30 @@ export const USAGE_PROVIDERS: Partial<Record<AgentKind, (h: Harness) => Promise<
   cursor: fetchCursorQuota,
 };
 
+// ── Test seam ────────────────────────────────────────────────────────────
+// Real providers hit the network/keychain, so tests can't exercise this
+// module's orchestration (freshness floor, force bypass, in-flight guard,
+// upsert, broadcast) against them hermetically. `resolveProvider` is the
+// single choke point `refreshOne`/`pollAllUsage` use to look up a kind's
+// provider; tests substitute a fake via `__setUsageProviderForTest` without
+// touching `USAGE_PROVIDERS` itself. With an empty override map (the default
+// in production), `resolveProvider` is byte-for-byte equivalent to reading
+// `USAGE_PROVIDERS[kind]` directly.
+const providerOverrides = new Map<AgentKind, (h: Harness) => Promise<HarnessQuota>>();
+
+function resolveProvider(kind: AgentKind): ((h: Harness) => Promise<HarnessQuota>) | undefined {
+  return providerOverrides.get(kind) ?? USAGE_PROVIDERS[kind];
+}
+
+/** Test-only: override the provider for a kind (pass null to clear). Never use in production. */
+export function __setUsageProviderForTest(
+  kind: AgentKind,
+  fn: ((h: Harness) => Promise<HarnessQuota>) | null,
+): void {
+  if (fn) providerOverrides.set(kind, fn);
+  else providerOverrides.delete(kind);
+}
+
 /**
  * Refresh (or return the cached) `HarnessQuota` snapshot for one harness.
  *
@@ -59,7 +83,7 @@ export async function refreshOne(
   const harness = harnesses.getByIdOrKind(harnessId);
   if (!harness || !harness.enabled) return null;
 
-  const provider = USAGE_PROVIDERS[harness.kind];
+  const provider = resolveProvider(harness.kind);
   if (!provider) return null;
 
   if (!opts?.force) {
