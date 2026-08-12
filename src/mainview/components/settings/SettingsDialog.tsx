@@ -15,6 +15,7 @@ import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { useFontSize } from "@/components/font-size-provider";
 import { useTheme } from "@/components/theme-provider";
 import { isMacPlatform } from "@/lib/font-size";
+import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
   SETTINGS_SECTIONS,
@@ -616,6 +617,7 @@ function GeneralSection({
   const canDecreaseFontSize = fontSizePercent > FONT_SIZE_MIN;
   const canIncreaseFontSize = fontSizePercent < FONT_SIZE_MAX;
   const canResetFontSize = fontSizePercent !== FONT_SIZE_DEFAULT;
+  const [replayingOnboarding, setReplayingOnboarding] = useState(false);
   return (
     <div className="space-y-4 pt-3 text-sm">
       <section className="space-y-1">
@@ -729,16 +731,20 @@ function GeneralSection({
             variant="outline"
             size="sm"
             data-testid="settings-replay-onboarding"
-            onClick={() => {
-              // "onboardingDismissed" mirrors ONBOARDING_DISMISSED_PREF in
-              // lib/onboarding.ts (kept inline since that module may not
-              // exist yet when this file is authored — do not import it).
-              void api.setPreference("onboardingDismissed", "false").catch(() => {
+            disabled={replayingOnboarding}
+            onClick={async () => {
+              if (replayingOnboarding) return;
+              setReplayingOnboarding(true);
+              // Await the write before closing — App re-reads preferences on
+              // close, so a fire-and-forget PUT can lose the race against
+              // that GET and silently discard the replay.
+              await api.setPreference(ONBOARDING_DISMISSED_PREF, "false").catch(() => {
                 // Best-effort, matching the theme/defaultHarness write idiom
                 // above — the checklist will simply not reappear if this
                 // silently fails, which is a minor papercut, not a hard
                 // error worth surfacing.
               });
+              setReplayingOnboarding(false);
               onClose();
             }}
           >
@@ -746,7 +752,7 @@ function GeneralSection({
           </Button>
         </div>
         <p className="text-[11px] text-muted-foreground">
-          Bring back the welcome tour and the onboarding checklist.
+          Bring back the onboarding checklist.
         </p>
       </section>
     </div>

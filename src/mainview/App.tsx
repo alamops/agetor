@@ -147,7 +147,7 @@ function reconcileById<T>(
  *  have no entry — an empty Review/Done column needs no explanation. */
 const EMPTY_COLUMN_HINT: Partial<Record<ColumnId, string>> = {
   backlog: "Ideas you haven't queued yet",
-  ready: "Waiting for you to press Run",
+  ready: "Tasks return here when a run needs another go",
   running: "Agents working right now",
   blocked: "Needs your attention",
 };
@@ -195,6 +195,13 @@ function AppInner() {
   // the welcome dialog for a beat before the first real fetch lands (same
   // class of bug the boot-splash minimum-dwell guards against elsewhere).
   const [tasksLoaded, setTasksLoaded] = useState(false);
+  // First successful `/projects` fetch — mirrors `tasksLoaded`/
+  // `harnessesLoaded`. Onboarding's "project" step needs a live projects
+  // list (added mid-session via NewTaskForm) to ever be able to check off,
+  // and gating on this (rather than assuming the boot-time fetch is enough)
+  // keeps the compact-strip flash guard consistent: a transient poll
+  // failure just delays onboarding rather than flashing it early.
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
   // "Get started" in WelcomeDialog is session-only (doesn't write the
   // server pref) — only "Skip" and the checklist's own dismiss persist.
   const [welcomeAcknowledged, setWelcomeAcknowledged] = useState(false);
@@ -324,14 +331,30 @@ function AppInner() {
   const refreshAgentModels = useCallback(async () => {
     try { setAgentModels(await api.listAgentModels()); } catch { /* leave previous state */ }
   }, []);
+  // Per-project serialized-form cache for `reconcileById` below, mirroring
+  // `taskReconcileCacheRef` — keeps `projects` referentially stable across
+  // polls where nothing actually changed.
+  const projectReconcileCacheRef = useRef(new Map<string, { obj: Project; json: string }>());
+  /** Re-list projects. GET /projects is a cheap DB read, so this rides the
+   *  same 2s poll as `refresh()` — projects added mid-session via
+   *  NewTaskForm now show up without a reload, which onboarding's "project"
+   *  step depends on to ever be able to check off. */
+  const refreshProjects = useCallback(async () => {
+    try {
+      const list = await api.listProjects();
+      setProjects((prev) => reconcileById(prev, list, (p) => p.path, projectReconcileCacheRef.current));
+      // Gates onboarding visibility (see `resolveOnboardingVisibility`'s
+      // `loaded` input) — set unconditionally on every success, cheap no-op
+      // once already true. A transient failure just delays onboarding
+      // (the poll retries), which is the safe direction.
+      setProjectsLoaded(true);
+    } catch { /* leave previous state; poll retries */ }
+  }, []);
   useEffect(() => {
     void refresh();
     void refreshAgents();
     void refreshAgentModels();
-    // Load projects once for the repo filter picker. New projects added
-    // mid-session via NewTaskForm won't show up until reload — matches the
-    // session-only filter persistence model.
-    api.listProjects().then(setProjects).catch(() => { /* leave empty */ });
+    void refreshProjects();
     // Resolve the user's home dir once so SettingsDialog can expand `~/…`
     // template paths into concrete absolute paths before validation.
     // `/defaults` is small + local, but a hiccup at boot would now leave
@@ -364,11 +387,17 @@ function AppInner() {
     // gate the poll" change without an immediate on-return refresh would
     // reintroduce the same class of "frozen until you nudge the window"
     // bug previously fixed there.
-    const t = setInterval(() => { if (!document.hidden) void refresh(); }, 2000);
+    const t = setInterval(() => {
+      if (!document.hidden) {
+        void refresh();
+        void refreshProjects();
+      }
+    }, 2000);
     const a = setInterval(() => { if (!document.hidden) void refreshAgents(); }, 15_000);
     const onVisible = () => {
       if (document.hidden) return;
       void refresh();
+      void refreshProjects();
       void refreshAgents();
     };
     document.addEventListener("visibilitychange", onVisible);
@@ -380,7 +409,7 @@ function AppInner() {
       window.removeEventListener("focus", onVisible);
       if (defaultsTimer) clearTimeout(defaultsTimer);
     };
-  }, [refresh, refreshAgents, refreshAgentModels]);
+  }, [refresh, refreshAgents, refreshAgentModels, refreshProjects]);
 
   // Keep the selected task in sync as the list refreshes.
   useEffect(() => {
@@ -645,12 +674,25 @@ function AppInner() {
   const onboardingVisibility = useMemo(
     () => resolveOnboardingVisibility({
       dismissedPref: onboardingDismissedPref,
-      loaded: prefsLoaded && tasksLoaded,
+      // All four sources the derivation reads from (prefs, tasks, harnesses,
+      // projects) must have resolved at least once — otherwise the checklist
+      // can flash the compact "some steps missing" strip for an existing
+      // user whose harnesses/projects just haven't loaded yet on a slow boot.
+      loaded: prefsLoaded && tasksLoaded && harnessesLoaded && projectsLoaded,
       steps: onboardingSteps,
       taskCount: tasks.length,
       welcomeAcknowledged,
     }),
-    [onboardingDismissedPref, prefsLoaded, tasksLoaded, onboardingSteps, tasks.length, welcomeAcknowledged],
+    [
+      onboardingDismissedPref,
+      prefsLoaded,
+      tasksLoaded,
+      harnessesLoaded,
+      projectsLoaded,
+      onboardingSteps,
+      tasks.length,
+      welcomeAcknowledged,
+    ],
   );
   // Existing-user upgrade path: write the dismissal pref once, the instant
   // `resolveOnboardingVisibility` signals every step already derives as
@@ -1015,10 +1057,44 @@ function AppInner() {
           {/* Kanban gets all remaining vertical space and scrolls horizontally
               on its own — the bottom bar stays anchored regardless of column
               count. */}
-          <div className="kanban-scroll relative flex-1 overflow-x-scroll">
+          {/* Outer positioning context lives OUTSIDE the horizontal
+              scroller: the zero-task overlay below is absolutely positioned
+              against this div, not `.kanban-scroll`, so scrolling the board
+              horizontally can't carry the card off-screen with it (an
+              abs-positioned descendant of a scrolling containing block
+              scrolls along with it — the previous bug). */}
+          <div className="relative flex-1">
+            <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
+              <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+                <div className="flex gap-3 p-4">
+                  {visibleColumns.map((c) => (
+                    <Column
+                      key={c.id}
+                      id={c.id}
+                      label={c.label}
+                      tasks={visibleTasks.filter((t) => t.column === c.id)}
+                      homeDir={homeDir}
+                      onStart={start}
+                      onCancel={cancel}
+                      onDelete={del}
+                      onOpen={setSelected}
+                      onDiff={setDiffTask}
+                      onMarkDone={markDone}
+                      onArchive={archive}
+                      onUnarchive={unarchive}
+                      emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
+                    />
+                  ))}
+                </div>
+              </DndContext>
+            </div>
             {/* Zero-task state: the full onboarding card sits above the
                 (still-visible, still-empty) column grid rather than
-                replacing it — dnd-kit's drop zones stay mounted underneath. */}
+                replacing it — dnd-kit's drop zones stay mounted underneath.
+                Positioned against the outer `relative flex-1` div (a sibling
+                of `.kanban-scroll`, not a descendant of it), so it stays
+                visually centered over the viewport regardless of how far
+                the board is scrolled horizontally. */}
             {onboardingVisibility.showChecklist && tasks.length === 0 && (
               <div className="pointer-events-none absolute inset-x-0 top-6 z-10 flex justify-center px-4">
                 <div className="pointer-events-auto">
@@ -1035,28 +1111,6 @@ function AppInner() {
                 </div>
               </div>
             )}
-            <DndContext sensors={sensors} onDragEnd={onDragEnd}>
-              <div className="flex gap-3 p-4">
-                {visibleColumns.map((c) => (
-                  <Column
-                    key={c.id}
-                    id={c.id}
-                    label={c.label}
-                    tasks={visibleTasks.filter((t) => t.column === c.id)}
-                    homeDir={homeDir}
-                    onStart={start}
-                    onCancel={cancel}
-                    onDelete={del}
-                    onOpen={setSelected}
-                    onDiff={setDiffTask}
-                    onMarkDone={markDone}
-                    onArchive={archive}
-                    onUnarchive={unarchive}
-                    emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
-                  />
-                ))}
-              </div>
-            </DndContext>
           </div>
         </main>
       </div>

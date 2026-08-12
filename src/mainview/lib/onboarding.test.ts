@@ -253,7 +253,7 @@ test("resolveOnboardingVisibility: replay ('false') shows checklist but never th
   expect(result.autoDismiss).toBe(false);
 });
 
-test("resolveOnboardingVisibility: replay stays non-autoDismiss even if all steps happen to be done", () => {
+test("resolveOnboardingVisibility: replay stays visible (not a no-op) even when all steps happen to be done", () => {
   const allDoneSteps: OnboardingStep[] = [
     { id: "harness", done: true },
     { id: "project", done: true },
@@ -268,9 +268,27 @@ test("resolveOnboardingVisibility: replay stays non-autoDismiss even if all step
     welcomeAcknowledged: false,
   });
   expect(result.autoDismiss).toBe(false);
-  // allDone means the checklist has nothing left to show either.
-  expect(result.showChecklist).toBe(false);
+  // Replay must force the checklist visible even though allDone — otherwise
+  // replaying onboarding for a fully set-up board would be a silent no-op.
+  expect(result.showChecklist).toBe(true);
   expect(result.showWelcome).toBe(false);
+});
+
+test("resolveOnboardingVisibility: dismissing again after a replay ('true') hides the checklist even if all steps are done", () => {
+  const allDoneSteps: OnboardingStep[] = [
+    { id: "harness", done: true },
+    { id: "project", done: true },
+    { id: "task", done: true },
+    { id: "run", done: true },
+  ];
+  const result = resolveOnboardingVisibility({
+    dismissedPref: "true",
+    loaded: true,
+    steps: allDoneSteps,
+    taskCount: 5,
+    welcomeAcknowledged: false,
+  });
+  expect(result).toEqual({ showWelcome: false, showChecklist: false, autoDismiss: false });
 });
 
 // --- resolveOnboardingVisibility: fresh user (pref undefined) --------------

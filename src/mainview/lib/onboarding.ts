@@ -71,6 +71,11 @@ export interface OnboardingVisibility {
  * this session, and the pref has never been set at all. A replay (pref
  * explicitly `"false"`) shows the checklist but skips the welcome dialog —
  * the user has already seen the intro once.
+ *
+ * Replay forces the checklist visible even when every step already derives
+ * as done — the whole point of replaying is to look at it again, so "all
+ * done" must not make it a no-op. Dismissing again (pref back to `"true"`)
+ * hides it as usual.
  */
 export function resolveOnboardingVisibility(input: {
   dismissedPref: string | undefined;
@@ -86,11 +91,12 @@ export function resolveOnboardingVisibility(input: {
   }
 
   const dismissed = dismissedPref === "true";
+  const replaying = dismissedPref === "false";
   const allDone = steps.every((step) => step.done);
   const prefUnset = dismissedPref === undefined;
 
   const autoDismiss = prefUnset && allDone;
-  const showChecklist = !dismissed && !allDone;
+  const showChecklist = loaded && (replaying || (!dismissed && !allDone));
   const showWelcome = showChecklist && taskCount === 0 && !welcomeAcknowledged && prefUnset;
 
   return { showWelcome, showChecklist, autoDismiss };

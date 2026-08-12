@@ -123,11 +123,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
     prevFocusNonceRef.current = focusNonce;
     if (focusNonce === undefined || focusNonce === prev) return;
     // Expand exactly like the collapse toggle button does, so the persisted
-    // preference and the in-memory state agree.
-    setCollapsed((c) => {
-      if (c) writeCollapsed(NEW_TASK_PANEL_COLLAPSED_KEY, false);
-      return false;
-    });
+    // preference and the in-memory state agree — the effect above persists
+    // on `[collapsed]` change, so no separate write is needed here.
+    setCollapsed(false);
     // Expansion may need a paint before the Title input exists/lays out —
     // defer the focus by a frame (same idiom as RunPanel's post-open focus).
     requestAnimationFrame(() => {

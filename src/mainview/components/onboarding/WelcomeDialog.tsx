@@ -44,13 +44,12 @@ export function WelcomeDialog({ open, onAcknowledge, onSkip }: Props) {
             and a coding agent — Claude Code, Codex, Cursor, or Gemini.
           </p>
           <p>
-            Run a task and its card moves itself across the board — from{" "}
-            <span className="text-foreground">Backlog</span> to{" "}
-            <span className="text-foreground">Ready</span> to{" "}
-            <span className="text-foreground">Running</span> to{" "}
-            <span className="text-foreground">Review</span> or{" "}
-            <span className="text-foreground">Done</span> — while the agent's output streams
-            live in the run panel.
+            Run it and the card moves to <span className="text-foreground">Running</span> while
+            the agent's output streams live; it lands in{" "}
+            <span className="text-foreground">Review</span> when the agent finishes (or{" "}
+            <span className="text-foreground">Blocked</span> / back to{" "}
+            <span className="text-foreground">Ready</span> if something goes wrong), and you
+            mark it <span className="text-foreground">Done</span>.
           </p>
           <p>
             The checklist that's about to appear walks through the handful of things a fresh

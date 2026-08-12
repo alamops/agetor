@@ -34,12 +34,13 @@ const STEP_LABEL: Record<OnboardingStepId, string> = {
 /** Exact login command per harness kind — shown in the harness step's login
  *  guidance block. Kept local (not imported from SettingsDialog) since that
  *  file's `HARNESS_HOME_COPY` documents the *env var* a home override sets,
- *  not the literal login invocation. */
-const LOGIN_COMMAND: Record<AgentKind, string> = {
+ *  not the literal login invocation. Gemini is deliberately absent: `gemini`
+ *  on its own isn't a login command, it's the CLI itself — see the prose
+ *  fallback below. */
+const LOGIN_COMMAND: Partial<Record<AgentKind, string>> = {
   "claude-code": "claude /login",
   codex: "codex login",
   cursor: "cursor-agent login",
-  gemini: "gemini",
 };
 
 function StepIcon({ done, index }: { done: boolean; index: number }) {
@@ -70,6 +71,9 @@ function HarnessStepDetail({
 }) {
   const rowById = new Map((harnessRows ?? []).map((h) => [h.id, h] as const));
   const harnessesWithHome = (harnessRows ?? []).filter((h) => h.home);
+  // Only show login guidance for kinds actually present (deduped) — no point
+  // walking a user with only claude-code through codex/cursor/gemini copy.
+  const presentKinds = Array.from(new Set(statuses.map((s) => s.kind)));
 
   return (
     <div className="space-y-3 pt-2">
@@ -78,7 +82,7 @@ function HarnessStepDetail({
           const row = rowById.get(s.harnessId);
           const label = row?.label ?? s.harnessId;
           const disabled = harnessRows !== null && row ? !row.enabled : false;
-          if (disabled) {
+          if (s.available && disabled) {
             return (
               <div key={s.harnessId} className="flex items-center gap-2 text-xs">
                 <span className="inline-block size-1.5 shrink-0 rounded-full bg-muted-foreground" />
@@ -110,7 +114,7 @@ function HarnessStepDetail({
                 <span className="inline-block size-1.5 shrink-0 rounded-full bg-danger-solid" />
                 <AgentIcon kind={s.kind} className="size-3.5 shrink-0" />
                 <span className="min-w-0 flex-1 truncate text-muted-foreground">
-                  {label} — not found
+                  {label} — not found{disabled ? " — disabled" : ""}
                 </span>
               </div>
               {s.installHint && (
@@ -126,11 +130,19 @@ function HarnessStepDetail({
       <div className="space-y-1 border-t border-border/60 pt-2">
         <p className="text-[11px] text-muted-foreground">Just installed one? Log it in first:</p>
         <div className="space-y-1">
-          {(Object.keys(LOGIN_COMMAND) as AgentKind[]).map((kind) => (
-            <code key={kind} className="block rounded bg-muted px-2 py-1 font-mono text-[11px]">
-              {LOGIN_COMMAND[kind]}
-            </code>
-          ))}
+          {presentKinds.map((kind) =>
+            kind === "gemini" ? (
+              <p key={kind} className="text-[11px] text-muted-foreground">
+                Gemini: run{" "}
+                <code className="rounded bg-muted px-1 py-0.5 font-mono">gemini</code> once and
+                follow the browser sign-in.
+              </p>
+            ) : LOGIN_COMMAND[kind] ? (
+              <code key={kind} className="block rounded bg-muted px-2 py-1 font-mono text-[11px]">
+                {LOGIN_COMMAND[kind]}
+              </code>
+            ) : null,
+          )}
         </div>
       </div>
 
