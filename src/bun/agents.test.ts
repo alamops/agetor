@@ -487,6 +487,18 @@ test("codex model 'gpt-5.6-sol' passes through verbatim as --model", () => {
   ]);
 });
 
+test("codex model 'gpt-5.6-cyber' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5.6-cyber", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-5.6-cyber",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
+  ]);
+});
+
 test("codex model 'gpt-5' adds --model gpt-5", () => {
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5", mode: "auto" });
   expect(cmd).toEqual([

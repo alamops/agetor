@@ -87,7 +87,7 @@ test("codex DEFAULT_MODEL is GPT-5.6 Sol", () => {
 });
 
 test("codex GPT-5.6 family supports none through max", () => {
-  for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+  for (const model of ["gpt-5.6-cyber", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
     const ids = supportedEfforts("codex", model).map((o) => o.id);
     expect(ids).toEqual(["max", "xhigh", "high", "medium", "low", "none"]);
   }
@@ -95,7 +95,7 @@ test("codex GPT-5.6 family supports none through max", () => {
 
 test("codex model picker includes the GPT-5.6 family", () => {
   const ids = AGENT_OPTIONS.codex.models.map((m) => m.id);
-  expect(ids.slice(0, 3)).toEqual(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+  expect(ids.slice(0, 4)).toEqual(["gpt-5.6-cyber", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
 });
 
 test("codex gpt-5.5 supports xhigh but not max", () => {

@@ -1448,6 +1448,9 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "haiku-4.5": [],
   },
   codex: {
+    // Cyber's own model page doesn't enumerate efforts; assume the GPT-5.6
+    // family surface (the set Sol documents). Revisit if codex rejects none/max.
+    "gpt-5.6-cyber": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-terra": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
@@ -1558,6 +1561,7 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
+      { id: "gpt-5.6-cyber", label: "GPT-5.6 Cyber", hint: "Cybersecurity-tuned GPT-5.6. Requires OpenAI Daybreak approval on an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Recommended default — flagship GPT-5.6 capability." },
       { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model for strong performance at lower cost." },
       { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model for high-volume workloads." },
