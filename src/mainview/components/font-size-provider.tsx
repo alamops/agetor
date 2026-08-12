@@ -16,20 +16,31 @@ import {
 // ~300ms after the last press, with whatever value settled.
 const PERSIST_DEBOUNCE_MS = 300;
 
+/** Options accepted by `increase`/`decrease`/`reset`. `silent: true` suppresses
+ *  the sonner toast — used by Settings → General's stepper buttons, where the
+ *  toast's top-right, very-high-z-index surface can cover the dialog's own
+ *  Close button and eat the next click. The keyboard-shortcut path (which has
+ *  no on-screen readout to lean on) always calls `applyStep` directly and so
+ *  keeps its toast regardless of this option. */
+export interface FontSizeStepOptions {
+  silent?: boolean;
+}
+
 export interface FontSizeContextValue {
   percent: number;
   setPercent: (pct: number) => void;
-  increase: () => void;
-  decrease: () => void;
-  reset: () => void;
+  increase: (opts?: FontSizeStepOptions) => void;
+  decrease: (opts?: FontSizeStepOptions) => void;
+  reset: (opts?: FontSizeStepOptions) => void;
   /** Live mirror of `percent`, updated synchronously every render — for
    *  App.tsx's one-shot boot reconcile, which runs inside an async
    *  `.then()` callback where the `percent` value closed over at effect-
    *  registration time would otherwise be stale by the time it resolves.
    *  Not meant for general consumption; prefer `percent` in render. */
   percentRef: React.RefObject<number>;
-  /** Flips to `true` the first time the user fires a recognized shortcut
-   *  press (see `applyStep` below) and never resets. App.tsx's boot
+  /** Flips to `true` the first time the user makes a deliberate font-size
+   *  change — a recognized shortcut press or a Settings → General stepper
+   *  click (see `applyStep` below) — and never resets. App.tsx's boot
    *  reconcile checks this to avoid clobbering a state the user has already
    *  deliberately changed with a possibly-stale DB read that raced it. */
   hasUserAdjustedRef: React.RefObject<boolean>;
@@ -152,18 +163,22 @@ export function FontSizeProvider({ children }: { children: React.ReactNode }) {
   }, [doPersist]);
 
   const applyStep = React.useCallback(
-    (action: FontSizeAction) => {
+    (action: FontSizeAction, opts?: FontSizeStepOptions) => {
       hasUserAdjustedRef.current = true;
       const next = stepFontSize(percentRef.current, action);
       // Feedback fires for every recognized press, even a no-op at a bound
       // (Cmd+= already at 170%, Cmd+0 already at 100%) — only the state
-      // update + persist stay behind the no-change guard below.
-      if (next === FONT_SIZE_MAX) {
-        toast(`Font size: maximum (${FONT_SIZE_MAX}%)`, { id: "font-size" });
-      } else if (next === FONT_SIZE_MIN) {
-        toast(`Font size: default (${FONT_SIZE_MIN}%)`, { id: "font-size" });
-      } else {
-        toast(`Font size: ${next}%`, { id: "font-size" });
+      // update + persist stay behind the no-change guard below. Skipped
+      // entirely for `silent` callers (the Settings stepper), which have
+      // their own on-screen readout as feedback instead.
+      if (!opts?.silent) {
+        if (next === FONT_SIZE_MAX) {
+          toast(`Font size: maximum (${FONT_SIZE_MAX}%)`, { id: "font-size" });
+        } else if (next === FONT_SIZE_MIN) {
+          toast(`Font size: default (${FONT_SIZE_MIN}%)`, { id: "font-size" });
+        } else {
+          toast(`Font size: ${next}%`, { id: "font-size" });
+        }
       }
       if (next === percentRef.current) return;
       setPercent(next);
@@ -171,9 +186,18 @@ export function FontSizeProvider({ children }: { children: React.ReactNode }) {
     [setPercent],
   );
 
-  const increase = React.useCallback(() => applyStep("increase"), [applyStep]);
-  const decrease = React.useCallback(() => applyStep("decrease"), [applyStep]);
-  const reset = React.useCallback(() => applyStep("reset"), [applyStep]);
+  const increase = React.useCallback(
+    (opts?: FontSizeStepOptions) => applyStep("increase", opts),
+    [applyStep],
+  );
+  const decrease = React.useCallback(
+    (opts?: FontSizeStepOptions) => applyStep("decrease", opts),
+    [applyStep],
+  );
+  const reset = React.useCallback(
+    (opts?: FontSizeStepOptions) => applyStep("reset", opts),
+    [applyStep],
+  );
 
   React.useEffect(() => {
     const isMac = isMacPlatform();

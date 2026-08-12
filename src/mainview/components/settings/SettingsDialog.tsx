@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, Monitor, Moon, Plus, Sun, Terminal, Trash2, X } from "lucide-react";
+import { ChevronLeft, Minus, Monitor, Moon, Plus, Sun, Terminal, Trash2, X } from "lucide-react";
 import { toast } from "sonner";
 import { ApiError, api, type HarnessesPayload, type HarnessInput } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -12,7 +12,9 @@ import { useConfirm } from "@/components/ui/confirm";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { GitHubTokensSection } from "@/components/settings/GitHubTokensSection";
 import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
+import { useFontSize } from "@/components/font-size-provider";
 import { useTheme } from "@/components/theme-provider";
+import { isMacPlatform } from "@/lib/font-size";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
   SETTINGS_SECTIONS,
@@ -26,6 +28,9 @@ import {
   type SettingsView,
 } from "@/lib/settings-dialog-view";
 import {
+  FONT_SIZE_DEFAULT,
+  FONT_SIZE_MAX,
+  FONT_SIZE_MIN,
   HARNESS_TEMPLATES,
   THEME_PREFERENCES,
   type AgentKind,
@@ -33,6 +38,16 @@ import {
   type HarnessTemplate,
   type ThemePreference,
 } from "../../../shared/types.ts";
+
+// Computed once at module load, same convention as RunPanel's
+// `IS_MAC_PLATFORM` — the Settings → General font-size hint text names the
+// platform-appropriate shortcut. The non-Mac string calls out "outside a
+// terminal" because `font-size-provider.tsx`'s keydown handler lets a
+// focused `.xterm` pane keep Ctrl+-/Ctrl+_ for readline's undo/literal
+// bindings there.
+const FONT_SIZE_HINT = isMacPlatform()
+  ? "⌘= and ⌘− also work anywhere; ⌘0 resets."
+  : "Ctrl+= and Ctrl+− also work anywhere outside a terminal; Ctrl+0 resets.";
 
 /** Icon shown per theme preference in the Settings → General picker. */
 const THEME_PREFERENCE_ICON: Record<ThemePreference, typeof Monitor> = {
@@ -586,6 +601,10 @@ function GeneralSection({
   // soft-deleted harness can't silently become the default for new tasks.
   const enabledHarnesses = payload.harnesses.filter((h) => h.enabled);
   const { preference: themePreference, setPreference: setThemePreference } = useTheme();
+  const { percent: fontSizePercent, increase: increaseFontSize, decrease: decreaseFontSize, reset: resetFontSize } = useFontSize();
+  const canDecreaseFontSize = fontSizePercent > FONT_SIZE_MIN;
+  const canIncreaseFontSize = fontSizePercent < FONT_SIZE_MAX;
+  const canResetFontSize = fontSizePercent !== FONT_SIZE_DEFAULT;
   return (
     <div className="space-y-4 pt-3 text-sm">
       <section className="space-y-1">
@@ -641,6 +660,55 @@ function GeneralSection({
         <p className="text-[11px] text-muted-foreground">
           Auto follows your system's appearance and switches live if it changes.
         </p>
+      </section>
+
+      <section className="space-y-1">
+        <label className="text-xs text-muted-foreground">Font size</label>
+        <div role="group" aria-label="Font size" className="flex items-center gap-1.5">
+          <Button
+            size="sm"
+            variant="outline"
+            className="w-8 px-0 aria-disabled:cursor-default aria-disabled:opacity-50"
+            aria-label="Decrease font size"
+            aria-disabled={!canDecreaseFontSize}
+            onClick={() => {
+              if (!canDecreaseFontSize) return;
+              decreaseFontSize({ silent: true });
+            }}
+          >
+            <Minus className="size-3.5" />
+          </Button>
+          <span role="status" aria-live="polite" className="w-10 text-center text-xs tabular-nums">
+            {fontSizePercent}%
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="w-8 px-0 aria-disabled:cursor-default aria-disabled:opacity-50"
+            aria-label="Increase font size"
+            aria-disabled={!canIncreaseFontSize}
+            onClick={() => {
+              if (!canIncreaseFontSize) return;
+              increaseFontSize({ silent: true });
+            }}
+          >
+            <Plus className="size-3.5" />
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="aria-disabled:cursor-default aria-disabled:opacity-50"
+            aria-label="Reset font size"
+            aria-disabled={!canResetFontSize}
+            onClick={() => {
+              if (!canResetFontSize) return;
+              resetFontSize({ silent: true });
+            }}
+          >
+            Reset
+          </Button>
+        </div>
+        <p className="text-[11px] text-muted-foreground">{FONT_SIZE_HINT}</p>
       </section>
     </div>
   );
