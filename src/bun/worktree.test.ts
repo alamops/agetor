@@ -455,6 +455,20 @@ test("getTaskDiff surfaces workdir changes for isolation=none tasks", async () =
   expect(fresh!.hunks).toContain("brand new");
 });
 
+test("getTaskDiff emits an unchanged (unprefixed) path for an untracked file when the workdir IS the repo root", async () => {
+  // The overwhelmingly common case — no `path.relative(root, cwd)` prefix to
+  // apply since root === cwd. Guards against the normalization accidentally
+  // adding a "./"-style prefix or otherwise mangling the common path.
+  const { getTaskDiff } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  writeFileSync(path.join(repo, "fresh.txt"), "brand new\n");
+
+  const diff = await getTaskDiff(fakeTask({ workdir: repo, isolation: "none" }));
+  const fresh = diff.files.find((f) => f.path === "fresh.txt");
+  expect(fresh).toBeDefined();
+  expect(fresh!.status).toBe("added");
+});
+
 test("getTaskDiff reports a friendly note when isolation=none workdir isn't a git repo", async () => {
   const { getTaskDiff } = await import("./worktree.ts");
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-nongit-diff-"));
@@ -704,6 +718,38 @@ test("getTaskDiffBlob: isolation=none task whose workdir is a repo SUBDIRECTORY 
   expect(result.ok).toBe(true);
   if (!result.ok) return;
   expect(Buffer.from(result.bytes)).toEqual(BLOB_V1);
+});
+
+test("getTaskDiff normalizes an UNTRACKED file's path to repo-root-relative for a subdir workdir, and getTaskDiffBlob resolves it at that same path", async () => {
+  // Regression pairing with the tracked-file subdir test above: `git
+  // ls-files --others` (unlike `git diff <base>`) runs in `cwd` and reports
+  // paths relative to IT, not the repo root — so for an isolation=none task
+  // whose workdir is `<repo>/sub`, the raw listing would say `assets/new.bin`
+  // while every tracked entry in the same TaskDiff says `sub/...`. getTaskDiff
+  // must prefix the subdirectory itself so the emitted DiffFile.path is
+  // root-relative like everything else, and getTaskDiffBlob must resolve
+  // that same root-relative path back to bytes.
+  const { getTaskDiff, getTaskDiffBlob } = await import("./worktree.ts");
+  const repo = await makeRepo();
+  const assetsDir = path.join(repo, "sub", "assets");
+  mkdirSync(assetsDir, { recursive: true });
+  writeFileSync(path.join(assetsDir, "new.bin"), BLOB_V1);
+  // Deliberately never `git add`ed — this is the untracked path.
+
+  const task = fakeTask({ workdir: path.join(repo, "sub"), isolation: "none" });
+  const diff = await getTaskDiff(task);
+
+  const file = diff.files.find((f) => f.path === "sub/assets/new.bin");
+  expect(file).toBeDefined();
+  expect(file!.status).toBe("added");
+  // Not the cwd-relative shape a naive `git ls-files --others` listing would
+  // have produced.
+  expect(diff.files.some((f) => f.path === "assets/new.bin")).toBe(false);
+
+  const blob = await getTaskDiffBlob(task, "sub/assets/new.bin", "new");
+  expect(blob.ok).toBe(true);
+  if (!blob.ok) return;
+  expect(Buffer.from(blob.bytes)).toEqual(BLOB_V1);
 });
 
 describe("getTaskDiffBlob: path traversal rejections", () => {

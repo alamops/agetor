@@ -23,6 +23,7 @@ import type {
   TaskDiff,
 } from "../shared/types.ts";
 import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
+import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { gitlabToken } from "./git-provider.ts";
 
@@ -627,6 +628,187 @@ export async function getGitLabPullDiff(repo: ProviderRepoInfo, number: number):
     base: null,
     files,
     note: files.length === 0 ? "No diff returned for this merge request." : undefined,
+  };
+}
+
+/** Structurally identical to `git-host.ts`'s `PullBlobResult` — kept as a
+ *  separate declaration (rather than imported) for the same reason
+ *  `github.ts`'s `GitHubBlobResult` is: `git-host.ts` is the consumer, not
+ *  the source, of this module's types, and TS's structural typing makes the
+ *  two interchangeable at the `pullBlob` dispatch call site. */
+type GitLabBlobResult =
+  | { ok: true; bytes: Uint8Array<ArrayBuffer>; contentType: string; ref: string }
+  | { ok: false; error: string; status?: number };
+
+interface GitLabPullBlobDetailCacheEntry {
+  baseSha: string;
+  headSha: string;
+  /** Numeric project ids, present whenever GitLab reports them as numbers.
+   *  `null` means "couldn't confirm" — treated as same-repo (fails closed to
+   *  the project we already have an owner/name slug for, not to an
+   *  unconfirmed numeric id). */
+  sourceProjectId: number | null;
+  targetProjectId: number | null;
+  fetchedAt: number;
+}
+
+/** Short-TTL cache of an MR's resolved base/head sha + source/target project
+ *  ids, keyed `${remoteHost}/${owner}/${name}#${number}` — mirrors
+ *  github.ts's `pullDetailCache` exactly (60s TTL, 200-entry wholesale-clear
+ *  eviction) so paging through a binary file's old/new sides, or several
+ *  files in the same MR, doesn't re-fetch `GET /merge_requests/:iid` (and
+ *  possibly `/versions`) on every blob request. */
+const pullBlobDetailCache = new Map<string, GitLabPullBlobDetailCacheEntry>();
+const PULL_BLOB_DETAIL_CACHE_LIMIT = 200;
+const PULL_BLOB_DETAIL_CACHE_TTL_MS = 60_000;
+
+function cachePullBlobDetail(key: string, entry: GitLabPullBlobDetailCacheEntry): void {
+  if (pullBlobDetailCache.size >= PULL_BLOB_DETAIL_CACHE_LIMIT && !pullBlobDetailCache.has(key)) {
+    pullBlobDetailCache.clear();
+  }
+  pullBlobDetailCache.set(key, entry);
+}
+
+/** Content-type for a binary diff preview, from the shared canonical
+ *  extension→MIME map — mirrors github.ts's `contentTypeForBlobPath`. Pure —
+ *  unit-tested via `__gitlabInternals`. */
+function contentTypeForGitLabBlobPath(path: string, fallback: string | null): string {
+  return contentTypeForPreviewPath(path) ?? fallback ?? "application/octet-stream";
+}
+
+/** Fetches the raw bytes of a single file from one side (old/new) of a
+ *  GitLab merge request's diff, for the binary-preview UI. Dispatched
+ *  through `git-host.ts`'s `pullBlob`.
+ *
+ *  - `side: "old"` reads the file at `diff_refs.base_sha` — GitLab's own
+ *    merge-base sha (unlike GitHub's `base.sha`, this one doesn't drift once
+ *    the base branch moves, so no separate compare round-trip is needed) —
+ *    from the *target* project (`repo.owner`/`repo.name`).
+ *  - `side: "new"` reads the file at `diff_refs.head_sha`, from the *source*
+ *    project — the target project for a same-repo MR, or the fork's numeric
+ *    `source_project_id` for a cross-repo one (GitLab's MR payload carries no
+ *    owner/name for the source project, only its numeric id).
+ *
+ *  `diff_refs` populates asynchronously right after an MR is created/pushed
+ *  to, so a missing/incomplete `diff_refs` falls back to the latest diff
+ *  "version" (`GET .../versions`) the same way `createGitLabPullLineComment`
+ *  does. The resolved tuple is cached — see `pullBlobDetailCache`.
+ *
+ *  Bytes come from the repository-files raw endpoint (`GET
+ *  /projects/:id/repository/files/:path/raw?ref=<sha>`), requested with a
+ *  permissive `accept` (`fetchGitLab` defaults to `application/json`, which
+ *  would be wrong for arbitrary binary bytes). Size is checked twice: from
+ *  `content-length` before reading the body, and again against the actual
+ *  byte count after `arrayBuffer()` (a chunked response can omit
+ *  `content-length`) — matching `MAX_BLOB_PREVIEW_BYTES`, not the 8MB diff
+ *  cap `getGitLabPullDiff` uses. */
+export async function getGitLabPullBlob(
+  repo: ProviderRepoInfo,
+  number: number,
+  relPath: string,
+  side: "old" | "new",
+): Promise<GitLabBlobResult> {
+  if (!Number.isInteger(number) || number <= 0) {
+    return { ok: false, error: "merge request number must be positive", status: 400 };
+  }
+  const path = relPath.trim().replace(/^\/+/, "");
+  if (!path) return { ok: false, error: "file path is required", status: 400 };
+
+  const token = await gitlabToken(repo.remoteHost);
+  const projectId = encodeProjectId(repo.owner, repo.name);
+  const detailKey = `${repo.remoteHost}/${repo.owner}/${repo.name}#${number}`;
+
+  const cached = pullBlobDetailCache.get(detailKey);
+  let baseSha: string;
+  let headSha: string;
+  let sourceProjectId: number | null;
+  let targetProjectId: number | null;
+
+  if (cached && Date.now() - cached.fetchedAt < PULL_BLOB_DETAIL_CACHE_TTL_MS) {
+    ({ baseSha, headSha, sourceProjectId, targetProjectId } = cached);
+  } else {
+    const mrRes = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}`, token);
+    if (!("status" in mrRes)) return { ok: false, error: mrRes.error, status: 502 };
+    const mrJson = await mrRes.json().catch(() => null);
+    if (!mrRes.ok) {
+      return mrRes.status === 404
+        ? { ok: false, error: "merge request not found", status: 404 }
+        : { ok: false, error: errorFrom(mrRes, mrJson, repo, !!token), status: mrRes.status };
+    }
+    const obj = mrJson && typeof mrJson === "object" ? mrJson as Record<string, unknown> : {};
+    const diffRefs = obj.diff_refs && typeof obj.diff_refs === "object" ? obj.diff_refs as Record<string, unknown> : null;
+    let resolvedBaseSha = diffRefs && typeof diffRefs.base_sha === "string" ? diffRefs.base_sha : null;
+    let resolvedHeadSha = diffRefs && typeof diffRefs.head_sha === "string" ? diffRefs.head_sha : null;
+    const resolvedSourceProjectId = typeof obj.source_project_id === "number" ? obj.source_project_id : null;
+    const resolvedTargetProjectId = typeof obj.target_project_id === "number" ? obj.target_project_id : null;
+
+    if (!resolvedBaseSha || !resolvedHeadSha) {
+      // diff_refs populates async after the MR is created/pushed to — fall
+      // back to the latest diff version, same as createGitLabPullLineComment.
+      const versionsRes = await fetchGitLab(`${GITLAB_API_BASE}/projects/${projectId}/merge_requests/${number}/versions`, token);
+      if (!("status" in versionsRes)) return { ok: false, error: versionsRes.error, status: 502 };
+      const versions = await versionsRes.json().catch(() => null);
+      if (!versionsRes.ok) {
+        return { ok: false, error: errorFrom(versionsRes, versions, repo, !!token), status: versionsRes.status };
+      }
+      const latest = Array.isArray(versions) && versions.length > 0 ? versions[0] as Record<string, unknown> : null;
+      resolvedBaseSha = latest && typeof latest.base_commit_sha === "string" ? latest.base_commit_sha : null;
+      resolvedHeadSha = latest && typeof latest.head_commit_sha === "string" ? latest.head_commit_sha : null;
+      if (!resolvedBaseSha || !resolvedHeadSha) {
+        return { ok: false, error: "GitLab returned no base/head commit for this merge request", status: 502 };
+      }
+    }
+
+    baseSha = resolvedBaseSha;
+    headSha = resolvedHeadSha;
+    sourceProjectId = resolvedSourceProjectId;
+    targetProjectId = resolvedTargetProjectId;
+    cachePullBlobDetail(detailKey, { baseSha, headSha, sourceProjectId, targetProjectId, fetchedAt: Date.now() });
+  }
+
+  let ref: string;
+  let blobProjectId: string;
+  if (side === "new") {
+    ref = headSha;
+    // Fail closed to the target project (the one we have an owner/name slug
+    // for) unless both ids are confirmed numbers and actually differ — an
+    // unconfirmed id is not a safe basis for routing to a different project.
+    const isFork = sourceProjectId !== null && targetProjectId !== null && sourceProjectId !== targetProjectId;
+    blobProjectId = isFork ? String(sourceProjectId) : projectId;
+  } else {
+    ref = baseSha;
+    blobProjectId = projectId;
+  }
+
+  const fileUrl = `${GITLAB_API_BASE}/projects/${blobProjectId}/repository/files/${encodeURIComponent(path)}/raw?ref=${encodeURIComponent(ref)}`;
+  const fileRes = await fetchGitLab(fileUrl, token, { accept: "*/*" });
+  if (!("status" in fileRes)) return { ok: false, error: fileRes.error, status: 502 };
+  if (fileRes.status === 404) return { ok: false, error: "file not present on this side", status: 404 };
+  if (!fileRes.ok) {
+    const raw = await fileRes.text().catch(() => "");
+    let msg = raw;
+    try {
+      const parsed = JSON.parse(raw) as { message?: unknown };
+      if (typeof parsed.message === "string") msg = parsed.message;
+    } catch { /* raw-file error bodies are sometimes plain text */ }
+    return { ok: false, error: authHint(fileRes.status, msg || `${fileRes.status} ${fileRes.statusText}`, repo, !!token), status: fileRes.status };
+  }
+
+  const contentLength = Number(fileRes.headers.get("content-length") ?? 0);
+  if (contentLength > MAX_BLOB_PREVIEW_BYTES) {
+    return { ok: false, error: `File is too large to preview (${Math.ceil(contentLength / 1_000_000)} MB).`, status: 413 };
+  }
+  const buf = await fileRes.arrayBuffer().catch(() => null);
+  if (!buf) return { ok: false, error: "GitLab returned an unreadable file response", status: 502 };
+  if (buf.byteLength > MAX_BLOB_PREVIEW_BYTES) {
+    return { ok: false, error: `File is too large to preview (${Math.ceil(buf.byteLength / 1_000_000)} MB).`, status: 413 };
+  }
+
+  return {
+    ok: true,
+    bytes: new Uint8Array(buf),
+    contentType: contentTypeForGitLabBlobPath(path, fileRes.headers.get("content-type")),
+    ref,
   };
 }
 
@@ -1295,4 +1477,5 @@ export const __gitlabInternals = {
   normalizeRepoLabel,
   sortItems,
   gitlabStateParams,
+  contentTypeForGitLabBlobPath,
 };

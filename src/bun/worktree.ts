@@ -920,15 +920,37 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
   // full additions via --no-index (which exits 1 when content differs).
   const listed = await git(["ls-files", "--others", "--exclude-standard", "-z"], cwd);
   if (listed.ok) {
+    // `ls-files` (and the `--no-index` diff below) run in `cwd`, so `rel` is
+    // CWD-relative — but tracked entries from `git diff <base>` above are
+    // repo-ROOT-relative. For an isolation=none task whose workdir is a repo
+    // subdirectory, mixing the two namespaces in one TaskDiff is wrong (it's
+    // exactly what getTaskDiffBlob's cwd-fallback exists to paper over).
+    // Normalize by prefixing the root→cwd path segment onto the emitted
+    // DiffFile.path only; the `--no-index` invocation itself keeps using the
+    // cwd-relative `rel`, since that's what exists relative to the cwd git
+    // runs in. `path.relative` already returns forward-slash segments on
+    // POSIX (this app is macOS-only per CLAUDE.md), so no join-separator
+    // normalization is needed beyond a defensive backslash guard.
+    //
+    // `repoRoot` reports git's canonicalized path (symlinks resolved, e.g.
+    // `/tmp` → `/private/tmp` on macOS — see `gitWritableRootsSync`'s doc
+    // comment for the same gotcha), so diffing it against a non-canonical
+    // `cwd` would spuriously produce a non-empty prefix even when cwd IS the
+    // root. Realpath `cwd` first to compare like-for-like.
+    const root = await repoRoot(cwd);
+    let realCwd = cwd;
+    try { realCwd = realpathSync(cwd); } catch { /* cwd missing — compare as-is */ }
+    const prefix = root ? path.relative(root, realCwd).split(path.sep).join("/") : "";
     const rels = listed.stdout.split("\0").filter(Boolean).slice(0, MAX_UNTRACKED);
     for (const rel of rels) {
       const res = await git(["diff", "--no-color", "--no-index", "--", "/dev/null", rel], cwd);
       if (res.exitCode !== 0 && res.exitCode !== 1) continue;
       const [parsed] = parseGitDiff(res.stdout);
+      const emittedPath = prefix ? `${prefix}/${rel}` : rel;
       files.push(
         parsed
-          ? { ...parsed, status: "added", path: rel, oldPath: null }
-          : { path: rel, oldPath: null, status: "added", additions: 0, deletions: 0, binary: false, hunks: "", truncated: false },
+          ? { ...parsed, status: "added", path: emittedPath, oldPath: null }
+          : { path: emittedPath, oldPath: null, status: "added", additions: 0, deletions: 0, binary: false, hunks: "", truncated: false },
       );
     }
   }
@@ -1029,12 +1051,14 @@ export async function getTaskDiffBlob(
     // `git show <sha>:<relPath>` is root-relative by construction, same as
     // the diff itself.) Resolve the repo root once and join there instead.
     //
-    // Caveat: untracked files surfaced via `git ls-files --others`
-    // (getTaskDiff's synthetic "added" entries) are CWD-relative, not
-    // root-relative — so such a file's path may only resolve under the
-    // cwd-relative join. Try the root-relative path first (the common case —
-    // tracked diffs are root-relative), and fall back to the cwd-relative
-    // join only when the root-relative stat misses and the two differ.
+    // The cwd-relative fallback below exists for untracked files surfaced via
+    // `git ls-files --others` — getTaskDiff's synthetic "added" entries used
+    // to emit those CWD-relative, which only resolved under this fallback
+    // join. getTaskDiff now normalizes those to root-relative paths at the
+    // source, so for any freshly-generated diff the root-relative join above
+    // always hits and this fallback is vestigial. It stays anyway: a stale
+    // client (open DiffDialog tab, cached response) may still hold a
+    // pre-normalization cwd-relative path, and falling back is free.
     const root = await repoRoot(cwd);
     const rootAbs = root ? path.join(root, relPath) : null;
     const cwdAbs = path.join(cwd, relPath);

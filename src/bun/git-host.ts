@@ -51,6 +51,7 @@ import {
   createGitLabIssue,
   createGitLabPull,
   createGitLabPullLineComment,
+  getGitLabPullBlob,
   getGitLabPullChecks,
   getGitLabPullDefaults,
   getGitLabPullDetail,
@@ -73,6 +74,7 @@ import {
   createBitbucketIssue,
   createBitbucketPull,
   createBitbucketPullLineComment,
+  getBitbucketPullBlob,
   getBitbucketPullChecks,
   getBitbucketPullDefaults,
   getBitbucketPullDetail,
@@ -413,10 +415,10 @@ export type PullBlobResult =
  * request's diff, for the binary-diff-preview UI (`BinaryFilePreview`).
  * GitHub is implemented (`getGitHubPullBlob` — resolves head/base repo and
  * anchors the old side at the PR's merge base, since the diff the UI shows
- * is merge-base-anchored, not `base.sha`-anchored). GitLab and Bitbucket
- * previews are deferred to a follow-up (see docs/plans/binary-diff-previews.md
- * §8) — both return `501 unsupported` rather than attempting a fetch, so the
- * UI's binary placeholder degrades gracefully instead of erroring.
+ * is merge-base-anchored, not `base.sha`-anchored). GitLab (`getGitLabPullBlob`
+ * — old side anchored at `diff_refs.base_sha`, GitLab's own merge base) and
+ * Bitbucket (`getBitbucketPullBlob`) are implemented the same way (see
+ * docs/plans/binary-diff-previews-providers.md).
  *
  * `input.path` is validated with `isSafeRelPath` (the same guard
  * `getTaskDiffBlob` applies to the task-diff blob route) before any
@@ -432,7 +434,9 @@ export async function pullBlob(input: PullBlobOpts): Promise<PullBlobResult> {
     return { ok: false, error: "invalid path", status: 400 };
   }
   if (repoInfo.provider === "github") return getGitHubPullBlob(input);
-  return { ok: false, status: 501, error: "binary preview not supported for this provider yet" };
+  return repoInfo.provider === "gitlab"
+    ? getGitLabPullBlob(repoInfo, input.number, input.path, input.side)
+    : getBitbucketPullBlob(repoInfo, input.number, input.path, input.side);
 }
 
 /**
