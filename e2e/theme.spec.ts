@@ -1,13 +1,13 @@
-import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
-import { E2E_API_PORT, E2E_API_TOKEN, E2E_BASE_URL } from "../playwright.config";
+import { test, expect, type APIRequestContext, type E2EBackend, type Page } from "./fixtures";
+import { gotoApp as gotoAppUrl, openSettingsGeneral, putPreference } from "./helpers";
 
 /**
  * E2E coverage for the Auto/Dark/Light theme feature
  * (docs/plans/auto-dark-light-theme.md, T10). Runs Chromium against the real
  * webview served by `bun run hmr` and the real Bun API/orchestrator served
- * by `src/bun/headless.ts` (both started by `playwright.config.ts`'s
- * `webServer`) — no mocked fetches, no internal API calls standing in for UI
- * interaction.
+ * by `src/bun/headless.ts` (a per-worker instance provisioned by the
+ * `backend` fixture in e2e/fixtures.ts) — no mocked fetches, no internal API
+ * calls standing in for UI interaction.
  *
  * These assert **computed colors and DOM classes**, never pixel/screenshot
  * diffs: Chromium's rendering differs from the WKWebView the app actually
@@ -15,15 +15,13 @@ import { E2E_API_PORT, E2E_API_TOKEN, E2E_BASE_URL } from "../playwright.config"
  * product. `screenshot: "only-on-failure"` in the config still captures
  * human-reviewable artifacts on failure.
  *
- * Tests share one headless server + SQLite DB (see `E2E_DATA_DIR`) and run
- * serially — the persistence spec depends on the DB state a prior test left
- * behind, and each test still starts from a known preference via the direct
- * `PUT /preferences/theme` call in `setThemePreference`, so ordering never
- * has to be inferred from Settings-UI state.
+ * All tests in this file share this worker's one headless backend + SQLite
+ * DB and run serially — the persistence spec depends on the DB state a
+ * prior test left behind, and each test still starts from a known
+ * preference via the direct `PUT /preferences/theme` call in
+ * `setThemePreference`, so ordering never has to be inferred from
+ * Settings-UI state.
  */
-
-const API_BASE = `http://127.0.0.1:${E2E_API_PORT}`;
-const BOOT_URL = `${E2E_BASE_URL}/#api=${E2E_API_PORT}&token=${E2E_API_TOKEN}`;
 
 test.describe.configure({ mode: "serial" });
 
@@ -33,20 +31,16 @@ test.describe.configure({ mode: "serial" });
  *  through the Settings UI, which is what's meant to be under test). */
 async function setThemePreference(
   request: APIRequestContext,
+  backend: E2EBackend,
   value: "auto" | "dark" | "light",
 ): Promise<void> {
-  const res = await request.put(`${API_BASE}/preferences/theme`, {
-    headers: { authorization: `Bearer ${E2E_API_TOKEN}` },
-    data: { value },
-  });
-  expect(res.ok()).toBeTruthy();
+  await putPreference(request, backend, "theme", value);
 }
 
 /** Navigates to the app boot URL and waits for real rendered content — the
  *  Settings button in the app bar — rather than a fixed sleep. */
-async function gotoApp(page: Page): Promise<void> {
-  await page.goto(BOOT_URL);
-  await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+async function gotoApp(page: Page, backend: E2EBackend): Promise<void> {
+  await gotoAppUrl(page, backend.bootBase);
 }
 
 function isDark(page: Page): Promise<boolean> {
@@ -61,20 +55,14 @@ function bodyBackground(page: Page): Promise<string> {
   return page.evaluate(() => getComputedStyle(document.body).backgroundColor);
 }
 
-async function openSettingsGeneral(page: Page) {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
-  const dialog = page.getByRole("dialog");
-  await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
-  return dialog;
-}
-
 test.describe("theme: boot resolution (no flash)", () => {
   for (const system of ["dark", "light"] as const) {
     test(`resolves "auto" to the system's ${system} scheme before first paint`, async ({
       page,
       request,
+      backend,
     }) => {
-      await setThemePreference(request, "auto");
+      await setThemePreference(request, backend, "auto");
 
       // Record the `dark` class + color-scheme the instant the document
       // finishes parsing (i.e. right after index.html's blocking <head>
@@ -99,7 +87,7 @@ test.describe("theme: boot resolution (no flash)", () => {
       });
 
       await page.emulateMedia({ colorScheme: system });
-      await gotoApp(page);
+      await gotoApp(page, backend);
 
       const atParse = await page.evaluate(
         () => (window as unknown as { __themeAtParse?: { cls: string; scheme: string } }).__themeAtParse,
@@ -122,9 +110,10 @@ test.describe("theme: Settings → General picker", () => {
   test("selecting Light flips <html> off dark and repaints body; selecting Dark restores it", async ({
     page,
     request,
+    backend,
   }) => {
-    await setThemePreference(request, "dark");
-    await gotoApp(page);
+    await setThemePreference(request, backend, "dark");
+    await gotoApp(page, backend);
     expect(await isDark(page)).toBe(true);
     const darkBg = await bodyBackground(page);
 
@@ -146,9 +135,9 @@ test.describe("theme: Settings → General picker", () => {
     expect(await bodyBackground(page)).toBe(darkBg);
   });
 
-  test("persists the choice across a reload", async ({ page, request }) => {
-    await setThemePreference(request, "dark");
-    await gotoApp(page);
+  test("persists the choice across a reload", async ({ page, request, backend }) => {
+    await setThemePreference(request, backend, "dark");
+    await gotoApp(page, backend);
 
     const dialog = await openSettingsGeneral(page);
     await dialog.getByRole("button", { name: "Light", exact: true }).click();
@@ -162,8 +151,8 @@ test.describe("theme: Settings → General picker", () => {
     expect(await isDark(page)).toBe(false);
     expect(await colorScheme(page)).toBe("light");
 
-    const prefs = await request.get(`${API_BASE}/preferences`, {
-      headers: { authorization: `Bearer ${E2E_API_TOKEN}` },
+    const prefs = await request.get(`${backend.apiBase}/preferences`, {
+      headers: { authorization: `Bearer ${backend.apiToken}` },
     });
     expect((await prefs.json()).theme).toBe("light");
   });
@@ -173,10 +162,11 @@ test.describe("theme: Auto follows the system", () => {
   test("tracks the emulated OS preference, including a live flip while open", async ({
     page,
     request,
+    backend,
   }) => {
-    await setThemePreference(request, "auto");
+    await setThemePreference(request, backend, "auto");
     await page.emulateMedia({ colorScheme: "light" });
-    await gotoApp(page);
+    await gotoApp(page, backend);
     expect(await isDark(page)).toBe(false);
 
     // Live flip — no reload, no re-navigation. This is the behavior
@@ -199,14 +189,15 @@ test.describe("theme: token layer is live", () => {
   test("a converted status token (--danger) actually differs between themes", async ({
     page,
     request,
+    backend,
   }) => {
     const readDanger = () =>
       page.evaluate(() =>
         getComputedStyle(document.documentElement).getPropertyValue("--danger").trim(),
       );
 
-    await setThemePreference(request, "dark");
-    await gotoApp(page);
+    await setThemePreference(request, backend, "dark");
+    await gotoApp(page, backend);
     const dangerDark = await readDanger();
 
     const dialog = await openSettingsGeneral(page);

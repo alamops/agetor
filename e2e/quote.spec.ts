@@ -1,20 +1,20 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
-import { E2E_API_PORT, E2E_API_TOKEN, E2E_BASE_URL } from "../playwright.config";
+import { test, expect, type APIRequestContext, type E2EBackend, type Page } from "./fixtures";
+import { gotoApp } from "./helpers";
 
 /**
  * E2E coverage for quote-on-select in the run panel's messages list
  * (docs/plans/quote-messages-list.md, §5 TT2). Runs Chromium against the
- * real webview + real Bun API/orchestrator (both started by
- * `playwright.config.ts`'s `webServer`) — no mocked fetches, no component
- * harness standing in for the actual DOM.
+ * real webview + real Bun API/orchestrator (a per-worker instance
+ * provisioned by the `backend` fixture in e2e/fixtures.ts) — no mocked
+ * fetches, no component harness standing in for the actual DOM.
  *
  * Producing a rendered message without a real `claude` CLI or tmux: the
- * config's `webServer.env` sets `AGETOR_CLAUDE_DRIVER=fake` (see the comment
- * there), which makes `spawnAgent`'s claude-code branch return an in-process
- * fake agent (`makeFakeAgent` in `src/bun/agents.ts`) instead of shelling out
- * to tmux. That fake emits a plain `stdout` chunk — `"fake response to:
+ * backend fixture sets `AGETOR_CLAUDE_DRIVER=fake` (see the comment there),
+ * which makes `spawnAgent`'s claude-code branch return an in-process fake
+ * agent (`makeFakeAgent` in `src/bun/agents.ts`) instead of shelling out to
+ * tmux. That fake emits a plain `stdout` chunk — `"fake response to:
  * <prompt>"` — ~5ms after start, which the run panel renders through the
  * generic `RawText` block (`RunPanel.tsx`'s `case "stdout"`), i.e. plain
  * selectable text inside a `[data-evid]` wrapper. `AGETOR_CLAUDE_BIN` /
@@ -33,14 +33,11 @@ import { E2E_API_PORT, E2E_API_TOKEN, E2E_BASE_URL } from "../playwright.config"
  * textarea's value/caret.
  *
  * Serial within this file since both tests below would otherwise race the
- * one task/composer they share; `theme.spec.ts` runs as a separate file
- * (separate worker/browser context) and never starts a run, so the two
- * specs don't observe each other's state.
+ * one task/composer they share; `theme.spec.ts` runs as a separate file (its
+ * own worker, browser context, and — since e2e/fixtures.ts — its own
+ * headless backend) and never starts a run, so the two specs don't observe
+ * each other's state.
  */
-
-const API_BASE = `http://127.0.0.1:${E2E_API_PORT}`;
-const BOOT_URL = `${E2E_BASE_URL}/#api=${E2E_API_PORT}&token=${E2E_API_TOKEN}`;
-const AUTH = { authorization: `Bearer ${E2E_API_TOKEN}` };
 
 test.describe.configure({ mode: "serial" });
 
@@ -55,29 +52,26 @@ interface TaskRow {
  *  `expect`) rather than leaving a silent 400 for a later step to trip on. */
 async function createAndStartFakeClaudeTask(
   request: APIRequestContext,
+  backend: E2EBackend,
   prompt: string,
 ): Promise<TaskRow> {
-  const createRes = await request.post(`${API_BASE}/tasks`, {
-    headers: AUTH,
+  const auth = { authorization: `Bearer ${backend.apiToken}` };
+  const createRes = await request.post(`${backend.apiBase}/tasks`, {
+    headers: auth,
     data: { title: prompt, prompt, isolation: "none", workdir: tmpdir() },
   });
   expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();
   const task = (await createRes.json()) as TaskRow;
 
-  const startRes = await request.post(`${API_BASE}/tasks/${task.id}/start`, { headers: AUTH });
+  const startRes = await request.post(`${backend.apiBase}/tasks/${task.id}/start`, {
+    headers: auth,
+  });
   expect(
     startRes.ok(),
     `POST /tasks/${task.id}/start -> ${startRes.status()}: ${await startRes.text()}`,
   ).toBeTruthy();
 
   return task;
-}
-
-/** Navigate to the app boot URL and wait for real rendered content — same
- *  pattern as theme.spec.ts's `gotoApp`. */
-async function gotoApp(page: Page): Promise<void> {
-  await page.goto(BOOT_URL);
-  await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
 }
 
 /** The run panel's slide-over `<aside>`. `RunPanel` is mounted after
@@ -135,16 +129,17 @@ test.describe("quote-on-select", () => {
   test("selecting a rendered message shows the Quote pill; quoting it twice stacks blockquotes in the composer", async ({
     page,
     request,
+    backend,
   }) => {
     const prompt = `quote-e2e ${randomUUID()}`;
-    await createAndStartFakeClaudeTask(request, prompt);
+    await createAndStartFakeClaudeTask(request, backend, prompt);
     // The fake driver's canned reply — see the fake-response comment atop
     // this file. Unique per test run via the prompt's uuid, so the
     // tree-walking text search below can never match stale content from a
     // prior run sharing the disposable e2e data dir.
     const responseMarker = `fake response to: ${prompt}`;
 
-    await gotoApp(page);
+    await gotoApp(page, backend.bootBase);
     const panel = await openTask(page, prompt);
 
     // Replayed over the task's unified SSE event stream regardless of
