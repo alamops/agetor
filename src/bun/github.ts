@@ -63,6 +63,7 @@ import type {
   TaskDiff,
 } from "../shared/types.ts";
 import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
+import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { tokenForHost } from "./github-tokens.ts";
 
@@ -1718,10 +1719,8 @@ interface GetGitHubPullBlobInput {
  *  consumer, not the source, of this module's types; TS's structural typing
  *  makes the two interchangeable at the `pullBlob` dispatch call site. */
 type GitHubBlobResult =
-  | { ok: true; bytes: Uint8Array; contentType: string }
+  | { ok: true; bytes: Uint8Array<ArrayBuffer>; contentType: string; ref: string }
   | { ok: false; error: string; status?: number };
-
-const GITHUB_BLOB_MAX_BYTES = 20_000_000;
 
 /** Merge-base sha cache for the "old" side of a PR blob fetch, keyed
  *  `${remoteHost}/${owner}/${name}#${number}@${headSha}` — the `.diff` media
@@ -1741,45 +1740,55 @@ function cacheMergeBase(key: string, sha: string): void {
   mergeBaseCache.set(key, sha);
 }
 
-/** Builds a `GitHubRepo` from a PR's `head.repo`/`base.repo` JSON object
- *  (`{ full_name: "owner/name" }`), reusing the *original* repo's
- *  `remoteHost` — the fork lives on the same git host, and tokens are
- *  stored per-host, not per-repo (see `githubToken`'s doc comment). Returns
- *  null when the embedded repo is absent (e.g. the fork was deleted), same
- *  as `normalizeMergeability`'s `headRepo` handling. */
-function repoFromPullSide(raw: unknown, host: string): GitHubRepo | null {
-  if (!raw || typeof raw !== "object") return null;
-  const fullName = (raw as Record<string, unknown>).full_name;
-  if (typeof fullName !== "string") return null;
+interface PullDetailCacheEntry {
+  headSha: string;
+  baseSha: string;
+  headRepoFullName: string | null;
+  baseRepoFullName: string | null;
+  fetchedAt: number;
+}
+
+/** Short-TTL cache of a PR's head/base sha + head/base repo full names,
+ *  keyed `${remoteHost}/${owner}/${name}#${number}` — without this, every
+ *  blob request (old side, then new side, or the user paging through
+ *  several binary files in the same PR) re-fetches `GET /pulls/:number`
+ *  from scratch even though the two sides of one preview session almost
+ *  always want the same PR detail. 60s TTL so a fresh push to the PR is
+ *  picked up reasonably promptly rather than serving a stale head sha for
+ *  the rest of the process's life. Same crude size-guard eviction style as
+ *  `mergeBaseCache` — not correctness-critical, just bounds memory. */
+const pullDetailCache = new Map<string, PullDetailCacheEntry>();
+const PULL_DETAIL_CACHE_LIMIT = 200;
+const PULL_DETAIL_CACHE_TTL_MS = 60_000;
+
+function cachePullDetail(key: string, entry: PullDetailCacheEntry): void {
+  if (pullDetailCache.size >= PULL_DETAIL_CACHE_LIMIT && !pullDetailCache.has(key)) {
+    pullDetailCache.clear();
+  }
+  pullDetailCache.set(key, entry);
+}
+
+/** Builds a `GitHubRepo` from a PR side's `full_name` (`"owner/name"`, as
+ *  read off `head.repo.full_name`/`base.repo.full_name` or the cached
+ *  `PullDetailCacheEntry`), reusing the *original* repo's `remoteHost` — the
+ *  fork lives on the same git host, and tokens are stored per-host, not
+ *  per-repo (see `githubToken`'s doc comment). Returns null when
+ *  `fullName` is null (e.g. the fork was deleted) or malformed. */
+function repoFromFullName(fullName: string | null, host: string): GitHubRepo | null {
+  if (!fullName) return null;
   const slash = fullName.indexOf("/");
   if (slash === -1) return null;
   return { owner: fullName.slice(0, slash), name: fullName.slice(slash + 1), remoteHost: host };
 }
 
-/** Extension → content-type for a binary diff preview. Deliberately doesn't
- *  trust GitHub's Contents API response content-type for known preview
- *  extensions (server-guessed types can be generic like
+/** Content-type for a binary diff preview, from the shared canonical
+ *  extension→MIME map (`../shared/attachments.ts`). Deliberately doesn't
+ *  trust GitHub's Contents API response content-type for a known preview
+ *  extension (server-guessed types can be generic like
  *  `application/octet-stream`) — only falls back to it when the extension
- *  isn't one of the previewable kinds `binaryPreviewKind` (shared/attachments.ts)
- *  recognizes. Pure. */
+ *  isn't one of the previewable kinds the shared map recognizes. Pure. */
 function contentTypeForBlobPath(path: string, fallback: string | null): string {
-  const base = path.split("/").pop() ?? "";
-  const dot = base.lastIndexOf(".");
-  const ext = dot === -1 ? "" : base.slice(dot + 1).toLowerCase();
-  const known: Record<string, string> = {
-    png: "image/png",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    gif: "image/gif",
-    webp: "image/webp",
-    svg: "image/svg+xml",
-    bmp: "image/bmp",
-    ico: "image/x-icon",
-    avif: "image/avif",
-    heic: "image/heic",
-    pdf: "application/pdf",
-  };
-  return known[ext] ?? fallback ?? "application/octet-stream";
+  return contentTypeForPreviewPath(path) ?? fallback ?? "application/octet-stream";
 }
 
 /** Fetches the raw bytes of a single file from one side (old/new) of a
@@ -1804,7 +1813,7 @@ function contentTypeForBlobPath(path: string, fallback: string | null): string {
  *  send a chunked response with no `content-length`). */
 export async function getGitHubPullBlob(input: GetGitHubPullBlobInput): Promise<GitHubBlobResult> {
   const repo = await repoForDir(input.dir);
-  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote", status: 400 };
   if (!Number.isInteger(input.number) || input.number <= 0) {
     return { ok: false, error: "pull request number must be positive", status: 400 };
   }
@@ -1812,28 +1821,53 @@ export async function getGitHubPullBlob(input: GetGitHubPullBlobInput): Promise<
   if (!relPath) return { ok: false, error: "file path is required", status: 400 };
 
   const token = await githubToken(repo.remoteHost ?? null);
-  const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
-  const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
-  if (!("status" in prRes)) return { ok: false, error: prRes.error, status: 502 };
-  const prJson = await prRes.json().catch(() => null);
-  if (!prRes.ok) {
-    return prRes.status === 404
-      ? { ok: false, error: "pull request not found", status: 404 }
-      : { ok: false, error: apiError(prJson, prRes.status, prRes.statusText), status: prRes.status };
-  }
-  const pr = prJson && typeof prJson === "object" ? (prJson as Record<string, unknown>) : {};
-  const head = pr.head && typeof pr.head === "object" ? pr.head as Record<string, unknown> : {};
-  const base = pr.base && typeof pr.base === "object" ? pr.base as Record<string, unknown> : {};
-  const headSha = typeof head.sha === "string" ? head.sha : null;
-  const baseSha = typeof base.sha === "string" ? base.sha : null;
-  if (!headSha || !baseSha) {
-    return { ok: false, error: "GitHub returned a pull request without head/base sha", status: 502 };
+
+  // PR detail (head/base sha + repo full names) is cached for a short TTL —
+  // see `pullDetailCache`'s doc comment. Avoids a redundant `GET
+  // /pulls/:number` for every blob request against the same PR.
+  const detailKey = `${repo.remoteHost}/${repoSlug(repo)}#${input.number}`;
+  const cachedDetail = pullDetailCache.get(detailKey);
+  let headSha: string;
+  let baseSha: string;
+  let headRepoFullName: string | null;
+  let baseRepoFullName: string | null;
+  if (cachedDetail && Date.now() - cachedDetail.fetchedAt < PULL_DETAIL_CACHE_TTL_MS) {
+    ({ headSha, baseSha, headRepoFullName, baseRepoFullName } = cachedDetail);
+  } else {
+    const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+    const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
+    if (!("status" in prRes)) return { ok: false, error: prRes.error, status: 502 };
+    const prJson = await prRes.json().catch(() => null);
+    if (!prRes.ok) {
+      return prRes.status === 404
+        ? { ok: false, error: "pull request not found", status: 404 }
+        : { ok: false, error: apiError(prJson, prRes.status, prRes.statusText), status: prRes.status };
+    }
+    const pr = prJson && typeof prJson === "object" ? (prJson as Record<string, unknown>) : {};
+    const head = pr.head && typeof pr.head === "object" ? pr.head as Record<string, unknown> : {};
+    const base = pr.base && typeof pr.base === "object" ? pr.base as Record<string, unknown> : {};
+    const resolvedHeadSha = typeof head.sha === "string" ? head.sha : null;
+    const resolvedBaseSha = typeof base.sha === "string" ? base.sha : null;
+    if (!resolvedHeadSha || !resolvedBaseSha) {
+      return { ok: false, error: "GitHub returned a pull request without head/base sha", status: 502 };
+    }
+    headSha = resolvedHeadSha;
+    baseSha = resolvedBaseSha;
+    headRepoFullName = head.repo && typeof head.repo === "object"
+      && typeof (head.repo as Record<string, unknown>).full_name === "string"
+      ? (head.repo as Record<string, unknown>).full_name as string
+      : null;
+    baseRepoFullName = base.repo && typeof base.repo === "object"
+      && typeof (base.repo as Record<string, unknown>).full_name === "string"
+      ? (base.repo as Record<string, unknown>).full_name as string
+      : null;
+    cachePullDetail(detailKey, { headSha, baseSha, headRepoFullName, baseRepoFullName, fetchedAt: Date.now() });
   }
 
   let blobRepo: GitHubRepo;
   let ref: string;
   if (input.side === "new") {
-    const headRepo = repoFromPullSide(head.repo, repo.remoteHost);
+    const headRepo = repoFromFullName(headRepoFullName, repo.remoteHost);
     if (!headRepo) {
       return {
         ok: false,
@@ -1844,7 +1878,7 @@ export async function getGitHubPullBlob(input: GetGitHubPullBlobInput): Promise<
     blobRepo = headRepo;
     ref = headSha;
   } else {
-    blobRepo = repoFromPullSide(base.repo, repo.remoteHost) ?? repo;
+    blobRepo = repoFromFullName(baseRepoFullName, repo.remoteHost) ?? repo;
     const cacheKey = `${repo.remoteHost}/${repoSlug(repo)}#${input.number}@${headSha}`;
     const cached = mergeBaseCache.get(cacheKey);
     if (cached) {
@@ -1888,12 +1922,12 @@ export async function getGitHubPullBlob(input: GetGitHubPullBlobInput): Promise<
   }
 
   const contentLength = Number(fileRes.headers.get("content-length") ?? 0);
-  if (contentLength > GITHUB_BLOB_MAX_BYTES) {
+  if (contentLength > MAX_BLOB_PREVIEW_BYTES) {
     return { ok: false, error: `File is too large to preview (${Math.ceil(contentLength / 1_000_000)} MB).`, status: 413 };
   }
   const buf = await fileRes.arrayBuffer().catch(() => null);
   if (!buf) return { ok: false, error: "GitHub returned an unreadable file response", status: 502 };
-  if (buf.byteLength > GITHUB_BLOB_MAX_BYTES) {
+  if (buf.byteLength > MAX_BLOB_PREVIEW_BYTES) {
     return { ok: false, error: `File is too large to preview (${Math.ceil(buf.byteLength / 1_000_000)} MB).`, status: 413 };
   }
 
@@ -1901,6 +1935,7 @@ export async function getGitHubPullBlob(input: GetGitHubPullBlobInput): Promise<
     ok: true,
     bytes: new Uint8Array(buf),
     contentType: contentTypeForBlobPath(relPath, fileRes.headers.get("content-type")),
+    ref,
   };
 }
 

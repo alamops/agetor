@@ -13,7 +13,7 @@ import {
   addRangeToSelection, composeDiffMessage, groupSelectedRows, isRowInDragRange, isSelectableKind,
   type DiffDragRange, type DiffSelectionBlock,
 } from "@/lib/diff-selection";
-import { BinaryFilePreview } from "./BinaryFilePreview";
+import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
 import type { AgentKind, DiffFile, Harness, Run, Task, TaskDiff } from "../../../shared/types.ts";
 
@@ -863,21 +863,18 @@ function FileBlock({
  *  row machinery — no `data-diff-path`/`data-diff-index`, no selection. */
 function BinaryDiffPreview({ taskId, file }: { taskId: string | null; file: DiffFile }) {
   const kind = binaryPreviewKind(file.path);
-  if (kind === null) {
+  if (kind === null || !taskId) {
     return <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file — no textual diff.</div>;
   }
-  if (!taskId) {
-    return <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file — no textual diff.</div>;
-  }
-  const fileName = file.path.slice(file.path.lastIndexOf("/") + 1);
+  const { oldUrl, newUrl } = binaryPreviewSides(file, (path, side) => api.taskDiffBlobUrl(taskId, path, side));
   return (
     <div className="px-3 py-2">
       <BinaryFilePreview
         kind={kind}
         status={file.status}
-        fileName={fileName}
-        oldUrl={file.status === "added" ? null : api.taskDiffBlobUrl(taskId, file.oldPath ?? file.path, "old")}
-        newUrl={file.status === "deleted" ? null : api.taskDiffBlobUrl(taskId, file.path, "new")}
+        fileName={binaryFileBasename(file.path)}
+        oldUrl={oldUrl}
+        newUrl={newUrl}
       />
     </div>
   );

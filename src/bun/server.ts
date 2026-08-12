@@ -176,7 +176,7 @@ import type {
 } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
-import { binaryPreviewKind, isImagePath } from "../shared/attachments.ts";
+import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -208,27 +208,14 @@ const json = (data: unknown, init?: ResponseInit) =>
     status: init?.status,
   });
 
-// Content-type map for GET /files/preview and the binary-diff-blob routes
-// below. Module-scope so it isn't reallocated on every request. `pdf` is
-// used by the blob routes only (/files/preview is image-only, gated by
-// isImagePath) — the extension→mimetype fallback below (`image/<ext>`)
-// only ever applies to image kinds, so pdf must be listed explicitly.
-const PREVIEW_CONTENT_TYPES: Record<string, string> = {
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  svg: "image/svg+xml",
-  ico: "image/x-icon",
-  pdf: "application/pdf",
-};
-
-// Content-type for a binary-diff-blob response (/tasks/:id/diff/blob,
-// /github/pull-blob). `kind` comes from `binaryPreviewKind`'s allowlist, so
-// the `image/<ext>` fallback below only ever applies to an image extension
-// — never to `pdf`, which is always the explicit map entry.
+// Content-type for the /tasks/:id/diff/blob response, from the shared
+// canonical extension→MIME map (`../shared/attachments.ts`, also used by
+// /files/preview below and by github.ts's pull-blob path — one map, no more
+// drift between the three). `relPath` has already passed `binaryPreviewKind`
+// by the time this is called, so the shared map always matches; the
+// fallback is defense-in-depth only.
 function blobContentType(relPath: string, kind: "image" | "pdf"): string {
-  const ext = relPath.slice(relPath.lastIndexOf(".") + 1).toLowerCase();
-  if (kind === "pdf") return PREVIEW_CONTENT_TYPES.pdf ?? "application/pdf";
-  return PREVIEW_CONTENT_TYPES[ext] ?? `image/${ext}`;
+  return contentTypeForPreviewPath(relPath) ?? (kind === "pdf" ? "application/pdf" : "application/octet-stream");
 }
 
 // Derived, never-persisted count of this task's still-`running` subagent
@@ -901,26 +888,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: result.error }, { status: result.status ?? 502, headers: corsHeaders(req) });
           }
 
-          // pullBlob's result carries bytes + contentType but no etag of its
-          // own — synthesize a weak one from byte length + path, stable
-          // enough for the modal-scoped 1h cache below (a PR blob at a given
-          // sha doesn't change; the merge-base can move, hence "weak" and a
-          // short ttl rather than the task-diff route's immutable one).
-          const etag = `W/"${result.bytes.byteLength}-${createHash("sha1").update(filePath).digest("hex").slice(0, 16)}"`;
+          // Strong ETag from the resolved `ref` (the exact sha the bytes were
+          // fetched at) + path — content-addressed, unlike the old weak etag
+          // (byte length + path only), which could collide/miss across two
+          // different shas of the same size. By the time we know `ref` the
+          // upstream GitHub fetch has already happened (pullBlob resolves
+          // after fetching), so a 304 here only saves the localhost transfer
+          // back to the browser, not the GitHub round trip — still worth it
+          // for a modal where the user pages back and forth between files.
+          const etag = `"${createHash("sha1").update(`${result.ref}:${filePath}`).digest("hex")}"`;
           if (req.headers.get("if-none-match") === etag) {
             return new Response(null, { status: 304, headers: { ...corsHeaders(req), etag } });
           }
-          // `new Uint8Array(bytes)` (copy, not a re-view) resolves the type
-          // to `Uint8Array<ArrayBuffer>` — `pullBlob`'s unparametrized
-          // `Uint8Array` return type defaults to `Uint8Array<ArrayBufferLike>`
-          // under TS 5.7+, which `BodyInit`'s `ArrayBufferView<ArrayBuffer>`
-          // constraint rejects.
-          return new Response(new Uint8Array(result.bytes), {
+          // Not content-addressed by URL (PR number, not a pinned sha) — the
+          // merge-base can move between requests, so revalidate every time;
+          // the ETag above makes that a cheap 304.
+          return new Response(result.bytes, {
             headers: {
               ...corsHeaders(req),
               "content-type": result.contentType,
               "x-content-type-options": "nosniff",
-              "cache-control": "private, max-age=3600",
+              "cache-control": "private, max-age=0, must-revalidate",
               etag,
             },
           });
@@ -3488,8 +3476,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // textual diff" placeholder. Same trust posture as /files/preview:
       // token-gated + loopback-only is the real boundary, the extension
       // allowlist (`binaryPreviewKind`) just keeps this from doubling as a
-      // generic blob reader, and `getTaskDiffBlob` independently rejects any
-      // path that would escape the task's cwd.
+      // generic blob reader, and `getTaskDiffBlob` rejects any path that
+      // would lexically escape the task's cwd (symlink containment is not
+      // enforced, consistent with /files/preview's trust posture).
       "/tasks/:id/diff/blob": {
         GET: authed(async (req) => {
           const t = tasks.get(req.params.id);
@@ -3525,12 +3514,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               ...corsHeaders(req),
               "content-type": blobContentType(relPath, kind),
               "x-content-type-options": "nosniff",
-              // "new" is the working tree — it can change under the user's
-              // feet, so revalidate every time. "old" is pinned to a resolved
-              // commit sha, so it never changes for a given etag.
-              "cache-control": side === "new"
-                ? "private, max-age=0, must-revalidate"
-                : "private, max-age=31536000, immutable",
+              // Neither side is content-addressed by URL: "new" is the
+              // working tree (can change under the user's feet), and "old"
+              // is pinned to `task.baseRef` which itself isn't stable — an
+              // isolation=none task's base is literally "HEAD" (moves with
+              // every commit), and a worktree task's baseRef can be null.
+              // Both sides revalidate on every request; the ETag (content
+              // hash for "old", size+mtime for "new") makes that a cheap 304.
+              "cache-control": "private, max-age=0, must-revalidate",
               etag: result.etag,
             },
           });
@@ -3892,7 +3883,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
           }
           const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
-          const contentType = PREVIEW_CONTENT_TYPES[ext] ?? `image/${ext}`;
+          // Shared canonical map (../shared/attachments.ts) — behavior is
+          // unchanged from the old inline map + `image/<ext>` fallback: every
+          // extension reachable here already passed `isImagePath`, so the
+          // shared lookup always hits and the fallback is never exercised.
+          const contentType = contentTypeForPreviewPath(raw) ?? `image/${ext}`;
           // ETag derived from size+mtime so a re-saved file at the same path
           // (e.g. a screenshot overwritten in place) is detected as changed.
           const etag = `"${st.size}-${st.mtimeMs}"`;

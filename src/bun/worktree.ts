@@ -7,6 +7,7 @@ import { dataDir } from "./db.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, WorktreeTeardownResult } from "../shared/types.ts";
+import { MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 
 export type { BranchInfo };
 
@@ -947,21 +948,25 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
   return { base: shortBase, files };
 }
 
-// Above this many bytes, a diff-preview blob (image/PDF) is refused rather
-// than read into memory whole — these routes serve the webview's inline
-// old-vs-new preview, not a general-purpose file reader.
-export const MAX_BLOB_PREVIEW_BYTES = 20_000_000;
+// Re-exported so existing/future importers of `MAX_BLOB_PREVIEW_BYTES` from
+// this module keep working; `../shared/attachments.ts` is now the canonical
+// definition (shared with `github.ts`'s GitHub pull-blob route).
+export { MAX_BLOB_PREVIEW_BYTES };
 
 /**
  * True iff `relPath` is safe to `path.join` onto a trusted `cwd`: non-empty,
  * free of null bytes, not itself absolute, and whose normalized form
  * doesn't escape `cwd` (no leading `..` segment once normalized). This is a
  * stricter contract than `/files/preview`'s (which trusts an already-
- * absolute, already-existing path) — `getTaskDiffBlob` takes a
+ * absolute, already-existing path) — `getTaskDiffBlob` (and, via
+ * `git-host.ts`'s `pullBlob`, the GitHub pull-blob route) take a
  * repo-relative path from the client, so traversal must be rejected before
- * it ever touches the filesystem or a `git` invocation.
+ * it ever touches the filesystem or a `git`/API invocation. Rejects
+ * lexically-escaping paths only; symlink containment is not enforced,
+ * consistent with `/files/preview`'s trust posture (this app has no
+ * sandbox — see the repo's CLAUDE.md).
  */
-function isSafeRelPath(relPath: string): boolean {
+export function isSafeRelPath(relPath: string): boolean {
   if (!relPath) return false;
   if (relPath.includes("\0")) return false;
   if (path.isAbsolute(relPath)) return false;
@@ -1017,12 +1022,37 @@ export async function getTaskDiffBlob(
   }
 
   if (side === "new") {
-    const abs = path.join(cwd, relPath);
+    // `git diff`/`git ls-files` report tracked paths relative to the repo
+    // ROOT, not necessarily `cwd` — for an isolation=none task whose workdir
+    // is a subdirectory of the repo, joining `relPath` onto `cwd` directly
+    // double-prefixes it and 404s. (The "old" side below is unaffected:
+    // `git show <sha>:<relPath>` is root-relative by construction, same as
+    // the diff itself.) Resolve the repo root once and join there instead.
+    //
+    // Caveat: untracked files surfaced via `git ls-files --others`
+    // (getTaskDiff's synthetic "added" entries) are CWD-relative, not
+    // root-relative — so such a file's path may only resolve under the
+    // cwd-relative join. Try the root-relative path first (the common case —
+    // tracked diffs are root-relative), and fall back to the cwd-relative
+    // join only when the root-relative stat misses and the two differ.
+    const root = await repoRoot(cwd);
+    const rootAbs = root ? path.join(root, relPath) : null;
+    const cwdAbs = path.join(cwd, relPath);
+    let abs = rootAbs ?? cwdAbs;
     let st;
     try {
       st = statSync(abs);
     } catch {
-      return { ok: false, error: "not found", status: 404 };
+      if (rootAbs && rootAbs !== cwdAbs) {
+        try {
+          st = statSync(cwdAbs);
+          abs = cwdAbs;
+        } catch {
+          return { ok: false, error: "not found", status: 404 };
+        }
+      } else {
+        return { ok: false, error: "not found", status: 404 };
+      }
     }
     // Only regular files: a FIFO/device named `*.png` would otherwise hang
     // the read forever (same guard as /files/preview).
@@ -1049,7 +1079,15 @@ export async function getTaskDiffBlob(
     return { ok: false, error: "not present at base", status: 404 };
   }
   const size = Number(sizeRes.stdout);
-  if (Number.isFinite(size) && size > MAX_BLOB_PREVIEW_BYTES) {
+  // Fail CLOSED on an unparsable size: `cat-file -s` exited 0 (handled
+  // above) but printed something we can't read as a number is "can't
+  // confirm this is safe to read into memory," not "assume it's small
+  // enough." Two separate branches (rather than one combined condition) so
+  // each gets its own clear error/status.
+  if (!Number.isFinite(size)) {
+    return { ok: false, error: "could not determine blob size", status: 404 };
+  }
+  if (size > MAX_BLOB_PREVIEW_BYTES) {
     return { ok: false, error: "too large to preview", status: 413 };
   }
 

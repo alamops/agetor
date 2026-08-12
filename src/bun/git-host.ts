@@ -44,6 +44,7 @@ import {
   updateGitHubIssue,
 } from "./github.ts";
 import { providerRepoForDir } from "./git-provider.ts";
+import { isSafeRelPath } from "./worktree.ts";
 import {
   closeGitLabPull,
   createGitLabComment,
@@ -399,7 +400,11 @@ export interface PullBlobOpts {
 }
 
 export type PullBlobResult =
-  | { ok: true; bytes: Uint8Array; contentType: string }
+  // `ref` is the exact sha the bytes were fetched at (head sha for "new",
+  // the resolved merge-base sha for "old") — used by the server route to
+  // build a truly content-addressed ETag instead of one derived only from
+  // byte length + path.
+  | { ok: true; bytes: Uint8Array<ArrayBuffer>; contentType: string; ref: string }
   // status: 404 missing, 413 too large, 501 unsupported provider, 502 upstream
   | { ok: false; error: string; status?: number };
 
@@ -412,10 +417,20 @@ export type PullBlobResult =
  * previews are deferred to a follow-up (see docs/plans/binary-diff-previews.md
  * §8) — both return `501 unsupported` rather than attempting a fetch, so the
  * UI's binary placeholder degrades gracefully instead of erroring.
+ *
+ * `input.path` is validated with `isSafeRelPath` (the same guard
+ * `getTaskDiffBlob` applies to the task-diff blob route) before any
+ * provider is dispatched to — without it, a path like
+ * `../../../../repos/victim/priv/contents/secret` would pass the caller's
+ * extension gate and normalize into an arbitrary-repo Contents API read
+ * under the user's own token.
  */
 export async function pullBlob(input: PullBlobOpts): Promise<PullBlobResult> {
   const repoInfo = await providerRepoForDir(input.dir);
-  if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
+  if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR, status: 400 };
+  if (!isSafeRelPath(input.path)) {
+    return { ok: false, error: "invalid path", status: 400 };
+  }
   if (repoInfo.provider === "github") return getGitHubPullBlob(input);
   return { ok: false, status: 501, error: "binary preview not supported for this provider yet" };
 }

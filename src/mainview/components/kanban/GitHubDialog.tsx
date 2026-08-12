@@ -69,7 +69,7 @@ import { cn } from "@/lib/utils";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
 import { mergeabilityView, type MergeTone } from "@/lib/mergeability";
 import { isCredentialError } from "@/lib/credential-error";
-import { BinaryFilePreview } from "./BinaryFilePreview";
+import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
 import { ResolveConflictsDialog, type ResolveConflictsContext } from "./ResolveConflictsDialog";
 import {
@@ -8940,17 +8940,18 @@ function Reactions({
 function PullBinaryPreview({ blobCtx, file }: { blobCtx: { repoDir: string; number: number } | null; file: DiffFile }) {
   const kind = binaryPreviewKind(file.path);
   if (kind === null || !blobCtx) {
-    return <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file, no textual diff.</div>;
+    return <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file — no textual diff.</div>;
   }
-  const fileName = file.path.slice(file.path.lastIndexOf("/") + 1);
+  const { oldUrl, newUrl } = binaryPreviewSides(file, (path, side) =>
+    api.pullBlobUrl({ path: blobCtx.repoDir, number: blobCtx.number, filePath: path, side }));
   return (
     <div className="px-3 py-2">
       <BinaryFilePreview
         kind={kind}
         status={file.status}
-        fileName={fileName}
-        oldUrl={file.status === "added" ? null : api.pullBlobUrl({ path: blobCtx.repoDir, number: blobCtx.number, filePath: file.oldPath ?? file.path, side: "old" })}
-        newUrl={file.status === "deleted" ? null : api.pullBlobUrl({ path: blobCtx.repoDir, number: blobCtx.number, filePath: file.path, side: "new" })}
+        fileName={binaryFileBasename(file.path)}
+        oldUrl={oldUrl}
+        newUrl={newUrl}
       />
     </div>
   );
