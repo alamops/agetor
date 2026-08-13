@@ -1,3 +1,8 @@
+-- Renumbered 042 → 043 at merge time: main took 042 for
+-- 042_subagents_running_idx (#178) while this branch was in flight. DBs
+-- that already applied it as "042_harness_usage" are covered by the
+-- aliases entry in index.ts (renumber-with-alias pattern).
+--
 -- Latest per-harness usage/quota snapshot for the topbar usage tracker
 -- (see docs/plans/harness-usage-tracker.md). Stores the most recent
 -- `HarnessQuota` (src/shared/types.ts) as JSON, keyed by harness id, so the

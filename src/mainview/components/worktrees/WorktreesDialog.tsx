@@ -314,7 +314,7 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                 discarded.
               </div>
             )}
-            {w.runActive && " An agent is still working on this task — archiving will stop it."}
+            {(w.runActive || w.heldByBackgroundAgents) && " An agent is still working on this task — archiving will stop it."}
           </>
         ),
         confirmLabel: copy.confirmLabel,
@@ -540,6 +540,9 @@ export function WorktreesDialog({ open, onClose, tasks, projects, onOpenTask, ho
                       <span className="min-w-0 truncate" title={w.path}>{abbreviateHome(w.path, homeDir)}</span>
                       <span>updated {formatAge(w.taskUpdatedAt)}</span>
                       {w.runActive && <span className="text-success">running</span>}
+                      {!w.runActive && w.heldByBackgroundAgents && (
+                        <span className="text-success">agents working</span>
+                      )}
                       {status === "loading" && (
                         <Loader2 className="size-3 animate-spin text-muted-foreground" aria-label="Loading git status" />
                       )}

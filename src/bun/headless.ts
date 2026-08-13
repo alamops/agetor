@@ -1,6 +1,6 @@
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
-import { db, dataDir } from "./db.ts";
+import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, reapIdleSessions } from "./orchestrator.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -29,11 +29,30 @@ import { pollAllUsage } from "./usage/poller.ts";
  */
 
 const IDLE_CHECK_MS = 30_000;
-/** Default idle-shutdown after 5 min with no run and no attached client.
+/** Default idle-shutdown after 5 min with no run, no running background
+ *  agent/workflow, and no attached client.
  *  `AGETOR_DAEMON_IDLE_MS=0` disables idle shutdown (daemon stays up). */
 const IDLE_TIMEOUT_MS = Number(
   process.env.AGETOR_DAEMON_IDLE_MS ?? 5 * 60 * 1000,
 );
+
+/** Ceiling on how long a `running` subagent row alone can hold the daemon up.
+ *  Two row classes can never settle on their own: workflow container rows are
+ *  deliberately exempt from the `STALE_SUBAGENT_SETTLE_MS` backstop
+ *  (claude-subagents.ts) — they're settled only by their completion
+ *  notification or user action — and rows created while
+ *  `AGETOR_TRACK_SUBAGENTS=0` is set are no-op stubs nothing will ever flip
+ *  to `completed`. Without a ceiling either one pins the daemon alive
+ *  forever. Past this ceiling the daemon may idle-exit exactly as it did
+ *  before this feature existed: the detached tmux session survives the exit,
+ *  and the next boot's `reconcileOrphans` reattaches or orphans it. */
+const SUBAGENT_HOLD_MAX_MS = 6 * 60 * 60 * 1000; // 6h
+
+/** Set once a swallowed `hasRunningWork` error has been logged, so a
+ *  sustained failure (e.g. SQLITE_BUSY) doesn't spam the log every 30s —
+ *  but a daemon that idle-exited during a DB failure window is still
+ *  diagnosable from the single line it did emit. */
+let loggedHasRunningWorkError = false;
 
 function hasRunningRuns(): boolean {
   try {
@@ -45,6 +64,24 @@ function hasRunningRuns(): boolean {
         .get() != null
     );
   } catch {
+    return false;
+  }
+}
+
+/** Daemon-wide "is anything still working?" — running runs OR running
+ *  background agents/workflows (subagent rows started within
+ *  `SUBAGENT_HOLD_MAX_MS`). Exported for tests. */
+export function hasRunningWork(): boolean {
+  if (hasRunningRuns()) return true;
+  try {
+    return subagents.hasAnyRunning(Date.now() - SUBAGENT_HOLD_MAX_MS);
+  } catch (err) {
+    if (!loggedHasRunningWorkError) {
+      loggedHasRunningWorkError = true;
+      daemonLog(
+        `hasRunningWork: subagents.hasAnyRunning failed, treating as idle: ${(err as Error)?.message ?? String(err)}`,
+      );
+    }
     return false;
   }
 }
@@ -150,7 +187,7 @@ export async function runDaemon(): Promise<void> {
   if (IDLE_TIMEOUT_MS > 0) {
     let idleSince: number | null = null;
     const timer = setInterval(() => {
-      if (hasRunningRuns() || attachedClientCount() > 0) {
+      if (hasRunningWork() || attachedClientCount() > 0) {
         idleSince = null;
         return;
       }
