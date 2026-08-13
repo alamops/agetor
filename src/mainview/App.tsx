@@ -18,6 +18,8 @@ import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
 import { UpdateBanner } from "@/components/updater/UpdateBanner";
 import { WorktreesDialog } from "@/components/worktrees/WorktreesDialog";
+import { WelcomeDialog } from "@/components/onboarding/WelcomeDialog";
+import { OnboardingChecklist } from "@/components/onboarding/OnboardingChecklist";
 import type { UpdateSnapshot } from "@/lib/api";
 import { useConfirm } from "@/components/ui/confirm";
 import { toast } from "sonner";
@@ -28,6 +30,8 @@ import { findTaskById } from "@/lib/notification-open";
 import { parseThemePreference } from "@/lib/theme";
 import { parsePullNumber } from "@/lib/pr-url";
 import { cn } from "@/lib/utils";
+import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
+import type { SettingsSectionId } from "@/lib/settings-dialog-view";
 import iconUrl from "../assets/agetor.iconset/icon_32x32@2x.png";
 
 /**
@@ -138,6 +142,16 @@ function reconcileById<T>(
   return merged;
 }
 
+/** Muted one-line hints shown in empty columns while onboarding's checklist
+ *  is visible (see `Column`'s `emptyHint` prop). Review/done intentionally
+ *  have no entry — an empty Review/Done column needs no explanation. */
+const EMPTY_COLUMN_HINT: Partial<Record<ColumnId, string>> = {
+  backlog: "Ideas you haven't queued yet",
+  ready: "Tasks return here when a run needs another go",
+  running: "Agents working right now",
+  blocked: "Needs your attention",
+};
+
 /**
  * The actual app tree. Split out from the default-exported `App` so it can
  * live *inside* `<ThemeProvider>` and call `useTheme()` — the provider must
@@ -149,6 +163,10 @@ function AppInner() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
+  // True once `/harnesses` has resolved at least once — lets onboarding's
+  // harness step tell "not loaded yet" (skip the disabled/enabled
+  // distinction) apart from "loaded, and it happens to be empty".
+  const [harnessesLoaded, setHarnessesLoaded] = useState(false);
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [] });
   const [selected, setSelected] = useState<Task | null>(null);
   const [diffTask, setDiffTask] = useState<Task | null>(null);
@@ -161,6 +179,35 @@ function AppInner() {
   const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
   const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Section the Settings dialog should land on when it next opens — set by
+  // onboarding's "Enable in Settings…" deep link, cleared on close so the
+  // plain gear-icon open still lands on General.
+  const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSectionId | undefined>(undefined);
+  // --- Onboarding (docs/plans/onboarding-first-run.md) ---------------------
+  // Server preference mirror. `undefined` = never fetched OR never set;
+  // `resolveOnboardingVisibility` treats those the same (both gate on
+  // `prefsLoaded` below), so no separate "not yet fetched" sentinel is
+  // needed here.
+  const [onboardingDismissedPref, setOnboardingDismissedPref] = useState<string | undefined>(undefined);
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
+  // First successful /tasks fetch — `resolveOnboardingVisibility`'s `loaded`
+  // must not fire before this, or a genuinely-empty fresh board could flash
+  // the welcome dialog for a beat before the first real fetch lands (same
+  // class of bug the boot-splash minimum-dwell guards against elsewhere).
+  const [tasksLoaded, setTasksLoaded] = useState(false);
+  // First successful `/projects` fetch — mirrors `tasksLoaded`/
+  // `harnessesLoaded`. Onboarding's "project" step needs a live projects
+  // list (added mid-session via NewTaskForm) to ever be able to check off,
+  // and gating on this (rather than assuming the boot-time fetch is enough)
+  // keeps the compact-strip flash guard consistent: a transient poll
+  // failure just delays onboarding rather than flashing it early.
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
+  // "Get started" in WelcomeDialog is session-only (doesn't write the
+  // server pref) — only "Skip" and the checklist's own dismiss persist.
+  const [welcomeAcknowledged, setWelcomeAcknowledged] = useState(false);
+  // Nonce bumped by onboarding's "Choose a project…" / "Create your first
+  // task" actions — NewTaskForm reacts to increments (expand + focus Title).
+  const [newTaskFocusNonce, setNewTaskFocusNonce] = useState(0);
   const [githubOpen, setGithubOpen] = useState(false);
   // Set by RunPanel's "Open PR" chip to open GitHubDialog pre-seeded for a
   // specific task; cleared when the dialog closes so a later plain "GitHub"
@@ -223,10 +270,26 @@ function AppInner() {
         const dbFontSize = clampFontSizePercent(prefs.fontSize);
         if (dbFontSize !== fontSizePercentRef.current) setFontSizePercent(dbFontSize);
       }
-    }).catch(() => { /* keep the boot-seeded preferences */ });
+      // Onboarding's dismissal flag piggybacks on this same fetch — no
+      // paint-blocking concern (unlike theme/font-size), so a single async
+      // read at boot is enough. `refetchOnboardingPref` (used after Settings
+      // closes) re-reads just this key via the same route.
+      setOnboardingDismissedPref(prefs[ONBOARDING_DISMISSED_PREF]);
+      setPrefsLoaded(true);
+    }).catch(() => { /* keep the boot-seeded preferences; onboarding stays hidden (prefsLoaded=false) rather than guess */ });
     // Run once at boot only — intentionally not re-run when either local
     // preference changes (that would fight the user's own picker/shortcut).
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Re-reads just the onboarding dismissal pref. Called after SettingsDialog
+   *  closes so a "Show getting started guide" replay (which writes the pref
+   *  server-side, then closes the dialog) is reflected without a full
+   *  preferences round-trip through the boot-only effect above. */
+  const refetchOnboardingPref = useCallback(() => {
+    api.listPreferences()
+      .then((prefs) => setOnboardingDismissedPref(prefs[ONBOARDING_DISMISSED_PREF]))
+      .catch(() => { /* keep last known value */ });
   }, []);
 
   // Per-task serialized-form cache for `reconcileById` below — see that
@@ -244,6 +307,10 @@ function AppInner() {
       // (e.g. re-checking a just-created task's branch); the reconciled,
       // identity-preserving version is what actually lands in state.
       setTasks((prev) => reconcileById(prev, list, (t) => t.id, taskReconcileCacheRef.current));
+      // Gates onboarding visibility (see `resolveOnboardingVisibility`'s
+      // `loaded` input) — set unconditionally on every success, cheap no-op
+      // once already true.
+      setTasksLoaded(true);
       return list;
     } catch { return null; /* keep last good snapshot; retry next tick */ }
   }, []);
@@ -252,19 +319,42 @@ function AppInner() {
       const payload = await api.listHarnesses();
       setHarnesses((prev) => reconcileById(prev, payload.harnesses, (h) => h.id));
       setAgents((prev) => reconcileById(prev, payload.statuses, (a) => a.harnessId));
+      // Harness rows (carries `enabled`) are already fetched here for the
+      // header's status dots — onboarding's harness step reuses this same
+      // state instead of a second fetch, but needs to distinguish "not
+      // loaded yet" from "loaded, zero harnesses" (the latter can't
+      // actually happen — built-ins are always seeded — but the checklist
+      // degrades gracefully either way per its contract).
+      setHarnessesLoaded(true);
     } catch { /* leave previous state */ }
   }, []);
   const refreshAgentModels = useCallback(async () => {
     try { setAgentModels(await api.listAgentModels()); } catch { /* leave previous state */ }
   }, []);
+  // Per-project serialized-form cache for `reconcileById` below, mirroring
+  // `taskReconcileCacheRef` — keeps `projects` referentially stable across
+  // polls where nothing actually changed.
+  const projectReconcileCacheRef = useRef(new Map<string, { obj: Project; json: string }>());
+  /** Re-list projects. GET /projects is a cheap DB read, so this rides the
+   *  same 2s poll as `refresh()` — projects added mid-session via
+   *  NewTaskForm now show up without a reload, which onboarding's "project"
+   *  step depends on to ever be able to check off. */
+  const refreshProjects = useCallback(async () => {
+    try {
+      const list = await api.listProjects();
+      setProjects((prev) => reconcileById(prev, list, (p) => p.path, projectReconcileCacheRef.current));
+      // Gates onboarding visibility (see `resolveOnboardingVisibility`'s
+      // `loaded` input) — set unconditionally on every success, cheap no-op
+      // once already true. A transient failure just delays onboarding
+      // (the poll retries), which is the safe direction.
+      setProjectsLoaded(true);
+    } catch { /* leave previous state; poll retries */ }
+  }, []);
   useEffect(() => {
     void refresh();
     void refreshAgents();
     void refreshAgentModels();
-    // Load projects once for the repo filter picker. New projects added
-    // mid-session via NewTaskForm won't show up until reload — matches the
-    // session-only filter persistence model.
-    api.listProjects().then(setProjects).catch(() => { /* leave empty */ });
+    void refreshProjects();
     // Resolve the user's home dir once so SettingsDialog can expand `~/…`
     // template paths into concrete absolute paths before validation.
     // `/defaults` is small + local, but a hiccup at boot would now leave
@@ -297,11 +387,17 @@ function AppInner() {
     // gate the poll" change without an immediate on-return refresh would
     // reintroduce the same class of "frozen until you nudge the window"
     // bug previously fixed there.
-    const t = setInterval(() => { if (!document.hidden) void refresh(); }, 2000);
+    const t = setInterval(() => {
+      if (!document.hidden) {
+        void refresh();
+        void refreshProjects();
+      }
+    }, 2000);
     const a = setInterval(() => { if (!document.hidden) void refreshAgents(); }, 15_000);
     const onVisible = () => {
       if (document.hidden) return;
       void refresh();
+      void refreshProjects();
       void refreshAgents();
     };
     document.addEventListener("visibilitychange", onVisible);
@@ -313,7 +409,7 @@ function AppInner() {
       window.removeEventListener("focus", onVisible);
       if (defaultsTimer) clearTimeout(defaultsTimer);
     };
-  }, [refresh, refreshAgents, refreshAgentModels]);
+  }, [refresh, refreshAgents, refreshAgentModels, refreshProjects]);
 
   // Keep the selected task in sync as the list refreshes.
   useEffect(() => {
@@ -566,6 +662,77 @@ function AppInner() {
     [tasks],
   );
 
+  // --- Onboarding derivation (pure lib/onboarding.ts, thin wiring here) ---
+  const enabledHarnessIds = useMemo(
+    () => (harnessesLoaded ? new Set(harnesses.filter((h) => h.enabled).map((h) => h.id)) : null),
+    [harnessesLoaded, harnesses],
+  );
+  const onboardingSteps = useMemo(
+    () => deriveOnboardingSteps({ statuses: agents, enabledHarnessIds, projectCount: projects.length, tasks }),
+    [agents, enabledHarnessIds, projects.length, tasks],
+  );
+  const onboardingVisibility = useMemo(
+    () => resolveOnboardingVisibility({
+      dismissedPref: onboardingDismissedPref,
+      // All four sources the derivation reads from (prefs, tasks, harnesses,
+      // projects) must have resolved at least once — otherwise the checklist
+      // can flash the compact "some steps missing" strip for an existing
+      // user whose harnesses/projects just haven't loaded yet on a slow boot.
+      loaded: prefsLoaded && tasksLoaded && harnessesLoaded && projectsLoaded,
+      steps: onboardingSteps,
+      taskCount: tasks.length,
+      welcomeAcknowledged,
+    }),
+    [
+      onboardingDismissedPref,
+      prefsLoaded,
+      tasksLoaded,
+      harnessesLoaded,
+      projectsLoaded,
+      onboardingSteps,
+      tasks.length,
+      welcomeAcknowledged,
+    ],
+  );
+  // Existing-user upgrade path: write the dismissal pref once, the instant
+  // `resolveOnboardingVisibility` signals every step already derives as
+  // done and the pref was never set — a ref guard (not just relying on the
+  // pref write to flip `autoDismiss` back false) because the write is
+  // async and several renders can land before it resolves.
+  const autoDismissWrittenRef = useRef(false);
+  useEffect(() => {
+    if (!onboardingVisibility.autoDismiss || autoDismissWrittenRef.current) return;
+    autoDismissWrittenRef.current = true;
+    setOnboardingDismissedPref("true");
+    void api.setPreference(ONBOARDING_DISMISSED_PREF, "true").catch(() => {
+      // Best-effort — worst case onboarding re-evaluates (and re-attempts
+      // this write) on the next state change; it never blocks the UI.
+      autoDismissWrittenRef.current = false;
+    });
+  }, [onboardingVisibility.autoDismiss]);
+
+  // Shared by WelcomeDialog's "Skip" and OnboardingChecklist's "Dismiss" —
+  // both permanently hide onboarding.
+  const dismissOnboarding = useCallback(() => {
+    setOnboardingDismissedPref("true");
+    void api.setPreference(ONBOARDING_DISMISSED_PREF, "true").catch(() => {
+      /* best-effort, matching the theme/defaultHarness write idiom elsewhere */
+    });
+  }, []);
+  const openSettingsHarnesses = useCallback(() => {
+    setSettingsInitialSection("harnesses");
+    setSettingsOpen(true);
+  }, []);
+  const onFocusNewTask = useCallback(() => {
+    setNewTaskFocusNonce((n) => n + 1);
+  }, []);
+  const onOpenOnboardingTerminal = useCallback((harnessId: string) => {
+    void api.openHarnessTerminal(harnessId).catch((e: unknown) => {
+      const message = e instanceof Error ? e.message : String(e);
+      toast.error("Couldn't open terminal", { description: message });
+    });
+  }, []);
+
   // Every handler below is wrapped in `useCallback` so it keeps a stable
   // identity across App re-renders (poll ticks, unrelated state changes,
   // etc.) — they're passed straight down to `Column`/`TaskCard`, both
@@ -816,6 +983,7 @@ function AppInner() {
           agents={agents}
           harnesses={harnesses}
           agentModels={agentModels}
+          focusNonce={newTaskFocusNonce}
           onSubmit={async (input, { start }) => {
             try {
               setError(null);
@@ -853,6 +1021,20 @@ function AppInner() {
             show={isTmuxMissing(agents)}
             onResolve={() => setTmuxDialogOpen(true)}
           />
+          {onboardingVisibility.showChecklist && tasks.length > 0 && (
+            <div className="px-4 pt-3">
+              <OnboardingChecklist
+                steps={onboardingSteps}
+                statuses={agents}
+                harnessRows={harnessesLoaded ? harnesses : null}
+                compact
+                onOpenSettingsHarnesses={openSettingsHarnesses}
+                onFocusNewTask={onFocusNewTask}
+                onOpenTerminal={onOpenOnboardingTerminal}
+                onDismiss={dismissOnboarding}
+              />
+            </div>
+          )}
           <KanbanFilters
             textQuery={textQuery}
             onTextQueryChange={setTextQuery}
@@ -875,28 +1057,60 @@ function AppInner() {
           {/* Kanban gets all remaining vertical space and scrolls horizontally
               on its own — the bottom bar stays anchored regardless of column
               count. */}
-          <div className="kanban-scroll flex-1 overflow-x-scroll">
-            <DndContext sensors={sensors} onDragEnd={onDragEnd}>
-              <div className="flex gap-3 p-4">
-                {visibleColumns.map((c) => (
-                  <Column
-                    key={c.id}
-                    id={c.id}
-                    label={c.label}
-                    tasks={visibleTasks.filter((t) => t.column === c.id)}
-                    homeDir={homeDir}
-                    onStart={start}
-                    onCancel={cancel}
-                    onDelete={del}
-                    onOpen={setSelected}
-                    onDiff={setDiffTask}
-                    onMarkDone={markDone}
-                    onArchive={archive}
-                    onUnarchive={unarchive}
+          {/* Outer positioning context lives OUTSIDE the horizontal
+              scroller: the zero-task overlay below is absolutely positioned
+              against this div, not `.kanban-scroll`, so scrolling the board
+              horizontally can't carry the card off-screen with it (an
+              abs-positioned descendant of a scrolling containing block
+              scrolls along with it — the previous bug). */}
+          <div className="relative flex-1">
+            <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
+              <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+                <div className="flex gap-3 p-4">
+                  {visibleColumns.map((c) => (
+                    <Column
+                      key={c.id}
+                      id={c.id}
+                      label={c.label}
+                      tasks={visibleTasks.filter((t) => t.column === c.id)}
+                      homeDir={homeDir}
+                      onStart={start}
+                      onCancel={cancel}
+                      onDelete={del}
+                      onOpen={setSelected}
+                      onDiff={setDiffTask}
+                      onMarkDone={markDone}
+                      onArchive={archive}
+                      onUnarchive={unarchive}
+                      emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
+                    />
+                  ))}
+                </div>
+              </DndContext>
+            </div>
+            {/* Zero-task state: the full onboarding card sits above the
+                (still-visible, still-empty) column grid rather than
+                replacing it — dnd-kit's drop zones stay mounted underneath.
+                Positioned against the outer `relative flex-1` div (a sibling
+                of `.kanban-scroll`, not a descendant of it), so it stays
+                visually centered over the viewport regardless of how far
+                the board is scrolled horizontally. */}
+            {onboardingVisibility.showChecklist && tasks.length === 0 && (
+              <div className="pointer-events-none absolute inset-x-0 top-6 z-10 flex justify-center px-4">
+                <div className="pointer-events-auto">
+                  <OnboardingChecklist
+                    steps={onboardingSteps}
+                    statuses={agents}
+                    harnessRows={harnessesLoaded ? harnesses : null}
+                    compact={false}
+                    onOpenSettingsHarnesses={openSettingsHarnesses}
+                    onFocusNewTask={onFocusNewTask}
+                    onOpenTerminal={onOpenOnboardingTerminal}
+                    onDismiss={dismissOnboarding}
                   />
-                ))}
+                </div>
               </div>
-            </DndContext>
+            )}
           </div>
         </main>
       </div>
@@ -961,15 +1175,31 @@ function AppInner() {
       />
       <SettingsDialog
         open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+        onClose={() => {
+          setSettingsOpen(false);
+          // Clear the deep-link so a later plain gear-icon open lands back
+          // on General instead of wherever onboarding last sent it.
+          setSettingsInitialSection(undefined);
+          // Reflects a "Show getting started guide" replay (General section
+          // writes the pref server-side, then calls this same onClose) —
+          // simplest correct option without threading a dedicated callback
+          // through SettingsDialog.
+          refetchOnboardingPref();
+        }}
         onChange={refreshAgents}
         homeDir={homeDir}
         dataDir={dataDir}
+        initialSection={settingsInitialSection}
       />
       <TmuxInstallDialog
         open={tmuxDialogOpen}
         onClose={() => setTmuxDialogOpen(false)}
         onResolved={refreshAgents}
+      />
+      <WelcomeDialog
+        open={onboardingVisibility.showWelcome}
+        onAcknowledge={() => setWelcomeAcknowledged(true)}
+        onSkip={dismissOnboarding}
       />
     </div>
   );

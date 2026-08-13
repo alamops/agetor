@@ -15,6 +15,7 @@ import { SavedPromptsSection } from "@/components/settings/SavedPromptsSection";
 import { useFontSize } from "@/components/font-size-provider";
 import { useTheme } from "@/components/theme-provider";
 import { isMacPlatform } from "@/lib/font-size";
+import { ONBOARDING_DISMISSED_PREF } from "@/lib/onboarding";
 import { abbreviateHome, cn } from "@/lib/utils";
 import {
   SETTINGS_SECTIONS,
@@ -25,6 +26,7 @@ import {
   openSection,
   openTemplates,
   resolveEscape,
+  type SettingsSectionId,
   type SettingsView,
 } from "@/lib/settings-dialog-view";
 import {
@@ -67,6 +69,10 @@ interface Props {
    *  template `home` paths so new harnesses default under the running dir
    *  (~/.agetor for the .app, ~/.agetor-dev for `bun run dev`). */
   dataDir: string;
+  /** Section to land on when the dialog opens. Applied on every open
+   *  transition (not just the first) — absent/undefined preserves today's
+   *  behavior of always resetting to General. */
+  initialSection?: SettingsSectionId;
 }
 
 /**
@@ -190,7 +196,7 @@ async function describeHarnessInUse(err: unknown): Promise<string | null> {
   return `In use by ${titles.length} ${noun}: ${titles.join(", ")}`;
 }
 
-export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Props) {
+export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir, initialSection }: Props) {
   const [version, setVersion] = useState<string>("");
   const [payload, setPayload] = useState<HarnessesPayload>({ harnesses: [], statuses: [] });
   const [defaultHarness, setDefaultHarness] = useState<string>("claude-code");
@@ -257,11 +263,12 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
   useEffect(() => {
     if (!open) return;
     void refresh();
-    // Reset to the General section on every open so a half-filled editor
-    // doesn't greet the user next time.
-    setView(initialView());
+    // Reset to the General section (or `initialSection`, when the caller
+    // wants a deep link) on every open so a half-filled editor doesn't
+    // greet the user next time.
+    setView(initialSection ? openSection(initialSection) : initialView());
     setFormError(null);
-  }, [open]);
+  }, [open, initialSection]);
 
   const statusByHarness = useMemo(() => {
     const map = new Map(payload.statuses.map((s) => [s.harnessId, s]));
@@ -452,6 +459,7 @@ export function SettingsDialog({ open, onClose, onChange, homeDir, dataDir }: Pr
                       tmuxSource={tmuxSource}
                       bundledTmuxAvailable={bundledTmuxAvailable}
                       onPickTmuxSource={onPickTmuxSource}
+                      onClose={onClose}
                     />
                   );
                 case "harnesses":
@@ -589,6 +597,7 @@ function GeneralSection({
   tmuxSource,
   bundledTmuxAvailable,
   onPickTmuxSource,
+  onClose,
 }: {
   payload: HarnessesPayload;
   defaultHarness: string;
@@ -596,6 +605,9 @@ function GeneralSection({
   tmuxSource: "system" | "bundled";
   bundledTmuxAvailable: boolean;
   onPickTmuxSource: (source: "system" | "bundled") => void;
+  /** Closes the Settings dialog — used by "Show getting started guide" so the
+   *  onboarding checklist underneath is visible after replaying it. */
+  onClose: () => void;
 }) {
   // Disabled harnesses are excluded from the default-harness picker so a
   // soft-deleted harness can't silently become the default for new tasks.
@@ -605,6 +617,7 @@ function GeneralSection({
   const canDecreaseFontSize = fontSizePercent > FONT_SIZE_MIN;
   const canIncreaseFontSize = fontSizePercent < FONT_SIZE_MAX;
   const canResetFontSize = fontSizePercent !== FONT_SIZE_DEFAULT;
+  const [replayingOnboarding, setReplayingOnboarding] = useState(false);
   return (
     <div className="space-y-4 pt-3 text-sm">
       <section className="space-y-1">
@@ -709,6 +722,38 @@ function GeneralSection({
           </Button>
         </div>
         <p className="text-[11px] text-muted-foreground">{FONT_SIZE_HINT}</p>
+      </section>
+
+      <section className="space-y-1">
+        <label className="text-xs text-muted-foreground">Getting started</label>
+        <div>
+          <Button
+            variant="outline"
+            size="sm"
+            data-testid="settings-replay-onboarding"
+            disabled={replayingOnboarding}
+            onClick={async () => {
+              if (replayingOnboarding) return;
+              setReplayingOnboarding(true);
+              // Await the write before closing — App re-reads preferences on
+              // close, so a fire-and-forget PUT can lose the race against
+              // that GET and silently discard the replay.
+              await api.setPreference(ONBOARDING_DISMISSED_PREF, "false").catch(() => {
+                // Best-effort, matching the theme/defaultHarness write idiom
+                // above — the checklist will simply not reappear if this
+                // silently fails, which is a minor papercut, not a hard
+                // error worth surfacing.
+              });
+              setReplayingOnboarding(false);
+              onClose();
+            }}
+          >
+            Show getting started guide
+          </Button>
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Bring back the onboarding checklist.
+        </p>
       </section>
     </div>
   );

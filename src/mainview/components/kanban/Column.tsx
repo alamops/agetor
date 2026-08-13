@@ -18,6 +18,12 @@ interface Props {
   onMarkDone: (t: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
+  /** Muted one-line hint shown in place of the (empty) task list, while
+   *  onboarding's checklist is visible. Only rendered when `tasks.length ===
+   *  0` — never overlays real cards. Non-interactive (`pointer-events-none`)
+   *  and stays inside the existing droppable container so dnd-kit's drop
+   *  zone is unaffected. */
+  emptyHint?: string;
 }
 
 /** Array is considered unchanged when same length and every element is the
@@ -32,7 +38,7 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -49,6 +55,9 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
         <Badge variant="outline">{tasks.length}</Badge>
       </div>
       <div className="flex flex-col gap-2">
+        {tasks.length === 0 && emptyHint && (
+          <p className="pointer-events-none px-1 text-xs text-muted-foreground">{emptyHint}</p>
+        )}
         {tasks.map((t) => (
           <TaskCard
             key={t.id}
@@ -90,5 +99,6 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.onMarkDone === next.onMarkDone &&
   prev.onArchive === next.onArchive &&
   prev.onUnarchive === next.onUnarchive &&
+  prev.emptyHint === next.emptyHint &&
   sameTasks(prev.tasks, next.tasks)
 ));
