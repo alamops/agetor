@@ -1,11 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./db.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, WorktreeTeardownResult } from "../shared/types.ts";
+import { MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 
 export type { BranchInfo };
 
@@ -43,6 +45,38 @@ async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Pro
       proc.exited,
     ]);
     return { ok: exitCode === 0, stdout: stdout.trim(), stderr: stderr.trim(), exitCode };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Like `git`, but for reading raw blob bytes (e.g. `git show <sha>:<path>`)
+ * whose content may not be valid UTF-8 — images and PDFs, in particular.
+ * `git`'s `text()` collection would mangle those bytes via replacement-
+ * character substitution, so this variant collects stdout as an
+ * `ArrayBuffer` instead. Same never-throws contract and 30s default timeout
+ * as `git`.
+ */
+async function gitRaw(
+  args: string[],
+  cwd: string,
+  timeoutMs = GIT_TIMEOUT_MS,
+): Promise<{ ok: boolean; exitCode: number; bytes: Uint8Array<ArrayBuffer>; stderr: string }> {
+  const proc = Bun.spawn(["git", ...args], {
+    cwd,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const timer = setTimeout(() => proc.kill(), timeoutMs);
+  try {
+    const [buf, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).arrayBuffer(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { ok: exitCode === 0, exitCode, bytes: new Uint8Array(buf), stderr: stderr.trim() };
   } finally {
     clearTimeout(timer);
   }
@@ -887,14 +921,50 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
   const listed = await git(["ls-files", "--others", "--exclude-standard", "-z"], cwd);
   if (listed.ok) {
     const rels = listed.stdout.split("\0").filter(Boolean).slice(0, MAX_UNTRACKED);
+    // `ls-files` (and the `--no-index` diff below) run in `cwd`, so `rel` is
+    // CWD-relative — but tracked entries from `git diff <base>` above are
+    // repo-ROOT-relative. For an isolation=none task whose workdir is a repo
+    // subdirectory, mixing the two namespaces in one TaskDiff is wrong (it's
+    // exactly what getTaskDiffBlob's cwd-fallback exists to paper over).
+    // Normalize by prefixing the root→cwd path segment onto the emitted
+    // DiffFile.path only; the `--no-index` invocation itself keeps using the
+    // cwd-relative `rel`, since that's what exists relative to the cwd git
+    // runs in. `path.sep` is "/" here (this app is macOS-only per
+    // CLAUDE.md), so the split/join below is a no-op — kept only for
+    // symmetry with the `path.relative` call it normalizes, not because it
+    // does any actual backslash conversion (a backslash is a legal macOS
+    // filename char, so it must never be rewritten).
+    //
+    // `repoRoot` reports git's canonicalized path (symlinks resolved, e.g.
+    // `/tmp` → `/private/tmp` on macOS — see `gitWritableRootsSync`'s doc
+    // comment for the same gotcha), so diffing it against a non-canonical
+    // `cwd` would spuriously produce a non-empty prefix even when cwd IS the
+    // root. Realpath `cwd` first to compare like-for-like. Skipped entirely
+    // when there are no untracked files to prefix — avoids paying a git
+    // spawn + realpathSync in the common zero-untracked case.
+    let prefix = "";
+    if (rels.length > 0) {
+      const root = await repoRoot(cwd);
+      let realCwd = cwd;
+      try { realCwd = realpathSync(cwd); } catch { /* cwd missing — compare as-is */ }
+      const rawPrefix = root ? path.relative(root, realCwd).split(path.sep).join("/") : "";
+      // GIT_WORK_TREE/bind-mount exotics can leave git's toplevel not a
+      // prefix of realpath(cwd), in which case `path.relative` returns a
+      // `..`-leading escape. A `../`-prefixed DiffFile.path would be
+      // rejected by isSafeRelPath downstream and permanently break that
+      // file's preview with no diagnostic — fall back to the old no-prefix
+      // behavior instead of emitting an escaping path.
+      prefix = rawPrefix.startsWith("..") ? "" : rawPrefix;
+    }
     for (const rel of rels) {
       const res = await git(["diff", "--no-color", "--no-index", "--", "/dev/null", rel], cwd);
       if (res.exitCode !== 0 && res.exitCode !== 1) continue;
       const [parsed] = parseGitDiff(res.stdout);
+      const emittedPath = prefix ? `${prefix}/${rel}` : rel;
       files.push(
         parsed
-          ? { ...parsed, status: "added", path: rel, oldPath: null }
-          : { path: rel, oldPath: null, status: "added", additions: 0, deletions: 0, binary: false, hunks: "", truncated: false },
+          ? { ...parsed, status: "added", path: emittedPath, oldPath: null }
+          : { path: emittedPath, oldPath: null, status: "added", additions: 0, deletions: 0, binary: false, hunks: "", truncated: false },
       );
     }
   }
@@ -912,6 +982,162 @@ export async function getTaskDiff(task: Task): Promise<TaskDiff> {
     };
   }
   return { base: shortBase, files };
+}
+
+// Re-exported so existing/future importers of `MAX_BLOB_PREVIEW_BYTES` from
+// this module keep working; `../shared/attachments.ts` is now the canonical
+// definition (shared with `github.ts`'s GitHub pull-blob route).
+export { MAX_BLOB_PREVIEW_BYTES };
+
+/**
+ * True iff `relPath` is safe to `path.join` onto a trusted `cwd`: non-empty,
+ * free of null bytes, not itself absolute, and whose normalized form
+ * doesn't escape `cwd` (no leading `..` segment once normalized). This is a
+ * stricter contract than `/files/preview`'s (which trusts an already-
+ * absolute, already-existing path) — `getTaskDiffBlob` (and, via
+ * `git-host.ts`'s `pullBlob`, the GitHub pull-blob route) take a
+ * repo-relative path from the client, so traversal must be rejected before
+ * it ever touches the filesystem or a `git`/API invocation. Rejects
+ * lexically-escaping paths only; symlink containment is not enforced,
+ * consistent with `/files/preview`'s trust posture (this app has no
+ * sandbox — see the repo's CLAUDE.md).
+ */
+export function isSafeRelPath(relPath: string): boolean {
+  if (!relPath) return false;
+  if (relPath.includes("\0")) return false;
+  if (path.isAbsolute(relPath)) return false;
+  const normalized = path.normalize(relPath);
+  if (path.isAbsolute(normalized)) return false;
+  if (normalized === ".." || normalized.startsWith(`..${path.sep}`)) return false;
+  return true;
+}
+
+/**
+ * Read the raw bytes of one file, on one side of a task's diff, for the
+ * binary-preview UI (images/PDFs get an old-vs-new inline preview instead of
+ * the plain "binary file — no textual diff" placeholder). Mirrors
+ * `getTaskDiff`'s cwd/base selection exactly, so "old"/"new" here are
+ * literally the two sides `git diff <base>` compared:
+ *
+ *  - "new" reads the on-disk file in the task's cwd (the working tree).
+ *  - "old" resolves `base` to a commit sha and reads the blob via
+ *    `git show <sha>:<relPath>` — raw bytes (`gitRaw`), never text, since
+ *    images/PDFs aren't valid UTF-8 and must never round-trip through a
+ *    string.
+ *
+ * Never throws. `relPath` must pass `isSafeRelPath` — this route is
+ * repo-dir-relative, not an arbitrary-path reader like `/files/preview`.
+ * Renamed files: the caller is responsible for passing whichever path
+ * applies to the requested side (e.g. `oldPath` for `side: "old"` on a
+ * rename) — this function has no rename awareness of its own.
+ */
+export async function getTaskDiffBlob(
+  task: Task,
+  relPath: string,
+  side: "old" | "new",
+): Promise<{ ok: true; bytes: Uint8Array<ArrayBuffer>; etag: string } | { ok: false; error: string; status: number }> {
+  let cwd: string;
+  let base: string;
+
+  if (task.isolation === "worktree") {
+    if (!task.worktreePath || !existsSync(task.worktreePath)) {
+      return { ok: false, error: "this task hasn't created a worktree yet", status: 404 };
+    }
+    cwd = task.worktreePath;
+    base = task.baseRef ?? "HEAD";
+  } else {
+    if (!existsSync(task.workdir) || !(await isGitRepo(task.workdir))) {
+      return { ok: false, error: "the task's workdir isn't a git repo", status: 404 };
+    }
+    cwd = task.workdir;
+    base = "HEAD";
+  }
+
+  if (!isSafeRelPath(relPath)) {
+    return { ok: false, error: "invalid path", status: 400 };
+  }
+
+  if (side === "new") {
+    // `git diff`/`git ls-files` report tracked paths relative to the repo
+    // ROOT, not necessarily `cwd` — for an isolation=none task whose workdir
+    // is a subdirectory of the repo, joining `relPath` onto `cwd` directly
+    // double-prefixes it and 404s. (The "old" side below is unaffected:
+    // `git show <sha>:<relPath>` is root-relative by construction, same as
+    // the diff itself.) Resolve the repo root once and join there instead.
+    //
+    // The cwd-relative fallback below exists for untracked files surfaced via
+    // `git ls-files --others` — getTaskDiff's synthetic "added" entries used
+    // to emit those CWD-relative, which only resolved under this fallback
+    // join. getTaskDiff now normalizes those to root-relative paths at the
+    // source, so for any freshly-generated diff the root-relative join above
+    // always hits and this fallback is vestigial. It stays anyway: a stale
+    // client (open DiffDialog tab, cached response) may still hold a
+    // pre-normalization cwd-relative path, and falling back is free.
+    const root = await repoRoot(cwd);
+    const rootAbs = root ? path.join(root, relPath) : null;
+    const cwdAbs = path.join(cwd, relPath);
+    let abs = rootAbs ?? cwdAbs;
+    let st;
+    try {
+      st = statSync(abs);
+    } catch {
+      if (rootAbs && rootAbs !== cwdAbs) {
+        try {
+          st = statSync(cwdAbs);
+          abs = cwdAbs;
+        } catch {
+          return { ok: false, error: "not found", status: 404 };
+        }
+      } else {
+        return { ok: false, error: "not found", status: 404 };
+      }
+    }
+    // Only regular files: a FIFO/device named `*.png` would otherwise hang
+    // the read forever (same guard as /files/preview).
+    if (!st.isFile()) {
+      return { ok: false, error: "not found", status: 404 };
+    }
+    if (st.size > MAX_BLOB_PREVIEW_BYTES) {
+      return { ok: false, error: "too large to preview", status: 413 };
+    }
+    const bytes = new Uint8Array(await Bun.file(abs).arrayBuffer());
+    return { ok: true, bytes, etag: `"${st.size}-${st.mtimeMs}"` };
+  }
+
+  // side === "old"
+  const rev = await git(["rev-parse", "--verify", `${base}^{commit}`], cwd, 10_000);
+  if (!rev.ok || !rev.stdout) {
+    return { ok: false, error: "could not resolve base", status: 404 };
+  }
+  const sha = rev.stdout;
+
+  // Check the blob's size before reading it whole into memory.
+  const sizeRes = await git(["cat-file", "-s", `${sha}:${relPath}`], cwd, 10_000);
+  if (!sizeRes.ok) {
+    return { ok: false, error: "not present at base", status: 404 };
+  }
+  const size = Number(sizeRes.stdout);
+  // Fail CLOSED on an unparsable size: `cat-file -s` exited 0 (handled
+  // above) but printed something we can't read as a number is "can't
+  // confirm this is safe to read into memory," not "assume it's small
+  // enough." Two separate branches (rather than one combined condition) so
+  // each gets its own clear error/status.
+  if (!Number.isFinite(size)) {
+    return { ok: false, error: "could not determine blob size", status: 404 };
+  }
+  if (size > MAX_BLOB_PREVIEW_BYTES) {
+    return { ok: false, error: "too large to preview", status: 413 };
+  }
+
+  const blob = await gitRaw(["show", `${sha}:${relPath}`], cwd);
+  if (!blob.ok) {
+    return { ok: false, error: "not present at base", status: 404 };
+  }
+  // Stable hash (not Bun.hash — see claude-tmux.ts's note on its algorithm
+  // not being a cross-version stability contract) of the resolved sha+path,
+  // so this etag stays valid for the lifetime of the pinned base.
+  const etag = `"${createHash("sha1").update(`${sha}:${relPath}`).digest("hex")}"`;
+  return { ok: true, bytes: blob.bytes, etag };
 }
 
 /**

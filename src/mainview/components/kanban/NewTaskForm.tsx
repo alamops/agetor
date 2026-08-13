@@ -91,9 +91,15 @@ interface Props {
   /** Models discovered from each agent's CLI at boot. Merged with the static
    *  AGENT_OPTIONS list. */
   agentModels: AgentModelMap;
+  /** Bumped by the onboarding checklist when it wants to draw attention to
+   *  this panel (e.g. the "create your first task" step). On increment
+   *  (never on mount, never while `undefined`) the panel expands if
+   *  collapsed, the Title field gets focus, and the panel root flashes a
+   *  brief highlight ring. */
+  focusNonce?: number;
 }
 
-export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props) {
+export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNonce }: Props) {
   // Collapsed = thin icon rail; the board's `flex-1` <main> takes the freed
   // width on its own. Seeded synchronously from localStorage (lazy initial
   // state) so a restart repaints in the state the user left it in — an async
@@ -104,6 +110,37 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
   useEffect(() => {
     writeCollapsed(NEW_TASK_PANEL_COLLAPSED_KEY, collapsed);
   }, [collapsed]);
+  const titleRef = useRef<HTMLInputElement>(null);
+  // Transient "look here" ring around the panel root, driven by `focusNonce`.
+  const [spotlight, setSpotlight] = useState(false);
+  const spotlightTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Guards against firing on mount (initial ref value equals the first prop
+  // value, so the first render never counts as an "increment") and against
+  // `focusNonce` being permanently `undefined` for callers that don't pass it.
+  const prevFocusNonceRef = useRef(focusNonce);
+  useEffect(() => {
+    const prev = prevFocusNonceRef.current;
+    prevFocusNonceRef.current = focusNonce;
+    if (focusNonce === undefined || focusNonce === prev) return;
+    // Expand exactly like the collapse toggle button does, so the persisted
+    // preference and the in-memory state agree — the effect above persists
+    // on `[collapsed]` change, so no separate write is needed here.
+    setCollapsed(false);
+    // Expansion may need a paint before the Title input exists/lays out —
+    // defer the focus by a frame (same idiom as RunPanel's post-open focus).
+    requestAnimationFrame(() => {
+      titleRef.current?.focus();
+    });
+    if (spotlightTimeoutRef.current) clearTimeout(spotlightTimeoutRef.current);
+    setSpotlight(true);
+    spotlightTimeoutRef.current = setTimeout(() => setSpotlight(false), 1600);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusNonce]);
+  useEffect(() => {
+    return () => {
+      if (spotlightTimeoutRef.current) clearTimeout(spotlightTimeoutRef.current);
+    };
+  }, []);
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [taskType, setTaskType] = useState<TaskType>(DEFAULT_TASK_TYPE);
@@ -566,6 +603,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
         // arm `dragging` on the rail, this also drops a stale ring if the
         // panel is collapsed while one is showing.
         dragging && !collapsed && "ring-2 ring-inset ring-primary",
+        // Onboarding "look here" highlight — independent of the drag ring
+        // above; the two conditions aren't expected to overlap in practice
+        // (drag requires the panel already focused/visible by the user).
+        spotlight && "ring-2 ring-info",
       )}
     >
       {/* VS Code-style collapse control: straddles the border between the
@@ -611,7 +652,13 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
         ) : (
           <div className="flex h-full w-80 flex-col">
             <div className="flex shrink-0 items-center justify-between border-b border-border/60 px-4 py-3">
-              <span className="text-sm font-semibold">New task</span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-sm font-semibold">New task</span>
+                <InfoTip
+                  label="How these fields fit together"
+                  text="A task is a unit of agent work. Type, Title and Prompt say what to do. Project, Branch and Isolate say where — with Isolate on, work happens on a fresh branch in a separate worktree, so your checkout stays clean. Harness, Mode, Model and Effort pick which agent runs it and how much autonomy it gets. Defaults are sensible — a title, a prompt and a project are enough to start."
+                />
+              </div>
               {selectedStatus?.available && selectedStatus.version && (
                 <span className="text-[11px] text-muted-foreground">
                   {selectedStatus.version}
@@ -646,6 +693,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
               <div className="space-y-1">
                 <label className="text-muted-foreground">Title</label>
                 <Input
+                  ref={titleRef}
                   placeholder="Short description"
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
@@ -944,6 +992,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels }: Props)
               {kind === "claude-code" && model === "fable-5" && (
                 <div className="text-[11px] text-muted-foreground">
                   Fable 5 uses 2x the usage of Opus.
+                </div>
+              )}
+
+              {/* Mythos 5 is Fable 5's access-gated twin — same 2x usage, plus the
+                  Project Glasswing requirement, so both need calling out here. */}
+              {kind === "claude-code" && model === "mythos-5" && (
+                <div className="text-[11px] text-muted-foreground">
+                  Mythos 5 uses 2x the usage of Opus and requires approved-org (Project Glasswing) access.
                 </div>
               )}
 

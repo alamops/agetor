@@ -59,6 +59,73 @@ export function isImagePath(path: string): boolean {
   return IMAGE_EXT_RE.test(basename(path));
 }
 
+const PDF_EXT_RE = /\.pdf$/i;
+
+/** True iff `path`'s basename ends in `.pdf` (case-insensitive). Same
+ *  path-parsing rule as `isImagePath` — a path ending in `/` is a directory
+ *  ref and is never a PDF, regardless of what precedes the trailing slash. */
+export function isPdfPath(path: string): boolean {
+  if (path.endsWith("/")) return false;
+  return PDF_EXT_RE.test(basename(path));
+}
+
+/** Binary file kinds the diff-preview UI knows how to render inline
+ *  (old-vs-new side by side) instead of the plain "binary file — no textual
+ *  diff" placeholder. */
+export type BinaryPreviewKind = "image" | "pdf";
+
+/** Classify `path` for the binary-diff-preview UI, or `null` if it's a
+ *  binary kind we don't have a preview renderer for (falls back to the
+ *  placeholder). */
+export function binaryPreviewKind(path: string): BinaryPreviewKind | null {
+  if (isImagePath(path)) return "image";
+  if (isPdfPath(path)) return "pdf";
+  return null;
+}
+
+/** Single canonical extension → MIME map for every binary-preview kind this
+ *  module recognizes (the `IMAGE_EXTENSIONS` above, plus `pdf`). Was
+ *  previously duplicated across `server.ts` (`PREVIEW_CONTENT_TYPES` +
+ *  `blobContentType`) and `github.ts` (`contentTypeForBlobPath`'s inline
+ *  `known` map) — kept here as the one source of truth so the three don't
+ *  drift. Extend this map (and `IMAGE_EXTENSIONS` above, for image kinds)
+ *  together when adding a previewable kind. */
+const PREVIEW_CONTENT_TYPES: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  svg: "image/svg+xml",
+  bmp: "image/bmp",
+  ico: "image/x-icon",
+  avif: "image/avif",
+  heic: "image/heic",
+  pdf: "application/pdf",
+};
+
+/** MIME type for `p`'s extension (basename-only, case-insensitive — same
+ *  path-parsing rule as `isImagePath`/`isPdfPath`), or `null` when `p` isn't
+ *  one of the binary-preview kinds `binaryPreviewKind` recognizes. Callers
+ *  that want a best-effort guess for an unrecognized extension (e.g. trust
+ *  a host API's own reported content-type) should `??` the result
+ *  themselves — this function never guesses beyond the canonical map. */
+export function contentTypeForPreviewPath(p: string): string | null {
+  const base = basename(p);
+  const dot = base.lastIndexOf(".");
+  if (dot === -1) return null;
+  const ext = base.slice(dot + 1).toLowerCase();
+  return PREVIEW_CONTENT_TYPES[ext] ?? null;
+}
+
+/** Above this many bytes, a diff/file-preview blob (image/PDF) is refused
+ *  rather than read into memory whole — these routes serve an inline
+ *  old-vs-new (or single-file) preview, not a general-purpose file reader.
+ *  Shared cap for every blob-preview route: the task-diff blob route
+ *  (`worktree.ts`'s `getTaskDiffBlob`) and the GitHub pull-blob route
+ *  (`github.ts`'s `getGitHubPullBlob`). */
+export const MAX_BLOB_PREVIEW_BYTES = 20_000_000;
+
 /** Matches claude's `[Image #<digits>]` placeholder token. `N` is a
  *  session-wide attachment counter, not a per-message index — don't attempt
  *  to correlate the number to anything positional. Module-private — callers

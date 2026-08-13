@@ -19,8 +19,9 @@ import type {
   TaskDiff,
 } from "../shared/types.ts";
 import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
+import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
-import { bitbucketCreds, type BitbucketCreds } from "./git-provider.ts";
+import { apiHostForRemote, bitbucketCreds, type BitbucketCreds } from "./git-provider.ts";
 
 /**
  * Bitbucket Cloud (api.bitbucket.org, REST 2.0) adapter
@@ -69,6 +70,67 @@ const BITBUCKET_API_BASE = "https://api.bitbucket.org";
 const BITBUCKET_FETCH_TIMEOUT_MS = 30_000;
 const BITBUCKET_DIFF_BODY_CAP_BYTES = 8_000_000;
 const BITBUCKET_PAGELEN = 30;
+
+/**
+ * Guards every exported entry point below against a Bitbucket Server / Data
+ * Center remote. This adapter (like `BITBUCKET_API_BASE` above) is Bitbucket
+ * *Cloud*-only by construction: Server/DC speaks a structurally different
+ * REST API (`/rest/api/1.0`, different resource shapes for PRs, issues,
+ * comments, diffs, …) — there is no base-URL swap that makes this module
+ * work against it, unlike GitLab's self-hosted case (which is the *same*
+ * `/api/v4` shape at a different host). Without this guard, a repo whose
+ * remote resolves to a Server/DC host would silently keep hitting the
+ * hardcoded `api.bitbucket.org` and come back with a misleading "repo not
+ * found" 404 instead of an actionable "wrong product" error — exactly
+ * today's failure mode.
+ *
+ * `apiHostForRemote` (git-provider.ts) resolves `repo.remoteHost` through
+ * `~/.ssh/config` the same way `gitlabHost`/`gitlabApiBase` do in gitlab.ts:
+ * `bitbucket.org` itself short-circuits to itself, and an alias whose
+ * `HostName` is `bitbucket.org` (or one of Bitbucket's alternate SSH
+ * hostnames, `altssh.bitbucket.org`/`ssh.bitbucket.org`) also resolves to
+ * `bitbucket.org` — both pass. It's sync, never throws, and caches its own
+ * resolution per host, so calling this at the top of every entry point below
+ * costs nothing beyond the first `ssh -G` shellout for a given remote host.
+ *
+ * This function only ever *rejects* on positive evidence of a distinct,
+ * dotted Server/DC domain — it fails open whenever ssh can't tell us
+ * anything useful:
+ *  - Resolved host is `bitbucket.org` → allow.
+ *  - Resolved host has no dot at all (e.g. a bare alias like
+ *    `bitbucket-work` with no matching `~/.ssh/config` entry) → allow. A
+ *    dotless string can never be a Server/DC FQDN, so this is ssh actively
+ *    telling us nothing, not evidence of a different product. The request
+ *    proceeds to `api.bitbucket.org` keyed by the alias's own credentials —
+ *    the same multi-identity behavior this module has always supported.
+ *  - Resolved host is a dotted domain other than `bitbucket.org` → reject.
+ *    ssh either actively redirected the raw remote host elsewhere (a real
+ *    alias-to-Server/DC mapping) or simply echoed the raw host back
+ *    unchanged (no `~/.ssh/config` entry at all) — either way this is
+ *    positive evidence of a distinct domain, so the request is rejected
+ *    before any network call, with a hint to add a `HostName bitbucket.org`
+ *    entry when the echoed-back case is actually a not-yet-configured cloud
+ *    alias.
+ *
+ * Host comparisons are case-insensitive (the resolved host is lowercased
+ * before every comparison) as a defensive measure against a future
+ * `ProviderRepoInfo` producer that doesn't already lowercase.
+ *
+ * Returns `null` (no error — proceed) on either allow path above; otherwise
+ * the rejection message every call site returns verbatim in its own error
+ * shape, before making any network call.
+ */
+function bitbucketServerError(repo: ProviderRepoInfo): string | null {
+  const resolved = apiHostForRemote(repo.remoteHost).toLowerCase();
+  if (resolved === "bitbucket.org") return null;
+  // Dotless: ssh has nothing to tell us (no matching config entry, no dot to
+  // even suggest a domain) — cannot be a Server/DC FQDN. Fail open.
+  if (!resolved.includes(".")) return null;
+  const raw = repo.remoteHost.toLowerCase();
+  const base = `Bitbucket Server / Data Center is not supported — only Bitbucket Cloud (bitbucket.org). This repo's remote resolves to ${resolved}.`;
+  if (resolved !== raw) return base;
+  return `${base} If ${resolved} is actually an SSH alias for Bitbucket Cloud, add a ~/.ssh/config entry with "HostName bitbucket.org" for it.`;
+}
 
 interface BitbucketError {
   ok: false;
@@ -590,6 +652,8 @@ export async function listBitbucketItems(
   repo: ProviderRepoInfo,
   opts: ListBitbucketItemsOptions,
 ): Promise<BitbucketListResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   const page = Number.isInteger(opts.page) && (opts.page as number) > 0 ? (opts.page as number) : 1;
 
@@ -651,6 +715,8 @@ export async function listBitbucketItems(
  *  doc comment) — the facade fills it in from local git the same way for
  *  every provider. */
 export async function getBitbucketPullDefaults(repo: ProviderRepoInfo): Promise<BitbucketPullDefaultsResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   const res = await fetchBitbucket(repoBasePath(repo), creds, "application/json");
   if (!("status" in res)) return res;
@@ -674,6 +740,8 @@ export async function createBitbucketPull(
   repo: ProviderRepoInfo,
   input: CreateBitbucketPullInput,
 ): Promise<BitbucketIssueResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   const title = input.title.trim();
   const head = input.head.trim();
@@ -713,6 +781,8 @@ export async function createBitbucketPull(
  *  200-file caps) — `parseGitDiff` tolerates a truncated unified diff either
  *  way (it just yields fewer/partial hunks). */
 export async function getBitbucketPullDiff(repo: ProviderRepoInfo, number: number): Promise<BitbucketDiffResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
 
@@ -760,6 +830,322 @@ export async function getBitbucketPullDiff(repo: ProviderRepoInfo, number: numbe
   };
 }
 
+/** Structurally identical to `git-host.ts`'s `PullBlobResult` — kept as a
+ *  separate declaration (rather than imported) for the same reason
+ *  github.ts's `GitHubBlobResult` is: `git-host.ts` is the consumer, not the
+ *  source, of this module's types, and TS's structural typing makes the two
+ *  interchangeable at the `pullBlob` dispatch call site. */
+type BitbucketBlobResult =
+  | { ok: true; bytes: Uint8Array<ArrayBuffer>; contentType: string; ref: string }
+  | { ok: false; error: string; status?: number };
+
+/** Short-TTL cache of a PR's source/destination commit shas + source/
+ *  destination repo full names, keyed `${remoteHost}/${owner}/${name}#${number}` —
+ *  mirrors github.ts's `pullDetailCache` (60s TTL, so a fresh push to the PR
+ *  is picked up reasonably promptly; crude size-guard eviction rather than an
+ *  LRU, since a single workstation's Git Integration modal won't realistically
+ *  open enough distinct PRs in one process lifetime to make eviction policy
+ *  matter). Without it, previewing both sides of a binary file — or paging
+ *  through several binary files in the same PR — would re-fetch
+ *  `GET /pullrequests/:number` from scratch every time. */
+interface BitbucketPullDetailCacheEntry {
+  sourceSha: string;
+  destSha: string;
+  sourceRepoFullName: string | null;
+  destRepoFullName: string | null;
+  fetchedAt: number;
+}
+const bitbucketPullDetailCache = new Map<string, BitbucketPullDetailCacheEntry>();
+const BITBUCKET_PULL_DETAIL_CACHE_LIMIT = 200;
+const BITBUCKET_PULL_DETAIL_CACHE_TTL_MS = 60_000;
+
+function cacheBitbucketPullDetail(key: string, entry: BitbucketPullDetailCacheEntry): void {
+  if (bitbucketPullDetailCache.size >= BITBUCKET_PULL_DETAIL_CACHE_LIMIT && !bitbucketPullDetailCache.has(key)) {
+    bitbucketPullDetailCache.clear();
+  }
+  bitbucketPullDetailCache.set(key, entry);
+}
+
+/** Merge-base sha cache for the "old" side of a PR blob fetch, keyed
+ *  `${remoteHost}/${owner}/${name}@${sourceSha}..${destSha}` — mirrors
+ *  github.ts's `mergeBaseCache` (no TTL: a resolved merge-base commit is
+ *  immutable once computed, unlike the PR detail above). Keyed on the sha
+ *  pair rather than the PR number since the merge-base of two commits is a
+ *  pure function of the commit graph, not of which PR asked for it — lets a
+ *  re-request for the same PR (or a different PR between the same two
+ *  branches) reuse the same cache entry. Only successful resolutions are
+ *  cached; a failed lookup is re-attempted on the next request rather than
+ *  being cached as a permanent miss. */
+const bitbucketMergeBaseCache = new Map<string, string>();
+const BITBUCKET_MERGE_BASE_CACHE_LIMIT = 200;
+
+function bitbucketMergeBaseCacheKey(repo: ProviderRepoInfo, sourceSha: string, destSha: string): string {
+  return `${repo.remoteHost}/${repo.owner}/${repo.name}@${sourceSha}..${destSha}`;
+}
+
+function cacheBitbucketMergeBase(key: string, sha: string): void {
+  if (bitbucketMergeBaseCache.size >= BITBUCKET_MERGE_BASE_CACHE_LIMIT && !bitbucketMergeBaseCache.has(key)) {
+    bitbucketMergeBaseCache.clear();
+  }
+  bitbucketMergeBaseCache.set(key, sha);
+}
+
+/**
+ * Resolves the merge-base sha for the "old" side of a PR blob fetch via
+ * Bitbucket Cloud's documented merge-base endpoint (REST api-group-commits):
+ * `GET {repoBasePath}/merge-base/{sourceSha}..{destSha}` (accept:
+ * application/json) → `{ hash: string, ... }`, where `hash` is the best
+ * common ancestor of the two commits. Returns null — never `destSha` itself —
+ * on any transport failure, non-2xx response, or unparseable/missing `hash`,
+ * so the caller applies the documented `destination.commit.hash`
+ * approximation itself and can tell resolver success from fallback. This also
+ * covers cross-repo PRs where the destination repo may not hold the source
+ * commit at all (a fork that's since diverged or been deleted) — the
+ * merge-base lookup simply fails and the caller falls back the same way.
+ * Cached only on success — see `bitbucketMergeBaseCache`. The response body
+ * is always consumed (via `.json()`) before returning, on both the success
+ * and the parse-failure path, so no fetch ever leaves an unconsumed body
+ * behind.
+ */
+async function resolveBitbucketMergeBase(
+  repo: ProviderRepoInfo,
+  sourceSha: string,
+  destSha: string,
+  creds: BitbucketCreds | null,
+): Promise<string | null> {
+  const cacheKey = bitbucketMergeBaseCacheKey(repo, sourceSha, destSha);
+  const cached = bitbucketMergeBaseCache.get(cacheKey);
+  if (cached) return cached;
+
+  const res = await fetchBitbucket(
+    `${repoBasePath(repo)}/merge-base/${encodeURIComponent(`${sourceSha}..${destSha}`)}`,
+    creds,
+    "application/json",
+  );
+  if (!("status" in res)) return null;
+  if (!res.ok) {
+    await res.json().catch(() => null); // consume body; error is non-actionable here, caller falls back
+    return null;
+  }
+  const json = await res.json().catch(() => null);
+  const hash = json && typeof json === "object" ? (json as Record<string, unknown>).hash : null;
+  if (typeof hash !== "string" || !hash) return null;
+  cacheBitbucketMergeBase(cacheKey, hash);
+  return hash;
+}
+
+/** Clears both `getBitbucketPullBlob` caches (PR detail + merge base).
+ *  Test-only affordance — exported via `__bitbucketInternals` so network
+ *  tests can `beforeEach` a clean slate rather than relying on distinct
+ *  fixture shas per test to dodge cross-test cache hits. */
+function resetBitbucketPullBlobCaches(): void {
+  bitbucketPullDetailCache.clear();
+  bitbucketMergeBaseCache.clear();
+}
+
+/** Builds a `ProviderRepoInfo` for a PR side's `full_name` (`"workspace/
+ *  repo_slug"`, as read off `source.repository.full_name`/
+ *  `destination.repository.full_name` or the cached
+ *  `BitbucketPullDetailCacheEntry`), reusing the *original* repo's `provider`
+ *  /`host`/`remoteHost` — the fork lives on the same Bitbucket workspace host,
+ *  and credentials are stored per-host, not per-repo. Returns null when
+ *  `fullName` is null (e.g. the fork/source repo was deleted) or malformed. */
+function bitbucketRepoFromFullName(fullName: string | null, base: ProviderRepoInfo): ProviderRepoInfo | null {
+  if (!fullName) return null;
+  const slash = fullName.indexOf("/");
+  if (slash === -1) return null;
+  return {
+    provider: base.provider,
+    host: base.host,
+    remoteHost: base.remoteHost,
+    owner: fullName.slice(0, slash),
+    name: fullName.slice(slash + 1),
+  };
+}
+
+/** `/src/{ref}/{path}` for a resolved repo — each path segment is
+ *  URL-encoded but `/` separators are preserved (Bitbucket treats them as
+ *  directories), mirroring `contentsUrl` in github.ts. */
+function srcUrl(repo: ProviderRepoInfo, ref: string, filePath: string): string {
+  const encodedPath = filePath.split("/").map(encodeURIComponent).join("/");
+  return `${repoBasePath(repo)}/src/${encodeURIComponent(ref)}/${encodedPath}`;
+}
+
+/**
+ * Fetches the raw bytes of a single file from one side (old/new) of a
+ * Bitbucket pull request's diff, for the binary-preview UI. Dispatched
+ * through `git-host.ts`'s `pullBlob`.
+ *
+ * - `side: "new"` reads the file at `source.commit.hash`, from the *source*
+ *   repository (a fork for a cross-repo PR). If the source repository's
+ *   `full_name` is missing/unparseable — the fork was deleted, or the API
+ *   simply omitted it — this returns 404 rather than silently falling back to
+ *   the destination repo: the destination almost certainly does not contain
+ *   the file at the fork-only commit, so a silent fallback would either 404
+ *   anyway or, worse, return the *wrong* file's bytes under the right path.
+ * - `side: "old"` reads the file at the PR's merge-base commit, resolved via
+ *   Bitbucket Cloud's documented merge-base endpoint
+ *   (`resolveBitbucketMergeBase`, `GET .../merge-base/{sourceSha}..{destSha}`
+ *   → `{hash}`). When the resolver fails (network error, non-2xx, or a
+ *   missing/unparseable `hash` — including the cross-repo case where the
+ *   destination repo doesn't share history with a since-diverged fork), this
+ *   falls back to `destination.commit.hash` — an **approximation** that
+ *   drifts if the destination branch has moved (and touched the same file)
+ *   since the PR diverged from it, the same "approximated" tone this module
+ *   already uses for `mergedAt`/`closedAt`. The old side is read from the
+ *   *destination* repository either way (`?? repo` fallback is fine here —
+ *   destination is the correct default when `destRepoFullName` is missing).
+ *
+ * Bytes come from the Source API (`GET .../src/{ref}/{path}`), which returns
+ * raw file content directly (no base64 envelope). Size is checked twice: from
+ * `content-length` before reading the body (cheap rejection of an obviously
+ * too-large file), and again against the actual byte count after
+ * `arrayBuffer()` (Bitbucket can send a chunked response with no
+ * `content-length`) — same double-guard as `getGitHubPullBlob`, against
+ * `MAX_BLOB_PREVIEW_BYTES` (not `BITBUCKET_DIFF_BODY_CAP_BYTES`, which bounds
+ * the unified diff text, a different budget from a single file's bytes).
+ *
+ * On the "old" side, a resolved (and possibly cached) merge base is never
+ * trusted blindly: if the `/src/{ref}/{path}` fetch 404s with `ref` set to a
+ * resolver-supplied sha (not `destSha`), the merge-base cache entry for this
+ * sha pair is evicted and the fetch is retried exactly once against
+ * `destSha` before surfacing a 404 to the caller. This keeps a stale or
+ * simply-wrong cached/resolved merge base from permanently breaking every
+ * old-side preview of a PR — a subsequent request re-resolves from scratch.
+ *
+ * No short-circuit on missing credentials: like every other read in this
+ * module (`getBitbucketPullDiff`, `getBitbucketPullChecks`, …), a public
+ * repo's blob is readable with `creds: null`; a private one surfaces through
+ * `bitbucketAccessHint`'s 401/403/404 enrichment same as any other call.
+ */
+export async function getBitbucketPullBlob(
+  repo: ProviderRepoInfo,
+  number: number,
+  relPath: string,
+  side: "old" | "new",
+): Promise<BitbucketBlobResult> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError, status: 501 };
+  if (!Number.isInteger(number) || number <= 0) {
+    return { ok: false, error: "pull request number must be positive", status: 400 };
+  }
+  const path = relPath.trim().replace(/^\/+/, "");
+  if (!path) return { ok: false, error: "file path is required", status: 400 };
+
+  const creds = await bitbucketCreds(repo.remoteHost);
+
+  // PR detail (source/destination sha + repo full names) is cached for a
+  // short TTL — see `bitbucketPullDetailCache`'s doc comment. Avoids a
+  // redundant `GET /pullrequests/:number` for every blob request against the
+  // same PR.
+  const detailKey = `${repo.remoteHost}/${repo.owner}/${repo.name}#${number}`;
+  const cachedDetail = bitbucketPullDetailCache.get(detailKey);
+  let sourceSha: string;
+  let destSha: string;
+  let sourceRepoFullName: string | null;
+  let destRepoFullName: string | null;
+  if (cachedDetail && Date.now() - cachedDetail.fetchedAt < BITBUCKET_PULL_DETAIL_CACHE_TTL_MS) {
+    ({ sourceSha, destSha, sourceRepoFullName, destRepoFullName } = cachedDetail);
+  } else {
+    const prRes = await fetchBitbucket(`${repoBasePath(repo)}/pullrequests/${number}`, creds, "application/json");
+    if (!("status" in prRes)) return { ok: false, error: prRes.error, status: 502 };
+    const prJson = await prRes.json().catch(() => null);
+    if (!prRes.ok) {
+      return { ok: false, error: errorFrom(prRes, prJson, repo, !!creds), status: prRes.status };
+    }
+    const prObj = prJson && typeof prJson === "object" ? prJson as Record<string, unknown> : {};
+    const source = prObj.source && typeof prObj.source === "object" ? prObj.source as Record<string, unknown> : {};
+    const destination = prObj.destination && typeof prObj.destination === "object"
+      ? prObj.destination as Record<string, unknown>
+      : {};
+    const sourceCommit = source.commit && typeof source.commit === "object" ? source.commit as Record<string, unknown> : {};
+    const destCommit = destination.commit && typeof destination.commit === "object"
+      ? destination.commit as Record<string, unknown>
+      : {};
+    const resolvedSourceSha = typeof sourceCommit.hash === "string" ? sourceCommit.hash : null;
+    const resolvedDestSha = typeof destCommit.hash === "string" ? destCommit.hash : null;
+    if (!resolvedSourceSha || !resolvedDestSha) {
+      return { ok: false, error: "Bitbucket returned a pull request without source/destination commit hashes", status: 502 };
+    }
+    sourceSha = resolvedSourceSha;
+    destSha = resolvedDestSha;
+    const sourceRepo = source.repository && typeof source.repository === "object"
+      ? source.repository as Record<string, unknown>
+      : {};
+    const destRepo = destination.repository && typeof destination.repository === "object"
+      ? destination.repository as Record<string, unknown>
+      : {};
+    sourceRepoFullName = typeof sourceRepo.full_name === "string" ? sourceRepo.full_name : null;
+    destRepoFullName = typeof destRepo.full_name === "string" ? destRepo.full_name : null;
+    cacheBitbucketPullDetail(detailKey, { sourceSha, destSha, sourceRepoFullName, destRepoFullName, fetchedAt: Date.now() });
+  }
+
+  let blobRepo: ProviderRepoInfo;
+  let ref: string;
+  if (side === "new") {
+    const sourceRepo = bitbucketRepoFromFullName(sourceRepoFullName, repo);
+    if (!sourceRepo) {
+      return {
+        ok: false,
+        error: "the source repository for this pull request is unavailable (the fork may have been deleted)",
+        status: 404,
+      };
+    }
+    blobRepo = sourceRepo;
+    ref = sourceSha;
+  } else {
+    blobRepo = bitbucketRepoFromFullName(destRepoFullName, repo) ?? repo;
+    const mergeBase = await resolveBitbucketMergeBase(repo, sourceSha, destSha, creds);
+    // Fallback: `destination.commit.hash` approximation — see this
+    // function's doc comment.
+    ref = mergeBase ?? destSha;
+  }
+
+  let fileRes = await fetchBitbucket(srcUrl(blobRepo, ref, path), creds, "*/*");
+  if (!("status" in fileRes)) return { ok: false, error: fileRes.error, status: 502 };
+  if (fileRes.status === 404 && side === "old" && ref !== destSha) {
+    // The resolved (and possibly cached) merge base doesn't actually have
+    // this file — evict the stale/wrong cache entry and retry once against
+    // the documented destSha approximation before giving up. See this
+    // function's doc comment.
+    bitbucketMergeBaseCache.delete(bitbucketMergeBaseCacheKey(repo, sourceSha, destSha));
+    ref = destSha;
+    fileRes = await fetchBitbucket(srcUrl(blobRepo, ref, path), creds, "*/*");
+    if (!("status" in fileRes)) return { ok: false, error: fileRes.error, status: 502 };
+  }
+  if (fileRes.status === 404) return { ok: false, error: "file not present on this side", status: 404 };
+  if (!fileRes.ok) {
+    const raw = await fileRes.text().catch(() => "");
+    let msg = raw;
+    try {
+      const parsed = JSON.parse(raw) as { error?: { message?: unknown } };
+      if (parsed.error && typeof parsed.error.message === "string") msg = parsed.error.message;
+    } catch { /* the src endpoint can return plain text on some errors too */ }
+    return {
+      ok: false,
+      error: bitbucketAccessHint(fileRes.status, msg || `${fileRes.status} ${fileRes.statusText}`, blobRepo, !!creds),
+      status: fileRes.status,
+    };
+  }
+
+  const contentLength = Number(fileRes.headers.get("content-length") ?? 0);
+  if (contentLength > MAX_BLOB_PREVIEW_BYTES) {
+    return { ok: false, error: `File is too large to preview (${Math.ceil(contentLength / 1_000_000)} MB).`, status: 413 };
+  }
+  const buf = await fileRes.arrayBuffer().catch(() => null);
+  if (!buf) return { ok: false, error: "Bitbucket returned an unreadable file response", status: 502 };
+  if (buf.byteLength > MAX_BLOB_PREVIEW_BYTES) {
+    return { ok: false, error: `File is too large to preview (${Math.ceil(buf.byteLength / 1_000_000)} MB).`, status: 413 };
+  }
+
+  return {
+    ok: true,
+    bytes: new Uint8Array(buf),
+    contentType: contentTypeForPreviewPath(path) ?? fileRes.headers.get("content-type") ?? "application/octet-stream",
+    ref,
+  };
+}
+
 /** Lists non-inline comments on a pull request or issue. Inline (line)
  *  comments and soft-deleted comments are excluded here — inline ones belong
  *  to `listBitbucketPullReviewComments`, and Bitbucket never removes a deleted
@@ -769,6 +1155,8 @@ export async function listBitbucketComments(
   number: number,
   kind: GitHubItemKind,
 ): Promise<BitbucketCommentsResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "item number must be positive" };
   const endpoint = kind === "pulls" ? "pullrequests" : "issues";
@@ -808,6 +1196,8 @@ export async function createBitbucketComment(
   kind: GitHubItemKind,
   body: string,
 ): Promise<BitbucketCommentResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "item number must be positive" };
   const trimmed = body.trim();
@@ -840,6 +1230,8 @@ export async function listBitbucketPullReviewComments(
   repo: ProviderRepoInfo,
   number: number,
 ): Promise<BitbucketPullReviewCommentsResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
   const url = new URL(`${BITBUCKET_API_BASE}${repoBasePath(repo)}/pullrequests/${number}/comments`);
@@ -876,6 +1268,8 @@ export async function createBitbucketPullLineComment(
   number: number,
   input: CreateBitbucketPullLineCommentInput,
 ): Promise<BitbucketPullLineCommentResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
   const body = input.body.trim();
@@ -914,6 +1308,8 @@ export async function replyBitbucketLineComment(
   commentId: number,
   body: string,
 ): Promise<BitbucketPullLineCommentResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
   if (!Number.isInteger(commentId) || commentId <= 0) return { ok: false, error: "review comment id must be positive" };
@@ -942,6 +1338,8 @@ export async function replyBitbucketLineComment(
  *  purely to fill that field — same two-request shape as
  *  `getGitHubPullChecks`, just for a different reason. */
 export async function getBitbucketPullChecks(repo: ProviderRepoInfo, number: number): Promise<BitbucketChecksResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
 
@@ -1114,6 +1512,8 @@ export async function getBitbucketPullMergeability(
   repo: ProviderRepoInfo,
   number: number,
 ): Promise<BitbucketMergeabilityResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
   const creds = await bitbucketCreds(repo.remoteHost);
 
@@ -1139,6 +1539,8 @@ export async function getBitbucketPullMergeability(
  *  other adapter function — the facade (`git-host.ts`) stitches it on via
  *  `withSourcePath`. */
 export async function getBitbucketPullDetail(repo: ProviderRepoInfo, number: number): Promise<BitbucketIssueResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
   const creds = await bitbucketCreds(repo.remoteHost);
   const res = await fetchBitbucket(`${repoBasePath(repo)}/pullrequests/${number}`, creds, "application/json");
@@ -1167,6 +1569,8 @@ export async function mergeBitbucketPull(
   number: number,
   method: GitHubPullMergeMethod,
 ): Promise<BitbucketPullMergeResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
   const strategy = BITBUCKET_MERGE_STRATEGY[method];
@@ -1194,6 +1598,8 @@ export async function mergeBitbucketPull(
  *  the only terminal non-merge state a pull request can reach via the API,
  *  so this is what `closeGitHubPull`'s call sites map onto. */
 export async function closeBitbucketPull(repo: ProviderRepoInfo, number: number): Promise<BitbucketActionResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
   if (!creds) return { ok: false, error: "Bitbucket authentication required to decline a pull request" };
@@ -1215,7 +1621,9 @@ export async function closeBitbucketPull(repo: ProviderRepoInfo, number: number)
  *  GitHub (`reopenGitHubPull`, a plain `state: "closed"` → back to `"open"`
  *  PATCH), a decline is terminal. Always returns a friendly, actionable error
  *  rather than attempting a request that Bitbucket would reject anyway. */
-export async function reopenBitbucketPull(_repo: ProviderRepoInfo, _number: number): Promise<BitbucketActionResponse> {
+export async function reopenBitbucketPull(repo: ProviderRepoInfo, _number: number): Promise<BitbucketActionResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   return { ok: false, error: "declined pull requests cannot be reopened on Bitbucket" };
 }
 
@@ -1233,6 +1641,8 @@ export async function reviewBitbucketPull(
   verdict: GitHubPullReviewEvent,
   body?: string,
 ): Promise<BitbucketActionResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "pull request number must be positive" };
   const trimmedBody = body?.trim() ?? "";
@@ -1284,6 +1694,8 @@ export async function createBitbucketIssue(
   repo: ProviderRepoInfo,
   input: CreateBitbucketIssueInput,
 ): Promise<BitbucketIssueResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   const title = input.title.trim();
   if (!title) return { ok: false, error: "issue title required" };
@@ -1329,6 +1741,8 @@ export async function updateBitbucketIssue(
   number: number,
   patch: UpdateBitbucketIssueInput,
 ): Promise<BitbucketIssueResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "issue number must be positive" };
   if (patch.state && patch.state !== "open" && patch.state !== "closed") {
@@ -1384,6 +1798,8 @@ function bitbucketViewerAccessHint(status: number, message: string, repo: Provid
  *  means an anonymous "" login rather than an error, same no-token behavior
  *  as the GitHub counterpart). */
 export async function getBitbucketViewer(repo: ProviderRepoInfo): Promise<BitbucketViewerResponse> {
+  const serverError = bitbucketServerError(repo);
+  if (serverError) return { ok: false, error: serverError };
   const creds = await bitbucketCreds(repo.remoteHost);
   if (!creds) return { ok: true, login: "" };
   const res = await fetchBitbucket("/2.0/user", creds, "application/json");
@@ -1419,6 +1835,7 @@ export const __bitbucketInternals = {
   normalizeBitbucketLineComment,
   normalizeBitbucketCheckRun,
   normalizeBitbucketMergeability,
+  bitbucketRepoFromFullName,
   scanBitbucketDiffstatConflicts,
   escapeBBQLString,
   prStateParams,
@@ -1427,6 +1844,7 @@ export const __bitbucketInternals = {
   buildIssuesBBQL,
   sortParam,
   bitbucketViewerUuid,
+  resetBitbucketPullBlobCaches,
   BITBUCKET_OPEN_ISSUE_STATES,
   BITBUCKET_CHECK_STATE_MAP,
   BITBUCKET_MERGE_STRATEGY,

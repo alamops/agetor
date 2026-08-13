@@ -22,7 +22,7 @@ async function settle(ms = 80) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-test("createTask (cursor) defaults model to auto and lands in backlog", async () => {
+test("createTask (cursor) defaults model to Grok 4.6 at high effort and lands in backlog", async () => {
   const { createTask } = await import("./orchestrator.ts");
 
   const created = await createTask({
@@ -36,7 +36,8 @@ test("createTask (cursor) defaults model to auto and lands in backlog", async ()
   if ("error" in created) throw new Error(created.error);
 
   expect(created.task.agent).toBe("cursor");
-  expect(created.task.model).toBe("auto");
+  expect(created.task.model).toBe("cursor-grok-4.6");
+  expect(created.task.effort).toBe("high");
   expect(created.task.column).toBe("backlog");
 });
 

@@ -2,20 +2,24 @@
 // path (URL, method, headers, body, pagination, error mapping) via the
 // fetch-mock harness in bitbucket-test-util.ts. Complements bitbucket.test.ts,
 // which unit-tests the pure helpers in isolation.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test, expect, beforeAll, afterAll } from "bun:test";
+import { test, expect, beforeAll, beforeEach, afterEach, afterAll } from "bun:test";
 import { makeBitbucketPrJson, makeBitbucketRepo, mockGitHubFetch } from "./bitbucket-test-util.ts";
 import type { MockRoute } from "./bitbucket-test-util.ts";
 import { setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
+import { __clearApiHostCacheForTest } from "./git-provider.ts";
 import {
+  __bitbucketInternals,
   closeBitbucketPull,
   createBitbucketComment,
   createBitbucketIssue,
   createBitbucketPull,
   createBitbucketPullLineComment,
+  getBitbucketPullBlob,
   getBitbucketPullDefaults,
+  getBitbucketPullDetail,
   getBitbucketPullDiff,
   getBitbucketPullMergeability,
   getBitbucketViewer,
@@ -59,6 +63,51 @@ afterAll(() => {
 });
 
 const REPO = makeBitbucketRepo("acme", "app");
+
+// getBitbucketPullBlob caches PR detail (source/dest sha + repo full names)
+// and resolved merge-base shas across calls — bun test shares one process
+// across every *.test.ts file, and git-host.test.ts's own bitbucket pullBlob
+// dispatch test touches bitbucket.org/acme/app#1. Reset before every test in
+// this file so no test here can observe a stale entry left by another file,
+// regardless of run order. The tests below also use PR numbers (41+) distinct
+// from git-host.test.ts's #1 as defense in depth.
+beforeEach(() => {
+  __bitbucketInternals.resetBitbucketPullBlobCaches();
+});
+
+// Every exported entry point now opens with a `bitbucketServerError` guard
+// (docs/plans/per-host-git-api-bases.md) that resolves `repo.remoteHost`
+// through `apiHostForRemote` (git-provider.ts, `ssh -G` under the hood).
+// `AGETOR_SSH_BIN` and `apiHostForRemote`'s module-level cache are reset
+// after every test in this file so a Server-host stub set by one test can
+// never leak a stale resolution into another test — this file's own tests,
+// or a sibling *.test.ts file sharing the same `bun test` process.
+const ORIGINAL_SSH_BIN = process.env.AGETOR_SSH_BIN;
+let sshStubDirs: string[] = [];
+
+afterEach(() => {
+  __clearApiHostCacheForTest();
+  if (ORIGINAL_SSH_BIN === undefined) delete process.env.AGETOR_SSH_BIN;
+  else process.env.AGETOR_SSH_BIN = ORIGINAL_SSH_BIN;
+  for (const dir of sshStubDirs) rmSync(dir, { recursive: true, force: true });
+  sshStubDirs = [];
+});
+
+/** Writes an executable stub standing in for `ssh`, mirroring
+ *  git-provider.test.ts's `writeSshStub` — `apiHostForRemote` invokes it as
+ *  `<stub> -G -- <host>`, so `$3` is the (lowercased) host argument. */
+function writeSshStub(script: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-bb-ssh-stub-"));
+  sshStubDirs.push(dir);
+  const binPath = path.join(dir, "ssh");
+  writeFileSync(binPath, script, { mode: 0o755 });
+  return binPath;
+}
+
+/** ssh stub that always echoes its input back as the resolved hostname —
+ *  the "identity" case (a genuine Server/DC domain, or a plain non-aliased
+ *  host, has no `~/.ssh/config` entry to redirect it). */
+const IDENTITY_SSH_STUB = '#!/bin/sh\necho "hostname $3"\n';
 
 // ---------------------------------------------------------------------------
 // listBitbucketItems
@@ -145,6 +194,13 @@ test("listBitbucketItems (issues) with NO credential at all surfaces the enriche
   const priorEmail = process.env.BITBUCKET_EMAIL;
   delete process.env.BITBUCKET_TOKEN;
   delete process.env.BITBUCKET_EMAIL;
+  // "bitbucket-work.com" is this suite's stand-in for a real `~/.ssh/config`
+  // multi-identity alias whose `HostName` is bitbucket.org (per the module
+  // doc comment above) — stub ssh to resolve it that way so the
+  // `bitbucketServerError` guard passes and this test still exercises what
+  // it's actually about: alias-host credential resolution, not API-host
+  // rejection.
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname bitbucket.org'\n");
   const aliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work.com");
   const mock = mockGitHubFetch([
     {
@@ -225,6 +281,7 @@ test("email:token credentials send Authorization: Basic base64(email:token)", as
 // ---------------------------------------------------------------------------
 
 test("a stored credential for the alias host authenticates the outgoing request with Basic email:api_token", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname bitbucket.org'\n");
   setGitHubToken("bitbucket-work.com", "user@example.com:storedtoken456");
   const aliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work.com");
   const mock = mockGitHubFetch([{ match: "/2.0/user", json: { nickname: "octo" } }]);
@@ -244,6 +301,7 @@ test("no credential at all (alias host, no stored entry, no env) sends an unauth
   const priorEmail = process.env.BITBUCKET_EMAIL;
   delete process.env.BITBUCKET_TOKEN;
   delete process.env.BITBUCKET_EMAIL;
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname bitbucket.org'\n");
   const aliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work.com");
   const bitbucketBody = {
     type: "error",
@@ -343,6 +401,232 @@ test("getBitbucketPullDiff fetches the /diff endpoint as raw text and parses it 
     expect(res.files).toHaveLength(1);
     expect(res.files[0]!.path).toBe("src/a.ts");
     expect(res.files[0]!.status).toBe("modified");
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// getBitbucketPullBlob
+// ---------------------------------------------------------------------------
+
+test("getBitbucketPullBlob new side: reads source.commit.hash from the source repo, encoding a subdir+space path (slashes preserved, space as %20)", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/41$/,
+      json: {
+        id: 41,
+        source: { commit: { hash: "srcsha1" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha1" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    {
+      match: "/2.0/repositories/acme/app/src/srcsha1/assets/sub/my%20file.png",
+      text: "NEWBYTES",
+      headers: { "content-type": "application/octet-stream" },
+    },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 41, "assets/sub/my file.png", "new");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("srcsha1");
+    expect(res.contentType).toBe("image/png");
+    expect(new TextDecoder().decode(res.bytes)).toBe("NEWBYTES");
+    // Unlike gitlab.ts (which %2F-encodes the whole path), bitbucket.ts's
+    // srcUrl encodes each path segment individually and rejoins with literal
+    // `/` — so a subdirectory does NOT show up as %2F here.
+    expect(mock.calls.some((c) => c.url.includes("/src/srcsha1/assets/sub/my%20file.png"))).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob old side: uses the official merge-base endpoint (sourceSha..destSha) and reads from the destination repo", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/42$/,
+      json: {
+        id: 42,
+        source: { commit: { hash: "srcsha2" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha2" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/merge-base/srcsha2..destsha2", json: { hash: "mbsha2" } },
+    { match: "/2.0/repositories/acme/app/src/mbsha2/readme.png", text: "OLDBYTES" },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 42, "readme.png", "old");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("mbsha2");
+    expect(new TextDecoder().decode(res.bytes)).toBe("OLDBYTES");
+    expect(mock.calls.some((c) => c.url.includes("/merge-base/srcsha2..destsha2"))).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob old side: merge-base endpoint failure (500) falls back to destination.commit.hash", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/43$/,
+      json: {
+        id: 43,
+        source: { commit: { hash: "srcsha3" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha3" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/merge-base/srcsha3..destsha3", status: 500, json: { error: { message: "Internal Server Error" } } },
+    { match: "/2.0/repositories/acme/app/src/destsha3/readme.png", text: "FALLBACK" },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 43, "readme.png", "old");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("destsha3");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob old side: a stale/wrong merge base 404s on /src, is evicted, and retried once at destSha", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/44$/,
+      json: {
+        id: 44,
+        source: { commit: { hash: "srcsha4" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha4" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/merge-base/srcsha4..destsha4", json: { hash: "mbsha4" } },
+    { match: "/2.0/repositories/acme/app/src/mbsha4/readme.png", status: 404, json: { error: { message: "Not Found" } } },
+    { match: "/2.0/repositories/acme/app/src/destsha4/readme.png", text: "RETRIED_OK" },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 44, "readme.png", "old");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("destsha4");
+    expect(new TextDecoder().decode(res.bytes)).toBe("RETRIED_OK");
+    expect(mock.calls.some((c) => c.url.includes("/src/mbsha4/readme.png"))).toBe(true);
+    expect(mock.calls.some((c) => c.url.includes("/src/destsha4/readme.png"))).toBe(true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob fork PR new side: uses the source repo parsed from source.repository.full_name; 404s with 'fork may have been deleted' wording when full_name is absent", async () => {
+  const forkMock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/45$/,
+      json: {
+        id: 45,
+        source: { commit: { hash: "forksha5" }, repository: { full_name: "forker/app2" } },
+        destination: { commit: { hash: "destsha5" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/2.0/repositories/forker/app2/src/forksha5/img.png", text: "FORKBYTES" },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 45, "img.png", "new");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.ref).toBe("forksha5");
+    expect(forkMock.calls.some((c) => c.url.includes("/2.0/repositories/forker/app2/src/forksha5/img.png"))).toBe(true);
+  } finally {
+    forkMock.restore();
+  }
+
+  const deletedForkMock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/46$/,
+      json: {
+        id: 46,
+        source: { commit: { hash: "forksha6" } }, // no `repository` key at all — full_name absent
+        destination: { commit: { hash: "destsha6" }, repository: { full_name: "acme/app" } },
+      },
+    },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 46, "img.png", "new");
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.status).toBe(404);
+    expect(res.error).toContain("fork may have been deleted");
+    expect(deletedForkMock.calls).toHaveLength(1); // only the PR-detail fetch — no /src attempt
+  } finally {
+    deletedForkMock.restore();
+  }
+});
+
+test("getBitbucketPullBlob detail-cache: two blob calls for the same PR only issue ONE detail fetch", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/47$/,
+      json: {
+        id: 47,
+        source: { commit: { hash: "csrc" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "cdest" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/merge-base/csrc..cdest", json: { hash: "cmb" } },
+    { match: "/2.0/repositories/acme/app/src/cmb/a.png", text: "A" },
+    { match: "/2.0/repositories/acme/app/src/csrc/a.png", text: "B" },
+  ]);
+  try {
+    const res1 = await getBitbucketPullBlob(REPO, 47, "a.png", "old");
+    const res2 = await getBitbucketPullBlob(REPO, 47, "a.png", "new");
+    expect(res1.ok).toBe(true);
+    expect(res2.ok).toBe(true);
+    expect(mock.calls.filter((c) => /\/pullrequests\/47$/.test(c.url))).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob returns 413 from content-length alone, without needing to read a large body", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/48$/,
+      json: {
+        id: 48,
+        source: { commit: { hash: "srcsha8" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha8" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    // Tiny body, huge content-length header — the 413 must come purely from
+    // the header check, before `.arrayBuffer()` is ever called.
+    { match: "/2.0/repositories/acme/app/src/srcsha8/huge.png", text: "x", headers: { "content-length": "21000000" } },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 48, "huge.png", "new");
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.status).toBe(413);
+    expect(res.error).toContain("21 MB");
+    expect(mock.calls.filter((c) => c.url.includes("/src/srcsha8/huge.png"))).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob 404 from /src on a non-merge-base path (new side) -> {ok:false, status:404, error contains 'not present'}", async () => {
+  const mock = mockGitHubFetch([
+    {
+      match: /\/pullrequests\/49$/,
+      json: {
+        id: 49,
+        source: { commit: { hash: "srcsha9" }, repository: { full_name: "acme/app" } },
+        destination: { commit: { hash: "destsha9" }, repository: { full_name: "acme/app" } },
+      },
+    },
+    { match: "/2.0/repositories/acme/app/src/srcsha9/missing.png", status: 404, json: { error: { message: "Not Found" } } },
+  ]);
+  try {
+    const res = await getBitbucketPullBlob(REPO, 49, "missing.png", "new");
+    expect(res).toEqual({ ok: false, error: "file not present on this side", status: 404 });
   } finally {
     mock.restore();
   }
@@ -877,6 +1161,157 @@ test("updateBitbucketIssue maps state:'closed' to 'resolved' and state:'open' pa
 
     await updateBitbucketIssue(REPO, 3, { state: "open" });
     expect(JSON.parse(mock.calls[1]!.body!)).toEqual({ state: "open" });
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Bitbucket Server / Data Center rejection (docs/plans/per-host-git-api-bases.md)
+//
+// Bitbucket Server/DC speaks a structurally different REST API
+// (`/rest/api/1.0`) than Bitbucket Cloud — this module is Cloud-only, so
+// every exported entry point now rejects a repo whose remote resolves (via
+// `apiHostForRemote`) to anything other than `bitbucket.org`, before making
+// any network call. These tests exercise four representative entry points
+// (a read, a blob fetch with its own `status` field, a detail fetch, and a
+// mutation) plus the alias-resolves-to-cloud happy path; every other
+// exported function is guarded identically (see bitbucket.ts).
+// ---------------------------------------------------------------------------
+
+const SERVER_REPO = makeBitbucketRepo("acme", "app", "bitbucket.mycompany.com");
+const ALIAS_TO_CLOUD_REPO = makeBitbucketRepo("acme", "app", "bb-work");
+
+test("getBitbucketPullDiff rejects a Bitbucket Server/DC remote host with zero fetch calls", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketPullDiff(SERVER_REPO, 1);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toBe(
+      "Bitbucket Server / Data Center is not supported — only Bitbucket Cloud (bitbucket.org). This repo's remote resolves to bitbucket.mycompany.com. "
+        + 'If bitbucket.mycompany.com is actually an SSH alias for Bitbucket Cloud, add a ~/.ssh/config entry with "HostName bitbucket.org" for it.',
+    );
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullBlob rejects a Bitbucket Server/DC remote host (status 501) with zero fetch calls", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketPullBlob(SERVER_REPO, 1, "README.md", "new");
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("Bitbucket Server / Data Center is not supported");
+    expect(res.status).toBe(501);
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketPullDetail rejects a Bitbucket Server/DC remote host with zero fetch calls", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketPullDetail(SERVER_REPO, 1);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("Bitbucket Server / Data Center is not supported");
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("mergeBitbucketPull (a mutation) rejects a Bitbucket Server/DC remote host with zero fetch calls", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await mergeBitbucketPull(SERVER_REPO, 1, "merge");
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("Bitbucket Server / Data Center is not supported");
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("an ssh-alias host that resolves to bitbucket.org proceeds normally (alias-to-cloud)", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname bitbucket.org'\n");
+  const mock = mockGitHubFetch([
+    {
+      match: "/pullrequests/41",
+      json: { id: 41, title: "PR", state: "OPEN", links: { html: { href: "https://bitbucket.org/acme/app/pull-requests/41" } } },
+    },
+  ]);
+  try {
+    const res = await getBitbucketPullDetail(ALIAS_TO_CLOUD_REPO, 41);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.item.number).toBe(41);
+    expect(mock.calls).toHaveLength(1);
+  } finally {
+    mock.restore();
+  }
+});
+
+// SF-3 (docs/plans/per-host-git-api-bases.md §8.1b): `bitbucketServerError`
+// rejects only on positive evidence of a distinct, dotted Server/DC domain —
+// it fails open whenever ssh can't actually tell us anything useful.
+
+test("a dotless ssh alias with no ~/.ssh/config mapping (ssh echoes it back unchanged) is allowed — a dotless string can never be a Server/DC FQDN", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const dotlessAliasRepo = makeBitbucketRepo("acme", "app", "bitbucket-work");
+  const mock = mockGitHubFetch([
+    { match: "/2.0/repositories/acme/app", json: { mainbranch: { name: "main" } } },
+  ]);
+  try {
+    const res = await getBitbucketPullDefaults(dotlessAliasRepo);
+    expect(res.ok).toBe(true);
+    expect(mock.calls).toHaveLength(1);
+    expect(mock.calls[0]!.url).toContain("api.bitbucket.org");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("a dotted self-hosted domain with no ~/.ssh/config mapping (ssh echoes it back unchanged) is rejected with the ssh-config HostName hint", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub(IDENTITY_SSH_STUB);
+  const selfHostedRepo = makeBitbucketRepo("acme", "app", "bitbucket.mycompany.com");
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketPullDefaults(selfHostedRepo);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("This repo's remote resolves to bitbucket.mycompany.com.");
+    expect(res.error).toContain(
+      'If bitbucket.mycompany.com is actually an SSH alias for Bitbucket Cloud, add a ~/.ssh/config entry with "HostName bitbucket.org" for it.',
+    );
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("an ssh alias actively resolved to a distinct dotted domain is rejected with the 'resolves to' variant and no ssh-config hint", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub("#!/bin/sh\necho 'hostname bitbucket.corp.example'\n");
+  const redirectedAliasRepo = makeBitbucketRepo("acme", "app", "bb-corp.example");
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketPullDefaults(redirectedAliasRepo);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toBe(
+      "Bitbucket Server / Data Center is not supported — only Bitbucket Cloud (bitbucket.org). This repo's remote resolves to bitbucket.corp.example.",
+    );
+    expect(res.error).not.toContain("HostName bitbucket.org");
+    expect(mock.calls).toHaveLength(0);
   } finally {
     mock.restore();
   }

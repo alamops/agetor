@@ -1109,12 +1109,14 @@ export interface CursorModelSpec {
  */
 export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // Default to Opus 5 — the most-capable Opus, priced identically to Opus 4.8
-  // ($5/$25 per MTok). Fable 5 sits above it in the picker but costs 2x the
-  // usage, so the default stays on the most-capable non-premium tier.
+  // ($5/$25 per MTok). Mythos 5 and Fable 5 sit above it in the picker but
+  // cost 2x the usage, so the default stays on the most-capable non-premium
+  // tier.
   "claude-code": "opus-5",
   "codex": "gpt-5.6-sol",
-  // Cursor's own "let cursor-agent pick" model — matches its CLI default.
-  "cursor": "auto",
+  // Grok 4.6 (high effort via DEFAULT_EFFORT) — replaces cursor-agent's own
+  // "auto" as agetor's default so new tasks pin an explicit flagship model.
+  "cursor": "cursor-grok-4.6",
   // gemini-3-pro-preview is the current flagship per google-gemini/gemini-cli
   // docs (verified 2026-08-06). Deliberately NOT the "auto" alias — a spike
   // showed "auto" internally routes across mixed pro/flash-lite models even
@@ -1125,8 +1127,10 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
   "codex": "high",
-  // Cursor's default model is still "auto", which declines effort and stores
-  // NULL. When the user chooses a parameterized Cursor model, default to High.
+  // Models with `effortIds` default to High where they expose it (else their
+  // first available level — e.g. claude-4.6-sonnet only exposes medium).
+  // Models without `effortIds` ("auto", composer-2.5, the Gemini rows, …)
+  // decline effort and store NULL.
   "cursor": "high",
   // Gemini has no per-invocation effort/thinking-budget flag (verified via
   // `gemini --help` on CLI 0.54.0 — thinkingBudget/thinkingLevel are
@@ -1137,6 +1141,21 @@ export const DEFAULT_EFFORT: Record<AgentKind, string> = {
 };
 
 export const CURSOR_MODEL_SPECS: Record<string, CursorModelSpec> = {
+  // Ids verified against `cursor-agent models` (CLI 2026.08.11): grok 4.6 ships
+  // as cursor-grok-4.6-{low,medium,high,xhigh} plus -fast variants of all four —
+  // no bare id, no max tier, no 1M/Max-Mode variant. The unsuffixed "Cursor
+  // Grok 4.6" label is the high tier, same convention as 4.5.
+  "cursor-grok-4.6": {
+    label: "Cursor Grok 4.6",
+    hint: "Recommended default — Cursor-hosted Grok 4.6.",
+    effortIds: {
+      xhigh: "cursor-grok-4.6-xhigh",
+      high: "cursor-grok-4.6-high",
+      medium: "cursor-grok-4.6-medium",
+      low: "cursor-grok-4.6-low",
+    },
+    fastEfforts: ["xhigh", "high", "medium", "low"],
+  },
   "auto": { label: "Auto", hint: "Cursor picks the model." },
   "gpt-5.3-codex": {
     label: "Codex 5.3",
@@ -1478,7 +1497,7 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
  */
 export const EFFORT_OPTIONS: AgentOption[] = [
   { id: "max", label: "Max thinking", hint: "Absolute maximum reasoning effort. Separate from Cursor Max Mode context." },
-  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
+  { id: "xhigh", label: "Extra high", hint: "Extended capability for long-horizon work. Fable 5 / Mythos 5 / Opus 5 / 4.8 / 4.7 / 4.6 / Sonnet 5 / codex." },
   { id: "high", label: "High", hint: "Deep reasoning. The API default where supported." },
   { id: "medium", label: "Medium", hint: "Balanced speed vs. capability." },
   { id: "low", label: "Low", hint: "Most efficient. Best for simple tasks." },
@@ -1504,13 +1523,15 @@ export const EFFORT_OPTIONS: AgentOption[] = [
  */
 export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> = {
   // Per https://platform.claude.com/docs/en/build-with-claude/effort the
-  // effort parameter is API-supported on Fable 5 / Opus 5 / 4.8 / 4.7 / 4.6 /
-  // Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is Fable-5-, Opus-, and Sonnet-5-only;
-  // Sonnet 4.6 has no xhigh; Haiku 4.5 doesn't support effort at all). The
-  // `/effort` CLI command accepts more
+  // effort parameter is API-supported on Fable 5 / Mythos 5 / Opus 5 / 4.8 /
+  // 4.7 / 4.6 / Sonnet 5 / Sonnet 4.6 / Opus 4.5 (xhigh is Fable-5-, Mythos-5-,
+  // Opus-, and Sonnet-5-only; Sonnet 4.6 has no xhigh; Haiku 4.5 doesn't
+  // support effort at all). The `/effort` CLI command accepts more
   // levels but the underlying API request would fail for unsupported pairs,
   // so we filter at the picker rather than letting the user fire bad runs.
   "claude-code": {
+    // Mythos 5 shares Fable 5's request surface (same underlying model).
+    "mythos-5": ["max", "xhigh", "high", "medium", "low"],
     // Fable 5 shares Opus 4.7/4.8's request surface (effort low→max, xhigh).
     "fable-5": ["max", "xhigh", "high", "medium", "low"],
     // Opus 5 supports the full effort ladder incl. xhigh (per claude-api skill).
@@ -1526,6 +1547,9 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "haiku-4.5": [],
   },
   codex: {
+    // Cyber's own model page doesn't enumerate efforts; assume the GPT-5.6
+    // family surface (the set Sol documents). Revisit if codex rejects none/max.
+    "gpt-5.6-cyber": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-sol": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-terra": ["max", "xhigh", "high", "medium", "low", "none"],
     "gpt-5.6-luna": ["max", "xhigh", "high", "medium", "low", "none"],
@@ -1547,6 +1571,7 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gemini-3-pro-preview": [],
     "gemini-3.1-pro-preview": [],
     "gemini-2.5-pro": [],
+    "gemini-3.7-flash": [],
     "gemini-3.5-flash": [],
     "gemini-2.5-flash": [],
   },
@@ -1556,10 +1581,14 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
  * Effort options the picker should show for a given (agent, model). Returns
  * an empty list when the model doesn't accept the effort flag (Haiku 4.5).
  * Unknown model ids fall back to the agent's `DEFAULT_MODEL` support set so a
- * user-pasted future model still gets a sensible picker. Returned in the
- * EFFORT_OPTIONS order (highest → lowest).
+ * user-pasted future model still gets a sensible picker — except for cursor,
+ * where effort is encoded in the model id itself (`cursorModelArg`): an
+ * unknown cursor id passes through verbatim, so any effort picked for it
+ * would silently never reach the CLI. Those report no efforts instead.
+ * Returned in the EFFORT_OPTIONS order (highest → lowest).
  */
 export function supportedEfforts(agent: AgentKind, model: string | null): AgentOption[] {
+  if (agent === "cursor" && model !== null && !(model in MODEL_EFFORT_SUPPORT.cursor)) return [];
   const key = model ?? DEFAULT_MODEL[agent];
   const ids =
     MODEL_EFFORT_SUPPORT[agent][key]
@@ -1581,6 +1610,7 @@ export function supportedEfforts(agent: AgentKind, model: string | null): AgentO
  */
 const MODEL_MODE_DENY: Record<AgentKind, Record<string, string[]>> = {
   "claude-code": {
+    "mythos-5": [],
     "fable-5": [],
     "opus-5": [],
     "opus-4.8": [],
@@ -1610,6 +1640,7 @@ export function supportedModes(agent: AgentKind, model: string | null): AgentOpt
 export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   "claude-code": {
     models: [
+      { id: "mythos-5", label: "Mythos 5", hint: "Fable 5's twin — same capability and cost; requires approved-org (Project Glasswing) access. Uses 2x the usage of Opus." },
       { id: "fable-5", label: "Fable 5", hint: "Most powerful tier — above Opus. Uses 2x the usage of Opus." },
       { id: "opus-5", label: "Opus 5", hint: "Most capable Opus; same usage cost as 4.8." },
       { id: "opus-4.8", label: "Opus 4.8", hint: "Prior Opus flagship." },
@@ -1634,6 +1665,7 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   },
   codex: {
     models: [
+      { id: "gpt-5.6-cyber", label: "GPT-5.6 Cyber", hint: "Cybersecurity-tuned GPT-5.6. Requires OpenAI Daybreak approval on an API-key account; rejected on ChatGPT plans." },
       { id: "gpt-5.6-sol", label: "GPT-5.6 Sol", hint: "Recommended default — flagship GPT-5.6 capability." },
       { id: "gpt-5.6-terra", label: "GPT-5.6 Terra", hint: "Balanced GPT-5.6 model for strong performance at lower cost." },
       { id: "gpt-5.6-luna", label: "GPT-5.6 Luna", hint: "Efficient GPT-5.6 model for high-volume workloads." },
@@ -1660,12 +1692,14 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     efforts: EFFORT_OPTIONS,
   },
   gemini: {
+    // Pro tier first, then Flash tier; newest first within each tier.
     models: [
       { id: "gemini-3-pro-preview", label: "Gemini 3 Pro (preview)", hint: "Recommended default — current flagship." },
       { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Newer preview tier." },
       { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "Prior stable flagship." },
-      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost." },
-      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, prior generation." },
+      { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", hint: "Latest and most capable Flash — strong on coding and agentic work at Flash cost." },
+      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost — prior Flash generation." },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earlier generation." },
     ],
     modes: [
       { id: "auto", label: "Auto (yolo)", hint: "Edit files without approval prompts (--yolo)." },

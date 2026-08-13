@@ -4119,7 +4119,7 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId }: { text
 
   const collapseClassName = cn(
     "agetor-md",
-    expanded ? "max-h-[40vh] overflow-y-auto" : "max-h-[4.5rem] overflow-hidden",
+    expanded ? "max-h-[40vh] overflow-y-auto" : "max-h-[4.8rem] overflow-hidden",
   );
 
   return (

@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { WebSocketHandler } from "bun";
@@ -58,6 +59,7 @@ import { planAskAnswers } from "./claude-questions.ts";
 import {
   getAheadCount,
   getTaskDiff,
+  getTaskDiffBlob,
   gitFetch,
   gitPull,
   gitPush,
@@ -176,7 +178,7 @@ import type {
 } from "../shared/types.ts";
 import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
 import { consumePendingOpenTask } from "./pending-open.ts";
-import { isImagePath } from "../shared/attachments.ts";
+import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
 // `API_PORT` is a module-load snapshot for index.ts's BrowserWindow URL.
@@ -208,14 +210,15 @@ const json = (data: unknown, init?: ResponseInit) =>
     status: init?.status,
   });
 
-// Content-type map for GET /files/preview. Module-scope so it isn't
-// reallocated on every request.
-const PREVIEW_CONTENT_TYPES: Record<string, string> = {
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  svg: "image/svg+xml",
-  ico: "image/x-icon",
-};
+// Content-type for the /tasks/:id/diff/blob response, from the shared
+// canonical extension→MIME map (`../shared/attachments.ts`, also used by
+// /files/preview below and by github.ts's pull-blob path — one map, no more
+// drift between the three). `relPath` has already passed `binaryPreviewKind`
+// by the time this is called, so the shared map always matches; the
+// fallback is defense-in-depth only.
+function blobContentType(relPath: string, kind: "image" | "pdf"): string {
+  return contentTypeForPreviewPath(relPath) ?? (kind === "pdf" ? "application/pdf" : "application/octet-stream");
+}
 
 // Derived, never-persisted count of this task's still-`running` subagent
 // rows — drives the kanban card's "N background agents" badge. Single-task
@@ -842,6 +845,75 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }
           return json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Serve the raw bytes of one file, on one side of a PR's diff, for the
+      // Git Integration modal's binary (image/PDF) preview. Mirrors
+      // /github/pull-diff's identifying params (`path` = the local repo dir
+      // used to resolve host/repo/number, `number` = the PR number) — the
+      // *blob's* repo-relative path is a distinct concept from that `path`
+      // param, so it's carried as `filePath` here to avoid a name collision
+      // with pull-diff's `path` (a deviation from the plan's literal
+      // `?path=<repo-rel>` shape, which would have shadowed the existing
+      // `path` meaning). Dispatches through git-host.ts's `pullBlob`, which
+      // resolves the PR's head/merge-base and fetches blob bytes via the
+      // provider's Contents API; unsupported providers (GitLab/Bitbucket in
+      // v1) return `{ ok: false, status: 501 }` from `pullBlob` itself.
+      "/github/pull-blob": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          const number = Number(url.searchParams.get("number"));
+          const filePath = url.searchParams.get("filePath") ?? "";
+          const side = url.searchParams.get("side");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
+            return json({ error: "valid pull request number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!filePath) {
+            return json({ error: "filePath required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (side !== "old" && side !== "new") {
+            return json({ error: "side must be 'old' or 'new'" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const kind = binaryPreviewKind(filePath);
+          if (!kind) {
+            return json(
+              { error: `no preview available for: ${filePath}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+
+          const result = await gitHost.pullBlob({ dir, number, path: filePath, side });
+          if (!result.ok) {
+            return json({ error: result.error }, { status: result.status ?? 502, headers: corsHeaders(req) });
+          }
+
+          // Strong ETag from the resolved `ref` (the exact sha the bytes were
+          // fetched at) + path — content-addressed, unlike the old weak etag
+          // (byte length + path only), which could collide/miss across two
+          // different shas of the same size. By the time we know `ref` the
+          // upstream GitHub fetch has already happened (pullBlob resolves
+          // after fetching), so a 304 here only saves the localhost transfer
+          // back to the browser, not the GitHub round trip — still worth it
+          // for a modal where the user pages back and forth between files.
+          const etag = `"${createHash("sha1").update(`${result.ref}:${filePath}`).digest("hex")}"`;
+          if (req.headers.get("if-none-match") === etag) {
+            return new Response(null, { status: 304, headers: { ...corsHeaders(req), etag } });
+          }
+          // Not content-addressed by URL (PR number, not a pinned sha) — the
+          // merge-base can move between requests, so revalidate every time;
+          // the ETag above makes that a cheap 304.
+          return new Response(result.bytes, {
+            headers: {
+              ...corsHeaders(req),
+              "content-type": result.contentType,
+              "x-content-type-options": "nosniff",
+              "cache-control": "private, max-age=0, must-revalidate",
+              etag,
+            },
+          });
         }),
       },
 
@@ -3431,6 +3503,64 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Serve the raw bytes of one file, on one side of a task's diff, so the
+      // Diff Modal can render an old-vs-new preview for binary files it knows
+      // how to display (images, PDFs) instead of the plain "binary file — no
+      // textual diff" placeholder. Same trust posture as /files/preview:
+      // token-gated + loopback-only is the real boundary, the extension
+      // allowlist (`binaryPreviewKind`) just keeps this from doubling as a
+      // generic blob reader, and `getTaskDiffBlob` rejects any path that
+      // would lexically escape the task's cwd (symlink containment is not
+      // enforced, consistent with /files/preview's trust posture).
+      "/tasks/:id/diff/blob": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+
+          const url = new URL(req.url);
+          const relPath = url.searchParams.get("path") ?? "";
+          const side = url.searchParams.get("side");
+          if (!relPath) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (side !== "old" && side !== "new") {
+            return json({ error: "side must be 'old' or 'new'" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const kind = binaryPreviewKind(relPath);
+          if (!kind) {
+            return json(
+              { error: `no preview available for: ${relPath}` },
+              { status: 415, headers: corsHeaders(req) },
+            );
+          }
+
+          const result = await getTaskDiffBlob(t, relPath, side);
+          if (!result.ok) {
+            return json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
+          }
+
+          if (req.headers.get("if-none-match") === result.etag) {
+            return new Response(null, { status: 304, headers: { ...corsHeaders(req), etag: result.etag } });
+          }
+          return new Response(result.bytes, {
+            headers: {
+              ...corsHeaders(req),
+              "content-type": blobContentType(relPath, kind),
+              "x-content-type-options": "nosniff",
+              // Neither side is content-addressed by URL: "new" is the
+              // working tree (can change under the user's feet), and "old"
+              // is pinned to `task.baseRef` which itself isn't stable — an
+              // isolation=none task's base is literally "HEAD" (moves with
+              // every commit), and a worktree task's baseRef can be null.
+              // Both sides revalidate on every request; the ETag (content
+              // hash for "old", size+mtime for "new") makes that a cheap 304.
+              "cache-control": "private, max-age=0, must-revalidate",
+              etag: result.etag,
+            },
+          });
+        }),
+      },
+
       // Open the task's claude-code tmux session in a new Terminal.app window.
       // The session name is deterministic (`agetor-<taskId-prefix>`) so we can
       // look it up without consulting the run row. We probe tmux availability
@@ -3786,7 +3916,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: `not found: ${raw}` }, { status: 404, headers: corsHeaders(req) });
           }
           const ext = raw.slice(raw.lastIndexOf(".") + 1).toLowerCase();
-          const contentType = PREVIEW_CONTENT_TYPES[ext] ?? `image/${ext}`;
+          // Shared canonical map (../shared/attachments.ts) — behavior is
+          // unchanged from the old inline map + `image/<ext>` fallback: every
+          // extension reachable here already passed `isImagePath`, so the
+          // shared lookup always hits and the fallback is never exercised.
+          const contentType = contentTypeForPreviewPath(raw) ?? `image/${ext}`;
           // ETag derived from size+mtime so a re-saved file at the same path
           // (e.g. a screenshot overwritten in place) is detected as changed.
           const etag = `"${st.size}-${st.mtimeMs}"`;

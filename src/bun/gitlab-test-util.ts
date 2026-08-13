@@ -10,6 +10,9 @@
 // `mockGitHubFetch` (github-test-util.ts) is host-agnostic — it just matches
 // on the request URL/method against a route table over `globalThis.fetch` —
 // so it is reused directly here rather than re-implemented.
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { ProviderRepoInfo } from "../shared/types.ts";
 
 export { mockGitHubFetch as mockGitLabFetch } from "./github-test-util.ts";
@@ -34,6 +37,46 @@ export function sampleRepo(overrides: Partial<ProviderRepoInfo> = {}): ProviderR
  *  token-routing path the same way `makeAliasGitHubRepo` does for GitHub. */
 export function sampleAliasRepo(aliasHost = "gitlab-work.io", overrides: Partial<ProviderRepoInfo> = {}): ProviderRepoInfo {
   return sampleRepo({ remoteHost: aliasHost, ...overrides });
+}
+
+/** Same as `sampleRepo`, but pointed at a genuine self-hosted GitLab domain
+ *  (docs/plans/per-host-git-api-bases.md) — both `host` and `remoteHost` are
+ *  the self-hosted domain itself (no ssh alias involved), exercising
+ *  `gitlabApiBase`'s per-host routing in gitlab-network.test.ts. */
+export function sampleSelfHostedRepo(selfHostedHost = "gitlab.mycompany.com", overrides: Partial<ProviderRepoInfo> = {}): ProviderRepoInfo {
+  return sampleRepo({ host: selfHostedHost, remoteHost: selfHostedHost, ...overrides });
+}
+
+/** Every mkdtemp dir `writeSshStub` has created, in creation order — drained
+ *  by `cleanupSshStubs()`. Module-level (not per-call cleanup) because the
+ *  stub's path is handed to callers via `AGETOR_SSH_BIN` and may outlive the
+ *  call that created it for the rest of a test. */
+const createdSshStubDirs: string[] = [];
+
+/** Writes an executable stub standing in for `ssh`, for pointing
+ *  `AGETOR_SSH_BIN` (git-provider.ts's `apiHostForRemote` override) at
+ *  deterministic, network-free hostname resolution — mirrors
+ *  git-provider.test.ts's own `writeSshStub`. `apiHostForRemote` invokes it
+ *  as `<stub> -G -- <host>`, so `$3` is the (lowercased, trimmed) host
+ *  argument when a stub cares to inspect it. Each call gets its own
+ *  throwaway mkdtemp dir under the OS tmp root; the dir is tracked
+ *  module-internally and only removed when the caller invokes
+ *  `cleanupSshStubs()` (e.g. from an `afterEach`/`afterAll`) — mirroring
+ *  git-provider.test.ts's own `createdDirs` pattern. */
+export function writeSshStub(script: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-gitlab-ssh-stub-"));
+  createdSshStubDirs.push(dir);
+  const binPath = path.join(dir, "ssh");
+  writeFileSync(binPath, script, { mode: 0o755 });
+  return binPath;
+}
+
+/** Removes every mkdtemp dir created by `writeSshStub` so far and clears the
+ *  tracking list. Consumers should call this from an `afterEach`/`afterAll`
+ *  to avoid leaking one throwaway dir per `writeSshStub` call. */
+export function cleanupSshStubs(): void {
+  for (const dir of createdSshStubDirs) rmSync(dir, { recursive: true, force: true });
+  createdSshStubDirs.length = 0;
 }
 
 /** A minimal-but-valid GitLab merge-request JSON object (REST v4 shape), as

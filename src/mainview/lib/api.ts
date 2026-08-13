@@ -1319,6 +1319,76 @@ export const api = {
   filePreviewUrl: (path: string): string =>
     `${BASE}/files/preview?path=${encodeURIComponent(path)}&token=${encodeURIComponent(API_TOKEN)}`,
 
+  /** Absolute URL for a task's worktree-diff binary blob (old or new side of
+   *  a binary file), for `<img src>` use in `BinaryFilePreview`. Same
+   *  `?token=` pattern as `filePreviewUrl` — `<img>` can't set an
+   *  `Authorization` header. Backed by `GET /tasks/:id/diff/blob`, which
+   *  resolves `side: "old"` via `git show <baseRef>:<path>` and `side:
+   *  "new"` from the on-disk file in the task's cwd (worktree or workdir),
+   *  mirroring what `getTaskDiff`'s underlying `git diff` compared. */
+  taskDiffBlobUrl: (taskId: string, path: string, side: "old" | "new"): string =>
+    `${BASE}/tasks/${taskId}/diff/blob?path=${encodeURIComponent(path)}&side=${side}&token=${encodeURIComponent(API_TOKEN)}`,
+
+  /** Absolute URL for a GitHub PR's binary blob (old or new side), for
+   *  `<img src>` use in `BinaryFilePreview`. Identifying params mirror
+   *  `getGitHubPullDiff` (`path`, `number`) exactly, plus the blob-specific
+   *  `filePath` (repo-relative file path — carried as a distinct param name
+   *  from `path`, which is the local repo dir used to resolve the GitHub
+   *  remote) and `side`. Backed by `GET /github/pull-blob`: the old side
+   *  anchors at the PR's merge base (the `.diff` shown is a three-dot
+   *  diff), the new side at the PR head sha. */
+  pullBlobUrl: (opts: { path: string; number: number; filePath: string; side: "old" | "new" }): string => {
+    const q = new URLSearchParams({
+      path: opts.path,
+      number: String(opts.number),
+      filePath: opts.filePath,
+      side: opts.side,
+      token: API_TOKEN,
+    });
+    return `${BASE}/github/pull-blob?${q.toString()}`;
+  },
+
+  /** Fetch binary blob bytes via an `Authorization: Bearer` header — used
+   *  for PDF panes, which go through `fetch`/pdf.js rather than an `<img>`
+   *  tag. This function always authenticates via the header, same as every
+   *  other `api.*` call; it doesn't rely on (or care about) a `?token=` in
+   *  `url` even though `url` is typically one of `taskDiffBlobUrl`'s /
+   *  `pullBlobUrl`'s outputs, which DO append one — those builders are
+   *  shared with `<img src>` consumers, which can't set headers at all, so
+   *  their URLs carry a token unconditionally. Throws an `Error` whose
+   *  message distinguishes a missing blob ("missing", 404) from one over
+   *  the server's size cap ("too-large", 413) from any other failure, so
+   *  callers can render a matching empty state. */
+  fetchBlobBytes: async (url: string): Promise<ArrayBuffer> => {
+    const res = await fetch(url, {
+      headers: { "authorization": `Bearer ${API_TOKEN}` },
+    });
+    if (!res.ok) {
+      if (res.status === 404) throw new Error("missing");
+      if (res.status === 413) throw new Error("too-large");
+      throw new Error(`${res.status} ${res.statusText}`);
+    }
+    return res.arrayBuffer();
+  },
+  /** Lightweight status probe for a blob URL, used to classify an `<img>`
+   *  `onError` (SF-10) without downloading the — possibly large — body the
+   *  way `fetchBlobBytes` does: the response is read only for its status,
+   *  then its body is cancelled unread. Same three-way classification as
+   *  `fetchBlobBytes`, as a return value instead of a thrown error since
+   *  this is a best-effort classification, not a load path a caller awaits
+   *  before rendering. */
+  probeBlobStatus: async (url: string): Promise<"missing" | "too-large" | "ok" | "error"> => {
+    try {
+      const res = await fetch(url, { headers: { "authorization": `Bearer ${API_TOKEN}` } });
+      void res.body?.cancel();
+      if (res.status === 404) return "missing";
+      if (res.status === 413) return "too-large";
+      return res.ok ? "ok" : "error";
+    } catch {
+      return "error";
+    }
+  },
+
   /** Persist an in-memory image (clipboard paste or macOS floating-thumbnail
    *  drag) to disk and get back its absolute path. Bypasses `j()` because the
    *  body is raw bytes, not JSON. */

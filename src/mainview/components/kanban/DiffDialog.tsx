@@ -13,6 +13,8 @@ import {
   addRangeToSelection, composeDiffMessage, groupSelectedRows, isRowInDragRange, isSelectableKind,
   type DiffDragRange, type DiffSelectionBlock,
 } from "@/lib/diff-selection";
+import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
+import { binaryPreviewKind } from "../../../shared/attachments.ts";
 import type { AgentKind, DiffFile, Harness, Run, Task, TaskDiff } from "../../../shared/types.ts";
 
 interface Props {
@@ -682,6 +684,7 @@ export function DiffDialog({ open, task, onClose }: Props) {
             {diff.files.map((f) => (
               <FileBlock
                 key={f.path}
+                taskId={taskId}
                 file={f}
                 open={openFiles.has(f.path)}
                 onToggle={() => toggle(f.path)}
@@ -787,6 +790,7 @@ type RowMouseDownHandler = (
 ) => void;
 
 function FileBlock({
+  taskId,
   file,
   open,
   onToggle,
@@ -796,6 +800,7 @@ function FileBlock({
   dragRange,
   registerBody,
 }: {
+  taskId: string | null;
   file: DiffFile;
   open: boolean;
   onToggle: () => void;
@@ -826,7 +831,7 @@ function FileBlock({
       </button>
       {open && (
         file.binary ? (
-          <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file — no textual diff.</div>
+          <BinaryDiffPreview taskId={taskId} file={file} />
         ) : (
           <>
             <DiffBody
@@ -846,6 +851,31 @@ function FileBlock({
           </>
         )
       )}
+    </div>
+  );
+}
+
+/** Binary-file branch of a `FileBlock` — renders an old/new image or PDF
+ *  preview when `file.path` is a kind `BinaryFilePreview` knows how to
+ *  render, else falls back to the plain placeholder. `file.path` is always
+ *  the file's NEW-state path (per `DiffFile`'s doc comment), so it's already
+ *  the right side to classify for a rename. Deliberately outside `DiffBody`'s
+ *  row machinery — no `data-diff-path`/`data-diff-index`, no selection. */
+function BinaryDiffPreview({ taskId, file }: { taskId: string | null; file: DiffFile }) {
+  const kind = binaryPreviewKind(file.path);
+  if (kind === null || !taskId) {
+    return <div className="px-3 py-2 text-xs italic text-muted-foreground">Binary file — no textual diff.</div>;
+  }
+  const { oldUrl, newUrl } = binaryPreviewSides(file, (path, side) => api.taskDiffBlobUrl(taskId, path, side));
+  return (
+    <div className="px-3 py-2">
+      <BinaryFilePreview
+        kind={kind}
+        status={file.status}
+        fileName={binaryFileBasename(file.path)}
+        oldUrl={oldUrl}
+        newUrl={newUrl}
+      />
     </div>
   );
 }
