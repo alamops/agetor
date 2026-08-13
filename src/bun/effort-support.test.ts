@@ -76,12 +76,18 @@ test("claude fable-5 supports xhigh + max", () => {
   expect(ids).toContain("max");
 });
 
+test("claude mythos-5 supports xhigh + max", () => {
+  const ids = supportedEfforts("claude-code", "mythos-5").map((o) => o.id);
+  expect(ids).toContain("xhigh");
+  expect(ids).toContain("max");
+});
+
 test("codex DEFAULT_MODEL is GPT-5.6 Sol", () => {
   expect(DEFAULT_MODEL.codex).toBe("gpt-5.6-sol");
 });
 
 test("codex GPT-5.6 family supports none through max", () => {
-  for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+  for (const model of ["gpt-5.6-cyber", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
     const ids = supportedEfforts("codex", model).map((o) => o.id);
     expect(ids).toEqual(["max", "xhigh", "high", "medium", "low", "none"]);
   }
@@ -89,7 +95,7 @@ test("codex GPT-5.6 family supports none through max", () => {
 
 test("codex model picker includes the GPT-5.6 family", () => {
   const ids = AGENT_OPTIONS.codex.models.map((m) => m.id);
-  expect(ids.slice(0, 3)).toEqual(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+  expect(ids.slice(0, 4)).toEqual(["gpt-5.6-cyber", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
 });
 
 test("codex gpt-5.5 supports xhigh but not max", () => {
@@ -119,6 +125,13 @@ test("ordered highest → lowest (no placeholder at the top)", () => {
   const expectedOrder = ["max", "xhigh", "high", "medium", "low"];
   const filteredExpected = expectedOrder.filter((id) => ids.includes(id));
   expect(ids).toEqual(filteredExpected);
+});
+
+// --- gemini: no per-invocation effort flag -------------------------------------
+
+test("gemini gemini-3.7-flash exposes no effort options (no effort flag on the CLI)", () => {
+  const ids = supportedEfforts("gemini", "gemini-3.7-flash").map((o) => o.id);
+  expect(ids).toEqual([]);
 });
 
 // --- cursor: model thinking modes + fast variants -----------------------------

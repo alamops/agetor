@@ -212,6 +212,16 @@ test("claude-code 'fable-5' maps to --model claude-fable-5", () => {
   ]);
 });
 
+test("claude-code 'mythos-5' maps to --model claude-mythos-5", () => {
+  const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "mythos-5", mode: "auto" });
+  expect(cmd).toEqual([
+    "claude",
+    "--model", "claude-mythos-5",
+    "--permission-mode", "auto",
+    "--", "do thing",
+  ]);
+});
+
 test("claude-code 'sonnet-5' maps to --model claude-sonnet-5", () => {
   const { cmd } = buildCommand(builtin("claude-code"), "do thing", { ...claudeDefaults, model: "sonnet-5", mode: "auto" });
   expect(cmd).toEqual([
@@ -476,6 +486,18 @@ test("codex model 'gpt-5.6-sol' passes through verbatim as --model", () => {
   ]);
 });
 
+test("codex model 'gpt-5.6-cyber' passes through verbatim as --model", () => {
+  const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5.6-cyber", mode: "auto" });
+  expect(cmd).toEqual([
+    "codex", "exec",
+    "--model", "gpt-5.6-cyber",
+    "-c", "model_reasoning_effort=high",
+    "--json", "--color", "never", "--skip-git-repo-check",
+    "--sandbox", "workspace-write",
+    "-",
+  ]);
+});
+
 test("codex model 'gpt-5' adds --model gpt-5", () => {
   const { cmd } = buildCommand(builtin("codex"), "hi", { ...codexDefaults, model: "gpt-5", mode: "auto" });
   expect(cmd).toEqual([
@@ -704,6 +726,18 @@ test("gemini with defaults emits -m + stream-json + --yolo + --skip-trust, promp
   expect(cmd).toEqual([
     "gemini",
     "-m", "gemini-3-pro-preview",
+    "--output-format", "stream-json",
+    "--yolo",
+    "--skip-trust",
+    "-p", "hi",
+  ]);
+});
+
+test("gemini-3.7-flash model id is emitted verbatim via -m", () => {
+  const { cmd } = buildCommand(builtin("gemini"), "hi", { ...geminiDefaults, model: "gemini-3.7-flash" });
+  expect(cmd).toEqual([
+    "gemini",
+    "-m", "gemini-3.7-flash",
     "--output-format", "stream-json",
     "--yolo",
     "--skip-trust",
