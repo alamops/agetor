@@ -61,7 +61,7 @@ Single agent, single wave — the three edits are tiny and the db helper is cons
 ## 7. Blast radius & risks
 
 - `listWorktrees` gains ≤1 indexed-ish query per age-eligible row — negligible (list is fetched on dialog open/Refresh, and the age branch is rare).
-- Daemon: a permanently-`running` subagent row would keep the daemon alive. Bounded: watcher staleness backstop settles quiet rows in ~10 min while the daemon lives; boot reconciliation orphans rows whose session is gone. `AGETOR_DAEMON_IDLE_MS=0` (stay-up) semantics untouched.
+- Daemon: a permanently-`running` subagent row would keep the daemon alive. The 10-min watcher staleness backstop (`STALE_SUBAGENT_SETTLE_MS`) only covers file-backed rows with a live watcher — it does **not** bound workflow container rows (deliberately exempt, settled only by their completion notification or user action) or rows left behind by an `AGETOR_TRACK_SUBAGENTS=0` no-op watcher. Those are instead bounded by `SUBAGENT_HOLD_MAX_MS` (6h, `src/bun/headless.ts`): `hasRunningWork` ignores subagent rows started before that cutoff, so a wedged row can hold the daemon for at most 6h. Past that ceiling the daemon may idle-exit exactly as it did before this feature: the detached tmux session survives, and the next boot's `reconcileOrphans` reattaches or orphans it. Actual bound = 10-min backstop for file-backed rows with a live watcher, 6h ceiling for everything else. Boot reconciliation also orphans rows whose session is gone. `AGETOR_DAEMON_IDLE_MS=0` (stay-up) semantics untouched.
 - Reaper untouched; archive/teardown untouched (see §3).
 - `WorktreeInfo` shape unchanged → no webview/CLI drift (`Dashboard.test.tsx` guards CLI constants, unaffected).
 

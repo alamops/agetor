@@ -3011,11 +3011,12 @@ export function listWorktrees(): WorktreeInfo[] {
       // A worktree can carry both reasons at once (archived AND past the
       // inactivity threshold), so these are independent checks, not a chain.
       if (task.archivedAt != null) staleReasons.push("archived");
-      // Age check first — cheap, and true for almost every row — so the
-      // per-row `hasRunning` query only runs for age-eligible rows, keeping
-      // this off the hot path. Background agents/workflows (subagent rows)
-      // still writing to the worktree must hold off the "inactive" flag even
-      // though the main run's own `active` slot is long gone.
+      // Age check before the subagent query — the 7-day threshold is false
+      // for almost every row, so the per-row `hasRunning` lookup only runs
+      // for the rare age-eligible one, keeping this off the hot path.
+      // Background agents/workflows (subagent rows) still writing to the
+      // worktree must hold off the "inactive" flag even though the main
+      // run's own `active` slot is long gone.
       if (
         !runActive
         && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS

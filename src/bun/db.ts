@@ -1185,11 +1185,24 @@ export const subagents = {
   },
   /** True when at least one subagent row for ANY task is still `running` —
    *  the task-agnostic sibling of `hasRunning`, for whole-process idle checks
-   *  (the headless daemon's idle-shutdown). */
-  hasAnyRunning(): boolean {
-    const row = db.query<{ 1: number }, []>(
-      `SELECT 1 FROM subagents WHERE status = 'running' LIMIT 1`,
-    ).get();
+   *  (the headless daemon's idle-shutdown). `startedAfter`, when given,
+   *  restricts the scan to rows started after that epoch-ms cutoff — the
+   *  caller's escape hatch against a row that can never settle (a workflow
+   *  container row, which has no staleness backstop, or a row left behind by
+   *  an `AGETOR_TRACK_SUBAGENTS=0` no-op watcher): past the cutoff nothing is
+   *  plausibly still going to finish it, so the idle check should stop
+   *  treating it as live work. */
+  hasAnyRunning(startedAfter?: number): boolean {
+    const row =
+      startedAfter != null
+        ? db
+            .query<{ 1: number }, [number]>(
+              `SELECT 1 FROM subagents WHERE status = 'running' AND started_at > ? LIMIT 1`,
+            )
+            .get(startedAfter)
+        : db.query<{ 1: number }, []>(
+            `SELECT 1 FROM subagents WHERE status = 'running' LIMIT 1`,
+          ).get();
     return row !== null;
   },
   /** How many of this task's subagents are `running`. Distinct from
