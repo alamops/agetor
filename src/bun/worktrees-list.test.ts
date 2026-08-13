@@ -200,6 +200,7 @@ test("does not flag a worktree inactive while a background agent is still runnin
     const held = listWorktrees().find((e) => e.id === taskId);
     expect(held).toBeDefined();
     expect(held?.staleReasons).not.toContain("inactive");
+    expect(held?.heldByBackgroundAgents).toBe(true);
 
     // Settle the row — the age condition is already satisfied, so the very
     // next listWorktrees() call should now report "inactive".
@@ -208,6 +209,7 @@ test("does not flag a worktree inactive while a background agent is still runnin
     const settled = listWorktrees().find((e) => e.id === taskId);
     expect(settled).toBeDefined();
     expect(settled?.staleReasons).toContain("inactive");
+    expect(settled?.heldByBackgroundAgents).toBe(false);
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
@@ -259,6 +261,7 @@ test("does not flag a worktree inactive while a workflow container row is runnin
     const held = listWorktrees().find((e) => e.id === taskId);
     expect(held).toBeDefined();
     expect(held?.staleReasons).not.toContain("inactive");
+    expect(held?.heldByBackgroundAgents).toBe(true);
   } finally {
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
@@ -280,6 +283,7 @@ test("listWorktrees flags an orphan dir (no task row) as \"orphaned\"", async ()
     expect(entry?.taskId).toBeNull();
     expect(entry?.stale).toBe(true);
     expect(entry?.staleReasons).toContain("orphaned");
+    expect(entry?.heldByBackgroundAgents).toBe(false);
   } finally {
     rmSync(orphanDir, { recursive: true, force: true });
   }

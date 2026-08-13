@@ -14,6 +14,7 @@ function worktree(overrides: Partial<WorktreeInfo> = {}): WorktreeInfo {
     branch: "agetor/task-1-do-the-thing",
     workdir: "/home/user/project",
     runActive: false,
+    heldByBackgroundAgents: false,
     stale: false,
     staleReasons: [],
     ...overrides,

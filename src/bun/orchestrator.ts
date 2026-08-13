@@ -2988,6 +2988,10 @@ export function listWorktrees(): WorktreeInfo[] {
     return [];
   }
   const taskById = new Map(tasks.list().map((t) => [t.id, t]));
+  // One grouped query for the whole listing (same pattern the `/tasks` route
+  // uses, backed by migration 042's partial index) instead of a per-row
+  // lookup — cheap enough to run unconditionally, unlike a git subprocess.
+  const runningByTask = subagents.runningCountsByTask();
   const out: WorktreeInfo[] = [];
   for (const name of entries) {
     if (name.startsWith(".")) continue;
@@ -3004,6 +3008,11 @@ export function listWorktrees(): WorktreeInfo[] {
     const staleReasons: WorktreeStaleReason[] = [];
     // Same active-run check archiveTask uses for its defence-in-depth guard.
     const runActive = !!(task?.runId && active.has(task.runId));
+    // Background agents/workflows (subagent rows) still writing to the
+    // worktree must hold off the "inactive" flag even though the main run's
+    // own `active` slot is long gone. Sourced from the grouped map above, so
+    // this is a lookup, not a query — always `false` for an orphan (no task).
+    const heldByBackgroundAgents = !!task && (runningByTask.get(task.id) ?? 0) > 0;
     if (!task) {
       // No owning row — nothing else applies (can't be archived or idle-by-age).
       staleReasons.push("orphaned");
@@ -3011,16 +3020,10 @@ export function listWorktrees(): WorktreeInfo[] {
       // A worktree can carry both reasons at once (archived AND past the
       // inactivity threshold), so these are independent checks, not a chain.
       if (task.archivedAt != null) staleReasons.push("archived");
-      // Age check before the subagent query — the 7-day threshold is false
-      // for almost every row, so the per-row `hasRunning` lookup only runs
-      // for the rare age-eligible one, keeping this off the hot path.
-      // Background agents/workflows (subagent rows) still writing to the
-      // worktree must hold off the "inactive" flag even though the main
-      // run's own `active` slot is long gone.
       if (
         !runActive
         && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS
-        && !subagents.hasRunning(task.id)
+        && !heldByBackgroundAgents
       ) {
         staleReasons.push("inactive");
       }
@@ -3039,6 +3042,7 @@ export function listWorktrees(): WorktreeInfo[] {
       // the `.git` pointer file — plain fs, no git subprocess.
       workdir: task?.workdir ?? parseWorktreeGitPointer(dirPath),
       runActive,
+      heldByBackgroundAgents,
       stale: staleReasons.length > 0,
       staleReasons,
     });
