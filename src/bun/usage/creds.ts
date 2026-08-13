@@ -144,7 +144,17 @@ export async function readClaudeToken(
       }
     }
   } catch {
-    // fall through to keychain
+    // fall through
+  }
+  // The macOS Keychain item ("Claude Code-credentials") holds the MAIN
+  // account's token only — an aliased harness (home set) must NEVER fall
+  // back to it, or its meters would silently show a *different account's*
+  // usage (observed live: three accounts all reporting the main account's
+  // numbers). An alias with no on-disk creds gets no token; the caller then
+  // falls through to the alias's own `.claude.json` cache, which is at
+  // least the right account.
+  if (harness.home !== null) {
+    return { token: null, scopes: [] };
   }
   const keychainToken = await readKeychainClaudeToken();
   if (keychainToken) {

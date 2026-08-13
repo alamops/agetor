@@ -97,6 +97,28 @@ function mapExtraUsage(raw: unknown): QuotaMeter[] {
 /** Derive a stable meter id + label/scope from one `limits[]` entry. Falls
  *  back to `group` or a positional id when `kind` is missing so a shape
  *  drift never throws. */
+/**
+ * Human labels for the `limits[]` kinds/groups observed live (2026-08) —
+ * the API sends lowercase machine names ("session", "weekly_all",
+ * "weekly_scoped") that read poorly verbatim in the popover. Scoped weekly
+ * windows get the model name appended ("Weekly (Fable)"). Returns `null`
+ * for unrecognized kinds so the caller's generic fallback still applies.
+ */
+function prettyLimitLabel(
+  kind: string | null,
+  group: string | null,
+  scope: string | undefined,
+): string | null {
+  const key = kind ?? group;
+  if (!key) return null;
+  if (key === "session" || key === "five_hour") return "Session (5h)";
+  if (key === "weekly" || key === "weekly_all") return "Weekly";
+  if (key === "weekly_scoped" || key === "weekly_opus" || key === "weekly_sonnet") {
+    return scope ? `Weekly (${scope})` : "Weekly (model)";
+  }
+  return null;
+}
+
 function mapLimitEntry(entry: unknown, index: number): QuotaMeter | null {
   if (!isObject(entry)) return null;
   const usedPercent = clampPercent(entry.percent);
@@ -110,7 +132,9 @@ function mapLimitEntry(entry: unknown, index: number): QuotaMeter | null {
       : undefined;
   const scope = typeof modelName === "string" && modelName ? modelName : undefined;
   const known = SCALAR_FIELDS.find((f) => f.id === id);
-  const label = known ? known.label : scope ? `${group ?? "Usage"} (${scope})` : (group ?? id);
+  const label = known
+    ? known.label
+    : prettyLimitLabel(kind, group, scope) ?? (scope ? `${group ?? "Usage"} (${scope})` : (group ?? id));
   const meter: QuotaMeter = {
     id,
     label,
@@ -212,8 +236,11 @@ async function tryFetchApiQuota(harness: Harness): Promise<HarnessQuota | null> 
     const now = Date.now();
     const meters = parseClaudeUsage(body, harness.id, harness.kind, "api", now);
     if (meters.length === 0) return null;
+    // The usage response itself carries no plan field (verified live
+    // 2026-08); enrich from the account's own `.claude.json` profile.
     const planType =
-      isObject(body) && typeof body.plan_type === "string" ? body.plan_type : null;
+      (isObject(body) && typeof body.plan_type === "string" ? body.plan_type : null) ??
+      (await readPlanTypeFromDotJson(harness));
     return {
       harnessId: harness.id,
       kind: harness.kind,
@@ -224,6 +251,29 @@ async function tryFetchApiQuota(harness: Harness): Promise<HarnessQuota | null> 
       meters,
       reason: null,
     };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pull a human plan label out of the account's `.claude.json` profile
+ * (`oauthAccount.organizationType`, e.g. "claude_max" → "max"). The usage
+ * endpoint itself sends no plan field, so this is the only per-account plan
+ * signal we have. Never throws; `null` when unavailable.
+ */
+async function readPlanTypeFromDotJson(harness: Harness): Promise<string | null> {
+  try {
+    const filePath = claudeDotJsonPath(harness);
+    if (!existsSync(filePath)) return null;
+    const parsed: unknown = JSON.parse(await Bun.file(filePath).text());
+    if (!isObject(parsed) || !isObject(parsed.oauthAccount)) return null;
+    const account = parsed.oauthAccount as Record<string, unknown>;
+    const orgType = account.organizationType;
+    if (typeof orgType === "string" && orgType) {
+      return orgType.startsWith("claude_") ? orgType.slice("claude_".length) : orgType;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -255,12 +305,16 @@ async function tryReadCacheQuota(harness: Harness): Promise<HarnessQuota | null>
     return {
       harnessId: harness.id,
       kind: harness.kind,
-      planType: null,
+      planType: await readPlanTypeFromDotJson(harness),
       status: meters.length > 0 ? "ok" : "unavailable",
       source: "cache",
       fetchedAtMs: cachedFetchedAtMs,
       meters,
-      reason: meters.length > 0 ? null : "No cached usage data in .claude.json yet",
+      reason:
+        meters.length > 0
+          ? null
+          : "No usage cache for this account yet — run a task on this harness " +
+            "(or use claude in its home) once and the CLI will populate it.",
     };
   } catch {
     return null;
@@ -290,6 +344,7 @@ export async function fetchClaudeQuota(harness: Harness): Promise<HarnessQuota> 
   return errorQuota(
     harness,
     "unavailable",
-    "No usage data available (no API token/scope and no cached usage file)",
+    "No usage data for this account yet — run a task on this harness once " +
+      "and the claude CLI will populate its usage cache.",
   );
 }

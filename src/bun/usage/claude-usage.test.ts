@@ -106,7 +106,9 @@ describe("parseClaudeUsage — limits[] shape supersedes scalar fields", () => {
     expect(meters).toHaveLength(1);
     expect(meters[0]).toMatchObject({
       id: "weekly_scoped",
-      label: "weekly (Fable)",
+      // Pretty label for known limit kinds (verified live 2026-08): the raw
+      // "weekly_scoped" machine name renders as "Weekly (<model>)".
+      label: "Weekly (Fable)",
       usedPercent: 33,
       resetsAtMs: Date.parse("2026-08-15T00:00:00Z"),
       scope: "Fable",
