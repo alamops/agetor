@@ -1183,6 +1183,15 @@ export const subagents = {
     ).get(taskId);
     return row !== null;
   },
+  /** True when at least one subagent row for ANY task is still `running` —
+   *  the task-agnostic sibling of `hasRunning`, for whole-process idle checks
+   *  (the headless daemon's idle-shutdown). */
+  hasAnyRunning(): boolean {
+    const row = db.query<{ 1: number }, []>(
+      `SELECT 1 FROM subagents WHERE status = 'running' LIMIT 1`,
+    ).get();
+    return row !== null;
+  },
   /** How many of this task's subagents are `running`. Distinct from
    *  `runningCountsByTask` so a single-task caller doesn't scan every row. */
   runningCountForTask(taskId: string): number {

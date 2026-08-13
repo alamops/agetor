@@ -2973,8 +2973,9 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
  *  - `"orphaned"` — no task row for the dir (crash/failed teardown leftover).
  *  - `"archived"` — the owning task is archived but the dir is still present
  *    (teardown pending, failed, or skipped because the worktree was dirty).
- *  - `"inactive"` — not archived, no run in flight, and the task hasn't been
- *    touched in over `WORKTREE_STALE_AFTER_MS`.
+ *  - `"inactive"` — not archived, no run in flight, no background
+ *    agents/workflows still running, and the task hasn't been touched in
+ *    over `WORKTREE_STALE_AFTER_MS`.
  *
  * Returns `[]` when `WORKTREES_DIR` doesn't exist yet (no worktree has ever
  * been created). Non-directory entries and dotfiles are skipped.
@@ -3010,7 +3011,16 @@ export function listWorktrees(): WorktreeInfo[] {
       // A worktree can carry both reasons at once (archived AND past the
       // inactivity threshold), so these are independent checks, not a chain.
       if (task.archivedAt != null) staleReasons.push("archived");
-      if (!runActive && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS) {
+      // Age check first — cheap, and true for almost every row — so the
+      // per-row `hasRunning` query only runs for age-eligible rows, keeping
+      // this off the hot path. Background agents/workflows (subagent rows)
+      // still writing to the worktree must hold off the "inactive" flag even
+      // though the main run's own `active` slot is long gone.
+      if (
+        !runActive
+        && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS
+        && !subagents.hasRunning(task.id)
+      ) {
         staleReasons.push("inactive");
       }
     }

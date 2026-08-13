@@ -1,6 +1,6 @@
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN } from "./api-config.ts";
-import { db, dataDir } from "./db.ts";
+import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, reapIdleSessions } from "./orchestrator.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -28,7 +28,8 @@ import { SESSION_REAP_SWEEP_MS } from "../shared/types.ts";
  */
 
 const IDLE_CHECK_MS = 30_000;
-/** Default idle-shutdown after 5 min with no run and no attached client.
+/** Default idle-shutdown after 5 min with no run, no running background
+ *  agent/workflow, and no attached client.
  *  `AGETOR_DAEMON_IDLE_MS=0` disables idle shutdown (daemon stays up). */
 const IDLE_TIMEOUT_MS = Number(
   process.env.AGETOR_DAEMON_IDLE_MS ?? 5 * 60 * 1000,
@@ -43,6 +44,17 @@ function hasRunningRuns(): boolean {
         )
         .get() != null
     );
+  } catch {
+    return false;
+  }
+}
+
+/** Daemon-wide "is anything still working?" — running runs OR running
+ *  background agents/workflows (subagent rows). Exported for tests. */
+export function hasRunningWork(): boolean {
+  if (hasRunningRuns()) return true;
+  try {
+    return subagents.hasAnyRunning();
   } catch {
     return false;
   }
@@ -132,7 +144,7 @@ export async function runDaemon(): Promise<void> {
   if (IDLE_TIMEOUT_MS > 0) {
     let idleSince: number | null = null;
     const timer = setInterval(() => {
-      if (hasRunningRuns() || attachedClientCount() > 0) {
+      if (hasRunningWork() || attachedClientCount() > 0) {
         idleSince = null;
         return;
       }
