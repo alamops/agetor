@@ -52,6 +52,7 @@
     "ink": "^7.0.5",
     "ink-spinner": "^5.0.0",
     "lucide-react": "^1.14.0",
+    "pdfjs-dist": "6.2.108",
     "picocolors": "^1.1.1",
     "react": "^19.2.6",
     "react-devtools-core": "^6.1.2",

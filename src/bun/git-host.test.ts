@@ -8,6 +8,7 @@ import {
   pullDefaults,
   labels,
   pullReopen,
+  pullBlob,
 } from "./git-host.ts";
 import { makeGitHubRepo } from "./github-test-util.ts";
 import { mockGitHubFetch, type FetchMock } from "./github-test-util.ts";
@@ -294,5 +295,87 @@ test("pullReopen on a bitbucket repo surfaces the 'cannot be reopened' error", a
   expect(res.ok).toBe(false);
   if (res.ok) return;
   expect(res.error).toContain("cannot be reopened");
+  expect(fetchMock.calls).toHaveLength(0);
+});
+
+// ---------------------------------------------------------------------------
+// pullBlob
+// ---------------------------------------------------------------------------
+
+test("pullBlob on a gitlab repo dispatches to getGitLabPullBlob and returns the file bytes", async () => {
+  const dir = await makeRepo("https://gitlab.com/acme/app.git");
+  fetchMock = mockGitHubFetch([
+    {
+      match: "/api/v4/projects/acme%2Fapp/merge_requests/1",
+      json: {
+        iid: 1,
+        diff_refs: { base_sha: "base123", head_sha: "head456" },
+        source_project_id: 10,
+        target_project_id: 10,
+      },
+    },
+    {
+      match: /\/repository\/files\/.*\/raw\?ref=head456/,
+      text: "PNGDATA",
+      headers: { "content-type": "application/octet-stream" },
+    },
+  ]);
+
+  const res = await pullBlob({ dir, number: 1, path: "assets/logo.png", side: "new" });
+  expect(res.ok).toBe(true);
+  if (!res.ok) return;
+  expect(res.ref).toBe("head456");
+  expect(res.contentType).toBe("image/png");
+  expect(new TextDecoder().decode(res.bytes)).toBe("PNGDATA");
+  expect(fetchMock.calls.some((c) => c.url.includes("/merge_requests/1"))).toBe(true);
+});
+
+// Bitbucket's `getBitbucketPullBlob` is implemented in bitbucket.ts (owned by
+// a sibling change) — this dispatch test doesn't assume its exact endpoint
+// shape, only that git-host.ts no longer short-circuits to 501 without
+// attempting a fetch. A catch-all route means whatever endpoint(s) the
+// Bitbucket adapter calls get *some* response instead of mockGitHubFetch
+// throwing "no route for ...".
+test("pullBlob on a bitbucket repo dispatches to the provider instead of returning 501", async () => {
+  const dir = await makeRepo("https://bitbucket.org/acme/app.git");
+  fetchMock = mockGitHubFetch([{ match: /.*/, status: 404, json: { error: { message: "not found" } } }]);
+
+  const res = await pullBlob({ dir, number: 1, path: "assets/logo.png", side: "old" });
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.status).not.toBe(501);
+  expect(fetchMock.calls.length).toBeGreaterThan(0);
+});
+
+test("pullBlob rejects an unsafe (path-traversal) filePath with 400 before dispatching to any provider — even github", async () => {
+  const dir = await makeGitHubRepo("acme", "app");
+  createdDirs.push(dir);
+  fetchMock = mockGitHubFetch([]); // a safe dispatch would fetch the Contents API — asserting it never gets there
+
+  const res = await pullBlob({ dir, number: 1, path: "../../etc/passwd", side: "new" });
+  expect(res).toEqual({ ok: false, status: 400, error: "invalid path" });
+  expect(fetchMock.calls).toHaveLength(0);
+});
+
+test("pullBlob rejects an absolute filePath with 400", async () => {
+  const dir = await makeGitHubRepo("acme", "app");
+  createdDirs.push(dir);
+  fetchMock = mockGitHubFetch([]);
+
+  const res = await pullBlob({ dir, number: 1, path: "/etc/passwd", side: "new" });
+  expect(res).toEqual({ ok: false, status: 400, error: "invalid path" });
+  expect(fetchMock.calls).toHaveLength(0);
+});
+
+test("pullBlob on a repo with no supported git remote returns 400 without a path/provider check", async () => {
+  const dir = await makeRepo("git@example.com:acme/app.git");
+  fetchMock = mockGitHubFetch([]);
+
+  const res = await pullBlob({ dir, number: 1, path: "assets/logo.png", side: "new" });
+  expect(res).toEqual({
+    ok: false,
+    status: 400,
+    error: "project does not have a supported git remote (GitHub, GitLab, or Bitbucket)",
+  });
   expect(fetchMock.calls).toHaveLength(0);
 });

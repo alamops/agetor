@@ -63,6 +63,7 @@ import type {
   TaskDiff,
 } from "../shared/types.ts";
 import { GIT_HOST_TOKENS_SECTION } from "../shared/types.ts";
+import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/attachments.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { tokenForHost } from "./github-tokens.ts";
 
@@ -1703,6 +1704,238 @@ export async function getGitHubPullDiff(input: GetGitHubPullDiffInput): Promise<
     base: null,
     files,
     note: files.length === 0 ? "No diff returned for this pull request." : undefined,
+  };
+}
+
+interface GetGitHubPullBlobInput {
+  dir: string;
+  number: number;
+  path: string;
+  side: "old" | "new";
+}
+
+/** Structurally identical to `git-host.ts`'s `PullBlobResult` — kept as a
+ *  separate declaration (rather than imported) because `git-host.ts` is the
+ *  consumer, not the source, of this module's types; TS's structural typing
+ *  makes the two interchangeable at the `pullBlob` dispatch call site. */
+type GitHubBlobResult =
+  | { ok: true; bytes: Uint8Array<ArrayBuffer>; contentType: string; ref: string }
+  | { ok: false; error: string; status?: number };
+
+/** Merge-base sha cache for the "old" side of a PR blob fetch, keyed
+ *  `${remoteHost}/${owner}/${name}#${number}@${headSha}` — the `.diff` media
+ *  type `getGitHubPullDiff` renders is a three-dot (merge-base-anchored)
+ *  diff, so the old side of a binary file must be read at the merge base,
+ *  not `base.sha` (which drifts if the base branch moves after the PR was
+ *  opened). Bounded with a crude size guard rather than an LRU — a single
+ *  workstation's Git Integration modal won't realistically open enough
+ *  distinct PRs in one process lifetime to make eviction policy matter. */
+const mergeBaseCache = new Map<string, string>();
+const MERGE_BASE_CACHE_LIMIT = 200;
+
+function cacheMergeBase(key: string, sha: string): void {
+  if (mergeBaseCache.size >= MERGE_BASE_CACHE_LIMIT && !mergeBaseCache.has(key)) {
+    mergeBaseCache.clear();
+  }
+  mergeBaseCache.set(key, sha);
+}
+
+interface PullDetailCacheEntry {
+  headSha: string;
+  baseSha: string;
+  headRepoFullName: string | null;
+  baseRepoFullName: string | null;
+  fetchedAt: number;
+}
+
+/** Short-TTL cache of a PR's head/base sha + head/base repo full names,
+ *  keyed `${remoteHost}/${owner}/${name}#${number}` — without this, every
+ *  blob request (old side, then new side, or the user paging through
+ *  several binary files in the same PR) re-fetches `GET /pulls/:number`
+ *  from scratch even though the two sides of one preview session almost
+ *  always want the same PR detail. 60s TTL so a fresh push to the PR is
+ *  picked up reasonably promptly rather than serving a stale head sha for
+ *  the rest of the process's life. Same crude size-guard eviction style as
+ *  `mergeBaseCache` — not correctness-critical, just bounds memory. */
+const pullDetailCache = new Map<string, PullDetailCacheEntry>();
+const PULL_DETAIL_CACHE_LIMIT = 200;
+const PULL_DETAIL_CACHE_TTL_MS = 60_000;
+
+function cachePullDetail(key: string, entry: PullDetailCacheEntry): void {
+  if (pullDetailCache.size >= PULL_DETAIL_CACHE_LIMIT && !pullDetailCache.has(key)) {
+    pullDetailCache.clear();
+  }
+  pullDetailCache.set(key, entry);
+}
+
+/** Builds a `GitHubRepo` from a PR side's `full_name` (`"owner/name"`, as
+ *  read off `head.repo.full_name`/`base.repo.full_name` or the cached
+ *  `PullDetailCacheEntry`), reusing the *original* repo's `remoteHost` — the
+ *  fork lives on the same git host, and tokens are stored per-host, not
+ *  per-repo (see `githubToken`'s doc comment). Returns null when
+ *  `fullName` is null (e.g. the fork was deleted) or malformed. */
+function repoFromFullName(fullName: string | null, host: string): GitHubRepo | null {
+  if (!fullName) return null;
+  const slash = fullName.indexOf("/");
+  if (slash === -1) return null;
+  return { owner: fullName.slice(0, slash), name: fullName.slice(slash + 1), remoteHost: host };
+}
+
+/** Content-type for a binary diff preview, from the shared canonical
+ *  extension→MIME map (`../shared/attachments.ts`). Deliberately doesn't
+ *  trust GitHub's Contents API response content-type for a known preview
+ *  extension (server-guessed types can be generic like
+ *  `application/octet-stream`) — only falls back to it when the extension
+ *  isn't one of the previewable kinds the shared map recognizes. Pure. */
+function contentTypeForBlobPath(path: string, fallback: string | null): string {
+  return contentTypeForPreviewPath(path) ?? fallback ?? "application/octet-stream";
+}
+
+/** Fetches the raw bytes of a single file from one side (old/new) of a
+ *  GitHub pull request's diff, for the binary-preview UI. Dispatched through
+ *  `git-host.ts`'s `pullBlob` (the GitLab/Bitbucket branches there return
+ *  `501 unsupported` without reaching this module).
+ *
+ *  - `side: "new"` reads the file at `head.sha`, from the *head* repo (a
+ *    fork for a cross-repo PR).
+ *  - `side: "old"` reads the file at the PR's merge-base commit (resolved
+ *    via the compare API and cached — see `mergeBaseCache`), from the *base*
+ *    repo — `base.sha` would be wrong once the base branch has moved past
+ *    where the PR forked from it, and the UI's diff is merge-base-anchored
+ *    (`getGitHubPullDiff` fetches the three-dot `.diff` media type).
+ *
+ *  Bytes come from the Contents API's raw media type
+ *  (`Accept: application/vnd.github.raw`), which — unlike the default JSON+
+ *  base64 response — isn't capped at ~1MB, matching `MAX_BLOB_PREVIEW_BYTES`
+ *  intent on the caller side. Size is checked twice: from `content-length`
+ *  before reading the body (cheap rejection of an obviously-too-large file),
+ *  and again against the actual byte count after `arrayBuffer()` (GitHub can
+ *  send a chunked response with no `content-length`). */
+export async function getGitHubPullBlob(input: GetGitHubPullBlobInput): Promise<GitHubBlobResult> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote", status: 400 };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "pull request number must be positive", status: 400 };
+  }
+  const relPath = input.path.trim().replace(/^\/+/, "");
+  if (!relPath) return { ok: false, error: "file path is required", status: 400 };
+
+  const token = await githubToken(repo.remoteHost ?? null);
+
+  // PR detail (head/base sha + repo full names) is cached for a short TTL —
+  // see `pullDetailCache`'s doc comment. Avoids a redundant `GET
+  // /pulls/:number` for every blob request against the same PR.
+  const detailKey = `${repo.remoteHost}/${repoSlug(repo)}#${input.number}`;
+  const cachedDetail = pullDetailCache.get(detailKey);
+  let headSha: string;
+  let baseSha: string;
+  let headRepoFullName: string | null;
+  let baseRepoFullName: string | null;
+  if (cachedDetail && Date.now() - cachedDetail.fetchedAt < PULL_DETAIL_CACHE_TTL_MS) {
+    ({ headSha, baseSha, headRepoFullName, baseRepoFullName } = cachedDetail);
+  } else {
+    const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+    const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
+    if (!("status" in prRes)) return { ok: false, error: prRes.error, status: 502 };
+    const prJson = await prRes.json().catch(() => null);
+    if (!prRes.ok) {
+      return prRes.status === 404
+        ? { ok: false, error: "pull request not found", status: 404 }
+        : { ok: false, error: apiError(prJson, prRes.status, prRes.statusText), status: prRes.status };
+    }
+    const pr = prJson && typeof prJson === "object" ? (prJson as Record<string, unknown>) : {};
+    const head = pr.head && typeof pr.head === "object" ? pr.head as Record<string, unknown> : {};
+    const base = pr.base && typeof pr.base === "object" ? pr.base as Record<string, unknown> : {};
+    const resolvedHeadSha = typeof head.sha === "string" ? head.sha : null;
+    const resolvedBaseSha = typeof base.sha === "string" ? base.sha : null;
+    if (!resolvedHeadSha || !resolvedBaseSha) {
+      return { ok: false, error: "GitHub returned a pull request without head/base sha", status: 502 };
+    }
+    headSha = resolvedHeadSha;
+    baseSha = resolvedBaseSha;
+    headRepoFullName = head.repo && typeof head.repo === "object"
+      && typeof (head.repo as Record<string, unknown>).full_name === "string"
+      ? (head.repo as Record<string, unknown>).full_name as string
+      : null;
+    baseRepoFullName = base.repo && typeof base.repo === "object"
+      && typeof (base.repo as Record<string, unknown>).full_name === "string"
+      ? (base.repo as Record<string, unknown>).full_name as string
+      : null;
+    cachePullDetail(detailKey, { headSha, baseSha, headRepoFullName, baseRepoFullName, fetchedAt: Date.now() });
+  }
+
+  let blobRepo: GitHubRepo;
+  let ref: string;
+  if (input.side === "new") {
+    const headRepo = repoFromFullName(headRepoFullName, repo.remoteHost);
+    if (!headRepo) {
+      return {
+        ok: false,
+        error: "the head repository for this pull request is unavailable (the fork may have been deleted)",
+        status: 404,
+      };
+    }
+    blobRepo = headRepo;
+    ref = headSha;
+  } else {
+    blobRepo = repoFromFullName(baseRepoFullName, repo.remoteHost) ?? repo;
+    const cacheKey = `${repo.remoteHost}/${repoSlug(repo)}#${input.number}@${headSha}`;
+    const cached = mergeBaseCache.get(cacheKey);
+    if (cached) {
+      ref = cached;
+    } else {
+      const compareUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/compare/`
+        + `${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`;
+      const compareRes = await fetchGitHub(compareUrl, token, "application/vnd.github+json");
+      if (!("status" in compareRes)) return { ok: false, error: compareRes.error, status: 502 };
+      const compareJson = await compareRes.json().catch(() => null);
+      if (!compareRes.ok) {
+        return { ok: false, error: apiError(compareJson, compareRes.status, compareRes.statusText), status: compareRes.status };
+      }
+      const mergeBaseObj = compareJson && typeof compareJson === "object"
+        ? (compareJson as Record<string, unknown>).merge_base_commit
+        : null;
+      const mergeBaseSha = mergeBaseObj && typeof mergeBaseObj === "object"
+        && typeof (mergeBaseObj as Record<string, unknown>).sha === "string"
+        ? (mergeBaseObj as Record<string, unknown>).sha as string
+        : null;
+      if (!mergeBaseSha) {
+        return { ok: false, error: "GitHub did not return a merge base for this pull request", status: 502 };
+      }
+      ref = mergeBaseSha;
+      cacheMergeBase(cacheKey, ref);
+    }
+  }
+
+  const fileUrl = `${contentsUrl(blobRepo, relPath)}?ref=${encodeURIComponent(ref)}`;
+  const fileRes = await fetchGitHub(fileUrl, token, "application/vnd.github.raw");
+  if (!("status" in fileRes)) return { ok: false, error: fileRes.error, status: 502 };
+  if (fileRes.status === 404) return { ok: false, error: "file not present on this side", status: 404 };
+  if (!fileRes.ok) {
+    const raw = await fileRes.text().catch(() => "");
+    let msg = raw;
+    try {
+      const parsed = JSON.parse(raw) as { message?: unknown };
+      if (typeof parsed.message === "string") msg = parsed.message;
+    } catch { /* raw-media error bodies are sometimes plain text */ }
+    return { ok: false, error: msg || `${fileRes.status} ${fileRes.statusText}`, status: fileRes.status };
+  }
+
+  const contentLength = Number(fileRes.headers.get("content-length") ?? 0);
+  if (contentLength > MAX_BLOB_PREVIEW_BYTES) {
+    return { ok: false, error: `File is too large to preview (${Math.ceil(contentLength / 1_000_000)} MB).`, status: 413 };
+  }
+  const buf = await fileRes.arrayBuffer().catch(() => null);
+  if (!buf) return { ok: false, error: "GitHub returned an unreadable file response", status: 502 };
+  if (buf.byteLength > MAX_BLOB_PREVIEW_BYTES) {
+    return { ok: false, error: `File is too large to preview (${Math.ceil(buf.byteLength / 1_000_000)} MB).`, status: 413 };
+  }
+
+  return {
+    ok: true,
+    bytes: new Uint8Array(buf),
+    contentType: contentTypeForBlobPath(relPath, fileRes.headers.get("content-type")),
+    ref,
   };
 }
 
