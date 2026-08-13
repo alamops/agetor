@@ -94,7 +94,10 @@ function extractTokenFromValue(value: string): string | null {
     // not JSON — fall through
   }
 
-  return null;
+  // Shape 3: a bare token value with no wrapper at all (e.g. the raw
+  // `cursorAuth/accessToken` JWT string). Previously only reachable via the
+  // JSON-nested path — a plain string value must get the same treatment.
+  return extractTokenFromValueNonJson(trimmed);
 }
 
 /** Helper for the JSON-nested-cookie-string case in `extractTokenFromValue`,
@@ -109,10 +112,43 @@ function extractTokenFromValueNonJson(value: string): string | null {
 }
 
 /**
+ * Derive the `WorkosCursorSessionToken` cookie value from the IDE's stored
+ * OAuth access token. The IDE keeps a bare JWT under `cursorAuth/accessToken`
+ * — NOT the web cookie itself. The web session cookie's observed format
+ * (what CodexBar derives, and what cursor.com's dashboard sends) is
+ * `<userId>%3A%3A<jwt>` — the user id URL-encoded-joined (`::`) with the
+ * JWT, where the user id is the tail of the JWT payload's `sub` claim
+ * (e.g. `sub: "auth0|user_xxx"` → `user_xxx`). Returns `null` when the
+ * token doesn't decode as a JWT with a usable `sub`. Never throws.
+ */
+function deriveSessionCookieFromJwt(accessToken: string): string | null {
+  try {
+    const parts = accessToken.split(".");
+    if (parts.length !== 3 || !parts[1]) return null;
+    const payloadJson = Buffer.from(parts[1], "base64url").toString("utf8");
+    const payload = JSON.parse(payloadJson) as Record<string, unknown>;
+    const sub = payload.sub;
+    if (typeof sub !== "string" || !sub) return null;
+    const userId = sub.includes("|") ? sub.slice(sub.lastIndexOf("|") + 1) : sub;
+    if (!userId) return null;
+    return `${userId}%3A%3A${accessToken}`;
+  } catch {
+    return null;
+  }
+}
+
+/** A bare JWT: three dot-separated base64url segments. */
+const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+
+/**
  * Probe the Cursor IDE's `state.vscdb` (a `bun:sqlite`-readable SQLite file)
- * for a stored `WorkosCursorSessionToken`. Opens read-only so we never
- * corrupt or lock a file the live Cursor app may also have open. Returns
- * `null` (never throws) if the file, table, or a matching row don't exist.
+ * for a Cursor web session. Opens read-only so we never corrupt or lock a
+ * file the live Cursor app may also have open. Returns `null` (never throws)
+ * if the file, table, or a matching row don't exist.
+ *
+ * Query discipline: this DB can be multi-GB (3.8GB observed on a real
+ * machine), so we only ever run *key*-indexed lookups — a `value LIKE '%…%'`
+ * would full-scan every blob in the table on every poll sweep.
  */
 function readCursorIdeCookie(): string | null {
   const dbPath = cursorStateDbPath();
@@ -123,15 +159,38 @@ function readCursorIdeCookie(): string | null {
     db = new Database(dbPath, { readonly: true });
     // ItemTable is VS Code's (and Cursor's, which forks it) standard
     // global-storage key/value table: `key TEXT, value BLOB/TEXT`.
+
+    // Primary path: the IDE's OAuth access token (a bare JWT) under the
+    // well-known key — derive the web session cookie from it.
+    const tokenRow = db
+      .query<{ value: string }, []>(
+        "SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'",
+      )
+      .get();
+    if (tokenRow && typeof tokenRow.value === "string") {
+      const jwt = tokenRow.value.trim().replace(/^"|"$/g, "");
+      if (JWT_RE.test(jwt)) {
+        const derived = deriveSessionCookieFromJwt(jwt);
+        if (derived) return derived;
+      }
+    }
+
+    // Fallback: any auth-ish *key* whose value carries a recognizable cookie
+    // shape (older/alternative storage layouts). Key-LIKE only — never
+    // value-LIKE (see query discipline above).
     const rows = db
       .query<{ key: string; value: string }, []>(
-        "SELECT key, value FROM ItemTable WHERE key LIKE '%cursorAuth%' OR key LIKE '%workos%' OR value LIKE '%WorkosCursorSessionToken%'",
+        "SELECT key, value FROM ItemTable WHERE key LIKE '%cursorAuth%' OR key LIKE '%workos%'",
       )
       .all();
     for (const row of rows) {
       if (typeof row.value !== "string") continue;
       const token = extractTokenFromValue(row.value);
-      if (token) return token;
+      if (token) {
+        // A bare JWT found via the fallback still needs the cookie derivation.
+        if (JWT_RE.test(token)) return deriveSessionCookieFromJwt(token) ?? null;
+        return token;
+      }
     }
     return null;
   } catch {
@@ -288,7 +347,55 @@ export function parseCursorUsage(
     return { meters: [], planType: null };
   }
 
-  // --- Plan usage meter -----------------------------------------------
+  // --- Confirmed live shape (verified 2026-08 against a real pro_plus
+  // account): meters live under `individualUsage`, with distinct percent
+  // fields per bucket — `totalPercentUsed` (the authoritative overall plan
+  // meter; note `used/limit` alone misleads here because bonus credits extend
+  // the included quota), `autoPercentUsed`, `apiPercentUsed`, and an
+  // `onDemand` used/limit pair. Reset = `billingCycleEnd`. When this shape is
+  // present it's used exclusively; the legacy probing below stays as the
+  // fallback for other/older schema variants.
+  const liveShape = getPath(summaryJson, "individualUsage.plan");
+  if (liveShape != null && typeof liveShape === "object") {
+    const cycleResetsAtMs = parseResetsAtMs(
+      getPath(summaryJson, "billingCycleEnd"),
+    );
+    const liveFields: Array<{ path: string; id: string; label: string }> = [
+      { path: "individualUsage.plan.totalPercentUsed", id: "plan", label: "Plan (total)" },
+      { path: "individualUsage.plan.autoPercentUsed", id: "auto", label: "Auto" },
+      { path: "individualUsage.plan.apiPercentUsed", id: "api", label: "API" },
+    ];
+    for (const f of liveFields) {
+      const pct = firstNumber(summaryJson, [f.path]);
+      if (pct != null) {
+        meters.push({
+          id: f.id,
+          label: f.label,
+          usedPercent: clampPercent(pct),
+          resetsAtMs: cycleResetsAtMs,
+        });
+      }
+    }
+    const odUsed = firstNumber(summaryJson, ["individualUsage.onDemand.used"]);
+    const odLimit = firstNumber(summaryJson, ["individualUsage.onDemand.limit"]);
+    if (odUsed != null && odLimit != null && odLimit > 0) {
+      meters.push({
+        id: "on-demand",
+        label: "On-demand",
+        usedPercent: clampPercent((odUsed / odLimit) * 100),
+        resetsAtMs: cycleResetsAtMs,
+      });
+    }
+    if (meters.length > 0) {
+      const livePlanType =
+        firstString(summaryJson, ["membershipType"]) ??
+        firstString(meJson, ["plan", "planType", "membershipType", "tier"]);
+      return { meters, planType: livePlanType };
+    }
+    // Shape present but nothing mapped — fall through to legacy probing.
+  }
+
+  // --- Plan usage meter (legacy probing) --------------------------------
   let planPercent = firstNumber(summaryJson, [
     "usedPercent",
     "usagePercent",
@@ -448,7 +555,12 @@ export async function fetchCursorQuota(harness: Harness): Promise<HarnessQuota> 
       planType: null,
       status: "unavailable",
       meters: [],
-      reason: "Cursor usage needs a signed-in Cursor app/browser session",
+      // Actionable guidance — rendered verbatim in the topbar popover, so
+      // tell the user exactly how to make usage appear rather than just
+      // stating that it can't.
+      reason:
+        "No Cursor session found. Open the Cursor desktop app and sign in, " +
+        "then Refresh here — Agetor reads Cursor's local login to fetch plan usage.",
     };
   }
 

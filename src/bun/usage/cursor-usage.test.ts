@@ -179,3 +179,67 @@ describe("parseCursorUsage — garbage/empty/null input", () => {
     expect(planType).toBeNull();
   });
 });
+
+describe("parseCursorUsage — confirmed live shape (individualUsage, 2026-08)", () => {
+  // Redacted real pro_plus response shape, verified live 2026-08-13.
+  const liveSummary = {
+    billingCycleStart: "2026-08-08T20:58:45.000Z",
+    billingCycleEnd: "2026-09-08T20:58:45.000Z",
+    membershipType: "pro_plus",
+    limitType: "user",
+    isUnlimited: false,
+    individualUsage: {
+      plan: {
+        enabled: true,
+        used: 7000,
+        limit: 7000,
+        remaining: 0,
+        breakdown: { included: 7000, bonus: 32742, total: 39742 },
+        autoPercentUsed: 40.84,
+        apiPercentUsed: 64.27,
+        totalPercentUsed: 43.67,
+      },
+      onDemand: { enabled: true, used: 0, limit: 5000, remaining: 5000 },
+    },
+    teamUsage: {},
+  };
+
+  test("maps total/auto/api + on-demand meters with billing-cycle reset", () => {
+    const { meters, planType } = parseCursorUsage(liveSummary, null, 0);
+    expect(meters.map((m) => m.id)).toEqual(["plan", "auto", "api", "on-demand"]);
+    const byId = Object.fromEntries(meters.map((m) => [m.id, m]));
+    expect(byId["plan"]!.usedPercent).toBeCloseTo(43.67, 1);
+    expect(byId["plan"]!.label).toBe("Plan (total)");
+    expect(byId["auto"]!.usedPercent).toBeCloseTo(40.84, 1);
+    expect(byId["api"]!.usedPercent).toBeCloseTo(64.27, 1);
+    expect(byId["on-demand"]!.usedPercent).toBe(0);
+    const cycleEnd = Date.parse("2026-09-08T20:58:45.000Z");
+    for (const m of meters) expect(m.resetsAtMs).toBe(cycleEnd);
+    expect(planType).toBe("pro_plus");
+  });
+
+  test("uses totalPercentUsed, NOT the misleading used/limit pair (bonus credits extend the quota)", () => {
+    // used===limit (7000/7000) would read 100%; the live branch must report
+    // totalPercentUsed (43.67) instead of falling into the legacy pair math.
+    const { meters } = parseCursorUsage(liveSummary, null, 0);
+    const plan = meters.find((m) => m.id === "plan")!;
+    expect(plan.usedPercent).toBeLessThan(50);
+  });
+
+  test("skips on-demand when limit is 0, keeps percent meters", () => {
+    const s = structuredClone(liveSummary);
+    s.individualUsage.onDemand.limit = 0;
+    const { meters } = parseCursorUsage(s, null, 0);
+    expect(meters.map((m) => m.id)).toEqual(["plan", "auto", "api"]);
+  });
+
+  test("individualUsage present but empty falls back to legacy probing without throwing", () => {
+    const { meters, planType } = parseCursorUsage(
+      { individualUsage: { plan: {} }, membershipType: "pro" },
+      null,
+      0,
+    );
+    expect(meters).toEqual([]);
+    expect(planType).toBe("pro");
+  });
+});
