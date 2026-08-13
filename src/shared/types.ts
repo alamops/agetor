@@ -1472,6 +1472,7 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
     "gemini-3-pro-preview": [],
     "gemini-3.1-pro-preview": [],
     "gemini-2.5-pro": [],
+    "gemini-3.7-flash": [],
     "gemini-3.5-flash": [],
     "gemini-2.5-flash": [],
   },
@@ -1588,12 +1589,14 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     efforts: EFFORT_OPTIONS,
   },
   gemini: {
+    // Pro tier first, then Flash tier; newest first within each tier.
     models: [
       { id: "gemini-3-pro-preview", label: "Gemini 3 Pro (preview)", hint: "Recommended default — current flagship." },
       { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", hint: "Newer preview tier." },
       { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "Prior stable flagship." },
-      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost." },
-      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, prior generation." },
+      { id: "gemini-3.7-flash", label: "Gemini 3.7 Flash", hint: "Latest and most capable Flash — strong on coding and agentic work at Flash cost." },
+      { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", hint: "Fast, lower cost — prior Flash generation." },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "Fast, lower cost, earlier generation." },
     ],
     modes: [
       { id: "auto", label: "Auto (yolo)", hint: "Edit files without approval prompts (--yolo)." },

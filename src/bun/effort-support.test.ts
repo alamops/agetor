@@ -127,6 +127,13 @@ test("ordered highest → lowest (no placeholder at the top)", () => {
   expect(ids).toEqual(filteredExpected);
 });
 
+// --- gemini: no per-invocation effort flag -------------------------------------
+
+test("gemini gemini-3.7-flash exposes no effort options (no effort flag on the CLI)", () => {
+  const ids = supportedEfforts("gemini", "gemini-3.7-flash").map((o) => o.id);
+  expect(ids).toEqual([]);
+});
+
 // --- cursor: model thinking modes + fast variants -----------------------------
 
 test("cursor DEFAULT_MODEL is 'auto' (cursor-agent's own 'let the CLI pick' default)", () => {
