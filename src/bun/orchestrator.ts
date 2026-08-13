@@ -2973,8 +2973,9 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
  *  - `"orphaned"` — no task row for the dir (crash/failed teardown leftover).
  *  - `"archived"` — the owning task is archived but the dir is still present
  *    (teardown pending, failed, or skipped because the worktree was dirty).
- *  - `"inactive"` — not archived, no run in flight, and the task hasn't been
- *    touched in over `WORKTREE_STALE_AFTER_MS`.
+ *  - `"inactive"` — not archived, no run in flight, no background
+ *    agents/workflows still running, and the task hasn't been touched in
+ *    over `WORKTREE_STALE_AFTER_MS`.
  *
  * Returns `[]` when `WORKTREES_DIR` doesn't exist yet (no worktree has ever
  * been created). Non-directory entries and dotfiles are skipped.
@@ -2987,6 +2988,10 @@ export function listWorktrees(): WorktreeInfo[] {
     return [];
   }
   const taskById = new Map(tasks.list().map((t) => [t.id, t]));
+  // One grouped query for the whole listing (same pattern the `/tasks` route
+  // uses, backed by migration 042's partial index) instead of a per-row
+  // lookup — cheap enough to run unconditionally, unlike a git subprocess.
+  const runningByTask = subagents.runningCountsByTask();
   const out: WorktreeInfo[] = [];
   for (const name of entries) {
     if (name.startsWith(".")) continue;
@@ -3003,6 +3008,11 @@ export function listWorktrees(): WorktreeInfo[] {
     const staleReasons: WorktreeStaleReason[] = [];
     // Same active-run check archiveTask uses for its defence-in-depth guard.
     const runActive = !!(task?.runId && active.has(task.runId));
+    // Background agents/workflows (subagent rows) still writing to the
+    // worktree must hold off the "inactive" flag even though the main run's
+    // own `active` slot is long gone. Sourced from the grouped map above, so
+    // this is a lookup, not a query — always `false` for an orphan (no task).
+    const heldByBackgroundAgents = !!task && (runningByTask.get(task.id) ?? 0) > 0;
     if (!task) {
       // No owning row — nothing else applies (can't be archived or idle-by-age).
       staleReasons.push("orphaned");
@@ -3010,7 +3020,11 @@ export function listWorktrees(): WorktreeInfo[] {
       // A worktree can carry both reasons at once (archived AND past the
       // inactivity threshold), so these are independent checks, not a chain.
       if (task.archivedAt != null) staleReasons.push("archived");
-      if (!runActive && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS) {
+      if (
+        !runActive
+        && Date.now() - task.updatedAt > WORKTREE_STALE_AFTER_MS
+        && !heldByBackgroundAgents
+      ) {
         staleReasons.push("inactive");
       }
     }
@@ -3028,6 +3042,7 @@ export function listWorktrees(): WorktreeInfo[] {
       // the `.git` pointer file — plain fs, no git subprocess.
       workdir: task?.workdir ?? parseWorktreeGitPointer(dirPath),
       runActive,
+      heldByBackgroundAgents,
       stale: staleReasons.length > 0,
       staleReasons,
     });

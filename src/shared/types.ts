@@ -796,6 +796,12 @@ export interface WorktreeInfo {
   workdir: string | null;
   /** True when the owning task currently has a run in flight. */
   runActive: boolean;
+  /** True when at least one background agent/workflow (subagent row) for the
+   *  owning task is still `status:"running"`. This is also why an
+   *  old-but-held worktree is not flagged `"inactive"` — see
+   *  {@link WorktreeStaleReason}. Always `false` for orphaned rows (no
+   *  owning task). */
+  heldByBackgroundAgents: boolean;
   /** True when `staleReasons` is non-empty. */
   stale: boolean;
   /** Every reason this worktree is considered stale; empty when not stale. */
