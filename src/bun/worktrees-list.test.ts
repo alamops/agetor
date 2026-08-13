@@ -154,6 +154,116 @@ test("listWorktrees flags an idle worktree as \"inactive\"", async () => {
   }
 });
 
+test("does not flag a worktree inactive while a background agent is still running", async () => {
+  const { createTask, listWorktrees } = await import("./orchestrator.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { db, tasks, subagents } = await import("./db.ts");
+  const { WORKTREE_STALE_AFTER_MS } = await import("../shared/types.ts");
+
+  const repo = await makeRepo();
+  const created = await createTask({
+    title: "held by background agent",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: repo,
+    isolation: "worktree",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  try {
+    const prepared = await prepareWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
+
+    // Same back-dating trick as the "inactive" test above — push updatedAt
+    // past the staleness threshold via raw SQL (tasks.update() would
+    // force-overwrite it back to now).
+    const oldTs = Date.now() - WORKTREE_STALE_AFTER_MS - 1000;
+    db.run(`UPDATE tasks SET updated_at = ? WHERE id = ?`, [oldTs, taskId]);
+
+    const agentId = `held-${randomUUID()}`;
+    subagents.insertIfAbsent({
+      id: agentId,
+      taskId,
+      runId: null, // the gate keys off task_id, not run_id
+      parentKind: "subagent",
+      agentType: "Explore",
+      description: "still working",
+      spawnDepth: 1,
+      sourcePath: `/tmp/agent-${agentId}.jsonl`,
+      status: "running",
+      startedAt: Date.now(),
+      endedAt: null,
+    });
+
+    const held = listWorktrees().find((e) => e.id === taskId);
+    expect(held).toBeDefined();
+    expect(held?.staleReasons).not.toContain("inactive");
+
+    // Settle the row — the age condition is already satisfied, so the very
+    // next listWorktrees() call should now report "inactive".
+    subagents.setStatus(agentId, "completed", Date.now());
+
+    const settled = listWorktrees().find((e) => e.id === taskId);
+    expect(settled).toBeDefined();
+    expect(settled?.staleReasons).toContain("inactive");
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+test("does not flag a worktree inactive while a workflow container row is running", async () => {
+  // Proves the guard is kind-agnostic: a 'workflow' container row (holds a
+  // task in `running` for the lifetime of a Claude Code Workflow run) must
+  // suppress "inactive" exactly like an ordinary 'subagent' row does.
+  const { createTask, listWorktrees } = await import("./orchestrator.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { db, tasks, subagents } = await import("./db.ts");
+  const { WORKTREE_STALE_AFTER_MS } = await import("../shared/types.ts");
+
+  const repo = await makeRepo();
+  const created = await createTask({
+    title: "held by workflow container",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: repo,
+    isolation: "worktree",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  try {
+    const prepared = await prepareWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath });
+
+    const oldTs = Date.now() - WORKTREE_STALE_AFTER_MS - 1000;
+    db.run(`UPDATE tasks SET updated_at = ? WHERE id = ?`, [oldTs, taskId]);
+
+    const agentId = `workflow-${randomUUID()}`;
+    subagents.insertIfAbsent({
+      id: agentId,
+      taskId,
+      runId: null,
+      parentKind: "workflow",
+      agentType: null,
+      description: "workflow container",
+      spawnDepth: 1,
+      sourcePath: `/tmp/workflow-${agentId}`,
+      status: "running",
+      startedAt: Date.now(),
+      endedAt: null,
+    });
+
+    const held = listWorktrees().find((e) => e.id === taskId);
+    expect(held).toBeDefined();
+    expect(held?.staleReasons).not.toContain("inactive");
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
 test("listWorktrees flags an orphan dir (no task row) as \"orphaned\"", async () => {
   const { listWorktrees } = await import("./orchestrator.ts");
   const { WORKTREES_DIR } = await import("./worktree.ts");
