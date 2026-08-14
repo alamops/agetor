@@ -9,13 +9,13 @@ import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { api, ApiError } from "@/lib/api";
 import { ASSISTANT_MD_COMPONENTS } from "./md-components";
-import type { Task, TaskPlan } from "../../../shared/types.ts";
+import type { AgentKind, Task, TaskPlan } from "../../../shared/types.ts";
 
-/** Status pill for a plan card / the PlanDialog header — same three-state
- *  vocabulary throughout (`pending` / `approved` / `superseded`), styled with
- *  semantic tokens only. Exported so `RunPanel`'s `PlanCard` can reuse it
- *  verbatim rather than re-deriving the label/color mapping — a one-way
- *  import (RunPanel -> PlanDialog) since RunPanel already imports the
+/** Status pill for a plan card / the PlanDialog header — same four-state
+ *  vocabulary throughout (`pending` / `approved` / `superseded` / `rejected`),
+ *  styled with semantic tokens only. Exported so `RunPanel`'s `PlanCard` can
+ *  reuse it verbatim rather than re-deriving the label/color mapping — a
+ *  one-way import (RunPanel -> PlanDialog) since RunPanel already imports the
  *  `PlanDialog` component from this module. */
 export function PlanStatusBadge({ status }: { status: TaskPlan["status"] }) {
   switch (status) {
@@ -37,6 +37,12 @@ export function PlanStatusBadge({ status }: { status: TaskPlan["status"] }) {
           Superseded
         </Badge>
       );
+    case "rejected":
+      return (
+        <Badge variant="outline" className="border-danger/50 text-danger">
+          Rejected
+        </Badge>
+      );
   }
 }
 
@@ -49,6 +55,16 @@ interface Props {
    *  this component (the caller keys it by `plan.id`), which is what resets
    *  the local `text`/`mode` state below back to a fresh baseline. */
   plan: TaskPlan;
+  /** The task's resolved harness kind (`RunPanelBody`'s `kind`, already
+   *  derived via `harnessKindOf` at the call site). Cursor plans are
+   *  editable/approvable from this dialog (writes a `.plan.md` file + sends
+   *  an approval message via the mutation routes below); claude-code plans
+   *  are read-only history — approval happens live in the tmux modal
+   *  (`TmuxPromptCard`'s plan branch in RunPanel.tsx), so this dialog only
+   *  ever displays a claude plan's content/status, never edits or approves
+   *  it. Every mutation affordance (Edit, Revert, Approve, Save & Approve)
+   *  is gated on `!claude` below. */
+  agentKind: AgentKind;
   onClose: () => void;
   /** Called with the fresh `Task` after any successful mutation (save,
    *  revert, approve) — the caller re-syncs its `plans` mirror from it. This
@@ -65,14 +81,29 @@ interface Props {
 }
 
 /**
- * Modal for a detected Cursor plan (`createPlanToolCall`). While `pending`,
- * the plan is editable and approvable; `approved`/`superseded` render a
- * read-only view. See `docs/plans/cursor-plan-approval.md` §3-4 for the full
- * approval-flow design this implements.
+ * Modal for a detected plan — Cursor's `createPlanToolCall` or claude-code's
+ * `ExitPlanMode`. For a Cursor plan, `pending` is editable and approvable
+ * from here (`editable`, below); `approved`/`superseded` render a read-only
+ * view. See `docs/plans/cursor-plan-approval.md` §3-4 for the full
+ * approval-flow design this implements. A claude-code plan (`agentKind ===
+ * "claude-code"`) is ALWAYS read-only regardless of status — its approval
+ * lives entirely in the live tmux modal (`TmuxPromptCard`'s plan branch in
+ * RunPanel.tsx), so this dialog is a viewer onto `task.plans` history for
+ * claude: content (edited text wins when present), status badge, no
+ * edit/approve/revert affordances, per docs/plans/claude-code-plan-mode-and-todo-tracker.md T4.
  */
-export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }: Props) {
+export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focusComposer }: Props) {
   const pending = plan.status === "pending";
   const approved = plan.status === "approved";
+  // Claude plans are read-only history — approval already happened (or
+  // didn't) via the live tmux modal, not through this dialog. `pending`
+  // still means "awaiting approval" for a claude plan (set the moment
+  // `ExitPlanMode` fires, cleared once the matching tool_result resolves
+  // it to `approved`/`rejected`), but there's no in-dialog action that can
+  // resolve it, so every edit/approve/revert affordance below is gated on
+  // `editable` (= cursor AND pending) rather than bare `pending`.
+  const claude = agentKind === "claude-code";
+  const editable = !claude && pending;
 
   // Local draft text — seeded once from the plan the dialog opened with (this
   // component is keyed by `plan.id` at the call site, so a genuine plan
@@ -88,14 +119,18 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
   // `task.plans` on every render. Drop out of Edit mode when that happens so
   // a stale textarea doesn't linger under a now-read-only plan.
   useEffect(() => {
-    if (!pending && mode === "edit") setMode("preview");
-  }, [pending, mode]);
+    if (!editable && mode === "edit") setMode("preview");
+  }, [editable, mode]);
 
   // Whitespace-only edits don't count as "edited" — the server rejects a
   // whitespace-only `editedContent` with 400, so an emptied textarea should
   // fall back to approving the original plan (plain "Approve Plan") rather
   // than offering "Save & Approve" against text that will just bounce.
-  const edited = pending && text !== plan.content && text.trim() !== "";
+  // Gated on `editable` (not bare `pending`) so a claude plan — which never
+  // enters Edit mode, so `text` can only diverge from `plan.content` when
+  // `editedContent` was already set at mount (an approved-with-edits plan,
+  // which isn't `pending` anyway) — never spuriously shows "Save & Approve".
+  const edited = editable && text !== plan.content && text.trim() !== "";
   // NOT gated on `pending`: a plan can supersede while the textarea still
   // holds unsaved text (see the effect above that drops out of Edit mode),
   // and closing should still prompt to save-or-discard that draft even
@@ -198,7 +233,13 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
   };
 
   const doApprove = async () => {
-    if (saving || sentButUnconfirmed) return;
+    // Defensive — the Approve button is never rendered for a claude plan
+    // (gated on `editable` below), but guard the mutation itself too: these
+    // are cursor-only routes (`api.approvePlan` writes a `.plan.md` file and
+    // auto-sends an approval message) and a claude plan's approval already
+    // happened live in the tmux modal, so calling this would be a no-op
+    // 4xx at best and a wrong second approval message at worst.
+    if (claude || saving || sentButUnconfirmed) return;
     setSaving(true);
     setError(null);
     try {
@@ -227,7 +268,8 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
   };
 
   const doSaveAndApprove = async () => {
-    if (saving || sentButUnconfirmed) return;
+    // Same guard as `doApprove` — cursor-only mutation route.
+    if (claude || saving || sentButUnconfirmed) return;
     setSaving(true);
     setError(null);
     try {
@@ -248,6 +290,10 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
   };
 
   const doRevert = async () => {
+    // Same guard — a claude plan never has a local draft to discard (see
+    // `edited`'s comment above), and `api.savePlanEdit` is a cursor-only
+    // route, so this must be a no-op for a claude plan regardless.
+    if (claude) return;
     setText(plan.content);
     // No persisted draft to clear — a purely-local edit that was never
     // saved, so there's nothing to round-trip through the server.
@@ -294,7 +340,7 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        {pending && (
+        {editable && (
           <div className="mb-2 flex items-center gap-1">
             <button
               type="button"
@@ -319,7 +365,7 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
             </button>
           </div>
         )}
-        {pending && mode === "edit" ? (
+        {editable && mode === "edit" ? (
           <Textarea
             value={text}
             onChange={(e) => setText(e.target.value)}
@@ -347,7 +393,7 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
           </div>
         )}
         <div className="flex items-center justify-end gap-2">
-          {pending && edited && (
+          {editable && edited && (
             <Button size="sm" variant="outline" onClick={() => void doRevert()} disabled={busy}>
               Revert Changes
             </Button>
@@ -355,7 +401,7 @@ export function PlanDialog({ task, plan, onClose, onPlanUpdated, focusComposer }
           <Button size="sm" variant="secondary" onClick={chatAboutIt} disabled={busy}>
             Chat about it
           </Button>
-          {pending && (
+          {editable && (
             <Button
               size="sm"
               onClick={() => void (edited ? doSaveAndApprove() : doApprove())}

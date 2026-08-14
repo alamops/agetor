@@ -32,6 +32,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   EVENTS_WINDOW_MAX,
+  PERMISSION_MODE_STATUS_PREFIX,
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
   cursorModelSupportsMaxMode,
@@ -90,12 +91,35 @@ function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
   return harnesses.find((h) => h.id === harnessId)?.kind ?? "claude-code";
 }
 
-/** Stable empty-array reference for `RunEventList`'s `plans` prop on a
- *  non-cursor task (plan cards are a cursor-only feature — see
- *  docs/plans/cursor-plan-approval.md §3). Reused instead of an inline `[]`
- *  literal so a re-render doesn't hand `RunEventList` a fresh identity for
- *  no reason. */
+/** Stable empty-array reference for `RunEventList`'s `plans` prop on a task
+ *  whose agent never produces plan records (codex, gemini — see
+ *  docs/plans/cursor-plan-approval.md §3 for cursor's `createPlanToolCall`
+ *  and docs/plans/claude-code-plan-mode-and-todo-tracker.md §2-3 for
+ *  claude-code's `ExitPlanMode`). Reused instead of an inline `[]` literal
+ *  so a re-render doesn't hand `RunEventList` a fresh identity for no
+ *  reason. */
 const NO_PLANS: TaskPlan[] = [];
+
+/** Claude's raw `--permission-mode` strings (as reported in its
+ *  `PERMISSION_MODE_STATUS_PREFIX` status chunks — see `claude-tmux.ts`'s
+ *  `toClaudeModeString`) don't all match agetor's own `AGENT_OPTIONS`
+ *  mode ids: `default` -> `ask` and `bypassPermissions` -> `bypass` are the
+ *  two that diverge; `acceptEdits`/`plan`/`auto` already agree. Inverse of
+ *  `toClaudeModeString`, kept here (not exported from shared/types) since
+ *  it's purely a display concern. */
+const CLAUDE_RAW_MODE_TO_OPTION_ID: Record<string, string> = {
+  default: "ask",
+  bypassPermissions: "bypass",
+};
+
+/** Friendly label for a raw claude permission-mode string, via
+ *  `AGENT_OPTIONS["claude-code"].modes`. Falls back to the raw string
+ *  verbatim for a mode id agetor doesn't curate yet — same "unknown ids
+ *  pass through" convention `buildCommand` uses server-side. */
+function permissionModeLabel(rawMode: string): string {
+  const optionId = CLAUDE_RAW_MODE_TO_OPTION_ID[rawMode] ?? rawMode;
+  return AGENT_OPTIONS["claude-code"].modes.find((m) => m.id === optionId)?.label ?? rawMode;
+}
 
 /**
  * `RunEvent` as held in the panel's local `events` state, tagged with a
@@ -2670,7 +2694,7 @@ function RunPanelBody({
                 runStatus={activeRunStatus}
                 indicatorMode={indicatorMode}
                 taskId={task.id}
-                plans={kind === "cursor" ? plans : NO_PLANS}
+                plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
                 onOpenPlan={onOpenPlan}
               />
             </>
@@ -3019,6 +3043,7 @@ function RunPanelBody({
           key={openPlan.id}
           task={task}
           plan={openPlan}
+          agentKind={kind}
           onClose={() => setPlanDialogId(null)}
           onPlanUpdated={(updated) => setPlans(updated.plans)}
           focusComposer={focusComposer}
@@ -3674,9 +3699,13 @@ function RunEventList({
    *  relative attachment ref can resolve against the task's worktree/workdir
    *  when the user clicks it. */
   taskId?: string;
-  /** Cursor plans detected on this task (`task.plans`). Empty for every
-   *  non-Cursor task. Matched against each `tool_use` event's parsed id via
-   *  `planByToolCallId` below to swap in a `PlanCard` for the matched event. */
+  /** Plans detected on this task (`task.plans`) — Cursor's
+   *  `createPlanToolCall` or claude-code's `ExitPlanMode`. Empty (`NO_PLANS`)
+   *  for every other agent. Matched against each `tool_use` event's parsed id
+   *  via `planByToolCallId` below to swap in a `PlanCard` for the matched
+   *  event; also consulted directly by `TmuxPromptCard` (via
+   *  `latestPlanMarkdown` below) to render the full plan markdown above
+   *  claude's plan-approval buttons. */
   plans?: TaskPlan[];
   /** Opens the plan modal for the given plan id — wired to `RunPanelBody`'s
    *  `planDialogId` state exactly like `onInteractionResolved` is wired to
@@ -3690,6 +3719,46 @@ function RunEventList({
   // runs renders as ugly prefixed text while only the in-flight events get
   // proper cards.
   const normalised = useMemo(() => events.map(normalizeLegacyEvent), [events]);
+
+  // Latest claude permission-mode, for the chip rendered next to the
+  // heartbeat below. Claude emits a `status` chunk (`PERMISSION_MODE_STATUS_
+  // PREFIX + <mode>`) at the start of every turn and on every mid-turn
+  // Shift+Tab cycle (`claude-tmux.ts`'s `permission-mode` case) — the LAST
+  // one in the stream is the mode the session is in right now. `null` when
+  // no such event has ever landed (non-claude tasks, or a claude task on an
+  // agetor version that predates this chip).
+  const latestPermissionMode = useMemo(() => {
+    for (let i = normalised.length - 1; i >= 0; i--) {
+      const e = normalised[i]!;
+      if (e.stream === "status" && e.data.startsWith(PERMISSION_MODE_STATUS_PREFIX)) {
+        return e.data.slice(PERMISSION_MODE_STATUS_PREFIX.length);
+      }
+    }
+    return null;
+  }, [normalised]);
+
+  // Full markdown for the plan `TmuxPromptCard`'s plan branch is about to
+  // act on — the source of truth is the task's latest PENDING claude plan
+  // (mirrors what `resolveClaudePlan` server-side is about to resolve),
+  // falling back to scanning `normalised` for the latest `ExitPlanMode`
+  // tool_use when no matching plan record has landed yet (a brief race: the
+  // tmux scraper can catch the modal before the orchestrator's chunk handler
+  // has processed the `tool_use` chunk that creates the plan row).
+  const latestPlanMarkdown = useMemo(() => {
+    for (let i = plans.length - 1; i >= 0; i--) {
+      const p = plans[i]!;
+      if (p.status === "pending") return p.editedContent ?? p.content;
+    }
+    for (let i = normalised.length - 1; i >= 0; i--) {
+      const e = normalised[i]!;
+      if (e.stream !== "tool_use") continue;
+      const parsed = safeParse<ParsedToolUse>(e.data);
+      if (parsed?.name === "ExitPlanMode" && isRecord(parsed.input) && typeof parsed.input.plan === "string") {
+        return parsed.input.plan;
+      }
+    }
+    return null;
+  }, [plans, normalised]);
 
   // Index tool_results by their tool_use_id so the tool-use card can show
   // the result inline beneath it. Falls back to a standalone tool-result
@@ -3846,6 +3915,12 @@ function RunEventList({
           // trailing `]` or ending in an ellipsis — are filtered too, on
           // replay as well as live.
           if (isImageSourceMetaBreadcrumb(e.data)) return [];
+          // Suppress the raw "permission-mode: <mode>" status chunk too —
+          // it's chip data for the heartbeat area (`latestPermissionMode`
+          // above / `PermissionModeChip` below), not a transcript log line
+          // worth showing inline (every turn start and every Shift+Tab would
+          // otherwise spam a divider into the scrollback).
+          if (e.data.startsWith(PERMISSION_MODE_STATUS_PREFIX)) return [];
           return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
           return [wrap(key, evid, <ErrorBlock text={e.data} />)];
@@ -3862,7 +3937,14 @@ function RunEventList({
         case "ask_questions":
           return <AskQuestionsCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
         case "tmux_prompt":
-          return <TmuxPromptCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
+          return (
+            <TmuxPromptCard
+              key={`int-${it.id}`}
+              req={it}
+              onResolved={onResolved}
+              planMarkdown={latestPlanMarkdown}
+            />
+          );
       }
     };
 
@@ -3887,7 +3969,7 @@ function RunEventList({
     current.body.push(...tail);
     if (current.header !== null || current.body.length > 0) out.push(current);
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan, latestPlanMarkdown]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -3897,8 +3979,11 @@ function RunEventList({
           {s.body}
         </section>
       ))}
-      {indicatorMode !== "off" && runStatus === "running" && (
-        <RunningIndicator />
+      {((indicatorMode !== "off" && runStatus === "running") || latestPermissionMode) && (
+        <div className="flex items-center gap-2">
+          {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
+          {latestPermissionMode && <PermissionModeChip rawMode={latestPermissionMode} />}
+        </div>
       )}
     </div>
   );
@@ -3920,6 +4005,31 @@ function RunningIndicator() {
       </span>
       <span>Agent is working…</span>
     </div>
+  );
+}
+
+/**
+ * Small chip next to the heartbeat showing claude's current
+ * `--permission-mode` (`latestPermissionMode`, derived in `RunEventList`
+ * from the last `PERMISSION_MODE_STATUS_PREFIX` status chunk). Rendered
+ * whenever a mode event exists, independent of `runStatus` — the mode
+ * persists between turns (it's a session property, not a per-turn one), so
+ * it stays visible after the heartbeat itself goes away. `plan` gets a
+ * distinct info-tinted treatment with an eye icon since it's the mode most
+ * worth calling out (claude won't touch files until the user approves).
+ */
+function PermissionModeChip({ rawMode }: { rawMode: string }) {
+  const isPlan = rawMode === "plan";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide",
+        isPlan ? "bg-info/10 text-info" : "bg-muted/60 text-muted-foreground",
+      )}
+    >
+      {isPlan && <Eye className="size-3" aria-hidden />}
+      {permissionModeLabel(rawMode)}
+    </span>
   );
 }
 
@@ -5414,9 +5524,19 @@ function AskQuestionsCard({
 function TmuxPromptCard({
   req,
   onResolved,
+  planMarkdown = null,
 }: {
   req: Extract<PendingInteraction, { kind: "tmux_prompt" }>;
   onResolved: (id: string) => void;
+  /** Full markdown for the plan this modal is asking about to proceed with
+   *  — `RunEventList`'s `latestPlanMarkdown` (task's latest pending claude
+   *  plan, or the latest `ExitPlanMode` tool_use as a fallback). `null` for
+   *  every non-plan `TmuxPromptCard` (the `isPlan` branch below is the only
+   *  consumer) and, defensively, for a plan modal with no resolvable content
+   *  (shouldn't happen in practice — `ExitPlanMode` always carries `input.
+   *  plan` — but the card degrades to today's buttons-only behaviour rather
+   *  than rendering an empty block). */
+  planMarkdown?: string | null;
 }) {
   const [submitting, setSubmitting] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -5445,8 +5565,11 @@ function TmuxPromptCard({
   // ExitPlanMode's native approval modal is a numbered prompt the scraper
   // catches like any other, but it deserves a first-class card (not the raw
   // pane dump) — same polish as the AskUserQuestion card. Detect it by its
-  // signature and render labelled buttons; the plan markdown itself is already
-  // shown just above in the ExitPlanMode tool-use card.
+  // signature and render labelled buttons plus the plan markdown itself
+  // (`planMarkdown`, below) — the plan's `tool_use` event renders as a
+  // `PlanCard` summary button now (see `RunEventList`'s `sections` memo),
+  // not an inline expanded body, so this card is the only place the full
+  // text is shown at decision time.
   const isPlan = /written up a plan|Would you like to proceed/i.test(req.paneText);
   if (isPlan) {
     const planLabel = (label: string): string => {
@@ -5463,8 +5586,15 @@ function TmuxPromptCard({
           <ClipboardList className="size-3.5" aria-hidden /> Claude’s plan is ready
         </div>
         <p className="mb-3 text-[12px] text-muted-foreground">
-          Claude finished a plan (shown above) and is ready to execute. How should it proceed?
+          Claude finished a plan{planMarkdown ? "" : " (shown above)"} and is ready to execute. How should it proceed?
         </p>
+        {planMarkdown && (
+          <div className="agetor-md mb-3 max-h-64 overflow-y-auto rounded-md border border-border/40 bg-muted/20 p-2 text-foreground">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MD_COMPONENTS}>
+              {planMarkdown}
+            </ReactMarkdown>
+          </div>
+        )}
         <div className="flex flex-col gap-1.5">
           {req.choices
             // Only the two "Yes, …" approvals are genuine one-click actions.
