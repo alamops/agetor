@@ -742,6 +742,78 @@ test("mapJsonlEventToChunks: omitting lastPermissionMode preserves always-emit d
   expect(out[0]).toEqual({ stream: "status", data: "permission-mode: auto" });
 });
 
+test("mapJsonlEventToChunks: user line's top-level permissionMode is a fallback mode-change signal (derived uuid avoids collision)", () => {
+  // Claude stamps `permissionMode` on every `user` line too, not just the
+  // dedicated `system`/`permission-mode` marker lines — this is the fallback
+  // path. The status chunk must use a DERIVED uuid, not the raw line uuid:
+  // this same line also emits a genuine `user` chunk below with the raw
+  // uuid, and reusing it would collide on the run_events dedup index
+  // `(run_id, IFNULL(subagent_id,''), line_uuid)` — the second insert gets
+  // silently dropped via INSERT OR IGNORE.
+  const seen: { stream: string; data: string; uuid?: string }[] = [];
+  const onChunk = (s: string, d: string, uuid?: string) => seen.push({ stream: s, data: d, uuid });
+  const line = JSON.stringify({
+    type: "user",
+    uuid: "user-line-1",
+    permissionMode: "plan",
+    message: { content: "hello" },
+  });
+  mapJsonlEventToChunks(line, onChunk);
+  expect(seen).toEqual([
+    { stream: "status", data: "permission-mode: plan", uuid: "user-line-1:permission-mode" },
+    { stream: "user", data: "hello", uuid: "user-line-1" },
+  ]);
+  expect(seen[0]!.uuid).not.toBe(seen[1]!.uuid);
+});
+
+test("mapJsonlEventToChunks: user-line permissionMode fallback is suppressed when it matches lastPermissionMode", () => {
+  const seen: { stream: string; data: string }[] = [];
+  const onChunk = (s: string, d: string) => seen.push({ stream: s, data: d });
+  const line = JSON.stringify({
+    type: "user",
+    uuid: "user-line-2",
+    permissionMode: "auto",
+    message: { content: "go" },
+  });
+  mapJsonlEventToChunks(line, onChunk, false, "auto");
+  // No status chunk — only the human-turn content chunk.
+  expect(seen).toEqual([{ stream: "user", data: "go" }]);
+});
+
+test("dispatchLine: a `user` line's permissionMode fallback shares the same emit-on-change dedup tracker as the `system`/`permission-mode` marker lines", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const taskId = "task-mode-user-fallback";
+  const state = __forTest.installSession(taskId, "/tmp/never-read.jsonl");
+  const emitted: { stream: string; data: string }[] = [];
+  state.lastChunk = (stream, data) => emitted.push({ stream, data });
+  const statusChunks = () => emitted.filter((e) => e.stream === "status" && e.data.startsWith("permission-mode: "));
+
+  // A `user` line reports "auto" first — nothing has announced it yet, so
+  // this is a genuine change and must emit.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user", uuid: "u1", permissionMode: "auto", message: { content: "hi" },
+  }));
+  expect(statusChunks()).toEqual([{ stream: "status", data: "permission-mode: auto" }]);
+  expect(state.permissionMode).toBe("auto");
+
+  // The dedicated marker line reporting the SAME mode right after is
+  // suppressed — the `user` line already announced it.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "system", uuid: "u2", permissionMode: "auto",
+  }));
+  expect(statusChunks()).toEqual([{ stream: "status", data: "permission-mode: auto" }]);
+
+  // A genuine change — the marker line reporting "plan" — still emits.
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "permission-mode", uuid: "u3", permissionMode: "plan",
+  }));
+  expect(statusChunks()).toEqual([
+    { stream: "status", data: "permission-mode: auto" },
+    { stream: "status", data: "permission-mode: plan" },
+  ]);
+  __forTest.uninstallSession(taskId);
+});
+
 test("mapJsonlEventToChunks: summary checkpoints surface as a status breadcrumb", () => {
   const { out, onChunk } = recorder();
   const line = JSON.stringify({ type: "summary", summary: "Earlier turns compacted" });
@@ -1775,6 +1847,48 @@ test("shouldWaitForAskJsonl: stalls only for a lossy pane with no JSONL, inside 
   expect(wait(false, lossy, null, now)).toBe(false);
 });
 
+test("shouldWaitForAskJsonl: also stalls for a pane whose top (header/question/option 1) scrolled off-screen, even with no '✂' markers", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const wait = __forTest.shouldWaitForAskJsonl;
+  // A REAL question modal (has the footer + "Chat about this" signature) but
+  // captured starting mid-option-1's wrapped description — option 1's own
+  // numbered row is gone, so the first REAL option reads "2.", not "1.". No
+  // "✂"/"lines hidden" collapse marker anywhere — the old trigger would have
+  // missed this entirely and registered a corrupted card immediately.
+  const truncatedTop = [
+    "One main model with others as failover/cost backups.",
+    "  2. Task-specialized",
+    "  3. Experimental",
+    "  4. Type something.",
+    "─".repeat(40),
+    "  5. Chat about this",
+    "",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+  ].join("\n");
+  const now = 1_000_000;
+  expect(wait(false, truncatedTop, now, now)).toBe(true);
+  // Grace expired → stop stalling (the caller falls through to the grow path
+  // or, failing that, refuses to register — see collectAskQuestionsFromPane).
+  expect(wait(false, truncatedTop, now - 2_001, now)).toBe(false);
+  // JSONL already available → use it, don't wait on the pane at all.
+  expect(wait(true, truncatedTop, now, now)).toBe(false);
+  // A COMPLETE question modal (option 1 present) never stalls.
+  const complete = [
+    " ☐ Providers",
+    "",
+    "Which provider?",
+    "",
+    "❯ 1. Task-specialized",
+    "  2. Experimental",
+    "  3. Type something.",
+    "─".repeat(40),
+    "  4. Chat about this",
+    "",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+  ].join("\n");
+  expect(wait(false, complete, now, now)).toBe(false);
+});
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * collectAskQuestionsFromPane — per-option preview capture orchestration
  *
@@ -1937,6 +2051,100 @@ test("collectAskQuestionsFromPane: flat no-preview question takes the fast path 
     expect(log.length).toBe(0);
   } finally {
     __forTest.uninstallSession("ask-nopreview");
+  }
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Truncation fix: a flat question whose header/question/option-1 scrolled
+ * off the top of a short pane must NOT take the fast path, and must NOT
+ * register at all unless growing the pane recovers a complete parse.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** A truncated-top capture (mirrors the `truncated_top` fixture): option 1's
+ *  leftover wrapped description survives, but its own numbered row — and the
+ *  header + question above it — are off-screen. No preview panel, so this
+ *  would have hit the old (unconditional) fast path. */
+const TRUNCATED_TOP_TAIL = [
+  "One main model with others as failover/cost backups.",
+  "  2. Task-specialized",
+  "  3. Experimental",
+  "  4. Type something.",
+  "─".repeat(40),
+  "  5. Chat about this",
+  "",
+  "Enter to select · ↑/↓ to navigate · Esc to cancel",
+].join("\n");
+
+/** What growing the pane (more rows) would reveal: the same modal with
+ *  header/question/option 1 back on screen. */
+const GROWN_COMPLETE_TAIL = [
+  " ☐ Providers",
+  "",
+  "There are 5+ AI providers wired up. How are they used?",
+  "",
+  "❯ 1. Primary + fallbacks",
+  "  One main model with others as failover/cost backups.",
+  "  2. Task-specialized",
+  "  3. Experimental",
+  "  4. Type something.",
+  "─".repeat(40),
+  "  5. Chat about this",
+  "",
+  "Enter to select · ↑/↓ to navigate · Esc to cancel",
+].join("\n");
+
+/** Minimal fake PaneIo whose `capture()` result depends on whether `resize`
+ *  has been called yet — models a real tmux pane where growing the window
+ *  lets the TUI redraw with the previously-scrolled-off top back on screen. */
+function makeGrowablePane(opts: { grownTail: string | null }) {
+  let grown = false;
+  const log: string[] = [];
+  const io = {
+    capture: () => (grown && opts.grownTail !== null ? opts.grownTail : TRUNCATED_TOP_TAIL),
+    send: (key: NavKey) => { log.push(key); return true; },
+    size: () => ({ w: 80, h: 24 }),
+    resize: (w: number, h: number) => { grown = true; log.push(`resize:${w}x${h}`); },
+    restore: (w: number, h: number) => { log.push(`restore:${w}x${h}`); },
+    sleep: async () => { /* no delay in tests */ },
+  };
+  return { io, log };
+}
+
+test("collectAskQuestionsFromPane: incomplete flat capture skips the fast path, grows, and registers once the grown capture is complete", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { io, log } = makeGrowablePane({ grownTail: GROWN_COMPLETE_TAIL });
+  const state = __forTest.installSession("ask-truncated-recovers", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+    expect(res).not.toBeNull();
+    expect(res!.length).toBe(1);
+    expect(res![0]!.question).toBe("There are 5+ AI providers wired up. How are they used?");
+    expect(res![0]!.options.map((o) => o.label)).toEqual([
+      "Primary + fallbacks", "Task-specialized", "Experimental",
+    ]);
+    // The fast path was skipped — a resize (grow) actually happened.
+    expect(log.some((l) => l.startsWith("resize:"))).toBe(true);
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+  } finally {
+    __forTest.uninstallSession("ask-truncated-recovers");
+  }
+});
+
+test("collectAskQuestionsFromPane: still incomplete after growing the pane → refuses to register (never drives a wrong answer)", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  // grownTail: null → capture() keeps returning the truncated pane even after
+  // resize (simulating a modal so tall even PREVIEW_PANE_ROWS can't show it).
+  const { io, log } = makeGrowablePane({ grownTail: null });
+  const state = __forTest.installSession("ask-truncated-stuck", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+    // Absolute rule: never register a card whose first option isn't #1.
+    expect(res).toBeNull();
+    expect(log.some((l) => l.startsWith("resize:"))).toBe(true);
+    // Pane size is always restored even when we give up.
+    expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+  } finally {
+    __forTest.uninstallSession("ask-truncated-stuck");
   }
 });
 

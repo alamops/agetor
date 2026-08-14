@@ -18,6 +18,16 @@ export const TMUX_MISSING_REASON = "tmux is required to drive claude-code intera
 export const SESSION_DIED_STATUS_PREFIX = "session ended: ";
 
 /**
+ * Sentinel prefix for the `status` chunk claude-tmux emits whenever the
+ * JSONL reports a permission-mode change (plan/auto/acceptEdits/…). Emitted
+ * only on change (not per-line), so the run panel's mode chip can derive its
+ * current value by scanning `displayedEvents` for the latest match instead
+ * of a dedicated API. Follows the `SESSION_DIED_STATUS_PREFIX` sentinel-chunk
+ * convention.
+ */
+export const PERMISSION_MODE_STATUS_PREFIX = "permission-mode: ";
+
+/**
  * The Settings section name where per-host git credentials live, interpolated
  * into the server-side credential-error hints (github.ts `privateRepoHint`,
  * gitlab.ts `authHint`, bitbucket.ts `bitbucketAccessHint` and friends) as
@@ -763,11 +773,15 @@ export interface Task {
   draft: TaskDraft | null;
   /**
    * Cursor plans detected from a run ending on `createPlanToolCall` (the
-   * agent wrote a plan and stopped). Server-managed — detected in
-   * `attachDoneHandler`, mutated only via the plan edit/approve routes, never
-   * patchable through the generic task PATCH. Empty for every non-Cursor
-   * task and for Cursor tasks that haven't produced a plan yet. At most one
-   * entry is ever `pending` at a time (see {@link TaskPlan.status}).
+   * agent wrote a plan and stopped), plus claude-code plans detected from
+   * `ExitPlanMode` tool_use/tool_result pairs in the chunk handler. Both are
+   * server-managed — detected in `attachDoneHandler` (cursor) or the chunk
+   * handler (claude), mutated only via the plan edit/approve routes for
+   * cursor (claude plans are read-only records — approval stays a live
+   * keystroke flow, not a route), never patchable through the generic task
+   * PATCH. Empty for every task of another kind, and for tasks that haven't
+   * produced a plan yet. At most one entry is ever `pending` at a time (see
+   * {@link TaskPlan.status}).
    */
   plans: TaskPlan[];
   runId: string | null;
@@ -803,6 +817,24 @@ export interface Task {
    * kanban card's terminal badge (hidden when zero).
    */
   openTerminalCount: number;
+  /**
+   * Board-level TODO/task-tools progress summary — `{ completed, total }`
+   * derived from the task's `TodoWrite`/`TaskCreate`/`TaskUpdate` tool
+   * events via `deriveTodoProgress`/`summarizeTodoProgress`
+   * (`src/shared/todo-progress.ts`) and persisted server-side by the
+   * orchestrator's chunk handler whenever a todo-family chunk lands. Null
+   * (or omitted) when the task has never emitted a todo-family tool call.
+   * Server-managed (not in the PATCH allow-list) — this is what lets the
+   * kanban board show a `3/8` mini-badge without loading per-task events on
+   * every 2s poll.
+   *
+   * Optional (rather than required like `plans`) so the many existing
+   * hand-built `Task` fixtures across `src/bun/*.test.ts` that predate this
+   * field don't all need a mechanical `todoProgress: null` edit — `db.ts`
+   * always populates it on read (`toTask`/`tasks.insert`/`tasks.update`), so
+   * runtime code can treat a missing key the same as `null`.
+   */
+  todoProgress?: { completed: number; total: number } | null;
   createdAt: number;
   updatedAt: number;
   /**
@@ -1066,8 +1098,13 @@ export interface TaskPlan {
    * `superseded` — a newer `createPlanToolCall` run landed while this one was
    * still pending. Chat turns do NOT supersede a pending plan — only another
    * detected plan does.
+   * `rejected` — terminal; a claude-code `ExitPlanMode` plan whose matching
+   * tool_result was neither the approval string nor an edited-plan approval
+   * (the user rejected it, or the turn was interrupted before approval).
+   * Cursor plans never land in this state — cursor's approve/edit routes are
+   * the only way a cursor plan resolves.
    */
-  status: "pending" | "approved" | "superseded";
+  status: "pending" | "approved" | "superseded" | "rejected";
   /** Unix ms timestamp when the plan was detected. */
   createdAt: number;
   /** Unix ms timestamp when approved, or null while pending/superseded. */

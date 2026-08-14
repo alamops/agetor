@@ -46,7 +46,7 @@ import { detectAskModal, parseModalPane, type AskModalKind, type NavKey, type Pa
  */
 
 import type { RunEventStream } from "../shared/types.ts";
-import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import { PERMISSION_MODE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import { imageSourceMetaPath } from "../shared/attachments.ts";
 
 /**
@@ -477,6 +477,11 @@ interface ParsedJsonlEvent {
   subtype?: string;
   uuid?: string;
   message?: AssistantMessage & UserMessage;
+  /** The active permission mode. Carried on the dedicated `system`/
+   *  `permission-mode` marker lines (emitted at the start of every turn, and
+   *  on every actual change) AND, as a fallback signal, on every `type:
+   *  "user"` line — see `mapParsedEventToChunks`'s `case "user"` and
+   *  `dispatchLine`'s SessionState mirror, both of which read this field. */
   permissionMode?: string;
   summary?: string;
   /** Origin tag claude stamps on *synthetic* `user` entries — messages it
@@ -825,6 +830,29 @@ function mapParsedEventToChunks(
 
   switch (evt.type) {
     case "user": {
+      // Fallback mode-change signal: every `user` line also carries a
+      // top-level `permissionMode` (not just the dedicated `system`/
+      // `permission-mode` marker lines above) — this catches a mode change
+      // for a caller that only sees `user` lines, or as a backstop if a
+      // marker line is ever missed. Same emit-on-change dedup via
+      // `lastPermissionMode`, so a marker line and a `user` line reporting
+      // the same value in the same turn don't double-emit.
+      //
+      // Uses a DERIVED uuid, not the raw line `uuid`, as the dedup key: this
+      // same line almost always ALSO emits a `user`/`tool_result`/status
+      // chunk below with the raw uuid, and reusing it here would collide on
+      // the `(run_id, IFNULL(subagent_id,''), line_uuid)` partial unique
+      // index — the second insert would be silently dropped via INSERT OR
+      // IGNORE (the exact hazard `includeUuidForApiError`'s doc above
+      // explains for the api-error case). A stable per-line derivation keeps
+      // reattach's offset-0 replay from re-emitting the same chip twice.
+      if (evt.permissionMode && evt.permissionMode !== lastPermissionMode) {
+        onChunk(
+          "status",
+          `${PERMISSION_MODE_STATUS_PREFIX}${evt.permissionMode}`,
+          uuid ? `${uuid}:permission-mode` : undefined,
+        );
+      }
       const content = evt.message?.content;
       // Background-task completion notifications: claude re-injects the
       // `<task-notification>…</task-notification>` blob as a synthetic
@@ -1017,7 +1045,7 @@ function mapParsedEventToChunks(
       // differs from what the caller already knows, so identical
       // "permission-mode: auto" chips don't spam the stream after every turn.
       if (evt.permissionMode && evt.permissionMode !== lastPermissionMode) {
-        onChunk("status", `permission-mode: ${evt.permissionMode}`, uuid);
+        onChunk("status", `${PERMISSION_MODE_STATUS_PREFIX}${evt.permissionMode}`, uuid);
       }
       // Independent `if` (not `else if`): a mode-bearing event and a
       // turn-duration event are conceptually unrelated fields on the same
@@ -1823,12 +1851,15 @@ interface SessionState {
   lastJsonlAppendAt: number;
   /** `Date.now()` of the last pane capture taken while the session was
    *  JSONL-idle (no turn in flight, no recent append). A native modal —
-   *  AskUserQuestion or a permission dialog — can appear with NO JSONL
-   *  write (claude doesn't persist the tool_use until it's answered), so
-   *  the idle path can't stop scraping entirely or it would never see a
-   *  question raised after the turn already resolved to `review`. Instead
-   *  it throttles to one capture every `SCRAPE_IDLE_POLL_MS`, stamping the
-   *  time here. 0 means "no idle capture taken yet". */
+   *  AskUserQuestion or a permission dialog — can appear before any (or any
+   *  RECENT) JSONL write lands: a permission dialog writes nothing to the
+   *  JSONL until answered, and even though claude DOES write the pending
+   *  AskUserQuestion tool_use pre-answer (see `readPendingAskQuestionsFromJsonl`),
+   *  it can flush lazily. So the idle path can't stop scraping entirely or it
+   *  would never see a question raised after the turn already resolved to
+   *  `review`. Instead it throttles to one capture every
+   *  `SCRAPE_IDLE_POLL_MS`, stamping the time here. 0 means "no idle capture
+   *  taken yet". */
   lastIdleScrapeAt: number;
   /** Fingerprint → `Date.now()` of when it was answered. The route
    *  handler stamps an entry here right after `dismissTmuxPrompt`; the
@@ -1841,9 +1872,11 @@ interface SessionState {
   recentlyAnsweredFingerprints: Map<string, number>;
   /**
    * The structured AskUserQuestion card registered for this session's live
-   * native modal, or null when none is up. Detection AND content come from the
-   * tmux pane: claude doesn't write the AskUserQuestion tool_use to the JSONL
-   * until the modal is *answered*, so the JSONL is useless while it's open. The
+   * native modal, or null when none is up. Detection comes from the tmux pane
+   * (`detectAskModal`); CONTENT preferentially comes from the pending
+   * AskUserQuestion tool_use claude already wrote to the JSONL (see
+   * `readPendingAskQuestionsFromJsonl`), falling back to a pane scrape
+   * (`collectAskQuestionsFromPane`) for the window before that flushes. The
    * card is resolved when the modal leaves the pane.
    */
   askCardId: string | null;
@@ -2238,13 +2271,18 @@ function captureTail(state: SessionState): string {
  * Read the live native AskUserQuestion modal off the tmux pane and register a
  * structured card for it.
  *
- * Why the pane and not the JSONL: claude does NOT write the AskUserQuestion
- * tool_use to the session JSONL until the modal is *answered*, so while it's
- * open the rendered pane is the only source of the question text + options. For
- * a single-question modal everything is on screen; for a multi-question
- * (tabbed) modal only the active tab's options are visible, so we briefly walk
- * the tabs (`→` per tab, capture+parse each, then `←` back to the first) and
- * register one card with every question.
+ * The JSONL tool_use (read via `readPendingAskQuestionsFromJsonl`) is the
+ * preferred source — claude DOES write the pending AskUserQuestion tool_use
+ * to the session JSONL before the modal is answered, and it carries the full
+ * question/options/previews the TUI may wrap or collapse on screen. But
+ * claude can flush it lazily, so this pane-scrape path is the fallback for
+ * while it's briefly absent from disk. For a single-question modal everything
+ * is on screen; for a multi-question (tabbed) modal only the active tab's
+ * options are visible, so we briefly walk the tabs (`→` per tab, capture+parse
+ * each, then `←` back to the first) and register one card with every question.
+ * A tall modal can also push the header/question/first option off the top of
+ * the visible pane — `collectAndRegisterAskCard` guards against trusting that
+ * kind of partial read (see `ParsedQuestionPane.complete`).
  *
  * Fire-and-forget from the scraper, guarded by `askCollecting` (so a 1s tick
  * can't start a second walk) and `askCardId` (so we never double-register). The
@@ -2537,13 +2575,17 @@ async function captureTabWithPreviews(
 }
 
 /** Pane fallback for when the JSONL tool_use isn't on disk yet: scrape the
- *  visible modal. A flat no-preview question registers immediately (fast path,
- *  no added latency). Otherwise — a tabbed modal, or a flat one already showing
- *  a preview panel — we grow the detached pane once (so previews aren't
- *  collapsed to "✂ N lines hidden") and walk it: every tab, and within each tab
- *  whose focused option has a preview, every option. A tabbed modal always grows
- *  because any of its questions may carry previews we can only detect by visiting
- *  the tab. The pane is detached (user sees the webview) and always restored.
+ *  visible modal. A flat no-preview COMPLETE question registers immediately
+ *  (fast path, no added latency) — `complete` (see `ParsedQuestionPane`) rules
+ *  out the tall-modal truncation bug: a header/question/option-1 pushed off
+ *  the top of a short pane must never register straight off `firstTail`.
+ *  Otherwise — a tabbed modal, a flat one already showing a preview panel, or
+ *  an incomplete flat capture — we grow the detached pane once (so previews
+ *  aren't collapsed to "✂ N lines hidden" AND a truncated top has room to
+ *  render in full) and walk it: every tab, and within each tab whose focused
+ *  option has a preview, every option. A tabbed modal always grows because any
+ *  of its questions may carry previews we can only detect by visiting the tab.
+ *  The pane is detached (user sees the webview) and always restored.
  *  `io` is injectable so the orchestration is unit-testable without tmux. */
 async function collectAskQuestionsFromPane(
   state: SessionState,
@@ -2562,8 +2604,9 @@ async function collectAskQuestionsFromPane(
     options: p.options.map((o) => ({ label: o.label, description: o.description, preview: o.preview })),
   });
 
-  // Fast path: a single flat question with no preview panel — nothing to walk.
-  if (n === 1 && !paneHasPreviewPanel(firstTail)) return [toAsk(first, headers[0])];
+  // Fast path: a single flat, COMPLETE question with no preview panel —
+  // nothing to walk, nothing missing from the top of the capture.
+  if (n === 1 && !paneHasPreviewPanel(firstTail) && first.complete) return [toAsk(first, headers[0])];
 
   const collected: Array<ParsedQuestionPane | null> = [];
   await queueTmuxOp(state.taskId, async (stillCurrent) => {
@@ -2624,7 +2667,12 @@ async function collectAskQuestionsFromPane(
 
   // Don't register a PARTIAL read: a tab that failed to parse (capture landed
   // mid-repaint) would give the wrong question count and mis-drive the answer.
-  if (collected.length !== n || collected.some((p) => p == null)) return null;
+  // Same rule for a tab that parsed but is still `!complete` — even after
+  // growing the pane, its first real option isn't numbered "1", meaning
+  // SOMETHING above it (header/question/option 1's own row) is still missing.
+  // Absolute rule: never register a card whose first option isn't #1 — the
+  // generic "claude is waiting at a prompt" handling is the fallback instead.
+  if (collected.length !== n || collected.some((p) => p == null || !p.complete)) return null;
   return collected.map((p, i) => toAsk(p!, headers[i]));
 }
 
@@ -2641,14 +2689,29 @@ function paneCollapsesContent(paneTail: string): boolean {
   return /✂|\blines hidden\b/.test(paneTail);
 }
 
+/** True when the pane parses but is missing its top (header/question/option 1
+ *  scrolled off a short pane — see `ParsedQuestionPane.complete`). A pane that
+ *  doesn't even parse as a question modal (e.g. it's mid-repaint, or — as in
+ *  some unit tests — a bare snippet with no footer) is deliberately NOT
+ *  treated as lossy here: `shouldWaitForAskJsonl` is only ever called once
+ *  `detectAskModal` has already confirmed a question modal is on the pane, so
+ *  a null parse in production would mean something else is wrong that a JSONL
+ *  wait can't fix either — same behavior as before this check existed. */
+function paneTruncatesTop(paneTail: string): boolean {
+  const parsed = parseModalPane(paneTail);
+  return parsed !== null && !parsed.complete;
+}
+
 /** Decide whether to keep waiting for the JSONL tool_use rather than register
- *  from the pane: only when there's no JSONL yet, the pane is lossy, and we're
- *  still inside the grace window. A simple (non-collapsed) pane registers
- *  immediately, so we never stall a question the pane can already render. Pure,
- *  so the timing logic is unit-testable without tmux. */
+ *  from the pane: only when there's no JSONL yet, the pane is lossy (it either
+ *  collapses content to "✂ N lines hidden", OR its top — header/question/
+ *  option 1 — scrolled off the captured pane), and we're still inside the
+ *  grace window. A simple, complete pane registers immediately, so we never
+ *  stall a question the pane can already render in full. Pure, so the timing
+ *  logic is unit-testable without tmux. */
 function shouldWaitForAskJsonl(hasJsonl: boolean, paneTail: string, firstSeenAt: number | null, now: number): boolean {
   if (hasJsonl || firstSeenAt === null) return false;
-  return paneCollapsesContent(paneTail) && now - firstSeenAt < ASK_JSONL_GRACE_MS;
+  return (paneCollapsesContent(paneTail) || paneTruncatesTop(paneTail)) && now - firstSeenAt < ASK_JSONL_GRACE_MS;
 }
 
 async function collectAndRegisterAskCard(state: SessionState, firstTail: string): Promise<void> {
@@ -2892,7 +2955,11 @@ function dispatchLine(state: SessionState, line: string): void {
   const notifContent = taskNotificationContent(evt);
   const uuid = rawUuid ?? (notifContent ? syntheticNotificationUuid(notifContent) : undefined);
 
-  // Mirror the latest mode-bearing JSONL event into SessionState.
+  // Mirror the latest mode-bearing JSONL event into SessionState. Includes
+  // `user` lines as a fallback signal — claude stamps `permissionMode` on
+  // every `user` line too, not just the dedicated `system`/`permission-mode`
+  // marker lines — so a mode change is picked up even if a marker line is
+  // ever missed or arrives out of order relative to the next user turn.
   // IMPORTANT: this update MUST stay above the seenLineUuids early-return.
   // On reattach the dedup set is pre-seeded from run_events, so every
   // replayed line — including mode events the prior process recorded — would
@@ -2912,7 +2979,7 @@ function dispatchLine(state: SessionState, line: string): void {
   // at the launch/reattach seed), so it always tracks what was actually
   // announced.
   const prevAnnouncedPermissionMode = state.lastAnnouncedPermissionMode;
-  if ((evt.type === "system" || evt.type === "permission-mode")
+  if ((evt.type === "system" || evt.type === "permission-mode" || evt.type === "user")
     && typeof evt.permissionMode === "string") {
     state.permissionMode = evt.permissionMode;
     state.lastAnnouncedPermissionMode = evt.permissionMode;
@@ -3732,10 +3799,11 @@ function scrapeOnce(state: SessionState): void {
   // that nothing is driving: the drive's bounded resends genuinely exhausted
   // (a real failure, not just a slow repaint), or the user attached to tmux
   // directly and navigated to review by hand. `parseModalPane` can't parse
-  // the review screen (no question/footer signature) and the JSONL has no
-  // tool_use until the modal is answered, so with the old blanket suppression
-  // a stranded review screen matched nothing on every tick, forever — the
-  // bug this whole change fixes. Letting `askOnPane` go false for "review"
+  // the review screen (no question/footer signature), and the JSONL-preferred
+  // path is never consulted here either — it's gated on `askOnPane` (kind ===
+  // "question"), which is false for "review" — so with the old blanket
+  // suppression a stranded review screen matched nothing on every tick,
+  // forever — the bug this whole change fixes. Letting `askOnPane` go false for "review"
   // lets it fall through to `matchNumberedModal`, which DOES match it
   // (`❯ 1. Submit answers` / `2. Cancel` — ≥2 numbered choices, cursor
   // marker, "1." anchor) and, after the usual two-tick stability gate,

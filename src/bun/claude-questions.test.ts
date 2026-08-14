@@ -126,6 +126,7 @@ describe("parseModalPane — reads the visible question off the pane", () => {
     expect(p.options.map((o) => o.label)).toEqual(["Red", "Green", "Blue"]);
     expect(p.options.every((o) => !o.checked)).toBe(true);
     expect(p.cursorIndex).toBe(0);
+    expect(p.complete).toBe(true);
   });
 
   test("flat single-select with Other (Name): excludes 'Type something' + 'Chat about this'", () => {
@@ -133,6 +134,7 @@ describe("parseModalPane — reads the visible question off the pane", () => {
     expect(p.questionText).toBe("What is your name?");
     expect(p.options.map((o) => o.label)).toEqual(["Alice", "Bob"]);
     expect(p.multiSelect).toBe(false);
+    expect(p.complete).toBe(true);
   });
 
   test("wrapped question + wrapped description: gathers every hard-wrapped row, not just the tail", () => {
@@ -151,6 +153,24 @@ describe("parseModalPane — reads the visible question off the pane", () => {
       "Each provider handles a specific job (OCR vs translate vs explain vs chat).",
     );
     expect(p.multiSelect).toBe(false);
+    expect(p.complete).toBe(true);
+  });
+
+  test("truncated top: header/question/option-1 scrolled off-screen → complete: false", () => {
+    // Same underlying modal as single_wrapped_question, but the capture starts
+    // mid-option-1's wrapped description (the header, question, and "1. Primary
+    // + fallbacks" row are off the top of a short pane). This is the exact shape
+    // that used to mis-drive an answer: option 1 disappears from the card and
+    // its leftover description line gets scooped up as the "question".
+    const p = parseModalPane(fx("truncated_top"))!;
+    expect(p.complete).toBe(false);
+    // Document the corruption this guards against, so a future refactor that
+    // "fixes" the symptom without fixing the underlying completeness check
+    // gets caught here too.
+    expect(p.options.map((o) => o.label)).toEqual(["Task-specialized", "Experimental"]);
+    expect(p.questionText).not.toBe(
+      "There are 5+ AI providers wired up (Vision, Translate, Gemini, Mistral, Groq, OpenAI). How are they used?",
+    );
   });
 
   test("pane fallback: TUI collapse markers ('✂ N lines hidden') + 'Notes:' rows never leak into descriptions", () => {
@@ -207,6 +227,7 @@ describe("parseModalPane — reads the visible question off the pane", () => {
     expect(p.options.map((o) => o.label)).toEqual(["Cheese", "Ham", "Mushroom"]);
     expect(p.options.every((o) => !o.checked)).toBe(true);
     expect(p.cursorIndex).toBe(0);
+    expect(p.complete).toBe(true);
   });
 
   test("tabbed single-select tab (Size): same tab bar, no checkboxes", () => {
@@ -216,6 +237,12 @@ describe("parseModalPane — reads the visible question off the pane", () => {
     expect(p.questionText).toBe("Pick a size");
     expect(p.multiSelect).toBe(false);
     expect(p.options.map((o) => o.label)).toEqual(["Small", "Large"]);
+    expect(p.complete).toBe(true);
+  });
+
+  test("toggled checkboxes: cursor on option 3 doesn't affect completeness (based on option 1, not the cursor)", () => {
+    const p = parseModalPane(fx("multi_toppings_toggled"))!;
+    expect(p.complete).toBe(true);
   });
 
   test("toggled checkboxes are reflected in `checked`", () => {
@@ -244,6 +271,7 @@ describe("parseModalPane — reads the visible question off the pane", () => {
     );
     expect(p.options[0]!.previewTruncated).toBe(false);
     expect(p.options[1]!.preview).toBeUndefined();
+    expect(p.complete).toBe(true);
   });
 
   test("collapsed preview panel: marker flips previewTruncated, partial text kept, labels clean", () => {

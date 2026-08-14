@@ -20,6 +20,52 @@ function toolUseEvent(name: string, input: unknown, overrides: Partial<RunEvent>
   return baseEvent({ data: JSON.stringify({ id: "tu2", name, input }), ...overrides });
 }
 
+/** A `TaskCreate` tool_use event — real wire shape: `input = { subject,
+ *  description, activeForm }`, joined to its tool_result by `id`. */
+function taskCreateEvent(
+  id: string,
+  subject: string,
+  activeForm?: string,
+  overrides: Partial<RunEvent> = {},
+): RunEvent {
+  return baseEvent({
+    data: JSON.stringify({
+      id,
+      name: "TaskCreate",
+      input: { subject, description: `${subject} — description`, ...(activeForm ? { activeForm } : {}) },
+    }),
+    ...overrides,
+  });
+}
+
+/** The `tool_result` matching a `TaskCreate` tool_use — real wire shape:
+ *  `data = { toolUseId, content, isError }`, `content` a string whose text
+ *  is `"Task #N created successfully: <subject>"`. */
+function taskCreateResultEvent(toolUseId: string, taskNumber: number, subject: string, overrides: Partial<RunEvent> = {}): RunEvent {
+  return baseEvent({
+    stream: "tool_result",
+    data: JSON.stringify({
+      toolUseId,
+      content: `Task #${taskNumber} created successfully: ${subject}`,
+      isError: false,
+    }),
+    ...overrides,
+  });
+}
+
+/** A `TaskUpdate` tool_use event — real wire shape: `input = { taskId,
+ *  status?, subject?, description? }`. */
+function taskUpdateEvent(
+  taskId: string,
+  patch: { status?: string; subject?: string; description?: string },
+  overrides: Partial<RunEvent> = {},
+): RunEvent {
+  return baseEvent({
+    data: JSON.stringify({ id: `tu-update-${taskId}`, name: "TaskUpdate", input: { taskId, ...patch } }),
+    ...overrides,
+  });
+}
+
 test("empty events array yields null", () => {
   expect(deriveTodoProgress([])).toBeNull();
 });
@@ -211,4 +257,184 @@ test("input.todos not an array only skips that one event — a later valid snaps
   const result = deriveTodoProgress(events);
   expect(result).not.toBeNull();
   expect(result?.total).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// Task-tools (TaskCreate / TaskUpdate) — current Claude Code sessions
+// ---------------------------------------------------------------------------
+
+test("TaskCreate with a matching tool_result is numbered from the result text", () => {
+  const events = [
+    taskCreateEvent("call_1", "Set up scaffolding", "Setting up scaffolding"),
+    taskCreateResultEvent("call_1", 1, "Set up scaffolding"),
+    taskCreateEvent("call_2", "Write tests", "Writing tests"),
+    taskCreateResultEvent("call_2", 2, "Write tests"),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result).not.toBeNull();
+  expect(result?.total).toBe(2);
+  expect(result?.completed).toBe(0);
+  expect(result?.todos.map((t) => t.content)).toEqual(["Set up scaffolding", "Write tests"]);
+  expect(result?.todos.every((t) => t.status === "pending")).toBe(true);
+});
+
+test("TaskCreate numbering follows the tool_result even when results resolve out of creation order", () => {
+  // Result for call_2 lands before call_1's in the event stream — the task
+  // number must still come from the parsed "Task #N" text, not array order.
+  const events = [
+    taskCreateEvent("call_1", "First created, numbered last", undefined),
+    taskCreateEvent("call_2", "Second created, numbered first", undefined),
+    taskCreateResultEvent("call_2", 1, "Second created, numbered first"),
+    taskCreateResultEvent("call_1", 2, "First created, numbered last"),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.todos.map((t) => t.content)).toEqual([
+    "Second created, numbered first",
+    "First created, numbered last",
+  ]);
+});
+
+test("TaskCreate without a tool_result falls back to sequential numbering in creation order", () => {
+  const events = [
+    taskCreateEvent("call_1", "Task A"),
+    taskCreateEvent("call_2", "Task B"),
+    taskCreateEvent("call_3", "Task C"),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result).not.toBeNull();
+  expect(result?.total).toBe(3);
+  expect(result?.todos.map((t) => t.content)).toEqual(["Task A", "Task B", "Task C"]);
+});
+
+test("TaskCreate whose tool_result content is unparseable falls back to sequential numbering", () => {
+  const events = [
+    taskCreateEvent("call_1", "Task A"),
+    baseEvent({
+      stream: "tool_result",
+      data: JSON.stringify({ toolUseId: "call_1", content: "some unrelated result text", isError: false }),
+    }),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.total).toBe(1);
+  expect(result?.todos[0]?.content).toBe("Task A");
+  expect(result?.todos[0]?.status).toBe("pending");
+});
+
+test("TaskUpdate moves a task to in_progress and carries the created activeForm through", () => {
+  const events = [
+    taskCreateEvent("call_1", "Task A", "Doing task A"),
+    taskCreateResultEvent("call_1", 1, "Task A"),
+    taskUpdateEvent("1", { status: "in_progress" }),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.todos[0]?.status).toBe("in_progress");
+  expect(result?.activeForm).toBe("Doing task A");
+});
+
+test("TaskUpdate moves a task to completed", () => {
+  const events = [
+    taskCreateEvent("call_1", "Task A"),
+    taskCreateResultEvent("call_1", 1, "Task A"),
+    taskUpdateEvent("1", { status: "in_progress" }),
+    taskUpdateEvent("1", { status: "completed" }),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.todos[0]?.status).toBe("completed");
+  expect(result?.completed).toBe(1);
+});
+
+test("TaskUpdate with an unknown taskId is tolerated and ignored", () => {
+  const events = [
+    taskCreateEvent("call_1", "Task A"),
+    taskCreateResultEvent("call_1", 1, "Task A"),
+    taskUpdateEvent("999", { status: "completed" }),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.total).toBe(1);
+  expect(result?.todos[0]?.status).toBe("pending");
+});
+
+test("TaskUpdate with an unknown status value is tolerated — item is left as-is", () => {
+  const events = [
+    taskCreateEvent("call_1", "Task A"),
+    taskCreateResultEvent("call_1", 1, "Task A"),
+    taskUpdateEvent("1", { status: "in_progress" }),
+    taskUpdateEvent("1", { status: "some-future-status" }),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.todos[0]?.status).toBe("in_progress");
+});
+
+test("TaskUpdate can edit the subject/content of an existing task", () => {
+  const events = [
+    taskCreateEvent("call_1", "Original subject"),
+    taskCreateResultEvent("call_1", 1, "Original subject"),
+    taskUpdateEvent("1", { subject: "Revised subject" }),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.todos[0]?.content).toBe("Revised subject");
+});
+
+test("TaskUpdate can edit subject and status together", () => {
+  const events = [
+    taskCreateEvent("call_1", "Original subject"),
+    taskCreateResultEvent("call_1", 1, "Original subject"),
+    taskUpdateEvent("1", { subject: "Revised subject", status: "completed" }),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.todos[0]?.content).toBe("Revised subject");
+  expect(result?.todos[0]?.status).toBe("completed");
+});
+
+test("no Task-tools or TodoWrite events at all yields null", () => {
+  const events = [toolUseEvent("Read", { file_path: "/a.ts" })];
+  expect(deriveTodoProgress(events)).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Mixed sessions — recency of the last event in each family decides the winner
+// ---------------------------------------------------------------------------
+
+test("mixed session: TaskCreate/TaskUpdate activity after a TodoWrite snapshot wins", () => {
+  const events = [
+    todoWriteEvent([
+      { content: "Legacy A", status: "completed" },
+      { content: "Legacy B", status: "pending" },
+    ]),
+    taskCreateEvent("call_1", "New task A"),
+    taskCreateResultEvent("call_1", 1, "New task A"),
+    taskCreateEvent("call_2", "New task B"),
+    taskCreateResultEvent("call_2", 2, "New task B"),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.todos.map((t) => t.content)).toEqual(["New task A", "New task B"]);
+});
+
+test("mixed session: a TodoWrite snapshot after Task-tools activity replaces the accumulated list", () => {
+  const events = [
+    taskCreateEvent("call_1", "Old task A"),
+    taskCreateResultEvent("call_1", 1, "Old task A"),
+    taskCreateEvent("call_2", "Old task B"),
+    taskCreateResultEvent("call_2", 2, "Old task B"),
+    todoWriteEvent([
+      { content: "Resumed A", status: "in_progress", activeForm: "Resuming A" },
+      { content: "Resumed B", status: "pending" },
+    ]),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.todos.map((t) => t.content)).toEqual(["Resumed A", "Resumed B"]);
+  expect(result?.activeForm).toBe("Resuming A");
+});
+
+test("mixed session: Task-tools resumes again after the TodoWrite snapshot", () => {
+  const events = [
+    todoWriteEvent([{ content: "Legacy A", status: "completed" }]),
+    taskCreateEvent("call_1", "Fresh task A"),
+    taskCreateResultEvent("call_1", 1, "Fresh task A"),
+    todoWriteEvent([{ content: "Stale snapshot", status: "pending" }]),
+    taskUpdateEvent("1", { status: "in_progress" }),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.todos.map((t) => t.content)).toEqual(["Fresh task A"]);
+  expect(result?.todos[0]?.status).toBe("in_progress");
 });

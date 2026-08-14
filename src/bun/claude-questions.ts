@@ -4,8 +4,10 @@
  * Agetor no longer intercepts AskUserQuestion via the PreToolUse hook. Claude
  * renders its native Ink modal in the tmux pane; the scraper detects it (via
  * `detectAskModal`), the run panel renders an agetor-native card from the
- * structured tool_use content that's already in the JSONL, and the user's
- * answer is driven back into the pane as keystrokes (`planAskAnswers`).
+ * structured tool_use content — preferring the JSONL tool_use (full question
+ * text, options, and multi-line previews) with the rendered pane as a
+ * fallback when that tool_use hasn't been flushed to disk yet — and the
+ * user's answer is driven back into the pane as keystrokes (`planAskAnswers`).
  *
  * Everything here is derived from captures of claude-code 2.1.161's
  * AskUserQuestion TUI (see src/bun/fixtures/askuserquestion/*.txt). The
@@ -180,14 +182,22 @@ export function parseAskModal(tail: string): ParsedAskModal | null {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
- * Pane parsing (the live source of question content)
+ * Pane parsing (the fallback source of question content)
  *
- * Claude does NOT write the AskUserQuestion tool_use to the JSONL until the
- * modal is *answered*, so while it's open the only source of the question text
- * + options is the rendered tmux pane. `parseModalPane` extracts the currently
- * visible question; for a multi-question (tabbed) modal the caller walks the
- * tabs (one `→` at a time) and parses each, since only the active tab's options
- * are on screen.
+ * Claude DOES write the pending AskUserQuestion tool_use to the session JSONL
+ * before the modal is answered (see `readPendingAskQuestionsFromJsonl` in
+ * claude-tmux.ts, which reads it straight off disk) — that's the preferred
+ * source, since it carries the full question/options/previews the TUI may
+ * wrap or collapse. But claude can flush it lazily, so while it's briefly
+ * absent from disk the rendered tmux pane is the only source of the question
+ * text + options. `parseModalPane` extracts the currently visible question
+ * from that pane; for a multi-question (tabbed) modal the caller walks the
+ * tabs (one `→` at a time) and parses each, since only the active tab's
+ * options are on screen. Because `capture-pane` only ever shows what fits on
+ * the live window, a tall modal can push the header/question/first option off
+ * the top of the visible area — `complete` on the returned
+ * {@link ParsedQuestionPane} flags when that happened so the caller (the
+ * driver in claude-tmux.ts) knows not to trust a partial read.
  * ────────────────────────────────────────────────────────────────────────── */
 
 export interface ParsedQuestionPane {
@@ -207,6 +217,16 @@ export interface ParsedQuestionPane {
   options: Array<{ label: string; description?: string; checked: boolean; preview?: string; previewTruncated?: boolean }>;
   /** 0-based cursor position among `options`, or -1 when the cursor is elsewhere. */
   cursorIndex: number;
+  /** True when this parse is trustworthy: the first real option's rendered
+   *  number is `1` (nothing above it — header, question, option 1 itself —
+   *  scrolled off the top of the captured pane) AND non-empty question text
+   *  was gathered. `false` means the capture is missing its top and must not
+   *  be trusted to drive an answer — e.g. a hard-wrapped option 1 description
+   *  can get mistaken for the question text once option 1's own label row is
+   *  off-screen (see `truncated_top` fixture). The caller (claude-tmux.ts)
+   *  decides what to do about it — wait for the JSONL, grow the pane, or (as
+   *  a last resort) refuse to register a card at all. */
+  complete: boolean;
 }
 
 /** A numbered option row: optional `❯`/`›` cursor, number, optional `[ ]`/`[✔]`
@@ -331,13 +351,16 @@ export function parseModalPane(tail: string): ParsedQuestionPane | null {
         .filter((s) => /^[☐☒]/.test(s)).map((s) => s.replace(/^[☐☒]\s*/, "").trim())
     : [];
 
-  // Every numbered row, in order.
+  // Every numbered row, in order. `num` is the row's own rendered number
+  // (e.g. `1` in "❯ 1. Red") — kept alongside the label so the completeness
+  // check below can tell a genuine option 1 from a capture that starts mid-
+  // list because the top of the modal scrolled off the visible pane.
   const raw = lines
     .map((l, idx) => {
       const m = l.match(OPTION_RE);
-      return m ? { idx, cursor: !!m[1], checkbox: m[3] ?? null, label: m[4]!.trim() } : null;
+      return m ? { idx, cursor: !!m[1], num: Number(m[2]), checkbox: m[3] ?? null, label: m[4]!.trim() } : null;
     })
-    .filter((r): r is { idx: number; cursor: boolean; checkbox: string | null; label: string } => r !== null);
+    .filter((r): r is { idx: number; cursor: boolean; num: number; checkbox: string | null; label: string } => r !== null);
 
   // Real answer options (drop the built-in "Type something" / "Chat about this").
   const kept = raw.filter((r) => !EXCLUDED_OPTION.test(r.label));
@@ -398,7 +421,15 @@ export function parseModalPane(tail: string): ParsedQuestionPane | null {
     options[cursorIndex]!.previewTruncated = focusedPreview.truncated;
   }
 
-  return { tabbed: tabHeaders.length > 0, tabHeaders, questionText, multiSelect, options, cursorIndex };
+  // Completeness verdict: trustworthy only when the first REAL option is
+  // rendered as "1." (nothing above it — including option 1's own label row
+  // — scrolled off the captured pane) and we actually gathered question
+  // text. "Type something." / "Chat about this" are excluded from `kept`
+  // before this check, so it can't be fooled by them ever landing at number
+  // 1 — claude always numbers real options first and appends those two last.
+  const complete = kept[0]!.num === 1 && questionText.trim().length > 0;
+
+  return { tabbed: tabHeaders.length > 0, tabHeaders, questionText, multiSelect, options, cursorIndex, complete };
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
