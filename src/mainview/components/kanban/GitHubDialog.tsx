@@ -6710,10 +6710,6 @@ function GitHubItemDetail({
             <CommitStatus status={commitStatus} loading={commitStatusLoading} error={commitStatusError} onRetry={onRetryCommitStatus} onRefresh={onRefreshCommitStatus} />
           )}
           <PullCommits commits={commits} loading={commitsLoading} error={commitsError} onRetry={onRetryCommits} />
-          <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} allowBatchReview={provider === "github"} blobCtx={blobCtx} />
-          {provider === "github" && (
-            <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
-          )}
           <ReviewComments
             path={itemPath}
             caps={caps}
@@ -6786,6 +6782,19 @@ function GitHubItemDetail({
         onSubmit={onSubmitComment}
         onRetry={onRetryComments}
       />
+      {/* The diff renders LAST, after the conversation. It's by far the tallest
+       *  section, and sitting it mid-detail buried the review/conversation
+       *  comment threads behind a long scroll. `PendingReview` stays glued to
+       *  it — that queue is built by clicking diff lines, and its "stale"
+       *  banner refers to the diff directly above it. */}
+      {item.kind === "pulls" && (
+        <>
+          <PullDiff diff={diff} loading={diffLoading} error={diffError} onRetry={onRetryDiff} onRefresh={onRefreshDiff} onLineComment={onLineComment} onAddToReview={onAddToReview} pending={pendingReview} allowBatchReview={provider === "github"} blobCtx={blobCtx} />
+          {provider === "github" && (
+            <PendingReview comments={pendingReview} stale={pendingStale} onRemove={onRemovePendingReview} />
+          )}
+        </>
+      )}
     </div>
   );
 }
