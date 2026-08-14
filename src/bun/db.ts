@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import path from "node:path";
-import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessUsage, Project, SavedPrompt, Task, TaskDraft, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
+import type { AgentKind, BacklogMessage, BranchNamingConfig, Harness, HarnessQuota, HarnessUsage, Project, SavedPrompt, Task, TaskDraft, TaskPlan, TaskReference, TaskType, Run, RunEventStream, Subagent, SubagentStatus } from "../shared/types.ts";
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
@@ -713,6 +713,9 @@ export const harnesses = {
       throw new HarnessInUseError(inUse.map((r) => r.id));
     }
     db.run(`DELETE FROM harnesses WHERE id = ?`, [id]);
+    // Drop any cached usage snapshot so a deleted alias doesn't leave an
+    // orphaned harness_usage row (the table has no FK cascade by design).
+    db.run(`DELETE FROM harness_usage WHERE harness_id = ?`, [id]);
   },
   /**
    * Soft delete / re-enable. Carve-out from `HarnessBuiltinError` — toggling
@@ -748,6 +751,60 @@ export const harnesses = {
       runningTaskIds: running.map((r) => r.id),
       totalTaskCount: total?.n ?? 0,
     };
+  },
+};
+
+type HarnessUsageRow = {
+  harness_id: string;
+  snapshot_json: string;
+  updated_at: number;
+};
+
+/**
+ * Latest per-harness usage/quota snapshot for the topbar usage tracker
+ * (docs/plans/harness-usage-tracker.md). Standalone table, deliberately not
+ * a column on `harnesses` — see migration 042's comment. `get`/`getAll`
+ * parse defensively (a malformed or stale-shape snapshot is dropped rather
+ * than thrown), mirroring `toHarness`'s handling of `env_json`.
+ */
+export const harnessUsage = {
+  get(harnessId: string): HarnessQuota | null {
+    const row = db
+      .query<HarnessUsageRow, [string]>(
+        `SELECT * FROM harness_usage WHERE harness_id = ?`,
+      )
+      .get(harnessId);
+    if (!row) return null;
+    try {
+      return JSON.parse(row.snapshot_json) as HarnessQuota;
+    } catch {
+      return null;
+    }
+  },
+  getAll(): HarnessQuota[] {
+    const rows = db
+      .query<HarnessUsageRow, []>(`SELECT * FROM harness_usage`)
+      .all();
+    const out: HarnessQuota[] = [];
+    for (const row of rows) {
+      try {
+        out.push(JSON.parse(row.snapshot_json) as HarnessQuota);
+      } catch {
+        // malformed snapshot — skip rather than throw.
+      }
+    }
+    return out;
+  },
+  upsert(quota: HarnessQuota): void {
+    db.run(
+      `INSERT INTO harness_usage (harness_id, snapshot_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(harness_id) DO UPDATE SET snapshot_json = excluded.snapshot_json, updated_at = excluded.updated_at`,
+      [quota.harnessId, JSON.stringify(quota), Date.now()],
+    );
+  },
+  delete(harnessId: string): void {
+    db.run(`DELETE FROM harness_usage WHERE harness_id = ?`, [harnessId]);
   },
 };
 

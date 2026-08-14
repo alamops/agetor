@@ -62,6 +62,7 @@ import type {
   GitHubWorkflowRunsResult,
   GitHubWorkflowsResult,
   Harness,
+  HarnessQuota,
   HarnessStatus,
   HarnessUsage,
   Isolation,
@@ -388,6 +389,16 @@ export const api = {
     }),
   getHarnessUsage: (id: string) =>
     j<HarnessUsage>(`/harnesses/${encodeURIComponent(id)}/usage`),
+  /** Persisted quota/usage snapshots for every harness — seeds the topbar
+   *  usage tracker on boot (`GET /usage`, distinct from `getHarnessUsage`
+   *  above, which is unrelated task-count blast radius). Live updates
+   *  arrive afterwards via the `harness_usage` `AppEvent` on
+   *  `subscribeAppEvents`. */
+  getAllUsage: () => j<HarnessQuota[]>("/usage"),
+  /** Force a fresh quota fetch for one harness, bypassing the poller's
+   *  cadence floor — the popover's manual Refresh button. */
+  refreshHarnessUsage: (id: string) =>
+    j<HarnessQuota>(`/harnesses/${encodeURIComponent(id)}/usage/refresh`, { method: "POST" }),
   openHarnessTerminal: (id: string) =>
     j<{ ok: true }>(`/harnesses/${encodeURIComponent(id)}/open-terminal`, {
       method: "POST",
@@ -1471,9 +1482,13 @@ export const api = {
     return () => es.close();
   },
 
-  /** App-level event stream — currently carries the quit_request signal
-   *  the main process sends when the user hits Cmd+Q while runs are
-   *  active. Live-only (no replay). */
+  /** App-level event stream — carries `quit_request` (the main process
+   *  sends it when the user hits Cmd+Q while runs are active), `open_task`
+   *  (a native-notification deep-link click), and `harness_usage` (a fresh
+   *  usage/quota snapshot from the background poller or a force-refresh —
+   *  see `getAllUsage`/`refreshHarnessUsage`). No type whitelist here: every
+   *  `AppEvent` variant is forwarded to `onEvent` as-is, so a new variant
+   *  needs no change in this function. Live-only (no replay). */
   subscribeAppEvents(onEvent: (e: AppEvent) => void): () => void {
     const es = new EventSource(`${BASE}/app/events?token=${encodeURIComponent(API_TOKEN)}`);
     es.onmessage = (m) => {

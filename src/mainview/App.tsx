@@ -3,11 +3,13 @@ import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } f
 import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
+import { UsageMeter } from "@/components/usage/UsageMeter";
+import { UsagePopover } from "@/components/usage/UsagePopover";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -168,6 +170,11 @@ function AppInner() {
   // distinction) apart from "loaded, and it happens to be empty".
   const [harnessesLoaded, setHarnessesLoaded] = useState(false);
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [] });
+  // Per-harness quota/usage snapshots for the topbar chip mini-bar + popover
+  // (D2). Seeded once on boot via `getAllUsage`, kept current afterwards by
+  // the `harness_usage` AppEvent (see the `subscribeAppEvents` handler
+  // below) — no polling here, the Bun-side poller drives freshness.
+  const [usage, setUsage] = useState<Record<string, HarnessQuota>>({});
   const [selected, setSelected] = useState<Task | null>(null);
   const [diffTask, setDiffTask] = useState<Task | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -355,6 +362,14 @@ function AppInner() {
     void refreshAgents();
     void refreshAgentModels();
     void refreshProjects();
+    // Seed the topbar usage tracker with whatever the Bun side last
+    // persisted, so chips show a meter immediately on boot rather than
+    // waiting for the next poll or SSE push. Best-effort — a failure here
+    // just means chips render without a mini-bar until the first
+    // `harness_usage` event arrives.
+    api.getAllUsage()
+      .then((list) => setUsage(Object.fromEntries(list.map((q) => [q.harnessId, q]))))
+      .catch(() => { /* leave empty */ });
     // Resolve the user's home dir once so SettingsDialog can expand `~/…`
     // template paths into concrete absolute paths before validation.
     // `/defaults` is small + local, but a hiccup at boot would now leave
@@ -458,6 +473,10 @@ function AppInner() {
   // anyway" the server arms a one-shot flag and re-issues Utils.quit().
   useEffect(() => {
     const cancel = api.subscribeAppEvents((ev) => {
+      if (ev.type === "harness_usage") {
+        setUsage((prev) => ({ ...prev, [ev.quota.harnessId]: ev.quota }));
+        return;
+      }
       if (ev.type === "open_task") {
         // A native notification deep-link (`agetor://task/<id>`) was
         // clicked. Open that task's RunPanel, fetching a fresh task list
@@ -924,21 +943,51 @@ function AppInner() {
             {agents.map((a) => {
               const harness = harnesses.find((h) => h.id === a.harnessId);
               const displayName = harness?.label ?? a.harnessId;
-              return (
+              const q = usage[a.harnessId];
+              const dot = (
                 <span
-                  key={a.harnessId}
+                  className={
+                    "inline-block size-1.5 rounded-full " +
+                    (a.available ? "bg-success-solid" : "bg-danger-solid")
+                  }
+                />
+              );
+              if (!q) {
+                return (
+                  <span
+                    key={a.harnessId}
+                    className="flex items-center gap-1"
+                    title={a.reason ?? a.path ?? ""}
+                  >
+                    <AgentIcon kind={a.kind} className="size-3" />
+                    {displayName}
+                    {dot}
+                  </span>
+                );
+              }
+              const chip = (
+                <span
                   className="flex items-center gap-1"
                   title={a.reason ?? a.path ?? ""}
                 >
                   <AgentIcon kind={a.kind} className="size-3" />
                   {displayName}
-                  <span
-                    className={
-                      "inline-block size-1.5 rounded-full " +
-                      (a.available ? "bg-success-solid" : "bg-danger-solid")
-                    }
-                  />
+                  <UsageMeter quota={q} />
+                  {dot}
                 </span>
+              );
+              return (
+                <UsagePopover
+                  key={a.harnessId}
+                  quota={q}
+                  harnessLabel={displayName}
+                  onRefresh={async () => {
+                    const fresh = await api.refreshHarnessUsage(a.harnessId);
+                    setUsage((prev) => ({ ...prev, [fresh.harnessId]: fresh }));
+                  }}
+                >
+                  {chip}
+                </UsagePopover>
               );
             })}
           </div>

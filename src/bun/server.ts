@@ -15,11 +15,13 @@ import {
   projects,
   preferences,
   harnesses,
+  harnessUsage,
   HarnessBuiltinError,
   HarnessInUseError,
   savedPrompts,
   dataDir,
 } from "./db.ts";
+import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -2799,6 +2801,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // Boot-seed endpoint for the topbar usage tracker
+      // (docs/plans/harness-usage-tracker.md, Wave C1): every persisted
+      // `HarnessQuota` snapshot, one per harness that's ever been polled.
+      // Cheap — reads straight from the `harness_usage` table, no network —
+      // the webview calls this once on load, then relies on `harness_usage`
+      // SSE pushes (broadcast by the poller/refresh path) plus its own
+      // manual Refresh for live updates. Not to be confused with
+      // `/harnesses/:id/usage` below, which is the unrelated task-count
+      // blast-radius probe.
+      "/usage": {
+        GET: authed((req) => json(harnessUsage.getAll(), { headers: corsHeaders(req) })),
+      },
+
       // Per-harness availability + version. Replaces the per-kind `/agents`
       // endpoint: each registered harness (built-in or alias) is probed
       // with its own binary path + env so multi-account aliases report
@@ -3039,6 +3054,24 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           return json(harnesses.usage(req.params.id), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Force a live refresh of the quota/usage tracker snapshot for one
+      // harness (docs/plans/harness-usage-tracker.md, Wave C1). Distinct
+      // from `/harnesses/:id/usage` above, which is the unrelated
+      // task-count blast-radius probe. `refreshOne` returns null when the
+      // harness id is unknown/disabled, or when its kind has no registered
+      // usage provider (gemini, grok) — in every such case there is nothing
+      // to show beyond the existing availability dot, so we 404 rather than
+      // synthesize an empty snapshot.
+      "/harnesses/:id/usage/refresh": {
+        POST: authed(async (req) => {
+          const quota = await refreshOne(req.params.id, { force: true });
+          if (!quota) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(quota, { headers: corsHeaders(req) });
         }),
       },
 

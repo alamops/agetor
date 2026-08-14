@@ -19,7 +19,7 @@
 
 ## 2. Context & constraints (grounded findings)
 
-Captured from a live repro (prod DB run `c230916e…`, JSONL session `cd1db86f…` under `~/.agetor/harnesses/claude-pbsco/projects/…`):
+Captured from a live repro (prod DB run `c230916e…`, JSONL session `cd1db86f…` under `~/.agetor/harnesses/<alias>/projects/…`):
 
 - **Live copy** (agetor records at send): `[screenshot-….png] I got this\n\nReferenced files/folders:\n- /Users/…/screenshots/screenshot-….png`
   Emitted at `orchestrator.ts:827` (task creation), `orchestrator.ts:1549` (fold-while-busy), `orchestrator.ts:1584` (idle follow-up).

@@ -57,6 +57,7 @@ import m039 from "./039_run_events_user_history.sql" with { type: "text" };
 import m040 from "./040_saved_prompts.sql" with { type: "text" };
 import m041 from "./041_task_plans.sql" with { type: "text" };
 import m042 from "./042_subagents_running_idx.sql" with { type: "text" };
+import m043 from "./043_harness_usage.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -103,4 +104,5 @@ export const migrations: Migration[] = [
   { id: "040_saved_prompts", sql: m040 },
   { id: "041_task_plans", sql: m041 },
   { id: "042_subagents_running_idx", sql: m042 },
+  { id: "043_harness_usage", sql: m043, aliases: ["042_harness_usage"] },
 ];
