@@ -1,5 +1,5 @@
 import type { AgentKind, Harness, HarnessQuota } from "../../shared/types.ts";
-import { USAGE_MIN_REFRESH_MS } from "../../shared/types.ts";
+import { USAGE_MIN_REFRESH_MS, USAGE_SUPPORTED_KINDS } from "../../shared/types.ts";
 import { harnessUsage, harnesses } from "../db.ts";
 import { broadcastAppEvent } from "../quit-guard.ts";
 import { fetchClaudeQuota } from "./claude-usage.ts";
@@ -25,9 +25,12 @@ import { fetchCursorQuota } from "./cursor-usage.ts";
  * live gemini/grok data), so harnesses of those kinds are skipped by both
  * `refreshOne` (returns null, no snapshot stored) and `pollAllUsage` (filtered
  * out of the sweep). Adding a new provider later is one new module + one
- * line here.
+ * line here + the kind added to `USAGE_SUPPORTED_KINDS` (shared/types.ts) —
+ * the key type below is derived from that list so the webview's
+ * supported-kind messaging can't drift from this registry.
  */
-export const USAGE_PROVIDERS: Partial<Record<AgentKind, (h: Harness) => Promise<HarnessQuota>>> = {
+export const USAGE_PROVIDERS: Partial<Record<AgentKind, (h: Harness) => Promise<HarnessQuota>>> &
+  Record<(typeof USAGE_SUPPORTED_KINDS)[number], (h: Harness) => Promise<HarnessQuota>> = {
   "claude-code": fetchClaudeQuota,
   codex: fetchCodexQuota,
   cursor: fetchCursorQuota,

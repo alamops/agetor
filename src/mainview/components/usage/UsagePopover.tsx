@@ -6,10 +6,16 @@ import { clampPercent, formatResetsIn, formatUpdatedAgo, tierColorVar, warnTier 
 import type { HarnessQuota } from "../../../shared/types.ts";
 
 interface Props {
-  quota: HarnessQuota;
+  /** The harness's latest usage snapshot, or `null` when none exists yet
+   *  (disabled harness, unsupported kind, or first poll still pending) —
+   *  the popover then renders `placeholder` guidance instead of meters. */
+  quota: HarnessQuota | null;
   harnessLabel: string;
   children: ReactNode;
   onRefresh: () => Promise<void>;
+  /** Guidance shown when `quota` is null: why there's no data and whether a
+   *  manual Refresh could produce some (`canRefresh` gates the button). */
+  placeholder?: { message: string; canRefresh: boolean };
 }
 
 // Same explicit map as UsageMeter — dynamic `bg-${token}` strings don't
@@ -30,7 +36,7 @@ const FILL_CLASS: Record<"success" | "warning" | "danger", string> = {
  * `index.css` or `tailwind.config.js` (checked at implementation time) — this
  * uses `bg-card`/`text-card-foreground` instead, which are.
  */
-export function UsagePopover({ quota, harnessLabel, children, onRefresh }: Props) {
+export function UsagePopover({ quota, harnessLabel, children, onRefresh, placeholder }: Props) {
   const [open, setOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -91,10 +97,14 @@ export function UsagePopover({ quota, harnessLabel, children, onRefresh }: Props
         >
           <div className="flex items-center justify-between gap-2">
             <span className="font-medium">{harnessLabel}</span>
-            {quota.planType && <span className="text-muted-foreground">{quota.planType}</span>}
+            {quota?.planType && <span className="text-muted-foreground">{quota.planType}</span>}
           </div>
 
-          {quota.meters.length === 0 ? (
+          {quota === null ? (
+            <div className="mt-2 text-muted-foreground">
+              {placeholder?.message ?? "No usage data"}
+            </div>
+          ) : quota.meters.length === 0 ? (
             <div className="mt-2 text-muted-foreground">{quota.reason ?? "No usage data"}</div>
           ) : (
             <div className="mt-2 space-y-2.5">
@@ -124,24 +134,30 @@ export function UsagePopover({ quota, harnessLabel, children, onRefresh }: Props
             </div>
           )}
 
-          <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-2">
-            <span className="text-muted-foreground">{formatUpdatedAgo(quota.fetchedAtMs, Date.now())}</span>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-6"
-              disabled={refreshing}
-              aria-label="Refresh usage"
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                void handleRefresh();
-              }}
-            >
-              <RefreshCw className={cn("size-3", refreshing && "animate-spin")} />
-            </Button>
-          </div>
+          {(quota !== null || placeholder?.canRefresh) && (
+            <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-2">
+              <span className="text-muted-foreground">
+                {quota !== null ? formatUpdatedAgo(quota.fetchedAtMs, Date.now()) : ""}
+              </span>
+              {(quota !== null || placeholder?.canRefresh) && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-6"
+                  disabled={refreshing}
+                  aria-label="Refresh usage"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    void handleRefresh();
+                  }}
+                >
+                  <RefreshCw className={cn("size-3", refreshing && "animate-spin")} />
+                </Button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -3,7 +3,7 @@ import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } f
 import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
@@ -952,19 +952,21 @@ function AppInner() {
                   }
                 />
               );
-              if (!q) {
-                return (
-                  <span
-                    key={a.harnessId}
-                    className="flex items-center gap-1"
-                    title={a.reason ?? a.path ?? ""}
-                  >
-                    <AgentIcon kind={a.kind} className="size-3" />
-                    {displayName}
-                    {dot}
-                  </span>
-                );
-              }
+              // Every chip is clickable: with a snapshot the popover shows
+              // meters; without one it explains WHY there's no data (harness
+              // disabled / kind unsupported / first poll pending) instead of
+              // silently rendering a bare chip — "no bar and no explanation"
+              // reads as broken.
+              const kindSupported = (USAGE_SUPPORTED_KINDS as readonly string[]).includes(a.kind);
+              const enabled = harness?.enabled ?? false;
+              const placeholder = !kindSupported
+                ? { message: "Usage tracking isn't supported for this harness yet.", canRefresh: false }
+                : !enabled
+                  ? {
+                      message: "Usage tracking is off because this harness is disabled — enable it in Settings → Harnesses to see its meters.",
+                      canRefresh: false,
+                    }
+                  : { message: "No usage data yet — the first poll runs shortly, or refresh now.", canRefresh: true };
               const chip = (
                 <span
                   className="flex items-center gap-1"
@@ -972,15 +974,16 @@ function AppInner() {
                 >
                   <AgentIcon kind={a.kind} className="size-3" />
                   {displayName}
-                  <UsageMeter quota={q} />
+                  {q && <UsageMeter quota={q} />}
                   {dot}
                 </span>
               );
               return (
                 <UsagePopover
                   key={a.harnessId}
-                  quota={q}
+                  quota={q ?? null}
                   harnessLabel={displayName}
+                  placeholder={placeholder}
                   onRefresh={async () => {
                     const fresh = await api.refreshHarnessUsage(a.harnessId);
                     setUsage((prev) => ({ ...prev, [fresh.harnessId]: fresh }));
