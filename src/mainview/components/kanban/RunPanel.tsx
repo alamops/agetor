@@ -100,6 +100,12 @@ function harnessKindOf(harnessId: string, harnesses: Harness[]): AgentKind {
  *  reason. */
 const NO_PLANS: TaskPlan[] = [];
 
+/** Signature substrings of claude-code's `ExitPlanMode` native approval
+ *  modal pane text — shared so `TmuxPromptCard`'s `isPlan` detection and
+ *  `RunEventList`'s `latestPlanMarkdown`/plan-signature gating test the
+ *  exact same pattern instead of two independently-maintained literals. */
+const CLAUDE_PLAN_PROMPT_RE = /written up a plan|Would you like to proceed/i;
+
 /** Claude's raw `--permission-mode` strings (as reported in its
  *  `PERMISSION_MODE_STATUS_PREFIX` status chunks — see `claude-tmux.ts`'s
  *  `toClaudeModeString`) don't all match agetor's own `AGENT_OPTIONS`
@@ -2696,6 +2702,7 @@ function RunPanelBody({
                 taskId={task.id}
                 plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
                 onOpenPlan={onOpenPlan}
+                agentKind={kind}
               />
             </>
           )}
@@ -3689,6 +3696,7 @@ function RunEventList({
   taskId,
   plans = [],
   onOpenPlan,
+  agentKind,
 }: {
   events: RunEvent[];
   interactions?: PendingInteraction[];
@@ -3711,6 +3719,11 @@ function RunEventList({
    *  `planDialogId` state exactly like `onInteractionResolved` is wired to
    *  `dismissInteraction`. */
   onOpenPlan?: (planId: string) => void;
+  /** This task's agent kind — gates `latestPlanMarkdown`'s fallback scan
+   *  below to claude-code only (the only agent whose `TmuxPromptCard` ever
+   *  needs it; cursor/codex/gemini tasks would otherwise pay the same
+   *  per-tool_use JSON-parse cost for a value nothing consumes). */
+  agentKind?: AgentKind;
 }) {
   // Index tool_results by their tool_use_id so the tool-use card can show
   // Normalise legacy `[tool: Name] {...}` / `[thinking] ...` / `[result] ...`
@@ -3749,6 +3762,17 @@ function RunEventList({
       const p = plans[i]!;
       if (p.status === "pending") return p.editedContent ?? p.content;
     }
+    // The fallback below JSON-`safeParse`s every `tool_use` event in the
+    // display window (up to `EVENTS_WINDOW_MAX`, ~3000) — only worth paying
+    // for when the result could actually be consumed: claude-code is the
+    // only agent kind with an `ExitPlanMode` signature, and the value is
+    // only ever read by a claude plan-approval `TmuxPromptCard`, so skip
+    // the scan entirely unless one is actually pending right now.
+    if (agentKind !== "claude-code") return null;
+    const hasPendingPlanPrompt = interactions.some(
+      (i) => i.kind === "tmux_prompt" && CLAUDE_PLAN_PROMPT_RE.test(i.paneText),
+    );
+    if (!hasPendingPlanPrompt) return null;
     for (let i = normalised.length - 1; i >= 0; i--) {
       const e = normalised[i]!;
       if (e.stream !== "tool_use") continue;
@@ -3758,7 +3782,21 @@ function RunEventList({
       }
     }
     return null;
-  }, [plans, normalised]);
+  }, [plans, normalised, agentKind, interactions]);
+
+  // Finding 4 (per-card plan markdown): in a multi-plan session, several
+  // `tmux_prompt` interactions can be pending at once but at most one is
+  // ever the live plan-approval modal — pick the most recent plan-signature
+  // one by `createdAt` so a historical/non-plan prompt never inherits the
+  // newest plan's markdown via the shared `latestPlanMarkdown` above.
+  const latestPlanPromptId = useMemo(() => {
+    let latest: PendingInteraction | null = null;
+    for (const it of interactions) {
+      if (it.kind !== "tmux_prompt" || !CLAUDE_PLAN_PROMPT_RE.test(it.paneText)) continue;
+      if (!latest || it.createdAt > latest.createdAt) latest = it;
+    }
+    return latest?.id ?? null;
+  }, [interactions]);
 
   // Index tool_results by their tool_use_id so the tool-use card can show
   // the result inline beneath it. Falls back to a standalone tool-result
@@ -3942,7 +3980,7 @@ function RunEventList({
               key={`int-${it.id}`}
               req={it}
               onResolved={onResolved}
-              planMarkdown={latestPlanMarkdown}
+              planMarkdown={it.id === latestPlanPromptId ? latestPlanMarkdown : null}
             />
           );
       }
@@ -3969,7 +4007,7 @@ function RunEventList({
     current.body.push(...tail);
     if (current.header !== null || current.body.length > 0) out.push(current);
     return out;
-  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan, latestPlanMarkdown]);
+  }, [normalised, interactionByIndex, resultByToolId, onInteractionResolved, taskId, planByToolCallId, onOpenPlan, latestPlanMarkdown, latestPlanPromptId]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -5570,7 +5608,7 @@ function TmuxPromptCard({
   // `PlanCard` summary button now (see `RunEventList`'s `sections` memo),
   // not an inline expanded body, so this card is the only place the full
   // text is shown at decision time.
-  const isPlan = /written up a plan|Would you like to proceed/i.test(req.paneText);
+  const isPlan = CLAUDE_PLAN_PROMPT_RE.test(req.paneText);
   if (isPlan) {
     const planLabel = (label: string): string => {
       const l = label.toLowerCase();

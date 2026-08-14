@@ -136,7 +136,15 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
   // and closing should still prompt to save-or-discard that draft even
   // though the plan is no longer pending. The button set shown below is
   // still driven by `status` + `edited`, not `dirty`.
-  const dirty = text !== (plan.editedContent ?? plan.content);
+  // Gated on `!claude`: a claude plan never has a local draft (it's never
+  // editable), but `editedContent` can still arrive asynchronously via the
+  // polled `plan` prop after a live tmux approval-with-edits — without this
+  // gate, `text` (seeded at mount from the pre-edit content) would diverge
+  // from the freshly-polled `editedContent` with no user input involved,
+  // flipping `dirty` true and trapping the user behind an "unsaved edits"
+  // prompt whose only working save route (`saveAndClose`) is a cursor-only
+  // mutation that 400s for a claude plan.
+  const dirty = !claude && text !== (plan.editedContent ?? plan.content);
   // Read-only views (approved OR superseded) show the persisted edit when
   // there is one — previously this only applied to `approved`, so a
   // superseded plan silently hid an `editedContent` draft behind the
@@ -185,6 +193,11 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
   };
 
   const saveAndClose = async () => {
+    // Defensive — `dirty` is now gated on `!claude` so this shouldn't be
+    // reachable for a claude plan, but `api.savePlanEdit` is a cursor-only
+    // route (rejected by `planCursorKindGuard`), so guard the mutation
+    // itself too rather than relying solely on the caller's gate.
+    if (claude) return;
     if (closeSaving) return;
     setCloseSaving(true);
     setCloseError(null);
@@ -330,6 +343,11 @@ export function PlanDialog({ task, plan, agentKind, onClose, onPlanUpdated, focu
             {plan.status === "superseded" && (
               <span className="text-[10px] text-muted-foreground">
                 A newer plan replaced this one before it was approved.
+              </span>
+            )}
+            {plan.status === "rejected" && claude && (
+              <span className="text-[10px] text-muted-foreground">
+                Claude's plan was declined or the turn was interrupted before approval.
               </span>
             )}
           </div>

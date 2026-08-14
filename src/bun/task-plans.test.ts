@@ -468,3 +468,42 @@ test("resolveClaudePlan: supersede + resolve interplay — resolving a supersede
   const next = resolveClaudePlan(superseded, "toolu_01", "User has approved your plan.", 3000);
   expect(next).toBe(superseded);
 });
+
+test("resolveClaudePlan: leading whitespace before the approval text does not misclassify it as rejected", () => {
+  // A genuine approval whose result content happens to start with a leading
+  // "\n" (or other whitespace) must still resolve to approved — the exact
+  // `startsWith` check without a `trimStart()` would flip this into a
+  // permanent `rejected` verdict (finding: leading-whitespace misclassification).
+  const plans = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "# Plan",
+    now: 1000,
+  });
+  const next = resolveClaudePlan(
+    plans,
+    "toolu_01",
+    "\n  User has approved your plan. You can now start coding.",
+    5000,
+  );
+  const plan = next[0]!;
+  expect(plan.status).toBe("approved");
+  expect(plan.approvedAt).toBe(5000);
+});
+
+test("resolveClaudePlan: leading whitespace before the approval text with the edited-plan marker still extracts editedContent", () => {
+  const plans = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "# Original Plan",
+    now: 1000,
+  });
+  const resultContent =
+    "\n\nUser has approved your plan. You can now start coding.\n\n"
+    + "## Approved Plan (edited by user):\n# Edited Plan\n\n- new step";
+  const next = resolveClaudePlan(plans, "toolu_01", resultContent, 5000);
+  const plan = next[0]!;
+  expect(plan.status).toBe("approved");
+  expect(plan.approvedEdited).toBe(true);
+  expect(plan.editedContent).toBe("# Edited Plan\n\n- new step");
+});

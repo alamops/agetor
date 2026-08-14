@@ -500,3 +500,71 @@ test("detachWatcherFor on an unknown taskId is a silent no-op", async () => {
   const { detachWatcherFor } = await import("./claude-subagents.ts");
   expect(() => detachWatcherFor(`no-such-task-${randomUUID()}`)).not.toThrow();
 });
+
+test("subagent JSONL with no system/permission-mode marker lines: repeated user-line permissionMode of the SAME value emits the status chip only once (no spam)", async () => {
+  const { attachSubagentWatcher, setSubagentEmitter } = await import("./claude-subagents.ts");
+  const { taskId, jsonlPath, subagentsDir } = await seed();
+
+  const captured: RunEvent[] = [];
+  setSubagentEmitter((e) => captured.push(e));
+
+  const agentId = "aaaaaaaaaaaa";
+  writeFileSync(path.join(subagentsDir, `agent-${agentId}.meta.json`),
+    JSON.stringify({ agentType: "general-purpose", description: "work", spawnDepth: 1 }));
+
+  // Realistic subagent transcript: claude stamps `permissionMode` on every
+  // `user` line, but there is no dedicated `system`/`permission-mode` marker
+  // line at all — the common case for a subagent sidechain. Before the fix,
+  // `fs.lastPermissionMode` was only ever advanced by those (absent) marker
+  // lines, so every one of these `user`/tool_result lines re-emitted an
+  // unchanged-mode `permission-mode: auto` status chip.
+  const lines = [
+    { type: "user", isSidechain: true, uuid: "u1", permissionMode: "auto", message: { role: "user", content: "start the thing" } },
+    { type: "user", isSidechain: true, uuid: "u2", permissionMode: "auto", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] } },
+    { type: "user", isSidechain: true, uuid: "u3", permissionMode: "auto", message: { role: "user", content: "keep going" } },
+  ].map((o) => JSON.stringify(o)).join("\n") + "\n";
+  writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), lines);
+
+  const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  w.pump(Date.now());
+
+  const statusChunks = captured.filter((e) =>
+    e.stream === "status" && e.data.startsWith("permission-mode: ") && e.subagentId === agentId);
+  expect(statusChunks.length).toBe(1);
+  expect(statusChunks[0]!.data).toBe("permission-mode: auto");
+
+  w.detach();
+  setSubagentEmitter(null);
+});
+
+test("subagent JSONL with no marker lines: a user-line permissionMode CHANGE still emits its own chip", async () => {
+  const { attachSubagentWatcher, setSubagentEmitter } = await import("./claude-subagents.ts");
+  const { taskId, jsonlPath, subagentsDir } = await seed();
+
+  const captured: RunEvent[] = [];
+  setSubagentEmitter((e) => captured.push(e));
+
+  const agentId = "bbbbbbbbbbbb";
+  writeFileSync(path.join(subagentsDir, `agent-${agentId}.meta.json`),
+    JSON.stringify({ agentType: "general-purpose", description: "work", spawnDepth: 1 }));
+
+  const lines = [
+    { type: "user", isSidechain: true, uuid: "v1", permissionMode: "auto", message: { role: "user", content: "start" } },
+    { type: "user", isSidechain: true, uuid: "v2", permissionMode: "auto", message: { role: "user", content: "still auto" } },
+    { type: "user", isSidechain: true, uuid: "v3", permissionMode: "plan", message: { role: "user", content: "now plan" } },
+  ].map((o) => JSON.stringify(o)).join("\n") + "\n";
+  writeFileSync(path.join(subagentsDir, `agent-${agentId}.jsonl`), lines);
+
+  const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  w.pump(Date.now());
+
+  const statusChunks = captured.filter((e) =>
+    e.stream === "status" && e.data.startsWith("permission-mode: ") && e.subagentId === agentId);
+  expect(statusChunks.map((c) => c.data)).toEqual([
+    "permission-mode: auto",
+    "permission-mode: plan",
+  ]);
+
+  w.detach();
+  setSubagentEmitter(null);
+});

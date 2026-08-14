@@ -60,11 +60,21 @@ export interface TodoProgressSummary {
 }
 
 /** Minimal shape this module reads off a run event. Callers (webview,
- *  orchestrator) pass richer objects — only `stream` and `data` are read,
- *  everything else is ignored/tolerated. */
+ *  orchestrator) pass richer objects — only `stream`, `data`, and (for
+ *  Task-tools run-scoping) `runId` are read, everything else is
+ *  ignored/tolerated.
+ *
+ *  `runId` is intentionally named to match `RunEvent.runId`
+ *  (`src/shared/types.ts`) exactly: the webview supplier (RunPanel) passes
+ *  `RunEvent[]` straight through to `deriveTodoProgress` with zero mapping,
+ *  so widening this contract with the SAME field name is what lets the
+ *  runId already on every `RunEvent` flow through unchanged. The `db.ts`
+ *  supplier (`todoRelevantEventsForTask`) is the other caller and now maps
+ *  `run_events.run_id` onto this same field. */
 export interface TodoProgressEvent {
   stream: string;
   data: string;
+  runId?: string | null;
 }
 
 const VALID_STATUSES: ReadonlySet<string> = new Set([
@@ -156,6 +166,17 @@ export function deriveTodoProgress(events: TodoProgressEvent[]): TodoProgress | 
   const taskItems = new Map<number, TodoItem>();
   let taskLastIndex = -1;
   let creationCount = 0;
+  // Run-scoping (finding: task accumulation must not span runs): a re-run
+  // restarts Claude's Task-tools numbering at 1, so accumulating across runs
+  // by number alone silently overwrites 1..k while leaving a stale k+1..n
+  // tail from the previous run inflating the total. Track the runId of the
+  // most recent TaskCreate and reset the accumulation the moment a new
+  // TaskCreate reports a DIFFERENT runId — TaskUpdate/TodoWrite don't carry
+  // their own reset signal, but every run's history always starts with its
+  // own TaskCreate before any TaskUpdate can reference it, so gating the
+  // reset on TaskCreate alone is sufficient.
+  let sawTaskCreate = false;
+  let currentTaskRunId: string | null = null;
 
   events.forEach((e, i) => {
     if (e.stream !== "tool_use") return;
@@ -184,16 +205,40 @@ export function deriveTodoProgress(events: TodoProgressEvent[]): TodoProgress | 
       const activeForm =
         typeof inputObj.activeForm === "string" ? inputObj.activeForm : undefined;
 
+      const eventRunId = e.runId ?? null;
+      if (sawTaskCreate && eventRunId !== currentTaskRunId) {
+        // A new run's TaskCreate stream started — discard the previous
+        // run's accumulated items/counter rather than let them linger as a
+        // stale tail behind this run's (re-started-at-1) numbering.
+        taskItems.clear();
+        creationCount = 0;
+      }
+      sawTaskCreate = true;
+      currentTaskRunId = eventRunId;
+
       creationCount++;
       let taskNum = creationCount;
+      let numberedFromResult = false;
       const toolUseId = obj.id;
       if (typeof toolUseId === "string" && toolUseId) {
         const resultText = resultTextById.get(toolUseId);
         if (resultText) {
           const m = TASK_CREATED_RE.exec(resultText);
           const captured = m?.[1];
-          if (captured) taskNum = parseInt(captured, 10);
+          if (captured) {
+            taskNum = parseInt(captured, 10);
+            numberedFromResult = true;
+          }
         }
+      }
+
+      // Never let a sequential-fallback number silently overwrite an
+      // existing entry (e.g. one already claimed by a result-derived
+      // number) — that would drop a task rather than just misnumber it.
+      // Result-derived numbers are authoritative and always win/overwrite,
+      // preserving TaskUpdate-by-taskId matching for the common case.
+      if (!numberedFromResult) {
+        while (taskItems.has(taskNum)) taskNum++;
       }
 
       taskItems.set(taskNum, { content, status: "pending", activeForm });

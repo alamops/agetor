@@ -426,6 +426,89 @@ test("mixed session: a TodoWrite snapshot after Task-tools activity replaces the
   expect(result?.activeForm).toBe("Resuming A");
 });
 
+// ---------------------------------------------------------------------------
+// Run-scoped accumulation — a re-run must not leave a stale tail from a
+// prior run's Task-tools numbering (finding: task accumulation spans runs
+// and never resets).
+// ---------------------------------------------------------------------------
+
+test("a second run whose TaskCreate numbering restarts at 1 resets the accumulation — no stale tail", () => {
+  const events = [
+    // Run 1: three tasks created and result-numbered 1, 2, 3.
+    taskCreateEvent("call_1", "Run1 task A", undefined, { runId: "run-1" }),
+    taskCreateResultEvent("call_1", 1, "Run1 task A", { runId: "run-1" }),
+    taskCreateEvent("call_2", "Run1 task B", undefined, { runId: "run-1" }),
+    taskCreateResultEvent("call_2", 2, "Run1 task B", { runId: "run-1" }),
+    taskCreateEvent("call_3", "Run1 task C", undefined, { runId: "run-1" }),
+    taskCreateResultEvent("call_3", 3, "Run1 task C", { runId: "run-1" }),
+    // Run 2 (a fresh turn/session): numbering restarts at 1 — only one task
+    // this time. Without the run-scoped reset, run 1's tasks #2 and #3 would
+    // survive untouched and inflate the total to 4.
+    taskCreateEvent("call_4", "Run2 task A", undefined, { runId: "run-2" }),
+    taskCreateResultEvent("call_4", 1, "Run2 task A", { runId: "run-2" }),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result).not.toBeNull();
+  expect(result?.total).toBe(1);
+  expect(result?.todos.map((t) => t.content)).toEqual(["Run2 task A"]);
+});
+
+test("TaskUpdate within the same run after the reset still resolves against the new run's items", () => {
+  const events = [
+    taskCreateEvent("call_1", "Run1 task A", undefined, { runId: "run-1" }),
+    taskCreateResultEvent("call_1", 1, "Run1 task A", { runId: "run-1" }),
+    taskCreateEvent("call_2", "Run2 task A", undefined, { runId: "run-2" }),
+    taskCreateResultEvent("call_2", 1, "Run2 task A", { runId: "run-2" }),
+    taskUpdateEvent("1", { status: "completed" }, { runId: "run-2" }),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.total).toBe(1);
+  expect(result?.todos[0]?.content).toBe("Run2 task A");
+  expect(result?.todos[0]?.status).toBe("completed");
+});
+
+test("events with no runId at all behave exactly as before (no spurious reset)", () => {
+  // Every prior test in this file omits runId on some events / relies on the
+  // shared "r1" default from baseEvent — the reset logic must never fire
+  // when runId is absent/constant, preserving backward compatibility.
+  const events = [
+    taskCreateEvent("call_1", "Task A"),
+    taskCreateResultEvent("call_1", 1, "Task A"),
+    taskCreateEvent("call_2", "Task B"),
+    taskCreateResultEvent("call_2", 2, "Task B"),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result?.total).toBe(2);
+});
+
+// ---------------------------------------------------------------------------
+// TaskCreate number collisions must never silently drop a task (finding:
+// sequential-fallback numbers can collide with a result-derived number).
+// ---------------------------------------------------------------------------
+
+test("a sequential-fallback number colliding with an existing result-derived entry does not overwrite it", () => {
+  const events = [
+    // call_1 is result-numbered #3 (an out-of-order/high number, as Claude
+    // can assign).
+    taskCreateEvent("call_1", "Result-numbered as #3"),
+    taskCreateResultEvent("call_1", 3, "Result-numbered as #3"),
+    // call_2 has no result — falls back to sequential count 2 (no collision).
+    taskCreateEvent("call_2", "Fallback-numbered #2"),
+    // call_3 has no result — falls back to sequential count 3, which COLLIDES
+    // with call_1's result-derived slot #3. Before the fix this silently
+    // overwrote call_1's entry, dropping it.
+    taskCreateEvent("call_3", "Fallback-numbered, collides at #3"),
+  ];
+  const result = deriveTodoProgress(events);
+  expect(result).not.toBeNull();
+  // All three tasks must survive — none is silently dropped by the collision.
+  expect(result?.total).toBe(3);
+  const contents = result?.todos.map((t) => t.content) ?? [];
+  expect(contents).toContain("Result-numbered as #3");
+  expect(contents).toContain("Fallback-numbered #2");
+  expect(contents).toContain("Fallback-numbered, collides at #3");
+});
+
 test("mixed session: Task-tools resumes again after the TodoWrite snapshot", () => {
   const events = [
     todoWriteEvent([{ content: "Legacy A", status: "completed" }]),

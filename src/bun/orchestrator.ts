@@ -960,14 +960,29 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
  *  todo-family chunk triggers below — TodoWrite/TaskCreate/TaskUpdate chunks
  *  are rare (most chunks are assistant text, thinking, or unrelated tool
  *  calls), so a plain substring check keeps the hot path a single `includes`
- *  away from a no-op. Mirrors the `run_events` LIKE filter in
- *  `runs.todoRelevantEventsForTask` — same three markers, same "raw string
- *  match is good enough, the real parsing happens in `deriveTodoProgress`"
- *  reasoning. */
-const TODO_FAMILY_MARKERS = ["TodoWrite", "TaskCreate", "TaskUpdate"];
+ *  away from a no-op. Markers are the literal serialized `"name":"<Tool>"`
+ *  envelope form (see `claude-tmux.ts`'s `JSON.stringify` of `tool_use`
+ *  blocks — no spaces), not a bare tool name substring: agetor dogfoods
+ *  itself, so an assistant/tool_result chunk quoting "TaskCreate" in prose
+ *  (e.g. describing this very code) is a real false positive with the bare
+ *  form, not a theoretical one.
+ *
+ *  Split by stream, mirroring `runs.todoRelevantEventsForTask`'s SQL LIKE
+ *  filter in db.ts (same split, same reason): a `tool_use` row carries
+ *  `"name":"<Tool>"`, but a `tool_result` row never does (`{toolUseId,
+ *  content, isError}`) — its ONLY todo-family shape `deriveTodoProgress`
+ *  ever consults is a `TaskCreate` result's `"Task #N created successfully"`
+ *  text, so that's the marker for the `tool_result` side. Without this
+ *  separate check, `tool_result` rows would never re-trigger the board
+ *  summary, and a TaskCreate's claude-assigned number wouldn't be reflected
+ *  until some unrelated LATER tool_use chunk happened to fire the recompute. */
+const TODO_FAMILY_TOOL_USE_MARKERS = ['"name":"TodoWrite"', '"name":"TaskCreate"', '"name":"TaskUpdate"'];
+const TODO_FAMILY_TOOL_RESULT_MARKER = "created successfully";
 
-function isTodoFamilyChunk(data: string): boolean {
-  return TODO_FAMILY_MARKERS.some((m) => data.includes(m));
+function isTodoFamilyChunk(stream: RunEvent["stream"], data: string): boolean {
+  if (stream === "tool_use") return TODO_FAMILY_TOOL_USE_MARKERS.some((m) => data.includes(m));
+  if (stream === "tool_result") return data.includes(TODO_FAMILY_TOOL_RESULT_MARKER);
+  return false;
 }
 
 /**
@@ -1026,9 +1041,33 @@ function maybeUpdateTodoProgress(taskId: string): void {
  * landing in close succession), and both `task-plans.ts` helpers are pure
  * transforms over whatever array they're handed. Never throws — same
  * try/catch-at-call-site contract as `detectCursorPlan`.
+ *
+ * Two cheap pre-filters keep `JSON.parse` off the common-case chunk (this
+ * runs on EVERY `tool_use`/`tool_result` chunk of every claude-code run —
+ * assistant text/thinking chunks never reach here at all, but tool chunks
+ * for ordinary tools like Read/Write/Bash are still the overwhelming
+ * majority, and a large `tool_result` — a big file read, a long command's
+ * output — is exactly the case where an unconditional parse is wasteful):
+ *  - `tool_use`: skip unless `data` contains the literal `"name":"ExitPlanMode"`
+ *    envelope substring (see `claude-tmux.ts`'s unspaced `JSON.stringify`).
+ *  - `tool_result`: skip unless the task already has a `pending` claude plan
+ *    — `resolveClaudePlan` only ever acts on a `tool_result` whose
+ *    `toolUseId` matches an existing pending plan, so with none pending
+ *    there is nothing this chunk could possibly resolve. This read is cheap
+ *    relative to parsing a potentially large result body, and results in
+ *    exactly one `tasks.get` either way (reused below, not re-fetched).
  */
 function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["stream"], data: string): void {
-  if (stream !== "tool_use" && stream !== "tool_result") return;
+  let task: Task | null;
+  if (stream === "tool_use") {
+    if (!data.includes('"name":"ExitPlanMode"')) return;
+    task = null; // fetched below, after confirming the parse is worthwhile
+  } else if (stream === "tool_result") {
+    task = tasks.get(taskId);
+    if (!task || !task.plans.some((p) => p.status === "pending")) return;
+  } else {
+    return;
+  }
 
   let parsed: unknown;
   try {
@@ -1048,7 +1087,7 @@ function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["s
     const plan = (input as Record<string, unknown>).plan;
     if (typeof plan !== "string" || plan.trim() === "") return;
 
-    const task = tasks.get(taskId);
+    task = tasks.get(taskId);
     if (!task) return;
     const next = upsertClaudePlanFromExitPlanMode(task.plans, {
       toolCallId,
@@ -1060,7 +1099,8 @@ function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["s
     return;
   }
 
-  // tool_result
+  // tool_result — `task` was already fetched (and confirmed to have a
+  // pending plan) by the pre-filter above.
   const toolUseId = chunk.toolUseId;
   if (typeof toolUseId !== "string" || toolUseId.length === 0) return;
   const content = chunk.content;
@@ -1073,10 +1113,8 @@ function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["s
       : "";
   if (!resultText) return;
 
-  const task = tasks.get(taskId);
-  if (!task) return;
-  const next = resolveClaudePlan(task.plans, toolUseId, resultText, Date.now());
-  if (next !== task.plans) tasks.update(taskId, { plans: next });
+  const next = resolveClaudePlan(task!.plans, toolUseId, resultText, Date.now());
+  if (next !== task!.plans) tasks.update(taskId, { plans: next });
 }
 
 /**
@@ -1102,7 +1140,7 @@ function makeChunkHandler(
     // Todo/task-tools board summary: re-derive + persist on any
     // TodoWrite/TaskCreate/TaskUpdate chunk, for every agent kind. Cheap
     // substring pre-filter keeps the common case (unrelated chunks) a no-op.
-    if ((stream === "tool_use" || stream === "tool_result") && isTodoFamilyChunk(data)) {
+    if (isTodoFamilyChunk(stream, data)) {
       try {
         maybeUpdateTodoProgress(taskId);
       } catch {

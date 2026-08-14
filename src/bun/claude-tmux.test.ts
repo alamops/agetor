@@ -789,19 +789,26 @@ test("dispatchLine: a `user` line's permissionMode fallback shares the same emit
   const statusChunks = () => emitted.filter((e) => e.stream === "status" && e.data.startsWith("permission-mode: "));
 
   // A `user` line reports "auto" first — nothing has announced it yet, so
-  // this is a genuine change and must emit.
+  // this is a genuine change and must emit. It advances
+  // `lastAnnouncedPermissionMode` (the dedup tracker), but NOT
+  // `state.permissionMode` itself — only the dedicated `system`/
+  // `permission-mode` marker lines may write that (it's load-bearing for
+  // Shift+Tab cycle counting, and a lagging `user` line must never clobber a
+  // pane-verified value with a stale one).
   __forTest.dispatchLine(state, JSON.stringify({
     type: "user", uuid: "u1", permissionMode: "auto", message: { content: "hi" },
   }));
   expect(statusChunks()).toEqual([{ stream: "status", data: "permission-mode: auto" }]);
-  expect(state.permissionMode).toBe("auto");
+  expect(state.permissionMode).toBe(null);
 
   // The dedicated marker line reporting the SAME mode right after is
-  // suppressed — the `user` line already announced it.
+  // suppressed — the `user` line already announced it — but it DOES write
+  // `state.permissionMode`, since it's the only line type allowed to.
   __forTest.dispatchLine(state, JSON.stringify({
     type: "system", uuid: "u2", permissionMode: "auto",
   }));
   expect(statusChunks()).toEqual([{ stream: "status", data: "permission-mode: auto" }]);
+  expect(state.permissionMode).toBe("auto");
 
   // A genuine change — the marker line reporting "plan" — still emits.
   __forTest.dispatchLine(state, JSON.stringify({
@@ -811,6 +818,16 @@ test("dispatchLine: a `user` line's permissionMode fallback shares the same emit
     { stream: "status", data: "permission-mode: auto" },
     { stream: "status", data: "permission-mode: plan" },
   ]);
+  expect(state.permissionMode).toBe("plan");
+
+  // A `user` line reporting the OLD mode ("auto") right after must NOT
+  // clobber `state.permissionMode` back to "auto" — this is the exact
+  // clobber this split guards against (a lagging user line racing a fresher
+  // pane-verified/marker-line mode).
+  __forTest.dispatchLine(state, JSON.stringify({
+    type: "user", uuid: "u4", permissionMode: "auto", message: { content: "stale" },
+  }));
+  expect(state.permissionMode).toBe("plan");
   __forTest.uninstallSession(taskId);
 });
 
@@ -2143,9 +2160,63 @@ test("collectAskQuestionsFromPane: still incomplete after growing the pane → r
     expect(log.some((l) => l.startsWith("resize:"))).toBe(true);
     // Pane size is always restored even when we give up.
     expect(log.some((l) => l.startsWith("restore:"))).toBe(true);
+    // First grow-but-still-incomplete failure counted against the latch.
+    expect(state.askGrowAttempts).toBe(1);
   } finally {
     __forTest.uninstallSession("ask-truncated-stuck");
   }
+});
+
+test("collectAskQuestionsFromPane: give-up latch — after MAX_ASK_GROW_ATTEMPTS incomplete-after-grow failures, stops resizing the pane and refuses collection outright", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { MAX_ASK_GROW_ATTEMPTS } = __forTest;
+  // Same "never recovers" pane as the test above — every grow leaves the
+  // capture truncated — but this drives it repeatedly, the way `scrapeOnce`
+  // re-entering on every ~1s tick would, to prove the collector eventually
+  // stops resizing the user's live tmux window instead of looping forever.
+  const { io, log } = makeGrowablePane({ grownTail: null });
+  const state = __forTest.installSession("ask-truncated-gives-up", "/tmp/never-read.jsonl");
+  try {
+    for (let i = 1; i <= MAX_ASK_GROW_ATTEMPTS; i++) {
+      const res = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+      expect(res).toBeNull();
+      expect(state.askGrowAttempts).toBe(i);
+    }
+    // Latch has now given up. One more call must NOT resize/restore again —
+    // it should bail immediately without touching the pane at all.
+    const resizeCallsBeforeGiveUp = log.filter((l) => l.startsWith("resize:")).length;
+    expect(resizeCallsBeforeGiveUp).toBe(MAX_ASK_GROW_ATTEMPTS);
+    const res = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+    expect(res).toBeNull();
+    // Counter doesn't keep climbing once given up — no new grow was attempted.
+    expect(state.askGrowAttempts).toBe(MAX_ASK_GROW_ATTEMPTS);
+    expect(log.filter((l) => l.startsWith("resize:")).length).toBe(resizeCallsBeforeGiveUp);
+
+    // A fresh modal (fingerprint change / the modal leaving the pane) resets
+    // the budget in production via `scrapeOnce`'s else-branch — simulate that
+    // reset directly here, since this test drives the collector in isolation.
+    state.askGrowAttempts = 0;
+    const resAfterReset = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+    expect(resAfterReset).toBeNull();
+    expect(state.askGrowAttempts).toBe(1);
+    expect(log.filter((l) => l.startsWith("resize:")).length).toBe(resizeCallsBeforeGiveUp + 1);
+  } finally {
+    __forTest.uninstallSession("ask-truncated-gives-up");
+  }
+});
+
+test("askFallbackAllowed — generic modal matcher stays suppressed until the grow latch gives up, and never competes with a registered ask card", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const { askFallbackAllowed, MAX_ASK_GROW_ATTEMPTS } = __forTest;
+  // Below the cap: still suppressed, no fallback.
+  expect(askFallbackAllowed(0, false)).toBe(false);
+  expect(askFallbackAllowed(MAX_ASK_GROW_ATTEMPTS - 1, false)).toBe(false);
+  // At/above the cap with no registered card: fallback allowed.
+  expect(askFallbackAllowed(MAX_ASK_GROW_ATTEMPTS, false)).toBe(true);
+  expect(askFallbackAllowed(MAX_ASK_GROW_ATTEMPTS + 1, false)).toBe(true);
+  // Even after giving up, a live registered ask card still wins — the
+  // generic matcher must never compete with a real structured card.
+  expect(askFallbackAllowed(MAX_ASK_GROW_ATTEMPTS, true)).toBe(false);
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *

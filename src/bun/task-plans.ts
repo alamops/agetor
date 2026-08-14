@@ -225,7 +225,11 @@ const CLAUDE_PLAN_EDITED_MARKER = "## Approved Plan (edited by user):";
  * `toolCallId` from another task, and (defensively) a plan that's already
  * left `pending` for any reason.
  *
- * `resultContent` is the tool_result's raw text:
+ * `resultContent` is the tool_result's raw text — matched after
+ * `trimStart()` so incidental leading whitespace (e.g. a leading "\n" some
+ * claude output shapes prepend) can never flip a genuine approval into a
+ * permanent `rejected` verdict; the exact-prefix contract only ever needed
+ * to rule out *content* differences, not incidental leading whitespace:
  *  - starts with `"User has approved your plan"` → `approved`. When it also
  *    contains the `"## Approved Plan (edited by user):"` marker, the text
  *    after the marker becomes `editedContent` (the edited plan wins, same
@@ -248,16 +252,17 @@ export function resolveClaudePlan(
   const plan = plans[idx]!;
   if (plan.status !== "pending") return plans;
 
+  const trimmed = resultContent.trimStart();
   const next = [...plans];
-  if (!resultContent.startsWith(CLAUDE_PLAN_APPROVED_PREFIX)) {
+  if (!trimmed.startsWith(CLAUDE_PLAN_APPROVED_PREFIX)) {
     next[idx] = { ...plan, status: "rejected", approvedAt: null };
     return next;
   }
 
-  const markerIdx = resultContent.indexOf(CLAUDE_PLAN_EDITED_MARKER);
+  const markerIdx = trimmed.indexOf(CLAUDE_PLAN_EDITED_MARKER);
   const editedContent = markerIdx === -1
     ? null
-    : resultContent.slice(markerIdx + CLAUDE_PLAN_EDITED_MARKER.length).trim() || null;
+    : trimmed.slice(markerIdx + CLAUDE_PLAN_EDITED_MARKER.length).trim() || null;
 
   next[idx] = {
     ...plan,
