@@ -2167,6 +2167,31 @@ test("collectAskQuestionsFromPane: still incomplete after growing the pane → r
   }
 });
 
+test("collectAskQuestionsFromPane: unavailable pane size (io.size() → null) still burns latch budget — a no-grow retry can never improve the capture", async () => {
+  const { __forTest } = await import("./claude-tmux.ts");
+  const log: string[] = [];
+  const io = {
+    capture: () => TRUNCATED_TOP_TAIL,
+    send: () => true,
+    size: () => null,
+    resize: (w: number, h: number) => { log.push(`resize:${w}x${h}`); },
+    restore: (w: number, h: number) => { log.push(`restore:${w}x${h}`); },
+    sleep: async () => { /* no delay in tests */ },
+  };
+  const state = __forTest.installSession("ask-size-unavailable", "/tmp/never-read.jsonl");
+  try {
+    const res = await __forTest.collectAskQuestionsFromPane(state, TRUNCATED_TOP_TAIL, io);
+    expect(res).toBeNull();
+    // No size → no resize attempted…
+    expect(log.some((l) => l.startsWith("resize:"))).toBe(false);
+    // …but the failure still counts, so the give-up (and the generic-card
+    // fallback it unlocks) stays reachable for this stuck shape.
+    expect(state.askGrowAttempts).toBe(1);
+  } finally {
+    __forTest.uninstallSession("ask-size-unavailable");
+  }
+});
+
 test("collectAskQuestionsFromPane: give-up latch — after MAX_ASK_GROW_ATTEMPTS incomplete-after-grow failures, stops resizing the pane and refuses collection outright", async () => {
   const { __forTest } = await import("./claude-tmux.ts");
   const { MAX_ASK_GROW_ATTEMPTS } = __forTest;

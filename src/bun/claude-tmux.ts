@@ -2639,10 +2639,12 @@ async function collectAskQuestionsFromPane(
   if (state.askGrowAttempts >= MAX_ASK_GROW_ATTEMPTS) return null;
 
   let grew = false;
+  let sizeUnavailable = false;
   const collected: Array<ParsedQuestionPane | null> = [];
   await queueTmuxOp(state.taskId, async (stillCurrent) => {
     const orig = io.size();
     if (orig) grew = true;
+    else sizeUnavailable = true;
     // Brackets the ONLY window where `window-size manual` is expected on this
     // session. ONE `finally` below owns both the restore and the clear (the
     // clear nested inside it) so a throwing `io.restore` — the injected
@@ -2712,10 +2714,13 @@ async function collectAskQuestionsFromPane(
   // `MAX_ASK_GROW_ATTEMPTS`, `scrapeOnce` stops suppressing the generic
   // matcher and an ordinary `tmux_prompt` card takes over.
   if (collected.length !== n || collected.some((p) => p == null || !p.complete)) {
-    // Only count this against a modal that actually got GROWN — a capture
-    // failure before we ever resized (e.g. the very first tab's parse) isn't
-    // the "grow didn't help" case this latch exists for.
-    if (grew) state.askGrowAttempts += 1;
+    // Count the failure when the pane actually got GROWN, and also when the
+    // pane size was UNAVAILABLE (`io.size()` returned null) — a no-grow retry
+    // at the same size can never improve the capture, so it must burn latch
+    // budget too or the give-up (and the generic-card fallback it unlocks)
+    // would be unreachable for exactly that stuck shape. The only uncounted
+    // exit is an op that never ran (superseded by a newer queued op).
+    if (grew || sizeUnavailable) state.askGrowAttempts += 1;
     return null;
   }
   return collected.map((p, i) => toAsk(p!, headers[i]));
@@ -2784,6 +2789,16 @@ async function collectAndRegisterAskCard(state: SessionState, firstTail: string)
       fingerprint: `ask-${runId}`,
     });
     state.askCardId = card.id;
+    // A generic `tmux_prompt` fallback card may already be live for this same
+    // modal — the give-up latch unsuppresses the generic matcher, and a
+    // late-flushing JSONL tool_use can still land afterwards (this path).
+    // scrapeOnce's per-tick auto-cancel would reap it on the next tick anyway
+    // (registering the ask card re-suppresses the matcher, so the prompt's
+    // fingerprint stops matching), but resolving it here avoids showing two
+    // cards for one modal for even a tick.
+    for (const pending of activeTmuxPromptsForTask(state.taskId)) {
+      answerTmuxPrompt(pending.id, { key: "__external__" });
+    }
     if (process.env.AGETOR_DEBUG) {
       (state.turnQueue[0]?.onChunk ?? state.lastChunk)?.(
         "status", `question card ready (${fromJsonl ? "jsonl" : "pane"})`,

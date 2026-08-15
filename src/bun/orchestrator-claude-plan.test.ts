@@ -380,9 +380,49 @@ test("a second run whose TaskCreate numbering restarts at 1 resets the board sum
   __dispatchChunkForTest(runId2, id, "claude-code", "tool_use", toolUse("toolu_c3", "TaskCreate", { subject: "Run2 A", activeForm: "A" }));
   __dispatchChunkForTest(runId2, id, "claude-code", "tool_result", toolResult("toolu_c3", "Task #1 created successfully: Run2 A"));
 
-  // Without the run-scoped reset, run 1's task #2 survives untouched and
-  // total would incorrectly read 3 instead of 1.
+  // The restart is detected from the NUMBERING (result-derived #1 collides
+  // with the dead session's #1 under different content) — without it, run 1's
+  // task #2 survives untouched and total would incorrectly read 3 instead of 1.
   expect(tasks.get(id)!.todoProgress).toEqual({ completed: 0, total: 1 });
+
+  await settle();
+  db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+});
+
+test("a follow-up run that ADDS a task continues the session's numbering — board summary extends, never resets", async () => {
+  const { id } = await newClaudeTask();
+  const runId1 = await startAndGetRunId(id);
+
+  __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_c1", "TaskCreate", { subject: "Turn1 A", activeForm: "A" }));
+  __dispatchChunkForTest(runId1, id, "claude-code", "tool_result", toolResult("toolu_c1", "Task #1 created successfully: Turn1 A"));
+  __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_c2", "TaskCreate", { subject: "Turn1 B", activeForm: "B" }));
+  __dispatchChunkForTest(runId1, id, "claude-code", "tool_result", toolResult("toolu_c2", "Task #2 created successfully: Turn1 B"));
+  __dispatchChunkForTest(runId1, id, "claude-code", "tool_use", toolUse("toolu_u1", "TaskUpdate", { taskId: "1", status: "completed" }));
+
+  expect(tasks.get(id)!.todoProgress).toEqual({ completed: 1, total: 2 });
+
+  // A follow-up turn = a NEW run row in the SAME claude session; claude's
+  // task numbering continues at #3 (it is per-session, not per-run). The
+  // summary must extend to 3, not collapse to 1.
+  const runId2 = randomUUID();
+  runs.insert({
+    id: runId2,
+    taskId: id,
+    agent: "claude-code",
+    status: "running",
+    startedAt: Date.now(),
+    endedAt: null,
+    exitCode: null,
+    tmuxSession: null,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+  });
+  __dispatchChunkForTest(runId2, id, "claude-code", "tool_use", toolUse("toolu_c3", "TaskCreate", { subject: "Turn2 C", activeForm: "C" }));
+  __dispatchChunkForTest(runId2, id, "claude-code", "tool_result", toolResult("toolu_c3", "Task #3 created successfully: Turn2 C"));
+
+  expect(tasks.get(id)!.todoProgress).toEqual({ completed: 1, total: 3 });
 
   await settle();
   db.run(`DELETE FROM tasks WHERE id = ?`, [id]);

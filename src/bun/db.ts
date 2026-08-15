@@ -1091,11 +1091,7 @@ export const runs = {
    *  (chronological) order — main-stream only (`subagent_id IS NULL`, same
    *  rationale as `lastEventData`/`lastToolUseData`: a background agent's own
    *  TodoWrite/TaskCreate/TaskUpdate calls track ITS todos, not the primary
-   *  task's, and must not be mixed into the board summary). Also returns
-   *  `runId` (mapped from `run_events.run_id`, always present) so
-   *  `deriveTodoProgress`'s run-scoped Task-tools reset (see
-   *  `src/shared/todo-progress.ts`) works over the server-derived path too,
-   *  not just the webview's `RunEvent[]` path.
+   *  task's, and must not be mixed into the board summary).
    *
    *  Two different LIKE shapes for the two streams, deliberately NOT a
    *  single shared marker set (mirrors `isTodoFamilyChunk` in
@@ -1119,9 +1115,9 @@ export const runs = {
    *  handler always calls `runs.appendEvent` before running this query (see
    *  `makeChunkHandler`), the just-arrived chunk is already included — no
    *  separate "append the current chunk" step needed. */
-  todoRelevantEventsForTask(taskId: string): Array<{ stream: string; data: string; runId: string }> {
-    const rows = db.query<{ stream: string; data: string; run_id: string }, [string]>(
-      `SELECT stream, data, run_events.run_id AS run_id
+  todoRelevantEventsForTask(taskId: string): Array<{ stream: string; data: string }> {
+    return db.query<{ stream: string; data: string }, [string]>(
+      `SELECT stream, data
        FROM run_events
        JOIN runs ON runs.id = run_events.run_id
        WHERE runs.task_id = ?
@@ -1136,7 +1132,6 @@ export const runs = {
          )
        ORDER BY run_events.id ASC`,
     ).all(taskId);
-    return rows.map((r) => ({ stream: r.stream, data: r.data, runId: r.run_id }));
   },
   /** Cheap existence check — is there at least one persisted event for this
    *  task older than `beforeId`? Backs the `hasMore` flag on both the SSE
