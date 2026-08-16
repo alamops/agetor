@@ -146,12 +146,21 @@
  * IS the `backgroundTaskId`, so the existing LIVE orchestrator dispatch
  * (`setBackgroundTaskSettledHandler`) and the restart-safe
  * `scanLineForTaskNotification` scan both settle this row with ZERO changes
- * to their own id-matching logic, only a new lookup against `bgShells`;
+ * to their own id-matching logic, only a new lookup against `bgShells`
+ * (review fix R2: that lookup also unconditionally latches `receiptSettled`,
+ * even when the row was already ceiling-settled to `completed`, so a
+ * trailing buffered flush after the harness's own authoritative receipt can
+ * never resurrect it — see `scanLineForTaskNotification`'s bg-shell branch);
  * (2) a bounded ceiling (`checkBgShellCeiling`) — `(Bash timeout ?? a
- * default) + a margin` after launch, settling `completed` (inferred) if the
- * notification never arrives, so a lost receipt can never wedge the row
- * `running` forever; a ceiling-settled (never receipt-settled) row flips back
- * to `running` if its output file keeps growing afterwards — the same
+ * default) + a margin` since the shell's LAST SIGN OF LIFE (review fix R1:
+ * anchored on `lastAppendAt`, not the immutable `startedAt` — an anchor that
+ * never moves would settle an actively-writing shell and then immediately
+ * flip it back on the very next output batch, oscillating forever), settling
+ * `completed` (inferred) if the notification never arrives, so a lost
+ * receipt can never wedge the row `running` forever; a ceiling-settled
+ * (never receipt-settled) row flips back to `running` if its output file
+ * keeps growing afterwards, for at most one more margin window past the
+ * settle (review fix R3 — see `checkBgShellCeiling`) — the same
  * bounce-rather-than-strand trade-off `checkStale` (W4) makes for file-backed
  * rows, applied here because the ceiling is itself only a guess. There is no
  * end-of-turn/staleness idle-detection for a bg shell (no transcript to go
@@ -330,6 +339,21 @@ const BG_SHELL_TIMEOUT_MARGIN_MS = 2 * 60_000;
  *  that a launch still pending behind this many newer ones is never coming. */
 const BG_SHELL_PENDING_MAX = 50;
 
+/** Review fix R4 — per-batch cap on `tailBgShells`'s read of a bg shell's raw
+ *  output file (see `readAppendedSync`'s `maxBytes`). Unlike a JSONL
+ *  transcript (bounded by line-at-a-time parsing), a bg shell's stdout+stderr
+ *  redirect has no inherent batch size: a chatty command (a verbose build, a
+ *  noisy test run) can append hundreds of MB between polls, and reading it
+ *  all in one shot would balloon a single `Buffer.alloc`, a single SQLite
+ *  `run_events` row, and a single SSE frame all at once. Clamping means the
+ *  worst case is `BG_SHELL_BATCH_MAX_BYTES` per shell per tick — the
+ *  remainder simply drains over however many subsequent ticks it takes,
+ *  which the offset-derived `bgshell:<id>:<offset>` line_uuid scheme already
+ *  tolerates without any change (each partial batch is still keyed by its
+ *  own starting offset). No env override — this is an internal safety valve,
+ *  not a tunable, mirroring `BG_SHELL_TIMEOUT_MARGIN_MS`'s posture. */
+const BG_SHELL_BATCH_MAX_BYTES = 256 * 1024;
+
 /**
  * SSE sink, injected once by the orchestrator at startup (which owns the
  * subscriber fan-out via `emit`). Kept as an injected dependency rather than a
@@ -446,8 +470,20 @@ function readMeta(subagentsDir: string, id: string): SubagentMeta {
 }
 
 /** Read bytes appended to a file since `offset`. Sync (like the main stream's
- *  `flushSync`) — keeps the per-tick body simple and ordered. */
-function readAppendedSync(filePath: string, offset: number): { text: string; next: number } {
+ *  `flushSync`) — keeps the per-tick body simple and ordered.
+ *
+ *  `maxBytes` (review fix R4, optional): clamps how much of the delta a
+ *  single call reads. Omitted by every caller except `tailBgShells` — those
+ *  callers keep reading the full delta in one shot, byte-identical to before
+ *  this fix. When passed and the available delta exceeds it, only `maxBytes`
+ *  bytes are read and `next` advances by that much instead of jumping to
+ *  `st.size`, so the caller's own offset naturally resumes mid-file on the
+ *  next call and the remainder drains over subsequent ticks. */
+function readAppendedSync(
+  filePath: string,
+  offset: number,
+  maxBytes?: number,
+): { text: string; next: number } {
   let st;
   try { st = statSync(filePath); } catch { return { text: "", next: offset }; }
   // Non-file (in practice: a directory) reads as "nothing appended" instead of
@@ -460,7 +496,8 @@ function readAppendedSync(filePath: string, offset: number): { text: string; nex
   // `toSubagent` coerced container rows into ordinary subagent rows.
   if (!st.isFile()) return { text: "", next: offset };
   if (st.size <= offset) return { text: "", next: offset };
-  const len = st.size - offset;
+  let len = st.size - offset;
+  if (maxBytes !== undefined && len > maxBytes) len = maxBytes;
   const buf = Buffer.alloc(len);
   let fd;
   try { fd = openSync(filePath, "r"); } catch { return { text: "", next: offset }; }
@@ -469,7 +506,10 @@ function readAppendedSync(filePath: string, offset: number): { text: string; nex
   } finally {
     closeSync(fd);
   }
-  return { text: buf.toString("utf8"), next: st.size };
+  // `offset + len` rather than `st.size`: identical value when the read
+  // wasn't clamped (every existing caller), but the correct partial cursor
+  // when it was.
+  return { text: buf.toString("utf8"), next: offset + len };
 }
 
 interface FileState {
@@ -731,6 +771,19 @@ interface BgShellState {
   status: SubagentStatus;
   startedAt: number;
   endedAt: number | null;
+  /** Review fix R1 — the ceiling's anchor, not just a write-side bookkeeping
+   *  field. Seeded to `startedAt` at row creation and to the rehydration
+   *  `attachedAt` on reattach (mirrors `FileState.lastAppendAt`'s own
+   *  rehydration seed, for the same reason: a raw `0`/epoch value would make
+   *  every reattached row instantly eligible for the ceiling), advanced by
+   *  `tailBgShells` on every batch of new output bytes, and reset to "now" on
+   *  a flip-back (the shell just proved it's alive again). `checkBgShellCeiling`
+   *  reads this — never `startedAt` — to decide whether a `running` row has
+   *  gone quiet long enough to infer completion: anchoring on immutable
+   *  `startedAt` instead would settle an actively-writing shell the moment
+   *  its total runtime crosses the ceiling and then flip it back on the very
+   *  next output batch, oscillating settle↔flip-back roughly every poll tick
+   *  for as long as the shell keeps writing. */
   lastAppendAt: number;
   /** Output-file offset at the moment `checkBgShellCeiling` inferred
    *  completion — the flip-back floor: further growth of the output file past
@@ -1529,12 +1582,22 @@ export function attachSubagentWatcher(opts: {
    * has no live tab content. `readAppendedSync` itself never throws (ENOENT/
    * stat errors degrade to "nothing appended"), so this needs no try/catch of
    * its own.
+   *
+   * Review fix R4 — each read is capped at `BG_SHELL_BATCH_MAX_BYTES`; a
+   * shell that outpaces the cap simply drains over more ticks (`b.offset`
+   * only advances by what was actually read, so nothing is skipped, only
+   * deferred). A batch that lands mid multi-byte UTF-8 sequence renders that
+   * one boundary byte-run as the `�` replacement character in this
+   * batch's text — a cosmetic, self-healing artifact (the next batch's bytes
+   * are unaffected), accepted the same way this file already accepts
+   * `tailFile`'s "a batch straddling the replay floor is conservatively
+   * treated as replay for one extra tick" trade-off.
    */
   function tailBgShells(): void {
     for (const b of bgShells.values()) {
       if (b.status !== "running" || !b.outputPath) continue;
       const batchStart = b.offset;
-      const { text, next } = readAppendedSync(b.outputPath, b.offset);
+      const { text, next } = readAppendedSync(b.outputPath, b.offset, BG_SHELL_BATCH_MAX_BYTES);
       if (!text) continue;
       b.offset = next;
       b.lastAppendAt = Date.now();
@@ -1863,26 +1926,47 @@ export function attachSubagentWatcher(opts: {
    * sees it), so without this a lost completion notification would hold its
    * task in `running` forever.
    *
-   * Forward direction: once `now - startedAt` exceeds the shell's own Bash
+   * Forward direction: once `now - lastAppendAt` exceeds the shell's own Bash
    * `timeout` (or `BG_SHELL_DEFAULT_TIMEOUT_MS` when absent/rehydrated) plus
    * `BG_SHELL_TIMEOUT_MARGIN_MS`, settle `completed` (inferred, NOT receipt —
    * see `BgShellState.receiptSettled`) and record `settleFloor` (the output
    * offset at settle time) for the flip-back half below.
    *
+   * Review fix R1 — anchored on `lastAppendAt` (last sign of life), NOT the
+   * immutable `startedAt`. An `startedAt` anchor never moves, so once total
+   * runtime crossed the ceiling it would stay crossed forever: the row
+   * settles here, flips back next tick on `tailBgShells`'s [now-in-the-past]
+   * output growth (since the row was never actually idle), and immediately
+   * re-crosses the same `startedAt`-based ceiling on the tick after that —
+   * oscillating settle↔flip-back roughly once per poll interval for as long
+   * as the shell keeps writing (≈50 column flips + ~100 DB writes/min in the
+   * finding this fixes). `lastAppendAt` only stops advancing once the shell
+   * actually goes quiet, so an actively-writing shell is alive BY EVIDENCE
+   * and never trips the ceiling; a genuinely silent one settles exactly
+   * `ceiling` after its last observed byte, same as before this fix for that
+   * case. See `BgShellState.lastAppendAt`'s own doc for the seed/advance/
+   * reset points that make this anchor trustworthy.
+   *
    * Flip-back direction: mirrors `checkStale`'s "bounce rather than strand"
    * trade-off (W4, see the module header) — a ceiling settle is only a
    * GUESS, so evidence it was wrong (the output file growing past
    * `settleFloor`, meaning the shell was actually still alive) resumes the
-   * hold. Skipped entirely for a `receiptSettled` row: the harness already
-   * said that one is over, and a trailing flush to its output file after the
-   * fact must not resurrect it — same posture as `tailFile`'s
-   * `blockedByReceiptSettle` guard for file-backed rows.
+   * hold (and, per R1, resets `lastAppendAt` so the resumed row gets a fresh
+   * ceiling window rather than being instantly re-eligible). Skipped
+   * entirely for a `receiptSettled` row: the harness already said that one
+   * is over, and a trailing flush to its output file after the fact must not
+   * resurrect it — same posture as `tailFile`'s `blockedByReceiptSettle`
+   * guard for file-backed rows. Review fix R3 — also bounded in TIME, not
+   * just by the `receiptSettled` latch: a row that hasn't proven itself
+   * alive within one more `BG_SHELL_TIMEOUT_MARGIN_MS` past its inferred
+   * settle never will, so it permanently drops out of this per-tick
+   * `statSync` watch instead of paying it forever.
    */
   function checkBgShellCeiling(now: number): void {
     for (const b of bgShells.values()) {
       if (b.status === "running") {
         const ceiling = (b.timeoutMs ?? BG_SHELL_DEFAULT_TIMEOUT_MS) + BG_SHELL_TIMEOUT_MARGIN_MS;
-        if (now - b.startedAt > ceiling) {
+        if (now - b.lastAppendAt > ceiling) {
           b.status = "completed";
           b.endedAt = now;
           b.settleFloor = b.offset;
@@ -1896,6 +1980,15 @@ export function attachSubagentWatcher(opts: {
       // never ceiling-settled or was settled some other way (receipt,
       // orphan) that never set one — nothing to compare against either way.
       if (b.receiptSettled || b.settleFloor === null || !b.outputPath) continue;
+      // Review fix R3 — permanently retire a ceiling-settled row from this
+      // watch once it's had a full extra margin window to prove itself
+      // alive and hasn't. Without this, a shell that settles and never
+      // writes again (the common case — it's actually done) pays a
+      // `statSync` on every tick for the rest of the task's lifetime.
+      if (now - (b.endedAt ?? now) > BG_SHELL_TIMEOUT_MARGIN_MS) {
+        b.settleFloor = null;
+        continue;
+      }
       let size: number;
       try {
         size = statSync(b.outputPath).size;
@@ -1906,6 +1999,11 @@ export function attachSubagentWatcher(opts: {
         b.status = "running";
         b.endedAt = null;
         b.settleFloor = null;
+        // Review fix R1 — the row just proved it's alive again; give it a
+        // fresh ceiling window measured from now rather than leaving
+        // `lastAppendAt` at its stale pre-settle value (which would make it
+        // instantly re-eligible for the ceiling on the very next pass).
+        b.lastAppendAt = now;
         subagentsDb.setStatus(b.id, "running", null);
         emitLifecycleForRow(toBgShellShape(b, taskId), "started");
         fireParkedDiscovery(taskId);
@@ -2147,10 +2245,24 @@ export function attachSubagentWatcher(opts: {
       }
       // Nor a `files` row — check `bgShells` (a bg shell's `backgroundTaskId`
       // IS the notification's `<task-id>`, see the module header's
-      // "Background shells" section). Same idempotent-and-`running`-only
-      // posture as the two lookups above.
+      // "Background shells" section). The SETTLE call keeps the same
+      // idempotent-and-`running`-only posture as the two lookups above, but
+      // review fix R2: the receipt LATCH just below it is unconditional on
+      // `b.status`. `checkBgShellCeiling` can mark a row `completed` (in
+      // memory AND in the DB) before this notification ever arrives; when
+      // that's already happened, `settleSubagentById` → `markSettledById`
+      // finds no `running` row to transition, returns `changed: false`, and
+      // never reaches `syncSettled` — so without a direct latch here,
+      // `receiptSettled` would stay `false` and `settleFloor` would stay
+      // set, leaving the row open to a spurious flip-back the next time the
+      // shell's process flushes its final buffered output, resurrecting a
+      // row the harness has already authoritatively closed out.
       const b = bgShells.get(id);
-      if (b && b.status === "running") settleSubagentById(id, "completed", "receipt");
+      if (b) {
+        b.receiptSettled = true;
+        b.settleFloor = null;
+        if (b.status === "running") settleSubagentById(id, "completed", "receipt");
+      }
     }
   }
 
@@ -2219,16 +2331,55 @@ export function attachSubagentWatcher(opts: {
    * Row creation must NEVER depend on the human-readable output-path parse
    * below — that text is explicitly not a stable contract (see the module
    * header). A regex miss still creates the row with `outputPath: null`,
-   * which only costs the live tab its content, never the hold.
+   * which only costs the live tab its content, never the hold. Review fix
+   * R8 — the path regex now tolerates spaces in the path (e.g. a workdir
+   * under "My Project"), matching everything up to the LAST `.output`
+   * boundary instead of stopping at the first whitespace run.
    *
    * Replay safety: a replayed stub for an id already in `bgShells`
    * (rehydrated from the DB, or created earlier this same process) early-
    * returns — mirrors `registerWorkflowContainer`'s idempotence posture. A
    * settled row must never be resurrected by its own replayed launch stub.
+   * Review fix R7 — the correlated `tool_use_id`'s `bgShellPending` entry is
+   * now consumed BEFORE that early return, not after: a replayed stub still
+   * names a real launch's pending entry, and leaving it behind wastes one of
+   * `BG_SHELL_PENDING_MAX`'s 50 slots permanently (nothing will ever consume
+   * it again) and can evict a genuinely live pending launch once the cap is
+   * hit.
+   *
+   * Review fix R6 — on a coalesced user line carrying MULTIPLE tool_result
+   * blocks (e.g. two backgrounded commands acknowledged in the same turn),
+   * blindly taking the FIRST block risked correlating this stub against the
+   * WRONG launch: wrong description/timeout pulled from `bgShellPending`,
+   * the wrong pending entry deleted (stranding the real one), and the
+   * output-path regex run over unrelated text. Now every tool_result block
+   * is considered and the best match wins: prefer the block whose own
+   * `content` string names THIS stub's `backgroundTaskId` (`id`, resolved
+   * above) — the strongest signal, since claude's stub text always echoes
+   * the id it just minted — then a block whose `tool_use_id` is a launch
+   * this watcher is actually waiting on (`bgShellPending`); only when
+   * neither matches (unexpected content shape, or the pending entry was
+   * already lost) does it fall back to the first block, same as before this
+   * fix.
+   *
+   * Review fix R5 — `startedAt` (and the initial `lastAppendAt`) now prefer
+   * the JSONL line's own top-level `timestamp` (an ISO string present on
+   * real main-JSONL lines) over `Date.now()`. A stub replayed on restart is
+   * being SCANNED now but was WRITTEN whenever claude actually launched the
+   * shell; using the scan time would hand an hours-old (or already-finished)
+   * shell a fresh full ceiling window, wrongly pulling its task back into
+   * `running`. Falls back to `Date.now()` when the field is missing or
+   * doesn't parse to a sane past instant (defensive — not expected to fail
+   * on the verified live shape).
    */
   function scanLineForBgShellStub(line: string): void {
     if (!line.includes("backgroundTaskId")) return;
-    let parsed: { type?: unknown; message?: { content?: unknown }; toolUseResult?: unknown };
+    let parsed: {
+      type?: unknown;
+      message?: { content?: unknown };
+      toolUseResult?: unknown;
+      timestamp?: unknown;
+    };
     try {
       parsed = JSON.parse(line);
     } catch {
@@ -2239,27 +2390,44 @@ export function attachSubagentWatcher(opts: {
     const trObj = tr && typeof tr === "object" ? (tr as Record<string, unknown>) : null;
     const id = typeof trObj?.backgroundTaskId === "string" ? trObj.backgroundTaskId : null;
     if (!id) return;
-    if (bgShells.has(id)) return; // replay of an already-known id — see doc above
 
+    // Review fix R6 — collect EVERY tool_result block instead of taking the
+    // first one, then pick the best match (see the doc above).
     const content = parsed.message?.content;
-    if (!Array.isArray(content)) return;
-    let toolUseId: string | null = null;
-    let contentText: string | null = null;
-    for (const block of content) {
-      if (!block || typeof block !== "object") continue;
-      const cb = block as { type?: unknown; tool_use_id?: unknown; content?: unknown };
-      if (cb.type !== "tool_result") continue;
-      toolUseId = typeof cb.tool_use_id === "string" ? cb.tool_use_id : null;
-      contentText = typeof cb.content === "string" ? cb.content : null;
-      break;
+    const toolResultBlocks: { toolUseId: string | null; content: string | null }[] = [];
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (!block || typeof block !== "object") continue;
+        const cb = block as { type?: unknown; tool_use_id?: unknown; content?: unknown };
+        if (cb.type !== "tool_result") continue;
+        toolResultBlocks.push({
+          toolUseId: typeof cb.tool_use_id === "string" ? cb.tool_use_id : null,
+          content: typeof cb.content === "string" ? cb.content : null,
+        });
+      }
     }
+    const chosen =
+      toolResultBlocks.find((r) => r.content !== null && r.content.includes(id)) ??
+      toolResultBlocks.find((r) => r.toolUseId !== null && bgShellPending.has(r.toolUseId)) ??
+      toolResultBlocks[0] ??
+      null;
+    const toolUseId = chosen?.toolUseId ?? null;
+    const contentText = chosen?.content ?? null;
 
+    // Review fix R7 — consume the pending entry BEFORE the replay
+    // early-return below, not after (see the doc above for why).
     const pending = toolUseId ? bgShellPending.get(toolUseId) : undefined;
     if (toolUseId) bgShellPending.delete(toolUseId);
 
+    if (bgShells.has(id)) return; // replay of an already-known id — see doc above
+
     // Best-effort output-path parse — see the doc above for why a miss must
-    // never block row creation.
-    const pathMatch = contentText ? /Output is being written to:\s*(\S+\.output)/.exec(contentText) : null;
+    // never block row creation. Review fix R8 — tolerates spaces in the
+    // path: matches everything up to the LAST `.output`, not up to the
+    // first whitespace run.
+    const pathMatch = contentText
+      ? /Output is being written to:\s*(.+?\.output)(?=[.\s]|$)/.exec(contentText)
+      : null;
     const outputPath = pathMatch ? pathMatch[1]! : null;
 
     const runId = resolveRunId(taskId);
@@ -2268,6 +2436,10 @@ export function attachSubagentWatcher(opts: {
     if (!runId) return;
 
     const now = Date.now();
+    // Review fix R5 — prefer the line's own timestamp over the scan-time
+    // `now` for `startedAt`/initial `lastAppendAt` (see the doc above).
+    const lineTs = typeof parsed.timestamp === "string" ? Date.parse(parsed.timestamp) : NaN;
+    const startedAt = Number.isFinite(lineTs) && lineTs > 0 && lineTs <= now ? lineTs : now;
     const b: BgShellState = {
       id,
       runId,
@@ -2277,9 +2449,9 @@ export function attachSubagentWatcher(opts: {
       outputPath,
       offset: 0,
       status: "running",
-      startedAt: now,
+      startedAt,
       endedAt: null,
-      lastAppendAt: now,
+      lastAppendAt: startedAt,
       settleFloor: null,
       receiptSettled: false,
     };
@@ -2512,11 +2684,22 @@ export function attachSubagentWatcher(opts: {
       // through, and latching `receiptSettled` here is what keeps
       // `checkBgShellCeiling`'s flip-back from resurrecting a row the
       // harness already said is over — mirrors the `files` branch above.
+      // Note this method only runs when `settleSubagent`'s `markSettledById`
+      // reported `changed: true` (a real `running` → terminal transition) —
+      // the no-op case (row already ceiling-settled) is handled directly by
+      // `scanLineForTaskNotification`'s own unconditional latch (review fix
+      // R2), since it never reaches here.
       const b = bgShells.get(id);
       if (!b) return;
       b.status = status;
       b.endedAt = endedAt;
-      if (source === "receipt") b.receiptSettled = true;
+      if (source === "receipt") {
+        b.receiptSettled = true;
+        // Review fix R2 — clear `settleFloor` alongside the latch so a
+        // receipt landing through THIS path also fully retires the
+        // ceiling's flip-back state, not just the boolean flag.
+        b.settleFloor = null;
+      }
     },
   };
   watchers.set(taskId, handle);

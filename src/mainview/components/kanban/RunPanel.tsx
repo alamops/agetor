@@ -3400,7 +3400,11 @@ function basename(p: string): string {
  * a finished one a check.
  */
 function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean; onSelect: (id: string) => void }) {
-  const label = s.agentType ?? "agent";
+  // Background shells always carry agentType "shell", which reads as a
+  // redundant label right next to the Terminal glyph below when there's no
+  // description to pair it with — prefer a more descriptive fallback for
+  // that row kind.
+  const label = s.parentKind === "bg_session" ? "background shell" : (s.agentType ?? "agent");
   return (
     <button
       type="button"
@@ -3426,10 +3430,13 @@ function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean
       ) : (
         <Check className="size-3 shrink-0 text-muted-foreground" />
       )}
-      {/* Background-shell subagents (agentType "shell", parentKind "bg_session")
+      {/* Background-shell subagents (parentKind "bg_session", agentType "shell")
           get a terminal glyph so they read as distinct from the generic
-          Task-tool subagents in a mixed strip. */}
-      {s.agentType === "shell" && <Terminal className="size-3 shrink-0 text-muted-foreground" />}
+          Task-tool subagents in a mixed strip. Keyed on parentKind — the
+          actual discriminator for "is this a bg shell" — rather than
+          agentType, which is just the literal string bg shells happen to
+          carry. */}
+      {s.parentKind === "bg_session" && <Terminal className="size-3 shrink-0 text-muted-foreground" />}
       <span className="max-w-[10rem] truncate">{label}</span>
       {s.description && (
         <span className="max-w-[12rem] truncate text-muted-foreground/70">· {s.description}</span>
@@ -4093,6 +4100,15 @@ function normalizeLegacyEvent(e: RunEvent): RunEvent {
   if (e.stream === "status" && e.data.startsWith("you: ")) {
     return { ...e, stream: "user", data: e.data.slice("you: ".length) };
   }
+  // Events tagged with a subagentId (background shells, Task subagents, …)
+  // postdate the structured-event refactor entirely — subagent tagging didn't
+  // exist when the legacy `[tool: X] `/`[thinking] `/`[result] ` stdout mapper
+  // was retired, so no legacy row can carry one. Raw background-shell stdout
+  // can legitimately *start* with one of those bracket prefixes (e.g. a test
+  // run emitting `[result] 3 tests failed`), which would otherwise get
+  // misparsed into a bogus structured tool-result card. Bail out before the
+  // prefix matching below.
+  if (e.subagentId) return e;
   if (e.stream !== "stdout" || !e.data) return e;
   const toolMatch = e.data.match(/^\[tool: ([^\]]+)\]\s*([\s\S]*)$/);
   if (toolMatch) {
