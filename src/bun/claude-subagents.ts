@@ -113,6 +113,55 @@
  * immune to the terminal-line flush loss that concurrent agents can hit — a
  * workflow runs up to ~10 at once), or by CASCADE when their container settles.
  *
+ * ── Background shells (`Bash(run_in_background:true)`) ────────────────────
+ *
+ * A `Bash` tool call with `run_in_background: true` is claude's own shell-
+ * backgrounding primitive — structurally unrelated to the Agent/Task/Workflow
+ * tools above. The model fires off a long-running command (a build, an e2e
+ * suite) and keeps working while it runs. There is no sidecar transcript file
+ * and no `subagents/` dir entry at all — just an immediate stub `tool_result`
+ * in the MAIN session JSONL naming a `backgroundTaskId`, and a raw
+ * stdout+stderr redirect file at a path claude reports in that stub's
+ * human-readable text. Without tracking it, `discover()`'s glob never sees
+ * it, `subagents.hasRunning` never counts it, and the task releases to
+ * `review` while the shell is still running.
+ *
+ * We model it as one `subagents` row (`parentKind: "bg_session"`,
+ * `agentType: "shell"`, id = `backgroundTaskId`), built from a two-line
+ * correlation over the MAIN session JSONL — an assistant `tool_use` line
+ * remembered in a small pending map (`scanLineForBgShellLaunch`), then
+ * matched against the immediate stub `tool_result` that names the
+ * `backgroundTaskId` (`scanLineForBgShellStub`), both called from
+ * `scanMainSignals` — rather than from any sidecar file, since there isn't
+ * one. The row's `sourcePath` is the shell's output file, best-effort
+ * regex-parsed from the stub's text (explicitly NOT a stable contract — a
+ * parse miss still creates the row, just with no tab content; see
+ * `scanLineForBgShellStub`). Live output tailing (`tailBgShells`) reads that
+ * file raw and persists/emits it as a `stdout` stream tagged with the row's
+ * id — there is no JSONL mapper involved, unlike every other stream in this
+ * file.
+ *
+ * Settle signals, all funnelling through `settleSubagentById` like every
+ * other row kind: (1) the completion `<task-notification>` — its `<task-id>`
+ * IS the `backgroundTaskId`, so the existing LIVE orchestrator dispatch
+ * (`setBackgroundTaskSettledHandler`) and the restart-safe
+ * `scanLineForTaskNotification` scan both settle this row with ZERO changes
+ * to their own id-matching logic, only a new lookup against `bgShells`;
+ * (2) a bounded ceiling (`checkBgShellCeiling`) — `(Bash timeout ?? a
+ * default) + a margin` after launch, settling `completed` (inferred) if the
+ * notification never arrives, so a lost receipt can never wedge the row
+ * `running` forever; a ceiling-settled (never receipt-settled) row flips back
+ * to `running` if its output file keeps growing afterwards — the same
+ * bounce-rather-than-strand trade-off `checkStale` (W4) makes for file-backed
+ * rows, applied here because the ceiling is itself only a guess. There is no
+ * end-of-turn/staleness idle-detection for a bg shell (no transcript to go
+ * idle by construction, so it is never entered into `files` and `checkStale`
+ * never sees it) — the ceiling is its only backstop besides the notification
+ * and the generic orphan paths, which cover it automatically (kind-agnostic).
+ *
+ * Gated behind `AGETOR_TRACK_BG_SHELLS`, nested under `ENABLED` exactly like
+ * `WORKFLOWS_ENABLED` — see `BG_SHELLS_ENABLED`.
+ *
  * This module is READ-ONLY w.r.t. the agent: it watches files and tails them.
  * It never spawns, signals, or tears down a tmux session — `detach()` only
  * closes fs watchers + the poll timer.
@@ -120,8 +169,9 @@
  * The format is internal to claude and the docs warn it can change between
  * versions, so everything here is defensive (missing dir / meta / fields all
  * degrade gracefully) and gated behind AGETOR_TRACK_SUBAGENTS (default on),
- * with the workflow half additionally gated behind AGETOR_TRACK_WORKFLOWS
- * (default on, nested under the former — see `WORKFLOWS_ENABLED`).
+ * with the workflow half additionally gated behind AGETOR_TRACK_WORKFLOWS and
+ * the bg-shell half behind AGETOR_TRACK_BG_SHELLS (both default on, nested
+ * under the former — see `WORKFLOWS_ENABLED` / `BG_SHELLS_ENABLED`).
  * A parse error on one subagent file can never affect the main stream — it is
  * isolated to that file's tail.
  * ────────────────────────────────────────────────────────────────────────── */
@@ -160,6 +210,20 @@ const ENABLED = process.env.AGETOR_TRACK_SUBAGENTS !== "0";
  *  cache-busting specifier (`./claude-subagents.ts?gate=<uuid>`), the same
  *  idiom the AGETOR_TRACK_SUBAGENTS test already uses. */
 const WORKFLOWS_ENABLED = ENABLED && process.env.AGETOR_TRACK_WORKFLOWS !== "0";
+
+/** Background-shell tracking (`Bash(run_in_background:true)` rows), off only
+ *  when explicitly disabled — and implicitly off whenever subagent tracking as
+ *  a whole is. Nested exactly like `WORKFLOWS_ENABLED`: a bg shell is a *kind*
+ *  of background agent, so disabling the outer switch must disable this too.
+ *  A bg shell writes no sidecar file `discover()`'s glob could ever find (it's
+ *  a raw stdout/stderr redirect, not a JSONL transcript under `subagents/`),
+ *  so `AGETOR_TRACK_BG_SHELLS=0` restores the pre-feature behavior exactly (no
+ *  rows → no hold → no tab) — the rollback lever if a future claude CLI change
+ *  breaks the on-disk assumptions in the module header's "Background shells"
+ *  section. Read once at module load, mirroring `WORKFLOWS_ENABLED` (see that
+ *  constant's doc for the cache-busting re-import idiom a test needs to flip
+ *  this after the module has already loaded). */
+const BG_SHELLS_ENABLED = ENABLED && process.env.AGETOR_TRACK_BG_SHELLS !== "0";
 
 /** Directory (under `<sessionId>/subagents/`) claude writes workflow transcript
  *  dirs into — one `<wf_runId>/` subdir per launched workflow. Created lazily,
@@ -233,6 +297,38 @@ const DONE_IDLE_MS = 1500;
  *  own doc describes; setting `AGETOR_SUBAGENT_STALE_MS` after this module has
  *  already loaded has no effect on the constant below. */
 const STALE_SUBAGENT_SETTLE_MS = Number(process.env.AGETOR_SUBAGENT_STALE_MS) || 10 * 60_000;
+
+/** Ceiling default for a tracked background shell (see the module header's
+ *  "Background shells" section) whose Bash `input.timeout` was absent (the
+ *  model didn't set one) OR whose row was rehydrated — a restart loses the
+ *  in-memory-only `BgShellState.timeoutMs` (not persisted; no column for it),
+ *  so a reattached row always falls back to this default regardless of what
+ *  the original launch specified. Same NaN/0-falls-through posture as
+ *  `STALE_SUBAGENT_SETTLE_MS` above: `Number(...)` on an unset/invalid
+ *  `AGETOR_BG_SHELL_STALE_MS` yields `NaN`, and `NaN || default` (like
+ *  `0 || default`) falls through silently rather than crashing the watcher or
+ *  disabling the ceiling — there is no env-var kill switch for the ceiling
+ *  itself, only for the whole feature (`AGETOR_TRACK_BG_SHELLS=0`). Read once
+ *  at module load, mirroring `STALE_SUBAGENT_SETTLE_MS`. */
+const BG_SHELL_DEFAULT_TIMEOUT_MS = Number(process.env.AGETOR_BG_SHELL_STALE_MS) || 30 * 60_000;
+
+/** Grace margin added on top of a bg shell's own ceiling (explicit Bash
+ *  `timeout` or `BG_SHELL_DEFAULT_TIMEOUT_MS`) before `checkBgShellCeiling`
+ *  infers completion. Gives the CLI's own timeout enforcement — and the
+ *  completion notification it triggers — a head start to arrive first, so the
+ *  common case never touches the ceiling at all; only a genuinely lost
+ *  notification falls through to it. */
+const BG_SHELL_TIMEOUT_MARGIN_MS = 2 * 60_000;
+
+/** Cap on `bgShellPending` (the toolUseId -> {description,timeoutMs} map
+ *  bridging a bg-shell launch line to its immediate stub, see
+ *  `scanLineForBgShellLaunch`). Entries are pruned on consumption by the stub
+ *  half, so this only matters if a stub is ever lost (a malformed line, a
+ *  future claude CLI shape change) — without a cap, a long-lived session that
+ *  keeps launching bg shells whose stubs never arrive would grow this map
+ *  unboundedly. The oldest entry is evicted to make room, on the assumption
+ *  that a launch still pending behind this many newer ones is never coming. */
+const BG_SHELL_PENDING_MAX = 50;
 
 /**
  * SSE sink, injected once by the orchestrator at startup (which owns the
@@ -596,6 +692,76 @@ function toWorkflowShape(w: WorkflowState, taskId: string): Subagent {
   };
 }
 
+/**
+ * In-memory twin of a tracked background shell row (`Bash(run_in_background:
+ * true)` — see the module header's "Background shells" section). Deliberately
+ * NOT a `FileState`: the shell's output file is a raw stdout/stderr redirect,
+ * not a JSONL transcript, so none of the FileState machinery (uuid dedup,
+ * end_turn detection, the `mapJsonlEventToChunks` mapper) applies to it —
+ * mirrors `WorkflowState`'s "own map, never `files`" posture for the same
+ * reason.
+ */
+interface BgShellState {
+  /** = claude's `backgroundTaskId` — also the row PK, and the id BOTH the
+   *  live orchestrator dispatch (`setBackgroundTaskSettledHandler` →
+   *  `settleSubagentById`) and the restart-safe `<task-notification>` scan
+   *  already key off unchanged. */
+  id: string;
+  runId: string;
+  /** The launching Bash tool_use id. Kept for reference/debugging only —
+   *  unlike `FileState.toolUseId`, nothing here correlates a SECOND
+   *  `tool_result` against it: the completion notification (or the ceiling)
+   *  is this row's settle signal, not a `scanLineForToolResult`-style scan.
+   *  `null` only if a stub line ever arrives with no `tool_use_id` block
+   *  (defensive — not expected on the verified live shape). */
+  toolUseId: string | null;
+  description: string | null;
+  /** Bash `input.timeout` (ms) from the launch line, when the model set one.
+   *  `null` after rehydration (not persisted — no column for it) or when the
+   *  model never set one; either way `checkBgShellCeiling` falls back to
+   *  `BG_SHELL_DEFAULT_TIMEOUT_MS`. */
+  timeoutMs: number | null;
+  /** Best-effort regex parse of the stub's human-readable content text.
+   *  `null` on a parse miss — the row still exists and still holds the task,
+   *  it just has no live tab content (see the module header — row creation
+   *  must never depend on this parse succeeding). */
+  outputPath: string | null;
+  /** Byte cursor into `outputPath`. */
+  offset: number;
+  status: SubagentStatus;
+  startedAt: number;
+  endedAt: number | null;
+  lastAppendAt: number;
+  /** Output-file offset at the moment `checkBgShellCeiling` inferred
+   *  completion — the flip-back floor: further growth of the output file past
+   *  this point means the shell was actually still alive. `null` when the row
+   *  has never been ceiling-settled (still running, or settled some other
+   *  way) — there is nothing to compare against, so flip-back is skipped. */
+  settleFloor: number | null;
+  /** Set once an AUTHORITATIVE completion notification settles this row —
+   *  mirrors `FileState.receiptSettled`'s "harder to resurrect" posture. A
+   *  receipt-settled shell never flips back on output growth (the harness
+   *  already said it's over); only a ceiling-settled (inferred) one does. */
+  receiptSettled: boolean;
+}
+
+function toBgShellShape(b: BgShellState, taskId: string): Subagent {
+  return {
+    id: b.id,
+    taskId,
+    runId: b.runId,
+    parentKind: "bg_session",
+    agentType: "shell",
+    description: b.description,
+    spawnDepth: 1,
+    sourcePath: b.outputPath ?? "",
+    toolUseId: b.toolUseId,
+    status: b.status,
+    startedAt: b.startedAt,
+    endedAt: b.endedAt,
+  };
+}
+
 /** Same lifecycle-event shape `emitLifecycle` builds from a live `FileState`,
  *  but built straight off a DB row instead — needed for callers (like
  *  `orphanRunningSubagents` below) that fire for a task with no attached
@@ -733,6 +899,18 @@ export function attachSubagentWatcher(opts: {
   // before (or without) the launch line that names its container — the journal
   // receipts are useful either way.
   const wfJournals = new Map<string, number>();
+  // Background shells (`Bash(run_in_background:true)`) this watcher knows
+  // about, keyed by `backgroundTaskId` (= row PK). Like `workflows`, NEVER
+  // merged into `files` — a bg shell's output file is raw text, not a JSONL
+  // transcript, so none of `FileState`'s machinery applies (see
+  // `BgShellState`, and the module header's "Background shells" section).
+  const bgShells = new Map<string, BgShellState>();
+  // Pending bg-shell launches, `toolUseId -> {description, timeoutMs}` —
+  // bridges the assistant launch line to the immediate stub that follows it
+  // (see `scanLineForBgShellLaunch`/`scanLineForBgShellStub`). Consumed
+  // (deleted) by the stub half; also capped at `BG_SHELL_PENDING_MAX` so a
+  // session whose stub is ever lost can't grow this unboundedly.
+  const bgShellPending = new Map<string, { description: string | null; timeoutMs: number | null }>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let dirWatcher: FSWatcher | null = null;
   let detached = false;
@@ -794,6 +972,49 @@ export function attachSubagentWatcher(opts: {
           // receipts it replays all funnel through `settleSubagentById`, which
           // no-ops on already-settled rows.
           if (row.sourcePath && !wfJournals.has(row.sourcePath)) wfJournals.set(row.sourcePath, 0);
+        }
+        continue;
+      }
+      if (row.parentKind === "bg_session") {
+        // Route to `bgShells`, never `files` — a bg shell's output file is
+        // raw text, not a JSONL transcript, so it must never be handed to
+        // `tailFile`'s mapper-driven machinery (see `BgShellState`).
+        if (BG_SHELLS_ENABLED) {
+          // Offset starts at the file's CURRENT size (not 0, unlike every
+          // `FileState` rehydration above): persisted `run_events` already
+          // cover this row's history via the normal SSE-replay path, and a
+          // raw-text tail has no per-line dedup key the way a JSONL tail
+          // does — re-tailing from 0 would re-persist (and re-emit, since
+          // `runs.appendEvent`'s dedup only applies to a provided
+          // `line_uuid`, and a replayed batch would get a DIFFERENT
+          // `bgshell:<id>:<offset>` key than its first pass) the entire
+          // output as a duplicate stream. `0` on a stat failure (file
+          // genuinely gone, or a transient FS error) degrades to "nothing
+          // more to tail" rather than crashing rehydration.
+          let offset = 0;
+          if (row.sourcePath) {
+            try { offset = statSync(row.sourcePath).size; } catch { /* offset stays 0 */ }
+          }
+          bgShells.set(row.id, {
+            id: row.id,
+            runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+            toolUseId: row.toolUseId ?? null,
+            description: row.description,
+            // Not persisted — a restart loses the specific Bash `timeout`;
+            // `checkBgShellCeiling` falls back to `BG_SHELL_DEFAULT_TIMEOUT_MS`.
+            timeoutMs: null,
+            outputPath: row.sourcePath || null,
+            offset,
+            status: row.status,
+            startedAt: row.startedAt,
+            endedAt: row.endedAt,
+            lastAppendAt: attachedAt,
+            // Never rehydrated (not persisted), mirroring `receiptSettled`
+            // below — a restart re-derives whichever matters the next time
+            // this row's settle-relevant signal replays.
+            settleFloor: null,
+            receiptSettled: false,
+          });
         }
         continue;
       }
@@ -1287,6 +1508,41 @@ export function attachSubagentWatcher(opts: {
     }
   }
 
+  /**
+   * Live output tailing for `running` background shells — the counterpart to
+   * `tailFile` for a raw stdout/stderr redirect instead of a JSONL transcript
+   * (see the module header's "Background shells" section). No mapper, no
+   * line-level parsing, no per-line dedup: `readAppendedSync` hands back
+   * whatever new bytes exist and they're persisted/emitted verbatim as ONE
+   * `stdout` event per batch — mirrors `tailFile`'s persist/emit idiom
+   * exactly (`runs.appendEvent` + the matching `emitFn` call, both taskId-
+   * tagged).
+   *
+   * `line_uuid = "bgshell:<id>:<batchStartOffset>"` — the batch's starting
+   * offset is a stable, monotonically-increasing key per shell, so a
+   * duplicate emit of the same batch (should this ever run twice for the
+   * same bytes) is deduped by the `(run_id, line_uuid)` partial unique index
+   * exactly like every other persisted stream.
+   *
+   * Skips a shell with no known `outputPath` (the best-effort parse in
+   * `scanLineForBgShellStub` missed) — its row still holds the task, it just
+   * has no live tab content. `readAppendedSync` itself never throws (ENOENT/
+   * stat errors degrade to "nothing appended"), so this needs no try/catch of
+   * its own.
+   */
+  function tailBgShells(): void {
+    for (const b of bgShells.values()) {
+      if (b.status !== "running" || !b.outputPath) continue;
+      const batchStart = b.offset;
+      const { text, next } = readAppendedSync(b.outputPath, b.offset);
+      if (!text) continue;
+      b.offset = next;
+      b.lastAppendAt = Date.now();
+      runs.appendEvent(b.runId, "stdout", text, `bgshell:${b.id}:${batchStart}`, b.id);
+      emitFn?.({ runId: b.runId, taskId, stream: "stdout", data: text, ts: Date.now(), subagentId: b.id });
+    }
+  }
+
   /** Tail one subagent file: dispatch newly-appended lines through the shared
    *  mapper, persisting + emitting each chunk tagged with the subagent id. */
   function tailFile(fs: FileState): void {
@@ -1600,6 +1856,64 @@ export function attachSubagentWatcher(opts: {
   }
 
   /**
+   * Bounded ceiling for a tracked background shell (see the module header's
+   * "Background shells" section) — the "the hold is bounded" half of the
+   * feature. A `running` bg shell has no transcript to go idle by
+   * construction (it is never entered into `files`, so `checkStale` never
+   * sees it), so without this a lost completion notification would hold its
+   * task in `running` forever.
+   *
+   * Forward direction: once `now - startedAt` exceeds the shell's own Bash
+   * `timeout` (or `BG_SHELL_DEFAULT_TIMEOUT_MS` when absent/rehydrated) plus
+   * `BG_SHELL_TIMEOUT_MARGIN_MS`, settle `completed` (inferred, NOT receipt —
+   * see `BgShellState.receiptSettled`) and record `settleFloor` (the output
+   * offset at settle time) for the flip-back half below.
+   *
+   * Flip-back direction: mirrors `checkStale`'s "bounce rather than strand"
+   * trade-off (W4, see the module header) — a ceiling settle is only a
+   * GUESS, so evidence it was wrong (the output file growing past
+   * `settleFloor`, meaning the shell was actually still alive) resumes the
+   * hold. Skipped entirely for a `receiptSettled` row: the harness already
+   * said that one is over, and a trailing flush to its output file after the
+   * fact must not resurrect it — same posture as `tailFile`'s
+   * `blockedByReceiptSettle` guard for file-backed rows.
+   */
+  function checkBgShellCeiling(now: number): void {
+    for (const b of bgShells.values()) {
+      if (b.status === "running") {
+        const ceiling = (b.timeoutMs ?? BG_SHELL_DEFAULT_TIMEOUT_MS) + BG_SHELL_TIMEOUT_MARGIN_MS;
+        if (now - b.startedAt > ceiling) {
+          b.status = "completed";
+          b.endedAt = now;
+          b.settleFloor = b.offset;
+          subagentsDb.setStatus(b.id, "completed", now);
+          emitLifecycleForRow(toBgShellShape(b, taskId), "finished");
+          fireSettle(taskId);
+        }
+        continue;
+      }
+      // Flip-back candidates only: a row with no `settleFloor` was either
+      // never ceiling-settled or was settled some other way (receipt,
+      // orphan) that never set one — nothing to compare against either way.
+      if (b.receiptSettled || b.settleFloor === null || !b.outputPath) continue;
+      let size: number;
+      try {
+        size = statSync(b.outputPath).size;
+      } catch {
+        continue; // file gone/unreadable this tick — try again next cycle
+      }
+      if (size > b.settleFloor) {
+        b.status = "running";
+        b.endedAt = null;
+        b.settleFloor = null;
+        subagentsDb.setStatus(b.id, "running", null);
+        emitLifecycleForRow(toBgShellShape(b, taskId), "started");
+        fireParkedDiscovery(taskId);
+      }
+    }
+  }
+
+  /**
    * Third settle signal (see module header): match one MAIN-session-JSONL line
    * against the `tool_result` blocks whose `tool_use_id` equals a tracked
    * `running` subagent's `toolUseId` — the fallback for a synchronous
@@ -1827,48 +2141,200 @@ export function attachSubagentWatcher(opts: {
       // unconditionally for every id costs nothing on the common case where
       // the id matches neither.
       const fs = files.get(id);
-      if (fs && fs.status === "running") settleSubagentById(id, "completed", "receipt");
+      if (fs && fs.status === "running") {
+        settleSubagentById(id, "completed", "receipt");
+        continue;
+      }
+      // Nor a `files` row — check `bgShells` (a bg shell's `backgroundTaskId`
+      // IS the notification's `<task-id>`, see the module header's
+      // "Background shells" section). Same idempotent-and-`running`-only
+      // posture as the two lookups above.
+      const b = bgShells.get(id);
+      if (b && b.status === "running") settleSubagentById(id, "completed", "receipt");
     }
+  }
+
+  /**
+   * Background-shell LAUNCH detection, half 1 of 2: an assistant `tool_use`
+   * block for `Bash` with `input.run_in_background === true`. Its own line
+   * carries only the tool_use id + description/timeout — the id that
+   * actually PKs the row (`backgroundTaskId`) doesn't exist yet; claude mints
+   * it on the immediate stub `tool_result` that follows in a LATER main-JSONL
+   * line (`scanLineForBgShellStub`). So this half only remembers
+   * `{description, timeoutMs}` under the tool_use id, in `bgShellPending`, for
+   * the stub half to pick up once it arrives.
+   *
+   * Verified live shape (see the plan doc):
+   *   {"type":"assistant","message":{"content":[{"type":"tool_use",
+   *    "id":…,"name":"Bash","input":{"command":…,"description":…,
+   *    "timeout":600000,"run_in_background":true}}]}}
+   */
+  function scanLineForBgShellLaunch(line: string): void {
+    // Cheap prefilter before any JSON.parse — the overwhelming majority of
+    // main-JSONL lines don't mention this substring at all.
+    if (!line.includes("run_in_background")) return;
+    let parsed: { type?: unknown; message?: { content?: unknown } };
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return; // one bad line must not abort the scan of the rest
+    }
+    if (parsed.type !== "assistant") return;
+    const content = parsed.message?.content;
+    if (!Array.isArray(content)) return;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const b = block as { type?: unknown; id?: unknown; name?: unknown; input?: unknown };
+      if (b.type !== "tool_use" || b.name !== "Bash" || typeof b.id !== "string") continue;
+      const input = b.input && typeof b.input === "object" ? (b.input as Record<string, unknown>) : null;
+      if (!input || input.run_in_background !== true) continue;
+      // Prune the oldest entry before inserting a new one once at the cap —
+      // see `BG_SHELL_PENDING_MAX`'s doc.
+      if (!bgShellPending.has(b.id) && bgShellPending.size >= BG_SHELL_PENDING_MAX) {
+        const oldest = bgShellPending.keys().next().value;
+        if (oldest !== undefined) bgShellPending.delete(oldest);
+      }
+      bgShellPending.set(b.id, {
+        description: typeof input.description === "string" ? input.description : null,
+        timeoutMs: typeof input.timeout === "number" ? input.timeout : null,
+      });
+    }
+  }
+
+  /**
+   * Background-shell LAUNCH detection, half 2 of 2: the immediate stub
+   * `tool_result` claude writes the moment a `Bash(run_in_background:true)`
+   * call is accepted. Verified live shape (see the plan doc):
+   *   {"type":"user","message":{"content":[{"type":"tool_result",
+   *    "tool_use_id":…,"content":"Command running in background with ID:
+   *    <id>. Output is being written to: <path>. You will be notified when
+   *    it completes.","is_error":false}]},"toolUseResult":{"stdout":"",
+   *    "stderr":"","interrupted":false,"backgroundTaskId":"<id>"}}
+   * `backgroundTaskId` IS the row PK — the same id both the LIVE orchestrator
+   * dispatch (`setBackgroundTaskSettledHandler`) and
+   * `scanLineForTaskNotification`'s widened lookup above key off unchanged,
+   * so creating the row under that id is all that's needed to wire up both
+   * settle paths with zero further changes to either.
+   *
+   * Row creation must NEVER depend on the human-readable output-path parse
+   * below — that text is explicitly not a stable contract (see the module
+   * header). A regex miss still creates the row with `outputPath: null`,
+   * which only costs the live tab its content, never the hold.
+   *
+   * Replay safety: a replayed stub for an id already in `bgShells`
+   * (rehydrated from the DB, or created earlier this same process) early-
+   * returns — mirrors `registerWorkflowContainer`'s idempotence posture. A
+   * settled row must never be resurrected by its own replayed launch stub.
+   */
+  function scanLineForBgShellStub(line: string): void {
+    if (!line.includes("backgroundTaskId")) return;
+    let parsed: { type?: unknown; message?: { content?: unknown }; toolUseResult?: unknown };
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (parsed.type !== "user") return;
+    const tr = parsed.toolUseResult;
+    const trObj = tr && typeof tr === "object" ? (tr as Record<string, unknown>) : null;
+    const id = typeof trObj?.backgroundTaskId === "string" ? trObj.backgroundTaskId : null;
+    if (!id) return;
+    if (bgShells.has(id)) return; // replay of an already-known id — see doc above
+
+    const content = parsed.message?.content;
+    if (!Array.isArray(content)) return;
+    let toolUseId: string | null = null;
+    let contentText: string | null = null;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const cb = block as { type?: unknown; tool_use_id?: unknown; content?: unknown };
+      if (cb.type !== "tool_result") continue;
+      toolUseId = typeof cb.tool_use_id === "string" ? cb.tool_use_id : null;
+      contentText = typeof cb.content === "string" ? cb.content : null;
+      break;
+    }
+
+    const pending = toolUseId ? bgShellPending.get(toolUseId) : undefined;
+    if (toolUseId) bgShellPending.delete(toolUseId);
+
+    // Best-effort output-path parse — see the doc above for why a miss must
+    // never block row creation.
+    const pathMatch = contentText ? /Output is being written to:\s*(\S+\.output)/.exec(contentText) : null;
+    const outputPath = pathMatch ? pathMatch[1]! : null;
+
+    const runId = resolveRunId(taskId);
+    // Same defensive skip `discover()`/`registerWorkflowContainer` make — no
+    // run to attach events to. In practice a live session always has one.
+    if (!runId) return;
+
+    const now = Date.now();
+    const b: BgShellState = {
+      id,
+      runId,
+      toolUseId,
+      description: pending?.description ?? null,
+      timeoutMs: pending?.timeoutMs ?? null,
+      outputPath,
+      offset: 0,
+      status: "running",
+      startedAt: now,
+      endedAt: null,
+      lastAppendAt: now,
+      settleFloor: null,
+      receiptSettled: false,
+    };
+    bgShells.set(id, b);
+    lastChangeAt = Date.now();
+    subagentsDb.insertIfAbsent(toBgShellShape(b, taskId));
+    emitLifecycleForRow(toBgShellShape(b, taskId), "started");
+    fireParkedDiscovery(taskId);
   }
 
   /**
    * Single pass over the bytes appended to the MAIN session JSONL since the
    * last pass, feeding every signal this watcher derives from it: tool_result
-   * correlation settles (above) and — when workflows are tracked — workflow
-   * launch detection plus the generalized task-notification backstop (W3,
-   * `scanLineForTaskNotification`).
+   * correlation settles (above); when workflows are tracked, workflow launch
+   * detection; when bg shells are tracked, the two-line bg-shell launch
+   * correlation (`scanLineForBgShellLaunch` + `scanLineForBgShellStub`); and
+   * the generalized task-notification backstop (W3,
+   * `scanLineForTaskNotification`), which now settles workflow containers,
+   * ordinary rows, AND bg shells.
    *
    * One shared `mainOffset` cursor, one read, one split. The early return is
    * deliberately narrow: bailing on `pending.length === 0` (as this did when
-   * tool_results were its only signal) would starve workflow/notification
-   * detection on exactly the common case — a task with no `toolUseId`-bearing
-   * subagent rows at all (which, post-W2, includes every async subagent as
-   * soon as its launch stub is scanned). So it only short-circuits when there
-   * is nothing of EITHER kind to look for.
+   * tool_results were its only signal) would starve workflow/bg-shell/
+   * notification detection on exactly the common case — a task with no
+   * `toolUseId`-bearing subagent rows at all (which, post-W2, includes every
+   * async subagent as soon as its launch stub is scanned). So it only
+   * short-circuits when there is nothing of ANY tracked kind to look for.
    *
-   * NOTE — `scanLineForTaskNotification` is gated behind `WORKFLOWS_ENABLED`
-   * below along with workflow launch detection, even though it now also
-   * backstops plain (non-workflow) async subagents. That's a deliberate
+   * NOTE — `scanLineForTaskNotification` runs whenever EITHER `WORKFLOWS_ENABLED`
+   * or bg shells are actively tracked (`BG_SHELLS_ENABLED && bgShells.size >
+   * 0` — no point scanning for a notification naming a row this watcher
+   * hasn't created yet), even though it also backstops plain (non-workflow)
+   * async subagents whenever workflows are on. That's a deliberate
    * scope-preserving choice, not an oversight: `WORKFLOWS_ENABLED` defaults
    * on, so this covers the overwhelming majority of installs unchanged; an
-   * operator who explicitly sets `AGETOR_TRACK_WORKFLOWS=0` also loses the
-   * async-notification backstop for ordinary subagents (they still have the
-   * end_turn-idle and staleness backstops) — a narrower rollback lever was
-   * judged preferable to adding a second independent env var for one scan.
+   * operator who explicitly sets `AGETOR_TRACK_WORKFLOWS=0` (with bg shells
+   * also off, or none yet discovered) also loses the async-notification
+   * backstop for ordinary subagents (they still have the end_turn-idle and
+   * staleness backstops) — a narrower rollback lever was judged preferable to
+   * adding a second independent env var for one scan.
    *
-   * COST NOTE — that widening means a workflow-tracking watcher scans the main
-   * transcript on every cycle, where before it usually skipped the read
-   * entirely. Two things keep that bounded: the first read after attach starts
-   * at most `REPLAY_WINDOW_BYTES` from the end (see the clamp in
-   * `attachSubagentWatcher`), and every read after it is incremental — the
-   * cursor only ever moves forward, so steady state is one `statSync` plus the
-   * handful of bytes the turn actually appended. The old "a task with no
-   * background agents never pays for this scan at all" property survives only
-   * with `AGETOR_TRACK_WORKFLOWS=0`.
+   * COST NOTE — tracking workflows OR bg shells means this watcher scans the
+   * main transcript on every cycle, where before (neither tracked) it usually
+   * skipped the read entirely. Two things keep that bounded: the first read
+   * after attach starts at most `REPLAY_WINDOW_BYTES` from the end (see the
+   * clamp in `attachSubagentWatcher`), and every read after it is incremental
+   * — the cursor only ever moves forward, so steady state is one `statSync`
+   * plus the handful of bytes the turn actually appended. The old "a task
+   * with no background agents never pays for this scan at all" property
+   * survives only with both `AGETOR_TRACK_WORKFLOWS=0` and
+   * `AGETOR_TRACK_BG_SHELLS=0`.
    */
   function scanMainSignals(): void {
     const pending = [...files.values()].filter((fs) => fs.status === "running" && fs.toolUseId);
-    if (pending.length === 0 && !WORKFLOWS_ENABLED) return;
+    if (pending.length === 0 && !WORKFLOWS_ENABLED && !BG_SHELLS_ENABLED) return;
 
     const { text, next } = readAppendedSync(opts.jsonlPath, mainOffset);
     if (!text) return;
@@ -1884,8 +2350,15 @@ export function attachSubagentWatcher(opts: {
         // same batch, and in file order the launch always precedes its
         // notification — so a workflow that started and finished while agetor
         // was down is registered and then settled within one pass, never left
-        // holding the card.
+        // holding the card. Same ordering argument applies to the bg-shell
+        // pair below.
         scanLineForWorkflowLaunch(line);
+      }
+      if (BG_SHELLS_ENABLED) {
+        scanLineForBgShellLaunch(line);
+        scanLineForBgShellStub(line);
+      }
+      if (WORKFLOWS_ENABLED || (BG_SHELLS_ENABLED && bgShells.size > 0)) {
         scanLineForTaskNotification(line);
       }
     }
@@ -1955,9 +2428,11 @@ export function attachSubagentWatcher(opts: {
         } catch { /* file gone/unreadable this tick — try again next cycle */ }
       }
       tailJournals();
+      if (BG_SHELLS_ENABLED) tailBgShells();
       scanMainSignals();
       checkDone(now);
       checkStale(now);
+      if (BG_SHELLS_ENABLED) checkBgShellCeiling(now);
     } catch { /* swallow — never crash the timer */ }
   }
 
@@ -1968,17 +2443,20 @@ export function attachSubagentWatcher(opts: {
     // A live workflow CONTAINER counts as "running" for cadence purposes even
     // when no agent file is open right now: between waves it is the only thing
     // holding the card, and the next wave's files should be picked up on the
-    // fast tier, not four seconds late.
+    // fast tier, not four seconds late. A `running` bg shell is the same case
+    // between its launch and its settle — there is no file to open at all.
     const anyRunning =
       [...files.values()].some((f) => f.status === "running") ||
-      [...workflows.values()].some((w) => w.status === "running");
+      [...workflows.values()].some((w) => w.status === "running") ||
+      [...bgShells.values()].some((b) => b.status === "running");
     let delay: number;
     if (anyRunning) {
       delay = FAST_POLL_MS;
-    } else if (files.size === 0 && workflows.size === 0 && wfJournals.size === 0
+    } else if (files.size === 0 && workflows.size === 0 && wfJournals.size === 0 && bgShells.size === 0
                && now - lastChangeAt >= DEEP_IDLE_AFTER_MS) {
-      // Never discovered a subagent OR a workflow and nothing's happened for
-      // a while — back off further than the ordinary idle cadence.
+      // Never discovered a subagent, a workflow, OR a bg shell and nothing's
+      // happened for a while — back off further than the ordinary idle
+      // cadence.
       delay = DEEP_IDLE_POLL_MS;
     } else {
       delay = SLOW_POLL_MS;
@@ -2023,9 +2501,22 @@ export function attachSubagentWatcher(opts: {
       // a container on every subsequent replay of the notification line, and
       // so the cadence check above drops back off the fast tier.
       const w = workflows.get(id);
-      if (!w) return;
-      w.status = status;
-      w.endedAt = endedAt;
+      if (w) {
+        w.status = status;
+        w.endedAt = endedAt;
+        return;
+      }
+      // Background shells live in their own map too (no file to back them —
+      // see `BgShellState`). This is what the LIVE orchestrator dispatch
+      // (`setBackgroundTaskSettledHandler` → `settleSubagentById`) flows
+      // through, and latching `receiptSettled` here is what keeps
+      // `checkBgShellCeiling`'s flip-back from resurrecting a row the
+      // harness already said is over — mirrors the `files` branch above.
+      const b = bgShells.get(id);
+      if (!b) return;
+      b.status = status;
+      b.endedAt = endedAt;
+      if (source === "receipt") b.receiptSettled = true;
     },
   };
   watchers.set(taskId, handle);

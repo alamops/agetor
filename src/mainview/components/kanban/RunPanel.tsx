@@ -3426,6 +3426,10 @@ function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean
       ) : (
         <Check className="size-3 shrink-0 text-muted-foreground" />
       )}
+      {/* Background-shell subagents (agentType "shell", parentKind "bg_session")
+          get a terminal glyph so they read as distinct from the generic
+          Task-tool subagents in a mixed strip. */}
+      {s.agentType === "shell" && <Terminal className="size-3 shrink-0 text-muted-foreground" />}
       <span className="max-w-[10rem] truncate">{label}</span>
       {s.description && (
         <span className="max-w-[12rem] truncate text-muted-foreground/70">· {s.description}</span>
