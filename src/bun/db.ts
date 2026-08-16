@@ -76,6 +76,7 @@ type TaskRow = {
   backlog: string;
   draft: string | null;
   plans: string;
+  todo_progress: string | null;
   run_id: string | null; created_at: number; updated_at: number;
   archived_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
@@ -137,8 +138,10 @@ const parseBacklog = (raw: string): BacklogMessage[] => {
  *  state — "approved" when approvedAt proves an approval happened, else
  *  "superseded" — never "pending": approve is non-idempotent (writes a file,
  *  messages a live agent), so corruption must not resurrect an approve button.
- *  Losing the record entirely would still be worse, so it is kept. */
-const PLAN_STATUSES = new Set<string>(["pending", "approved", "superseded"]);
+ *  Losing the record entirely would still be worse, so it is kept. `rejected`
+ *  (claude-code `ExitPlanMode` plans only — a resolved-but-not-approved
+ *  outcome) is a real, non-corrupt terminal status, not a fallback target. */
+const PLAN_STATUSES = new Set<string>(["pending", "approved", "superseded", "rejected"]);
 
 const parsePlans = (raw: string): TaskPlan[] => {
   try {
@@ -211,6 +214,30 @@ const parseDraft = (raw: unknown): TaskDraft | null => {
   } catch { return null; }
 };
 
+/** Parse the stored `todo_progress` JSON, tolerating NULL (no todo-family
+ *  tool call observed yet), malformed JSON, and unexpected shapes — all
+ *  collapse to `null` rather than throwing, same treatment as `parseDraft`.
+ *  Only `{ completed: number, total: number }` is accepted, and only when
+ *  both are non-negative integers with `completed <= total`
+ *  (`{completed:9,total:0}` or a negative count is exactly as invalid as a
+ *  missing/wrong-typed field) — anything else is discarded wholesale rather
+ *  than partially trusted, since a corrupt summary is worse than none. */
+const parseTodoProgress = (raw: string | null): Task["todoProgress"] => {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const completed = (parsed as { completed?: unknown }).completed;
+    const total = (parsed as { total?: unknown }).total;
+    if (
+      typeof completed !== "number" || !Number.isInteger(completed) || completed < 0
+      || typeof total !== "number" || !Number.isInteger(total) || total < 0
+      || completed > total
+    ) return null;
+    return { completed, total };
+  } catch { return null; }
+};
+
 /** Optional pre-computed grouped counts, threaded in by `tasks.list()` so a
  *  multi-row query does one pass over each in-memory registry instead of a
  *  per-row `countPendingForTask`/`countTerminals` scan (289 tasks × 2 linear
@@ -252,6 +279,7 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   hasOpenableRun: r.has_openable_run === 1,
   pendingInteractionCount: counts?.pending ? (counts.pending.get(r.id) ?? 0) : countPendingForTask(r.id),
   openTerminalCount: counts?.terminals ? (counts.terminals.get(r.id) ?? 0) : countTerminals(r.id),
+  todoProgress: parseTodoProgress(r.todo_progress),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   archivedAt: r.archived_at,
@@ -293,9 +321,9 @@ export const tasks = {
     db.run(
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
-          branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans,
+          branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -304,13 +332,14 @@ export const tasks = {
         JSON.stringify(t.backlog ?? []),
         t.draft ? JSON.stringify(t.draft) : null,
         JSON.stringify(t.plans ?? []),
+        t.todoProgress ? JSON.stringify(t.todoProgress) : null,
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
       ],
     );
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -319,7 +348,7 @@ export const tasks = {
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
-         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?,
+         branch=?, branch_source=?, worktree_path=?, base_ref=?, pr_url=?, mode=?, model=?, effort=?, fast=?, max_mode=?, refs=?, backlog=?, draft=?, plans=?, todo_progress=?,
          run_id=?, updated_at=?, archived_at=?
        WHERE id=?`,
       [
@@ -330,6 +359,7 @@ export const tasks = {
         JSON.stringify(next.backlog ?? []),
         next.draft ? JSON.stringify(next.draft) : null,
         JSON.stringify(next.plans ?? []),
+        next.todoProgress ? JSON.stringify(next.todoProgress) : null,
         next.runId, next.updatedAt, next.archivedAt ?? null, id,
       ],
     );
@@ -1056,6 +1086,52 @@ export const runs = {
        ORDER BY id DESC
        LIMIT ?`,
     ).all(limit);
+  },
+  /** Todo-family tool events for a task, across every run, in event-id
+   *  (chronological) order — main-stream only (`subagent_id IS NULL`, same
+   *  rationale as `lastEventData`/`lastToolUseData`: a background agent's own
+   *  TodoWrite/TaskCreate/TaskUpdate calls track ITS todos, not the primary
+   *  task's, and must not be mixed into the board summary).
+   *
+   *  Two different LIKE shapes for the two streams, deliberately NOT a
+   *  single shared marker set (mirrors `isTodoFamilyChunk` in
+   *  orchestrator.ts, same split for the same reason):
+   *   - `tool_use` rows carry `"name":"<Tool>"` in their JSON envelope, so
+   *     the filter matches that literal envelope form rather than a bare
+   *     substring — a bare `LIKE '%TaskCreate%'` also matches an unrelated
+   *     tool_result whose text happens to quote "TaskCreate" (this repo
+   *     dogfoods itself, so that's a real false positive, not a theoretical
+   *     one).
+   *   - `tool_result` rows have NO tool name at all (`{toolUseId, content,
+   *     isError}`) — only `TaskCreate`'s result is ever consulted by
+   *     `deriveTodoProgress` (to resolve the "Task #N" number), and always
+   *     via the fixed `"Task #N created successfully"` text Claude emits, so
+   *     that's the cheapest-but-correct marker: cheaper than admitting every
+   *     tool_result row for the task (most of which `deriveTodoProgress`
+   *     would just discard by unmatched `toolUseId`), and correct because it
+   *     targets the exact literal all TaskCreate results share.
+   *  Backs the orchestrator chunk handler's board-summary update: rare
+   *  chunks, so a full re-derive per call is cheap, and because the chunk
+   *  handler always calls `runs.appendEvent` before running this query (see
+   *  `makeChunkHandler`), the just-arrived chunk is already included — no
+   *  separate "append the current chunk" step needed. */
+  todoRelevantEventsForTask(taskId: string): Array<{ stream: string; data: string }> {
+    return db.query<{ stream: string; data: string }, [string]>(
+      `SELECT stream, data
+       FROM run_events
+       JOIN runs ON runs.id = run_events.run_id
+       WHERE runs.task_id = ?
+         AND run_events.subagent_id IS NULL
+         AND (
+           (run_events.stream = 'tool_use' AND (
+             data LIKE '%"name":"TodoWrite"%'
+             OR data LIKE '%"name":"TaskCreate"%'
+             OR data LIKE '%"name":"TaskUpdate"%'
+           ))
+           OR (run_events.stream = 'tool_result' AND data LIKE '%created successfully%')
+         )
+       ORDER BY run_events.id ASC`,
+    ).all(taskId);
   },
   /** Cheap existence check — is there at least one persisted event for this
    *  task older than `beforeId`? Backs the `hasMore` flag on both the SSE

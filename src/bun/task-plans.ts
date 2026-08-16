@@ -183,3 +183,93 @@ export function approvePlan(
   next[idx] = approved;
   return { plans: next, approved };
 }
+
+/**
+ * Record a freshly-detected claude-code `ExitPlanMode` plan. Thin wrapper
+ * over `upsertDetectedPlan` — claude's `ExitPlanMode` tool_use has no `name`
+ * field (cursor's `createPlanToolCall` does), so this always passes
+ * `name: null`. Same idempotent-by-`toolCallId` / supersede-prior-`pending`
+ * contract as the cursor path: a reattach-replayed tool_use is a no-op
+ * (dedup by `toolCallId`), and at most one plan is ever `pending` per task —
+ * a fresh `ExitPlanMode` supersedes whatever was pending before it.
+ *
+ * Claude plans are read-only records once created: approval stays a live
+ * tmux-keystroke flow (see `resolveClaudePlan`), not a route — so unlike
+ * cursor's `approvePlan`, nothing here ever sets `filePath`.
+ */
+export function upsertClaudePlanFromExitPlanMode(
+  plans: TaskPlan[],
+  input: { toolCallId: string; runId: string; content: string; now: number },
+): TaskPlan[] {
+  return upsertDetectedPlan(plans, { ...input, name: null });
+}
+
+/** Exact prefix claude's `ExitPlanMode` approval tool_result starts with when
+ *  the user approved the plan (verified against real JSONL — plan §2). Any
+ *  other tool_result content for the same call id (rejection copy, an
+ *  interrupted turn, …) is treated as a rejection — there is no separate
+ *  "the user explicitly rejected" signal to match on. */
+const CLAUDE_PLAN_APPROVED_PREFIX = "User has approved your plan";
+
+/** Marker claude's approval tool_result includes when the user edited the
+ *  plan in the native UI before approving — everything after it is the
+ *  edited plan markdown, replacing the original. */
+const CLAUDE_PLAN_EDITED_MARKER = "## Approved Plan (edited by user):";
+
+/**
+ * Resolve a claude-code `ExitPlanMode` plan from its matching tool_result.
+ * Mirrors `upsertDetectedPlan`'s "return the SAME array by reference when
+ * there's nothing to do" contract, so callers can gate the DB write on
+ * `next !== plans` exactly like `detectCursorPlan` already does for cursor —
+ * that covers a stale/duplicate tool_result replayed on reattach, a
+ * `toolCallId` from another task, and (defensively) a plan that's already
+ * left `pending` for any reason.
+ *
+ * `resultContent` is the tool_result's raw text — matched after
+ * `trimStart()` so incidental leading whitespace (e.g. a leading "\n" some
+ * claude output shapes prepend) can never flip a genuine approval into a
+ * permanent `rejected` verdict; the exact-prefix contract only ever needed
+ * to rule out *content* differences, not incidental leading whitespace:
+ *  - starts with `"User has approved your plan"` → `approved`. When it also
+ *    contains the `"## Approved Plan (edited by user):"` marker, the text
+ *    after the marker becomes `editedContent` (the edited plan wins, same
+ *    `effectiveContent` convention cursor plans use) and `approvedEdited` is
+ *    derived from that, matching `approvePlan`'s convention.
+ *  - anything else → `rejected` (user declined, or the turn was interrupted
+ *    before an explicit approval/rejection was recorded).
+ *
+ * Claude plans never get a `filePath` — approval doesn't write a file the
+ * way cursor's `approvePlan` does; the plan stays a read-only history record.
+ */
+export function resolveClaudePlan(
+  plans: TaskPlan[],
+  toolCallId: string,
+  resultContent: string,
+  now: number,
+): TaskPlan[] {
+  const idx = plans.findIndex((p) => p.toolCallId === toolCallId);
+  if (idx === -1) return plans;
+  const plan = plans[idx]!;
+  if (plan.status !== "pending") return plans;
+
+  const trimmed = resultContent.trimStart();
+  const next = [...plans];
+  if (!trimmed.startsWith(CLAUDE_PLAN_APPROVED_PREFIX)) {
+    next[idx] = { ...plan, status: "rejected", approvedAt: null };
+    return next;
+  }
+
+  const markerIdx = trimmed.indexOf(CLAUDE_PLAN_EDITED_MARKER);
+  const editedContent = markerIdx === -1
+    ? null
+    : trimmed.slice(markerIdx + CLAUDE_PLAN_EDITED_MARKER.length).trim() || null;
+
+  next[idx] = {
+    ...plan,
+    status: "approved",
+    editedContent,
+    approvedAt: now,
+    approvedEdited: editedContent !== null,
+  };
+  return next;
+}

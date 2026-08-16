@@ -1,0 +1,11 @@
+One main model with others as failover/cost backups.
+  2. Task-specialized
+  Each provider handles a specific job
+  (OCR vs translate vs explain vs chat).
+  3. Experimental
+  Several are leftovers/experiments, not all in active use.
+  4. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

@@ -5,7 +5,8 @@ import { basename, join } from "node:path";
 import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
-import { upsertDetectedPlan } from "./task-plans.ts";
+import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
+import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
 import {
   AGENT_OPTIONS,
   DEFAULT_BRANCH_CONFIG,
@@ -439,6 +440,25 @@ export function __emitForTest(e: RunEvent): void {
  *  surface. */
 export function __emitGlobalForTest(e: GlobalEvent): void {
   emitGlobal(e);
+}
+
+/**
+ * Test hook: build and immediately fire a `makeChunkHandler` chunk for a
+ * given run/task — the SAME handler real runs use (`runs.appendEvent` +
+ * SSE emit + todo-progress/claude-plan detection + the api-error/
+ * session-died/unknown-command sentinel checks). Lets orchestrator-level
+ * tests (e.g. `orchestrator-claude-plan.test.ts`) drive synthetic
+ * `tool_use`/`tool_result` chunks through the real detection pipeline
+ * without a canned fake-driver scenario for every shape under test. Not
+ * part of the public surface. */
+export function __dispatchChunkForTest(
+  runId: string,
+  taskId: string,
+  kind: AgentKind,
+  stream: RunEvent["stream"],
+  data: string,
+): void {
+  makeChunkHandler(runId, taskId, kind, null)(stream, data);
 }
 
 /**
@@ -936,6 +956,167 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   return { runId };
 }
 
+/** Cheap pre-filter before doing the more expensive JSON-parse + DB query a
+ *  todo-family chunk triggers below — TodoWrite/TaskCreate/TaskUpdate chunks
+ *  are rare (most chunks are assistant text, thinking, or unrelated tool
+ *  calls), so a plain substring check keeps the hot path a single `includes`
+ *  away from a no-op. Markers are the literal serialized `"name":"<Tool>"`
+ *  envelope form (see `claude-tmux.ts`'s `JSON.stringify` of `tool_use`
+ *  blocks — no spaces), not a bare tool name substring: agetor dogfoods
+ *  itself, so an assistant/tool_result chunk quoting "TaskCreate" in prose
+ *  (e.g. describing this very code) is a real false positive with the bare
+ *  form, not a theoretical one.
+ *
+ *  Split by stream, mirroring `runs.todoRelevantEventsForTask`'s SQL LIKE
+ *  filter in db.ts (same split, same reason): a `tool_use` row carries
+ *  `"name":"<Tool>"`, but a `tool_result` row never does (`{toolUseId,
+ *  content, isError}`) — its ONLY todo-family shape `deriveTodoProgress`
+ *  ever consults is a `TaskCreate` result's `"Task #N created successfully"`
+ *  text, so that's the marker for the `tool_result` side. Without this
+ *  separate check, `tool_result` rows would never re-trigger the board
+ *  summary, and a TaskCreate's claude-assigned number wouldn't be reflected
+ *  until some unrelated LATER tool_use chunk happened to fire the recompute. */
+const TODO_FAMILY_TOOL_USE_MARKERS = ['"name":"TodoWrite"', '"name":"TaskCreate"', '"name":"TaskUpdate"'];
+const TODO_FAMILY_TOOL_RESULT_MARKER = "created successfully";
+
+function isTodoFamilyChunk(stream: RunEvent["stream"], data: string): boolean {
+  if (stream === "tool_use") return TODO_FAMILY_TOOL_USE_MARKERS.some((m) => data.includes(m));
+  if (stream === "tool_result") return data.includes(TODO_FAMILY_TOOL_RESULT_MARKER);
+  return false;
+}
+
+/**
+ * Re-derive and persist the board-level `tasks.todo_progress` summary after a
+ * todo-family `tool_use`/`tool_result` chunk lands. Works for every agent
+ * kind — chunks are a generic `{stream,data}` shape, and gating this on
+ * `kind` would be one more thing to keep in sync with whichever harnesses
+ * grow Task-tools-style tools next (plan §3).
+ *
+ * Must be called AFTER `runs.appendEvent` has persisted the chunk that
+ * triggered it (see the call site in `makeChunkHandler`, which appends
+ * before running any detection): `runs.todoRelevantEventsForTask` re-reads
+ * `run_events` synchronously via `bun:sqlite`, so the just-arrived chunk is
+ * already in the result set — there is no separate "append the current
+ * chunk in memory" step needed, and none is done here.
+ *
+ * Writes only when the derived summary actually changed (by value, not
+ * reference — `deriveTodoProgress` re-parses the whole history every call),
+ * so a `TaskUpdate` that round-trips to an unchanged summary (e.g. an
+ * unknown taskId, tolerated as a no-op by `deriveTodoProgress`) doesn't
+ * churn the row. Never throws — same "detection bugs must not break run
+ * settlement" contract as `detectCursorPlan` (plan §7); the caller wraps
+ * this in try/catch too, belt-and-braces.
+ */
+function maybeUpdateTodoProgress(taskId: string): void {
+  const events = runs.todoRelevantEventsForTask(taskId);
+  const summary = summarizeTodoProgress(deriveTodoProgress(events));
+  const task = tasks.get(taskId);
+  if (!task) return;
+  const current = task.todoProgress ?? null;
+  const changed = summary === null
+    ? current !== null
+    : current === null || current.completed !== summary.completed || current.total !== summary.total;
+  if (changed) tasks.update(taskId, { todoProgress: summary });
+}
+
+/**
+ * Claude-code-only: detect and persist `ExitPlanMode` plan history from the
+ * generic chunk stream, mirroring `detectCursorPlan`'s "pure helper in
+ * task-plans.ts + thin DB-touching wrapper here" split. Unlike cursor's
+ * detection (run-settlement only), this runs on every `tool_use`/
+ * `tool_result` chunk as it arrives — claude's plan-approval loop is a live
+ * keystroke-driven flow the run panel needs to reflect in near-real-time
+ * (plan §3/§6), not just after the run resolves.
+ *
+ * - `tool_use` chunk with `name === "ExitPlanMode"` → `upsertClaudePlanFromExitPlanMode`
+ *   records a `pending` plan keyed by the tool_use's `id`, superseding any
+ *   prior pending claude plan.
+ * - `tool_result` chunk whose `toolUseId` matches a `pending` claude plan →
+ *   `resolveClaudePlan` transitions it to `approved` (capturing an edited
+ *   plan when present) or `rejected`.
+ *
+ * Re-reads `tasks.get` rather than trusting a snapshot, same race-avoidance
+ * rationale as `detectCursorPlan`: `plans` can be mutated concurrently (e.g.
+ * a PATCH edit path on some other plan kind, or two chunks for the same task
+ * landing in close succession), and both `task-plans.ts` helpers are pure
+ * transforms over whatever array they're handed. Never throws — same
+ * try/catch-at-call-site contract as `detectCursorPlan`.
+ *
+ * Two cheap pre-filters keep `JSON.parse` off the common-case chunk (this
+ * runs on EVERY `tool_use`/`tool_result` chunk of every claude-code run —
+ * assistant text/thinking chunks never reach here at all, but tool chunks
+ * for ordinary tools like Read/Write/Bash are still the overwhelming
+ * majority, and a large `tool_result` — a big file read, a long command's
+ * output — is exactly the case where an unconditional parse is wasteful):
+ *  - `tool_use`: skip unless `data` contains the literal `"name":"ExitPlanMode"`
+ *    envelope substring (see `claude-tmux.ts`'s unspaced `JSON.stringify`).
+ *  - `tool_result`: skip unless the task already has a `pending` claude plan
+ *    — `resolveClaudePlan` only ever acts on a `tool_result` whose
+ *    `toolUseId` matches an existing pending plan, so with none pending
+ *    there is nothing this chunk could possibly resolve. This read is cheap
+ *    relative to parsing a potentially large result body, and results in
+ *    exactly one `tasks.get` either way (reused below, not re-fetched).
+ */
+function maybeTrackClaudePlan(taskId: string, runId: string, stream: RunEvent["stream"], data: string): void {
+  let task: Task | null;
+  if (stream === "tool_use") {
+    if (!data.includes('"name":"ExitPlanMode"')) return;
+    task = null; // fetched below, after confirming the parse is worthwhile
+  } else if (stream === "tool_result") {
+    task = tasks.get(taskId);
+    if (!task || !task.plans.some((p) => p.status === "pending")) return;
+  } else {
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  const chunk = parsed as Record<string, unknown>;
+
+  if (stream === "tool_use") {
+    if (chunk.name !== "ExitPlanMode") return;
+    const toolCallId = chunk.id;
+    if (typeof toolCallId !== "string" || toolCallId.length === 0) return;
+    const input = chunk.input;
+    if (!input || typeof input !== "object") return;
+    const plan = (input as Record<string, unknown>).plan;
+    if (typeof plan !== "string" || plan.trim() === "") return;
+
+    task = tasks.get(taskId);
+    if (!task) return;
+    const next = upsertClaudePlanFromExitPlanMode(task.plans, {
+      toolCallId,
+      runId,
+      content: plan,
+      now: Date.now(),
+    });
+    if (next !== task.plans) tasks.update(taskId, { plans: next });
+    return;
+  }
+
+  // tool_result — `task` was already fetched (and confirmed to have a
+  // pending plan) by the pre-filter above.
+  const toolUseId = chunk.toolUseId;
+  if (typeof toolUseId !== "string" || toolUseId.length === 0) return;
+  const content = chunk.content;
+  const resultText = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+        .map((x) => (x && typeof x === "object" && (x as { type?: string }).type === "text" ? (x as { text?: string }).text ?? "" : ""))
+        .join("")
+      : "";
+  if (!resultText) return;
+
+  const next = resolveClaudePlan(task!.plans, toolUseId, resultText, Date.now());
+  if (next !== task!.plans) tasks.update(taskId, { plans: next });
+}
+
 /**
  * Per-run chunk handler. Appends every event to `run_events`, fans out to
  * SSE listeners, and runs the claude API-error → `blocked` flip.
@@ -956,6 +1137,26 @@ function makeChunkHandler(
   return (stream: RunEvent["stream"], data: string, lineUuid?: string) => {
     runs.appendEvent(runId, stream, data, lineUuid);
     emit({ runId, taskId, stream, data, ts: Date.now() });
+    // Todo/task-tools board summary: re-derive + persist on any
+    // TodoWrite/TaskCreate/TaskUpdate chunk, for every agent kind. Cheap
+    // substring pre-filter keeps the common case (unrelated chunks) a no-op.
+    if (isTodoFamilyChunk(stream, data)) {
+      try {
+        maybeUpdateTodoProgress(taskId);
+      } catch {
+        // Never let todo-progress derivation break run settlement.
+      }
+    }
+    // Claude plan history: ExitPlanMode tool_use/tool_result pairs, claude
+    // only — cursor's plan detection stays exclusively in `detectCursorPlan`
+    // at run settlement.
+    if (kind === "claude-code") {
+      try {
+        maybeTrackClaudePlan(taskId, runId, stream, data);
+      } catch {
+        // Never let plan-history tracking break run settlement.
+      }
+    }
     // Claude API-error path: claude-tmux emits a sentinel status chunk on
     // synthetic `isApiErrorMessage` lines (529, 400, …) and resolves the
     // turn. Flip to `blocked` here so the card stops sitting in `running`,
@@ -2456,9 +2657,12 @@ export async function createTask(
     backlog: [],
     // Composer draft starts empty; autosaved from the run panel thereafter.
     draft: null,
-    // Brand-new tasks have no detected Cursor plans yet — populated later by
-    // `attachDoneHandler` when a run ends on `createPlanToolCall`.
+    // Brand-new tasks have no detected Cursor/claude plans yet — populated
+    // later by `attachDoneHandler` (cursor) or the chunk handler (claude).
     plans: [],
+    // Brand-new tasks have no todo-family tool activity yet — populated
+    // later by the chunk handler's `maybeUpdateTodoProgress`.
+    todoProgress: null,
     runId: null,
     // Derived at fetch time via SQL EXISTS — supply `false` here so the
     // `Task` shape is complete; `tasks.insert` re-fetches and the real

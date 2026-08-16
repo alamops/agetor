@@ -656,6 +656,22 @@ export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined 
   return fakeDrivers.get(taskId);
 }
 
+/**
+ * Alternate trigger for the `AGETOR_FAKE_CLAUDE_TODOS` scenario (see
+ * `makeFakeAgent` below): a substring in the *prompt* rather than an env var.
+ * Env-var scenario selection is fixed for the whole process — every task the
+ * fake driver spawns for gets the same behavior — which is fine for unit
+ * tests (`beforeAll` sets the var per file) but doesn't compose with the e2e
+ * suite's worker-scoped backend fixture (`e2e/fixtures.ts`), which spawns one
+ * `headless.ts` per worker with a fixed env block shared by every test/task
+ * in that worker. A spec can't get its own env var into that already-running
+ * process, but it CAN put anything it wants in `task.prompt` at task-create
+ * time — so this marker is the e2e-reachable equivalent of the env gate,
+ * exported so `e2e/todo-progress.spec.ts` can reference the exact string
+ * instead of duplicating it.
+ */
+export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
+
 function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): SpawnedAgent {
   const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
@@ -719,6 +735,95 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
       );
     });
     after(resolveDelayMs, () => { resolveDone(0); });
+  } else if (
+    process.env.AGETOR_FAKE_CLAUDE_TODOS === "1"
+    || prompt.includes(FAKE_CLAUDE_TODOS_PROMPT_MARKER)
+  ) {
+    // Test hook: simulate a Task-tools (`TaskCreate`/`TaskUpdate`) session so
+    // orchestrator/RunPanel/board-badge tests can drive the todo tracker
+    // (src/shared/todo-progress.ts) end to end without a real claude CLI.
+    // Chunk shapes match exactly what claude-tmux.ts's real mapper produces:
+    // a `tool_use` chunk's `data` is `{id, name, input, serverSide}`, and its
+    // matching `tool_result` chunk's `data` is `{toolUseId, content,
+    // isError}` — `deriveTodoProgress` joins the two on `toolUseId ===
+    // TaskCreate's id` to resolve the "Task #N created successfully: …" task
+    // number (see that module's header comment). Two creates + one update to
+    // `in_progress` on the first task is enough to exercise every code path
+    // the derivation covers (multi-item accumulation, result-text task-number
+    // resolution, status mutation) while still landing on a stable, easily
+    // asserted end state: 2 tasks, 0 done, task #1 in progress.
+    //
+    // Only turn 1 (a fresh spawn, never a `--resume`) runs this scenario —
+    // real claude only *creates* tasks once per plan; a follow-up turn on
+    // the same session reuses the default echo behavior below, same as every
+    // other canned scenario in this driver.
+    after(5, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "fake-todo-create-1",
+          name: "TaskCreate",
+          input: { subject: "Phase 1 — Investigate", description: "Look into the root cause.", activeForm: "Investigating" },
+          serverSide: false,
+        }),
+        "fake-todo-create-1-tu",
+      );
+    });
+    after(8, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "fake-todo-create-1",
+          content: "Task #1 created successfully: Phase 1 — Investigate",
+          isError: false,
+        }),
+        "fake-todo-create-1-tr",
+      );
+    });
+    after(11, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "fake-todo-create-2",
+          name: "TaskCreate",
+          input: { subject: "Phase 2 — Implement", description: "Ship the fix.", activeForm: "Implementing" },
+          serverSide: false,
+        }),
+        "fake-todo-create-2-tu",
+      );
+    });
+    after(14, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "fake-todo-create-2",
+          content: "Task #2 created successfully: Phase 2 — Implement",
+          isError: false,
+        }),
+        "fake-todo-create-2-tr",
+      );
+    });
+    after(17, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "fake-todo-update-1",
+          name: "TaskUpdate",
+          input: { taskId: "1", status: "in_progress" },
+          serverSide: false,
+        }),
+        "fake-todo-update-1-tu",
+      );
+    });
+    after(20, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({ toolUseId: "fake-todo-update-1", content: "Task #1 updated", isError: false }),
+        "fake-todo-update-1-tr",
+      );
+    });
+    after(23, () => onChunk("assistant", "Starting Phase 1 — Investigate now."));
+    after(26, () => { onChunk("status", "turn complete"); resolveDone(0); });
   } else {
     after(5, () => onChunk("stdout", `fake response to: ${prompt}`));
     after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });

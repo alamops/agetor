@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -117,6 +117,21 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               >
                 <Bot className="size-3" />
                 {runningSubagents}
+              </Badge>
+            )}
+            {task.todoProgress && task.todoProgress.total > 0 && (
+              <Badge
+                variant="outline"
+                className={cn(
+                  "gap-1 text-[10px]",
+                  task.todoProgress.completed === task.todoProgress.total
+                    ? "text-success"
+                    : "text-muted-foreground",
+                )}
+                title={`${task.todoProgress.completed} of ${task.todoProgress.total} tasks done`}
+              >
+                <ListTodo className="size-3" />
+                {task.todoProgress.completed}/{task.todoProgress.total}
               </Badge>
             )}
           </div>

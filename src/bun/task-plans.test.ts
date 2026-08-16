@@ -5,7 +5,9 @@ import {
   effectiveContent,
   planIdFromCallId,
   planSlug,
+  resolveClaudePlan,
   setEditedContent,
+  upsertClaudePlanFromExitPlanMode,
   upsertDetectedPlan,
 } from "./task-plans.ts";
 
@@ -311,4 +313,197 @@ test("effectiveContent: returns the edited content when present, not the origina
   const plan = makePlan({ editedContent: "edited version" });
   expect(effectiveContent(plan)).toBe("edited version");
   expect(effectiveContent(plan)).not.toBe(plan.content);
+});
+
+// --- upsertClaudePlanFromExitPlanMode -------------------------------------
+
+test("upsertClaudePlanFromExitPlanMode: appends a pending plan with name null", () => {
+  const next = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01abc",
+    runId: "run-1",
+    content: "# Plan\n\n- step one",
+    now: 1000,
+  });
+  expect(next.length).toBe(1);
+  expect(next[0]!.status).toBe("pending");
+  expect(next[0]!.name).toBeNull();
+  expect(next[0]!.content).toBe("# Plan\n\n- step one");
+  expect(next[0]!.toolCallId).toBe("toolu_01abc");
+});
+
+test("upsertClaudePlanFromExitPlanMode: idempotent by toolCallId (reattach-safe), same as upsertDetectedPlan", () => {
+  const first = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01abc",
+    runId: "run-1",
+    content: "original plan",
+    now: 1000,
+  });
+  const second = upsertClaudePlanFromExitPlanMode(first, {
+    toolCallId: "toolu_01abc",
+    runId: "run-1",
+    content: "different content — must be ignored",
+    now: 2000,
+  });
+  expect(second).toBe(first);
+  expect(second[0]!.content).toBe("original plan");
+});
+
+test("upsertClaudePlanFromExitPlanMode: a new ExitPlanMode supersedes a stale pending plan", () => {
+  const first = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "plan one",
+    now: 1000,
+  });
+  const second = upsertClaudePlanFromExitPlanMode(first, {
+    toolCallId: "toolu_02",
+    runId: "run-2",
+    content: "plan two",
+    now: 2000,
+  });
+  expect(second.length).toBe(2);
+  expect(second[0]!.status).toBe("superseded");
+  expect(second[1]!.status).toBe("pending");
+});
+
+// --- resolveClaudePlan ------------------------------------------------------
+
+test("resolveClaudePlan: returns the SAME array reference when toolCallId doesn't match any plan", () => {
+  const plans = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "plan",
+    now: 1000,
+  });
+  const next = resolveClaudePlan(plans, "toolu_does_not_exist", "User has approved your plan.", 2000);
+  expect(next).toBe(plans);
+});
+
+test("resolveClaudePlan: returns the SAME array reference when the matching plan is no longer pending", () => {
+  const plans = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "plan",
+    now: 1000,
+  });
+  const approved = resolveClaudePlan(plans, "toolu_01", "User has approved your plan.", 2000);
+  expect(approved).not.toBe(plans);
+  // A stale/duplicate tool_result replayed on reattach must be a no-op.
+  const replayed = resolveClaudePlan(approved, "toolu_01", "User has approved your plan.", 3000);
+  expect(replayed).toBe(approved);
+});
+
+test("resolveClaudePlan: plain approval (no edit marker) sets status approved, approvedEdited false, editedContent null", () => {
+  const plans = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "# Original Plan",
+    now: 1000,
+  });
+  const next = resolveClaudePlan(
+    plans,
+    "toolu_01",
+    "User has approved your plan. You can now start coding.",
+    5000,
+  );
+  expect(next).not.toBe(plans);
+  const plan = next[0]!;
+  expect(plan.status).toBe("approved");
+  expect(plan.approvedAt).toBe(5000);
+  expect(plan.approvedEdited).toBe(false);
+  expect(plan.editedContent).toBeNull();
+  expect(plan.content).toBe("# Original Plan");
+  // Claude plans never get a filePath — approval doesn't write a file.
+  expect(plan.filePath).toBeNull();
+});
+
+test("resolveClaudePlan: approval with the edited-plan marker extracts the edited text, sets approvedEdited true", () => {
+  const plans = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "# Original Plan\n\n- step one",
+    now: 1000,
+  });
+  const resultContent =
+    "User has approved your plan. You can now start coding. Start with what you' told will be step #1.\n\n"
+    + "## Approved Plan (edited by user):\n# Edited Plan\n\n- step one (edited)\n- step two (added)";
+  const next = resolveClaudePlan(plans, "toolu_01", resultContent, 5000);
+  const plan = next[0]!;
+  expect(plan.status).toBe("approved");
+  expect(plan.approvedEdited).toBe(true);
+  expect(plan.editedContent).toBe("# Edited Plan\n\n- step one (edited)\n- step two (added)");
+  // Original content is preserved verbatim — edits live in editedContent only.
+  expect(plan.content).toBe("# Original Plan\n\n- step one");
+});
+
+test("resolveClaudePlan: any other tool_result content (rejection/interrupt) resolves to rejected", () => {
+  const plans = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "# Plan",
+    now: 1000,
+  });
+  const next = resolveClaudePlan(plans, "toolu_01", "The user rejected your plan.", 5000);
+  const plan = next[0]!;
+  expect(plan.status).toBe("rejected");
+  expect(plan.approvedAt).toBeNull();
+});
+
+test("resolveClaudePlan: supersede + resolve interplay — resolving a superseded (non-pending) plan is a no-op", () => {
+  const first = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "plan one",
+    now: 1000,
+  });
+  const superseded = upsertClaudePlanFromExitPlanMode(first, {
+    toolCallId: "toolu_02",
+    runId: "run-2",
+    content: "plan two",
+    now: 2000,
+  });
+  expect(superseded[0]!.status).toBe("superseded");
+  // A late-arriving tool_result for the superseded call id must not
+  // resurrect it — it's no longer the actionable plan.
+  const next = resolveClaudePlan(superseded, "toolu_01", "User has approved your plan.", 3000);
+  expect(next).toBe(superseded);
+});
+
+test("resolveClaudePlan: leading whitespace before the approval text does not misclassify it as rejected", () => {
+  // A genuine approval whose result content happens to start with a leading
+  // "\n" (or other whitespace) must still resolve to approved — the exact
+  // `startsWith` check without a `trimStart()` would flip this into a
+  // permanent `rejected` verdict (finding: leading-whitespace misclassification).
+  const plans = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "# Plan",
+    now: 1000,
+  });
+  const next = resolveClaudePlan(
+    plans,
+    "toolu_01",
+    "\n  User has approved your plan. You can now start coding.",
+    5000,
+  );
+  const plan = next[0]!;
+  expect(plan.status).toBe("approved");
+  expect(plan.approvedAt).toBe(5000);
+});
+
+test("resolveClaudePlan: leading whitespace before the approval text with the edited-plan marker still extracts editedContent", () => {
+  const plans = upsertClaudePlanFromExitPlanMode([], {
+    toolCallId: "toolu_01",
+    runId: "run-1",
+    content: "# Original Plan",
+    now: 1000,
+  });
+  const resultContent =
+    "\n\nUser has approved your plan. You can now start coding.\n\n"
+    + "## Approved Plan (edited by user):\n# Edited Plan\n\n- new step";
+  const next = resolveClaudePlan(plans, "toolu_01", resultContent, 5000);
+  const plan = next[0]!;
+  expect(plan.status).toBe("approved");
+  expect(plan.approvedEdited).toBe(true);
+  expect(plan.editedContent).toBe("# Edited Plan\n\n- new step");
 });

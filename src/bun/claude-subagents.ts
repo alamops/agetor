@@ -1372,7 +1372,18 @@ export function attachSubagentWatcher(opts: {
             detail: formatApiErrorDetail(typeof o.apiErrorStatus === "number" ? o.apiErrorStatus : undefined),
           };
         }
-        if ((o.type === "system" || o.type === "permission-mode") && typeof o.permissionMode === "string") {
+        // Also mirror `user` lines' `permissionMode`, not just the dedicated
+        // `system`/`permission-mode` marker lines: `mapParsedEventToChunks`'s
+        // `case "user"` (claude-tmux.ts) emits the SAME `permission-mode: X`
+        // status chunk off a `user` line's `permissionMode` as a fallback
+        // signal, gated on `lastPermissionMode`. A subagent JSONL with no
+        // marker lines at all (the common case) would otherwise never advance
+        // `fs.lastPermissionMode`, so every `user`/`tool_result` line's
+        // `permissionMode` compares against a stale (often `null`) value and
+        // re-emits an unchanged-mode chip on every single line. Mirroring
+        // `user` lines here keeps this dedup in lockstep with the mapper's.
+        if ((o.type === "system" || o.type === "permission-mode" || o.type === "user")
+          && typeof o.permissionMode === "string") {
           linePermissionMode = o.permissionMode;
         }
       } catch { /* fall through; mapper will surface the parse error */ }
