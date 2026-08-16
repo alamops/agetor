@@ -198,13 +198,9 @@ export async function remoteSyncState(dir: string): Promise<RemoteSyncState> {
 }
 
 /**
- * Whether `dir`'s HEAD has already landed on the source repo's default
- * branch — i.e. is an ancestor of it, so the worktree's work is safe to
- * throw away. `null` means "couldn't determine" and must never be presented
- * as merged; callers should treat it as unknown, same contract as
- * `hasUncommittedChanges`/`getAheadCount`.
- *
- * Default branch resolution, most to least authoritative:
+ * The repo's default branch as a ref usable directly with `merge-base` /
+ * `rev-parse` — `origin/main`-shaped when the remote advertises one, a bare
+ * local `main`/`master` otherwise. Most to least authoritative:
  *
  * 1. `git rev-parse --abbrev-ref origin/HEAD` — the remote's advertised
  *    default (e.g. resolves to `origin/main`). Used verbatim when it
@@ -215,10 +211,33 @@ export async function remoteSyncState(dir: string): Promise<RemoteSyncState> {
  *    `git show-ref --verify --quiet refs/heads/<b>` (exit 0 = branch exists).
  * 3. Neither resolves: return `null` rather than guessing.
  *
- * Once a default branch candidate is picked, `git merge-base --is-ancestor
- * HEAD <default>` maps exit code 0 → `true` (HEAD is an ancestor, i.e.
- * merged), exit code 1 → `false` (diverged/not merged), and any other exit
- * code (git error) → `null`.
+ * Callers must treat `null` as *unknown*, never as "there is no default
+ * branch". Assumes `dir` is already known to be a git repo — the two callers
+ * below both check first, so this doesn't re-spawn `isGitRepo`.
+ */
+async function resolveDefaultBranchRef(dir: string): Promise<string | null> {
+  const originHead = await git(["rev-parse", "--abbrev-ref", "origin/HEAD"], dir);
+  if (originHead.ok && originHead.stdout.length > 0 && originHead.stdout !== "origin/HEAD") {
+    return originHead.stdout;
+  }
+  for (const candidate of ["main", "master"]) {
+    const ref = await git(["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`], dir);
+    if (ref.ok) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Whether `dir`'s HEAD has already landed on the source repo's default
+ * branch — i.e. is an ancestor of it, so the worktree's work is safe to
+ * throw away. `null` means "couldn't determine" and must never be presented
+ * as merged; callers should treat it as unknown, same contract as
+ * `hasUncommittedChanges`/`getAheadCount`.
+ *
+ * Once `resolveDefaultBranchRef` picks a candidate, `git merge-base
+ * --is-ancestor HEAD <default>` maps exit code 0 → `true` (HEAD is an
+ * ancestor, i.e. merged), exit code 1 → `false` (diverged/not merged), and
+ * any other exit code (git error) → `null`.
  *
  * Runs with `cwd` = `dir`; a linked worktree shares the source repo's refs
  * via its common git dir, so this resolves correctly without needing the
@@ -228,20 +247,7 @@ export async function isMergedIntoDefaultBranch(dir: string): Promise<boolean | 
   if (!existsSync(dir)) return null;
   if (!(await isGitRepo(dir))) return null;
 
-  let defaultBranch: string | null = null;
-
-  const originHead = await git(["rev-parse", "--abbrev-ref", "origin/HEAD"], dir);
-  if (originHead.ok && originHead.stdout.length > 0 && originHead.stdout !== "origin/HEAD") {
-    defaultBranch = originHead.stdout;
-  } else {
-    for (const candidate of ["main", "master"]) {
-      const ref = await git(["show-ref", "--verify", "--quiet", `refs/heads/${candidate}`], dir);
-      if (ref.ok) {
-        defaultBranch = candidate;
-        break;
-      }
-    }
-  }
+  const defaultBranch = await resolveDefaultBranchRef(dir);
 
   if (!defaultBranch || defaultBranch.startsWith("-")) return null;
 
@@ -249,6 +255,48 @@ export async function isMergedIntoDefaultBranch(dir: string): Promise<boolean | 
   if (res.exitCode === 0) return true;
   if (res.exitCode === 1) return false;
   return null;
+}
+
+export interface HeadBranchState {
+  /** Short name of the branch `dir` currently has checked out (`main`,
+   *  `feat/thing`). `null` on a detached HEAD, a missing dir, or a non-repo —
+   *  all three mean "there is no branch to open a PR from". */
+  branch: string | null;
+  /** `branch` IS the repo's default branch, so a PR from it would degenerate
+   *  to base == head. **`false` also covers "couldn't tell"** (no
+   *  `origin/HEAD`, no local `main`/`master`) — the caller is a UI gate, and
+   *  hiding the affordance on an unresolvable default is the worse failure:
+   *  a bogus base == head PR is rejected loudly by GitHub with the branch
+   *  pickers right there, whereas a silently missing button reads as the
+   *  feature being broken. */
+  isDefaultBranch: boolean;
+}
+
+/**
+ * The branch `dir` is on and whether it's the repo default. Drives the "Create
+ * PR" gate for `isolation: "none"` tasks, which have no agetor-managed
+ * `task.branch` to key off — the user's own checkout is the head branch.
+ *
+ * Local-only (no network), same as `remoteSyncState`, since it's polled
+ * alongside it every 5s per open run panel.
+ */
+export async function headBranchState(dir: string): Promise<HeadBranchState> {
+  const NONE: HeadBranchState = { branch: null, isDefaultBranch: false };
+  if (!existsSync(dir)) return NONE;
+  if (!(await isGitRepo(dir))) return NONE;
+
+  // `--abbrev-ref HEAD` prints the literal "HEAD" on a detached checkout.
+  const head = await git(["rev-parse", "--abbrev-ref", "HEAD"], dir);
+  if (!head.ok || !head.stdout || head.stdout === "HEAD") return NONE;
+  const branch = head.stdout;
+
+  const defaultRef = await resolveDefaultBranchRef(dir);
+  if (!defaultRef) return { branch, isDefaultBranch: false };
+  // `resolveDefaultBranchRef` returns a remote-qualified ref (`origin/main`)
+  // in its first tier and a bare local name (`main`) in its second, so strip
+  // one leading remote segment before comparing against a local branch name.
+  const defaultName = defaultRef.startsWith("origin/") ? defaultRef.slice("origin/".length) : defaultRef;
+  return { branch, isDefaultBranch: branch === defaultName };
 }
 
 // A directory's git top-level is stable for the lifetime of the process, so

@@ -1004,6 +1004,20 @@ export interface TaskGitStatus {
    * block this — only unpushed local commits do.
    */
   remoteSynced: boolean;
+  /**
+   * Short name of the branch the task's dir currently has checked out, or
+   * `null` on a detached HEAD / uninspectable dir. Distinct from
+   * `task.branch`, which is agetor's *worktree-managed* branch and is `null`
+   * for every `isolation: "none"` task — this is the live git answer, and
+   * it's what lets an isolation-none task on the user's own feature branch
+   * still offer "Create PR" (see `prHeadBranch` in `lib/commit-push.ts`).
+   */
+  branch: string | null;
+  /** `branch` is the repo's default branch, so a PR from it would degenerate
+   *  to base == head. `false` also means "couldn't determine" — see
+   *  `HeadBranchState.isDefaultBranch` in `worktree.ts` for why unknown
+   *  resolves to offering the affordance rather than hiding it. */
+  isDefaultBranch: boolean;
 }
 
 /** A live terminal tab for a task. Returned by the terminal REST endpoints;
