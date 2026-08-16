@@ -203,6 +203,7 @@ test("getGitStatus: ignored short-circuit for a non-git workdir", async () => {
     });
     expect(await client.getGitStatus(t.id)).toEqual({
       hasChanges: false, ahead: 0, ignored: true, hasUpstream: false, remoteSynced: false,
+      branch: null, isDefaultBranch: false,
     });
 
     await client.deleteTask(t.id);

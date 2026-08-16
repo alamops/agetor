@@ -64,6 +64,7 @@ import {
   gitPull,
   gitPush,
   hasUncommittedChanges,
+  headBranchState,
   listBranches,
   remoteSyncState,
 } from "./worktree.ts";
@@ -3667,7 +3668,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       //
       // `hasUpstream`/`remoteSynced` additionally drive the "Open PR" chip —
       // computed via `remoteSyncState` (local tracking-ref check, no
-      // network). When an upstream exists, its ahead count IS the push-ahead
+      // network) — as do `branch`/`isDefaultBranch` from `headBranchState`,
+      // which are what let an `isolation: "none"` task (no agetor-managed
+      // `task.branch`, so NULL on the row) still offer the chip when the
+      // user's own checkout is on a real non-default branch.
+      // When an upstream exists, its ahead count IS the push-ahead
       // count (`rev-list @{u}..HEAD` — the same first tier `getAheadCount`
       // would run), so `ahead` reuses it and `getAheadCount` only runs as
       // the fallback for branches with no upstream yet (or a failed count),
@@ -3681,13 +3686,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
           }
           const dir = t.worktreePath ?? t.workdir;
-          const [result, syncState] = await Promise.all([
+          const [result, syncState, headState] = await Promise.all([
             hasUncommittedChanges(dir),
             remoteSyncState(dir),
+            headBranchState(dir),
           ]);
           if (result === null) {
             return json(
-              { hasChanges: false, ahead: 0, ignored: true, hasUpstream: false, remoteSynced: false } satisfies TaskGitStatus,
+              {
+                hasChanges: false,
+                ahead: 0,
+                ignored: true,
+                hasUpstream: false,
+                remoteSynced: false,
+                branch: null,
+                isDefaultBranch: false,
+              } satisfies TaskGitStatus,
               { headers: corsHeaders(req) },
             );
           }
@@ -3701,6 +3715,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               ignored: false,
               hasUpstream: syncState.hasUpstream,
               remoteSynced: syncState.hasUpstream && syncState.ahead === 0,
+              branch: headState.branch,
+              isDefaultBranch: headState.isDefaultBranch,
             } satisfies TaskGitStatus,
             { headers: corsHeaders(req) },
           );

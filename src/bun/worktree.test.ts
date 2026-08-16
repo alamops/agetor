@@ -1322,6 +1322,56 @@ describe("remoteSyncState", () => {
   });
 });
 
+// Backs the "Create PR" gate for `isolation: "none"` tasks, which have no
+// agetor-managed `task.branch` — the user's own checkout IS the head branch.
+describe("headBranchState", () => {
+  test("returns no branch for a non-existent dir and for a non-git directory", async () => {
+    const { headBranchState } = await import("./worktree.ts");
+    const missing = path.join(tmpdir(), `agetor-wt-hb-missing-${randomUUID()}`);
+    expect(await headBranchState(missing)).toEqual({ branch: null, isDefaultBranch: false });
+
+    const dir = mkdtempSync(path.join(tmpdir(), "agetor-wt-hb-nongit-"));
+    expect(await headBranchState(dir)).toEqual({ branch: null, isDefaultBranch: false });
+  });
+
+  test("flags the local default branch (no origin — resolves via local main)", async () => {
+    const { headBranchState } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    expect(await headBranchState(repo)).toEqual({ branch: "main", isDefaultBranch: true });
+  });
+
+  test("a feature branch is not the default branch", async () => {
+    const { headBranchState } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    await git(["checkout", "-b", "feat/thing"], repo);
+    expect(await headBranchState(repo)).toEqual({ branch: "feat/thing", isDefaultBranch: false });
+  });
+
+  test("strips the remote prefix when origin/HEAD supplies the default", async () => {
+    const { headBranchState } = await import("./worktree.ts");
+    const { repo } = await makeRepoWithOrigin();
+    // Give the clone a real `origin/HEAD` so tier 1 of the resolution ladder
+    // fires and returns the remote-qualified `origin/main` — the comparison
+    // must still match the bare local branch name.
+    await git(["remote", "set-head", "origin", "main"], repo);
+    expect(await runCapture(["rev-parse", "--abbrev-ref", "origin/HEAD"], repo)).toBe("origin/main");
+
+    expect(await headBranchState(repo)).toEqual({ branch: "main", isDefaultBranch: true });
+
+    await git(["checkout", "-b", "feat/via-origin-head"], repo);
+    expect(await headBranchState(repo)).toEqual({
+      branch: "feat/via-origin-head", isDefaultBranch: false,
+    });
+  });
+
+  test("detached HEAD reports no branch", async () => {
+    const { headBranchState } = await import("./worktree.ts");
+    const repo = await makeRepo();
+    await git(["checkout", "--detach", "HEAD"], repo);
+    expect(await headBranchState(repo)).toEqual({ branch: null, isDefaultBranch: false });
+  });
+});
+
 describe("detachWorktree", () => {
   test("removes the checkout but keeps the branch and its commits", async () => {
     const { prepareWorkdir, detachWorktree } = await import("./worktree.ts");

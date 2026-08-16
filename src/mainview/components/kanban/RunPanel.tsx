@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
 import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
-import { shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
+import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { EXPAND_EVENT, isExpandTargetFor } from "@/lib/expand-on-jump";
 import { latestPrProposal } from "@/lib/pr-proposal";
@@ -105,27 +105,6 @@ const NO_PLANS: TaskPlan[] = [];
  *  `RunEventList`'s `latestPlanMarkdown`/plan-signature gating test the
  *  exact same pattern instead of two independently-maintained literals. */
 const CLAUDE_PLAN_PROMPT_RE = /written up a plan|Would you like to proceed/i;
-
-/** Claude's raw `--permission-mode` strings (as reported in its
- *  `PERMISSION_MODE_STATUS_PREFIX` status chunks — see `claude-tmux.ts`'s
- *  `toClaudeModeString`) don't all match agetor's own `AGENT_OPTIONS`
- *  mode ids: `default` -> `ask` and `bypassPermissions` -> `bypass` are the
- *  two that diverge; `acceptEdits`/`plan`/`auto` already agree. Inverse of
- *  `toClaudeModeString`, kept here (not exported from shared/types) since
- *  it's purely a display concern. */
-const CLAUDE_RAW_MODE_TO_OPTION_ID: Record<string, string> = {
-  default: "ask",
-  bypassPermissions: "bypass",
-};
-
-/** Friendly label for a raw claude permission-mode string, via
- *  `AGENT_OPTIONS["claude-code"].modes`. Falls back to the raw string
- *  verbatim for a mode id agetor doesn't curate yet — same "unknown ids
- *  pass through" convention `buildCommand` uses server-side. */
-function permissionModeLabel(rawMode: string): string {
-  const optionId = CLAUDE_RAW_MODE_TO_OPTION_ID[rawMode] ?? rawMode;
-  return AGENT_OPTIONS["claude-code"].modes.find((m) => m.id === optionId)?.label ?? rawMode;
-}
 
 /**
  * `RunEvent` as held in the panel's local `events` state, tagged with a
@@ -2268,6 +2247,10 @@ function RunPanelBody({
   // then renders disabled with its "start the task" tooltip instead of
   // vanishing from the row.
   const showResolveConflicts = !archived && canOfferResolveConflicts(parsedPrUrl, prStatus);
+  // Head branch a "Create PR" would open from — agetor's worktree branch, or
+  // the workdir's live non-default branch for an isolation:"none" task. `null`
+  // means "nothing sensible to PR from", which is also the chip's gate.
+  const prHead = prHeadBranch(task.branch ?? null, gitStatus);
   const resolveConflictsSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => {
     if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
@@ -2845,13 +2828,16 @@ function RunPanelBody({
                 )}
                 {/* Offered once the branch is pushed and synced with its
                     remote (git-state-only, same convention as Commit & push
-                    above). Requires a real task branch — an isolation:"none"
-                    task sits on the project's own checkout (often main with a
-                    synced upstream), where "open a PR" would degenerate to
-                    base == head. Gone once a PR exists (the durable "View PR"
-                    link lives in the panel header). The proposal parse runs
-                    on click, not per event flush — the stream can be long. */}
-                {!task.prUrl && task.branch != null && shouldOfferOpenPr(gitStatus) && !sending && (
+                    above). Requires a head branch to PR *from* — either
+                    agetor's own worktree branch, or (isolation:"none", where
+                    `task.branch` is NULL by construction) the workdir's live
+                    checked-out branch as long as it isn't the repo default,
+                    which would degenerate to base == head. See
+                    `prHeadBranch`. Gone once a PR exists (the durable
+                    "View PR" link lives in the panel header). The proposal
+                    parse runs on click, not per event flush — the stream can
+                    be long. */}
+                {!task.prUrl && prHead != null && shouldOfferOpenPr(gitStatus) && !sending && (
                   <Button
                     size="sm"
                     variant="secondary"
@@ -2859,7 +2845,7 @@ function RunPanelBody({
                       const proposal = latestPrProposal(events);
                       onOpenPullRequest({
                         projectPath: task.workdir,
-                        head: task.branch ?? "",
+                        head: prHead,
                         title: proposal?.title ?? "",
                         body: proposal?.description ?? "",
                         taskId: task.id,
@@ -3744,23 +3730,6 @@ function RunEventList({
   // proper cards.
   const normalised = useMemo(() => events.map(normalizeLegacyEvent), [events]);
 
-  // Latest claude permission-mode, for the chip rendered next to the
-  // heartbeat below. Claude emits a `status` chunk (`PERMISSION_MODE_STATUS_
-  // PREFIX + <mode>`) at the start of every turn and on every mid-turn
-  // Shift+Tab cycle (`claude-tmux.ts`'s `permission-mode` case) — the LAST
-  // one in the stream is the mode the session is in right now. `null` when
-  // no such event has ever landed (non-claude tasks, or a claude task on an
-  // agetor version that predates this chip).
-  const latestPermissionMode = useMemo(() => {
-    for (let i = normalised.length - 1; i >= 0; i--) {
-      const e = normalised[i]!;
-      if (e.stream === "status" && e.data.startsWith(PERMISSION_MODE_STATUS_PREFIX)) {
-        return e.data.slice(PERMISSION_MODE_STATUS_PREFIX.length);
-      }
-    }
-    return null;
-  }, [normalised]);
-
   // Full markdown for the plan `TmuxPromptCard`'s plan branch is about to
   // act on — the source of truth is the task's latest PENDING claude plan
   // (mirrors what `resolveClaudePlan` server-side is about to resolve),
@@ -3964,11 +3933,12 @@ function RunEventList({
           // trailing `]` or ending in an ellipsis — are filtered too, on
           // replay as well as live.
           if (isImageSourceMetaBreadcrumb(e.data)) return [];
-          // Suppress the raw "permission-mode: <mode>" status chunk too —
-          // it's chip data for the heartbeat area (`latestPermissionMode`
-          // above / `PermissionModeChip` below), not a transcript log line
-          // worth showing inline (every turn start and every Shift+Tab would
-          // otherwise spam a divider into the scrollback).
+          // Suppress the raw "permission-mode: <mode>" status chunk too. It
+          // used to feed a chip pinned below the transcript; that chip is
+          // gone, but the suppression is NOT dead code — claude emits one of
+          // these at every turn start and every mid-turn Shift+Tab, so
+          // dropping this guard would spam a divider into the scrollback for
+          // each one (and historical rows already carry them).
           if (e.data.startsWith(PERMISSION_MODE_STATUS_PREFIX)) return [];
           return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
@@ -4028,12 +3998,7 @@ function RunEventList({
           {s.body}
         </section>
       ))}
-      {((indicatorMode !== "off" && runStatus === "running") || latestPermissionMode) && (
-        <div className="flex items-center gap-2">
-          {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
-          {latestPermissionMode && <PermissionModeChip rawMode={latestPermissionMode} />}
-        </div>
-      )}
+      {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
     </div>
   );
 }
@@ -4054,31 +4019,6 @@ function RunningIndicator() {
       </span>
       <span>Agent is working…</span>
     </div>
-  );
-}
-
-/**
- * Small chip next to the heartbeat showing claude's current
- * `--permission-mode` (`latestPermissionMode`, derived in `RunEventList`
- * from the last `PERMISSION_MODE_STATUS_PREFIX` status chunk). Rendered
- * whenever a mode event exists, independent of `runStatus` — the mode
- * persists between turns (it's a session property, not a per-turn one), so
- * it stays visible after the heartbeat itself goes away. `plan` gets a
- * distinct info-tinted treatment with an eye icon since it's the mode most
- * worth calling out (claude won't touch files until the user approves).
- */
-function PermissionModeChip({ rawMode }: { rawMode: string }) {
-  const isPlan = rawMode === "plan";
-  return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide",
-        isPlan ? "bg-info/10 text-info" : "bg-muted/60 text-muted-foreground",
-      )}
-    >
-      {isPlan && <Eye className="size-3" aria-hidden />}
-      {permissionModeLabel(rawMode)}
-    </span>
   );
 }
 

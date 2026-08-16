@@ -255,7 +255,10 @@ test("GET /tasks/:id/git-status reports ignored+no-upstream for a non-git workdi
   });
   expect(res.status).toBe(200);
   const body = await res.json();
-  expect(body).toEqual({ hasChanges: false, ahead: 0, ignored: true, hasUpstream: false, remoteSynced: false });
+  expect(body).toEqual({
+    hasChanges: false, ahead: 0, ignored: true, hasUpstream: false, remoteSynced: false,
+    branch: null, isDefaultBranch: false,
+  });
 });
 
 test("pull-create guards: archived task, mismatched workdir, and existing prUrl are never stamped", async () => {
