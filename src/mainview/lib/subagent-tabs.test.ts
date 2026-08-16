@@ -182,3 +182,32 @@ test("resolveActiveStream: a workflow container id is never a valid stream to la
   expect(resolveActiveStream("wf", true, subs)).toBe("main");
   expect(resolveActiveStream("a", true, subs)).toBe("a");
 });
+
+// ── bg_session (backgrounded shell) tab coverage ────────────────────────────
+// docs/plans/fix-bg-shell-detection.md §2-3: a `Bash(run_in_background: true)`
+// shell surfaces as a `parentKind: "bg_session"` row and must be tabbable
+// exactly like a `"subagent"`/`"workflow_agent"` row (only `"workflow"`
+// containers are excluded by `isTabbable`) — no new logic needed here, this
+// just locks in that the existing generic handling covers the new kind.
+
+test("sortSubagentTabs: a bg_session row is included and sorts with running-first ordering", () => {
+  const subs = [
+    sub("a", "completed", 0, "subagent"),
+    sub("b", "running", 1, "bg_session"),
+    sub("c", "completed", 2, "workflow_agent"),
+  ];
+  expect(sortSubagentTabs(subs).map((s) => s.id)).toEqual(["b", "a", "c"]);
+});
+
+test("shouldShowSubagentTabs: a lone running bg_session row shows tabs even with the parent turn idle", () => {
+  expect(shouldShowSubagentTabs([sub("shell", "running", 0, "bg_session")], false)).toBe(true);
+});
+
+test("resolveActiveStream: accepts a running bg_session row's id", () => {
+  const subs = [sub("shell", "running", 0, "bg_session")];
+  expect(resolveActiveStream("shell", true, subs)).toBe("shell");
+});
+
+test("shouldShowSubagentTabs: a completed bg_session row with the parent turn idle collapses the strip", () => {
+  expect(shouldShowSubagentTabs([sub("shell", "completed", 0, "bg_session")], false)).toBe(false);
+});

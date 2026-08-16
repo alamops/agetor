@@ -104,6 +104,30 @@ async function insertRunningSubagent(taskId: string): Promise<string> {
   return id;
 }
 
+/** Mirrors `insertRunningSubagent` for a `parentKind: "bg_session"` row — the
+ *  DB/hold-gate representation of a backgrounded `Bash(run_in_background:
+ *  true)` shell (see docs/plans/fix-bg-shell-detection.md §2-3). `hasRunning`
+ *  and the release predicate are kind-agnostic, so this should hold/release
+ *  identically to a `"subagent"` row. */
+async function insertRunningBgShell(taskId: string): Promise<string> {
+  const { subagents } = await import("./db.ts");
+  const id = `bgshell-${randomUUID()}`;
+  subagents.insertIfAbsent({
+    id,
+    taskId,
+    runId: null,
+    parentKind: "bg_session",
+    agentType: "shell",
+    description: "test bg shell",
+    spawnDepth: 1,
+    sourcePath: `/tmp/${id}.output`,
+    status: "running",
+    startedAt: Date.now(),
+    endedAt: null,
+  });
+  return id;
+}
+
 test("hold: a succeeded run with a running subagent keeps the task in running", async () => {
   const { startTask } = await import("./orchestrator.ts");
   const { tasks, runs } = await import("./db.ts");
@@ -165,6 +189,90 @@ test("no hold (regression guard): a succeeded run with no subagent rows goes str
 
   const task = tasks.get(taskId);
   expect(task?.column).toBe("review");
+});
+
+// ── bg_session (backgrounded shell) hold coverage ───────────────────────────
+// docs/plans/fix-bg-shell-detection.md §2-3: a `Bash(run_in_background: true)`
+// shell is tracked as a `parentKind: "bg_session"` subagents row and must hold
+// / release exactly like a `"subagent"` row — `hasRunning` and the release
+// predicate are kind-agnostic by design (no orchestrator/db changes needed).
+
+test("hold: a succeeded run with a running bg_session row (backgrounded shell) keeps the task in running", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const taskId = await createClaudeTask("hold-bgshell");
+  await insertRunningBgShell(taskId);
+
+  const res = await startTask(taskId);
+  if (!("runId" in res)) throw new Error("expected the run to start");
+  const runId = res.runId;
+
+  await wait(250);
+
+  const task = tasks.get(taskId);
+  expect(task?.column).toBe("running");
+  const run = runs.get(runId);
+  expect(run?.status).toBe("succeeded");
+});
+
+test("release: settling a bg_session row via settleSubagentById releases the task to review", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, subagents } = await import("./db.ts");
+  const { settleSubagentById } = await import("./claude-subagents.ts");
+
+  const taskId = await createClaudeTask("hold-bgshell-release");
+  const bgId = await insertRunningBgShell(taskId);
+
+  const res = await startTask(taskId);
+  if (!("runId" in res)) throw new Error("expected the run to start");
+  await wait(250);
+
+  // Sanity: confirm the task is actually held before driving the release.
+  expect(tasks.get(taskId)?.column).toBe("running");
+  expect(subagents.hasRunning(taskId)).toBe(true);
+
+  // Drive the same externally-detected-completion path a live `<task-
+  // notification>` (or restart-safe journal scan) takes: settleSubagentById
+  // settles the single row and fires the orchestrator's release hook itself.
+  const changed = settleSubagentById(bgId, "completed");
+  expect(changed).toBe(true);
+
+  expect(subagents.hasRunning(taskId)).toBe(false);
+  const task = tasks.get(taskId);
+  expect(task?.column).toBe("review");
+});
+
+test("hasRunning treats subagent and bg_session rows alike: settling only the subagent leaves the bg_session hold intact", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, subagents } = await import("./db.ts");
+  const { settleSubagentById } = await import("./claude-subagents.ts");
+
+  const taskId = await createClaudeTask("hold-bgshell-mixed");
+  const subagentId = await insertRunningSubagent(taskId);
+  const bgId = await insertRunningBgShell(taskId);
+
+  const res = await startTask(taskId);
+  if (!("runId" in res)) throw new Error("expected the run to start");
+  await wait(250);
+
+  expect(tasks.get(taskId)?.column).toBe("running");
+  expect(subagents.hasRunning(taskId)).toBe(true);
+
+  // Settle only the "subagent" row — the bg_session row is still running, so
+  // the mixed-kind hold must stay intact and the task must not release.
+  const subagentChanged = settleSubagentById(subagentId, "completed");
+  expect(subagentChanged).toBe(true);
+
+  expect(subagents.hasRunning(taskId)).toBe(true);
+  expect(tasks.get(taskId)?.column).toBe("running");
+
+  // Now settle the bg_session row too — the last hold clears, task releases.
+  const bgChanged = settleSubagentById(bgId, "completed");
+  expect(bgChanged).toBe(true);
+
+  expect(subagents.hasRunning(taskId)).toBe(false);
+  expect(tasks.get(taskId)?.column).toBe("review");
 });
 
 test("cancelled wins over a hold: task goes to ready, not running", async () => {
