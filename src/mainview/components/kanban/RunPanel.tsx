@@ -5641,7 +5641,7 @@ function TmuxPromptCard({
   // click — the only correct action is handing the user off to the real
   // terminal, where the existing `__external__` sweep notices the prompt
   // was answered and clears this card on its own.
-  if (req.unparsable === true || req.choices.length === 0) {
+  if (req.unparsable === true) {
     const openInTerminal = async () => {
       if (opening) return;
       setOpening(true);
@@ -5651,7 +5651,6 @@ function TmuxPromptCard({
       } catch (e) {
         const msg = e instanceof Error ? e.message : "Could not attach to tmux session";
         setOpenError(msg);
-        toast.error(msg);
       } finally {
         setOpening(false);
       }

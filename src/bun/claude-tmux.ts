@@ -3540,18 +3540,16 @@ function sha1(s: string): string {
 }
 
 /**
- * Footer phrasings claude's Ink modals draw, seeded from every modal this
- * scraper already knows how to parse (`Esc to cancel`, the trust-folder
- * dialog's `Enter to confirm`, ExitPlanMode's `Enter to continue`) plus the
- * 2.1.234 auto-mode wizard's `Esc to cancel` / arrow-key variant. A pane
- * ending in one of these is unambiguously a drawn-and-waiting modal, not
- * streamed prose — printed numbered lists and normal assistant text never
- * carry this exact phrasing. Extending this list is a one-line change if a
- * future claude version introduces a new footer we haven't seen yet (see
- * plan §8); the stuck-turn watchdog below is the version-proof net for
- * whatever this allow-list misses.
+ * Footer phrasings claude's Ink modals draw. Every entry is evidence-backed —
+ * a false hit here gates the user's composer, so this allow-list only carries
+ * footers observed on a real pane: `esc to cancel` / `enter to confirm` from
+ * the tool-permission and trust-folder fixtures in claude-tmux-scraper.test.ts,
+ * `enter to continue` from the 2.1.234 auto-mode wizard footer
+ * (`←/→ to change usage · Enter to continue · Esc to cancel`). Do not add a
+ * phrasing without a captured pane to back it (plan §8); the stuck-turn
+ * watchdog below is the version-proof net for whatever this list misses.
  */
-const MODAL_FOOTER_RE = /esc to cancel|enter to confirm|enter to continue|esc to go back/i;
+const MODAL_FOOTER_RE = /esc to cancel|enter to confirm|enter to continue/i;
 
 /** How long a turn can sit silent (no JSONL growth, no working spinner) before
  *  `matchUnparsableModal`'s watchdog arm treats it as stuck rather than just
@@ -3879,12 +3877,19 @@ function decideScrapeTick(p: {
   return { run: true, stampIdle: true };
 }
 
+/** Claude's working-spinner line ("esc to interrupt"). Single source of truth
+ *  for the phrase — it feeds both `VOLATILE_PANE_LINE_RE` below and the
+ *  stuck-turn watchdog's `tailHasSpinner` input in `scrapeOnce`, which must
+ *  never drift apart (a spinner the watchdog can't see would false-trip the
+ *  fallback card mid-turn). */
+const SPINNER_RE = /esc to interrupt/i;
+
 /** Pane chrome that repaints on a fixed cadence independent of anything
  *  meaningful happening — claude's "esc to interrupt" spinner/status footer
  *  (its elapsed-time-and-token-count portion ticks every render) and its
  *  rotating "Tip: …" hint banner. Matched against a line AFTER trailing
  *  whitespace has already been trimmed off (see `normalizePaneForActivity`). */
-const VOLATILE_PANE_LINE_RE = /esc to interrupt|^\s*Tip:/i;
+const VOLATILE_PANE_LINE_RE = new RegExp(`${SPINNER_RE.source}|^\\s*Tip:`, "i");
 
 /**
  * Normalize a captured pane tail into the form used for the "did the pane
@@ -4035,7 +4040,7 @@ function scrapeOnce(state: SessionState): void {
         turnInFlight: turnInFlight(state),
         lastJsonlAppendAt: state.lastJsonlAppendAt,
         now,
-        tailHasSpinner: /esc to interrupt/i.test(tail),
+        tailHasSpinner: SPINNER_RE.test(tail),
         askCardLive: state.askCardId !== null,
       })));
 
