@@ -3614,7 +3614,12 @@ function stuckTurnFallbackArmed(p: {
  * "Tip:" banner) stripped first. This has to be stable tick-to-tick while
  * the same modal sits on screen, or the `__external__` auto-cancel sweep
  * (which resolves any registered prompt whose fingerprint no longer matches
- * the live pane) would kill its own card on every tick.
+ * the live pane) would kill its own card on every tick. The blank/volatile
+ * filter runs BEFORE the trailing-window slice — a raw `slice(-12)` window
+ * saturated by the modal would let a fluctuating trailing blank row or a
+ * transient spinner line evict real content from the front and jitter the
+ * hash, so the two-tick gate could never converge on exactly the tall
+ * modals this matcher exists for.
  */
 function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch | null {
   const lines = tail.split("\n");
@@ -3622,13 +3627,12 @@ function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch
   const footerFires = nonBlank.slice(-3).some((l) => MODAL_FOOTER_RE.test(l));
   if (!footerFires && !watchdogArmed) return null;
 
-  const paneLines = lines.slice(-12);
-  const paneText = paneLines.join("\n").trimEnd();
-  const cleaned = paneLines
+  const paneLines = lines
     .map((l) => l.trimEnd())
     .filter((l) => l.length > 0 && !VOLATILE_PANE_LINE_RE.test(l))
-    .join("\n");
-  const fingerprint = sha1(`unparsable:${cleaned}`);
+    .slice(-12);
+  const paneText = paneLines.join("\n");
+  const fingerprint = sha1(`unparsable:${paneText}`);
   return { paneText, choices: [], cursorIndex: 0, fingerprint, unparsable: true };
 }
 

@@ -310,6 +310,96 @@ test("registerTmuxPrompt rejects reserved sentinel keys", async () => {
   })).toThrow(/reserved/);
 });
 
+/* ── Unparsable fallback tmux_prompt (unparsable:true, choices:[]) ────── */
+
+test("registerTmuxPrompt with unparsable:true + choices:[] creates a request carrying both, broadcast + listPendingForTask included, and it survives JSON serialization", async () => {
+  const { registerTmuxPrompt, listPendingForTask, setBroadcaster } = await import("./interactions.ts");
+  const broadcasted: unknown[] = [];
+  setBroadcaster((req) => broadcasted.push(req));
+
+  const { req } = registerTmuxPrompt({
+    taskId: "tUnparsable", runId: "rU",
+    paneText: "Set up auto mode for your environment?\n...\nEsc to cancel",
+    choices: [],
+    fingerprint: "fp-unparsable",
+    unparsable: true,
+  });
+
+  expect(req.unparsable).toBe(true);
+  expect(req.choices).toEqual([]);
+
+  // Broadcast payload carries the flag.
+  expect(broadcasted).toHaveLength(1);
+  expect((broadcasted[0] as { unparsable?: boolean }).unparsable).toBe(true);
+
+  // listPendingForTask (the SSE-replay / snapshot path) carries it too.
+  const pending = listPendingForTask("tUnparsable");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { unparsable?: boolean }).unparsable).toBe(true);
+  expect((pending[0] as { choices: unknown[] }).choices).toEqual([]);
+
+  // Must survive JSON round-tripping the way the SSE path serializes events.
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect(roundTripped.unparsable).toBe(true);
+  expect(roundTripped.choices).toEqual([]);
+});
+
+test("registerTmuxPrompt without the unparsable flag leaves it undefined (back-compat)", async () => {
+  const { registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
+  const { req } = registerTmuxPrompt({
+    taskId: "tNormal", runId: "rN",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "fp-normal",
+  });
+
+  expect(req.unparsable).toBeUndefined();
+
+  const pending = listPendingForTask("tNormal");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { unparsable?: boolean }).unparsable).toBeUndefined();
+
+  // Round-tripping through JSON must not invent the key (JSON.stringify
+  // drops `undefined` properties, matching how the SSE payload would look).
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect("unparsable" in roundTripped).toBe(false);
+});
+
+test("an unparsable prompt resolves via the __external__ sentinel (scrapeOnce sweep path), leaves the pending list, and fans out a resolved event", async () => {
+  const { registerTmuxPrompt, answerTmuxPrompt, listPendingForTask, setResolvedBroadcaster } =
+    await import("./interactions.ts");
+  const resolved: Array<{ id: string; kind: string }> = [];
+  setResolvedBroadcaster((r) => resolved.push({ id: r.id, kind: r.kind }));
+
+  const { id, req, answer } = registerTmuxPrompt({
+    taskId: "tExternal", runId: "rE",
+    paneText: "Set up auto mode for your environment?",
+    choices: [],
+    fingerprint: "fp-external",
+    unparsable: true,
+  });
+  expect(listPendingForTask("tExternal")).toHaveLength(1);
+
+  // The scraper sweep resolves a fallback card the same way it resolves any
+  // other tmux_prompt whose fingerprint no longer matches the live pane.
+  expect(answerTmuxPrompt(id, { key: "__external__" })).toBe(true);
+  await expect(answer).resolves.toEqual({ key: "__external__" });
+
+  expect(listPendingForTask("tExternal")).toHaveLength(0);
+  expect(resolved).toEqual([{ id: req.id, kind: "tmux_prompt" }]);
+});
+
+test("empty choices array passes the reserved-key validation (no choices to reject)", async () => {
+  const { registerTmuxPrompt } = await import("./interactions.ts");
+  expect(() => registerTmuxPrompt({
+    taskId: "t-empty-choices", runId: "r1",
+    paneText: "?",
+    choices: [],
+    fingerprint: "fp-empty-choices",
+    unparsable: true,
+  })).not.toThrow();
+});
+
 test("answer* paths emit on the resolved broadcaster", async () => {
   const {
     setResolvedBroadcaster,
