@@ -3378,6 +3378,12 @@ interface ScrapeMatch {
    *  first sighting and skip the two-tick stability gate, so tool-use permission
    *  prompts appear promptly. */
   highConfidence?: boolean;
+  /** True when this is the last-resort fallback match (`matchUnparsableModal`) —
+   *  a modal-shaped or stuck-turn pane no real matcher parsed. `choices` is
+   *  always empty; the UI renders a "read it in the terminal" card instead of
+   *  choice buttons. Deliberately never paired with `highConfidence` — see
+   *  `matchUnparsableModal`. */
+  unparsable?: boolean;
 }
 
 /** Recognise claude's standard numbered-choice modal:
@@ -3531,6 +3537,101 @@ function matchYesNoModal(tail: string): ScrapeMatch | null {
 
 function sha1(s: string): string {
   return createHash("sha1").update(s).digest("hex").slice(0, 16);
+}
+
+/**
+ * Footer phrasings claude's Ink modals draw, seeded from every modal this
+ * scraper already knows how to parse (`Esc to cancel`, the trust-folder
+ * dialog's `Enter to confirm`, ExitPlanMode's `Enter to continue`) plus the
+ * 2.1.234 auto-mode wizard's `Esc to cancel` / arrow-key variant. A pane
+ * ending in one of these is unambiguously a drawn-and-waiting modal, not
+ * streamed prose — printed numbered lists and normal assistant text never
+ * carry this exact phrasing. Extending this list is a one-line change if a
+ * future claude version introduces a new footer we haven't seen yet (see
+ * plan §8); the stuck-turn watchdog below is the version-proof net for
+ * whatever this allow-list misses.
+ */
+const MODAL_FOOTER_RE = /esc to cancel|enter to confirm|enter to continue|esc to go back/i;
+
+/** How long a turn can sit silent (no JSONL growth, no working spinner) before
+ *  `matchUnparsableModal`'s watchdog arm treats it as stuck rather than just
+ *  slow. A judgment call (plan §8), not empirically tuned — long enough that
+ *  a genuinely slow tool call (a big `Bash` run, a large read) doesn't false-
+ *  trip, short enough that a silently wedged TUI doesn't strand the task. */
+const STUCK_TURN_FALLBACK_MS = 60_000;
+
+/** Pure decision for the watchdog arm of `matchUnparsableModal` — exposed via
+ *  `__forTest` so the in-flight/quiet/spinner/ask truth table is unit-
+ *  testable without a live tmux pane. True only when ALL of: a turn is
+ *  actually in flight (there's a "running" run to protect), the session has
+ *  written JSONL before (a `0` timestamp means we've never seen a turn
+ *  start — nothing to be stuck on), it's been quiet past the threshold, the
+ *  raw pane tail does NOT show claude's `esc to interrupt` working spinner
+ *  (a long-running tool call is busy, not stuck — the spinner repaints even
+ *  when no JSONL line has landed yet), and no AskUserQuestion card/collection
+ *  is already live (that path owns the pane and has its own give-up ladder,
+ *  see `askFallbackAllowed`). */
+function stuckTurnFallbackArmed(p: {
+  turnInFlight: boolean;
+  lastJsonlAppendAt: number;
+  now: number;
+  tailHasSpinner: boolean;
+  askCardLive: boolean;
+}): boolean {
+  return p.turnInFlight
+    && p.lastJsonlAppendAt !== 0
+    && p.now - p.lastJsonlAppendAt > STUCK_TURN_FALLBACK_MS
+    && !p.tailHasSpinner
+    && !p.askCardLive;
+}
+
+/**
+ * Last-resort fallback for a pane no other matcher parsed: an unnumbered
+ * arrow-key widget, a free-text/device-code prompt, a single-option modal
+ * (`matchNumberedModal` requires ≥2), a prose confirmation, or a genuinely
+ * wedged turn. Registers a `tmux_prompt` with empty `choices` — there's no
+ * keystroke this scraper can plan, so the UI's job is just "tell the user to
+ * go answer it in the attached terminal", not drive an answer back.
+ *
+ * Fires under either of two independent arms:
+ *   (1) Footer arm — the last 3 NON-BLANK tail lines contain a recognised
+ *       modal footer (`MODAL_FOOTER_RE`). Non-blank, not a fixed raw-line
+ *       slice, because `tmux capture-pane` pads trailing blank rows (same
+ *       reasoning as `matchNumberedModal`'s high-confidence check).
+ *   (2) Watchdog arm — `watchdogArmed` (the caller pre-computes this via
+ *       `stuckTurnFallbackArmed`, since it needs session state this pure
+ *       matcher doesn't have).
+ *
+ * Deliberately never `highConfidence` (see `ScrapeMatch.unparsable`): unlike
+ * `matchNumberedModal`'s footer fast-path, footer presence here IS the
+ * trigger itself, not extra confidence layered on top of an already-parsed
+ * choice set — so a single-tick sighting must not register a card. Skipping
+ * the two-tick gate would let a mid-repaint transient (a real modal's frame
+ * still animating in, a paste in flight) flash a fallback card the user
+ * never needed.
+ *
+ * The fingerprint is sha1 of the SAME trailing lines used for `paneText`
+ * (not the full scrape tail), with blank lines and volatile chrome
+ * (`VOLATILE_PANE_LINE_RE` — the spinner/token-count line, the rotating
+ * "Tip:" banner) stripped first. This has to be stable tick-to-tick while
+ * the same modal sits on screen, or the `__external__` auto-cancel sweep
+ * (which resolves any registered prompt whose fingerprint no longer matches
+ * the live pane) would kill its own card on every tick.
+ */
+function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch | null {
+  const lines = tail.split("\n");
+  const nonBlank = lines.filter((l) => l.trim().length > 0);
+  const footerFires = nonBlank.slice(-3).some((l) => MODAL_FOOTER_RE.test(l));
+  if (!footerFires && !watchdogArmed) return null;
+
+  const paneLines = lines.slice(-12);
+  const paneText = paneLines.join("\n").trimEnd();
+  const cleaned = paneLines
+    .map((l) => l.trimEnd())
+    .filter((l) => l.length > 0 && !VOLATILE_PANE_LINE_RE.test(l))
+    .join("\n");
+  const fingerprint = sha1(`unparsable:${cleaned}`);
+  return { paneText, choices: [], cursorIndex: 0, fingerprint, unparsable: true };
 }
 
 /**
@@ -3930,7 +4031,13 @@ function scrapeOnce(state: SessionState): void {
 
   const match = (claudeIsWriting || (askOnPane && !askUnrecoverable))
     ? null
-    : (matchNumberedModal(tail) ?? matchYesNoModal(tail));
+    : (matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchUnparsableModal(tail, stuckTurnFallbackArmed({
+        turnInFlight: turnInFlight(state),
+        lastJsonlAppendAt: state.lastJsonlAppendAt,
+        now,
+        tailHasSpinner: /esc to interrupt/i.test(tail),
+        askCardLive: state.askCardId !== null,
+      })));
 
   // Auto-cancel: any registered prompt for this task whose fingerprint
   // is NOT what we see now has been dismissed (either externally via
@@ -3997,6 +4104,7 @@ function scrapeOnce(state: SessionState): void {
     choices: match.choices,
     cursorIndex: match.cursorIndex,
     fingerprint: match.fingerprint,
+    unparsable: match.unparsable,
   });
 }
 
@@ -4770,7 +4878,11 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           // slice, two-tick stability gate, and external-dismissal sweep.
           const paneLines = pane.split("\n");
           const tail = paneLines.slice(Math.max(0, paneLines.length - SCRAPE_TAIL_LINES)).join("\n");
-          const generic = matchNumberedModal(tail) ?? matchYesNoModal(tail);
+          // Footer arm only — no turn is in flight during boot, so the
+          // stuck-turn watchdog arm doesn't apply here (see
+          // `matchUnparsableModal`). This is the fix for the screenshotted
+          // 2.1.234 auto-mode wizard, which appears pre-JSONL.
+          const generic = matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchUnparsableModal(tail, false);
           if (!generic) { lastGenericFingerprint = null; continue; }
           // External dismissal: a previously surfaced startup prompt whose
           // content no longer matches the pane (user answered it from a real
@@ -4805,6 +4917,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
             choices: generic.choices,
             cursorIndex: generic.cursorIndex,
             fingerprint: generic.fingerprint,
+            unparsable: generic.unparsable,
           });
           sawStartupPromptThisWindow = true;
           opts.onChunk("status", "claude is asking a question on startup — answer it to continue");
@@ -5565,6 +5678,14 @@ export const __forTest = {
   matchYesNoModal,
   matchStartupConsentDialog,
   clearedStabilityGate,
+  /** Fallback matcher for prompts no real matcher parsed, plus its pure
+   *  watchdog-arm decision and tuning constants — exposed so the scraper
+   *  test suite can assert footer/watchdog firing and non-firing without a
+   *  live tmux pane. */
+  matchUnparsableModal,
+  stuckTurnFallbackArmed,
+  MODAL_FOOTER_RE,
+  STUCK_TURN_FALLBACK_MS,
   /** Pure idle-throttle decision used by `scrapeOnce` — exposed so the
    *  regression test can assert a JSONL-idle session keeps scraping (at the
    *  throttled cadence) instead of stopping forever, which would strand a
