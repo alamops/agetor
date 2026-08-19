@@ -863,7 +863,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // A fresh prefill is an explicit navigation, so it pops back to the list
   // first — which is also what the user sees while the fetch is in flight —
   // mirroring the New-PR prefill's part 2 below, which unconditionally calls
-  // `setView(openCompose())` on the same "navigation wins" principle.
+  // `setView(openCompose())` on the same "navigation wins" principle. If the
+  // stale view happens to be `compose`, popping it must go through
+  // `resetComposers()` too, to honor the same invariant `exitCompose` documents
+  // below (otherwise `pullPrefillTaskId` stays armed).
   useEffect(() => {
     if (!open || !pullDetailPrefill) return;
     if (lastPullDetailPrefillRef.current === pullDetailPrefill) return;
@@ -871,8 +874,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     pendingPullDetailPrefillRef.current = pullDetailPrefill;
     setProjectPath(pullDetailPrefill.projectPath);
     setKind("pulls");
+    // compose can only be left via resetComposers — see exitCompose below.
+    if (viewRef.current.kind === "compose") resetComposers();
     setView((cur) => (cur.kind === "list" ? cur : backToList()));
-  }, [open, pullDetailPrefill]);
+  }, [open, pullDetailPrefill, resetComposers]);
 
   // Stable signal of the aggregate candidate set (G8): the joined project paths
   // when "All repositories" is selected, "" otherwise. Threaded into the reload
