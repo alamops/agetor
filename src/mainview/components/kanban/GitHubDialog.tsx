@@ -850,7 +850,20 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // PR-detail prefill consumption, part 1 of 2 — same shape as the New-PR
   // prefill's part 1 above: point project + kind at the target PR, but leave
   // the actual fetch-and-navigate to part 2 (declared after the composer-
-  // reset effect) so a project switch has already landed.
+  // reset effect) so a project switch has already landed. Also pops any
+  // stale surviving view back to the list: the dialog stays mounted and
+  // `view` survives close (see the close-reset effect below), so reopening
+  // on the SAME project (a same-project "View PR" click, the common case)
+  // leaves `view` on the previous task's `{kind:"detail"}` — and since
+  // `projectPath`/`kind` are then value-no-ops, the `[projectPath, kind]`
+  // reset effect never fires to pop it. Left alone, that stale view would
+  // false-trip part 2's `viewRef.current.kind !== "list"` guard once the
+  // fetch resolves, silently discarding the freshly-fetched PR and leaving
+  // the previous task's PR on screen (the "View PR opens the wrong PR" bug).
+  // A fresh prefill is an explicit navigation, so it pops back to the list
+  // first — which is also what the user sees while the fetch is in flight —
+  // mirroring the New-PR prefill's part 2 below, which unconditionally calls
+  // `setView(openCompose())` on the same "navigation wins" principle.
   useEffect(() => {
     if (!open || !pullDetailPrefill) return;
     if (lastPullDetailPrefillRef.current === pullDetailPrefill) return;
@@ -858,6 +871,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     pendingPullDetailPrefillRef.current = pullDetailPrefill;
     setProjectPath(pullDetailPrefill.projectPath);
     setKind("pulls");
+    setView((cur) => (cur.kind === "list" ? cur : backToList()));
   }, [open, pullDetailPrefill]);
 
   // Stable signal of the aggregate candidate set (G8): the joined project paths
@@ -1195,8 +1209,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // armed: a manual "New PR" would then stamp an unrelated PR's URL onto that
   // task. The issue-composer fields are cleared here too (previously only the
   // pull composer was — issue-composer state used to leak across opens).
-  // Detail/panel views are deliberately left untouched — they already survive
-  // close/reopen, and that's unrelated to this cleanup.
+  // Detail/panel views are deliberately left untouched here — survival across
+  // a generic close/reopen (no prefill) is intentional. A prefill-driven
+  // reopen is a different case and handles its own stale-view pop in the
+  // PR-detail prefill's part 1 effect above, not here.
   useEffect(() => {
     if (open) return;
     setView((cur) => (cur.kind === "compose" ? backToList() : cur));
