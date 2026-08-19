@@ -216,6 +216,11 @@ export interface PendingTmuxPrompt {
   choices: Array<{ key: string; label: string }>;
   fingerprint: string;
   createdAt: number;
+  /** True when the scraper couldn't parse this modal into choices (footer-
+   *  gated fallback or stuck-turn watchdog) — `choices` is always `[]` in
+   *  that case. The RunPanel renders an "Open in Terminal" fallback card
+   *  instead of choice buttons. */
+  unparsable?: boolean;
 }
 
 export type PendingInteraction =

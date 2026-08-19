@@ -120,6 +120,13 @@ export interface TmuxPromptRequest {
    *  dismissal (the prompt disappeared from the pane). */
   fingerprint: string;
   createdAt: number;
+  /** True when this card is the fallback for a prompt no real matcher
+   *  parsed — `choices` is empty and there's no keystroke path back into
+   *  the pane. The UI renders a distinct "answer it in the terminal" card
+   *  instead of choice buttons; the answer route still accepts only
+   *  `__external__` / `__cancelled__` since there are no real choices to
+   *  validate against. */
+  unparsable?: boolean;
 }
 
 export interface TmuxPromptAnswer {
@@ -276,6 +283,7 @@ export function registerTmuxPrompt(args: {
   choices: TmuxPromptChoice[];
   cursorIndex?: number;
   fingerprint: string;
+  unparsable?: boolean;
 }): { id: string; req: TmuxPromptRequest; answer: Promise<TmuxPromptAnswer> } {
   // Defend the reserved-key namespace — `__external__` / `__cancelled__`
   // must be unambiguously sentinels, not legitimate user keystrokes.
@@ -297,6 +305,7 @@ export function registerTmuxPrompt(args: {
     cursorIndex: args.cursorIndex,
     fingerprint: args.fingerprint,
     createdAt: Date.now(),
+    unparsable: args.unparsable,
   };
   const answer = new Promise<TmuxPromptAnswer>((resolve) => {
     tmuxPrompts.set(id, { req, resolve });

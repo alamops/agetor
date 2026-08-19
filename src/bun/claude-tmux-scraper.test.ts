@@ -8,8 +8,18 @@ import path from "node:path";
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-scraper-"));
 
 import { __forTest } from "./claude-tmux.ts";
+import { detectAskModal } from "./claude-questions.ts";
 
-const { matchNumberedModal, matchYesNoModal, matchStartupConsentDialog, clearedStabilityGate } = __forTest;
+const {
+  matchNumberedModal,
+  matchYesNoModal,
+  matchStartupConsentDialog,
+  clearedStabilityGate,
+  matchUnparsableModal,
+  stuckTurnFallbackArmed,
+  MODAL_FOOTER_RE,
+  STUCK_TURN_FALLBACK_MS,
+} = __forTest;
 
 /** Real tmux pane captures of claude-code 2.1.161's AskUserQuestion modal —
  *  same fixture directory claude-questions.test.ts reads from. */
@@ -509,4 +519,270 @@ test("decideScrapeTick — a session that never appended (lastJsonlAppendAt === 
     now: NOW,
   });
   expect(d).toEqual({ run: true, stampIdle: false });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// matchUnparsableModal / stuckTurnFallbackArmed — the unknown/unparsable
+// Claude Code prompt fallback (docs/plans/unknown-claude-prompts-fallback.md
+// §5). Last-resort matcher for a pane no real matcher parsed: fires on a
+// recognised modal footer (`MODAL_FOOTER_RE`) over the last 3 non-blank tail
+// lines, or on the stuck-turn watchdog. Always `unparsable: true`, empty
+// `choices`, never `highConfidence` — so it always needs the two-tick
+// stability gate.
+
+// The claude 2.1.234 "Set up auto mode for your environment?" startup wizard
+// — a real tmux pane capture (from a screenshot). Unnumbered arrow-key
+// widget (`◂ Mixed ▸` value selector, `[ ]` checkbox rows) that
+// matchNumberedModal/matchYesNoModal/detectAskModal all reject, bounded by a
+// real Ink footer. This is the canonical fixture the fallback exists for.
+const AUTO_MODE_WIZARD_PANE = `Set up auto mode for your environment?
+
+Claude Code reads this project, your recent Claude sessions, and optionally your shell history and other
+repositories. Claude analyzes this data and customizes auto mode to make better decisions.
+
+  How you use Claude here    ◂ Mixed ▸
+❯ Also scan shell history    [ ]
+  Also scan your other repos [ ]
+
+  Continue
+
+←/→ to change usage · Enter to continue · Esc to cancel`;
+
+test("matchUnparsableModal — auto-mode wizard: no real matcher parses it, fallback fires via the footer arm", () => {
+  expect(matchNumberedModal(AUTO_MODE_WIZARD_PANE)).toBeNull();
+  expect(matchYesNoModal(AUTO_MODE_WIZARD_PANE)).toBeNull();
+  expect(detectAskModal(AUTO_MODE_WIZARD_PANE)).toBeNull();
+
+  const m = matchUnparsableModal(AUTO_MODE_WIZARD_PANE, false);
+  expect(m).not.toBeNull();
+  expect(m!.unparsable).toBe(true);
+  expect(m!.choices).toEqual([]);
+  expect(m!.cursorIndex).toBe(0);
+  // Deliberately never high-confidence — footer presence IS the trigger, not
+  // extra confidence on top of an already-parsed choice set, so a single-tick
+  // sighting must still clear the two-tick stability gate.
+  expect(m!.highConfidence).toBeFalsy();
+});
+
+test("MODAL_FOOTER_RE — matches the three evidence-backed footer phrasings, case-insensitively", () => {
+  expect(MODAL_FOOTER_RE.test("Esc to cancel · Tab to amend")).toBe(true);
+  expect(MODAL_FOOTER_RE.test("Enter to confirm · Esc to cancel")).toBe(true);
+  expect(MODAL_FOOTER_RE.test("←/→ to change usage · Enter to continue · Esc to cancel")).toBe(true);
+  expect(MODAL_FOOTER_RE.test("ENTER TO CONTINUE")).toBe(true);
+  expect(MODAL_FOOTER_RE.test("? for shortcuts")).toBe(false);
+});
+
+// ── Fingerprint stability ────────────────────────────────────────────────
+//
+// `matchUnparsableModal`'s fingerprint is sha1 of the same last-12-raw-line
+// window used for `paneText`, with blank + volatile lines stripped before
+// hashing. That's only tick-to-tick stable when the meaningful content has
+// slack inside the 12-line window — i.e. fewer than 12 raw lines total, so a
+// trailing blank row or a transient volatile line (the spinner, the "Tip:"
+// banner) lands in the slack instead of evicting real content from the
+// FRONT of the window (`lines.slice(-12)` is a raw positional slice, not a
+// last-N-non-blank slice the way the footer-arm check and paneText's own
+// "12 lines" comment imply).
+//
+// The canonical wizard fixture above is exactly 12 raw lines (8 meaningful +
+// 4 blank) with the footer as its true last line — zero slack — so it is
+// the worst case, not the representative one. Use a shorter footer-bearing
+// pane (well under 12 lines, as a fuller real capture with scrollback above
+// the modal would leave slack in this window) to pin the intended
+// tolerance; see the fixture below for the canonical pane's actual
+// (fragile) behavior at zero slack, which is a discovered gap, not
+// something this suite asserts as "working".
+const SHORT_UNPARSABLE_PANE = `Do a thing?
+
+Enter to continue · Esc to cancel`;
+
+test("matchUnparsableModal — fingerprint is stable across trailing blank-row padding (with window slack)", () => {
+  const clean = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const withTrailingBlanks = matchUnparsableModal(`${SHORT_UNPARSABLE_PANE}\n\n\n`, false)!;
+  expect(clean).not.toBeNull();
+  expect(withTrailingBlanks.fingerprint).toBe(clean.fingerprint);
+});
+
+test("matchUnparsableModal — fingerprint is stable across an inserted volatile line (with window slack)", () => {
+  // A spinner/"Tip:" line appearing between ticks (VOLATILE_PANE_LINE_RE)
+  // must not change the fingerprint — it's stripped before hashing.
+  const clean = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const withVolatile = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace("Do a thing?", "Do a thing?\n✳ Compacting… (esc to interrupt)"),
+    false,
+  )!;
+  expect(withVolatile.fingerprint).toBe(clean.fingerprint);
+
+  const withTip = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace("Do a thing?", "Do a thing?\nTip: press Shift+Tab to cycle modes"),
+    false,
+  )!;
+  expect(withTip.fingerprint).toBe(clean.fingerprint);
+});
+
+test("matchUnparsableModal — a genuinely different modal gets a different fingerprint", () => {
+  const a = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const b = matchUnparsableModal(`Do a DIFFERENT thing?\n\nEnter to continue · Esc to cancel`, false)!;
+  expect(a.fingerprint).not.toBe(b.fingerprint);
+});
+
+test("matchUnparsableModal — the canonical (zero-slack) wizard fixture's fingerprint IS stable across trailing padding", () => {
+  // Regression guard for a window-saturation bug: an earlier implementation
+  // took a raw `lines.slice(-12)` BEFORE filtering blank/volatile lines, so
+  // when the meaningful content already filled all 12 lines (as the real
+  // wizard pane does — 8 meaningful + 4 blank, footer as the true last
+  // line), a fluctuating trailing blank row or a transient spinner line
+  // evicted real content from the FRONT of the window and jittered the
+  // hash — the two-tick stability gate could never converge on exactly the
+  // tall modal this feature was built for. The filter must run first.
+  const clean = matchUnparsableModal(AUTO_MODE_WIZARD_PANE, false)!;
+  const withTrailingBlanks = matchUnparsableModal(`${AUTO_MODE_WIZARD_PANE}\n\n`, false)!;
+  const withTrailingSpinner = matchUnparsableModal(
+    `${AUTO_MODE_WIZARD_PANE}\n✳ Compacting… (esc to interrupt)`,
+    false,
+  )!;
+  expect(clean).not.toBeNull();
+  expect(withTrailingBlanks).not.toBeNull();
+  expect(withTrailingBlanks.fingerprint).toBe(clean.fingerprint);
+  expect(withTrailingSpinner.fingerprint).toBe(clean.fingerprint);
+});
+
+// ── Negative panes (footer arm must stay silent) ─────────────────────────
+
+test("matchUnparsableModal — normal idle input-box pane does not fire", () => {
+  const pane = `╭──────────────────────────────────────────────────────────────────────────╮
+│ >                                                                            │
+╰──────────────────────────────────────────────────────────────────────────╯
+  ? for shortcuts · ← for agents`;
+  expect(matchUnparsableModal(pane, false)).toBeNull();
+});
+
+test("matchUnparsableModal — working pane with the 'esc to interrupt' spinner but no footer does not fire", () => {
+  const pane = `● Running Bash(npm test)…
+
+✳ Working… (esc to interrupt · 12s · 1.2k tokens)`;
+  expect(matchUnparsableModal(pane, false)).toBeNull();
+});
+
+test("matchUnparsableModal — plain transcript pane does not fire", () => {
+  const pane = `● I've updated the file to fix the bug.
+
+Let me run the tests now to confirm the fix works as expected.`;
+  expect(matchUnparsableModal(pane, false)).toBeNull();
+});
+
+test("matchUnparsableModal — a footer phrase quoted in transcript prose ABOVE the last 3 non-blank lines does not fire", () => {
+  const pane = `The dialog said "Esc to cancel · Tab to amend" when I saw it earlier.
+
+Here's what I found after digging further:
+Line A
+Line B
+Line C
+Line D`;
+  expect(matchUnparsableModal(pane, false)).toBeNull();
+});
+
+// ── Precedence sanity ─────────────────────────────────────────────────────
+
+test("matchUnparsableModal — precedence: a numbered tool-permission modal is caught by matchNumberedModal first, but WOULD also match the fallback alone", () => {
+  // scrapeOnce's real dispatch is `matchNumberedModal(tail) ?? matchYesNoModal(tail)
+  // ?? matchUnparsableModal(...)` — the fallback is the final `??` arm, so a
+  // parseable numbered modal never reaches it in practice. This test documents
+  // that ordering is load-bearing: in isolation, matchUnparsableModal WOULD
+  // also fire on the same pane (it carries a recognised footer), so if the
+  // `??` chain were ever reordered, a real numbered modal would silently
+  // downgrade to the "read it in the terminal" fallback card instead of
+  // rendering real clickable choices.
+  const pane = `Do you want to proceed?
+❯ 1. Yes
+  2. No
+
+Esc to cancel · Tab to amend`;
+
+  const numbered = matchNumberedModal(pane);
+  expect(numbered).not.toBeNull();
+  expect(numbered!.choices.map((c) => c.key)).toEqual(["1", "2"]);
+  expect(numbered!.highConfidence).toBe(true);
+
+  const fallbackAlone = matchUnparsableModal(pane, false);
+  expect(fallbackAlone).not.toBeNull();
+  expect(fallbackAlone!.unparsable).toBe(true);
+
+  // scrapeOnce's actual `??` chain: numbered wins.
+  const dispatched = matchNumberedModal(pane) ?? matchYesNoModal(pane) ?? matchUnparsableModal(pane, false);
+  expect(dispatched).toEqual(numbered);
+});
+
+// ── stuckTurnFallbackArmed truth table ────────────────────────────────────
+
+const WATCHDOG_NOW = 2_000_000;
+const ALL_ARMED = {
+  turnInFlight: true,
+  lastJsonlAppendAt: WATCHDOG_NOW - STUCK_TURN_FALLBACK_MS - 1,
+  now: WATCHDOG_NOW,
+  tailHasSpinner: false,
+  askCardLive: false,
+};
+
+test("stuckTurnFallbackArmed — all conditions true → armed", () => {
+  expect(stuckTurnFallbackArmed(ALL_ARMED)).toBe(true);
+});
+
+test("stuckTurnFallbackArmed — no turn in flight → not armed", () => {
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, turnInFlight: false })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — lastJsonlAppendAt === 0 (never appended) → not armed", () => {
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, lastJsonlAppendAt: 0 })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — quiet exactly AT the threshold (not strictly over) → not armed", () => {
+  expect(stuckTurnFallbackArmed({
+    ...ALL_ARMED,
+    lastJsonlAppendAt: WATCHDOG_NOW - STUCK_TURN_FALLBACK_MS, // quiet === threshold, not >
+  })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — quiet one ms past the threshold → armed", () => {
+  expect(stuckTurnFallbackArmed({
+    ...ALL_ARMED,
+    lastJsonlAppendAt: WATCHDOG_NOW - STUCK_TURN_FALLBACK_MS - 1,
+  })).toBe(true);
+});
+
+test("stuckTurnFallbackArmed — working spinner present → not armed (busy, not stuck)", () => {
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, tailHasSpinner: true })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — an ask card/collection is already live → not armed (owns its own give-up ladder)", () => {
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, askCardLive: true })).toBe(false);
+});
+
+// ── Watchdog arm on matchUnparsableModal ──────────────────────────────────
+
+test("matchUnparsableModal — watchdog arm fires on a footerless stuck pane when watchdogArmed is true, stays silent when false", () => {
+  const stuckPane = `● Running Bash(a very long build)…
+
+Still going, no visible progress, nothing that looks like a modal or a
+footer — just a wedged TUI.`;
+  expect(matchUnparsableModal(stuckPane, false)).toBeNull();
+  const armed = matchUnparsableModal(stuckPane, true);
+  expect(armed).not.toBeNull();
+  expect(armed!.unparsable).toBe(true);
+  expect(armed!.choices).toEqual([]);
+});
+
+// ── Two-tick stability gate applies to unparsable matches ─────────────────
+
+test("clearedStabilityGate — an unparsable match never has highConfidence, so it needs two ticks like any other low-confidence match", () => {
+  const m = matchUnparsableModal(AUTO_MODE_WIZARD_PANE, false)!;
+  expect(m.unparsable).toBe(true);
+  expect(m.highConfidence).toBeFalsy();
+  // First sighting: no previous fingerprint recorded yet → does not clear.
+  expect(clearedStabilityGate(m, null)).toBe(false);
+  // A different prior fingerprint (a different modal was on screen last
+  // tick) → still does not clear.
+  expect(clearedStabilityGate(m, "some-other-fingerprint")).toBe(false);
+  // Same fingerprint on the second consecutive tick → clears.
+  expect(clearedStabilityGate(m, m.fingerprint)).toBe(true);
 });

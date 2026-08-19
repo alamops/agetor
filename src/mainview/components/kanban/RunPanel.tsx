@@ -5538,6 +5538,11 @@ function TmuxPromptCard({
 }) {
   const [submitting, setSubmitting] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Only used by the unparsable-fallback branch below, but declared here
+  // (unconditionally) to satisfy the rules of hooks — this component has
+  // early returns above where these would otherwise live.
+  const [openError, setOpenError] = useState<string | null>(null);
+  const [opening, setOpening] = useState(false);
   const send = async (key: string) => {
     if (submitting) return;
     setSubmitting(key);
@@ -5627,6 +5632,56 @@ function TmuxPromptCard({
           Rejecting dismisses the plan; then describe your changes in the message box below.
         </p>
         {error && <p className="mt-2 text-[11px] text-destructive">{error}</p>}
+      </div>
+    );
+  }
+
+  // Footer-gated / stuck-turn fallback: the scraper saw *something* claude
+  // is blocked on but couldn't parse it into choices. There's nothing to
+  // click — the only correct action is handing the user off to the real
+  // terminal, where the existing `__external__` sweep notices the prompt
+  // was answered and clears this card on its own.
+  if (req.unparsable === true) {
+    const openInTerminal = async () => {
+      if (opening) return;
+      setOpening(true);
+      setOpenError(null);
+      try {
+        await api.openTmux(req.taskId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Could not attach to tmux session";
+        setOpenError(msg);
+      } finally {
+        setOpening(false);
+      }
+    };
+    return (
+      <div className="rounded-md border border-warning/60 bg-card p-3 ring-1 ring-warning/40">
+        <div className="mb-2 flex items-center justify-between">
+          <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-warning">
+            <Terminal className="size-3.5" aria-hidden /> Claude is asking something Agetor can’t read
+          </span>
+        </div>
+        <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/40 bg-muted/40 p-2 font-mono text-[11px] leading-snug">
+          {cleanPromptPane(req.paneText)}
+        </pre>
+        <div className="mt-3 flex items-center justify-end gap-2">
+          <Button
+            onClick={() => void openInTerminal()}
+            size="sm"
+            variant="secondary"
+            disabled={opening}
+          >
+            <Terminal className="mr-1 size-3.5" aria-hidden />
+            {opening ? "Opening…" : "Open in Terminal"}
+          </Button>
+        </div>
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Answering the prompt in the terminal resolves this card automatically.
+        </p>
+        {openError && (
+          <p className="mt-2 text-right text-[11px] text-destructive">{openError}</p>
+        )}
       </div>
     );
   }
