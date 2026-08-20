@@ -1227,6 +1227,13 @@ export const api = {
       { method: "POST", body: JSON.stringify({ line }) },
       { retry: false },
     ),
+  /** Bumps the task's read watermark to its latest assistant event, clearing
+   *  `task.unread`. Called on opening/switching/closing the run panel — see
+   *  App.tsx's `selected`-tracking effect. Returns the full updated Task so
+   *  the caller can reconcile it into board state immediately (optimistic —
+   *  don't wait for the next poll). Idempotent; safe to fire-and-forget. */
+  markTaskSeen: (taskId: string) =>
+    j<Task>(`/tasks/${taskId}/seen`, { method: "POST" }),
 
   // Messages backlog — saved, not-yet-sent draft messages parked on a task.
   // Every mutation returns the full updated Task so the caller can re-sync.

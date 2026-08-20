@@ -442,6 +442,40 @@ function AppInner() {
     dismissPending(selected.id);
   }, [selected?.id]);
 
+  // Mark-seen wiring for the unread-bullet indicator (see TaskCard's corner
+  // dot). Fires whenever the open task changes — open, switch, or close —
+  // and marks BOTH the newly-opened id and the previously-open id: opening
+  // clears the dot for the task you're about to read, and closing clears it
+  // again for whatever streamed in while you were watching (the panel
+  // suppresses the dot live via `isOpen`, so nothing needs to change while
+  // it's open). `prevMarkSeenIdRef` (distinct from `selectedIdRef` below,
+  // which the global-events subscription owns) is updated at the end of
+  // this same effect, after reading its pre-update value, so it always
+  // holds "the id that was open before this transition".
+  const prevMarkSeenIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const currentId = selected?.id ?? null;
+    const previousId = prevMarkSeenIdRef.current;
+    const idsToMark = new Set<string>();
+    if (currentId) idsToMark.add(currentId);
+    if (previousId) idsToMark.add(previousId);
+    for (const id of idsToMark) {
+      api.markTaskSeen(id)
+        .then((updated) => {
+          // Optimistic reconcile — don't wait for the next 2s poll to clear
+          // the dot. Replaces just this task's object, matching the
+          // identity-preserving idiom `reconcileById` uses elsewhere.
+          setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+        })
+        .catch((e) => {
+          // Fire-and-forget: a failed mark-seen must never block or break
+          // opening/switching/closing a task.
+          console.warn("[agetor] markTaskSeen failed", e);
+        });
+    }
+    prevMarkSeenIdRef.current = currentId;
+  }, [selected?.id]);
+
   // `panelMounted` follows `selected !== null` on open but lags by the
   // RunPanel's exit animation on close, so the Toaster doesn't snap back to
   // the right edge (and slide under the receding panel) for ~250ms.
@@ -1135,6 +1169,7 @@ function AppInner() {
                       onArchive={archive}
                       onUnarchive={unarchive}
                       emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
+                      selectedTaskId={selected?.id ?? null}
                     />
                   ))}
                 </div>

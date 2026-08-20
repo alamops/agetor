@@ -24,6 +24,11 @@ interface Props {
    *  and stays inside the existing droppable container so dnd-kit's drop
    *  zone is unaffected. */
   emptyHint?: string;
+  /** Id of the task currently open in the run panel (App.tsx's `selected`),
+   *  or null/undefined when no panel is open. Threaded down to each
+   *  `TaskCard` as `isOpen` so the unread dot is suppressed for the task
+   *  being actively watched. */
+  selectedTaskId?: string | null;
 }
 
 /** Array is considered unchanged when same length and every element is the
@@ -38,7 +43,7 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   return (
     <div
@@ -71,6 +76,7 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
             onMarkDone={onMarkDone}
             onArchive={onArchive}
             onUnarchive={onUnarchive}
+            isOpen={t.id === selectedTaskId}
           />
         ))}
       </div>
@@ -86,7 +92,13 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
  *  member tasks are all reference-unchanged bails out — so a single task
  *  update (which only changes that one task's object identity, per
  *  App.tsx's `reconcileById`) only re-renders the column(s) that actually
- *  contain the changed task. */
+ *  contain the changed task.
+ *
+ *  `selectedTaskId` is compared explicitly (primitive, cheap) so opening/
+ *  switching/closing the run panel re-renders the column(s) that need to
+ *  flip a card's `isOpen` — namely the column containing the newly-selected
+ *  task and, on switch/close, the column containing the previously-selected
+ *  one. */
 export const Column = memo(ColumnImpl, (prev, next) => (
   prev.id === next.id &&
   prev.label === next.label &&
@@ -100,5 +112,6 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.onArchive === next.onArchive &&
   prev.onUnarchive === next.onUnarchive &&
   prev.emptyHint === next.emptyHint &&
+  prev.selectedTaskId === next.selectedTaskId &&
   sameTasks(prev.tasks, next.tasks)
 ));

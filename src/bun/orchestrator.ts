@@ -1135,7 +1135,7 @@ function makeChunkHandler(
   _mode: Task["mode"],
 ) {
   return (stream: RunEvent["stream"], data: string, lineUuid?: string) => {
-    runs.appendEvent(runId, stream, data, lineUuid);
+    const eventId = runs.appendEvent(runId, stream, data, lineUuid);
     emit({ runId, taskId, stream, data, ts: Date.now() });
     // Todo/task-tools board summary: re-derive + persist on any
     // TodoWrite/TaskCreate/TaskUpdate chunk, for every agent kind. Cheap
@@ -1145,6 +1145,31 @@ function makeChunkHandler(
         maybeUpdateTodoProgress(taskId);
       } catch {
         // Never let todo-progress derivation break run settlement.
+      }
+    }
+    // Unread-indicator watermark: bump on every top-level assistant event.
+    // `makeChunkHandler`'s closure has no `subagentId` — every call site that
+    // builds one (see the `onChunk` call sites above) is the MAIN-stream
+    // dispatcher for a task's own run. Subagent transcript lines never reach
+    // here at all: they're appended via a completely separate call site
+    // (`runs.appendEvent(fs.runId, stream, data, lineUuid, fs.subagentId)` in
+    // claude-subagents.ts) with their own `emitFn`, and the live-only
+    // `"subagent"` stream (lifecycle deltas) is explicitly never persisted
+    // (see `RunEventStream`'s doc comment in shared/types.ts) — so it can't
+    // reach `appendEvent` either. That makes every `stream === "assistant"`
+    // chunk seen here unconditionally "no subagent attribution" by
+    // construction; no extra `subagent_id` check is needed (or possible —
+    // this closure never receives one). `eventId` is `null` when
+    // `appendEvent`'s dedup (`INSERT OR IGNORE` on `line_uuid`) found the row
+    // already persisted — e.g. a reattach replay re-delivering a line this
+    // process already streamed before restart — in which case the watermark
+    // was already bumped by the original insert and must not be bumped
+    // again here.
+    if (stream === "assistant" && eventId != null) {
+      try {
+        tasks.noteAssistantEvent(taskId, eventId);
+      } catch {
+        // Never let unread-watermark tracking break run settlement.
       }
     }
     // Claude plan history: ExitPlanMode tool_use/tool_result pairs, claude

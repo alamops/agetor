@@ -59,6 +59,7 @@ import m041 from "./041_task_plans.sql" with { type: "text" };
 import m042 from "./042_subagents_running_idx.sql" with { type: "text" };
 import m043 from "./043_harness_usage.sql" with { type: "text" };
 import m044 from "./044_todo_progress.sql" with { type: "text" };
+import m045 from "./045_unread_watermarks.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -107,4 +108,5 @@ export const migrations: Migration[] = [
   { id: "042_subagents_running_idx", sql: m042 },
   { id: "043_harness_usage", sql: m043, aliases: ["042_harness_usage"] },
   { id: "044_todo_progress", sql: m044 },
+  { id: "045_unread_watermarks", sql: m045 },
 ];

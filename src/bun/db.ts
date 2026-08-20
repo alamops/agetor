@@ -77,6 +77,12 @@ type TaskRow = {
   draft: string | null;
   plans: string;
   todo_progress: string | null;
+  // Unread-indicator watermark pair (migration 045). Not spread into `Task`
+  // directly — only the derived `unread` boolean is (see `toTask`). Written
+  // exclusively by `tasks.noteAssistantEvent` / `tasks.markSeen`, never by
+  // the generic `insert`/`update` paths (see those methods for why).
+  last_assistant_event_id: number | null;
+  last_seen_event_id: number | null;
   run_id: string | null; created_at: number; updated_at: number;
   archived_at: number | null;
   /** SQLite EXISTS returns 0/1; we map to boolean in toTask. Computed via
@@ -280,6 +286,11 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   pendingInteractionCount: counts?.pending ? (counts.pending.get(r.id) ?? 0) : countPendingForTask(r.id),
   openTerminalCount: counts?.terminals ? (counts.terminals.get(r.id) ?? 0) : countTerminals(r.id),
   todoProgress: parseTodoProgress(r.todo_progress),
+  // Derived, never stored: a monotonic-id watermark comparison, race-free by
+  // construction (see migration 045's doc comment). NULL
+  // `last_assistant_event_id` (no assistant event ever observed) always
+  // reads as false, matching "an upgraded/brand-new DB starts all-read".
+  unread: r.last_assistant_event_id != null && r.last_assistant_event_id > (r.last_seen_event_id ?? 0),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   archivedAt: r.archived_at,
@@ -322,8 +333,9 @@ export const tasks = {
       `INSERT INTO tasks
          (id, title, prompt, "column", agent, workdir, isolation, task_type,
           branch, branch_source, worktree_path, base_ref, pr_url, mode, model, effort, fast, max_mode, refs, backlog, draft, plans, todo_progress,
+          last_assistant_event_id, last_seen_event_id,
           run_id, created_at, updated_at, archived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         t.id, t.title, t.prompt, t.column, t.agent, t.workdir, t.isolation,
         t.taskType,
@@ -333,18 +345,28 @@ export const tasks = {
         t.draft ? JSON.stringify(t.draft) : null,
         JSON.stringify(t.plans ?? []),
         t.todoProgress ? JSON.stringify(t.todoProgress) : null,
+        // A brand-new task has never had an assistant event or a mark-seen
+        // — both start NULL, which `toTask` reads as `unread: false`.
+        null, null,
         t.runId, t.createdAt, t.updatedAt, t.archivedAt ?? null,
       ],
     );
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, unread: false, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
     if (!current) return null;
     const next: Task = { ...current, ...patch, id, updatedAt: Date.now() };
+    // Deliberately does NOT touch last_assistant_event_id/last_seen_event_id
+    // — those two columns are written exclusively by `noteAssistantEvent` /
+    // `markSeen` below via their own targeted UPDATEs. `Task` only exposes
+    // the derived `unread` boolean (see `toTask`), never the raw watermark
+    // ints, so there is nothing for a generic patch to carry for these
+    // columns anyway; omitting them from the SET clause is what makes an
+    // unrelated field edit (title, column, …) leave the watermark untouched.
     db.run(
       `UPDATE tasks SET
          title=?, prompt=?, "column"=?, agent=?, workdir=?, isolation=?, task_type=?,
@@ -373,6 +395,42 @@ export const tasks = {
   },
   delete(id: string) {
     db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+  },
+  /**
+   * Mark a task's unread watermark caught-up-to-date: `last_seen_event_id`
+   * becomes `max(last_assistant_event_id, last_seen_event_id)` (both
+   * NULL-coalesced to 0), computed in SQL via the 2-arg scalar `MAX()` so the
+   * read-then-write is atomic within the single UPDATE rather than a
+   * separate SELECT + UPDATE race. Called from `POST /tasks/:id/seen` on
+   * both open and close of the run panel (plan §3). Returns the freshly
+   * updated Task, or null if the task doesn't exist.
+   */
+  markSeen(taskId: string): Task | null {
+    db.run(
+      `UPDATE tasks SET
+         last_seen_event_id = MAX(COALESCE(last_assistant_event_id, 0), COALESCE(last_seen_event_id, 0)),
+         updated_at = ?
+       WHERE id = ?`,
+      [Date.now(), taskId],
+    );
+    return this.get(taskId);
+  },
+  /**
+   * Monotonic bump of the unread watermark's producer side — called by the
+   * orchestrator's chunk handler after persisting a top-level (non-subagent)
+   * `assistant` event. Only writes when `eventId` is strictly greater than
+   * the current value (or the column is still NULL), so an out-of-order
+   * call — e.g. two chunks racing, or a reattach replay re-delivering an
+   * older id — can never move the watermark backwards and spuriously
+   * re-flag a task the user already caught up on.
+   */
+  noteAssistantEvent(taskId: string, eventId: number): void {
+    db.run(
+      `UPDATE tasks SET
+         last_assistant_event_id = ?, updated_at = ?
+       WHERE id = ? AND (last_assistant_event_id IS NULL OR last_assistant_event_id < ?)`,
+      [eventId, Date.now(), taskId, eventId],
+    );
   },
 };
 
@@ -1147,29 +1205,41 @@ export const runs = {
     ).get(taskId, beforeId);
     return row !== null;
   },
+  /**
+   * Returns the inserted row's `id`, or `null` when nothing was actually
+   * inserted — i.e. the `INSERT OR IGNORE` dedup path hit an existing
+   * `(run_id, line_uuid)` row. Callers that only care about "did this event
+   * land, and what's its id" (the unread-watermark detector in
+   * `makeChunkHandler`) can rely on `null` meaning "already persisted
+   * earlier, don't re-derive from it" rather than misreading a stale
+   * `lastInsertRowid` left over from some unrelated prior statement on this
+   * connection. Existing call sites all predate this return value and
+   * simply don't use it.
+   */
   appendEvent(
     runId: string,
     stream: RunEventStream,
     data: string,
     lineUuid?: string | null,
     subagentId?: string | null,
-  ) {
+  ): number | null {
     // INSERT OR IGNORE only when a dedup key is provided. With NULL keys the
     // partial unique index (`WHERE line_uuid IS NOT NULL`) doesn't apply, so
     // non-JSONL events still insert unconditionally and we don't accidentally
     // suppress two genuinely distinct status/stderr rows that happen to share
     // (runId, NULL).
     if (lineUuid) {
-      db.run(
+      const result = db.run(
         `INSERT OR IGNORE INTO run_events (run_id, stream, data, ts, line_uuid, subagent_id) VALUES (?, ?, ?, ?, ?, ?)`,
         [runId, stream, data, Date.now(), lineUuid, subagentId ?? null],
       );
-    } else {
-      db.run(
-        `INSERT INTO run_events (run_id, stream, data, ts, subagent_id) VALUES (?, ?, ?, ?, ?)`,
-        [runId, stream, data, Date.now(), subagentId ?? null],
-      );
+      return result.changes > 0 ? Number(result.lastInsertRowid) : null;
     }
+    const result = db.run(
+      `INSERT INTO run_events (run_id, stream, data, ts, subagent_id) VALUES (?, ?, ?, ?, ?)`,
+      [runId, stream, data, Date.now(), subagentId ?? null],
+    );
+    return Number(result.lastInsertRowid);
   },
   /** Return every JSONL line uuid already persisted across *every* run of
    *  this task. Used by `reattachSession` to seed the in-memory dedup set so
