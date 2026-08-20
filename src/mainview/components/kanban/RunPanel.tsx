@@ -2338,13 +2338,20 @@ function RunPanelBody({
     if (!canSend) { setSendDragging(false); return; }
     if (e.currentTarget === e.target) setSendDragging(false);
   };
-  const reportSendCapture = ({ items, skipped, error }: {
+  const reportSendCapture = ({ items, skipped, skippedFolders, error }: {
     items: CapturedItem[];
     skipped: number;
+    skippedFolders: number;
     error?: string;
   }) => {
     if (error) setSendHint(`Couldn't save screenshot: ${error}`);
-    else if (skipped && !items.length) setSendHint("Nothing to attach — drag a file from Finder, or a screenshot blob.");
+    else if (skippedFolders && skipped > skippedFolders && !items.length) {
+      setSendHint("Couldn't attach some items, including a folder — use the folder picker for folders.");
+    } else if (skippedFolders && !items.length) {
+      setSendHint("Couldn't attach the folder — use the folder picker instead.");
+    } else if (skipped && !items.length) {
+      setSendHint("Nothing to attach — drag a file from Finder, or paste a screenshot.");
+    }
   };
   const onSendDrop = async (e: React.DragEvent) => {
     // preventDefault unconditionally so a stray drop while !canSend doesn't
@@ -2353,7 +2360,7 @@ function RunPanelBody({
     setSendDragging(false);
     if (!canSend) return;
     setSendHint(null);
-    const result = await captureDroppedOrPastedItems(e.dataTransfer);
+    const result = await captureDroppedOrPastedItems(e.dataTransfer, { kind: "drop" });
     reportSendCapture(result);
     applySendCaptured(result.items);
   };
@@ -2364,7 +2371,7 @@ function RunPanelBody({
     if (!hasFile) return;
     e.preventDefault();
     setSendHint(null);
-    const result = await captureDroppedOrPastedItems(cd);
+    const result = await captureDroppedOrPastedItems(cd, { kind: "paste" });
     reportSendCapture(result);
     applySendCaptured(result.items);
   };

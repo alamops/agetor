@@ -25,6 +25,7 @@ import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
   buildHarnessTerminalCommand,
@@ -257,6 +258,30 @@ function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
     refs.push({ path: abs, isDirectory: st.isDirectory() });
   }
   return refs;
+}
+
+// Turn the caller-supplied `?name=` for /attachments into a safe basename
+// that can't escape `${dataDir}/attachments/`, then uniquify it against
+// what's already on disk. Stripping null bytes and path separators before
+// `path.basename` is defense in depth (`path.basename` alone already drops
+// any `/`-delimited directory component); trimming leading dots keeps the
+// result from landing as a hidden dotfile-looking name.
+function uniqueAttachmentName(rawName: string): string {
+  const cleaned = rawName
+    .replace(/\0/g, "")
+    .replace(/[/\\]/g, "-");
+  let safe = path.basename(cleaned).replace(/^\.+/, "");
+  if (!safe) safe = "attachment";
+  const ext = path.extname(safe);
+  const stem = ext ? safe.slice(0, -ext.length) : safe;
+  const dir = path.join(dataDir, "attachments");
+  let candidate = safe;
+  let n = 2;
+  while (existsSync(path.join(dir, candidate))) {
+    candidate = `${stem}-${n}${ext}`;
+    n++;
+  }
+  return candidate;
 }
 
 // We bind to 127.0.0.1 so CORS is mostly belt-and-suspenders. We still echo
@@ -3839,6 +3864,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // WKWebView drops carry no `file://` URL for non-image files/folders
+      // (see the header comment in ./drag-pasteboard.ts), so there's nothing
+      // for the webview to hand `/refs/resolve`. This route reads the macOS
+      // drag pasteboard directly instead — it always reflects the drag that
+      // just ended, since a drop event fires the instant that drag ends.
+      "/refs/drag": {
+        POST: authed((req) => {
+          return json({ refs: refsFromPaths(readDragPasteboardPaths()) }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // Persist a screenshot blob to `${dataDir}/screenshots/` and return its
       // absolute path. Backs the textarea drag/drop + paste flows on the
       // webview — macOS floating-thumbnail drags and clipboard pastes carry
@@ -3887,6 +3923,47 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
           const id = crypto.randomUUID().slice(0, 8);
           const basename = `screenshot-${ts}-${id}.${ext}`;
+          const abs = path.join(dir, basename);
+          await Bun.write(abs, buf);
+          return json({ path: abs, basename }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Persist an arbitrary-content-type blob to `${dataDir}/attachments/`
+      // and return its absolute path. Backs non-image file/folder drops
+      // whose source isn't Finder (so there's no drag-pasteboard path to
+      // recover — e.g. a browser or another app's internal drag) and pasted
+      // non-image blobs: both carry bytes but no filesystem path, so — same
+      // rationale as `/screenshots` above — the only way to give an agent a
+      // path to read is to write the bytes out ourselves. Unlike
+      // `/screenshots`, any content type is accepted (there's no fixed set
+      // of "file" mime types to gate on) and the filename comes from the
+      // caller via `?name=`, sanitized to a safe basename below.
+      "/attachments": {
+        POST: authed(async (req) => {
+          const MAX = 25 * 1024 * 1024;
+          const claimed = Number(req.headers.get("content-length") ?? "");
+          if (Number.isFinite(claimed) && claimed > MAX) {
+            return json(
+              { error: `attachment exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          const buf = await req.arrayBuffer();
+          if (buf.byteLength > MAX) {
+            return json(
+              { error: `attachment exceeds ${MAX} bytes` },
+              { status: 413, headers: corsHeaders(req) },
+            );
+          }
+          if (buf.byteLength === 0) {
+            return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const url = new URL(req.url);
+          const rawName = url.searchParams.get("name") ?? "";
+          const basename = uniqueAttachmentName(rawName);
+          const dir = path.join(dataDir, "attachments");
+          mkdirSync(dir, { recursive: true });
           const abs = path.join(dir, basename);
           await Bun.write(abs, buf);
           return json({ path: abs, basename }, { headers: corsHeaders(req) });

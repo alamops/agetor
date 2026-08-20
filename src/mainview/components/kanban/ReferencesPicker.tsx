@@ -85,9 +85,13 @@ export function ReferencesPicker({
     e.stopPropagation();
     setDragging(false);
     setHint(null);
-    const { items, skipped, error } = await captureDroppedOrPastedItems(e.dataTransfer);
+    const { items, skipped, skippedFolders, error } = await captureDroppedOrPastedItems(e.dataTransfer, { kind: "drop" });
     if (error) {
       setHint(`Couldn't save screenshot: ${error}`);
+    } else if (skippedFolders && skipped > skippedFolders && !items.length) {
+      setHint("Couldn't attach some items, including a folder — use the folder picker above for folders.");
+    } else if (skippedFolders && !items.length) {
+      setHint("Couldn't attach the folder — use the folder picker above instead.");
     } else if (skipped && !items.length) {
       setHint("Drag a file from Finder, or a screenshot from the macOS thumbnail.");
     }
