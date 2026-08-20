@@ -463,9 +463,13 @@ function AppInner() {
       api.markTaskSeen(id)
         .then((updated) => {
           // Optimistic reconcile — don't wait for the next 2s poll to clear
-          // the dot. Replaces just this task's object, matching the
-          // identity-preserving idiom `reconcileById` uses elsewhere.
-          setTasks((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+          // the dot. Merges ONLY the `unread` field: `updated` is a snapshot
+          // taken server-side at POST time and lands asynchronously, so a
+          // wholesale replace could revert a concurrent optimistic patch
+          // (e.g. the SSE column handler's running→review flip).
+          setTasks((prev) =>
+            prev.map((t) => (t.id === updated.id ? { ...t, unread: updated.unread } : t)),
+          );
         })
         .catch((e) => {
           // Fire-and-forget: a failed mark-seen must never block or break

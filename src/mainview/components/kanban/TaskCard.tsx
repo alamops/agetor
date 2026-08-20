@@ -92,8 +92,11 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         // with that ring (an outline) without visual conflict, and sits
         // above the header badge stack in the DOM/paint order.
         <span
-          className="absolute -top-1 -right-1 size-2.5 rounded-full bg-info ring-2 ring-background"
+          // -1.5 offsets keep the dot's background halo clear of the
+          // awaiting state's ring-offset outline instead of notching it.
+          className="absolute -top-1.5 -right-1.5 size-2.5 rounded-full bg-info ring-2 ring-background"
           title="New messages"
+          role="img"
           aria-label="New messages"
         />
       )}

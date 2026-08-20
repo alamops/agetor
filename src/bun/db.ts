@@ -398,20 +398,26 @@ export const tasks = {
   },
   /**
    * Mark a task's unread watermark caught-up-to-date: `last_seen_event_id`
-   * becomes `max(last_assistant_event_id, last_seen_event_id)` (both
-   * NULL-coalesced to 0), computed in SQL via the 2-arg scalar `MAX()` so the
-   * read-then-write is atomic within the single UPDATE rather than a
-   * separate SELECT + UPDATE race. Called from `POST /tasks/:id/seen` on
-   * both open and close of the run panel (plan §3). Returns the freshly
-   * updated Task, or null if the task doesn't exist.
+   * catches up to `last_assistant_event_id` in a single guarded UPDATE, so
+   * the read-then-write is atomic (no SELECT + UPDATE race) and the
+   * statement no-ops entirely when the task is already caught up (the
+   * common case — the panel-open/close effect fires on every selection
+   * change). Called from `POST /tasks/:id/seen` on both open and close of
+   * the run panel (plan §3). Returns the freshly updated Task, or null if
+   * the task doesn't exist.
    */
   markSeen(taskId: string): Task | null {
+    // No-op when already caught up, and no `updated_at` bump either way:
+    // the watermark is server-managed read-state, not a task mutation, and
+    // touching `updated_at` here would defeat `reconcileById`'s identity
+    // preservation (every panel open/close would re-render the board).
     db.run(
       `UPDATE tasks SET
-         last_seen_event_id = MAX(COALESCE(last_assistant_event_id, 0), COALESCE(last_seen_event_id, 0)),
-         updated_at = ?
-       WHERE id = ?`,
-      [Date.now(), taskId],
+         last_seen_event_id = last_assistant_event_id
+       WHERE id = ?
+         AND last_assistant_event_id IS NOT NULL
+         AND COALESCE(last_seen_event_id, 0) < last_assistant_event_id`,
+      [taskId],
     );
     return this.get(taskId);
   },
@@ -425,11 +431,17 @@ export const tasks = {
    * re-flag a task the user already caught up on.
    */
   noteAssistantEvent(taskId: string, eventId: number): void {
+    // Deliberately does NOT bump `updated_at`: this fires on every assistant
+    // chunk of a streaming task, and moving `updated_at` would change the
+    // row's JSON on every 2s poll — defeating `reconcileById`'s identity
+    // preservation and re-rendering the card/column/RunPanel while a task
+    // merely streams. The `unread` flip itself changes the JSON when it
+    // matters.
     db.run(
       `UPDATE tasks SET
-         last_assistant_event_id = ?, updated_at = ?
+         last_assistant_event_id = ?
        WHERE id = ? AND (last_assistant_event_id IS NULL OR last_assistant_event_id < ?)`,
-      [eventId, Date.now(), taskId, eventId],
+      [eventId, taskId, eventId],
     );
   },
 };

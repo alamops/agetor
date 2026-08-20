@@ -94,11 +94,10 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
  *  App.tsx's `reconcileById`) only re-renders the column(s) that actually
  *  contain the changed task.
  *
- *  `selectedTaskId` is compared explicitly (primitive, cheap) so opening/
- *  switching/closing the run panel re-renders the column(s) that need to
- *  flip a card's `isOpen` — namely the column containing the newly-selected
- *  task and, on switch/close, the column containing the previously-selected
- *  one. */
+ *  `selectedTaskId` is compared explicitly (primitive, cheap). App passes
+ *  the same value to every column, so opening/switching/closing the run
+ *  panel re-renders every column — the inner `TaskCard` memo then keeps the
+ *  actual DOM work to the card(s) whose `isOpen` flips. */
 export const Column = memo(ColumnImpl, (prev, next) => (
   prev.id === next.id &&
   prev.label === next.label &&
