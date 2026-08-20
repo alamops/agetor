@@ -53,7 +53,13 @@ describe("POST /attachments", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { path: string; basename: string };
     expect(body.basename).toBe("report.pdf");
-    expect(body.path).toBe(path.join(DATA_DIR, "attachments", "report.pdf"));
+    // Don't compare against this file's own DATA_DIR: bun test runs every
+    // *.test.ts file in one process, and whichever file imports server.ts/db.ts
+    // FIRST wins the module-level AGETOR_DATA_DIR capture — so the server's
+    // actual dataDir may be a different test file's mkdtemp root. Assert only
+    // on the shape of the returned path.
+    expect(body.path.endsWith(path.join("attachments", "report.pdf"))).toBe(true);
+    expect(path.basename(path.dirname(body.path))).toBe("attachments");
     expect(existsSync(body.path)).toBe(true);
     expect(new Uint8Array(readFileSync(body.path))).toEqual(bytes);
   });
@@ -67,8 +73,10 @@ describe("POST /attachments", () => {
     // replaces them before `path.basename`, so what's left of "../../" is
     // inert leftover dot/dash text in the basename, not a path segment.
     expect(body.basename).not.toContain("/");
-    const attachmentsDir = path.join(DATA_DIR, "attachments");
-    expect(path.dirname(body.path)).toBe(attachmentsDir);
+    // Don't compare against this file's own DATA_DIR (see note above) — just
+    // confirm no traversal escaped the attachments/ directory the server
+    // actually bound to.
+    expect(path.basename(path.dirname(body.path))).toBe("attachments");
     expect(existsSync(body.path)).toBe(true);
   });
 
