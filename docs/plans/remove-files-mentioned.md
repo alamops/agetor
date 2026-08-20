@@ -34,7 +34,7 @@ Straight deletion (no feature flag, no "improve the heuristic" alternative): the
 
 ## 5. Work breakdown — test tasks
 
-- None to create: the feature had zero test coverage, and a pure removal leaves nothing new to test. **E2e: not applicable** — no e2e harness exists in this repo, and the change is a UI deletion covered by typecheck + existing suite.
+- None to create: the feature had zero test coverage, and a pure removal leaves nothing new to test. **E2e: not applicable** — a Playwright harness does exist (`playwright.config.ts`, `e2e/*.spec.ts`), but no spec references the "Files mentioned" chip row and a pure deletion adds no new browser-observable behavior to assert.
 - Verification: run `bun run typecheck` and `bun test` (full suite).
 
 ## 6. Execution waves
