@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -261,27 +261,63 @@ function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
 }
 
 // Turn the caller-supplied `?name=` for /attachments into a safe basename
-// that can't escape `${dataDir}/attachments/`, then uniquify it against
-// what's already on disk. Stripping null bytes and path separators before
-// `path.basename` is defense in depth (`path.basename` alone already drops
-// any `/`-delimited directory component); trimming leading dots keeps the
-// result from landing as a hidden dotfile-looking name.
-function uniqueAttachmentName(rawName: string): string {
+// that can't escape `${dataDir}/attachments/`. Stripping null bytes and path
+// separators before `path.basename` is defense in depth (`path.basename`
+// alone already drops any `/`-delimited directory component); trimming
+// leading dots keeps the result from landing as a hidden dotfile-looking
+// name. The stem is capped at 120 UTF-8 bytes — `?name=` is caller-supplied
+// and macOS caps filenames at 255 bytes — trimmed a character at a time
+// (never mid-byte-sequence) so multi-byte UTF-8 names don't come out
+// mangled. Uniquification against what's already on disk happens at write
+// time (see `writeAttachmentAtomic` below), not here — an existsSync probe
+// here would leave a TOCTOU gap for concurrent same-name uploads.
+function sanitizeAttachmentBasename(rawName: string): { stem: string; ext: string } {
   const cleaned = rawName
     .replace(/\0/g, "")
     .replace(/[/\\]/g, "-");
   let safe = path.basename(cleaned).replace(/^\.+/, "");
   if (!safe) safe = "attachment";
   const ext = path.extname(safe);
-  const stem = ext ? safe.slice(0, -ext.length) : safe;
-  const dir = path.join(dataDir, "attachments");
-  let candidate = safe;
-  let n = 2;
-  while (existsSync(path.join(dir, candidate))) {
-    candidate = `${stem}-${n}${ext}`;
-    n++;
+  let stem = ext ? safe.slice(0, -ext.length) : safe;
+  if (!stem) stem = "attachment";
+  const MAX_STEM_BYTES = 120;
+  while (Buffer.byteLength(stem, "utf8") > MAX_STEM_BYTES) {
+    stem = stem.slice(0, -1);
   }
-  return candidate;
+  if (!stem) stem = "attachment";
+  return { stem, ext };
+}
+
+// Write `buf` under `dir` as `${stem}${ext}`, using an atomic exclusive
+// create (`wx`) so two concurrent uploads that sanitize to the same
+// basename (the client fires same-basename uploads via `Promise.all`)
+// can't race an existsSync-then-write check-then-act gap and silently
+// clobber each other. On EEXIST, fall back once to a unique-by-construction
+// name; if even that collides, the error propagates to the route's catch.
+function writeAttachmentAtomic(
+  dir: string,
+  stem: string,
+  ext: string,
+  buf: ArrayBuffer,
+): { abs: string; basename: string } {
+  const createExclusive = (basename: string): string => {
+    const abs = path.join(dir, basename);
+    const fd = openSync(abs, "wx");
+    try {
+      writeSync(fd, Buffer.from(buf));
+    } finally {
+      closeSync(fd);
+    }
+    return abs;
+  };
+  const primary = `${stem}${ext}`;
+  try {
+    return { abs: createExclusive(primary), basename: primary };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    const fallback = `${stem}-${crypto.randomUUID().slice(0, 8)}${ext}`;
+    return { abs: createExclusive(fallback), basename: fallback };
+  }
 }
 
 // We bind to 127.0.0.1 so CORS is mostly belt-and-suspenders. We still echo
@@ -3941,32 +3977,42 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // caller via `?name=`, sanitized to a safe basename below.
       "/attachments": {
         POST: authed(async (req) => {
-          const MAX = 25 * 1024 * 1024;
-          const claimed = Number(req.headers.get("content-length") ?? "");
-          if (Number.isFinite(claimed) && claimed > MAX) {
+          try {
+            const MAX = 25 * 1024 * 1024;
+            const claimed = Number(req.headers.get("content-length") ?? "");
+            if (Number.isFinite(claimed) && claimed > MAX) {
+              return json(
+                { error: `attachment exceeds ${MAX} bytes` },
+                { status: 413, headers: corsHeaders(req) },
+              );
+            }
+            const buf = await req.arrayBuffer();
+            if (buf.byteLength > MAX) {
+              return json(
+                { error: `attachment exceeds ${MAX} bytes` },
+                { status: 413, headers: corsHeaders(req) },
+              );
+            }
+            if (buf.byteLength === 0) {
+              return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
+            }
+            const url = new URL(req.url);
+            const rawName = url.searchParams.get("name") ?? "";
+            const dir = path.join(dataDir, "attachments");
+            // mkdirSync must run before any name computation that touches the
+            // dir (the atomic `wx` create below stats/creates inside it).
+            mkdirSync(dir, { recursive: true });
+            const { stem, ext } = sanitizeAttachmentBasename(rawName);
+            const { abs, basename } = writeAttachmentAtomic(dir, stem, ext, buf);
+            return json({ path: abs, basename }, { headers: corsHeaders(req) });
+          } catch (e) {
+            const msg = (e as Error).message ?? String(e);
+            console.error("[agetor] /attachments failed:", e);
             return json(
-              { error: `attachment exceeds ${MAX} bytes` },
-              { status: 413, headers: corsHeaders(req) },
+              { error: `attachment write failed: ${msg}` },
+              { status: 500, headers: corsHeaders(req) },
             );
           }
-          const buf = await req.arrayBuffer();
-          if (buf.byteLength > MAX) {
-            return json(
-              { error: `attachment exceeds ${MAX} bytes` },
-              { status: 413, headers: corsHeaders(req) },
-            );
-          }
-          if (buf.byteLength === 0) {
-            return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
-          }
-          const url = new URL(req.url);
-          const rawName = url.searchParams.get("name") ?? "";
-          const basename = uniqueAttachmentName(rawName);
-          const dir = path.join(dataDir, "attachments");
-          mkdirSync(dir, { recursive: true });
-          const abs = path.join(dir, basename);
-          await Bun.write(abs, buf);
-          return json({ path: abs, basename }, { headers: corsHeaders(req) });
         }),
       },
 

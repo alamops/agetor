@@ -16,12 +16,13 @@
 // read a pasteboard by name (only `NSPasteboard.general`). So we talk to the
 // Objective-C runtime directly via `bun:ffi`, calling `objc_msgSend` against
 // `NSPasteboard`/`NSString` the same way a compiled Cocoa helper would. This
-// was spike-verified (see docs/spikes or the scratchpad spike this module
-// was adapted from): `NSFilenamesPboardType` yields real POSIX paths, while
+// was spike-verified (see docs/plans/non-image-file-folder-drop-refs.md §2,
+// which records the NSFilenamesPboardType-vs-public.file-url evidence):
+// `NSFilenamesPboardType` yields real POSIX paths, while
 // the modern `public.file-url` UTI only yields file-id URLs
 // (`file:///.file/id=…`) that don't resolve to a stable path — so we
 // deliberately read the legacy type.
-import { dlopen, FFIType, CString, ptr, type Pointer } from "bun:ffi";
+import { dlopen, FFIType, CString, type Pointer } from "bun:ffi";
 
 const NS_PASTEBOARD_NAME_DRAG = "Apple CFPasteboard drag";
 const NS_FILENAMES_PBOARD_TYPE = "NSFilenamesPboardType";
@@ -36,6 +37,13 @@ interface ObjcHandles {
   send0: (receiver: Pointer | null, sel: Pointer | null) => Pointer | null;
   // (receiver, selector, ptr-arg) -> ptr
   send1: (receiver: Pointer | null, sel: Pointer | null, arg: Pointer | null) => Pointer | null;
+  autoreleasePoolPush: () => Pointer | null;
+  autoreleasePoolPop: (pool: Pointer | null) => void;
+  // Keep the dlopen'd Library wrappers alive for the process lifetime — once
+  // a Library object is garbage collected, the lifetime of symbols pulled
+  // from it (objc_msgSend included) is unspecified. Referenced here so they
+  // can never be collected while `handles` itself is reachable.
+  _libs: unknown[];
 }
 
 let handles: ObjcHandles | null = null;
@@ -53,19 +61,24 @@ function getHandles(): ObjcHandles {
   const objcBase = dlopen("/usr/lib/libobjc.A.dylib", {
     objc_getClass: { args: [FFIType.cstring], returns: FFIType.ptr },
     sel_registerName: { args: [FFIType.cstring], returns: FFIType.ptr },
+    objc_autoreleasePoolPush: { args: [], returns: FFIType.ptr },
+    objc_autoreleasePoolPop: { args: [FFIType.ptr], returns: FFIType.void },
   });
-  const send0 = dlopen("/usr/lib/libobjc.A.dylib", {
+  const send0Lib = dlopen("/usr/lib/libobjc.A.dylib", {
     objc_msgSend: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
-  }).symbols.objc_msgSend;
-  const send1 = dlopen("/usr/lib/libobjc.A.dylib", {
+  });
+  const send1Lib = dlopen("/usr/lib/libobjc.A.dylib", {
     objc_msgSend: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
-  }).symbols.objc_msgSend;
+  });
 
   handles = {
     getClass: objcBase.symbols.objc_getClass as ObjcHandles["getClass"],
     registerName: objcBase.symbols.sel_registerName as ObjcHandles["registerName"],
-    send0: send0 as ObjcHandles["send0"],
-    send1: send1 as ObjcHandles["send1"],
+    send0: send0Lib.symbols.objc_msgSend as ObjcHandles["send0"],
+    send1: send1Lib.symbols.objc_msgSend as ObjcHandles["send1"],
+    autoreleasePoolPush: objcBase.symbols.objc_autoreleasePoolPush as ObjcHandles["autoreleasePoolPush"],
+    autoreleasePoolPop: objcBase.symbols.objc_autoreleasePoolPop as ObjcHandles["autoreleasePoolPop"],
+    _libs: [appkit, objcBase, send0Lib, send1Lib],
   };
   return handles;
 }
@@ -79,7 +92,13 @@ function sel(h: ObjcHandles, name: string): Pointer | null {
 }
 
 function nsstr(h: ObjcHandles, s: string): Pointer | null {
-  return h.send1(cls(h, "NSString"), sel(h, "stringWithUTF8String:"), ptr(Buffer.from(s + "\0")));
+  // Pass the Buffer itself (not `ptr(buffer)`) as the ptr-typed arg: bun:ffi
+  // converts a TypedArray argument to a pointer and roots it for the
+  // duration of the call. `ptr(buffer)` instead hands back a raw address
+  // with no reference keeping the Buffer alive — GC can free it before
+  // objc_msgSend dereferences it, which segfaults the whole Bun process.
+  const buf = Buffer.from(s + "\0");
+  return h.send1(cls(h, "NSString"), sel(h, "stringWithUTF8String:"), buf as unknown as Pointer);
 }
 
 // objc autoreleased returns (NSString* etc.) are owned by the runtime's
@@ -122,6 +141,8 @@ function decodeXmlEntities(s: string): string {
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
     .replace(/&#39;/g, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(parseInt(dec, 10)))
     .replace(/&amp;/g, "&"); // must run last, or a literal "&amp;lt;" would double-decode
 }
 
@@ -148,12 +169,20 @@ export function readDragPasteboardPaths(): string[] {
   if (process.platform !== "darwin") return [];
   try {
     const h = getHandles();
-    const pb = h.send1(cls(h, "NSPasteboard"), sel(h, "pasteboardWithName:"), nsstr(h, NS_PASTEBOARD_NAME_DRAG));
-    if (!pb) return [];
-    const value = h.send1(pb, sel(h, "stringForType:"), nsstr(h, NS_FILENAMES_PBOARD_TYPE));
-    const xml = jsstr(h, value);
-    if (!xml) return [];
-    return parseFilenamesPlist(xml);
+    // stringWithUTF8String:/stringForType: hand back autoreleased objects;
+    // without a pool draining them, they leak and objc logs "autoreleased
+    // with no pool in place" to stderr.
+    const pool = h.autoreleasePoolPush();
+    try {
+      const pb = h.send1(cls(h, "NSPasteboard"), sel(h, "pasteboardWithName:"), nsstr(h, NS_PASTEBOARD_NAME_DRAG));
+      if (!pb) return [];
+      const value = h.send1(pb, sel(h, "stringForType:"), nsstr(h, NS_FILENAMES_PBOARD_TYPE));
+      const xml = jsstr(h, value);
+      if (!xml) return [];
+      return parseFilenamesPlist(xml);
+    } finally {
+      h.autoreleasePoolPop(pool);
+    }
   } catch {
     // A pasteboard read is inherently best-effort (wrong OS version, objc
     // runtime hiccup, pasteboard mid-mutation) — degrade to no paths rather

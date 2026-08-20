@@ -1,7 +1,17 @@
 import type { TaskReference } from "../../shared/types.ts";
-import { isImagePath } from "../../shared/attachments.ts";
 import { api } from "./api";
 import { refBasename } from "./path";
+
+// Deliberately narrower than `isImagePath` (shared/attachments.ts, 10
+// extensions incl. svg/heic/bmp/ico/avif): this predicate gates which
+// pasteboard-recovered image refs get *excluded* so they fall through to
+// `POST /screenshots`, and that endpoint only accepts the four content-types
+// browsers actually produce for `<img>`-renderable blobs (png/jpeg/gif/webp
+// — see server.ts's `allowed` map). A ref for an extension outside this set
+// (e.g. `.svg`) must NOT be excluded here, or it would lose its recovered
+// path and then 415 on upload instead of just attaching by path like any
+// other non-image file.
+const SCREENSHOT_UPLOADABLE = /\.(png|jpe?g|gif|webp)$/i;
 
 // `File` in a browser/WKWebView does NOT carry an absolute path (the `.path`
 // property is an Electron-only Chromium extension and is always undefined
@@ -21,7 +31,11 @@ export interface CapturedItem {
 
 export interface CaptureResult {
   items: CapturedItem[];
-  /** Non-image, no-path items that couldn't be turned into a reference. */
+  /** Can currently only originate from the rung-1 (`file://` URL) resolver
+   *  path: the server-side resolver returning fewer refs than paths given
+   *  (e.g. a path that no longer exists). The rung-3 classification loop
+   *  categorizes every collected file into either a ref, an upload, or
+   *  `skippedFolders` — it never falls through to this counter. */
   skipped: number;
   /** Folder entries that couldn't be turned into a reference (never uploaded,
    *  never byte-copied) — always present, 0 when none were seen. */
@@ -183,29 +197,54 @@ export interface CaptureOptions {
  *      concept of "the drag that just happened"; the drag pasteboard could
  *      hold an unrelated *earlier* drag's paths (or be stale/empty), and
  *      querying it on paste would attach the wrong files. Non-transient,
- *      non-image-file refs are kept; when the DataTransfer also collected
- *      `File` objects, a ref is only trusted if its basename matches one of
- *      them (guards a stale pasteboard) — except a folder-only drop can
- *      collect zero `File`s in WebKit even though it's a real drop, so with
- *      nothing to cross-check against, the refs are trusted unvalidated.
- *      Matched files are consumed here and skip rung 3/4 below.
+ *      screenshot-uploadable-image refs are dropped (they stay on the rung 3
+ *      upload path below, unchanged); everything else is partitioned into
+ *      directory refs and file refs:
+ *        - Directory refs are **always accepted** — they're part of the
+ *          drag that just ended, and WebKit often produces no `File` entry
+ *          for a directory at all, so basename-matching one against
+ *          `collected` (the way file refs are validated below) would be
+ *          unreliable.
+ *        - File refs are only trusted **when `collected` is non-empty**, and
+ *          only the ones whose basename matches a collected `File` (guards a
+ *          stale pasteboard). When `collected` is empty, no file refs are
+ *          accepted — a folder-only drop legitimately collects zero `File`s
+ *          in WebKit (covered by the directory-refs rule above), but trusting
+ *          bare file refs with nothing to cross-check against would let a
+ *          stale/unrelated earlier drag's pasteboard attach files that were
+ *          never part of this drop. This means a "notes.txt + myproj/
+ *          dropped together" drop attaches *both* — the directory
+ *          unconditionally, the file because it matches a collected `File`.
+ *      Any collected `File` whose basename matches an accepted ref (folder or
+ *      file) is consumed here and skips rung 3/4 below.
  *
- *   3. Each remaining carried file is classified:
+ *   3. Each remaining carried file is classified, in order:
  *      - `file.path` present (future-proofing; always undefined in
  *        WKWebView) → use it directly.
+ *      - `isDirectory` (set by `collectFiles` from `webkitGetAsEntry()`) →
+ *        can't be uploaded or byte-copied as a single blob, so it's counted
+ *        in `skippedFolders` and dropped (rung 4).
  *      - `image/*` blob (macOS floating screenshot thumbnail, Cmd+V image
  *        paste, or an image left over after rung 2) → upload via the
  *        injected `uploader` and use the path the server writes.
- *      - any other non-directory blob → byte-copy fallback: upload via the
- *        injected `attachmentUploader` and use the path the server writes.
- *        This is what lets a path-less non-image paste (or a drop whose
- *        pasteboard lookup failed) still attach instead of being skipped.
+ *      - `f.size === 0 && !f.type` → a probable directory that arrived via
+ *        `source.files` (which never carries `isDirectory`, see
+ *        `collectFiles`) or via a `webkitGetAsEntry()` that returned null —
+ *        WebKit surfaces a dropped folder as a zero-byte, typeless `File` in
+ *        both cases, indistinguishable from a genuinely empty file except by
+ *        this heuristic. Counted in `skippedFolders` rather than uploaded, to
+ *        avoid POSTing a directory Blob whose read would fail on the server.
+ *        (Trade-off: a real empty, typeless file also loses its byte-copy
+ *        fallback here — accepted, since its pasteboard path usually
+ *        recovers it via rung 1 or 2 first.)
+ *      - any other blob → byte-copy fallback: upload via the injected
+ *        `attachmentUploader` and use the path the server writes. This is
+ *        what lets a path-less non-image paste (or a drop whose pasteboard
+ *        lookup failed) still attach instead of being skipped.
  *
- *   4. A directory entry that survives to this point (rung 2 didn't apply —
- *      paste, or a drop whose pasteboard step found nothing to match it)
- *      can't be uploaded or byte-copied as a single blob, so it's counted in
- *      `skippedFolders` and dropped. Anything else uncategorizable is
- *      counted in `skipped`, as before.
+ *   4. See the `isDirectory` and zero-byte-blob branches in rung 3 above —
+ *      both funnel into `skippedFolders`. There is no other "uncategorizable"
+ *      case: every collected file is either a ref, an upload, or a folder.
  *
  * Everything read directly off the DataTransfer (`collectFiles`,
  * `extractFilePaths`) happens synchronously before the first `await`, since
@@ -231,6 +270,9 @@ export async function captureDroppedOrPastedItems(
   if (!source) return { items: [], skipped: 0, skippedFolders: 0 };
   // Read everything synchronously up front — the DataTransfer dies on yield.
   const collected = collectFiles(source);
+  // Snapshot alongside the other sync reads, not after the first `await` —
+  // `source.types` reads empty once the DataTransfer is dead.
+  const typesSnapshot = Array.from(source.types ?? []);
   // Drop transient (temp-dir) URLs so a screenshot-thumbnail drag falls
   // through to the blob-upload path below rather than referencing a file
   // that may vanish — see `isTransientPath`.
@@ -250,28 +292,45 @@ export async function captureDroppedOrPastedItems(
   // why paste must never consult it.
   const draggedItems: CapturedItem[] = [];
   const consumed = new Set<number>();
-  const carriedFiles = collected.length > 0 || Array.from(source.types ?? []).includes("Files");
+  const carriedFiles = collected.length > 0 || typesSnapshot.includes("Files");
   if (kind === "drop" && carriedFiles) {
     try {
       const dragged = await dragRefsFn();
+      // Only the four types `POST /screenshots` can actually take stay on
+      // the rung 3 upload path — see `SCREENSHOT_UPLOADABLE`. Every other
+      // extension (including other image-ish ones like .svg/.heic) is kept
+      // here and recovers its path like any non-image file.
       const filtered = dragged.filter(
-        (ref) => !isTransientPath(ref.path) && !(!ref.isDirectory && isImagePath(ref.path)),
+        (ref) => !isTransientPath(ref.path) && !(!ref.isDirectory && SCREENSHOT_UPLOADABLE.test(ref.path)),
       );
+      // Consume the collected `File` (if any) matching `ref`'s basename and
+      // return whether one was found.
+      const consumeMatch = (ref: TaskReference): boolean => {
+        const base = refBasename(ref.path);
+        const idx = collected.findIndex((c, i) => !consumed.has(i) && c.file.name === base);
+        if (idx === -1) return false;
+        consumed.add(idx);
+        return true;
+      };
+
+      // Directories: always accepted — see the flow comment above for why
+      // basename-matching against `collected` isn't a reliable gate for
+      // them. Still consume a matching collected `File` when one exists, so
+      // it isn't double-processed by the rung 3 loop below.
+      for (const ref of filtered.filter((r) => r.isDirectory)) {
+        consumeMatch(ref);
+        draggedItems.push({ ref, basename: refBasename(ref.path) });
+      }
+
+      // Files: only trusted when `collected` is non-empty, and only the
+      // ones matching a collected `File` (stale-pasteboard guard). When
+      // `collected` is empty, no file refs are accepted here — see the flow
+      // comment above for why the folder-only case is covered by the
+      // directories loop instead.
       if (collected.length > 0) {
-        for (const ref of filtered) {
+        for (const ref of filtered.filter((r) => !r.isDirectory)) {
           const base = refBasename(ref.path);
-          const idx = collected.findIndex((c, i) => !consumed.has(i) && c.file.name === base);
-          if (idx !== -1) {
-            consumed.add(idx);
-            draggedItems.push({ ref, basename: base });
-          }
-        }
-      } else {
-        // Folder-only drop: WebKit can collect zero `File`s even though the
-        // drop is real, so there's nothing to cross-check against — trust
-        // the pasteboard's refs unvalidated.
-        for (const ref of filtered) {
-          draggedItems.push({ ref, basename: refBasename(ref.path) });
+          if (consumeMatch(ref)) draggedItems.push({ ref, basename: base });
         }
       }
     } catch {
@@ -286,13 +345,14 @@ export async function captureDroppedOrPastedItems(
     }
     // Nothing usable — leave a breadcrumb so a test drag reveals what WebKit
     // actually exposed (helps if a future macOS strips file:// from drags).
-    if (source.types?.length) {
-      console.warn("[agetor] drop carried no file:// URLs; types =", Array.from(source.types));
+    // Uses the pre-await snapshot — `source.types` reads empty by now.
+    if (typesSnapshot.length) {
+      console.warn("[agetor] drop carried no file:// URLs; types =", typesSnapshot);
     }
     return { items: [], skipped: 0, skippedFolders: 0 };
   }
 
-  type PendingResult = CapturedItem | { skipped: true } | { folder: true } | { error: string };
+  type PendingResult = CapturedItem | { folder: true } | { error: string };
   const pending: Array<Promise<PendingResult>> = [];
   for (let i = 0; i < collected.length; i++) {
     if (consumed.has(i)) continue;
@@ -304,6 +364,10 @@ export async function captureDroppedOrPastedItems(
       }));
       continue;
     }
+    if (isDirectory) {
+      pending.push(Promise.resolve({ folder: true }));
+      continue;
+    }
     if (f.type && f.type.startsWith("image/")) {
       pending.push(
         uploader(f)
@@ -312,30 +376,32 @@ export async function captureDroppedOrPastedItems(
       );
       continue;
     }
-    if (!isDirectory) {
-      pending.push(
-        attachmentUploaderFn(f, f.name || "attachment")
-          .then((r) => ({ ref: { path: r.path, isDirectory: false }, basename: r.basename }))
-          .catch((e: Error) => ({ error: e.message })),
-      );
-      continue;
-    }
-    if (isDirectory) {
+    // A dropped directory can arrive here mislabeled as a plain file: WebKit
+    // surfaces it as a zero-byte, typeless `File` both when it came through
+    // `source.files` (`collectFiles` never sets `isDirectory` on that path)
+    // and when `webkitGetAsEntry()` returned null. Treat that shape as a
+    // probable directory rather than uploading a blob whose read would fail
+    // server-side. A genuinely empty, typeless file is misclassified the
+    // same way and loses its byte-copy fallback here — accepted, since its
+    // pasteboard path usually recovers it first (rung 1/2).
+    if (f.size === 0 && !f.type) {
       pending.push(Promise.resolve({ folder: true }));
       continue;
     }
-    pending.push(Promise.resolve({ skipped: true }));
+    pending.push(
+      attachmentUploaderFn(f, f.name || "attachment")
+        .then((r) => ({ ref: { path: r.path, isDirectory: false }, basename: r.basename }))
+        .catch((e: Error) => ({ error: e.message })),
+    );
   }
   const settled = await Promise.all(pending);
   const items: CapturedItem[] = [...draggedItems];
-  let skipped = 0;
   let skippedFolders = 0;
   let error: string | undefined;
   for (const r of settled) {
     if ("ref" in r) items.push(r);
     else if ("error" in r) error = r.error;
-    else if ("folder" in r) skippedFolders++;
-    else skipped++;
+    else skippedFolders++;
   }
-  return { items, skipped, skippedFolders, ...(error ? { error } : {}) };
+  return { items, skipped: 0, skippedFolders, ...(error ? { error } : {}) };
 }

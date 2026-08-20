@@ -5,10 +5,39 @@ import { InfoTip } from "@/components/ui/info-tip";
 import { cn } from "@/lib/utils";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import { captureDroppedOrPastedItems } from "@/lib/capture-refs";
+import type { CaptureResult } from "@/lib/capture-refs";
 import { api } from "@/lib/api";
 import type { TaskReference } from "../../../shared/types.ts";
 
 export { captureDroppedOrPastedItems, type CapturedItem, type CaptureResult } from "@/lib/capture-refs";
+
+/**
+ * Shared decision ladder for the "what happened to my drop/paste" hint,
+ * used by this component's own onDrop plus NewTaskForm's reportCapture and
+ * RunPanel's reportSendCapture. Keep the condition order in sync across all
+ * three call sites even when the wording differs per surface:
+ *
+ *   1. `error`                                    -> attach-failure message
+ *   2. `skippedFolders > 0 && items.length > 0`    -> partial success (files
+ *      landed, a folder didn't) — never gated on `!items.length`, so a
+ *      partial success doesn't silently swallow the folder failure.
+ *   3. `skippedFolders > 0` (nothing attached)     -> folder-only failure
+ *   4. `skipped > 0 && !items.length`               -> "nothing to attach"
+ *   5. otherwise                                    -> no hint (null)
+ *
+ * `skipped` and `skippedFolders` are disjoint counters (folders never
+ * increment `skipped`), so don't compare them against each other.
+ */
+export function dropHintMessage(
+  { items, skipped, skippedFolders, error }: Pick<CaptureResult, "items" | "skipped" | "skippedFolders" | "error">,
+  messages: { partialFolder: string; allFolder: string; nothingToAttach: string },
+): string | null {
+  if (error) return `Couldn't attach: ${error}`;
+  if (skippedFolders > 0 && items.length > 0) return messages.partialFolder;
+  if (skippedFolders > 0) return messages.allFolder;
+  if (skipped > 0 && !items.length) return messages.nothingToAttach;
+  return null;
+}
 
 interface Props {
   refs: TaskReference[];
@@ -85,17 +114,13 @@ export function ReferencesPicker({
     e.stopPropagation();
     setDragging(false);
     setHint(null);
-    const { items, skipped, skippedFolders, error } = await captureDroppedOrPastedItems(e.dataTransfer, { kind: "drop" });
-    if (error) {
-      setHint(`Couldn't save screenshot: ${error}`);
-    } else if (skippedFolders && skipped > skippedFolders && !items.length) {
-      setHint("Couldn't attach some items, including a folder — use the folder picker above for folders.");
-    } else if (skippedFolders && !items.length) {
-      setHint("Couldn't attach the folder — use the folder picker above instead.");
-    } else if (skipped && !items.length) {
-      setHint("Drag a file from Finder, or a screenshot from the macOS thumbnail.");
-    }
-    append(items.map((i) => i.ref));
+    const result = await captureDroppedOrPastedItems(e.dataTransfer, { kind: "drop" });
+    setHint(dropHintMessage(result, {
+      partialFolder: "Attached the files — one folder couldn't be attached; use the folder picker above.",
+      allFolder: "Couldn't attach the folder — use the folder picker above instead.",
+      nothingToAttach: "Drag a file from Finder, or a screenshot from the macOS thumbnail.",
+    }));
+    append(result.items.map((i) => i.ref));
   };
 
   const onDragOver = (e: React.DragEvent) => {
