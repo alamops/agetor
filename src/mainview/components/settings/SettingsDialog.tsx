@@ -101,7 +101,7 @@ function parseEnv(raw: string): { env: Record<string, string>; ignored: number }
  *  badge everywhere a harness/template kind is shown. Extend this list (not
  *  the individual call sites) as a kind graduates out of experimental. */
 function isExperimentalKind(kind: AgentKind): boolean {
-  return kind === "codex" || kind === "cursor" || kind === "gemini";
+  return kind === "codex" || kind === "cursor" || kind === "gemini" || kind === "fx";
 }
 
 function stringifyEnv(env: Record<string, string>): string {
@@ -158,6 +158,11 @@ const HARNESS_HOME_COPY: Record<AgentKind, { label: string; slug: string; help: 
     label: "GEMINI_CLI_HOME override (absolute path; optional)",
     slug: "gemini-2",
     help: "Sets GEMINI_CLI_HOME on spawn — gemini stores its login, sessions, and settings under this path (a dedicated override, not the real HOME), so a separate path gives this harness its own account.",
+  },
+  fx: {
+    label: "HOME override (absolute path; optional)",
+    slug: "fx-2",
+    help: "HOME override — fx has no dedicated config-dir env var; the harness home becomes $HOME for the spawned agent, so fx's state (~/.fx) lands under this path, giving this harness its own account.",
   },
 };
 
@@ -1039,8 +1044,8 @@ function Editor({
       </div>
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground">Harness type</label>
-        <div className="grid grid-cols-4 gap-1">
-          {(["claude-code", "codex", "cursor", "gemini"] as AgentKind[]).map((k) => {
+        <div className="grid grid-cols-5 gap-1">
+          {(["claude-code", "codex", "cursor", "gemini", "fx"] as AgentKind[]).map((k) => {
             const experimental = isExperimentalKind(k);
             return (
               <Button

@@ -10,6 +10,8 @@ import {
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
 import { spawnCursorViaTmux } from "./cursor-tmux.ts";
+import { dataDir } from "./db.ts";
+import { spawnFxViaAcp, type FxMode } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { gitWritableRootsSync } from "./worktree.ts";
 
@@ -82,8 +84,12 @@ export interface AgentRunOptions {
    * Existing session id to resume a prior conversation on a follow-up turn.
    * For claude-code: the JSONL session uuid, resumed via `claude --resume
    * <id>`. For codex: the `thread_id`, resumed via `codex exec resume <id>`.
-   * Either way the new prompt attaches to the full prior conversation instead
-   * of starting fresh.
+   * For fx: fx's own ACP session id (DISCOVERED from `session/new`'s
+   * response on the first turn, not pre-generated — see `onSessionId` on
+   * `SpawnAgentArgs`), resumed via the ACP `session/resume` request (falling
+   * back to `session/load` on a resume error — see fx-acp.ts). Either way
+   * the new prompt attaches to the full prior conversation instead of
+   * starting fresh.
    */
   resumeSessionId?: string | null;
   /**
@@ -107,6 +113,19 @@ export interface AgentRunOptions {
    * sandbox (which can't write anything regardless).
    */
   codexExternalGitDirs?: string[];
+  /**
+   * The run row id, threaded into `buildCommand` ONLY for fx: fx's argv
+   * embeds a deterministic `--log-file <dataDir>/fx-logs/<runId>.log` path
+   * (fx owns and writes that log itself — see fx-acp.ts's header — this just
+   * gives it somewhere to open). Every other kind ignores this field; codex
+   * and cursor instead take a `runId` directly as a `spawnAgent`/tmux-driver
+   * argument for the same per-turn log/prompt-file purpose, since their
+   * per-kind command-building functions (`buildCodexCommand`) already have a
+   * dedicated seam for cwd/run-scoped values. fx's is simpler (no fs calls
+   * needed to resolve it) so it rides directly in `AgentRunOptions` instead
+   * of getting its own `buildFxCommand` wrapper.
+   */
+  runId?: string | null;
 }
 
 // Map friendly model ids to the exact strings the claude-code CLI expects.
@@ -194,6 +213,10 @@ export function resolveBin(harness: Harness): string {
       fallback = "gemini";
       override = process.env.AGETOR_GEMINI_BIN;
       break;
+    case "fx":
+      fallback = "fx";
+      override = process.env.AGETOR_FX_BIN;
+      break;
   }
   if (override) return override;
   return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
@@ -231,6 +254,13 @@ export function harnessEnv(harness: Harness): Record<string, string> {
       env.HOME = harness.home;
       env.CODEX_HOME = path.join(harness.home, ".codex");
     } else if (harness.kind === "cursor") {
+      env.HOME = harness.home;
+    } else if (harness.kind === "fx") {
+      // fx has no dedicated config-dir env var (verified against binary
+      // v0.0.4 — no FX_HOME or FX_CONFIG_DIR in its strings); its state
+      // lives hardcoded at `~/.fx/*`, so isolating an additional account's
+      // login/config means a true HOME override, same approach as cursor's
+      // branch above.
       env.HOME = harness.home;
     } else {
       // gemini: GEMINI_CLI_HOME is a dedicated home-override env var (verified
@@ -552,6 +582,47 @@ export function buildCommand(
       );
     }
     args.push("-p", prompt);
+
+    return { cmd: args, env: Object.keys(env).length ? env : undefined };
+  }
+
+  if (harness.kind === "fx") {
+    // fx — driven over ACP/stdio via fx-acp.ts, no tmux involved at all (see
+    // that file's header). The prompt is NOT an argv element: it rides over
+    // the `session/prompt` JSON-RPC call the driver issues after the
+    // handshake, so unlike claude/gemini there's no tmux-imsg-cap-style
+    // argv-size budget to enforce here.
+    const extra = (process.env.AGETOR_FX_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+    if (!opts.model) {
+      throw new Error("model is required for fx");
+    }
+    if (!opts.runId) {
+      throw new Error("runId is required for fx (used to build the --log-file path)");
+    }
+
+    // fx owns and writes its own `--log-file` for its own troubleshooting —
+    // agetor never reads it (fx-acp.ts's `ensureLogDirForArgv` only makes
+    // sure the parent dir exists so `fx acp` doesn't fail to open it). This
+    // is the seam `FxLaunchOptions.argv` documents: buildCommand emits the
+    // full argv, `--log-file` already filled in; the driver appends nothing.
+    const logFile = path.join(dataDir, "fx-logs", `${opts.runId}.log`);
+
+    const args: string[] = [bin, "acp", "--model", opts.model, "--log-file", logFile, ...extra];
+
+    // Permission posture rides as an env var, not an argv flag — mirrors the
+    // FX_PERMISSION_MODE contract FxLaunchOptions.env documents. `auto`
+    // (also the null default, per house convention) and `ask` map straight
+    // through since fx's own mode ids already match agetor's; any other
+    // (future/unknown) mode id passes through verbatim, same convention as
+    // every other kind's unknown-model/mode passthrough in this file.
+    const mode = opts.mode ?? "auto";
+    env.FX_PERMISSION_MODE = mode;
+
+    // fx has no per-invocation effort/reasoning flag — its models route
+    // through the Vercel AI Gateway verbatim, with no CLI-level effort knob
+    // (mirrors gemini's silent-ignore of opts.effort above, not codex's
+    // required-effort throw).
 
     return { cmd: args, env: Object.keys(env).length ? env : undefined };
   }
@@ -944,10 +1015,12 @@ export interface SpawnAgentArgs {
    * Fires with the agent's session uuid. For claude-code and gemini, both of
    * which take a self-issued `--session-id`, this fires synchronously before
    * the CLI has even written its first event — useful for persisting the id
-   * on the run row immediately. For codex it fires later, once the driver
-   * discovers the `thread_id` from the `thread.started` event (codex has no
-   * pre-generation flag). Not invoked at all pre-gemini for codex-shaped
-   * "no comparable session id" cases — every kind now has one.
+   * on the run row immediately. For codex and fx it fires later, once the
+   * driver DISCOVERS the id from the process itself — codex from the
+   * `thread.started` event, fx from the ACP `session/new` response's
+   * `sessionId` (both have no pre-generation flag/mechanism). Not invoked at
+   * all pre-gemini for codex-shaped "no comparable session id" cases — every
+   * kind now has one.
    */
   onSessionId?: (sessionId: string) => void;
   opts?: AgentRunOptions;
@@ -1053,6 +1126,38 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       env: built.env ?? {},
       cwd,
       onChunk,
+    });
+  }
+
+  if (harness.kind === "fx") {
+    // fx — driven over ACP/stdio via fx-acp.ts, a plain `Bun.spawn` child
+    // process with no tmux involved (see that file's header for why: an ACP
+    // stdio server has nothing to reattach to across an agetor restart, so a
+    // mid-turn death orphans the run by design).
+    if (process.env.AGETOR_FX_DRIVER === "fake") {
+      // Build the command anyway so the fake records the prompt going by and
+      // exercises the same validation (missing model/runId) the real path
+      // does; the fake's behaviour doesn't depend on the argv shape.
+      buildCommand(harness, prompt, { ...opts, runId });
+      // fx's ACP session id is DISCOVERED from `session/new`'s response, not
+      // pre-generated — mirrors codex's `thread.started`-discovery timing
+      // (see the `onSessionId` doc on `SpawnAgentArgs`), not claude/gemini's
+      // pre-generated-uuid pattern.
+      onSessionId?.(`fake-fx-session-${taskId}`);
+      return makeFakeAgent(taskId, prompt, onChunk);
+    }
+    const built = buildCommand(harness, prompt, { ...opts, runId });
+    return spawnFxViaAcp({
+      taskId,
+      runId,
+      argv: built.cmd,
+      env: built.env ?? {},
+      cwd,
+      promptText: prompt,
+      mode: (opts.mode ?? "auto") as FxMode,
+      resumeSessionId: opts.resumeSessionId ?? undefined,
+      onChunk,
+      onSessionId,
     });
   }
 

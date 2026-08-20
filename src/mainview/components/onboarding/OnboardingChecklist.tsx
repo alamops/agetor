@@ -41,6 +41,7 @@ const LOGIN_COMMAND: Partial<Record<AgentKind, string>> = {
   "claude-code": "claude /login",
   codex: "codex login",
   cursor: "cursor-agent login",
+  fx: "fx login",
 };
 
 function StepIcon({ done, index }: { done: boolean; index: number }) {

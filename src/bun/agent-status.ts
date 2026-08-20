@@ -12,6 +12,7 @@ const INSTALL_HINTS: Record<AgentKind, string> = {
   "codex": "npm i -g @openai/codex",
   "cursor": "curl https://cursor.com/install -fsS | bash",
   "gemini": "npm i -g @google/gemini-cli",
+  "fx": "curl -fsSL https://fx.sh/setup.sh | bash",
 };
 
 async function probeVersion(bin: string, env: Record<string, string>): Promise<string | null> {

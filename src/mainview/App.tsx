@@ -169,7 +169,7 @@ function AppInner() {
   // harness step tell "not loaded yet" (skip the disabled/enabled
   // distinction) apart from "loaded, and it happens to be empty".
   const [harnessesLoaded, setHarnessesLoaded] = useState(false);
-  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [] });
+  const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
   // Per-harness quota/usage snapshots for the topbar chip mini-bar + popover
   // (D2). Seeded once on boot via `getAllUsage`, kept current afterwards by
   // the `harness_usage` AppEvent (see the `subscribeAppEvents` handler

@@ -185,6 +185,7 @@ export interface AgentModelMap {
   "codex": { id: string; label?: string }[];
   "cursor": { id: string; label?: string }[];
   "gemini": { id: string; label?: string }[];
+  "fx": { id: string; label?: string }[];
 }
 
 /** Pending multi-question card from claude's built-in AskUserQuestion tool
