@@ -203,6 +203,11 @@ async function provisionBackend(
       AGETOR_CLAUDE_BIN: "/bin/echo",
       AGETOR_TMUX_BIN: "/bin/echo",
       AGETOR_CLAUDE_ARGS: "",
+      // Same fake-driver treatment for the fx harness — inert for every
+      // spec here (none of them start an fx run) but keeps this fixture
+      // ahead of a future fx-driven spec the way the codex/cursor/gemini
+      // equivalents would if a spec here exercised them.
+      AGETOR_FX_DRIVER: "fake",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

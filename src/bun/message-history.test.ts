@@ -104,7 +104,7 @@ function seedTask(agent: string, overrides: Partial<Task> = {}): { taskId: strin
   runs.insert({
     id: runId, taskId, agent: agent as Task["agent"], status: "succeeded",
     startedAt: now, endedAt: now + 1, exitCode: 0,
-    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
   return { taskId, runId };
 }

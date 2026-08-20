@@ -137,7 +137,7 @@ test.skipIf(!HAVE_TMUX)("follow-up to a task whose session outlived the process 
       tmuxSession: sessionName,
       claudeSessionId: "prior-claude-session-id",
       codexSessionId: null,
-      cursorSessionId: null, geminiSessionId: null,
+      cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
     });
 
     const result = await sendInput(priorRunId, "please continue");

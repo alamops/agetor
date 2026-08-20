@@ -90,7 +90,7 @@ async function seedTask(opts: {
     id: runId, taskId, agent: "claude-code", status: opts.runStatus, startedAt: now,
     endedAt: opts.runStatus === "running" ? null : now,
     exitCode: opts.runStatus === "succeeded" ? 0 : opts.runStatus === "failed" ? 1 : null,
-    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
+    tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
   return { taskId, runId };
 }
@@ -339,13 +339,13 @@ test("runs.origin round-trips through insert/get/listForTask", async () => {
     id: contRunId, taskId, agent: "claude-code", status: "running", startedAt: now,
     endedAt: null, exitCode: null, tmuxSession: null, claudeSessionId: "sess-1",
     codexSessionId: null, origin: "continuation",
-    cursorSessionId: null, geminiSessionId: null,
+    cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
   });
 
   const plainRunId = `run-origin-plain-${randomUUID()}`;
   runs.insert({
     id: plainRunId, taskId, agent: "claude-code", status: "succeeded", startedAt: now,
-    endedAt: now, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null,
+    endedAt: now, exitCode: 0, tmuxSession: null, claudeSessionId: null, codexSessionId: null, cursorSessionId: null, geminiSessionId: null, fxSessionId: null,
     // origin intentionally omitted — the pre-migration-023 shape.
   });
 
