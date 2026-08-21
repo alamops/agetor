@@ -436,3 +436,117 @@ test("answer* paths emit on the resolved broadcaster", async () => {
   expect(seen.map((s) => s.kind)).toEqual(["ask_questions", "tmux_prompt", "tmux_prompt"]);
   expect(seen.map((s) => s.id)).toEqual([q.id, t.id, t2.id]);
 });
+
+/* ── fx ACP session/request_permission (real in-process awaiter) ─────── */
+
+/** Convenience wrapper mirroring `makePrompt` above — registers an
+ *  fx_permission with two options, the shape `respondPermissionRequest`
+ *  (fx-acp.ts) actually sends. */
+async function makeFxPermission(taskId: string, runId: string) {
+  const { registerFxPermission } = await import("./interactions.ts");
+  return registerFxPermission({
+    taskId, runId,
+    toolCall: { toolCallId: "tc-1", title: "Run something", kind: "execute" },
+    options: [
+      { optionId: "allow-once", name: "allow-once", kind: "allow_once" },
+      { optionId: "reject-once", name: "reject-once", kind: "reject_once" },
+    ],
+    mode: "ask",
+  });
+}
+
+test("registerFxPermission + answerFxPermission round-trips an optionId, and the card leaves the pending list", async () => {
+  const { listPendingForTask, answerFxPermission, __testing } = await import("./interactions.ts");
+  expect(__testing.fxPermissionsSize()).toBe(0);
+
+  const { id, req, answer } = await makeFxPermission("tFx", "rFx");
+  expect(__testing.fxPermissionsSize()).toBe(1);
+  expect(req.kind).toBe("fx_permission");
+  expect(req.taskId).toBe("tFx");
+  expect(listPendingForTask("tFx").map((r) => r.id)).toEqual([id]);
+
+  expect(answerFxPermission(id, { optionId: "allow-once" })).toBe(true);
+  await expect(answer).resolves.toEqual({ optionId: "allow-once" });
+
+  expect(__testing.fxPermissionsSize()).toBe(0);
+  expect(listPendingForTask("tFx")).toHaveLength(0);
+});
+
+test("answerFxPermission is idempotent: a second answer for the same id returns false", async () => {
+  const { answerFxPermission } = await import("./interactions.ts");
+  const { id, answer } = await makeFxPermission("tFxTwice", "rFx");
+
+  expect(answerFxPermission(id, { optionId: "allow-once" })).toBe(true);
+  await expect(answer).resolves.toEqual({ optionId: "allow-once" });
+
+  // A second (racing) resolution attempt for the same id — e.g. the
+  // driver's own cancel/teardown sweep landing after the user already
+  // answered — must be a safe no-op, not a double-resolve.
+  expect(answerFxPermission(id, { cancelled: true })).toBe(false);
+});
+
+test("findFxPermissionById returns the pending request, then null once answered", async () => {
+  const { findFxPermissionById, answerFxPermission } = await import("./interactions.ts");
+  const { id } = await makeFxPermission("tFxFind", "rFx");
+
+  expect(findFxPermissionById(id)?.taskId).toBe("tFxFind");
+  expect(findFxPermissionById("missing-id")).toBeNull();
+
+  answerFxPermission(id, { optionId: "reject-once" });
+  expect(findFxPermissionById(id)).toBeNull();
+});
+
+test("cancelPendingForTask resolves a pending fx_permission with {cancelled: true} and removes it", async () => {
+  const { cancelPendingForTask, __testing } = await import("./interactions.ts");
+  const { answer } = await makeFxPermission("tFxCancel", "rFx");
+  expect(__testing.fxPermissionsSize()).toBe(1);
+
+  cancelPendingForTask("tFxCancel", "stop");
+  await expect(answer).resolves.toEqual({ cancelled: true });
+  expect(__testing.fxPermissionsSize()).toBe(0);
+});
+
+test("cancelPendingForTask leaves other tasks' fx_permission cards untouched", async () => {
+  const { cancelPendingForTask, answerFxPermission } = await import("./interactions.ts");
+  const keep = await makeFxPermission("tFxA", "rFx");
+  const drop = await makeFxPermission("tFxB", "rFx");
+
+  cancelPendingForTask("tFxB", "stop");
+  await expect(drop.answer).resolves.toEqual({ cancelled: true });
+
+  // 'keep' still pending → answerable:
+  expect(answerFxPermission(keep.id, { optionId: "allow-once" })).toBe(true);
+  await expect(keep.answer).resolves.toEqual({ optionId: "allow-once" });
+});
+
+test("registerFxPermission broadcasts the card, and answering it fires the resolved broadcaster", async () => {
+  const { setBroadcaster, setResolvedBroadcaster, answerFxPermission } = await import("./interactions.ts");
+  const broadcasted: string[] = [];
+  const resolved: Array<{ id: string; kind: string }> = [];
+  setBroadcaster((req) => broadcasted.push(req.kind));
+  setResolvedBroadcaster((r) => resolved.push({ id: r.id, kind: r.kind }));
+
+  const { id } = await makeFxPermission("tFxBroadcast", "rFx");
+  expect(broadcasted).toEqual(["fx_permission"]);
+  expect(resolved).toEqual([]);
+
+  answerFxPermission(id, { optionId: "allow-once" });
+  expect(resolved).toEqual([{ id, kind: "fx_permission" }]);
+});
+
+test("listPendingForTask returns fx_permission entries alongside the other kinds, in createdAt order", async () => {
+  const { registerScrapedAskQuestions, registerTmuxPrompt, listPendingForTask } = await import("./interactions.ts");
+  registerScrapedAskQuestions({
+    taskId: "tFxMixed", runId: "rM",
+    questions: [{ question: "?", options: [{ label: "A" }] }],
+    fingerprint: "fp-fx-mixed-ask",
+  });
+  registerTmuxPrompt({
+    taskId: "tFxMixed", runId: "rM",
+    paneText: "?", choices: [{ key: "1", label: "Y" }], fingerprint: "fp-fx-mixed-tmux",
+  });
+  await makeFxPermission("tFxMixed", "rM");
+
+  const kinds = listPendingForTask("tFxMixed").map((r) => r.kind).sort();
+  expect(kinds).toEqual(["ask_questions", "fx_permission", "tmux_prompt"]);
+});

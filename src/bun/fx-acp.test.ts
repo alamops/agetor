@@ -12,7 +12,17 @@ import path from "node:path";
 // ../shared/types.ts, and a TYPE-ONLY import from ./claude-tmux.ts that is
 // erased at compile time and never pulls db.ts in at runtime).
 import { dropFxSession, fxSessionActive, spawnFxViaAcp, type FxLaunchOptions, type FxMode } from "./fx-acp.ts";
-import { SESSION_DIED_STATUS_PREFIX, type RunEventStream } from "../shared/types.ts";
+import { FX_USAGE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX, type RunEventStream } from "../shared/types.ts";
+// fx-acp.ts's own permission driving is the thing under test here, but the
+// tests themselves need to reach into the SAME in-memory registry the driver
+// awaits on — there is no other way to answer a carded fx_permission request
+// from outside the driver (that's the whole point of the registry: it's the
+// seam `POST /fx-permissions/:id/answer` uses in the real app). interactions.ts
+// has no db.ts import (verified above the fake-server block already covers
+// fx-acp.ts's own import graph) so pulling it in here doesn't need an
+// AGETOR_DATA_DIR dance either.
+import { answerFxPermission, listPendingForTask, type FxPermissionRequest } from "./interactions.ts";
+import { deriveTodoProgress } from "../shared/todo-progress.ts";
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Fake `fx acp` server: a real child process that speaks newline-delimited
@@ -129,6 +139,7 @@ const FAKE_ACP_SERVER_SRC = [
   '      id: "perm-1",',
   '      method: "session/request_permission",',
   "      params: {",
+  '        toolCall: { toolCallId: "tc-perm-1", title: "Run something", kind: "execute" },',
   "        options: [",
   '          { optionId: "allow-always", kind: "allow_always" },',
   '          { optionId: "allow-once", kind: "allow_once" },',
@@ -136,6 +147,68 @@ const FAKE_ACP_SERVER_SRC = [
   "        ]",
   "      }",
   "    });",
+  "    return;",
+  "  }",
+  '  if (scenario === "permission-stop") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "need permission" } } });',
+  "    send({",
+  '      jsonrpc: "2.0",',
+  '      id: "perm-stop",',
+  '      method: "session/request_permission",',
+  "      params: {",
+  '        toolCall: { toolCallId: "tc-perm-stop", title: "Run something", kind: "execute" },',
+  "        options: [",
+  '          { optionId: "allow-once", kind: "allow_once" },',
+  '          { optionId: "reject-once", kind: "reject_once" }',
+  "        ]",
+  "      }",
+  "    });",
+  "    return;",
+  "  }",
+  '  if (scenario === "permission-empty") {',
+  "    send({",
+  '      jsonrpc: "2.0",',
+  '      id: "perm-empty",',
+  '      method: "session/request_permission",',
+  "      params: {",
+  '        toolCall: { toolCallId: "tc-empty", title: "Run something", kind: "execute" },',
+  "        options: []",
+  "      }",
+  "    });",
+  "    return;",
+  "  }",
+  '  if (scenario === "permission-die") {',
+  "    send({",
+  '      jsonrpc: "2.0",',
+  '      id: "perm-die",',
+  '      method: "session/request_permission",',
+  "      params: {",
+  '        toolCall: { toolCallId: "tc-die", title: "Run something", kind: "execute" },',
+  "        options: [",
+  '          { optionId: "allow-once", kind: "allow_once" },',
+  '          { optionId: "reject-once", kind: "reject_once" }',
+  "        ]",
+  "      }",
+  "    });",
+  '    setTimeout(function () { process.exit(1); }, 20);',
+  "    return;",
+  "  }",
+  '  if (scenario === "plan-update") {',
+  '    notify("session/update", { update: { sessionUpdate: "plan", entries: [',
+  '      { content: "Write tests", status: "completed", priority: "high" },',
+  '      { content: "", status: "pending" },',
+  '      { content: "Fix bug", status: "bogus-status", priority: "low" },',
+  '      { content: "Ship it", status: "in_progress" }',
+  "    ] } });",
+  '    notify("session/update", { update: { sessionUpdate: "plan", entries: [] } });',
+  '    setTimeout(function () { ok(id, { stopReason: "end_turn" }); }, 15);',
+  "    return;",
+  "  }",
+  '  if (scenario === "usage-update") {',
+  '    notify("session/update", { update: { sessionUpdate: "usage_update", used: 100, size: 1000, cost: { amount: 0.05, currency: "USD" } } });',
+  '    notify("session/update", { update: { sessionUpdate: "usage_update", used: 200, size: 1000, cost: { amount: 0.1 } } });',
+  '    notify("session/update", { update: { sessionUpdate: "usage_update", used: "not-a-number", size: 1000 } });',
+  '    setTimeout(function () { ok(id, { stopReason: "end_turn" }); }, 15);',
   "    return;",
   "  }",
   '  if (scenario === "stopreason-refusal") {',
@@ -185,6 +258,11 @@ const FAKE_ACP_SERVER_SRC = [
   "    const respondId = promptId;",
   '    setTimeout(function () { ok(respondId, { stopReason: "cancelled" }); }, 10);',
   "  }",
+  '  if (scenario === "permission-stop" && promptId !== null && !cancelPromptResponded) {',
+  "    cancelPromptResponded = true;",
+  "    const respondId = promptId;",
+  '    setTimeout(function () { ok(respondId, { stopReason: "cancelled" }); }, 15);',
+  "  }",
   '  if (scenario === "cancel-permission-race") {',
   "    // A permission request racing the client's cancel: sent AFTER the",
   "    // client's session/cancel arrived, while the prompt is still pending.",
@@ -207,6 +285,9 @@ const FAKE_ACP_SERVER_SRC = [
   "function handleReply(msg) {",
   '  capture("reply", msg);',
   '  if (msg.id === "perm-1" && promptId !== null) {',
+  '    setTimeout(function () { ok(promptId, { stopReason: "end_turn" }); }, 10);',
+  "  }",
+  '  if (msg.id === "perm-empty" && promptId !== null) {',
   '    setTimeout(function () { ok(promptId, { stopReason: "end_turn" }); }, 10);',
   "  }",
   '  if (msg.id === "perm-race" && promptId !== null) {',
@@ -315,6 +396,19 @@ function spawnFake(
   });
 
   return { agent, chunks, sessionIds, taskId, runId, captureFile };
+}
+
+/** Poll the shared interactions registry until an `fx_permission` card shows
+ *  up for this task, then return it. Mirrors how the real UI would discover
+ *  a card via `GET /tasks/:id/events` replay / SSE — there is no push hook
+ *  in this test file, so we poll the same registry the route handler reads. */
+async function waitForFxPermissionCard(taskId: string, timeoutMs = 4000): Promise<FxPermissionRequest> {
+  let found: FxPermissionRequest | undefined;
+  await waitFor(() => {
+    found = listPendingForTask(taskId).find((r) => r.kind === "fx_permission") as FxPermissionRequest | undefined;
+    return found !== undefined;
+  }, timeoutMs);
+  return found!;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -448,19 +542,142 @@ describe("session/request_permission auto-answer policy", () => {
     return result!.outcome!;
   }
 
-  test("auto mode answers allow_once (fail-scoped preference)", async () => {
-    const outcome = await permissionOutcomeFor("auto");
-    expect(outcome).toEqual({ outcome: "selected", optionId: "allow-once" });
+  test("auto mode registers a card, and the driver's reply echoes whatever the card is answered with", async () => {
+    const { agent, taskId, captureFile } = spawnFake("permission", { mode: "auto" });
+
+    const card = await waitForFxPermissionCard(taskId);
+    expect(card.taskId).toBe(taskId);
+    expect(card.mode).toBe("auto");
+    expect(card.toolCall).toEqual({ toolCallId: "tc-perm-1", title: "Run something", kind: "execute" });
+    // Every option lacks a `name` on the wire (see the fake's "permission"
+    // scenario) — the driver falls back to `optionId` for each.
+    expect(card.options).toEqual([
+      { optionId: "allow-always", name: "allow-always", kind: "allow_always" },
+      { optionId: "allow-once", name: "allow-once", kind: "allow_once" },
+      { optionId: "reject-once", name: "reject-once", kind: "reject_once" },
+    ]);
+
+    expect(answerFxPermission(card.id, { optionId: "allow-once" })).toBe(true);
+
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-1");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "selected", optionId: "allow-once" });
+
+    // The card is gone from the registry once answered.
+    expect(listPendingForTask(taskId)).toHaveLength(0);
   }, 10_000);
 
-  test("yolo mode answers allow_once", async () => {
-    const outcome = await permissionOutcomeFor("yolo");
-    expect(outcome).toEqual({ outcome: "selected", optionId: "allow-once" });
+  test("yolo mode answers allow_once with no card ever registered", async () => {
+    const { agent, taskId, captureFile } = spawnFake("permission", { mode: "yolo" });
+    const code = await agent.done;
+    expect(code).toBe(0);
+    // yolo answers synchronously — never surfaces a card to poll for at all.
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-1");
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "selected", optionId: "allow-once" });
   }, 10_000);
 
-  test("ask mode answers reject_once", async () => {
-    const outcome = await permissionOutcomeFor("ask");
-    expect(outcome).toEqual({ outcome: "selected", optionId: "reject-once" });
+  test("ask mode registers a card, and answering it reject-once flows through to fx", async () => {
+    const { agent, taskId, captureFile } = spawnFake("permission", { mode: "ask" });
+
+    const card = await waitForFxPermissionCard(taskId);
+    expect(card.mode).toBe("ask");
+
+    expect(answerFxPermission(card.id, { optionId: "reject-once" })).toBe(true);
+
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-1");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "selected", optionId: "reject-once" });
+
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+  }, 10_000);
+
+  test("a card answered cancelled replies with outcome cancelled", async () => {
+    const { agent, taskId, captureFile } = spawnFake("permission", { mode: "ask" });
+
+    const card = await waitForFxPermissionCard(taskId);
+    expect(answerFxPermission(card.id, { cancelled: true })).toBe(true);
+
+    const code = await agent.done;
+    expect(code).toBe(0); // the fake resolves end_turn on any reply to perm-1
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-1");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "cancelled" });
+
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+  }, 10_000);
+
+  test("kill() while a card is open resolves the card (registry empties) and fx receives outcome cancelled", async () => {
+    const { agent, chunks, taskId, captureFile } = spawnFake("permission-stop", { mode: "auto" });
+
+    await waitFor(() => chunks.some((c) => c.stream === "assistant" && c.data === "need permission"));
+    const card = await waitForFxPermissionCard(taskId);
+    expect(card.mode).toBe("auto");
+
+    agent.kill();
+
+    // The card must resolve out of the registry promptly, driven by
+    // cancelFxTurn's drain loop — not left dangling until the process dies.
+    await waitFor(() => listPendingForTask(taskId).length === 0);
+
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-stop");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "cancelled" });
+  }, 10_000);
+
+  test("empty options auto-cancels with no card ever registered, and emits a status chunk saying so", async () => {
+    const { agent, chunks, taskId, captureFile } = spawnFake("permission-empty", { mode: "auto" });
+
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-empty");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "cancelled" });
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.includes("no options"))).toBe(true);
+  }, 10_000);
+
+  test("process death while a card is open removes it from the registry (settleFx's sweep) and fails the turn", async () => {
+    const { agent, chunks, taskId } = spawnFake("permission-die", { mode: "auto" });
+
+    const card = await waitForFxPermissionCard(taskId);
+    expect(card.toolCall.toolCallId).toBe("tc-die");
+
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    // settleFx's card sweep resolved it — never left dangling past death.
+    expect(listPendingForTask(taskId)).toHaveLength(0);
+
+    const statusChunks = chunks.filter((c) => c.stream === "status");
+    expect(statusChunks.some((c) => c.data.startsWith(SESSION_DIED_STATUS_PREFIX))).toBe(true);
   }, 10_000);
 
   test("unknown/future mode id fails closed to reject_once", async () => {
@@ -491,6 +708,91 @@ describe("session/request_permission auto-answer policy", () => {
     const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
     expect(result?.outcome).toEqual({ outcome: "cancelled" });
   }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4b. `plan` → synthetic TodoWrite tool_use.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("plan session/update → TodoWrite tool_use", () => {
+  test(
+    "coerces entries (blank content dropped, bogus status → pending, priority dropped) and a later empty-entries plan clears it",
+    async () => {
+      const { agent, chunks } = spawnFake("plan-update");
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const toolUseChunks = chunks.filter((c) => c.stream === "tool_use");
+      expect(toolUseChunks).toHaveLength(2);
+
+      const first = JSON.parse(toolUseChunks[0]!.data);
+      expect(first.name).toBe("TodoWrite");
+      // "Write tests" (completed), the blank-content entry dropped, "Fix bug"
+      // (bogus status → pending, priority dropped), "Ship it" (in_progress).
+      expect(first.input.todos).toEqual([
+        { content: "Write tests", status: "completed" },
+        { content: "Fix bug", status: "pending" },
+        { content: "Ship it", status: "in_progress" },
+      ]);
+
+      const second = JSON.parse(toolUseChunks[1]!.data);
+      expect(second.name).toBe("TodoWrite");
+      expect(second.input.todos).toEqual([]);
+
+      // deriveTodoProgress reads the LAST TodoWrite snapshot — the explicit
+      // empty clear — so it must report null (no usable state), not the
+      // first snapshot's counts.
+      const progress = deriveTodoProgress(chunks.map((c) => ({ stream: c.stream, data: c.data })));
+      expect(progress).toBeNull();
+    },
+    10_000,
+  );
+
+  test("deriveTodoProgress over just the first snapshot reports 1/3 completed", async () => {
+    // Re-derive over a prefix of the same event stream (everything up to and
+    // including the first plan's tool_use) to assert the {completed,total}
+    // shape independent of the second (clearing) snapshot.
+    const { agent, chunks } = spawnFake("plan-update");
+    await agent.done;
+
+    const toolUseChunks = chunks.filter((c) => c.stream === "tool_use");
+    const firstIndex = chunks.indexOf(toolUseChunks[0]!);
+    const prefix = chunks.slice(0, firstIndex + 1).map((c) => ({ stream: c.stream, data: c.data }));
+
+    const progress = deriveTodoProgress(prefix);
+    expect(progress).not.toBeNull();
+    expect(progress!.completed).toBe(1);
+    expect(progress!.total).toBe(3);
+  }, 10_000);
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 4c. `usage_update` → FX_USAGE_STATUS_PREFIX status chunk.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("usage_update session/update → status chunk", () => {
+  test(
+    "valid used/size/cost emits a chunk; a malformed cost drops only cost; non-numeric used/size drops the whole update",
+    async () => {
+      const { agent, chunks } = spawnFake("usage-update");
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const usageChunks = chunks
+        .filter((c) => c.stream === "status" && c.data.startsWith(FX_USAGE_STATUS_PREFIX))
+        .map((c) => JSON.parse(c.data.slice(FX_USAGE_STATUS_PREFIX.length)));
+
+      // Only two of the three fake updates should have produced a chunk —
+      // the third (non-numeric `used`) is silently dropped in full.
+      expect(usageChunks).toHaveLength(2);
+      expect(usageChunks[0]).toEqual({ used: 100, size: 1000, cost: { amount: 0.05, currency: "USD" } });
+      // Malformed cost (missing `currency`) is dropped on its own —
+      // used/size still emit with no `cost` key at all.
+      expect(usageChunks[1]).toEqual({ used: 200, size: 1000 });
+      expect("cost" in usageChunks[1]).toBe(false);
+    },
+    10_000,
+  );
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *
