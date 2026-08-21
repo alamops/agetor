@@ -40,6 +40,23 @@ export const PERMISSION_MODE_STATUS_PREFIX = "permission-mode: ";
 export const FX_USAGE_STATUS_PREFIX = "fx-usage: ";
 
 /**
+ * True for `status`-stream chunks that are UI-internal sentinel channels, not
+ * transcript content: currently `PERMISSION_MODE_STATUS_PREFIX` (fed a chip,
+ * now suppressed-only) and `FX_USAGE_STATUS_PREFIX` (feeds the run-row usage
+ * chip). Every renderer of raw status events — RunPanel's status dividers,
+ * the CLI's `agetor logs` formatter, and the TUI dashboard — must consult
+ * this ONE predicate instead of maintaining its own prefix list, so a new
+ * sentinel can't silently leak verbatim into one surface while another
+ * suppresses it.
+ */
+export function isInternalStatusSentinel(data: string): boolean {
+  return (
+    data.startsWith(PERMISSION_MODE_STATUS_PREFIX) ||
+    data.startsWith(FX_USAGE_STATUS_PREFIX)
+  );
+}
+
+/**
  * The Settings section name where per-host git credentials live, interpolated
  * into the server-side credential-error hints (github.ts `privateRepoHint`,
  * gitlab.ts `authHint`, bitbucket.ts `bitbucketAccessHint` and friends) as

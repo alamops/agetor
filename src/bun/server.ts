@@ -4111,25 +4111,25 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // kinds above there is no pane and no keystroke leg; resolving the
       // interaction directly unblocks the awaiter, which sends the ACP
       // JSON-RPC response back to the fx child.
+      //
+      // Not-found and lost-race outcomes return `{ ok: false }` at HTTP 200,
+      // mirroring the tmux-prompt sibling above: either the request was
+      // already resolved by someone else (a concurrent answer, or fx
+      // auto-cancelling) or the id is unknown, and in both cases the UI
+      // should just drop the card on its next poll rather than treat it as
+      // an error — a 404 here would also make health-gated fetch replays
+      // invisible. Genuine validation failures (missing/unknown optionId)
+      // stay 400.
       "/fx-permissions/:id/answer": {
         POST: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as { optionId?: unknown; cancel?: unknown };
           const pending = findFxPermissionById(req.params.id);
           if (!pending) {
-            return json(
-              { error: "unknown or already-resolved permission request" },
-              { status: 404, headers: corsHeaders(req) },
-            );
+            return json({ ok: false }, { headers: corsHeaders(req) });
           }
           if (body.cancel === true) {
             const ok = answerFxPermission(req.params.id, { cancelled: true });
-            if (!ok) {
-              return json(
-                { error: "unknown or already-resolved permission request" },
-                { status: 404, headers: corsHeaders(req) },
-              );
-            }
-            return json({ ok: true }, { headers: corsHeaders(req) });
+            return json({ ok }, { headers: corsHeaders(req) });
           }
           const optionId = typeof body.optionId === "string" ? body.optionId : "";
           if (!optionId) {
@@ -4143,13 +4143,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "unknown option" }, { status: 400, headers: corsHeaders(req) });
           }
           const ok = answerFxPermission(req.params.id, { optionId });
-          if (!ok) {
-            return json(
-              { error: "unknown or already-resolved permission request" },
-              { status: 404, headers: corsHeaders(req) },
-            );
-          }
-          return json({ ok: true }, { headers: corsHeaders(req) });
+          return json({ ok }, { headers: corsHeaders(req) });
         }),
       },
 

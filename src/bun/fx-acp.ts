@@ -415,6 +415,12 @@ function handleServerRequest(state: FxSessionState, method: string, id: number |
     // while later lines (including a RACING session/cancel notification's
     // effects) keep arriving.
     state.pendingPermissionIds.add(id);
+    // Fail closed: `registerFxPermission`'s synchronous broadcast to SSE
+    // listeners can throw through an arbitrary listener callback, and a
+    // thrown rejection here must never strand fx awaiting a reply that will
+    // now never come. Answer `cancelled` and drop the request's bookkeeping
+    // from both maps so a later cancelFxTurn/settleFx sweep doesn't try to
+    // resolve an id that's already dead.
     void respondPermissionRequest(
       state,
       id,
@@ -424,7 +430,12 @@ function handleServerRequest(state: FxSessionState, method: string, id: number |
             toolCall?: { toolCallId?: string; title?: string; kind?: string; rawInput?: unknown };
           }
         | undefined,
-    );
+    ).catch((err) => {
+      emit(state, "status", `fx acp: permission handling failed: ${err instanceof Error ? err.message : String(err)}`);
+      respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+      state.cardIdByRequestId.delete(id);
+      state.pendingPermissionIds.delete(id);
+    });
     return;
   }
   // fx advertised no fs/terminal capabilities at `initialize` — it
@@ -504,6 +515,18 @@ async function respondPermissionRequest(
     kind: o.kind,
   }));
 
+  // ACP's schema only guarantees `toolCallId` on this request — `options`
+  // may be absent or empty, and this file never trusts that silently. An
+  // unanswerable card (nothing for the user to click) must never register;
+  // answer cancelled up front instead, and say so out loud so a silent
+  // cancel is diagnosable rather than looking like the card vanished.
+  if (cardOptions.length === 0) {
+    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+    state.pendingPermissionIds.delete(id);
+    emit(state, "status", "fx acp: permission request had no options — auto-cancelled");
+    return;
+  }
+
   const { id: cardId, answer } = registerFxPermission({
     taskId: state.taskId,
     runId: state.runId,
@@ -532,6 +555,17 @@ async function respondPermissionRequest(
   // documented in the file header: `answerFxPermission` is what unblocked
   // us, never `respondRpc` — we're the only path that ever calls it.
   if (state.resolved) {
+    state.pendingPermissionIds.delete(id);
+    return;
+  }
+
+  // A selected answer landing during cancellation must NOT become outcome
+  // "selected" — ACP's contract is that every pending request answers
+  // cancelled once session/cancel is sent, and a card answer racing that
+  // (e.g. the HTTP answer route resolving just before cancelFxTurn's drain
+  // loop reaches this id) must still lose to the cancellation.
+  if (state.cancelRequested) {
+    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
     state.pendingPermissionIds.delete(id);
     return;
   }
