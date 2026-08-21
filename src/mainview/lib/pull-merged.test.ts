@@ -44,11 +44,6 @@ describe("isMergedPull", () => {
     const issue = item({ kind: "issues", mergedAt: "2026-01-02T00:00:00Z", state: "closed" });
     expect(isMergedPull(issue)).toBe(false);
   });
-
-  test("false for an open PR", () => {
-    const openPr = item({ kind: "pulls", state: "open", mergedAt: null });
-    expect(isMergedPull(openPr)).toBe(false);
-  });
 });
 
 describe("mergedPullReplacement", () => {

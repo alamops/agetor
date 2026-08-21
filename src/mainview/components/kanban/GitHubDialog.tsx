@@ -673,6 +673,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // or the view leaves "detail", so detail(A) -> list -> detail(A) and a
   // dialog reopen onto a surviving detail view both refresh again.
   const lastDetailRefreshKeyRef = useRef<string | null>(null);
+  // Bumped by every local write to `result.items` (see `upsertListItem`). The
+  // refresh-on-detail-entry effect below snapshots this before awaiting
+  // `getGitHubPullDetail` and re-checks it before applying the response — if
+  // the user clicks Merge while the entry fetch is in flight, the merge's
+  // local upsert lands first and bumps this ref, so the (now-stale) pre-merge
+  // detail response is dropped instead of reverting the just-merged card.
+  const itemMutationSeq = useRef(0);
   const [view, setView] = useState<GitHubDialogView>({ kind: "list" });
   // Mirrors `view` for the async prefill effect below, which needs to check
   // "has the user navigated away from the list?" from inside a promise
@@ -2327,21 +2334,48 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     mergeabilityRetries.current[key] = 0;
     setMergeability((cur) => ({ ...cur, [key]: undefined }));
     setMergeabilityErrors((cur) => ({ ...cur, [key]: undefined }));
+    // Invalidation must also defeat any mergeability request already in
+    // flight for this key — bumping the seq makes its .then/.catch/.finally
+    // no-ops, which means its `finally` will no longer clear the loading
+    // flag, so clear it explicitly here (matches the manual refresh handler).
+    mergeabilitySeq.current += 1;
+    setMergeabilityLoading((cur) => ({ ...cur, [key]: false }));
 
+    // Snapshot before the await so a local mutation that lands mid-flight
+    // (e.g. the user clicks Merge while this entry fetch is in flight) is
+    // detectable once the response comes back — see `itemMutationSeq`.
+    const epoch = itemMutationSeq.current;
     const itemPath = item.sourcePath ?? projectPath;
     if (!itemPath) return;
     let cancelled = false;
     void (async () => {
       try {
-        const result = await api.getGitHubPullDetail(itemPath, item.number);
-        if (cancelled || !result?.ok || !result.item) return;
-        const fresh = result.item;
-        upsertListItem(fresh, false, true);
+        const detail = await api.getGitHubPullDetail(itemPath, item.number);
+        if (cancelled || !detail?.ok || !detail.item) return;
+        // A local mutation (merge, close, reopen, edit, ...) landed while this
+        // fetch was in flight and already reflects the newer truth — applying
+        // this now-stale response would revert it (e.g. un-merge a just-merged
+        // card). Drop it.
+        if (itemMutationSeq.current !== epoch) return;
+        const fresh = detail.item;
+        // Update-only: a "View PR" deep-link can open a PR that was never in
+        // the filtered/paged list, and inserting it here would append an
+        // out-of-sort row. Only reconcile items already present.
+        if (result?.items.some((it) => sameItem(it, fresh))) {
+          upsertListItem(fresh, false, true);
+        }
         if (viewRef.current.kind === "detail" && itemKey(viewRef.current.item) === key) {
           setView(openDetail(fresh));
         }
       } catch {
-        // Silent — cached data stays, mergeability banner surfaces its own error.
+        // Silent — cached data stays, mergeability banner surfaces its own
+        // error. Reset the entry-refresh bookkeeping (only if it still points
+        // at this entry — don't clobber a newer entry's) so the next natural
+        // navigation into this detail view (open/view/projectPath change)
+        // retries instead of the failure sticking forever.
+        if (lastDetailRefreshKeyRef.current === key) {
+          lastDetailRefreshKeyRef.current = null;
+        }
       }
     })();
     return () => {
@@ -2901,6 +2935,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // reopen) so the user sees the result instead of the row silently vanishing;
   // it drops out naturally on the next refresh.
   const upsertListItem = (replacement: GitHubListItem, prepend = false, keepIfPresent = false) => {
+    // Every local item write goes through here — bump so an in-flight refresh
+    // fetch (the refresh-on-detail-entry effect) can detect a newer local
+    // mutation landed while it was awaiting and drop its now-stale response.
+    itemMutationSeq.current += 1;
     setResult((cur) => {
       if (!cur) return cur;
       // Match on kind+number+sourcePath (G8) so a write to repo B's #5 can't
@@ -3719,6 +3757,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
               mergeabilityRetries.current[itemKey(expandedItem)] = 0;
               setMergeability((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
               setMergeabilityErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+              // Defeat any request already in flight for this key — bumping
+              // the seq makes its .then/.catch/.finally no-ops, so the loading
+              // flag must be cleared manually here or it would stay stuck.
+              mergeabilitySeq.current += 1;
+              setMergeabilityLoading((cur) => ({ ...cur, [itemKey(expandedItem)]: false }));
             }}
             onRetryCommits={() => {
               if (expandedItem.kind !== "pulls") return;
@@ -6345,7 +6388,7 @@ function GitHubItemRow({
   // Navigates to the detail subpage for this item (GitHubDialogView).
   onToggle: () => void;
 }) {
-  const merged = item.kind === "pulls" && !!item.mergedAt;
+  const merged = isMergedPull(item);
   const stateClass = item.state === "open"
     ? "text-success"
     : merged
@@ -7700,7 +7743,12 @@ function PullActions({
         <div className="flex flex-col items-center justify-center gap-2 rounded-md border border-merged/30 bg-merged/10 px-4 py-6 text-center">
           <GitMerge className="size-6 text-merged" />
           <span className="text-sm font-medium text-merged">Pull request successfully merged</span>
-          {item.mergedAt && <span className="text-[11px] text-merged/80">Merged on {fmtDate(item.mergedAt)}</span>}
+          {(() => {
+            // Only render once `fmtDate` produces something — an unparsable
+            // `mergedAt` would otherwise leave a dangling "Merged on ".
+            const mergedOn = fmtDate(item.mergedAt ?? "");
+            return mergedOn && <span className="text-[11px] text-merged/80">Merged on {mergedOn}</span>;
+          })()}
         </div>
       ) : (
       <div className="grid gap-3 lg:grid-cols-3">
@@ -7832,7 +7880,7 @@ function PullActions({
       </div>
       )}
 
-      {!merged && pendingCount > 0 && (
+      {pendingCount > 0 && (
         <div className="mt-3 flex items-start gap-1.5 text-[11px] text-warning">
           <AlertCircle className="mt-px size-3.5 shrink-0" />
           {pendingCount} review comment{pendingCount === 1 ? "" : "s"} queued — submit via Approve / Comment / Request; merging or closing won't post {pendingCount === 1 ? "it" : "them"}.
