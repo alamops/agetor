@@ -25,9 +25,12 @@ export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
     if (req.kind === "ask_questions") {
       const ok = await answerAsk(client, req);
       if (!ok) return; // cancelled
-    } else {
+    } else if (req.kind === "tmux_prompt") {
       const ok = await answerTmux(client, req);
       if (!ok) return;
+    } else {
+      // fx_permission has no CLI answer path yet — answer via the app.
+      out(c.dim(`skipping ${req.kind} — not answerable from the CLI yet`));
     }
   }
 }

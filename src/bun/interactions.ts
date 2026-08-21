@@ -1,21 +1,37 @@
 import { randomUUID } from "node:crypto";
 
 /**
- * In-process registry for user interactions claude needs to drive through
- * agetor's UI: scraper-sourced AskUserQuestion / ExitPlanMode modals, and
- * unstructured tmux-pane prompts. Each follows the same shape — a localhost
- * POST or a scraper-driven send-keys sequence that we hold open via a Promise
- * (or a no-op resolve) until the user answers.
+ * In-process registry for user interactions an agent needs to drive through
+ * agetor's UI: scraper-sourced AskUserQuestion / ExitPlanMode modals,
+ * unstructured tmux-pane prompts, and fx's ACP `session/request_permission`
+ * calls. Each follows the same shape — a localhost POST, a scraper-driven
+ * send-keys sequence, or a driver awaiting an RPC reply — held open via a
+ * Promise (or a no-op resolve, for the scraper-sourced kinds) until the user
+ * answers.
  *
  * Everything here is in-memory. Pending interactions don't survive an agetor
  * restart, by design: on boot we reattach or orphan `agetor-*` tmux sessions
  * (we never blind-kill), so the children waiting on these promises are
- * re-derived from the live pane rather than persisted.
+ * re-derived from the live pane rather than persisted. fx has no reattach
+ * path at all (`fx-acp.ts` is a plain piped-stdio child, not tmux-hosted) —
+ * a restart simply kills the driver and its pending card dies with it, same
+ * in-memory-only discipline, just with no live process left to re-derive
+ * anything from.
+ *
+ * Settlement single-source-of-truth: for the two kinds with a real awaiter
+ * (`tmux_prompt`, `fx_permission`), exactly one of three paths resolves any
+ * given entry — the user's answer via its HTTP route, `cancelPendingForTask`
+ * (Stop / delete), or (for fx) the driver's own cancel/teardown calling
+ * `answerFxPermission` directly instead of ever replying to the RPC itself.
+ * Whichever gets there first deletes the map entry, so the other two become
+ * no-ops (`answer*` returns `false` / the id is already gone) — no request
+ * is ever answered twice.
  */
 
 export type InteractionKind =
   | "ask_questions"   // claude built-in AskUserQuestion (scraper-sourced)
-  | "tmux_prompt";    // unstructured in-REPL prompt detected by scraping the tmux pane
+  | "tmux_prompt"     // unstructured in-REPL prompt detected by scraping the tmux pane
+  | "fx_permission";  // fx ACP session/request_permission (real in-process awaiter)
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Claude built-in AskUserQuestion (scraper-sourced).
@@ -138,9 +154,74 @@ export interface TmuxPromptAnswer {
   key: string;
 }
 
+/* ────────────────────────────────────────────────────────────────────────── *
+ * fx ACP `session/request_permission` (real in-process awaiter).
+ *
+ * Unlike the scraper-sourced kinds above, fx is a plain `Bun.spawn` child
+ * speaking JSON-RPC over piped stdio (`fx-acp.ts`) — there is no tmux pane to
+ * scrape and no keystroke path back in. `session/request_permission` blocks
+ * fx's turn until agetor answers the RPC call, so this kind follows the
+ * `tmux_prompt` structural pattern exactly: `registerFxPermission` hands the
+ * driver a real Promise it awaits directly, and `answerFxPermission` resolves
+ * it from whichever of the three settlement paths gets there first (user
+ * card answer via the HTTP route, Stop/delete via `cancelPendingForTask`, or
+ * the driver's own cancel/teardown path) — see `cancelPendingForTask` below,
+ * which is what keeps all three paths converging on the *same* entry instead
+ * of each trying to resolve (or double-resolve) the RPC independently.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** The ACP tool call a permission request is asking about. Mirrors
+ *  ACP's `ToolCallUpdate` shape, trimmed to what the card needs to render —
+ *  only `toolCallId` is guaranteed present on the wire; `title`/`kind`/
+ *  `rawInput` are optional per schema and rendered generically when absent. */
+export interface FxPermissionToolCall {
+  toolCallId: string;
+  title?: string;
+  kind?: string;
+  rawInput?: unknown;
+}
+
+/** One selectable option fx offered for a permission request. `kind` is a
+ *  hint from ACP's `PermissionOptionKind` (`allow_once` | `allow_always` |
+ *  `reject_once` | `reject_always`) but kept as a plain optional string —
+ *  fx additionally documents session-scoped approvals ("Allow for this
+ *  session") beyond the four canonical kinds, so the card renders fx's own
+ *  option `name`s verbatim rather than hardcoding a fixed set. */
+export interface FxPermissionOption {
+  optionId: string;
+  name: string;
+  kind?: string;
+}
+
+export interface FxPermissionRequest {
+  kind: "fx_permission";
+  id: string;
+  taskId: string;
+  runId: string;
+  createdAt: number;
+  toolCall: FxPermissionToolCall;
+  options: FxPermissionOption[];
+  /** The agetor mode (`auto` | `ask`) that caused this request to surface as
+   *  a card in the first place — `yolo` auto-allows and never reaches this
+   *  registry. Carried through so the UI can tailor copy without having to
+   *  re-derive it from the task row. */
+  mode: string;
+}
+
+/** `{ optionId }` echoes the user's pick straight back to fx's
+ *  `outcome: { outcome: "selected", optionId }`. `{ cancelled: true }` is the
+ *  Stop/delete/driver-teardown path — mirrors `TmuxPromptAnswer`'s
+ *  `"__cancelled__"` sentinel idiom, but as a real discriminant since fx's
+ *  RPC reply is itself a `{outcome: "cancelled"}` shape rather than a bare
+ *  key string. */
+export type FxPermissionAnswer =
+  | { optionId: string }
+  | { cancelled: true };
+
 export type AnyRequest =
   | AskQuestionsRequest
-  | TmuxPromptRequest;
+  | TmuxPromptRequest
+  | FxPermissionRequest;
 
 interface AskQuestionsEntry {
   req: AskQuestionsRequest;
@@ -150,9 +231,14 @@ interface TmuxPromptEntry {
   req: TmuxPromptRequest;
   resolve: (answer: TmuxPromptAnswer) => void;
 }
+interface FxPermissionEntry {
+  req: FxPermissionRequest;
+  resolve: (answer: FxPermissionAnswer) => void;
+}
 
 const askQuestions = new Map<string, AskQuestionsEntry>();
 const tmuxPrompts = new Map<string, TmuxPromptEntry>();
+const fxPermissions = new Map<string, FxPermissionEntry>();
 
 type BroadcastFn = (req: AnyRequest) => void;
 let broadcast: BroadcastFn = () => { /* installed by the orchestrator */ };
@@ -356,6 +442,51 @@ export function activeTmuxPromptsForTask(taskId: string): TmuxPromptRequest[] {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
+ * fx ACP permission requests
+ * ────────────────────────────────────────────────────────────────────────── */
+
+export function registerFxPermission(args: {
+  taskId: string;
+  runId: string;
+  toolCall: FxPermissionToolCall;
+  options: FxPermissionOption[];
+  mode: string;
+}): { id: string; req: FxPermissionRequest; answer: Promise<FxPermissionAnswer> } {
+  const id = randomUUID();
+  const req: FxPermissionRequest = {
+    kind: "fx_permission",
+    id,
+    taskId: args.taskId,
+    runId: args.runId,
+    createdAt: Date.now(),
+    toolCall: args.toolCall,
+    options: args.options,
+    mode: args.mode,
+  };
+  const answer = new Promise<FxPermissionAnswer>((resolve) => {
+    fxPermissions.set(id, { req, resolve });
+  });
+  broadcast(req);
+  return { id, req, answer };
+}
+
+export function answerFxPermission(id: string, answer: FxPermissionAnswer): boolean {
+  const entry = fxPermissions.get(id);
+  if (!entry) return false;
+  fxPermissions.delete(id);
+  entry.resolve(answer);
+  fanoutResolved(entry.req);
+  return true;
+}
+
+/** Look up a pending fx_permission by id — used by the route handler to
+ *  validate the chosen `optionId` against the recorded options before
+ *  resolving the driver's awaiter. */
+export function findFxPermissionById(id: string): FxPermissionRequest | null {
+  return fxPermissions.get(id)?.req ?? null;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── *
  * Shared helpers
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -384,12 +515,21 @@ export function cancelPendingForTask(taskId: string, reason: string): void {
     entry.resolve({ key: "__cancelled__" });
     fanoutResolved(entry.req);
   }
+  for (const [id, entry] of fxPermissions) {
+    if (entry.req.taskId !== taskId) continue;
+    fxPermissions.delete(id);
+    // Unblocks the fx-acp driver's awaiter — it answers fx's RPC with
+    // `outcome: "cancelled"` instead of ever registering a resolved pick.
+    entry.resolve({ cancelled: true });
+    fanoutResolved(entry.req);
+  }
 }
 
 export function listPendingForTask(taskId: string): AnyRequest[] {
   const out: AnyRequest[] = [];
   for (const e of askQuestions.values()) if (e.req.taskId === taskId) out.push(e.req);
   for (const e of tmuxPrompts.values()) if (e.req.taskId === taskId) out.push(e.req);
+  for (const e of fxPermissions.values()) if (e.req.taskId === taskId) out.push(e.req);
   return out.sort((a, b) => a.createdAt - b.createdAt);
 }
 
@@ -400,6 +540,7 @@ export function countPendingForTask(taskId: string): number {
   let n = 0;
   for (const e of askQuestions.values()) if (e.req.taskId === taskId) n++;
   for (const e of tmuxPrompts.values()) if (e.req.taskId === taskId) n++;
+  for (const e of fxPermissions.values()) if (e.req.taskId === taskId) n++;
   return n;
 }
 
@@ -414,6 +555,9 @@ export function pendingCountsByTask(): Map<string, number> {
   for (const e of tmuxPrompts.values()) {
     counts.set(e.req.taskId, (counts.get(e.req.taskId) ?? 0) + 1);
   }
+  for (const e of fxPermissions.values()) {
+    counts.set(e.req.taskId, (counts.get(e.req.taskId) ?? 0) + 1);
+  }
   return counts;
 }
 
@@ -421,9 +565,11 @@ export function pendingCountsByTask(): Map<string, number> {
 export const __testing = {
   askQuestionsSize: () => askQuestions.size,
   tmuxPromptsSize: () => tmuxPrompts.size,
+  fxPermissionsSize: () => fxPermissions.size,
   reset() {
     askQuestions.clear();
     tmuxPrompts.clear();
+    fxPermissions.clear();
     broadcast = () => { /* reset */ };
     broadcastResolved = () => { /* reset */ };
   },

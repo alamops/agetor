@@ -151,8 +151,10 @@ export function AnswerOverlay({
         return;
       }
 
-      // tmux_prompt — last entry is the synthetic "reject".
-      if (key.return) {
+      // tmux_prompt — last entry is the synthetic "reject". fx_permission has
+      // no CLI/TUI answer path yet (RunPanel-only, per the fx interactions
+      // plan) — nothing to do here for that kind.
+      if (key.return && req.kind === "tmux_prompt") {
         const isReject = cursor === req.choices.length;
         setSubmitting(true);
         const body = isReject ? { reject: true } : { key: req.choices[cursor]!.key };
@@ -168,6 +170,10 @@ export function AnswerOverlay({
   if (loading) return <Text dimColor>loading question…</Text>;
   if (submitting) return <Text dimColor>submitting…</Text>;
   if (!req) return <Text dimColor>nothing pending — esc to close</Text>;
+  if (req.kind === "fx_permission") {
+    // No CLI/TUI answer path yet — answer via the RunPanel.
+    return <Text dimColor>fx permission requests aren't answerable here yet — use the app.</Text>;
+  }
 
   const multi = req.kind === "ask_questions" && !!req.questions[qIndex]?.multiSelect;
   const width = (process.stdout.columns || 80) - 6;
@@ -214,5 +220,6 @@ function optionLabels(req: AnyRequest | null, qIndex: number): string[] {
   if (req.kind === "ask_questions") {
     return [...(req.questions[qIndex]?.options.map((o) => o.label) ?? []), OTHER];
   }
+  if (req.kind === "fx_permission") return []; // no CLI/TUI answer path yet
   return [...req.choices.map((ch) => ch.label), "Reject / Esc"];
 }

@@ -28,6 +28,18 @@ export const SESSION_DIED_STATUS_PREFIX = "session ended: ";
 export const PERMISSION_MODE_STATUS_PREFIX = "permission-mode: ";
 
 /**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits per ACP
+ * `usage_update` notification. Payload is JSON: `{used, size, cost?:
+ * {amount, currency}}` (verbatim ACP shape — `used`/`size` are token counts,
+ * `cost` is present only when fx reports one). RunPanel suppresses this
+ * prefix from the transcript's status dividers (same as
+ * `PERMISSION_MODE_STATUS_PREFIX` — that suppression is load-bearing, not
+ * dead code) and instead derives the latest value into a small usage chip on
+ * the run's summary row.
+ */
+export const FX_USAGE_STATUS_PREFIX = "fx-usage: ";
+
+/**
  * The Settings section name where per-host git credentials live, interpolated
  * into the server-side credential-error hints (github.ts `privateRepoHint`,
  * gitlab.ts `authHint`, bitbucket.ts `bitbucketAccessHint` and friends) as
@@ -1823,9 +1835,9 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "google/gemini-3-pro", label: "Gemini 3 Pro" },
     ],
     modes: [
-      { id: "auto", label: "Auto", hint: "fx sandbox plus LLM auto-review of unresolved tool calls." },
+      { id: "auto", label: "Auto", hint: "fx sandbox + LLM auto-review; unresolved tool calls surface as approval cards." },
       { id: "yolo", label: "Yolo", hint: "No permission checks, no sandbox — full access." },
-      { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; unresolved tool calls are rejected." },
+      { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
     // No model in MODEL_EFFORT_SUPPORT.fx accepts the effort flag, so the
     // picker collapses for every model — see EFFORT_OPTIONS list comment.
