@@ -4,7 +4,7 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, RefreshCw, Search, Send, Slash, SquareSlash,
+  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
@@ -32,6 +32,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   EVENTS_WINDOW_MAX,
+  FX_USAGE_STATUS_PREFIX,
   PERMISSION_MODE_STATUS_PREFIX,
   cursorModelIdCoveredByCatalog,
   cursorModelSupportsFast,
@@ -198,6 +199,29 @@ function formatTime(ts: number): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+/** fx's `usage_update` payload, decoded from the `FX_USAGE_STATUS_PREFIX`
+ *  sentinel — mirrors the ACP shape `{used, size, cost?: {amount, currency}}`
+ *  (`src/bun/fx-acp.ts`). */
+interface FxUsageData {
+  used: number;
+  size: number;
+  cost?: { amount: number; currency: string };
+}
+
+/** Compact token-count formatting for the usage chip: 45_000 → "45k",
+ *  1_200_000 → "1.2M". Whole thousands/millions drop the decimal. */
+function formatUsageCount(n: number): string {
+  if (n >= 1_000_000) {
+    const v = n / 1_000_000;
+    return `${Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)}M`;
+  }
+  if (n >= 1_000) {
+    const v = n / 1_000;
+    return `${Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)}k`;
+  }
+  return String(n);
 }
 
 /**
@@ -1220,6 +1244,24 @@ function RunPanelBody({
    *  The rebuild-from-JSONL path only ever covers the main session transcript,
    *  so it splices against these. */
   const mainEvents = useMemo(() => events.filter((e) => !e.subagentId), [events]);
+
+  /** Latest fx `usage_update` per run, keyed by `runId` — feeds the run-row
+   *  chip in `RunsList`. Sourced from the raw (unfiltered) `events` state
+   *  rather than `displayedEvents` so the chip stays correct regardless of
+   *  which subagent tab is active or whether a JSONL rebuild snapshot has
+   *  spliced the main stream. `events` arrives in arrival order, so a plain
+   *  overwrite-on-iterate naturally keeps the latest per run (fx's own
+   *  `usage_update` cadence is "MAY", snapshot semantics — most-recent wins). */
+  const usageByRunId = useMemo(() => {
+    const m = new Map<string, FxUsageData>();
+    for (const e of events) {
+      if (e.stream !== "status" || !e.data.startsWith(FX_USAGE_STATUS_PREFIX)) continue;
+      const parsed = safeParse<FxUsageData>(e.data.slice(FX_USAGE_STATUS_PREFIX.length));
+      if (!parsed || typeof parsed.used !== "number" || typeof parsed.size !== "number") continue;
+      m.set(e.runId, parsed);
+    }
+    return m;
+  }, [events]);
 
   /** Background/sub-agent events bucketed by subagent id, in arrival order. */
   const subagentEventsById = useMemo(() => {
@@ -2567,7 +2609,7 @@ function RunPanelBody({
         tmuxSession={latestRun?.tmuxSession ?? null}
       />
 
-      <RunsList runs={runs} />
+      <RunsList runs={runs} usageByRun={usageByRunId} />
 
       <TerminalsSection task={task} />
 
@@ -3502,7 +3544,27 @@ function SubagentTabs({
  * for the latest run (status, ordinal, time, duration). Expanded: every
  * prior run in reverse-chronological order.
  */
-function RunsList({ runs }: { runs: Run[] }) {
+/** Compact `used/size` (+ `· $cost`/`· cost CUR`) chip for an fx run's
+ *  latest `usage_update`, rendered beside the duration/exit chips on a
+ *  run-summary row. `title` carries the exact numbers on hover; the visible
+ *  text is the abbreviated form. */
+function UsageChip({ usage }: { usage: FxUsageData }) {
+  const costText = usage.cost
+    ? usage.cost.currency === "USD"
+      ? ` · $${usage.cost.amount.toFixed(2)}`
+      : ` · ${usage.cost.amount.toFixed(2)} ${usage.cost.currency}`
+    : "";
+  const title = `fx usage: ${usage.used.toLocaleString()}/${usage.size.toLocaleString()} tokens`
+    + (usage.cost ? ` · ${usage.cost.amount.toFixed(2)} ${usage.cost.currency}` : "");
+  return (
+    <span className="text-muted-foreground" title={title}>
+      {formatUsageCount(usage.used)}/{formatUsageCount(usage.size)}
+      {costText}
+    </span>
+  );
+}
+
+function RunsList({ runs, usageByRun }: { runs: Run[]; usageByRun?: Map<string, FxUsageData> }) {
   const [open, setOpen] = useState(false);
 
   if (runs.length === 0) {
@@ -3558,6 +3620,7 @@ function RunsList({ runs }: { runs: Run[] }) {
           {latest.exitCode !== null && latest.exitCode !== 0 && (
             <span className="text-destructive">exit {latest.exitCode}</span>
           )}
+          {usageByRun?.get(latest.id) && <UsageChip usage={usageByRun.get(latest.id)!} />}
           {canExpand && (
             <span className="text-muted-foreground">{open ? "▲" : "▼"}</span>
           )}
@@ -3587,11 +3650,14 @@ function RunsList({ runs }: { runs: Run[] }) {
                   #{ordinalFor(r.id)} · {formatTime(r.startedAt)}
                 </span>
               </span>
-              <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
-                {formatDuration(r)}
-                {r.exitCode !== null && r.exitCode !== 0 && (
-                  <span className="ml-1 text-destructive">exit {r.exitCode}</span>
-                )}
+              <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] text-muted-foreground">
+                <span>
+                  {formatDuration(r)}
+                  {r.exitCode !== null && r.exitCode !== 0 && (
+                    <span className="ml-1 text-destructive">exit {r.exitCode}</span>
+                  )}
+                </span>
+                {usageByRun?.get(r.id) && <UsageChip usage={usageByRun.get(r.id)!} />}
               </span>
             </li>
           ))}
@@ -3940,6 +4006,12 @@ function RunEventList({
           // dropping this guard would spam a divider into the scrollback for
           // each one (and historical rows already carry them).
           if (e.data.startsWith(PERMISSION_MODE_STATUS_PREFIX)) return [];
+          // Same idea for fx's usage-update sentinel — it feeds the run-row
+          // usage chip (`RunsList`'s `UsageChip`, derived in the parent from
+          // the raw `events` state), not the transcript. fx's `usage_update`
+          // cadence is unspecified ("MAY"), so leaving this unsuppressed
+          // would spam a divider into the scrollback on every update.
+          if (e.data.startsWith(FX_USAGE_STATUS_PREFIX)) return [];
           return [wrap(key, evid, <StatusDivider text={e.data} />)];
         case "stderr":
           return [wrap(key, evid, <ErrorBlock text={e.data} />)];
@@ -3964,6 +4036,8 @@ function RunEventList({
               planMarkdown={it.id === latestPlanPromptId ? latestPlanMarkdown : null}
             />
           );
+        case "fx_permission":
+          return <FxPermissionCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
       }
     };
 
@@ -5713,6 +5787,97 @@ function TmuxPromptCard({
               disabled={submitting !== null}
             >
               {submitting === c.key ? "Sending…" : `${c.key}. ${c.label}`}
+            </Button>
+          );
+        })}
+      </div>
+      {error && (
+        <p className="mt-2 text-right text-[11px] text-destructive">{error}</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Card for fx's ACP `session/request_permission` — the ACP-native analog
+ * of `TmuxPromptCard` above, but a real in-process RPC awaiter rather than
+ * a scraped tmux pane: resolving the interaction (via `answerFxPermission`)
+ * directly unblocks fx's turn, so there's no keystroke leg and no
+ * "already resolved" scraper race to guard against beyond the ordinary
+ * network-failure retry.
+ *
+ * Shares `AskQuestionsCard`'s card shell (border-primary/ring-primary — a
+ * permission gate is closer in weight to a question than a paused-pane
+ * warning). Option buttons render fx's own `name`s verbatim: fx documents
+ * session-scoped approvals ("Allow for this session") beyond ACP's four
+ * canonical `PermissionOptionKind`s, so hardcoding a fixed label set would
+ * misrender those.
+ */
+function FxPermissionCard({
+  req,
+  onResolved,
+}: {
+  req: Extract<PendingInteraction, { kind: "fx_permission" }>;
+  onResolved: (id: string) => void;
+}) {
+  const [submitting, setSubmitting] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const choose = async (optionId: string) => {
+    if (submitting) return;
+    setSubmitting(optionId);
+    setError(null);
+    try {
+      // Resolve the card only after the server confirms — mirrors
+      // `TmuxPromptCard.send`'s rationale: an optimistic clear on a failed
+      // delivery would hide the card while fx is still blocked on it.
+      await api.answerFxPermission(req.id, { optionId });
+      onResolved(req.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to send the answer.");
+    } finally {
+      setSubmitting(null);
+    }
+  };
+
+  const title = req.toolCall.title || req.toolCall.kind || "tool call";
+
+  return (
+    <div className="rounded-md border border-primary/60 bg-card p-3 ring-1 ring-primary/40">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-primary">
+          <ShieldAlert className="size-3.5" aria-hidden /> Fx is requesting permission
+        </span>
+      </div>
+      <div className="rounded-md border border-border/40 bg-muted/20 p-2">
+        <div className="flex items-center gap-1.5 text-[12px] font-medium">
+          <span className="truncate">{title}</span>
+          {req.toolCall.kind && (
+            <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[9px] uppercase text-muted-foreground">
+              {req.toolCall.kind}
+            </Badge>
+          )}
+        </div>
+        {req.toolCall.rawInput !== undefined && (
+          <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded bg-muted/40 p-1.5 font-mono text-[10px] leading-snug text-muted-foreground">
+            {typeof req.toolCall.rawInput === "string"
+              ? req.toolCall.rawInput
+              : JSON.stringify(req.toolCall.rawInput, null, 2)}
+          </pre>
+        )}
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        {req.options.map((opt) => {
+          const isReject = opt.kind?.startsWith("reject") ?? false;
+          return (
+            <Button
+              key={opt.optionId}
+              onClick={() => void choose(opt.optionId)}
+              size="sm"
+              variant={isReject ? "outline" : "default"}
+              disabled={submitting !== null}
+            >
+              {submitting === opt.optionId ? "Sending…" : opt.name}
             </Button>
           );
         })}

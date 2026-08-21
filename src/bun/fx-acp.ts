@@ -2,7 +2,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import type { Subprocess } from "bun";
 import type { RunEventStream } from "../shared/types.ts";
-import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import { FX_USAGE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 // `ChunkHandler` / `SpawnedAgent` are generic driver-infra types (not part of
 // the fx-specific surface a sibling task is adding to shared/types.ts), so
 // importing them from claude-tmux.ts — the same seam cursor-tmux.ts and
@@ -10,6 +10,17 @@ import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 // call sites structurally identical for the orchestrator wiring that lands
 // later. Nothing fx-specific is imported from shared/types.ts.
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
+// The fx_permission interaction kind (registry contracts landed in a prior
+// task) — this driver is the only caller of `registerFxPermission` /
+// `answerFxPermission`; the HTTP answer route (server.ts, a sibling task)
+// calls `answerFxPermission` too, converging on the same map entry.
+import {
+  answerFxPermission,
+  registerFxPermission,
+  type FxPermissionAnswer,
+  type FxPermissionOption,
+  type FxPermissionToolCall,
+} from "./interactions.ts";
 
 /**
  * Driver for the `fx` agent kind — Vercel Labs' fx coding agent, driven via
@@ -98,24 +109,63 @@ import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
  *     `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, and
  *     `tool_call_update` (terminal statuses only); every other variant is
  *     silently ignored as forward-compat (v1 scope).
- *   - `session/request_permission` (SCHEMA-DERIVED — never exercised
- *     against a real approval in the spike): an inbound *request* (has an
- *     `id`) that this driver must answer. Policy is fail-closed: permissive
- *     auto-answering applies ONLY to `auto`/`yolo` mode, which pick
- *     `allow_once`/`allow_always`/first-option (in that order — `allow_once`
- *     is preferred so an approval stays scoped to the turn instead of
- *     writing a durable rule into the user's fx config); every other mode id
- *     — `ask`, and any unknown/future id — takes the reject arm and picks
- *     `reject_once`/`reject_always` (else responds `cancelled`). Any other
- *     inbound request method gets a `-32601` error — fx shouldn't send one,
- *     since `initialize` advertised no fs/terminal capabilities, but this
- *     driver never trusts that silently.
+ *   - `session/request_permission` (SCHEMA-DERIVED for the request/response
+ *     envelope; UNVERIFIED-LIVE for what a real card interaction looks like
+ *     — the spike's unauthenticated binary never reached a real approval):
+ *     an inbound *request* (has an `id`) that this driver must answer.
+ *     Policy: `yolo` auto-allows (`allow_once`/`allow_always`/first-option,
+ *     in that order — `allow_once` is preferred so an approval stays scoped
+ *     to the turn instead of writing a durable rule into the user's fx
+ *     config); any unknown/future mode id fails closed to auto-reject
+ *     (`reject_once`/`reject_always`, else `cancelled`) — both paths answer
+ *     synchronously, no card, unchanged from the original policy. `ask` AND
+ *     `auto` (owner decision — auto-mode requests now stall for a human
+ *     instead of auto-allowing) instead register a card via
+ *     `registerFxPermission` (`src/bun/interactions.ts`) and `await` its
+ *     `answer` promise before replying — see "Settlement invariant" below.
+ *     Any other inbound request method gets a `-32601` error — fx shouldn't
+ *     send one, since `initialize` advertised no fs/terminal capabilities,
+ *     but this driver never trusts that silently.
+ *   - `plan` (SCHEMA-DERIVED — never observed live; fx may not even emit
+ *     this variant, see the plan doc's A1): a full snapshot,
+ *     `entries[{content, priority, status}]`. Mapped to a synthetic
+ *     `TodoWrite`-shaped `tool_use` chunk so it rides the existing TODO
+ *     tracker (`shared/todo-progress.ts`) and board badge with zero new UI;
+ *     `priority` is dropped (the tracker has no such concept). Malformed
+ *     entries are dropped individually, a non-array `entries` drops the
+ *     whole update; an explicit empty array is a valid clear and is still
+ *     emitted.
+ *   - `usage_update` (SCHEMA-DERIVED — never observed live, cadence
+ *     unspecified by the schema): `{used, size, cost?: {amount, currency}}`
+ *     token counts. Mapped to a `status` chunk under the
+ *     `FX_USAGE_STATUS_PREFIX` sentinel (`shared/types.ts`) — same
+ *     transcript-suppression-plus-latest-value-chip convention as
+ *     `PERMISSION_MODE_STATUS_PREFIX`. Missing/non-numeric `used`/`size`
+ *     silently drops the update; a malformed `cost` object is dropped but
+ *     `used`/`size` still emit.
  *   - Cancellation: `session/cancel` is a **notification**, not a request
  *     (no reply is expected) — after sending it we give the in-flight
  *     `session/prompt` a few seconds to resolve with `stopReason:
  *     "cancelled"` on its own, answer any still-pending inbound permission
- *     request as `cancelled` so fx isn't stuck waiting on us, then SIGTERM
- *     (SIGKILL after a grace period if it didn't exit).
+ *     request as `cancelled` so fx isn't stuck waiting on us (routed through
+ *     the registry for carded requests — see below), then SIGTERM (SIGKILL
+ *     after a grace period if it didn't exit).
+ *   - **Settlement invariant for carded permission requests**: exactly one
+ *     of three paths ever calls `respondRpc` for a given `id` — (1) the
+ *     awaiting `respondPermissionRequest` call itself, once
+ *     `registerFxPermission`'s `answer` promise resolves (user card answer,
+ *     routed through `POST /fx-permissions/:id/answer` in a sibling task);
+ *     (2) nothing else, ever — `cancelFxTurn`'s drain loop and `settleFx`'s
+ *     card sweep never call `respondRpc` directly for a carded id, only
+ *     `answerFxPermission(cardId, {cancelled: true})`, which *unblocks* path
+ *     (1) rather than racing it. Path (1) itself is guarded: after the
+ *     `await`, if `state.resolved` is already true (the turn settled while
+ *     the card was open — death, cancel-timeout kill, or a same-tick
+ *     turn-end), it skips `respondRpc` entirely, since the stdin pipe may
+ *     already be closing/closed. `answerFxPermission` returns `false` on an
+ *     already-resolved id, so a card answered by the user at the exact
+ *     moment Stop tears it down naturally degrades to a no-op on whichever
+ *     side loses the race — no double-resolve, no unhandled rejection.
  *   - Death: an unexpected process exit before the pending `session/prompt`
  *     resolves emits the shared `SESSION_DIED_STATUS_PREFIX` sentinel — the
  *     same one the tmux drivers use — so the orchestrator's existing
@@ -204,8 +254,19 @@ interface FxSessionState {
    *  own persisted events already cover it). */
   suppressUpdates: boolean;
   /** Ids of inbound `session/request_permission` requests we haven't
-   *  answered yet — drained (answered `cancelled`) on cancel. */
+   *  answered yet — drained (answered `cancelled`) on cancel. For a carded
+   *  (ask/auto) request this stays populated for the lifetime of the open
+   *  card, not just a synchronous tick — see `cardIdByRequestId`. */
   pendingPermissionIds: Set<number | string>;
+  /** ACP request id → interactions-registry card id, for every currently
+   *  OPEN `fx_permission` card (ask/auto mode only — yolo/unknown-mode
+   *  requests never register a card, they answer synchronously and never
+   *  appear here). `cancelFxTurn`'s drain loop and `settleFx`'s card sweep
+   *  use this to resolve the registry entry (`answerFxPermission`) instead
+   *  of `respondRpc`-ing directly — see the file header's "Settlement
+   *  invariant" note. Entries are removed by `respondPermissionRequest`
+   *  itself once its `await answer` resolves. */
+  cardIdByRequestId: Map<number | string, string>;
   seq: number;
   seenLineUuids: Set<string>;
 
@@ -346,9 +407,24 @@ function handleServerRequest(state: FxSessionState, method: string, id: number |
     // Registered before dispatch, unregistered only once the response is
     // actually written (in respondPermissionRequest) — this is what makes
     // cancelFxTurn's "answer pending permissions with outcome cancelled"
-    // drain loop real instead of a no-op over an always-empty set.
+    // drain loop real instead of a no-op over an always-empty set. `void`d
+    // because ask/auto mode now `await`s a card answer that may take
+    // arbitrarily long (a human, not a promise that resolves this tick) —
+    // handleServerRequest itself must stay synchronous so the stdout pump
+    // (single-threaded line dispatch loop) never stalls behind an open card
+    // while later lines (including a RACING session/cancel notification's
+    // effects) keep arriving.
     state.pendingPermissionIds.add(id);
-    respondPermissionRequest(state, id, params as { options?: Array<{ optionId: string; kind?: string }> } | undefined);
+    void respondPermissionRequest(
+      state,
+      id,
+      params as
+        | {
+            options?: Array<{ optionId: string; name?: string; kind?: string }>;
+            toolCall?: { toolCallId?: string; title?: string; kind?: string; rawInput?: unknown };
+          }
+        | undefined,
+    );
     return;
   }
   // fx advertised no fs/terminal capabilities at `initialize` — it
@@ -357,16 +433,23 @@ function handleServerRequest(state: FxSessionState, method: string, id: number |
   respondRpcError(state, id, -32601, "Method not found");
 }
 
-function respondPermissionRequest(
+async function respondPermissionRequest(
   state: FxSessionState,
   id: number | string,
-  params: { options?: Array<{ optionId: string; kind?: string }> } | undefined,
-): void {
+  params:
+    | {
+        options?: Array<{ optionId: string; name?: string; kind?: string }>;
+        toolCall?: { toolCallId?: string; title?: string; kind?: string; rawInput?: unknown };
+      }
+    | undefined,
+): Promise<void> {
   // A request that arrives once cancellation is underway (or after the turn
   // already settled) must not be policy-answered — in auto/yolo mode the
   // permissive arm would authorize fx to START a new tool action in the
   // middle of a user-initiated Stop. ACP's cancellation contract is that the
-  // client answers such requests with outcome "cancelled".
+  // client answers such requests with outcome "cancelled". Checked BEFORE
+  // ever registering a card — no card should exist for a request that's
+  // already moot.
   if (state.cancelRequested || state.resolved) {
     respondRpc(state, id, { outcome: { outcome: "cancelled" } });
     state.pendingPermissionIds.delete(id);
@@ -376,23 +459,94 @@ function respondPermissionRequest(
   const options = Array.isArray(params?.options) ? params!.options! : [];
   const pick = (kinds: string[]) => options.find((o) => kinds.includes(o.kind ?? ""));
 
-  // Fail-closed: permissive auto-answering applies ONLY to auto/yolo. Every
-  // other mode id — "ask", and any unknown/future id — takes the reject arm.
-  let chosen: { optionId: string; kind?: string } | undefined;
-  if (state.mode === "yolo" || state.mode === "auto") {
+  if (state.mode === "yolo") {
     // Prefer allow_once over allow_always so an approval stays scoped to
-    // this turn instead of writing a durable rule into the user's fx config.
-    chosen = pick(["allow_once"]) ?? pick(["allow_always"]) ?? options[0];
-  } else {
-    chosen = pick(["reject_once"]) ?? pick(["reject_always"]);
-  }
-
-  if (!chosen) {
-    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+    // this turn instead of writing a durable rule into the user's fx
+    // config. Unchanged from the original (pre-card) policy.
+    const chosen = pick(["allow_once"]) ?? pick(["allow_always"]) ?? options[0];
+    respondRpc(
+      state,
+      id,
+      chosen ? { outcome: { outcome: "selected", optionId: chosen.optionId } } : { outcome: { outcome: "cancelled" } },
+    );
     state.pendingPermissionIds.delete(id);
     return;
   }
-  respondRpc(state, id, { outcome: { outcome: "selected", optionId: chosen.optionId } });
+
+  if (state.mode !== "auto" && state.mode !== "ask") {
+    // Fail-closed: any unknown/future mode id takes the reject arm and
+    // never surfaces a card. Unchanged from the original (pre-card) policy.
+    const chosen = pick(["reject_once"]) ?? pick(["reject_always"]);
+    respondRpc(
+      state,
+      id,
+      chosen ? { outcome: { outcome: "selected", optionId: chosen.optionId } } : { outcome: { outcome: "cancelled" } },
+    );
+    state.pendingPermissionIds.delete(id);
+    return;
+  }
+
+  // ask | auto (owner decision: auto now cards too, instead of auto-
+  // allowing) — register an fx_permission card and await its answer instead
+  // of answering synchronously. `toolCall`/`options` are sanitized down to
+  // exactly the fields the card needs; only `toolCallId` is guaranteed on
+  // the wire per ACP's schema, so every other field is optional-checked.
+  const rawToolCall = params?.toolCall;
+  const toolCall: FxPermissionToolCall = {
+    toolCallId: typeof rawToolCall?.toolCallId === "string" ? rawToolCall.toolCallId : "unknown",
+    title: typeof rawToolCall?.title === "string" ? rawToolCall.title : undefined,
+    kind: typeof rawToolCall?.kind === "string" ? rawToolCall.kind : undefined,
+    rawInput: rawToolCall && "rawInput" in rawToolCall ? rawToolCall.rawInput : undefined,
+  };
+  const cardOptions: FxPermissionOption[] = options.map((o) => ({
+    optionId: o.optionId,
+    name: typeof o.name === "string" && o.name.length > 0 ? o.name : o.optionId,
+    kind: o.kind,
+  }));
+
+  const { id: cardId, answer } = registerFxPermission({
+    taskId: state.taskId,
+    runId: state.runId,
+    toolCall,
+    options: cardOptions,
+    mode: state.mode,
+  });
+  state.cardIdByRequestId.set(id, cardId);
+
+  let answer_: FxPermissionAnswer;
+  try {
+    answer_ = await answer;
+  } finally {
+    // Whatever the outcome, this id no longer has an open card once the
+    // promise settles — remove it BEFORE the state.resolved check below so
+    // a concurrent cancelFxTurn/settleFx sweep racing this same tick never
+    // sees (and tries to re-resolve) an id whose card has already resolved.
+    state.cardIdByRequestId.delete(id);
+  }
+
+  // The turn may have settled (death, cancel-timeout force-kill, or a
+  // same-tick turn-end) WHILE this card was open — the stdin pipe backing
+  // `respondRpc` may already be closing/closed by the time the await above
+  // returns, so a resolution arriving after settlement must not attempt a
+  // reply at all. This is the other half of the settlement invariant
+  // documented in the file header: `answerFxPermission` is what unblocked
+  // us, never `respondRpc` — we're the only path that ever calls it.
+  if (state.resolved) {
+    state.pendingPermissionIds.delete(id);
+    return;
+  }
+
+  if ("cancelled" in answer_ && answer_.cancelled) {
+    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+  } else if ("optionId" in answer_ && cardOptions.some((o) => o.optionId === answer_.optionId)) {
+    // Belt-and-suspenders — the HTTP answer route validates the optionId
+    // against the same request before ever calling `answerFxPermission`,
+    // but a second check here costs nothing and means this driver never
+    // trusts a value it didn't itself offer.
+    respondRpc(state, id, { outcome: { outcome: "selected", optionId: answer_.optionId } });
+  } else {
+    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+  }
   state.pendingPermissionIds.delete(id);
 }
 
@@ -497,10 +651,69 @@ function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unk
       return;
     }
 
+    case "plan": {
+      // Full snapshot semantics (ACP: "client replaces the entire plan with
+      // each update") — mirrors legacy TodoWrite exactly, so this rides the
+      // existing TODO tracker (shared/todo-progress.ts) with zero new UI.
+      // A non-array `entries` is malformed — ignore the whole update rather
+      // than emit a bogus empty list (which would read as an explicit
+      // clear, a different thing). An actual empty array IS a valid
+      // explicit clear and must still emit.
+      const rawEntries = (update as { entries?: unknown }).entries;
+      if (!Array.isArray(rawEntries)) return;
+      const todos: Array<{ content: string; status: "pending" | "in_progress" | "completed" }> = [];
+      for (const raw of rawEntries) {
+        // Individual malformed entries are dropped, not fatal to the rest
+        // of the snapshot — mirrors coerceTodoItem's per-item tolerance in
+        // shared/todo-progress.ts (which also re-coerces this same payload
+        // downstream, so this is belt-and-suspenders, not the only guard).
+        if (raw == null || typeof raw !== "object") continue;
+        const r = raw as Record<string, unknown>;
+        if (typeof r.content !== "string" || r.content.trim() === "") continue;
+        const status =
+          r.status === "pending" || r.status === "in_progress" || r.status === "completed" ? r.status : "pending";
+        // `priority` is intentionally dropped — the TODO tracker has no
+        // priority concept (recorded as a known reduction in the plan doc).
+        todos.push({ content: r.content, status });
+      }
+      emit(
+        state,
+        "tool_use",
+        JSON.stringify({ id: "fx-plan", name: "TodoWrite", input: { todos }, serverSide: false }),
+        `fx:${state.runId}:${state.seq++}`,
+      );
+      return;
+    }
+
+    case "usage_update": {
+      const used = (update as { used?: unknown }).used;
+      const size = (update as { size?: unknown }).size;
+      // Missing/non-numeric used|size is malformed — ignore silently rather
+      // than emit a chip with holes in it.
+      if (typeof used !== "number" || typeof size !== "number") return;
+      const rawCost = (update as { cost?: unknown }).cost;
+      let cost: { amount: number; currency: string } | undefined;
+      if (rawCost != null && typeof rawCost === "object") {
+        const c = rawCost as Record<string, unknown>;
+        if (typeof c.amount === "number" && typeof c.currency === "string") {
+          cost = { amount: c.amount, currency: c.currency };
+        }
+        // A malformed cost object is dropped on its own — used/size still
+        // emit rather than losing the whole update over an optional field.
+      }
+      emit(
+        state,
+        "status",
+        FX_USAGE_STATUS_PREFIX + JSON.stringify({ used, size, ...(cost ? { cost } : {}) }),
+        `fx:${state.runId}:${state.seq++}`,
+      );
+      return;
+    }
+
     default:
-      // plan, usage_update, current_mode_update, available_commands_update,
-      // user_message_chunk, session_info_update, config_option_update, and
-      // any future variant — silent forward-compat (v1 scope).
+      // current_mode_update, available_commands_update, user_message_chunk,
+      // session_info_update, config_option_update, and any future variant —
+      // silent forward-compat (v1 scope).
       return;
   }
 }
@@ -591,6 +804,22 @@ function settleFx(state: FxSessionState, code: number): void {
   if (fxSessions.get(state.taskId) === state) fxSessions.delete(state.taskId);
   liveFxProcs.delete(state.proc);
   killProc(state);
+  // Sweep any still-open fx_permission card so it never outlives the
+  // driver — process death mid-card (the most common way settleFx runs
+  // without ever going through cancelFxTurn's drain loop) would otherwise
+  // leak a registry entry the UI keeps showing a card for forever. Resolved
+  // via the registry (answerFxPermission), never respondRpc — see the file
+  // header's "Settlement invariant" note: the awaiting respondPermissionRequest
+  // call is the only path that ever writes an RPC reply, and it already
+  // checks `state.resolved` (now true) and skips replying once this sweep
+  // wakes it. `answerFxPermission` is idempotent (returns false on an
+  // already-resolved id), so this can't double-resolve a card the user
+  // answered in the same tick.
+  for (const cardId of state.cardIdByRequestId.values()) {
+    answerFxPermission(cardId, { cancelled: true });
+  }
+  state.cardIdByRequestId.clear();
+  state.pendingPermissionIds.clear();
   for (const pending of state.pending.values()) pending.reject(new Error("fx session settled"));
   state.pending.clear();
   state.resolveDone(code);
@@ -632,10 +861,26 @@ async function cancelFxTurn(state: FxSessionState): Promise<void> {
   if (state.resolved) return;
   state.cancelRequested = true;
   if (state.sessionId) sendNotification(state, "session/cancel", { sessionId: state.sessionId });
-  for (const id of state.pendingPermissionIds) {
-    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+  // Drain every still-pending permission request. A carded (ask/auto) id
+  // has an open registry entry — resolve it through the registry
+  // (`answerFxPermission`), which unblocks the awaiting
+  // `respondPermissionRequest` call so THAT call is the one that writes the
+  // RPC reply (see the file header's "Settlement invariant"). A non-carded
+  // id (yolo/unknown, which answer synchronously and so in practice are
+  // never still pending by the time this loop runs) is answered directly,
+  // same as before this change — kept as the backstop for a future policy
+  // that introduces an async pre-registration window. Snapshot to an array
+  // first since the carded branch doesn't delete from the set inline (that
+  // happens in respondPermissionRequest once its await resolves).
+  for (const id of Array.from(state.pendingPermissionIds)) {
+    const cardId = state.cardIdByRequestId.get(id);
+    if (cardId) {
+      answerFxPermission(cardId, { cancelled: true });
+    } else {
+      respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+      state.pendingPermissionIds.delete(id);
+    }
   }
-  state.pendingPermissionIds.clear();
 
   await waitUntilResolved(state, CANCEL_WAIT_MS);
   if (!state.resolved) {
@@ -877,6 +1122,7 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     sessionId: opts.resumeSessionId ?? null,
     suppressUpdates: false,
     pendingPermissionIds: new Set(),
+    cardIdByRequestId: new Map(),
     seq: 0,
     seenLineUuids: new Set(),
     resolved: false,

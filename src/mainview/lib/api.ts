@@ -224,9 +224,49 @@ export interface PendingTmuxPrompt {
   unparsable?: boolean;
 }
 
+/** The ACP tool call an fx permission request is asking about — mirrors
+ *  `FxPermissionToolCall` on the server (`src/bun/interactions.ts`). Only
+ *  `toolCallId` is guaranteed; `title`/`kind`/`rawInput` are rendered
+ *  generically when absent. */
+export interface FxPermissionToolCall {
+  toolCallId: string;
+  title?: string;
+  kind?: string;
+  rawInput?: unknown;
+}
+
+/** One selectable option fx offered. `kind` is a hint from ACP's
+ *  `PermissionOptionKind` (`allow_once` | `allow_always` | `reject_once` |
+ *  `reject_always`) but kept as a plain optional string since fx documents
+ *  additional session-scoped kinds beyond those four — the card renders
+ *  fx's own `name` verbatim rather than hardcoding a fixed set. */
+export interface FxPermissionOption {
+  optionId: string;
+  name: string;
+  kind?: string;
+}
+
+/** Pending fx ACP `session/request_permission` call (real in-process
+ *  awaiter — unlike the two scraper-sourced kinds above, resolving this
+ *  directly unblocks fx's turn; there is no pane and no keystroke leg).
+ *  Mirrors `FxPermissionRequest` on the server. */
+export interface PendingFxPermission {
+  kind: "fx_permission";
+  id: string;
+  taskId: string;
+  runId: string;
+  createdAt: number;
+  toolCall: FxPermissionToolCall;
+  options: FxPermissionOption[];
+  /** The agetor mode (`auto` | `ask`) that caused this request to surface
+   *  as a card — `yolo` auto-allows and never reaches here. */
+  mode: string;
+}
+
 export type PendingInteraction =
   | PendingAskQuestions
-  | PendingTmuxPrompt;
+  | PendingTmuxPrompt
+  | PendingFxPermission;
 
 /** One stored per-host git credential, as surfaced to the webview. The store
  *  is shared across GitHub/GitLab/Bitbucket — `host` may be a plain provider
@@ -1429,6 +1469,15 @@ export const api = {
    *  recorded set before injecting keystrokes via `tmux send-keys`. */
   answerTmuxPrompt: (id: string, body: { key: string } | { reject: true }) =>
     j<{ ok: boolean }>(`/tmux-prompts/${id}/answer`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** Answer an fx ACP permission request. `{ optionId }` must be one of the
+   *  option ids the request advertised — the server validates against the
+   *  recorded set before echoing it back into the ACP RPC reply.
+   *  `{ cancel: true }` is the Stop/delete path. */
+  answerFxPermission: (id: string, body: { optionId: string } | { cancel: true }) =>
+    j<{ ok: boolean }>(`/fx-permissions/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
