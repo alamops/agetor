@@ -543,14 +543,21 @@ test("queuePaste: settle window holds the next paste for slash commands", async 
 
 test("queuePaste: pastes for different taskIds don't block each other", async () => {
   await withFakeTmuxBin(async () => {
-    const SETTLE = 120;
+    // Settle chosen large: task-B's elapsed includes a fake-tmux process
+    // spawn whose cost under a loaded full-suite run has been observed at
+    // 70ms+, so the bound must dwarf spawn latency while staying well
+    // under SETTLE. 400/2 = 200ms gives ~3x headroom over the worst
+    // observed spawn without weakening the serialization signal.
+    const SETTLE = 400;
     const prev = __forTest.setSlashCommandSettleMs(SETTLE);
     try {
       const taskA = randomUUID();
       const taskB = randomUUID();
 
-      // Task A's slash command holds a 120ms settle window.
+      // Task A's slash command holds a SETTLE ms settle window.
       const slashA = __forTest.queuePaste(taskA, "sess-a", "/model X", SETTLE);
+      let aResolved = false;
+      void slashA.then(() => { aResolved = true; });
       const t0 = performance.now();
       // Task B's paste should be able to run immediately — independent
       // chain. If we accidentally globalized the lock, this would wait
@@ -558,8 +565,11 @@ test("queuePaste: pastes for different taskIds don't block each other", async ()
       await __forTest.queuePaste(taskB, "sess-b", "user msg", 0);
       const elapsed = performance.now() - t0;
 
-      // Generous upper bound — proves task-B is NOT serialized behind
-      // task-A's settle. On a healthy run elapsed is ~0–5ms.
+      // Clock-free serialization detector: were the chains shared, B could
+      // only complete after A's settle window — i.e. after slashA resolved.
+      // A still pending here proves B never waited on A.
+      expect(aResolved).toBe(false);
+      // Belt-and-braces upper bound — on a healthy run elapsed is ~0–5ms.
       expect(elapsed).toBeLessThan(SETTLE / 2);
       await slashA;
     } finally {
@@ -1002,7 +1012,6 @@ test("queuePaste(image): non-image bracketed paste does NOT take the long gap (u
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     try {
       const taskId = randomUUID();
-      const t0 = performance.now();
       await __forTest.queuePaste(
         taskId,
         "sess-txt",
@@ -1011,13 +1020,19 @@ test("queuePaste(image): non-image bracketed paste does NOT take the long gap (u
         undefined,
         { bracketed: true },
       );
-      const elapsed = performance.now() - t0;
-      // Well under the 5_000 ms slow-path bound. 500 ms is generous
-      // against CI scheduler noise while still being orders of magnitude
-      // below the bound.
-      expect(elapsed).toBeLessThan(500);
+      // Discriminate on the delete-buffer → Enter gap from the tmux log,
+      // not total wall clock: the run spawns four sub-bun tmux recorders
+      // whose cold starts (100ms+ each under a loaded suite) sit inside
+      // any end-to-end elapsed measurement — see withRecordingTmuxBin's
+      // "upper bound" warning. The gap itself is ~20ms (base bracketed
+      // gap + one spawn) on the fast path and ≥ 5_000ms on a misfired
+      // image path, so half the image settle is an unambiguous ceiling.
+      const entries = readTmuxLog(logPath);
+      const deleteBuffer = entries[2]!;
+      const sendKeys = entries[3]!;
+      expect(sendKeys.ms - deleteBuffer.ms).toBeLessThan(5_000 / 2);
       // Trailing send-keys Enter still fires exactly once.
-      const enterCalls = readTmuxLog(logPath)
+      const enterCalls = entries
         .filter((e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "Enter");
       expect(enterCalls.length).toBe(1);
     } finally {
