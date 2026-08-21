@@ -68,6 +68,7 @@ import {
 import { cn } from "@/lib/utils";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
 import { mergeabilityView, type MergeTone } from "@/lib/mergeability";
+import { isMergedPull, mergedPullReplacement } from "@/lib/pull-merged";
 import { isCredentialError } from "@/lib/credential-error";
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
@@ -666,6 +667,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // Bounds the self-healing re-poll when GitHub returns mergeable=null. Keyed by
   // itemKey (G8) so two same-numbered PRs across repos don't share a retry budget.
   const mergeabilityRetries = useRef<Record<string, number>>({});
+  // Tracks the itemKey of the pulls-detail view the refresh-on-entry effect
+  // (below) last refreshed, so it fires once per *entry* into a detail view
+  // rather than on every render — reset to null whenever the dialog closes
+  // or the view leaves "detail", so detail(A) -> list -> detail(A) and a
+  // dialog reopen onto a surviving detail view both refresh again.
+  const lastDetailRefreshKeyRef = useRef<string | null>(null);
   const [view, setView] = useState<GitHubDialogView>({ kind: "list" });
   // Mirrors `view` for the async prefill effect below, which needs to check
   // "has the user navigated away from the list?" from inside a promise
@@ -2283,6 +2290,65 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
       });
   }, [open, projectPath, expandedItem, mergeability, mergeabilityLoading, mergeabilityErrors]);
 
+  // Refresh-on-detail-entry: detail views deliberately survive dialog
+  // close/reopen (see the close effect above `resetComposers`), and the
+  // mergeability effect above never invalidates its own cache once
+  // populated — it's gated on the cached item's `state === "open"` and
+  // skips entirely once a value/error/loading flag is already set. So
+  // opening back into a detail view for a PR that was merged (or otherwise
+  // changed) somewhere else — another agetor window, the GitHub web UI —
+  // would show a stale mergeability banner and a live action grid forever.
+  // This effect fires once per *entry* into a pulls detail view (tracked via
+  // `lastDetailRefreshKeyRef`, reset whenever the dialog closes or the view
+  // leaves "detail", so detail(A) -> list -> detail(A) and a dialog reopen
+  // onto a surviving detail view both refresh again) and does two things:
+  // (1) invalidates the mergeability cache exactly like the manual refresh
+  // handler (`onRefreshMergeability` below) does — the fetch effect above
+  // then refetches on its own for open PRs, and correctly skips merged/closed
+  // ones; (2) fetches a fresh copy of the item itself via the same
+  // `getGitHubPullDetail` endpoint the "View PR" prefill effect above uses,
+  // since mergeability alone can't detect a PR merged outside agetor.
+  // Failure is silent — no toast, no error state — cached data stays on
+  // screen and the mergeability banner has its own error surface for open
+  // PRs; a toast on every detail-view entry would be noisy offline. Guarded
+  // against navigation clobber via `viewRef` (a plain closure over `view`
+  // would only see the value from the render that started the fetch), same
+  // idiom as the "View PR" prefill effect.
+  useEffect(() => {
+    if (!open || view.kind !== "detail" || view.item.kind !== "pulls") {
+      lastDetailRefreshKeyRef.current = null;
+      return;
+    }
+    const item = view.item;
+    const key = itemKey(item);
+    if (lastDetailRefreshKeyRef.current === key) return;
+    lastDetailRefreshKeyRef.current = key;
+
+    mergeabilityRetries.current[key] = 0;
+    setMergeability((cur) => ({ ...cur, [key]: undefined }));
+    setMergeabilityErrors((cur) => ({ ...cur, [key]: undefined }));
+
+    const itemPath = item.sourcePath ?? projectPath;
+    if (!itemPath) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await api.getGitHubPullDetail(itemPath, item.number);
+        if (cancelled || !result?.ok || !result.item) return;
+        const fresh = result.item;
+        upsertListItem(fresh, false, true);
+        if (viewRef.current.kind === "detail" && itemKey(viewRef.current.item) === key) {
+          setView(openDetail(fresh));
+        }
+      } catch {
+        // Silent — cached data stays, mergeability banner surfaces its own error.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, view, projectPath]);
+
   useEffect(() => {
     if (!open || !projectPath || !expandedItem || expandedItem.kind !== "pulls") return;
     const number = expandedItem.number;
@@ -2634,7 +2700,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
       const result = await api.mergeGitHubPull({ path: itemPath, number: item.number, method });
-      if (result.merged) markPullClosed(item);
+      if (result.merged) markPullClosed(item, mergedPullReplacement(item));
       setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Pull request merged." }));
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
@@ -7500,6 +7566,11 @@ function PullActions({
   // Merge, auto-merge, update-branch and draft-toggle stay push-only.
   canModifyOwn: boolean;
 }) {
+  // A merged PR replaces the mergeability banner + Review/Merge/Close grid
+  // below with a single positive card — there's nothing actionable left to
+  // show once GitHub has actually merged the branches (as opposed to just
+  // closing the PR unmerged, which keeps today's disabled-grid behavior).
+  const merged = isMergedPull(item);
   const disabled = item.state !== "open" || !!busy;
   const view = item.state === "open" && mergeability ? mergeabilityView(mergeability) : null;
   const mergeDisabled = disabled || !canPush || (view ? !view.canMerge : false);
@@ -7625,6 +7696,13 @@ function PullActions({
         </div>
       )}
 
+      {merged ? (
+        <div className="flex flex-col items-center justify-center gap-2 rounded-md border border-merged/30 bg-merged/10 px-4 py-6 text-center">
+          <GitMerge className="size-6 text-merged" />
+          <span className="text-sm font-medium text-merged">Pull request successfully merged</span>
+          {item.mergedAt && <span className="text-[11px] text-merged/80">Merged on {fmtDate(item.mergedAt)}</span>}
+        </div>
+      ) : (
       <div className="grid gap-3 lg:grid-cols-3">
         <div className="min-w-0">
           <div className="mb-1 flex items-center justify-between gap-2">
@@ -7752,8 +7830,9 @@ function PullActions({
           </Button>
         </div>
       </div>
+      )}
 
-      {pendingCount > 0 && (
+      {!merged && pendingCount > 0 && (
         <div className="mt-3 flex items-start gap-1.5 text-[11px] text-warning">
           <AlertCircle className="mt-px size-3.5 shrink-0" />
           {pendingCount} review comment{pendingCount === 1 ? "" : "s"} queued — submit via Approve / Comment / Request; merging or closing won't post {pendingCount === 1 ? "it" : "them"}.

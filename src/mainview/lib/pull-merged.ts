@@ -1,0 +1,29 @@
+import type { GitHubListItem } from "../../shared/types.ts";
+
+/** Whether `item` is a pull request that has actually been merged (as opposed
+ *  to closed-unmerged) — the one signal `state: "closed"` alone can't give,
+ *  since GitHub collapses both outcomes into the same `state` value. Drives
+ *  whether the GitHub dialog's PR detail view shows the purple "merged" card
+ *  in place of the mergeability banner + Review/Merge/Close action grid. */
+export function isMergedPull(item: GitHubListItem): boolean {
+  return item.kind === "pulls" && !!item.mergedAt;
+}
+
+/** Builds the optimistic list-item replacement for a PR just merged from
+ *  inside agetor. GitHub's merge endpoint response (`{merged, sha, message}`)
+ *  carries no `mergedAt` — so the UI stamps an approximate one (default: now)
+ *  to flip the card to "merged" immediately, and the next real fetch (the
+ *  refresh-on-detail-entry effect, or a manual mergeability refresh) corrects
+ *  it with GitHub's actual timestamp. `closedAt` is preserved if the item
+ *  already carries one; otherwise it's stamped with the same timestamp,
+ *  matching what `markPullClosed`'s default replacement does for a plain
+ *  close. Every other field on `item` is passed through unchanged. */
+export function mergedPullReplacement(item: GitHubListItem, mergedAtIso?: string): GitHubListItem {
+  const stamp = mergedAtIso ?? new Date().toISOString();
+  return {
+    ...item,
+    state: "closed",
+    closedAt: item.closedAt ?? stamp,
+    mergedAt: stamp,
+  };
+}
