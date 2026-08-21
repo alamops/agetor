@@ -42,6 +42,7 @@ import { ProjectPicker } from "./ProjectPicker";
 import {
   ReferencesPicker,
   captureDroppedOrPastedItems,
+  dropHintMessage,
   mergeRefs,
   type CapturedItem,
 } from "./ReferencesPicker";
@@ -554,14 +555,17 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
     });
     restoreCaret(promptRef.current, caret);
   };
-  const reportCapture = ({ items, skipped, error }: {
+  const reportCapture = (result: {
     items: CapturedItem[];
     skipped: number;
+    skippedFolders: number;
     error?: string;
   }) => {
-    if (error) setDropHint(`Couldn't save screenshot: ${error}`);
-    else if (skipped && !items.length) setDropHint("Nothing to attach — drag a file from Finder, or a screenshot blob.");
-    else setDropHint(null);
+    setDropHint(dropHintMessage(result, {
+      partialFolder: "Attached the files — one folder couldn't be attached; use the folder picker.",
+      allFolder: "Couldn't attach the folder — use the folder picker instead.",
+      nothingToAttach: "Nothing to attach — drag a file from Finder, or paste a screenshot.",
+    }));
   };
   const onAsideDrop = async (e: React.DragEvent) => {
     if (collapsed) return;
@@ -569,7 +573,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
     setDragging(false);
     setDropHint(null);
     const dt = e.dataTransfer;
-    const result = await captureDroppedOrPastedItems(dt);
+    const result = await captureDroppedOrPastedItems(dt, { kind: "drop" });
     reportCapture(result);
     applyCaptured(result.items);
   };
@@ -582,7 +586,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
     if (!hasFile) return;
     e.preventDefault();
     setDropHint(null);
-    const result = await captureDroppedOrPastedItems(cd);
+    const result = await captureDroppedOrPastedItems(cd, { kind: "paste" });
     reportCapture(result);
     applyCaptured(result.items);
   };
