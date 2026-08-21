@@ -35,12 +35,17 @@ import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
  * rather than being tailed from a file after the fact:
  *
  *   - There is deliberately **no `reattachFxSession`** export. A mid-turn
- *     agetor restart orphans the run *by design* — the child process either
- *     dies with agetor (normal child process semantics) or, if it somehow
- *     outlives agetor, there is no surviving stdin/stdout handle left to
- *     drive it with, so reattaching would be a no-op anyway. Boot
- *     reconciliation's generic "no live session for a `running` row → flip
- *     to `orphaned`" path handles this the same way it would handle any
+ *     agetor restart orphans the run *by design* — a bare child process does
+ *     NOT die with its parent on POSIX (an unparented child is reparented to
+ *     init and keeps running), but there is no surviving stdin/stdout handle
+ *     left to drive it with once agetor exits, so reattaching would be a
+ *     no-op anyway. To avoid leaking that orphaned `fx acp` process across a
+ *     restart, every spawned child is tracked in a module-level `liveFxProcs`
+ *     set (registered on spawn, unregistered on settlement) and a single
+ *     `process.on("exit", …)` hook best-effort-kills whatever is still
+ *     registered when agetor itself exits. Boot reconciliation's generic
+ *     "no live session for a `running` row → flip to `orphaned`" path
+ *     handles the DB-row side of this the same way it would handle any
  *     other agent kind whose session vanished — no fx-specific boot-time
  *     code is needed or provided here.
  *   - There is no on-disk NDJSON log this driver reads from (fx is told to
@@ -95,12 +100,16 @@ import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
  *     silently ignored as forward-compat (v1 scope).
  *   - `session/request_permission` (SCHEMA-DERIVED — never exercised
  *     against a real approval in the spike): an inbound *request* (has an
- *     `id`) that this driver must answer. Policy: `ask` mode picks a
- *     `reject_once`/`reject_always` option (else responds `cancelled`);
- *     `auto`/`yolo` pick `allow_always`/`allow_once`/first-option (in that
- *     order). Any other inbound request method gets a `-32601` error — fx
- *     shouldn't send one, since `initialize` advertised no fs/terminal
- *     capabilities, but this driver never trusts that silently.
+ *     `id`) that this driver must answer. Policy is fail-closed: permissive
+ *     auto-answering applies ONLY to `auto`/`yolo` mode, which pick
+ *     `allow_once`/`allow_always`/first-option (in that order — `allow_once`
+ *     is preferred so an approval stays scoped to the turn instead of
+ *     writing a durable rule into the user's fx config); every other mode id
+ *     — `ask`, and any unknown/future id — takes the reject arm and picks
+ *     `reject_once`/`reject_always` (else responds `cancelled`). Any other
+ *     inbound request method gets a `-32601` error — fx shouldn't send one,
+ *     since `initialize` advertised no fs/terminal capabilities, but this
+ *     driver never trusts that silently.
  *   - Cancellation: `session/cancel` is a **notification**, not a request
  *     (no reply is expected) — after sending it we give the in-flight
  *     `session/prompt` a few seconds to resolve with `stopReason:
@@ -207,6 +216,22 @@ interface FxSessionState {
 
 const fxSessions = new Map<string, FxSessionState>(); // taskId -> state
 
+/** Every currently-spawned `fx acp` child, tracked so a mid-turn agetor exit
+ *  doesn't leak an orphaned process (see the file header's "Architecture"
+ *  section — a bare child does NOT die with its parent on POSIX). Registered
+ *  in `spawnFxViaAcp`, unregistered in `settleFx`. */
+const liveFxProcs = new Set<Subprocess<"pipe", "pipe", "pipe">>();
+
+process.on("exit", () => {
+  for (const proc of liveFxProcs) {
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+});
+
 /* ────────────────────────────────────────────────────────────────────────── *
  * Wire I/O.
  * ────────────────────────────────────────────────────────────────────────── */
@@ -307,6 +332,11 @@ function handleLine(state: FxSessionState, line: string): void {
 
 function handleServerRequest(state: FxSessionState, method: string, id: number | string, params: unknown): void {
   if (method === "session/request_permission") {
+    // Registered before dispatch, unregistered only once the response is
+    // actually written (in respondPermissionRequest) — this is what makes
+    // cancelFxTurn's "answer pending permissions with outcome cancelled"
+    // drain loop real instead of a no-op over an always-empty set.
+    state.pendingPermissionIds.add(id);
     respondPermissionRequest(state, id, params as { options?: Array<{ optionId: string; kind?: string }> } | undefined);
     return;
   }
@@ -324,19 +354,24 @@ function respondPermissionRequest(
   const options = Array.isArray(params?.options) ? params!.options! : [];
   const pick = (kinds: string[]) => options.find((o) => kinds.includes(o.kind ?? ""));
 
+  // Fail-closed: permissive auto-answering applies ONLY to auto/yolo. Every
+  // other mode id — "ask", and any unknown/future id — takes the reject arm.
   let chosen: { optionId: string; kind?: string } | undefined;
-  if (state.mode === "ask") {
-    chosen = pick(["reject_once"]) ?? pick(["reject_always"]);
+  if (state.mode === "yolo" || state.mode === "auto") {
+    // Prefer allow_once over allow_always so an approval stays scoped to
+    // this turn instead of writing a durable rule into the user's fx config.
+    chosen = pick(["allow_once"]) ?? pick(["allow_always"]) ?? options[0];
   } else {
-    chosen = pick(["allow_always"]) ?? pick(["allow_once"]) ?? options[0];
+    chosen = pick(["reject_once"]) ?? pick(["reject_always"]);
   }
 
-  state.pendingPermissionIds.delete(id);
   if (!chosen) {
     respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+    state.pendingPermissionIds.delete(id);
     return;
   }
   respondRpc(state, id, { outcome: { outcome: "selected", optionId: chosen.optionId } });
+  state.pendingPermissionIds.delete(id);
 }
 
 function handleServerNotification(state: FxSessionState, method: string, params: unknown): void {
@@ -409,6 +444,9 @@ function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unk
     }
 
     case "tool_call": {
+      // No real id to correlate a later tool_call_update against — still
+      // worth emitting (a seq-based id renders fine on its own), it just
+      // can never pair with a result (see the tool_call_update branch).
       const id = typeof update.toolCallId === "string" ? update.toolCallId : `seq${state.seq++}`;
       emit(
         state,
@@ -422,7 +460,12 @@ function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unk
     case "tool_call_update": {
       const status = update.status;
       if (status !== "completed" && status !== "failed") return; // pending/in_progress — ignore
-      const id = typeof update.toolCallId === "string" ? update.toolCallId : `seq${state.seq++}`;
+      // Without a real toolCallId there is nothing to pair this result with
+      // the tool_use it completes — minting an independent seq-based id here
+      // would never match the use event's id (different seq counter state),
+      // so drop the event rather than emit an unpairable orphan.
+      if (typeof update.toolCallId !== "string") return;
+      const id = update.toolCallId;
       emit(
         state,
         "tool_result",
@@ -459,7 +502,17 @@ async function pumpStdout(state: FxSessionState): Promise<void> {
         state.stdoutBuf = state.stdoutBuf.slice(nl + 1);
         handleLine(state, line);
       }
-      if (state.stdoutBuf.length > MAX_STDOUT_BUFFER_BYTES) {
+      // `stdoutBuf.length` is UTF-16 code units, not bytes — comparing it
+      // directly against a byte-denominated cap under-triggers for
+      // multi-byte UTF-8 text. A UTF-8 char is at most 4 bytes → at most ~3x
+      // the UTF-16 units it can produce (surrogate pairs are 2 units for up
+      // to 4 bytes), so `length` is always >= `byteLength / 3`; that makes
+      // `length * 3 >= MAX` a cheap, always-safe pre-check before paying for
+      // the exact `Buffer.byteLength` computation.
+      if (
+        state.stdoutBuf.length * 3 >= MAX_STDOUT_BUFFER_BYTES &&
+        Buffer.byteLength(state.stdoutBuf, "utf8") > MAX_STDOUT_BUFFER_BYTES
+      ) {
         failTurn(state, `${SESSION_DIED_STATUS_PREFIX}fx stdout exceeded ${MAX_STDOUT_BUFFER_BYTES} bytes without a newline`);
         return;
       }
@@ -509,7 +562,12 @@ async function pumpStderr(state: FxSessionState): Promise<void> {
 function settleFx(state: FxSessionState, code: number): void {
   if (state.resolved) return;
   state.resolved = true;
-  fxSessions.delete(state.taskId);
+  // Identity-checked: a cross-kind agent switch or a fresh turn on the same
+  // task can already have replaced this taskId's map entry with a newer
+  // state by the time this (older) state settles — an unconditional delete
+  // would unregister the wrong (still-live) session.
+  if (fxSessions.get(state.taskId) === state) fxSessions.delete(state.taskId);
+  liveFxProcs.delete(state.proc);
   killProc(state);
   for (const pending of state.pending.values()) pending.reject(new Error("fx session settled"));
   state.pending.clear();
@@ -780,6 +838,7 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     stdout: "pipe",
     stderr: "pipe",
   });
+  liveFxProcs.add(proc);
 
   const state: FxSessionState = {
     taskId: opts.taskId,
@@ -805,14 +864,20 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
 
   const done = new Promise<number>((resolve) => { state.resolveDone = resolve; });
 
-  void pumpStdout(state);
+  const stdoutPump = pumpStdout(state);
   void pumpStderr(state);
 
   // Death watch: an unexpected process exit before we've settled the turn
   // (initialize/session/new/prompt never got their response) is a genuine
   // death, not an orderly finish — surface the shared sentinel + last stderr
-  // for context.
-  state.proc.exited.then((code) => {
+  // for context. We wait for the stdout pump to drain first: `proc.exited`
+  // can resolve before the pump has finished reading and dispatching
+  // whatever fx already flushed to the pipe (e.g. the terminal
+  // `session/prompt` response, or a protocol-error reply) — racing ahead of
+  // that would clobber an actionable result/error with a generic
+  // "session died" status.
+  state.proc.exited.then(async (code) => {
+    await stdoutPump.catch(() => { /* pump's own catch already handled/logged failure */ });
     if (state.resolved) return;
     const tail = state.stderrRing.length > 0 ? `\n${state.stderrRing.join("\n")}` : "";
     failTurn(state, `${SESSION_DIED_STATUS_PREFIX}fx process exited unexpectedly (code ${code})${tail}`);

@@ -1823,8 +1823,8 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
       { id: "google/gemini-3-pro", label: "Gemini 3 Pro" },
     ],
     modes: [
-      { id: "yolo", label: "Yolo", hint: "No permission checks, no sandbox — full access." },
       { id: "auto", label: "Auto", hint: "fx sandbox plus LLM auto-review of unresolved tool calls." },
+      { id: "yolo", label: "Yolo", hint: "No permission checks, no sandbox — full access." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; unresolved tool calls are rejected." },
     ],
     // No model in MODEL_EFFORT_SUPPORT.fx accepts the effort flag, so the

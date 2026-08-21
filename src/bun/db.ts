@@ -665,7 +665,7 @@ export const harnesses = {
         : id === "codex" ? "Codex"
         : id === "cursor" ? "Cursor"
         : id === "gemini" ? "Gemini CLI"
-        : "fx";
+        : "fx.sh";
       return {
         id,
         kind: id,

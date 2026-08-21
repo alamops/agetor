@@ -1429,6 +1429,7 @@ function attachDoneHandler(
       drainCodexQueue(taskId);
       drainCursorQueue(taskId);
       drainGeminiQueue(taskId);
+      drainFxQueue(taskId);
     })
     .catch((err) => {
       const handle = active.get(runId);
@@ -1462,6 +1463,7 @@ function attachDoneHandler(
       drainCodexQueue(taskId);
       drainCursorQueue(taskId);
       drainGeminiQueue(taskId);
+      drainFxQueue(taskId);
     });
 }
 

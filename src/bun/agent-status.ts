@@ -43,6 +43,44 @@ async function probeVersion(bin: string, env: Record<string, string>): Promise<s
 }
 
 /**
+ * The bare name `fx` collides with a popular npm JSON-viewer CLI. A
+ * `--version` exit-status check alone can't tell them apart, so for fx
+ * harnesses we additionally probe `--help` and look for a marker string
+ * unique to Vercel's fx ("coding agent" — real fx v0.0.4 says "Fast, native
+ * coding agent for the terminal"; the JSON viewer's says "Terminal JSON
+ * viewer"). Doesn't gate on exit code — some CLIs exit non-zero for --help.
+ */
+async function probeHelp(bin: string, env: Record<string, string>): Promise<string | null> {
+  const proc = Bun.spawn([bin, "--help"], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, ...env },
+  });
+
+  const timer = setTimeout(() => {
+    try { proc.kill(); } catch { /* already gone */ }
+  }, VERSION_PROBE_TIMEOUT_MS);
+
+  try {
+    await proc.exited;
+    const [out, err] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    return `${out}\n${err}`;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const FX_HELP_MARKER = "coding agent";
+const FX_WRONG_BINARY_HINT =
+  "found a different 'fx' binary (JSON viewer?) — install Vercel fx: curl -fsSL https://fx.sh/setup.sh | bash or set AGETOR_FX_BIN";
+
+/**
  * Resolve an executable name to an absolute path. Absolute paths bypass `$PATH`
  * and are checked for existence directly — `Bun.which` only searches `$PATH`
  * and returns null for absolute paths, which would falsely report a hand-
@@ -109,6 +147,24 @@ export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
   }
 
   const version = await probeVersion(path, harnessEnv(harness));
+
+  if (harness.kind === "fx" && version !== null) {
+    const helpOutput = await probeHelp(path, harnessEnv(harness));
+    const looksLikeFx = helpOutput?.toLowerCase().includes(FX_HELP_MARKER) ?? false;
+    if (!looksLikeFx) {
+      return {
+        harnessId: harness.id,
+        kind: harness.kind,
+        bin,
+        available: false,
+        path,
+        version,
+        reason: `\`${bin}\` doesn't look like Vercel fx`,
+        installHint: FX_WRONG_BINARY_HINT,
+      };
+    }
+  }
+
   return {
     harnessId: harness.id,
     kind: harness.kind,
