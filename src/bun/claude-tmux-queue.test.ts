@@ -996,13 +996,13 @@ test("queuePaste(image): non-image bracketed paste does NOT take the long gap (u
   // — small enough that the bracketed test above's GAP - TOLERANCE math
   // doesn't apply — proving the path went through `bracketedEnterGapMs`
   // and not through the scaled image settle.
+  const IMG = 20_000;
   await withRecordingTmuxBin(async (logPath) => {
-    const prevImg = __forTest.setImageAttachSettleMs(5_000);
+    const prevImg = __forTest.setImageAttachSettleMs(IMG);
     const prevGap = __forTest.setBracketedEnterGapMs(20);
     const prevSettle = __forTest.setSlashCommandSettleMs(0);
     try {
       const taskId = randomUUID();
-      const t0 = performance.now();
       await __forTest.queuePaste(
         taskId,
         "sess-txt",
@@ -1011,13 +1011,24 @@ test("queuePaste(image): non-image bracketed paste does NOT take the long gap (u
         undefined,
         { bracketed: true },
       );
-      const elapsed = performance.now() - t0;
-      // Well under the 5_000 ms slow-path bound. 500 ms is generous
-      // against CI scheduler noise while still being orders of magnitude
-      // below the bound.
-      expect(elapsed).toBeLessThan(500);
+      // Assert on the delete-buffer → send-keys Enter delta from the
+      // recording tmux bin (like the gap-floor tests above), NOT on total
+      // wall-clock around queuePaste: the wall-clock version accumulated
+      // four sub-bun spawn round-trips + interpreter startup and hovered
+      // at its 500 ms budget under full-suite load (a long-standing flake).
+      // The delta spans exactly one scheduled gap plus one spawn start —
+      // ~20 ms + spawn latency on the fast path, >= IMG - tolerance if the
+      // image detector misfired — so IMG / 2 is orders of magnitude of
+      // headroom in both directions regardless of machine load.
+      const entries = readTmuxLog(logPath);
+      const deleteBuffer = entries[2]!;
+      const sendKeys = entries[3]!;
+      expect(deleteBuffer.argv[0]).toBe("delete-buffer");
+      expect(sendKeys.argv[sendKeys.argv.length - 1]).toBe("Enter");
+      const deltaMs = sendKeys.ms - deleteBuffer.ms;
+      expect(deltaMs).toBeLessThan(IMG / 2);
       // Trailing send-keys Enter still fires exactly once.
-      const enterCalls = readTmuxLog(logPath)
+      const enterCalls = entries
         .filter((e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "Enter");
       expect(enterCalls.length).toBe(1);
     } finally {
