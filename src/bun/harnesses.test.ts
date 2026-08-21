@@ -198,6 +198,85 @@ test("insert accepts kind:'gemini' and round-trips a gemini alias", () => {
   expect(harnesses.get("gemini-work")!.home).toBe("/tmp/agetor-test-gemini-home");
 });
 
+test("fx is a built-in row (carve-out setEnabled toggle works like every other built-in)", () => {
+  // 045_fx_harness.sql seeds fx with enabled=0 (mirrors codex's 016 /
+  // cursor's / gemini's disabled-by-default rollout posture) — not
+  // re-asserted here for the same reason the gemini test above doesn't
+  // re-assert it: this file's beforeEach unconditionally re-enables every
+  // built-in for test isolation.
+  const h = harnesses.get("fx")!;
+  expect(h.isBuiltin).toBe(true);
+  expect(h.kind).toBe("fx");
+  expect(h.label).toBe("fx.sh");
+  expect(harnesses.setEnabled("fx", false).enabled).toBe(false);
+  expect(harnesses.get("fx")!.enabled).toBe(false);
+  expect(() => harnesses.update("fx", { label: "Renamed" })).toThrow(HarnessBuiltinError);
+});
+
+test("insert accepts kind:'fx' and round-trips an fx alias", () => {
+  const inserted = harnesses.insert({
+    id: "fx-work",
+    kind: "fx",
+    label: "fx (work)",
+    home: "/tmp/agetor-test-fx-home",
+    bin: null,
+    env: {},
+  });
+  expect(inserted.kind).toBe("fx");
+  expect(harnesses.get("fx-work")!.home).toBe("/tmp/agetor-test-fx-home");
+});
+
+test("getByIdOrKind synthesises a built-in fx row for legacy id without a matching row", () => {
+  // Same capture/restore rationale as the claude-code/gemini versions of
+  // this test above.
+  const saved = db.query(`SELECT * FROM harnesses WHERE id = ?`).get("fx");
+  try {
+    db.run(`DELETE FROM harnesses WHERE id = ?`, ["fx"]);
+    const synth = harnesses.getByIdOrKind("fx");
+    expect(synth?.kind).toBe("fx");
+    expect(synth?.isBuiltin).toBe(true);
+    expect(synth?.label).toBe("fx.sh");
+  } finally {
+    if (saved) {
+      const s = saved as Record<string, SQLQueryBindings>;
+      db.run(
+        `INSERT OR IGNORE INTO harnesses (id, kind, label, is_builtin, home, bin, env_json, created_at, updated_at, enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [s.id, s.kind, s.label, s.is_builtin, s.home, s.bin, s.env_json, s.created_at, s.updated_at, s.enabled] as SQLQueryBindings[],
+      );
+    }
+  }
+});
+
+test("insert rejects kind:'grok'/'kimi' even though the harnesses.kind CHECK constraint permits them", () => {
+  // migrations/045_fx_harness.sql widens the `harnesses.kind` CHECK to admit
+  // 'grok' and 'kimi' pre-emptively — those are in-flight sibling branches'
+  // own harness kinds, and the table-rebuild migration recipe requires the
+  // CHECK to be a superset across all in-flight branches so an
+  // INSERT...SELECT row copy never fails regardless of migration apply
+  // order. That widened CHECK is a SQLite-schema-level allowance only:
+  // `harnesses.insert` (db.ts) enforces its own separate app-layer
+  // whitelist (`claude-code` | `codex` | `cursor` | `gemini` | `fx`) that
+  // has NOT grown to include 'grok'/'kimi' yet, so an attempt to insert
+  // either is rejected before the CHECK constraint is ever consulted.
+  for (const kind of ["grok", "kimi"]) {
+    expect(() =>
+      harnesses.insert({ id: `${kind}-work`, kind: kind as never, label: kind }),
+    ).toThrow(new RegExp(`unknown harness kind: ${kind}`));
+  }
+});
+
+test("getByIdOrKind returns null for CHECK-permitted-but-app-unrecognized kinds ('grok', 'kimi')", () => {
+  // Mirrors the insert rejection above: getByIdOrKind's synthesis whitelist
+  // is the same closed set as insert's, so a legacy/foreign 'grok' or 'kimi'
+  // id (which the CHECK constraint would happily store, but which no
+  // migration has ever seeded a builtin row for) resolves to null rather
+  // than silently fabricating a builtin for a kind agetor doesn't drive.
+  for (const kind of ["grok", "kimi"]) {
+    expect(harnesses.getByIdOrKind(kind)).toBeNull();
+  }
+});
+
 test("getByIdOrKind synthesises a built-in gemini row for legacy id without a matching row", () => {
   // Same capture/restore rationale as the claude-code version of this test
   // above — belt-and-braces against this file's isolation being defeated.

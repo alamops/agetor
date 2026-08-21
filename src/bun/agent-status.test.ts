@@ -27,6 +27,7 @@ beforeEach(() => {
   delete process.env.AGETOR_CODEX_BIN;
   delete process.env.AGETOR_CLAUDE_BIN;
   delete process.env.AGETOR_GEMINI_BIN;
+  delete process.env.AGETOR_FX_BIN;
   delete process.env.AGETOR_TMUX_BIN;
   sandbox = null;
 });
@@ -132,4 +133,60 @@ test("claude-code alias with a CLAUDE_CONFIG_DIR override is available without p
   const status = await checkHarness(alias);
   expect(status.available).toBe(true);
   expect(status.reason).toBeNull();
+});
+
+// --- fx --------------------------------------------------------------------
+// fx's probe is the only one with a second, help-text stage: the bare name
+// `fx` collides with a popular npm JSON-viewer CLI, so a `--version`
+// exit-status check alone can't distinguish them — checkHarness additionally
+// probes `--help` and looks for a marker string unique to Vercel's fx
+// ("coding agent"). See agent-status.ts's probeHelp/FX_HELP_MARKER.
+
+test("fx returns available=false with install hint when the bin is missing", async () => {
+  process.env.AGETOR_FX_BIN = "definitely-not-a-real-binary-xyz123";
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(false);
+  expect(status.path).toBeNull();
+  expect(status.reason).toContain("not found on PATH");
+  expect(status.installHint).toContain("fx.sh");
+});
+
+/**
+ * Plant a fake `fx` binary at <dir>/fx that answers `--version` with exit 0
+ * plus a version string, and `--help` with `helpText` on stdout — mirroring
+ * the dual-probe contract `checkHarness` runs for kind `"fx"`
+ * (probeVersion, then probeHelp gated on a non-null version). Returns the
+ * fake binary's absolute path; registers the containing dir in `sandbox` so
+ * `afterEach` cleans it up.
+ */
+function plantFakeFxBin(helpText: string): string {
+  sandbox = mkdtempSync(path.join(tmpdir(), "agetor-agent-status-fx-"));
+  const bin = path.join(sandbox, "fx");
+  writeFileSync(
+    bin,
+    `#!/bin/sh\n`
+      + `if [ "$1" = "--version" ]; then echo "0.0.4"; exit 0; fi\n`
+      + `if [ "$1" = "--help" ]; then echo "${helpText}"; exit 0; fi\n`
+      + `exit 1\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+test("fx returns available=true when --version succeeds and --help contains the 'coding agent' marker", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxBin("Fast, native coding agent for the terminal");
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(true);
+  expect(status.version).toBe("0.0.4");
+  expect(status.reason).toBeNull();
+  expect(status.installHint).toBeNull();
+});
+
+test("fx returns available=false with the wrong-binary hint when --help lacks the marker (e.g. the npm JSON-viewer 'fx')", async () => {
+  process.env.AGETOR_FX_BIN = plantFakeFxBin("Terminal JSON viewer");
+  const status = await checkAgent("fx");
+  expect(status.available).toBe(false);
+  expect(status.version).toBe("0.0.4");
+  expect(status.reason).toContain("doesn't look like Vercel fx");
+  expect(status.installHint).toContain("fx.sh");
 });
