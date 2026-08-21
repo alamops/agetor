@@ -211,6 +211,12 @@ interface FxSessionState {
 
   resolved: boolean;
   killRequested: boolean;
+  /** Set the moment a cancel is requested — from then on, any inbound
+   *  `session/request_permission` (including one racing the cancel drain or
+   *  arriving during the post-cancel grace window) is answered `cancelled`
+   *  instead of going through the normal allow/reject policy, per ACP's
+   *  cancellation contract. */
+  cancelRequested: boolean;
   resolveDone: (code: number) => void;
 }
 
@@ -280,6 +286,11 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 /** Emit a chunk through the run's `line_uuid` dedup gate, mirroring the other
  *  drivers' `seenLineUuids` pattern (see cursor-tmux.ts / gemini-tmux.ts). */
 function emit(state: FxSessionState, stream: RunEventStream, data: string, lineUuid?: string): void {
+  // A settled turn emits nothing: pumpStdout keeps dispatching whatever
+  // lines remain in the pipe until SIGTERM actually closes the stream, and
+  // those trailing updates would otherwise append events to a run the
+  // orchestrator has already finalized (or, post-delete, to a missing row).
+  if (state.resolved) return;
   if (lineUuid) {
     if (state.seenLineUuids.has(lineUuid)) return;
     state.seenLineUuids.add(lineUuid);
@@ -351,6 +362,17 @@ function respondPermissionRequest(
   id: number | string,
   params: { options?: Array<{ optionId: string; kind?: string }> } | undefined,
 ): void {
+  // A request that arrives once cancellation is underway (or after the turn
+  // already settled) must not be policy-answered — in auto/yolo mode the
+  // permissive arm would authorize fx to START a new tool action in the
+  // middle of a user-initiated Stop. ACP's cancellation contract is that the
+  // client answers such requests with outcome "cancelled".
+  if (state.cancelRequested || state.resolved) {
+    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+    state.pendingPermissionIds.delete(id);
+    return;
+  }
+
   const options = Array.isArray(params?.options) ? params!.options! : [];
   const pick = (kinds: string[]) => options.find((o) => kinds.includes(o.kind ?? ""));
 
@@ -608,6 +630,7 @@ async function waitUntilResolved(state: FxSessionState, timeoutMs: number): Prom
  */
 async function cancelFxTurn(state: FxSessionState): Promise<void> {
   if (state.resolved) return;
+  state.cancelRequested = true;
   if (state.sessionId) sendNotification(state, "session/cancel", { sessionId: state.sessionId });
   for (const id of state.pendingPermissionIds) {
     respondRpc(state, id, { outcome: { outcome: "cancelled" } });
@@ -858,6 +881,7 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     seenLineUuids: new Set(),
     resolved: false,
     killRequested: false,
+    cancelRequested: false,
     resolveDone: () => { /* replaced below */ },
   };
   fxSessions.set(opts.taskId, state);

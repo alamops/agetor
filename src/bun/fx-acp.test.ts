@@ -150,6 +150,10 @@ const FAKE_ACP_SERVER_SRC = [
   '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "working..." } } });',
   "    return;",
   "  }",
+  '  if (scenario === "cancel-permission-race") {',
+  '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "working..." } } });',
+  "    return;",
+  "  }",
   '  if (scenario === "die-mid-turn") {',
   "    setTimeout(function () { process.exit(1); }, 20);",
   "    return;",
@@ -181,12 +185,33 @@ const FAKE_ACP_SERVER_SRC = [
   "    const respondId = promptId;",
   '    setTimeout(function () { ok(respondId, { stopReason: "cancelled" }); }, 10);',
   "  }",
+  '  if (scenario === "cancel-permission-race") {',
+  "    // A permission request racing the client's cancel: sent AFTER the",
+  "    // client's session/cancel arrived, while the prompt is still pending.",
+  "    // The driver must answer it cancelled, never via the allow policy.",
+  "    send({",
+  '      jsonrpc: "2.0",',
+  '      id: "perm-race",',
+  '      method: "session/request_permission",',
+  "      params: {",
+  "        options: [",
+  '          { optionId: "allow-always", kind: "allow_always" },',
+  '          { optionId: "allow-once", kind: "allow_once" },',
+  '          { optionId: "reject-once", kind: "reject_once" }',
+  "        ]",
+  "      }",
+  "    });",
+  "  }",
   "}",
   "",
   "function handleReply(msg) {",
   '  capture("reply", msg);',
   '  if (msg.id === "perm-1" && promptId !== null) {',
   '    setTimeout(function () { ok(promptId, { stopReason: "end_turn" }); }, 10);',
+  "  }",
+  '  if (msg.id === "perm-race" && promptId !== null) {',
+  "    const respondId = promptId;",
+  '    setTimeout(function () { ok(respondId, { stopReason: "cancelled" }); }, 10);',
   "  }",
   "}",
   "",
@@ -445,6 +470,26 @@ describe("session/request_permission auto-answer policy", () => {
     // unreleased mode id passed through verbatim from buildCommand would.
     const outcome = await permissionOutcomeFor("weird-unknown" as FxMode);
     expect(outcome).toEqual({ outcome: "selected", optionId: "reject-once" });
+  }, 10_000);
+
+  test("a permission request arriving AFTER cancel is answered cancelled, not via the allow policy", async () => {
+    // Regression for the cancel-window race: kill() sends session/cancel,
+    // and the fake replies by sending a session/request_permission (with
+    // allow options) — i.e. a request racing the cancellation. Even in
+    // permissive "auto" mode the driver must answer it with outcome
+    // "cancelled": an allow here would authorize fx to START a new tool
+    // action in the middle of a user-initiated Stop.
+    const { agent, chunks, captureFile } = spawnFake("cancel-permission-race", { mode: "auto" });
+    await waitFor(() => chunks.some((c) => c.stream === "assistant" && c.data.includes("working")));
+    agent.kill();
+    const code = await agent.done;
+    expect(code).toBe(1);
+
+    const entries = readCaptured(captureFile);
+    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-race");
+    expect(reply).toBeDefined();
+    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
+    expect(result?.outcome).toEqual({ outcome: "cancelled" });
   }, 10_000);
 });
 

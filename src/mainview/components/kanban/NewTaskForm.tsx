@@ -902,7 +902,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
                         : kind === "gemini"
                         ? "Routed to gemini's --approval-mode plan — a real read-only mode, no changes made."
                         : kind === "fx"
-                        ? "fx has no native plan mode — routed to propose-only 'ask' so nothing auto-executes."
+                        ? "fx has no native plan mode — routed to 'ask': only pre-approved rules run, everything else is rejected."
                         : "Plan only — agent describes what it would do without making changes."
                     }
                   >

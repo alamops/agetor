@@ -960,7 +960,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
         ? { geminiSessionId: sessionId }
         : { fxSessionId: sessionId });
     },
-    opts: { mode: task.mode, model: task.model, effort: task.effort, fast: task.fast, maxMode: task.maxMode },
+    opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, fast: task.fast, maxMode: task.maxMode },
   });
   registerActiveRun(runId, taskId, task, agent);
   emit({
@@ -1886,7 +1886,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
     },
     opts: {
       mode: task.mode,
-      model: task.model,
+      model: task.model ?? DEFAULT_MODEL[harness.kind],
       effort: task.effort,
       fast: task.fast,
       maxMode: task.maxMode,
@@ -2033,7 +2033,7 @@ function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
     },
     opts: {
       mode: task.mode,
-      model: task.model,
+      model: task.model ?? DEFAULT_MODEL[harness.kind],
       effort: task.effort,
       fast: task.fast,
       maxMode: task.maxMode,
@@ -2189,7 +2189,7 @@ function spawnGeminiTurnNow(task: Task, taskId: string, line: string): string {
     },
     opts: {
       mode: task.mode,
-      model: task.model,
+      model: task.model ?? DEFAULT_MODEL[harness.kind],
       effort: task.effort,
       fast: task.fast,
       maxMode: task.maxMode,
@@ -2334,7 +2334,7 @@ function spawnFxTurnNow(task: Task, taskId: string, line: string): string {
     },
     opts: {
       mode: task.mode,
-      model: task.model,
+      model: task.model ?? DEFAULT_MODEL[harness.kind],
       effort: task.effort,
       fast: task.fast,
       maxMode: task.maxMode,
@@ -2634,7 +2634,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
     },
     opts: {
       mode: task.mode,
-      model: task.model,
+      model: task.model ?? DEFAULT_MODEL[harness.kind],
       effort: task.effort,
       fast: task.fast,
       maxMode: task.maxMode,
