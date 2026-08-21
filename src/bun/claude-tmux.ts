@@ -5788,6 +5788,10 @@ export const __forTest = {
     return prev;
   },
   getImageAttachSettleMs(): number { return imageAttachSettleMs; },
+  /** The gap the last bracketed `queuePaste` actually chose (base gap vs
+   *  scaled image settle). Lets tests pin the detector's path decision
+   *  deterministically instead of upper-bounding wall-clock elapsed. */
+  getLastBracketedGapMs(): number | null { return lastBracketedGapMs; },
   /** Image-path detection used by `queuePaste` to decide whether to
    *  take the long (image-attach) gap. Re-exported for unit tests so the
    *  rule can be asserted without reaching into the regex literal. */
@@ -5990,6 +5994,13 @@ let slashCommandSettleMs = 700;
  */
 let bracketedEnterGapMs = 80;
 
+/** Gap (ms) chosen by the most recent `queuePaste` bracketed branch —
+ *  the base `bracketedEnterGapMs` or the scaled image-attach settle.
+ *  Recorded so tests can assert WHICH path the image detector picked
+ *  without an upper-bound wall-clock assertion (those flake under
+ *  scheduler load). Never read by production code. */
+let lastBracketedGapMs: number | null = null;
+
 /**
  * Append a tmux operation to the per-task chain. The `fn` thunk runs
  * after every prior op for the same task has settled. Errors thrown by
@@ -6150,6 +6161,7 @@ function queuePaste(
       const gap = imageCount > 0
         ? Math.min(imageAttachSettleMs * imageCount, IMAGE_ATTACH_SETTLE_MAX_MS)
         : bracketedEnterGapMs;
+      lastBracketedGapMs = gap;
       if (gap > 0) await Bun.sleep(gap);
       if (!stillCurrent()) return;
       const enter = tmux(["send-keys", "-t", sessionName, "Enter"]);

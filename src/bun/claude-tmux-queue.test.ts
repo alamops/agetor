@@ -1001,11 +1001,12 @@ test("queuePaste(image): gap scales linearly with the number of image paths", as
 });
 
 test("queuePaste(image): non-image bracketed paste does NOT take the long gap (uses base bracketed gap instead)", async () => {
-  // Bloat the image settle to a value that would blow the test budget if
-  // the detector misfired. Base bracketed gap is a small non-zero value
-  // — small enough that the bracketed test above's GAP - TOLERANCE math
-  // doesn't apply — proving the path went through `bracketedEnterGapMs`
-  // and not through the scaled image settle.
+  // Bloat the image settle to a value the detector must NOT pick, and set
+  // the base bracketed gap to a distinctive small value. The recorded
+  // `lastBracketedGapMs` then pins which path `queuePaste` chose — a
+  // deterministic assertion, unlike the wall-clock upper bound this test
+  // used to make (`elapsed < 500` flaked at 500–880 ms under scheduler
+  // load: the budget also absorbed several recording-tmux-stub spawns).
   await withRecordingTmuxBin(async (logPath) => {
     const prevImg = __forTest.setImageAttachSettleMs(5_000);
     const prevGap = __forTest.setBracketedEnterGapMs(20);
@@ -1020,13 +1021,16 @@ test("queuePaste(image): non-image bracketed paste does NOT take the long gap (u
         undefined,
         { bracketed: true },
       );
-      // Discriminate on the delete-buffer → Enter gap from the tmux log,
-      // not total wall clock: the run spawns four sub-bun tmux recorders
-      // whose cold starts (100ms+ each under a loaded suite) sit inside
-      // any end-to-end elapsed measurement — see withRecordingTmuxBin's
-      // "upper bound" warning. The gap itself is ~20ms (base bracketed
-      // gap + one spawn) on the fast path and ≥ 5_000ms on a misfired
-      // image path, so half the image settle is an unambiguous ceiling.
+      // The non-image paste must have taken the base bracketed gap (20),
+      // not the 5_000 ms image settle — the recorded gap deterministically
+      // pins which path `queuePaste` chose.
+      expect(__forTest.getLastBracketedGapMs()).toBe(20);
+      // Belt-and-braces on the *observed* timing: the delete-buffer → Enter
+      // gap from the tmux log stays orders of magnitude under a misfired
+      // image settle. Log-derived, not total wall clock — the run spawns
+      // four sub-bun tmux recorders whose cold starts (100ms+ each under a
+      // loaded suite) would sit inside any end-to-end elapsed budget; see
+      // withRecordingTmuxBin's "upper bound" warning.
       const entries = readTmuxLog(logPath);
       const deleteBuffer = entries[2]!;
       const sendKeys = entries[3]!;
