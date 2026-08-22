@@ -550,3 +550,82 @@ test("listPendingForTask returns fx_permission entries alongside the other kinds
   const kinds = listPendingForTask("tFxMixed").map((r) => r.kind).sort();
   expect(kinds).toEqual(["ask_questions", "fx_permission", "tmux_prompt"]);
 });
+
+/* ── Broadcast-throw rollback ──────────────────────────────────────────
+ *
+ * Every register* function wraps its `broadcast(req)` call in try/catch:
+ * a throwing listener (the orchestrator's SSE fan-out has no per-listener
+ * try/catch of its own) must not strand a phantom pending entry the UI can
+ * never see or dismiss. The rollback removes the entry from its map AND
+ * fires the resolved-broadcast (so any UI that DID see the request before
+ * the listener threw learns it's gone too) before rethrowing the original
+ * error to the caller. Covered here for the real in-process awaiter
+ * (`fx_permission`) and one sibling kind (`tmux_prompt`) — `ask_questions`
+ * shares the identical rollback shape (see `registerScrapedAskQuestions` in
+ * interactions.ts) and is not re-covered per kind here.
+ * ────────────────────────────────────────────────────────────────────── */
+
+test("registerFxPermission rolls back when the broadcaster throws: the entry never lands in the registry, and the resolved-broadcast still fires", async () => {
+  const { setBroadcaster, setResolvedBroadcaster, listPendingForTask, __testing } = await import("./interactions.ts");
+  const resolved: Array<{ id: string; taskId: string; kind: string }> = [];
+  setResolvedBroadcaster((r) => resolved.push({ id: r.id, taskId: r.taskId, kind: r.kind }));
+  setBroadcaster(() => {
+    throw new Error("boom");
+  });
+
+  let thrown: unknown;
+  try {
+    await makeFxPermission("tFxThrow", "rFx");
+  } catch (err) {
+    thrown = err;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect((thrown as Error).message).toBe("boom");
+
+  // Rolled back: never registered, so nothing is pending and nothing is
+  // answerable.
+  expect(__testing.fxPermissionsSize()).toBe(0);
+  expect(listPendingForTask("tFxThrow")).toHaveLength(0);
+
+  // The resolved-broadcast still fired for the doomed entry, so a UI that
+  // rendered the card from an earlier (successful) listener in the same
+  // fan-out learns to drop it.
+  expect(resolved).toHaveLength(1);
+  expect(resolved[0]).toEqual({ id: resolved[0]!.id, taskId: "tFxThrow", kind: "fx_permission" });
+
+  // Restore so a subsequent test in this file (or a later call within this
+  // one) doesn't inherit the throwing broadcaster.
+  setBroadcaster(() => { /* restored */ });
+  setResolvedBroadcaster(() => { /* restored */ });
+});
+
+test("registerTmuxPrompt rolls back the same way when the broadcaster throws (sibling kind)", async () => {
+  const { setBroadcaster, setResolvedBroadcaster, registerTmuxPrompt, listPendingForTask, __testing } =
+    await import("./interactions.ts");
+  const resolved: Array<{ id: string; taskId: string; kind: string }> = [];
+  setResolvedBroadcaster((r) => resolved.push({ id: r.id, taskId: r.taskId, kind: r.kind }));
+  setBroadcaster(() => {
+    throw new Error("kaboom");
+  });
+
+  let thrown: unknown;
+  try {
+    registerTmuxPrompt({
+      taskId: "tTmuxThrow", runId: "r1",
+      paneText: "?", choices: [{ key: "1", label: "Yes" }], fingerprint: "fp-throw",
+    });
+  } catch (err) {
+    thrown = err;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect((thrown as Error).message).toBe("kaboom");
+
+  expect(__testing.tmuxPromptsSize()).toBe(0);
+  expect(listPendingForTask("tTmuxThrow")).toHaveLength(0);
+
+  expect(resolved).toHaveLength(1);
+  expect(resolved[0]).toEqual({ id: resolved[0]!.id, taskId: "tTmuxThrow", kind: "tmux_prompt" });
+
+  setBroadcaster(() => { /* restored */ });
+  setResolvedBroadcaster(() => { /* restored */ });
+});

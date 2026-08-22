@@ -1020,9 +1020,16 @@ test("queuePaste(image): non-image bracketed paste does NOT take the long gap (u
       // ~20 ms + spawn latency on the fast path, >= IMG - tolerance if the
       // image detector misfired — so IMG / 2 is orders of magnitude of
       // headroom in both directions regardless of machine load.
+      // Locate the calls by predicate rather than fixed index — pinning to
+      // entries[2]/entries[3] silently breaks if an earlier step ever grows
+      // an extra tmux call, without failing loudly on the intent being
+      // tested (delete-buffer → the Enter that follows it).
       const entries = readTmuxLog(logPath);
-      const deleteBuffer = entries[2]!;
-      const sendKeys = entries[3]!;
+      const deleteBufferIdx = entries.findIndex((e) => e.argv[0] === "delete-buffer");
+      const deleteBuffer = entries[deleteBufferIdx]!;
+      const sendKeys = entries
+        .slice(deleteBufferIdx + 1)
+        .find((e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "Enter")!;
       expect(deleteBuffer.argv[0]).toBe("delete-buffer");
       expect(sendKeys.argv[sendKeys.argv.length - 1]).toBe("Enter");
       const deltaMs = sendKeys.ms - deleteBuffer.ms;

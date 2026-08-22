@@ -11,7 +11,14 @@ import path from "node:path";
 // here; confirmed by reading fx-acp.ts's imports (node:fs, node:path, "bun",
 // ../shared/types.ts, and a TYPE-ONLY import from ./claude-tmux.ts that is
 // erased at compile time and never pulls db.ts in at runtime).
-import { dropFxSession, fxSessionActive, spawnFxViaAcp, type FxLaunchOptions, type FxMode } from "./fx-acp.ts";
+import {
+  dropFxSession,
+  fxSessionActive,
+  reapLiveFxProcs,
+  spawnFxViaAcp,
+  type FxLaunchOptions,
+  type FxMode,
+} from "./fx-acp.ts";
 import { FX_USAGE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX, type RunEventStream } from "../shared/types.ts";
 // fx-acp.ts's own permission driving is the thing under test here, but the
 // tests themselves need to reach into the SAME in-memory registry the driver
@@ -68,6 +75,15 @@ const FAKE_ACP_SERVER_SRC = [
   '  send({ jsonrpc: "2.0", method: method, params: params });',
   "}",
   "",
+  "// Test hygiene: collapses the repeated",
+  "// setTimeout(function () { ok(id, { stopReason: X }) }, N) shape that used",
+  "// to be duplicated per scenario. `reason` defaults to \"end_turn\".",
+  "function endTurn(id, ms, reason) {",
+  "  setTimeout(function () {",
+  '    ok(id, { stopReason: reason || "end_turn" });',
+  "  }, ms);",
+  "}",
+  "",
   'process.on("SIGTERM", function () {',
   '  capture("sigterm", {});',
   "  process.exit(0);",
@@ -94,6 +110,15 @@ const FAKE_ACP_SERVER_SRC = [
   '  if (scenario === "unauth-die-race") {',
   '    fail(id, -32600, "Fx needs access to Vercel AI Gateway. Run fx login to authenticate.");',
   "    process.exit(1);",
+  "    return;",
+  "  }",
+  '  if (scenario === "initialize-error-mimics-timeout") {',
+  "    // A REAL fx protocol error whose message happens to start with the",
+  '    // exact wording our own RpcTimeoutError uses ("timed out waiting for").',
+  "    // Regression: this must be classified by error CLASS, not by matching",
+  "    // that text, or the driver would misreport this as a generic",
+  "    // session-died sentinel instead of surfacing fx's actual message.",
+  '    fail(id, -32000, "timed out waiting for gateway upstream");',
   "    return;",
   "  }",
   "  ok(id, {});",
@@ -129,7 +154,7 @@ const FAKE_ACP_SERVER_SRC = [
   '  capture("session/prompt", params);',
   '  if (scenario === "happy" || scenario === "resume" || scenario === "resume-fallback") {',
   "    streamHappyUpdates();",
-  '    setTimeout(function () { ok(id, { stopReason: "end_turn" }); }, 20);',
+  '    endTurn(id, 20, "end_turn");',
   "    return;",
   "  }",
   '  if (scenario === "permission") {',
@@ -201,22 +226,22 @@ const FAKE_ACP_SERVER_SRC = [
   '      { content: "Ship it", status: "in_progress" }',
   "    ] } });",
   '    notify("session/update", { update: { sessionUpdate: "plan", entries: [] } });',
-  '    setTimeout(function () { ok(id, { stopReason: "end_turn" }); }, 15);',
+  '    endTurn(id, 15, "end_turn");',
   "    return;",
   "  }",
   '  if (scenario === "usage-update") {',
   '    notify("session/update", { update: { sessionUpdate: "usage_update", used: 100, size: 1000, cost: { amount: 0.05, currency: "USD" } } });',
   '    notify("session/update", { update: { sessionUpdate: "usage_update", used: 200, size: 1000, cost: { amount: 0.1 } } });',
   '    notify("session/update", { update: { sessionUpdate: "usage_update", used: "not-a-number", size: 1000 } });',
-  '    setTimeout(function () { ok(id, { stopReason: "end_turn" }); }, 15);',
+  '    endTurn(id, 15, "end_turn");',
   "    return;",
   "  }",
   '  if (scenario === "stopreason-refusal") {',
-  '    setTimeout(function () { ok(id, { stopReason: "refusal" }); }, 10);',
+  '    endTurn(id, 10, "refusal");',
   "    return;",
   "  }",
   '  if (scenario === "stopreason-cancelled") {',
-  '    setTimeout(function () { ok(id, { stopReason: "cancelled" }); }, 10);',
+  '    endTurn(id, 10, "cancelled");',
   "    return;",
   "  }",
   '  if (scenario === "kill-cancel") {',
@@ -235,20 +260,20 @@ const FAKE_ACP_SERVER_SRC = [
   '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "before" } } });',
   '    process.stdout.write("not json at all, this line should be skipped\\n");',
   '    notify("session/update", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "after" } } });',
-  '    setTimeout(function () { ok(id, { stopReason: "end_turn" }); }, 15);',
+  '    endTurn(id, 15, "end_turn");',
   "    return;",
   "  }",
   '  if (scenario === "missing-tool-call-id") {',
   '    notify("session/update", { update: { sessionUpdate: "tool_call", toolCallId: "tc-1", title: "Run", kind: "execute", rawInput: {} } });',
   '    notify("session/update", { update: { sessionUpdate: "tool_call_update", status: "completed", rawOutput: {} } });',
-  '    setTimeout(function () { ok(id, { stopReason: "end_turn" }); }, 15);',
+  '    endTurn(id, 15, "end_turn");',
   "    return;",
   "  }",
   '  if (scenario === "stall-for-drop") {',
   "    return;",
   "  }",
   "  streamHappyUpdates();",
-  '  setTimeout(function () { ok(id, { stopReason: "end_turn" }); }, 20);',
+  '  endTurn(id, 20, "end_turn");',
   "}",
   "",
   "function handleCancel(params) {",
@@ -256,12 +281,12 @@ const FAKE_ACP_SERVER_SRC = [
   '  if (scenario === "kill-cancel" && promptId !== null && !cancelPromptResponded) {',
   "    cancelPromptResponded = true;",
   "    const respondId = promptId;",
-  '    setTimeout(function () { ok(respondId, { stopReason: "cancelled" }); }, 10);',
+  '    endTurn(respondId, 10, "cancelled");',
   "  }",
   '  if (scenario === "permission-stop" && promptId !== null && !cancelPromptResponded) {',
   "    cancelPromptResponded = true;",
   "    const respondId = promptId;",
-  '    setTimeout(function () { ok(respondId, { stopReason: "cancelled" }); }, 15);',
+  '    endTurn(respondId, 15, "cancelled");',
   "  }",
   '  if (scenario === "cancel-permission-race") {',
   "    // A permission request racing the client's cancel: sent AFTER the",
@@ -285,14 +310,14 @@ const FAKE_ACP_SERVER_SRC = [
   "function handleReply(msg) {",
   '  capture("reply", msg);',
   '  if (msg.id === "perm-1" && promptId !== null) {',
-  '    setTimeout(function () { ok(promptId, { stopReason: "end_turn" }); }, 10);',
+  '    endTurn(promptId, 10, "end_turn");',
   "  }",
   '  if (msg.id === "perm-empty" && promptId !== null) {',
-  '    setTimeout(function () { ok(promptId, { stopReason: "end_turn" }); }, 10);',
+  '    endTurn(promptId, 10, "end_turn");',
   "  }",
   '  if (msg.id === "perm-race" && promptId !== null) {',
   "    const respondId = promptId;",
-  '    setTimeout(function () { ok(respondId, { stopReason: "cancelled" }); }, 10);',
+  '    endTurn(respondId, 10, "cancelled");',
   "  }",
   "}",
   "",
@@ -529,10 +554,15 @@ describe("resume fallback (session/load)", () => {
  * ────────────────────────────────────────────────────────────────────────── */
 
 describe("session/request_permission auto-answer policy", () => {
+  /** Shared by every mode that answers `session/request_permission`
+   *  SYNCHRONOUSLY — yolo (allow) and any unknown/future mode id (fail-closed
+   *  reject) — neither ever surfaces a card, so this also asserts
+   *  `listPendingForTask` stays empty for both callers. */
   async function permissionOutcomeFor(mode: FxMode): Promise<{ outcome: string; optionId?: string }> {
-    const { agent, captureFile } = spawnFake("permission", { mode });
+    const { agent, taskId, captureFile } = spawnFake("permission", { mode });
     const code = await agent.done;
     expect(code).toBe(0);
+    expect(listPendingForTask(taskId)).toHaveLength(0);
 
     const entries = readCaptured(captureFile);
     const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-1");
@@ -573,16 +603,8 @@ describe("session/request_permission auto-answer policy", () => {
   }, 10_000);
 
   test("yolo mode answers allow_once with no card ever registered", async () => {
-    const { agent, taskId, captureFile } = spawnFake("permission", { mode: "yolo" });
-    const code = await agent.done;
-    expect(code).toBe(0);
-    // yolo answers synchronously — never surfaces a card to poll for at all.
-    expect(listPendingForTask(taskId)).toHaveLength(0);
-
-    const entries = readCaptured(captureFile);
-    const reply = entries.find((e) => e.label === "reply" && (e.msg as { id?: string }).id === "perm-1");
-    const result = (reply!.msg as { result?: { outcome?: { outcome: string; optionId?: string } } }).result;
-    expect(result?.outcome).toEqual({ outcome: "selected", optionId: "allow-once" });
+    const outcome = await permissionOutcomeFor("yolo");
+    expect(outcome).toEqual({ outcome: "selected", optionId: "allow-once" });
   }, 10_000);
 
   test("ask mode registers a card, and answering it reject-once flows through to fx", async () => {
@@ -845,6 +867,40 @@ describe("unauthenticated fx binary", () => {
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *
+ * 6.5. RpcTimeoutError classification — regression.
+ *
+ * `isTimeoutError` distinguishes "we gave up waiting" (our own RpcTimeoutError
+ * class, thrown only by `withTimeout`'s internal timer) from a real fx error
+ * whose message happens to start with the identical wording. If that
+ * distinction were ever done by string-matching instead of `instanceof`, a
+ * real fx protocol error reading "timed out waiting for X" would be
+ * misreported as the generic SESSION_DIED_STATUS_PREFIX sentinel instead of
+ * fx's own actionable message.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("RpcTimeoutError classification", () => {
+  test(
+    "a real fx error whose message starts with 'timed out waiting for' is surfaced verbatim, never reclassified as SESSION_DIED",
+    async () => {
+      const { agent, chunks } = spawnFake("initialize-error-mimics-timeout");
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks).toHaveLength(1);
+      // Verbatim fx error text (plus the driver's own "(code N)" suffix from
+      // errMessage/handleLine) — not the synthetic "fx did not respond to
+      // initialize within 30000ms" wording `isTimeoutError`'s true branch
+      // would have produced had it string-matched instead of class-checked.
+      expect(statusChunks[0]!.data).toBe("timed out waiting for gateway upstream (code -32000)");
+      expect(statusChunks[0]!.data.startsWith("timed out waiting for")).toBe(true);
+      expect(statusChunks[0]!.data.startsWith(SESSION_DIED_STATUS_PREFIX)).toBe(false);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
  * 7. Kill / cancel.
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -977,5 +1033,65 @@ describe("dropFxSession", () => {
 
   test("is a safe no-op when no session exists for the task", () => {
     expect(() => dropFxSession(`task-nonexistent-${randomUUID()}`)).not.toThrow();
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 12. reapLiveFxProcs.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("reapLiveFxProcs", () => {
+  test(
+    "SIGKILLs every live fx child directly (no signal sent to the test process itself) and the turn settles failed once the exit is observed",
+    async () => {
+      const { agent, sessionIds, taskId, captureFile } = spawnFake("stall-for-drop");
+
+      // Wait until the session is actually live before reaping, so this
+      // exercises tearing down a real in-flight turn.
+      await waitFor(() => sessionIds.length === 1);
+      expect(fxSessionActive(taskId)).toBe(true);
+
+      // reapLiveFxProcs() only ever calls proc.kill("SIGKILL") on the tracked
+      // children — it never delivers a signal to this test process, so no
+      // SIGINT/SIGTERM/SIGHUP handler runs and bun's own test process stays
+      // untouched.
+      reapLiveFxProcs();
+
+      const code = await agent.done;
+      expect(code).toBe(1);
+      // The exit watcher (proc.exited.then(...)) observes the SIGKILL exit,
+      // fails the turn with the SESSION_DIED sentinel, and settleFx clears
+      // the in-memory session — same end state as dropFxSession, reached via
+      // a different (signal-handler) entry point.
+      expect(fxSessionActive(taskId)).toBe(false);
+
+      // SIGKILL bypasses the fake's own SIGTERM handler entirely — no
+      // "sigterm" capture line is ever written. This distinguishes
+      // reapLiveFxProcs's hard kill from dropFxSession/killProc's graceful
+      // SIGTERM-then-SIGKILL sequence (asserted in the sibling test above).
+      expect(readCaptured(captureFile).some((e) => e.label === "sigterm")).toBe(false);
+    },
+    10_000,
+  );
+
+  test("is a safe no-op when no fx child is currently live", () => {
+    expect(() => reapLiveFxProcs()).not.toThrow();
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 13. Signal-handler registration (module-load side effect).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("signal handlers", () => {
+  test("SIGINT/SIGTERM/SIGHUP reap handlers are installed once fx-acp.ts has been imported", () => {
+    // fx-acp.ts is imported at the top of this file, so its top-level
+    // `for (const [sig] of FX_REAP_SIGNALS) process.on(sig, ...)` loop has
+    // already run by the time this test executes — verified by presence,
+    // not by re-importing (Bun's module cache means a second import
+    // wouldn't re-run the registration anyway).
+    expect(process.listenerCount("SIGINT")).toBeGreaterThanOrEqual(1);
+    expect(process.listenerCount("SIGTERM")).toBeGreaterThanOrEqual(1);
+    expect(process.listenerCount("SIGHUP")).toBeGreaterThanOrEqual(1);
   });
 });

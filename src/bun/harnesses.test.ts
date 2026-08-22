@@ -250,15 +250,16 @@ test("getByIdOrKind synthesises a built-in fx row for legacy id without a matchi
 
 test("insert rejects kind:'grok'/'kimi' even though the harnesses.kind CHECK constraint permits them", () => {
   // migrations/045_fx_harness.sql widens the `harnesses.kind` CHECK to admit
-  // 'grok' and 'kimi' pre-emptively — those are in-flight sibling branches'
-  // own harness kinds, and the table-rebuild migration recipe requires the
-  // CHECK to be a superset across all in-flight branches so an
-  // INSERT...SELECT row copy never fails regardless of migration apply
-  // order. That widened CHECK is a SQLite-schema-level allowance only:
-  // `harnesses.insert` (db.ts) enforces its own separate app-layer
-  // whitelist (`claude-code` | `codex` | `cursor` | `gemini` | `fx`) that
-  // has NOT grown to include 'grok'/'kimi' yet, so an attempt to insert
-  // either is rejected before the CHECK constraint is ever consulted.
+  // 'grok' and 'kimi' — reserved kinds the migration's own comment documents
+  // as not shipped here, kept in the CHECK so the table-rebuild recipe's
+  // INSERT...SELECT row copy stays order-independent regardless of which
+  // kind's migration lands first (a rebuild whose CHECK excludes an
+  // already-seeded kind fails its row copy). That widened CHECK is a
+  // SQLite-schema-level allowance only: `harnesses.insert` (db.ts) enforces
+  // its own separate app-layer whitelist (`claude-code` | `codex` |
+  // `cursor` | `gemini` | `fx`) that does not include 'grok'/'kimi', so an
+  // attempt to insert either is rejected before the CHECK constraint is
+  // ever consulted.
   for (const kind of ["grok", "kimi"]) {
     expect(() =>
       harnesses.insert({ id: `${kind}-work`, kind: kind as never, label: kind }),

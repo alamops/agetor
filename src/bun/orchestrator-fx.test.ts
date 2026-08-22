@@ -40,6 +40,24 @@ writeFileSync(
 chmodSync(fxBinPath, 0o755);
 process.env.AGETOR_FX_BIN = fxBinPath;
 
+// The model-null fallback regression test below wants a second, non-fx kind
+// under its own fake driver to prove `task.model ?? DEFAULT_MODEL[kind]`
+// isn't an fx-specific fallback. claude-code's `checkHarness` pre-flight
+// additionally probes tmux (see agent-status.ts's TMUX_MISSING_REASON), so
+// both bins need a stand-in — same convention as orchestrator-claude-plan.test.ts.
+process.env.AGETOR_CLAUDE_DRIVER = "fake";
+process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
+process.env.AGETOR_TMUX_BIN = "/bin/echo";
+
+// The spawn-throw hardening test below needs a kind whose FAKE spawn path
+// still calls the real `buildCommand` synchronously (gemini's does, to keep
+// the fake's argv-validation behavior honest — see agents.ts's spawnAgent
+// gemini branch) so a real, deterministic synchronous throw (the
+// GEMINI_PROMPT_ARGV_MAX_BYTES cap) is reachable without touching a real
+// CLI. Same convention as orchestrator-gemini.test.ts.
+process.env.AGETOR_GEMINI_DRIVER = "fake";
+process.env.AGETOR_GEMINI_BIN = "/bin/echo";
+
 beforeAll(async () => {
   await import("./db.ts");
 });
@@ -455,4 +473,230 @@ test("reconcileOrphans has no reattach path for fx: a mid-boot running fx run al
 
   // A second call is a no-op — nothing left to reconcile.
   expect(reconcileOrphans()).toBe(0);
+});
+
+/* ─── T11 additions: todo tracker, card × queue interplay, model-null
+ * fallback, spawn-throw hardening ────────────────────────────────────── */
+
+test("fx: TaskCreate/TaskUpdate chunks persist tasks.todo_progress the same kind-agnostic way claude's do", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, harnesses } = await import("./db.ts");
+  const { FAKE_CLAUDE_TODOS_PROMPT_MARKER } = await import("./agents.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx todos",
+    prompt: `do the thing ${FAKE_CLAUDE_TODOS_PROMPT_MARKER}`,
+    agent: "fx",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+
+  // The canned scenario's last chunk fires at ~26ms.
+  await settle(120);
+
+  // Two TaskCreate calls, one TaskUpdate to in_progress on task #1 — 2 total,
+  // 0 completed (see FAKE_CLAUDE_TODOS_PROMPT_MARKER's scenario in agents.ts:
+  // it never emits a "completed" status).
+  const task = tasks.get(taskId);
+  expect(task?.todoProgress).toEqual({ completed: 0, total: 2 });
+});
+
+test("fx: a follow-up sent while an fx_permission card is open queues (no second run yet); answering the card resolves the turn and drainFxQueue then spawns the queued follow-up", async () => {
+  const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+  const { runs, harnesses } = await import("./db.ts");
+  const { FAKE_FX_PERMISSION_PROMPT_MARKER } = await import("./agents.ts");
+  const { listPendingForTask, answerFxPermission } = await import("./interactions.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx card+queue",
+    prompt: `edit a file ${FAKE_FX_PERMISSION_PROMPT_MARKER}`,
+    agent: "fx",
+    mode: "ask",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  const firstRunId = "runId" in started ? started.runId : "";
+
+  // registerFxPermission runs synchronously inside spawnAgent (not gated by
+  // the fake's setTimeout ladder), but poll defensively rather than assume
+  // that timing.
+  let pending = listPendingForTask(taskId);
+  for (let i = 0; i < 30 && pending.length === 0; i++) {
+    await settle(10);
+    pending = listPendingForTask(taskId);
+  }
+  expect(pending.length).toBe(1);
+  const card = pending[0]!;
+  expect(card.kind).toBe("fx_permission");
+
+  // A follow-up sent while the card is open must queue — delivered:true,
+  // attached to the still-active run, and NO second run row yet.
+  const res = await sendInput(firstRunId, "follow-up while waiting");
+  expect(res.delivered).toBe(true);
+  if (res.delivered) expect(res.runId).toBe(firstRunId);
+  expect(runs.listForTask(taskId).length).toBe(1);
+
+  // Answer the card — unblocks the fake driver's awaiter, resolving turn one.
+  const ok = answerFxPermission(card.id, { optionId: "allow-once" });
+  expect(ok).toBe(true);
+  expect(listPendingForTask(taskId)).toHaveLength(0);
+
+  await settle(120);
+
+  // drainFxQueue (wired into attachDoneHandler) spawned the queued
+  // follow-up as a second run once the first settled — neither is stranded
+  // in `running`.
+  const list = runs.listForTask(taskId);
+  expect(list.length).toBe(2);
+  expect(list.every((r) => r.status !== "running")).toBe(true);
+});
+
+test("fx: yolo-mode never registers a card and completes with an auto-allowed status", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { runs, harnesses } = await import("./db.ts");
+  const { FAKE_FX_PERMISSION_PROMPT_MARKER } = await import("./agents.ts");
+  const { listPendingForTask } = await import("./interactions.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx yolo",
+    prompt: `edit a file ${FAKE_FX_PERMISSION_PROMPT_MARKER}`,
+    agent: "fx",
+    mode: "yolo",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+  const runId = "runId" in started ? started.runId : "";
+
+  await settle(80);
+
+  // Never surfaced a card, in yolo or at any point during the turn.
+  expect(listPendingForTask(taskId)).toHaveLength(0);
+
+  const list = runs.listForTask(taskId);
+  expect(list.length).toBe(1);
+  expect(list[0]?.status).toBe("succeeded");
+
+  const events = runs.eventsForTask(taskId);
+  expect(
+    events.some((e) => e.runId === runId && e.stream === "status" && e.data.includes("auto-allowed")),
+  ).toBe(true);
+});
+
+test("model-null fallback regression (fx): task.model=null still resolves via DEFAULT_MODEL.fx at spawn time — no throw", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, runs, harnesses } = await import("./db.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx null model",
+    prompt: "turn one",
+    agent: "fx",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  tasks.update(taskId, { model: null });
+  expect(tasks.get(taskId)?.model).toBeNull();
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+
+  await settle();
+
+  const list = runs.listForTask(taskId);
+  expect(list.length).toBe(1);
+  expect(list[0]?.status).toBe("succeeded");
+});
+
+test("model-null fallback regression (claude-code): task.model=null still resolves via DEFAULT_MODEL['claude-code'] at spawn time — no throw", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, runs, harnesses } = await import("./db.ts");
+  harnesses.setEnabled("claude-code", true);
+
+  const created = await createTask({
+    title: "claude null model",
+    prompt: "turn one",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  tasks.update(taskId, { model: null });
+  expect(tasks.get(taskId)?.model).toBeNull();
+
+  const started = await startTask(taskId);
+  if ("error" in started) throw new Error(started.error);
+
+  await settle();
+
+  const list = runs.listForTask(taskId);
+  expect(list.length).toBe(1);
+  expect(list[0]?.status).toBe("succeeded");
+});
+
+// Spawn-throw hardening: the reviewer asked for a deterministic, SYNCHRONOUS
+// `buildCommand` throw reachable under a fake driver. gemini's fake branch
+// (agents.ts's spawnAgent) calls the real `buildCommand(harness, prompt,
+// opts)` before ever constructing the fake agent — unlike fx/claude-code's
+// fake branches, which build the command too but gemini's is the one with a
+// throw condition (GEMINI_PROMPT_ARGV_MAX_BYTES) that's trivial to trigger
+// from a test without touching any real CLI. That throw propagates through
+// `spawnAgent` into `spawnAgentOrFail`'s catch, which is exactly the path
+// this test pins.
+test("spawn-throw hardening (gemini): an oversized prompt hits spawnAgentOrFail's catch — startTask returns {error}, the run row is failed, the task is back in ready with runId null", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, runs, harnesses } = await import("./db.ts");
+  const { GEMINI_PROMPT_ARGV_MAX_BYTES } = await import("./agents.ts");
+  harnesses.setEnabled("gemini", true);
+
+  const oversizedPrompt = "x".repeat(GEMINI_PROMPT_ARGV_MAX_BYTES + 200);
+  const created = await createTask({
+    title: "gemini oversized prompt",
+    prompt: oversizedPrompt,
+    agent: "gemini",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await startTask(taskId);
+  expect("error" in started).toBe(true);
+  if ("error" in started) {
+    expect(started.error).toContain(`prompt exceeds ${GEMINI_PROMPT_ARGV_MAX_BYTES} bytes`);
+  }
+
+  const list = runs.listForTask(taskId);
+  expect(list.length).toBe(1);
+  expect(list[0]?.status).toBe("failed");
+
+  const task = tasks.get(taskId);
+  expect(task?.column).toBe("ready");
+  expect(task?.runId).toBeNull();
 });
