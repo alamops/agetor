@@ -19,6 +19,13 @@ const {
   stuckTurnFallbackArmed,
   MODAL_FOOTER_RE,
   STUCK_TURN_FALLBACK_MS,
+  WORKING_LINE_RE,
+  MODAL_NOTICE_RE,
+  paneShowsClaudeWorking,
+  WORKING_CHROME_WINDOW_LINES,
+  UNPARSABLE_STABILITY_TICKS,
+  nextUnparsableStreak,
+  unparsableStreakCleared,
 } = __forTest;
 
 /** Real tmux pane captures of claude-code 2.1.161's AskUserQuestion modal —
@@ -720,7 +727,7 @@ const ALL_ARMED = {
   turnInFlight: true,
   lastJsonlAppendAt: WATCHDOG_NOW - STUCK_TURN_FALLBACK_MS - 1,
   now: WATCHDOG_NOW,
-  tailHasSpinner: false,
+  paneWorking: false,
   askCardLive: false,
 };
 
@@ -750,8 +757,12 @@ test("stuckTurnFallbackArmed — quiet one ms past the threshold → armed", () 
   })).toBe(true);
 });
 
-test("stuckTurnFallbackArmed — working spinner present → not armed (busy, not stuck)", () => {
-  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, tailHasSpinner: true })).toBe(false);
+test("stuckTurnFallbackArmed — pane shows claude working → not armed (busy, not stuck)", () => {
+  // No longer spinner-specific: `paneWorking` is `paneShowsClaudeWorking(tail)`,
+  // which stays true across a working turn's quiet-JSONL windows (background
+  // agent waits, long tool calls, elapsed-summary spinners) — not just while
+  // the 1 Hz-blinking "esc to interrupt" text happens to be on-screen.
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking: true })).toBe(false);
 });
 
 test("stuckTurnFallbackArmed — an ask card/collection is already live → not armed (owns its own give-up ladder)", () => {
@@ -785,4 +796,328 @@ test("clearedStabilityGate — an unparsable match never has highConfidence, so 
   expect(clearedStabilityGate(m, "some-other-fingerprint")).toBe(false);
   // Same fingerprint on the second consecutive tick → clears.
   expect(clearedStabilityGate(m, m.fingerprint)).toBe(true);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// 2.1.239 hardening — docs/plans/unknown-tui-detection-flicker.md §5.
+//
+// The #185 fallback card was flickering during NORMAL claude-code 2.1.239
+// activity (streaming, tool calls, background-agent waits): the working
+// indicators the old `SPINNER_RE=/esc to interrupt/i` guard relied on moved
+// (status-bar `esc to interrupt` now blinks at ~1 Hz and is absent for whole
+// quiet-JSONL windows during a bg-agent wait or long tool call) or changed
+// shape (a ticking spinner glyph + elapsed/token-counter line). This section
+// covers: (A) `paneShowsClaudeWorking`'s truth table against real captured
+// 2.1.239 panes, (B) `MODAL_NOTICE_RE`'s usage-limit auto-continue veto on
+// BOTH matchUnparsableModal arms, (C) that the veto/gate doesn't over-
+// suppress genuinely actionable notices or the existing wizard fixture, (D)
+// that the working-gate — not the matcher itself — is what suppresses a
+// footer-bearing pane that also shows working chrome (mirrors scrapeOnce's
+// real `paneShowsClaudeWorking(tail) ? null : matchUnparsableModal(...)`
+// dispatch), (E) fingerprint stability across the new volatile forms, and
+// (F) the raised 3-tick stability constant.
+
+// ── A. paneShowsClaudeWorking truth table ──────────────────────────────────
+
+const WORKING_PANE_LINES = [
+  // Present-participle spinner (glyph + word + ellipsis).
+  "✽ Frosting… (2m 52s · ↓ 12.1k tokens)",
+  // Dot-glyph spinner — `·` doubles as the spinner glyph here, not just a
+  // mid-line separator; the leading-anchor is what makes this safe (see the
+  // prose-bullet false case below).
+  "· Prestidigitating… (1h 21m 31s · ↓ 259.0k tokens)",
+  // Elapsed summary — no ellipsis, just "<Word> for <n><unit>".
+  "✻ Cooked for 2m 18s",
+  // Elapsed + a live shell.
+  "✻ Brewed for 9s · 1 shell still running",
+  // Background-agent wait — the only normal-work window with NO ticking
+  // spinner line at all; this phrase is what covers it.
+  "✻ Waiting for 1 background agent to finish",
+  // Status-bar interrupt (auto mode) — the legacy signal, now 1 Hz-blinking,
+  // kept as one input among several rather than the sole gate.
+  "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent",
+  // Background-agent roster row — ticking token counter, no spinner glyph.
+  "  ◯ general-purpose  W2-A launch-path persistence  10s · ↓ 46.2k tokens",
+  // Status-bar shell count (no "esc to interrupt" on this particular frame).
+  "  ⏵⏵ auto mode on · 1 shell · ← 1 agent · ↓ to manage",
+];
+
+for (const line of WORKING_PANE_LINES) {
+  test(`paneShowsClaudeWorking — true for 2.1.239 working chrome: ${JSON.stringify(line)}`, () => {
+    expect(paneShowsClaudeWorking(line)).toBe(true);
+    // Also true when the line sits inside a fuller pane tail.
+    expect(paneShowsClaudeWorking(`some prior line\n${line}\nsome later line`)).toBe(true);
+  });
+}
+
+const IDLE_INPUT_BOX_PANE = `╭────╮
+│ >  │
+╰────╯
+  ? for shortcuts · ← for agents`;
+
+test("paneShowsClaudeWorking — false for the idle input-box pane", () => {
+  expect(paneShowsClaudeWorking(IDLE_INPUT_BOX_PANE)).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false for the auto-mode wizard fixture (fallback must still fire for it)", () => {
+  // This is the safety property the whole gate rests on: a real prompt/wizard
+  // REPLACES the working chrome rather than co-rendering with it, so gating
+  // the fallback on `!paneShowsClaudeWorking` can never hide this fixture.
+  expect(paneShowsClaudeWorking(AUTO_MODE_WIZARD_PANE)).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false for a prose bullet that merely starts with the '·' glyph", () => {
+  // Regression for the over-match the review caught: the dot-glyph spinner
+  // form requires an ellipsis (`…`) right after the leading word, and the
+  // elapsed form requires `\d+` immediately followed by `s`/`m`/`h` (no
+  // space). "for 3 reasons" has neither — the digit is followed by a space,
+  // not a unit letter — so ordinary prose starting with "· " must not read
+  // as a spinner.
+  expect(paneShowsClaudeWorking("  · Something worth noting for 3 reasons below")).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false for prose that merely mentions tokens", () => {
+  // Regression for the over-match the review caught: TOKEN_COUNTER_LINE is
+  // anchored to a `·`/arrow separator immediately before the count, so plain
+  // prose mentioning "tokens" (no `·↓`/`·↑` glyph) must not match.
+  expect(paneShowsClaudeWorking("The response used about 5 tokens total, roughly.")).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false for the idle manual-mode status bar", () => {
+  expect(paneShowsClaudeWorking("  ⏸ manual mode on · ? for shortcuts · ← 1 agent")).toBe(false);
+});
+
+test("WORKING_LINE_RE — sanity: still matches the legacy 'esc to interrupt' status-bar phrase directly", () => {
+  expect(WORKING_LINE_RE.test("esc to interrupt")).toBe(true);
+  expect(WORKING_LINE_RE.test("nothing to see here")).toBe(false);
+});
+
+test("paneShowsClaudeWorking — transcript prose that merely RESEMBLES working chrome stays false", () => {
+  // Regression for the review finding: every arm is anchored to the chrome
+  // shape it came from, so look-alike prose in the transcript can't read as
+  // working (and thereby hide a genuine prompt rendered below it).
+  expect(paneShowsClaudeWorking("  · 3 shell scripts were updated")).toBe(false); // status-bar arm needs `· N shell ·`/EOL
+  expect(paneShowsClaudeWorking("Waiting for 2 background agents to report back.")).toBe(false); // needs the leading spinner glyph
+  expect(paneShowsClaudeWorking("· Loading… more text follows")).toBe(false); // spinner arm needs `(` or EOL after `…`
+  // …while the real chrome shapes those guards protect still read as working.
+  expect(paneShowsClaudeWorking("✻ Waiting for 1 background agent to finish")).toBe(true);
+  expect(paneShowsClaudeWorking("  ⏵⏵ auto mode on · 1 shell · ← 1 agent · ↓ to manage")).toBe(true);
+  expect(paneShowsClaudeWorking("✻ Determining…")).toBe(true); // bare spinner, no parenthetical yet
+  expect(paneShowsClaudeWorking("✳ Compacting… (esc to interrupt)")).toBe(true);
+});
+
+test("paneShowsClaudeWorking — only inspects the bottom widget area (last WORKING_CHROME_WINDOW_LINES non-blank lines), not the scrollback transcript", () => {
+  expect(WORKING_CHROME_WINDOW_LINES).toBe(16);
+  // A tool result that echoes claude chrome (an agent inspecting tmux panes —
+  // agetor dogfooding) sits in the TRANSCRIPT, well above a real wizard that
+  // then renders below it. Before the window was bounded, that echo gated the
+  // fallback off for as long as it stayed inside the 40-line scrape tail.
+  const echoedChromeAboveWizard =
+    "  ⎿  status: ⏵⏵ auto mode on · esc to interrupt · ← 1 agent\n"
+    + Array.from({ length: 20 }, (_, i) => `transcript line ${i + 1}`).join("\n")
+    + "\n" + AUTO_MODE_WIZARD_PANE;
+  expect(paneShowsClaudeWorking(echoedChromeAboveWizard)).toBe(false);
+  // …and the real scrapeOnce dispatch therefore still cards the wizard.
+  const dispatched = paneShowsClaudeWorking(echoedChromeAboveWizard)
+    ? null
+    : matchUnparsableModal(echoedChromeAboveWizard, false);
+  expect(dispatched).not.toBeNull();
+  expect(dispatched!.unparsable).toBe(true);
+  // Boundary: a working line exactly WORKING_CHROME_WINDOW_LINES non-blank
+  // lines from the bottom is still seen; one line further up is not. The
+  // deepest live widget area captured (4 background agents) was 13 rows, so
+  // 16 keeps every real form inside the window.
+  const filler = (n: number) => Array.from({ length: n }, (_, i) => `row ${i + 1}`).join("\n");
+  const working = "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent";
+  expect(paneShowsClaudeWorking(`${working}\n${filler(WORKING_CHROME_WINDOW_LINES - 1)}`)).toBe(true);
+  expect(paneShowsClaudeWorking(`${working}\n${filler(WORKING_CHROME_WINDOW_LINES)}`)).toBe(false);
+  // Blank rows don't count toward the window (tmux pads the capture).
+  expect(paneShowsClaudeWorking(`${working}\n\n\n\n${filler(WORKING_CHROME_WINDOW_LINES - 1)}`)).toBe(true);
+});
+
+// ── B. MODAL_NOTICE_RE veto — both matchUnparsableModal arms ───────────────
+
+test("matchUnparsableModal — usage-limit auto-continue notice is vetoed on the footer arm", () => {
+  const m = matchUnparsableModal(
+    "Usage limit reached · continuing automatically at 8am · esc to cancel",
+    false,
+  );
+  expect(m).toBeNull();
+});
+
+test("matchUnparsableModal — usage-limit auto-continue notice is ALSO vetoed on the watchdog arm (the must-fix from review)", () => {
+  // A mid-turn limit pause keeps the turn in flight and the pane quiet, which
+  // would otherwise arm the stuck-turn watchdog — so the notice veto has to
+  // apply regardless of which arm would have fired.
+  const m = matchUnparsableModal(
+    "Usage limit reached · continuing automatically at 8am · esc to cancel",
+    true,
+  );
+  expect(m).toBeNull();
+});
+
+test("matchUnparsableModal — 'continuing shortly' variant is also vetoed on the watchdog arm", () => {
+  const m = matchUnparsableModal(
+    "Usage limit reached · continuing shortly · esc to cancel",
+    true,
+  );
+  expect(m).toBeNull();
+});
+
+test("MODAL_NOTICE_RE — matches both auto-continue phrasings, not the actionable reset notice", () => {
+  expect(MODAL_NOTICE_RE.test("continuing automatically")).toBe(true);
+  expect(MODAL_NOTICE_RE.test("continuing shortly")).toBe(true);
+  expect(MODAL_NOTICE_RE.test("press enter to continue")).toBe(false);
+});
+
+// ── C. Still-cards cases (veto/gate must not over-suppress) ────────────────
+
+test("matchUnparsableModal — 'Usage limit has reset · press enter to continue' is never vetoed (genuinely actionable)", () => {
+  // Carries a MODAL_FOOTER_RE phrase ("enter to continue") and no
+  // MODAL_NOTICE_RE phrase ("has reset" is not an auto-continue notice) — the
+  // veto must not sweep this one up along with the auto-continue variants.
+  // Drawn as the bottom line it fires the footer arm outright …
+  const bottom = matchUnparsableModal("Usage limit has reset · press enter to continue", false);
+  expect(bottom).not.toBeNull();
+  expect(bottom!.unparsable).toBe(true);
+  // … but claude draws notice-class lines in the HINT SLOT above the input
+  // box (observed 5 non-blank lines from the bottom for the weekly-limit
+  // hint), which is outside the footer arm's last-3 window. There it reaches
+  // the user via the watchdog arm instead — the turn is still in flight, the
+  // pane is quiet, nothing shows working — so assert exactly that split, not
+  // an instant footer-arm card the real rendering can't deliver.
+  const hintSlot = `⏺ Working on it.
+
+          Usage limit has reset · press enter to continue
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsClaudeWorking(hintSlot)).toBe(false);
+  expect(matchUnparsableModal(hintSlot, false)).toBeNull(); // footer arm can't see it
+  const viaWatchdog = matchUnparsableModal(hintSlot, true);
+  expect(viaWatchdog).not.toBeNull(); // watchdog arm: NOT vetoed
+  expect(viaWatchdog!.unparsable).toBe(true);
+});
+
+test("matchUnparsableModal — the auto-continue veto covers the card's 12-line window, not just the last 3 lines (hint-slot notice + watchdog → null)", () => {
+  // Regression for the review finding: with the veto scoped to the last 3
+  // non-blank lines, a notice drawn in the hint slot (5th from the bottom)
+  // was invisible to the veto while the watchdog arm — turn in flight, JSONL
+  // quiet for hours during the limit pause, no working chrome — still built
+  // the card. The veto must scan the same window the card is built from.
+  const hintSlot = `⏺ Working on it.
+
+          Usage limit reached · continuing automatically at 8am · esc to cancel
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsClaudeWorking(hintSlot)).toBe(false); // so the watchdog WOULD arm
+  expect(matchUnparsableModal(hintSlot, true)).toBeNull();
+  expect(matchUnparsableModal(hintSlot, false)).toBeNull();
+});
+
+test("matchUnparsableModal — the auto-mode wizard fixture still cards (unchanged; see the existing footer-arm test above)", () => {
+  const m = matchUnparsableModal(AUTO_MODE_WIZARD_PANE, false);
+  expect(m).not.toBeNull();
+  expect(m!.unparsable).toBe(true);
+});
+
+// ── D. Working-gate composition (mirrors scrapeOnce's real dispatch) ───────
+
+test("matchUnparsableModal + paneShowsClaudeWorking — a footer-bearing pane that ALSO shows working chrome is only suppressed by the gate, not the matcher", () => {
+  const pane = `Some prompt?
+
+✻ Waiting for 1 background agent to finish
+
+Enter to continue · Esc to cancel`;
+
+  // The matcher alone doesn't know about working chrome — it still matches.
+  const alone = matchUnparsableModal(pane, false);
+  expect(alone).not.toBeNull();
+  expect(alone!.unparsable).toBe(true);
+
+  // scrapeOnce's real call site gates on `!paneShowsClaudeWorking` first —
+  // this is what actually suppresses it. Documents the gate is load-bearing:
+  // if it were ever dropped at the call site, this exact pane would flicker
+  // a card during a normal background-agent wait.
+  const gated = paneShowsClaudeWorking(pane) ? null : matchUnparsableModal(pane, false);
+  expect(gated).toBeNull();
+});
+
+// ── E. Fingerprint stability across the new volatile forms ─────────────────
+
+test("matchUnparsableModal — fingerprint is stable across an inserted elapsed-spinner/shell line (widened VOLATILE_PANE_LINE_RE)", () => {
+  // Analogous to the existing "inserted volatile line" test above, but for
+  // the new 2.1.239 forms specifically: a `✻ Brewed for 9s · 1 shell still
+  // running` line landing between ticks must not jitter the fingerprint, or
+  // the __external__ auto-cancel sweep would resolve a card that never
+  // stopped being the same real modal.
+  const clean = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const withElapsedSpinner = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace(
+      "Do a thing?",
+      "Do a thing?\n✻ Brewed for 9s · 1 shell still running",
+    ),
+    false,
+  )!;
+  expect(clean).not.toBeNull();
+  expect(withElapsedSpinner).not.toBeNull();
+  expect(withElapsedSpinner.fingerprint).toBe(clean.fingerprint);
+
+  const withTokenCounterRoster = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace(
+      "Do a thing?",
+      "Do a thing?\n  ◯ general-purpose  some task  10s · ↓ 46.2k tokens",
+    ),
+    false,
+  )!;
+  expect(withTokenCounterRoster.fingerprint).toBe(clean.fingerprint);
+});
+
+// ── F. Constant sanity ──────────────────────────────────────────────────────
+
+test("UNPARSABLE_STABILITY_TICKS is 3 (raised from the generic 2-tick gate)", () => {
+  expect(UNPARSABLE_STABILITY_TICKS).toBe(3);
+});
+
+// Drive the pure streak step exactly the way scrapeOnce does: per tick,
+// `streak = nextUnparsableStreak(streak, sameFingerprintAsLastTick)` when the
+// tick produced an unparsable match, `streak = 0` on any tick that didn't
+// (null match, parseable match, answered prompt). Registration happens on the
+// first tick where `unparsableStreakCleared(streak)`.
+function driveStreak(ticks: Array<string | null>): number | null {
+  let streak = 0;
+  let last: string | null = null;
+  for (const [i, fp] of ticks.entries()) {
+    if (fp === null) { streak = 0; last = null; continue; }
+    streak = nextUnparsableStreak(streak, last === fp);
+    last = fp;
+    if (unparsableStreakCleared(streak)) return i; // 0-based tick index of registration
+  }
+  return null;
+}
+
+test("unparsable streak — the same fingerprint on 3 consecutive ticks registers on the 3rd, never earlier", () => {
+  expect(driveStreak(["A", "A"])).toBeNull();
+  expect(driveStreak(["A", "A", "A"])).toBe(2);
+});
+
+test("unparsable streak — a different fingerprint in between restarts the count (A,B,A never registers)", () => {
+  expect(driveStreak(["A", "B", "A"])).toBeNull();
+  expect(driveStreak(["A", "B", "A", "A"])).toBeNull();
+  expect(driveStreak(["A", "B", "B", "B"])).toBe(3);
+});
+
+test("unparsable streak — a null-match tick (claude wrote JSONL / working chrome appeared) resets it (A,A,∅,A,A never registers)", () => {
+  expect(driveStreak(["A", "A", null, "A", "A"])).toBeNull();
+  expect(driveStreak(["A", "A", null, "A", "A", "A"])).toBe(5);
+});
+
+test("unparsable streak — a 1–2 tick blip (the old flicker) never registers", () => {
+  // The exact shape the fix exists for: a transient match that survives one
+  // or two ticks before the pane moves on must never become a card.
+  expect(driveStreak(["A", null, "A", null, "A", null])).toBeNull();
+  expect(driveStreak(["A", "A", null, "A", "A", null])).toBeNull();
 });
