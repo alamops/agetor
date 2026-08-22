@@ -3,17 +3,7 @@ import path from "node:path";
 import type { Subprocess } from "bun";
 import type { RunEventStream } from "../shared/types.ts";
 import { FX_USAGE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
-// `ChunkHandler` / `SpawnedAgent` are generic driver-infra types (not part of
-// the fx-specific surface a sibling task is adding to shared/types.ts), so
-// importing them from claude-tmux.ts — the same seam cursor-tmux.ts and
-// gemini-tmux.ts already import from — is safe and keeps the three drivers'
-// call sites structurally identical for the orchestrator wiring that lands
-// later. Nothing fx-specific is imported from shared/types.ts.
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
-// The fx_permission interaction kind (registry contracts landed in a prior
-// task) — this driver is the only caller of `registerFxPermission` /
-// `answerFxPermission`; the HTTP answer route (server.ts, a sibling task)
-// calls `answerFxPermission` too, converging on the same map entry.
 import {
   answerFxPermission,
   registerFxPermission,
@@ -25,152 +15,58 @@ import {
 /**
  * Driver for the `fx` agent kind — Vercel Labs' fx coding agent, driven via
  * `fx acp`, an Agent Client Protocol (ACP) server speaking newline-delimited
- * JSON-RPC 2.0 over stdio.
+ * JSON-RPC 2.0 over stdio (one JSON object per line each direction).
  *
- * ── Architecture, and how this differs from every other driver in this repo ──
+ * ── Architecture ──
  *
- * claude-tmux.ts / codex-tmux.ts / cursor-tmux.ts / gemini-tmux.ts all host
- * their CLI inside a *detached tmux session* and observe it indirectly: by
- * tailing a JSONL/NDJSON log file the CLI writes to disk, or (claude) by
- * scraping a rendered pane. That indirection exists for one reason — restart
- * survival: a bare child process dies with the agetor process, a detached
- * tmux session doesn't, so a turn can keep running (and be reattached to)
- * across an agetor restart.
+ * claude-tmux.ts / codex-tmux.ts / cursor-tmux.ts / gemini-tmux.ts each host
+ * their CLI inside a *detached tmux session* so a turn survives an agetor
+ * restart, and observe it indirectly (tailing a log file, or scraping a
+ * pane). `fx acp` is a stateful RPC *server* over stdio instead: the moment
+ * its stdin pipe or parent process disappears, its session is gone — there
+ * is nothing on the other end to reattach to. So this driver spawns `fx acp`
+ * as a **plain `Bun.spawn` child with piped stdio**, no tmux, one process
+ * per turn, driven live over the pipe rather than tailed from a file:
  *
- * fx has no such story. `fx acp` is a stateful RPC *server* over stdio: the
- * moment its stdin pipe or its parent process disappears, its session is
- * gone — there is nothing to reattach to on the other end, because the only
- * channel back into it was the pipe itself. So this driver spawns `fx acp`
- * as a **plain `Bun.spawn` child process with piped stdio**, no tmux
- * involved at all, and treats every event as arriving *live* over the pipe
- * rather than being tailed from a file after the fact:
+ *   - No `reattachFxSession` export, by design — see above. Boot
+ *     reconciliation flips a still-`running` row to `orphaned` the same way
+ *     it would for any other agent kind whose session vanished.
+ *   - No on-disk log this driver reads: `--log-file` is fx's OWN debug log
+ *     (for fx's own troubleshooting); this driver only ensures its parent
+ *     directory exists.
+ *   - `seenLineUuids` dedup still applies, matching the other three
+ *     drivers, even though there's no reattach-replay path requiring it.
+ *   - **Reaping**: every spawned child is tracked in `liveFxProcs`.
+ *     `process.on("exit", …)` covers normal exit and Electrobun's
+ *     `Utils.quit()` path; `SIGINT`/`SIGTERM`/`SIGHUP` handlers (installed
+ *     only when nothing else already listens for that signal) additionally
+ *     cover a bare Ctrl-C or `kill` that `exit` alone would miss.
  *
- *   - There is deliberately **no `reattachFxSession`** export. A mid-turn
- *     agetor restart orphans the run *by design* — a bare child process does
- *     NOT die with its parent on POSIX (an unparented child is reparented to
- *     init and keeps running), but there is no surviving stdin/stdout handle
- *     left to drive it with once agetor exits, so reattaching would be a
- *     no-op anyway. To avoid leaking that orphaned `fx acp` process across a
- *     restart, every spawned child is tracked in a module-level `liveFxProcs`
- *     set (registered on spawn, unregistered on settlement) and a single
- *     `process.on("exit", …)` hook best-effort-kills whatever is still
- *     registered when agetor itself exits. Boot reconciliation's generic
- *     "no live session for a `running` row → flip to `orphaned`" path
- *     handles the DB-row side of this the same way it would handle any
- *     other agent kind whose session vanished — no fx-specific boot-time
- *     code is needed or provided here.
- *   - There is no on-disk NDJSON log this driver reads from (fx is told to
- *     write its OWN debug log via `--log-file`, for fx's own troubleshooting
- *     — this driver only ensures that log's parent directory exists so
- *     `fx acp` doesn't fail to open it; the driver never reads that file).
- *   - `line_uuid`-based de-duplication (`seenLineUuids`, matching the other
- *     three drivers) is still applied defensively, even though there's no
- *     reattach-replay path that strictly requires it here — it's what keeps
- *     a spurious duplicate `tool_call_update` from double-emitting a
- *     terminal tool_result within a single live run.
+ * ── Settlement invariant for carded (ask/auto) permission requests ──
  *
- * ── Protocol facts encoded below ──
+ * Exactly one path ever calls `respondRpc` for a given request id: the
+ * awaiting `respondPermissionRequest` call, once `registerFxPermission`'s
+ * `answer` promise resolves. `cancelFxTurn`'s drain loop and `settleFx`'s
+ * card sweep never call `respondRpc` for a carded id — only
+ * `answerFxPermission(cardId, {cancelled: true})`, which *unblocks* that
+ * awaiting call rather than racing it. The awaiting call is guarded twice
+ * after its `await`: if `state.resolved` is already true it skips replying
+ * entirely (the stdin pipe may be closing/closed); if `state.cancelRequested`
+ * is true a `selected` answer is downgraded to `cancelled` (ACP's
+ * cancellation contract). `answerFxPermission` returns `false` on an
+ * already-resolved id, so a card answered at the exact moment Stop tears it
+ * down degrades to a no-op on whichever side loses the race.
  *
- * Everything in this file's protocol layer was verified against a spike run
- * of the real `fx` v0.0.4 binary plus the canonical ACP `schema.json`, NOT
- * inferred from docs alone. Facts are flagged inline as SPIKE-VERIFIED
- * (observed against the live binary) or SCHEMA-DERIVED (shape asserted by
- * the ACP schema but not exercised end-to-end in the spike, e.g. anything
- * gated behind successful auth, which the spike environment did not have).
+ * ── Protocol index (verified against fx v0.0.4 + ACP's canonical schema.json) ──
  *
- *   - Framing (SPIKE-VERIFIED): one UTF-8 JSON object per line on stdout;
- *     write requests/notifications as `JSON.stringify(msg) + "\n"` on
- *     stdin. stderr is diagnostic text, not protocol.
- *   - Handshake (SPIKE-VERIFIED): `initialize` (id 1) with
- *     `protocolVersion: 1` as a **number** — sending it as a string
- *     produces a `-32602` (Invalid params) error. An unauthenticated fx
- *     binary fails `initialize` itself with a `-32600` error whose message
- *     is the user-actionable "Fx needs access to Vercel AI Gateway. Run fx
- *     login…" text, and then answers every subsequent method with "Not
- *     initialized" — so a failed `initialize` is terminal for the turn,
- *     not just for that one call.
- *   - `session/new` (SPIKE-VERIFIED) → `{sessionId, modes?}`; `modes
- *     .availableModes` is used to best-effort map agetor's mode onto fx's
- *     `session/set_mode`, and failures there are swallowed — losing the
- *     mode nudge is not worth failing a turn over.
- *   - `session/resume` / `session/load` (SCHEMA-DERIVED for the fallback
- *     path — the spike's unauthenticated binary couldn't reach a second
- *     turn): resume is tried first; a method-not-found (`-32601`) or
- *     invalid-params (`-32602`) error falls back to `session/load`, during
- *     which every `session/update` notification is discarded (fx replays
- *     history the run's own persisted events already cover).
- *   - `session/prompt` (SPIKE-VERIFIED shape, SCHEMA-DERIVED stopReason
- *     enum beyond `end_turn`): the response is the ONLY turn-completion
- *     signal and arrives only once the whole turn is over, so unlike every
- *     other RPC call this driver makes, it is issued with **no timeout**.
- *   - `session/update` streaming (SPIKE-VERIFIED envelope shape,
- *     SCHEMA-DERIVED variant list): discriminated on
- *     `params.update.sessionUpdate`. This driver handles
- *     `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, and
- *     `tool_call_update` (terminal statuses only); every other variant is
- *     silently ignored as forward-compat (v1 scope).
- *   - `session/request_permission` (SCHEMA-DERIVED for the request/response
- *     envelope; UNVERIFIED-LIVE for what a real card interaction looks like
- *     — the spike's unauthenticated binary never reached a real approval):
- *     an inbound *request* (has an `id`) that this driver must answer.
- *     Policy: `yolo` auto-allows (`allow_once`/`allow_always`/first-option,
- *     in that order — `allow_once` is preferred so an approval stays scoped
- *     to the turn instead of writing a durable rule into the user's fx
- *     config); any unknown/future mode id fails closed to auto-reject
- *     (`reject_once`/`reject_always`, else `cancelled`) — both paths answer
- *     synchronously, no card, unchanged from the original policy. `ask` AND
- *     `auto` (owner decision — auto-mode requests now stall for a human
- *     instead of auto-allowing) instead register a card via
- *     `registerFxPermission` (`src/bun/interactions.ts`) and `await` its
- *     `answer` promise before replying — see "Settlement invariant" below.
- *     Any other inbound request method gets a `-32601` error — fx shouldn't
- *     send one, since `initialize` advertised no fs/terminal capabilities,
- *     but this driver never trusts that silently.
- *   - `plan` (SCHEMA-DERIVED — never observed live; fx may not even emit
- *     this variant, see the plan doc's A1): a full snapshot,
- *     `entries[{content, priority, status}]`. Mapped to a synthetic
- *     `TodoWrite`-shaped `tool_use` chunk so it rides the existing TODO
- *     tracker (`shared/todo-progress.ts`) and board badge with zero new UI;
- *     `priority` is dropped (the tracker has no such concept). Malformed
- *     entries are dropped individually, a non-array `entries` drops the
- *     whole update; an explicit empty array is a valid clear and is still
- *     emitted.
- *   - `usage_update` (SCHEMA-DERIVED — never observed live, cadence
- *     unspecified by the schema): `{used, size, cost?: {amount, currency}}`
- *     token counts. Mapped to a `status` chunk under the
- *     `FX_USAGE_STATUS_PREFIX` sentinel (`shared/types.ts`) — same
- *     transcript-suppression-plus-latest-value-chip convention as
- *     `PERMISSION_MODE_STATUS_PREFIX`. Missing/non-numeric `used`/`size`
- *     silently drops the update; a malformed `cost` object is dropped but
- *     `used`/`size` still emit.
- *   - Cancellation: `session/cancel` is a **notification**, not a request
- *     (no reply is expected) — after sending it we give the in-flight
- *     `session/prompt` a few seconds to resolve with `stopReason:
- *     "cancelled"` on its own, answer any still-pending inbound permission
- *     request as `cancelled` so fx isn't stuck waiting on us (routed through
- *     the registry for carded requests — see below), then SIGTERM (SIGKILL
- *     after a grace period if it didn't exit).
- *   - **Settlement invariant for carded permission requests**: exactly one
- *     of three paths ever calls `respondRpc` for a given `id` — (1) the
- *     awaiting `respondPermissionRequest` call itself, once
- *     `registerFxPermission`'s `answer` promise resolves (user card answer,
- *     routed through `POST /fx-permissions/:id/answer` in a sibling task);
- *     (2) nothing else, ever — `cancelFxTurn`'s drain loop and `settleFx`'s
- *     card sweep never call `respondRpc` directly for a carded id, only
- *     `answerFxPermission(cardId, {cancelled: true})`, which *unblocks* path
- *     (1) rather than racing it. Path (1) itself is guarded: after the
- *     `await`, if `state.resolved` is already true (the turn settled while
- *     the card was open — death, cancel-timeout kill, or a same-tick
- *     turn-end), it skips `respondRpc` entirely, since the stdin pipe may
- *     already be closing/closed. `answerFxPermission` returns `false` on an
- *     already-resolved id, so a card answered by the user at the exact
- *     moment Stop tears it down naturally degrades to a no-op on whichever
- *     side loses the race — no double-resolve, no unhandled rejection.
- *   - Death: an unexpected process exit before the pending `session/prompt`
- *     resolves emits the shared `SESSION_DIED_STATUS_PREFIX` sentinel — the
- *     same one the tmux drivers use — so the orchestrator's existing
- *     pattern-match flips the card to `blocked` without any fx-specific
- *     orchestrator code.
+ *   - `initialize`                  SPIKE-VERIFIED             handshake; unauth fails here (see describeHandshakeFailure)
+ *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?}; mode nudge is best-effort (see runFxTurn)
+ *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602 (see runFxTurn)
+ *   - `session/prompt`              SPIKE-VERIFIED shape       sole completion signal, no timeout (see runFxTurn)
+ *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate)
+ *   - `session/request_permission`  SCHEMA-DERIVED, UNVERIFIED-LIVE card flow  (see respondPermissionRequest)
+ *   - `session/cancel`              SCHEMA-DERIVED             notification, no reply expected (see cancelFxTurn)
+ *   - death                         —                          unexpected exit before settlement (see the `exited` watcher)
  */
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -194,9 +90,11 @@ const STDERR_RING_SIZE = 20;
  *  backstop purely against a runaway/misbehaving process. Treated as death. */
 const MAX_STDOUT_BUFFER_BYTES = 32 * 1024 * 1024;
 
-/** Agetor's permission mode, as agents.ts will pass it through — kept local
- *  (not imported from shared/types.ts) per this task's boundary: the
- *  fx-specific mode/model option lists are landing there in a parallel task. */
+/** Agetor's permission mode, as agents.ts passes it through. Narrowed
+ *  locally (not reused from shared/types.ts) so the policy switch in
+ *  `respondPermissionRequest` is exhaustive over exactly `yolo`/`auto`/
+ *  `ask` — `AgentRunOptions.mode` itself stays `string | null`, same as
+ *  every other agent kind. */
 export type FxMode = "yolo" | "auto" | "ask";
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -253,11 +151,6 @@ interface FxSessionState {
    *  replayed `session/update` history it carries is discarded (the run's
    *  own persisted events already cover it). */
   suppressUpdates: boolean;
-  /** Ids of inbound `session/request_permission` requests we haven't
-   *  answered yet — drained (answered `cancelled`) on cancel. For a carded
-   *  (ask/auto) request this stays populated for the lifetime of the open
-   *  card, not just a synchronous tick — see `cardIdByRequestId`. */
-  pendingPermissionIds: Set<number | string>;
   /** ACP request id → interactions-registry card id, for every currently
    *  OPEN `fx_permission` card (ask/auto mode only — yolo/unknown-mode
    *  requests never register a card, they answer synchronously and never
@@ -279,6 +172,10 @@ interface FxSessionState {
    *  cancellation contract. */
   cancelRequested: boolean;
   resolveDone: (code: number) => void;
+  /** Resolves the moment `resolveDone` fires — the same promise returned to
+   *  the caller as `SpawnedAgent.done`, kept on state as well so
+   *  `waitUntilResolved` can race it instead of polling. */
+  done: Promise<number>;
 }
 
 const fxSessions = new Map<string, FxSessionState>(); // taskId -> state
@@ -289,7 +186,7 @@ const fxSessions = new Map<string, FxSessionState>(); // taskId -> state
  *  in `spawnFxViaAcp`, unregistered in `settleFx`. */
 const liveFxProcs = new Set<Subprocess<"pipe", "pipe", "pipe">>();
 
-process.on("exit", () => {
+function reapLiveFxProcs(): void {
   for (const proc of liveFxProcs) {
     try {
       proc.kill("SIGKILL");
@@ -297,7 +194,34 @@ process.on("exit", () => {
       // already gone
     }
   }
-});
+}
+
+process.on("exit", reapLiveFxProcs);
+
+// Belt-and-suspenders for the signals `exit` doesn't cover: Node/Bun's
+// default handler for SIGINT/SIGTERM/SIGHUP terminates the process WITHOUT
+// running "exit" listeners, so a bare Ctrl-C on `bun run dev` (SIGINT) or a
+// plain `kill`/service-manager stop (SIGTERM/SIGHUP) would otherwise leak a
+// still-running `fx acp` child with write access to the task's worktree.
+// Only installed when nothing else is already listening for that signal
+// (checked at module load, once) — this repo has no app-level quit handler
+// today (Electrobun's confirm-on-quit path calls `Utils.quit()`, which DOES
+// fire "exit" and is covered by the hook above), but if one is added later
+// it becomes the sole owner of that signal's shutdown sequence rather than
+// racing this one.
+const FX_REAP_SIGNALS: Array<[NodeJS.Signals, number]> = [
+  ["SIGINT", 2],
+  ["SIGTERM", 15],
+  ["SIGHUP", 1],
+];
+for (const [sig, num] of FX_REAP_SIGNALS) {
+  if (process.listenerCount(sig) === 0) {
+    process.on(sig, () => {
+      reapLiveFxProcs();
+      process.exit(128 + num);
+    });
+  }
+}
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Wire I/O.
@@ -334,9 +258,50 @@ function respondRpcError(state: FxSessionState, id: number | string, code: numbe
   writeMessage(state, { jsonrpc: "2.0", id, error: { code, message } });
 }
 
+/** Shorthand for the `outcome: "cancelled"` reply every reject-fast path in
+ *  the permission flow sends — the shared terminal answer for a moot,
+ *  unanswerable, or already-settled request. */
+function respondCancelled(state: FxSessionState, id: number | string): void {
+  respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+}
+
+/** Try each kind in `preferredKinds`, in order, and answer `selected` with
+ *  the first option whose `kind` matches; if none match, answer `cancelled`
+ *  — unless `fallbackToFirstOption` is set, in which case any offered
+ *  option (regardless of kind) is taken rather than cancelling outright.
+ *  Shared by the yolo (`allow_once` → `allow_always` → any option) and
+ *  fail-closed (`reject_once` → `reject_always` → cancelled, deliberately
+ *  no first-option fallback — an unrecognized request must never silently
+ *  become an allow) synchronous-answer arms of the permission policy. */
+function answerByKind(
+  state: FxSessionState,
+  id: number | string,
+  options: Array<{ optionId: string; kind?: string }>,
+  preferredKinds: string[],
+  fallbackToFirstOption = false,
+): void {
+  let chosen: { optionId: string; kind?: string } | undefined;
+  for (const kind of preferredKinds) {
+    chosen = options.find((o) => o.kind === kind);
+    if (chosen) break;
+  }
+  if (!chosen && fallbackToFirstOption) chosen = options[0];
+  if (chosen) {
+    respondRpc(state, id, { outcome: { outcome: "selected", optionId: chosen.optionId } });
+  } else {
+    respondCancelled(state, id);
+  }
+}
+
+/** Thrown only by `withTimeout`'s own timer — never by fx. Distinguishing it
+ *  by class (not by matching the message text) is what lets `isTimeoutError`
+ *  tell "we gave up waiting" apart from an fx-supplied error whose message
+ *  happens to start with the same words (see `isTimeoutError`). */
+class RpcTimeoutError extends Error {}
+
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timed out waiting for ${label} (${ms}ms)`)), ms);
+    const timer = setTimeout(() => reject(new RpcTimeoutError(`timed out waiting for ${label} (${ms}ms)`)), ms);
     p.then(
       (v) => { clearTimeout(timer); resolve(v); },
       (e) => { clearTimeout(timer); reject(e instanceof Error ? e : new Error(String(e))); },
@@ -404,23 +369,24 @@ function handleLine(state: FxSessionState, line: string): void {
 
 function handleServerRequest(state: FxSessionState, method: string, id: number | string, params: unknown): void {
   if (method === "session/request_permission") {
-    // Registered before dispatch, unregistered only once the response is
-    // actually written (in respondPermissionRequest) — this is what makes
-    // cancelFxTurn's "answer pending permissions with outcome cancelled"
-    // drain loop real instead of a no-op over an always-empty set. `void`d
-    // because ask/auto mode now `await`s a card answer that may take
+    // `void`d because ask/auto mode now `await`s a card answer that may take
     // arbitrarily long (a human, not a promise that resolves this tick) —
     // handleServerRequest itself must stay synchronous so the stdout pump
     // (single-threaded line dispatch loop) never stalls behind an open card
     // while later lines (including a RACING session/cancel notification's
-    // effects) keep arriving.
-    state.pendingPermissionIds.add(id);
+    // effects) keep arriving. A carded (ask/auto) request's id lands in
+    // `cardIdByRequestId` synchronously, inside respondPermissionRequest,
+    // before its `await answer` — that's the only bookkeeping a later
+    // cancelFxTurn/settleFx sweep needs; a non-carded (yolo/unknown) request
+    // answers synchronously with no await in between, so it's never still
+    // pending by the time a sweep could run.
+    //
     // Fail closed: `registerFxPermission`'s synchronous broadcast to SSE
     // listeners can throw through an arbitrary listener callback, and a
     // thrown rejection here must never strand fx awaiting a reply that will
     // now never come. Answer `cancelled` and drop the request's bookkeeping
-    // from both maps so a later cancelFxTurn/settleFx sweep doesn't try to
-    // resolve an id that's already dead.
+    // so a later cancelFxTurn/settleFx sweep doesn't try to resolve an id
+    // that's already dead.
     void respondPermissionRequest(
       state,
       id,
@@ -431,10 +397,9 @@ function handleServerRequest(state: FxSessionState, method: string, id: number |
           }
         | undefined,
     ).catch((err) => {
-      emit(state, "status", `fx acp: permission handling failed: ${err instanceof Error ? err.message : String(err)}`);
-      respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+      emit(state, "status", `fx acp: permission handling failed: ${errMessage(err)}`);
+      respondCancelled(state, id);
       state.cardIdByRequestId.delete(id);
-      state.pendingPermissionIds.delete(id);
     });
     return;
   }
@@ -462,46 +427,33 @@ async function respondPermissionRequest(
   // ever registering a card — no card should exist for a request that's
   // already moot.
   if (state.cancelRequested || state.resolved) {
-    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
-    state.pendingPermissionIds.delete(id);
+    respondCancelled(state, id);
     return;
   }
 
   const options = Array.isArray(params?.options) ? params!.options! : [];
-  const pick = (kinds: string[]) => options.find((o) => kinds.includes(o.kind ?? ""));
 
   if (state.mode === "yolo") {
     // Prefer allow_once over allow_always so an approval stays scoped to
     // this turn instead of writing a durable rule into the user's fx
-    // config. Unchanged from the original (pre-card) policy.
-    const chosen = pick(["allow_once"]) ?? pick(["allow_always"]) ?? options[0];
-    respondRpc(
-      state,
-      id,
-      chosen ? { outcome: { outcome: "selected", optionId: chosen.optionId } } : { outcome: { outcome: "cancelled" } },
-    );
-    state.pendingPermissionIds.delete(id);
+    // config; falls back to any offered option rather than cancelling —
+    // yolo never surfaces a card.
+    answerByKind(state, id, options, ["allow_once", "allow_always"], true);
     return;
   }
 
   if (state.mode !== "auto" && state.mode !== "ask") {
     // Fail-closed: any unknown/future mode id takes the reject arm and
-    // never surfaces a card. Unchanged from the original (pre-card) policy.
-    const chosen = pick(["reject_once"]) ?? pick(["reject_always"]);
-    respondRpc(
-      state,
-      id,
-      chosen ? { outcome: { outcome: "selected", optionId: chosen.optionId } } : { outcome: { outcome: "cancelled" } },
-    );
-    state.pendingPermissionIds.delete(id);
+    // never surfaces a card, with no first-option fallback.
+    answerByKind(state, id, options, ["reject_once", "reject_always"]);
     return;
   }
 
-  // ask | auto (owner decision: auto now cards too, instead of auto-
-  // allowing) — register an fx_permission card and await its answer instead
-  // of answering synchronously. `toolCall`/`options` are sanitized down to
-  // exactly the fields the card needs; only `toolCallId` is guaranteed on
-  // the wire per ACP's schema, so every other field is optional-checked.
+  // ask AND auto both card — auto does not auto-allow. Register an
+  // fx_permission card and await its answer instead of answering
+  // synchronously. `toolCall`/`options` are sanitized down to exactly the
+  // fields the card needs; only `toolCallId` is guaranteed on the wire per
+  // ACP's schema, so every other field is optional-checked.
   const rawToolCall = params?.toolCall;
   const toolCall: FxPermissionToolCall = {
     toolCallId: typeof rawToolCall?.toolCallId === "string" ? rawToolCall.toolCallId : "unknown",
@@ -521,8 +473,7 @@ async function respondPermissionRequest(
   // answer cancelled up front instead, and say so out loud so a silent
   // cancel is diagnosable rather than looking like the card vanished.
   if (cardOptions.length === 0) {
-    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
-    state.pendingPermissionIds.delete(id);
+    respondCancelled(state, id);
     emit(state, "status", "fx acp: permission request had no options — auto-cancelled");
     return;
   }
@@ -551,11 +502,8 @@ async function respondPermissionRequest(
   // same-tick turn-end) WHILE this card was open — the stdin pipe backing
   // `respondRpc` may already be closing/closed by the time the await above
   // returns, so a resolution arriving after settlement must not attempt a
-  // reply at all. This is the other half of the settlement invariant
-  // documented in the file header: `answerFxPermission` is what unblocked
-  // us, never `respondRpc` — we're the only path that ever calls it.
+  // reply at all (see header: Settlement invariant).
   if (state.resolved) {
-    state.pendingPermissionIds.delete(id);
     return;
   }
 
@@ -565,13 +513,12 @@ async function respondPermissionRequest(
   // (e.g. the HTTP answer route resolving just before cancelFxTurn's drain
   // loop reaches this id) must still lose to the cancellation.
   if (state.cancelRequested) {
-    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
-    state.pendingPermissionIds.delete(id);
+    respondCancelled(state, id);
     return;
   }
 
   if ("cancelled" in answer_ && answer_.cancelled) {
-    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+    respondCancelled(state, id);
   } else if ("optionId" in answer_ && cardOptions.some((o) => o.optionId === answer_.optionId)) {
     // Belt-and-suspenders — the HTTP answer route validates the optionId
     // against the same request before ever calling `answerFxPermission`,
@@ -579,9 +526,8 @@ async function respondPermissionRequest(
     // trusts a value it didn't itself offer.
     respondRpc(state, id, { outcome: { outcome: "selected", optionId: answer_.optionId } });
   } else {
-    respondRpc(state, id, { outcome: { outcome: "cancelled" } });
+    respondCancelled(state, id);
   }
-  state.pendingPermissionIds.delete(id);
 }
 
 function handleServerNotification(state: FxSessionState, method: string, params: unknown): void {
@@ -638,51 +584,69 @@ function toolResultContent(update: Record<string, unknown>): unknown {
   return update;
 }
 
-function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unknown>): void {
+/** A chunk `mapFxUpdate` wants emitted — the pure equivalent of an `emit()`
+ *  call, minus the dedup/settled-turn gating `emit` itself applies. */
+interface FxChunk {
+  stream: RunEventStream;
+  data: string;
+  lineUuid?: string;
+}
+
+/**
+ * Pure `session/update` → chunk(s) mapper — mirrors `mapCodexEvent` /
+ * `mapCursorEvent` / `mapGeminiEvent` being exported, side-effect-free
+ * functions the fake-server driver tests don't need to spawn a child to
+ * exercise. `ctx.nextSeq` stands in for the stateful `state.seq++` the
+ * inline version used; callers pass `() => state.seq++` to keep the
+ * sequence shared across a whole run.
+ */
+export function mapFxUpdate(update: Record<string, unknown>, ctx: { runId: string; nextSeq: () => number }): FxChunk[] {
   const kind = update.sessionUpdate;
   switch (kind) {
     case "agent_message_chunk": {
       const text = extractText(update.content);
-      if (text) emit(state, "assistant", text, `fx:${state.runId}:${state.seq++}`);
-      return;
+      return text ? [{ stream: "assistant", data: text, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}` }] : [];
     }
 
     case "agent_thought_chunk": {
       const text = extractText(update.content);
-      if (text) emit(state, "thinking", text, `fx:${state.runId}:${state.seq++}`);
-      return;
+      return text ? [{ stream: "thinking", data: text, lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}` }] : [];
     }
 
     case "tool_call": {
-      // No real id to correlate a later tool_call_update against — still
-      // worth emitting (a seq-based id renders fine on its own), it just
-      // can never pair with a result (see the tool_call_update branch).
-      const id = typeof update.toolCallId === "string" ? update.toolCallId : `seq${state.seq++}`;
-      emit(
-        state,
-        "tool_use",
-        JSON.stringify({ id, name: toolCallName(update), input: toolCallInput(update), serverSide: false }),
-        `fx:tool:${id}:use`,
-      );
-      return;
+      const id =
+        typeof update.toolCallId === "string"
+          ? update.toolCallId
+          : // No real id to correlate a later tool_call_update against —
+            // still worth emitting (a seq-based id renders fine on its
+            // own), it just can never pair with a result (see the
+            // tool_call_update branch).
+            `seq${ctx.nextSeq()}`;
+      return [
+        {
+          stream: "tool_use",
+          data: JSON.stringify({ id, name: toolCallName(update), input: toolCallInput(update), serverSide: false }),
+          lineUuid: `fx:tool:${id}:use`,
+        },
+      ];
     }
 
     case "tool_call_update": {
       const status = update.status;
-      if (status !== "completed" && status !== "failed") return; // pending/in_progress — ignore
+      if (status !== "completed" && status !== "failed") return []; // pending/in_progress — ignore
       // Without a real toolCallId there is nothing to pair this result with
       // the tool_use it completes — minting an independent seq-based id here
       // would never match the use event's id (different seq counter state),
       // so drop the event rather than emit an unpairable orphan.
-      if (typeof update.toolCallId !== "string") return;
+      if (typeof update.toolCallId !== "string") return [];
       const id = update.toolCallId;
-      emit(
-        state,
-        "tool_result",
-        JSON.stringify({ toolUseId: id, content: toolResultContent(update), isError: status === "failed" }),
-        `fx:tool:${id}:result`,
-      );
-      return;
+      return [
+        {
+          stream: "tool_result",
+          data: JSON.stringify({ toolUseId: id, content: toolResultContent(update), isError: status === "failed" }),
+          lineUuid: `fx:tool:${id}:result`,
+        },
+      ];
     }
 
     case "plan": {
@@ -694,7 +658,7 @@ function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unk
       // clear, a different thing). An actual empty array IS a valid
       // explicit clear and must still emit.
       const rawEntries = (update as { entries?: unknown }).entries;
-      if (!Array.isArray(rawEntries)) return;
+      if (!Array.isArray(rawEntries)) return [];
       const todos: Array<{ content: string; status: "pending" | "in_progress" | "completed" }> = [];
       for (const raw of rawEntries) {
         // Individual malformed entries are dropped, not fatal to the rest
@@ -710,13 +674,13 @@ function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unk
         // priority concept (recorded as a known reduction in the plan doc).
         todos.push({ content: r.content, status });
       }
-      emit(
-        state,
-        "tool_use",
-        JSON.stringify({ id: "fx-plan", name: "TodoWrite", input: { todos }, serverSide: false }),
-        `fx:${state.runId}:${state.seq++}`,
-      );
-      return;
+      return [
+        {
+          stream: "tool_use",
+          data: JSON.stringify({ id: "fx-plan", name: "TodoWrite", input: { todos }, serverSide: false }),
+          lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
+        },
+      ];
     }
 
     case "usage_update": {
@@ -724,7 +688,7 @@ function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unk
       const size = (update as { size?: unknown }).size;
       // Missing/non-numeric used|size is malformed — ignore silently rather
       // than emit a chip with holes in it.
-      if (typeof used !== "number" || typeof size !== "number") return;
+      if (typeof used !== "number" || typeof size !== "number") return [];
       const rawCost = (update as { cost?: unknown }).cost;
       let cost: { amount: number; currency: string } | undefined;
       if (rawCost != null && typeof rawCost === "object") {
@@ -735,20 +699,30 @@ function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unk
         // A malformed cost object is dropped on its own — used/size still
         // emit rather than losing the whole update over an optional field.
       }
-      emit(
-        state,
-        "status",
-        FX_USAGE_STATUS_PREFIX + JSON.stringify({ used, size, ...(cost ? { cost } : {}) }),
-        `fx:${state.runId}:${state.seq++}`,
-      );
-      return;
+      return [
+        {
+          stream: "status",
+          data: FX_USAGE_STATUS_PREFIX + JSON.stringify({ used, size, ...(cost ? { cost } : {}) }),
+          lineUuid: `fx:${ctx.runId}:${ctx.nextSeq()}`,
+        },
+      ];
     }
 
     default:
       // current_mode_update, available_commands_update, user_message_chunk,
       // session_info_update, config_option_update, and any future variant —
       // silent forward-compat (v1 scope).
-      return;
+      return [];
+  }
+}
+
+/** `dispatchSessionUpdate` is the stateful adapter around the pure
+ *  `mapFxUpdate`: it supplies `ctx` from the session's own runId/seq
+ *  counter and routes every resulting chunk through `emit` (dedup +
+ *  settled-turn gating), same as before the extraction. */
+function dispatchSessionUpdate(state: FxSessionState, update: Record<string, unknown>): void {
+  for (const c of mapFxUpdate(update, { runId: state.runId, nextSeq: () => state.seq++ })) {
+    emit(state, c.stream, c.data, c.lineUuid);
   }
 }
 
@@ -841,19 +815,12 @@ function settleFx(state: FxSessionState, code: number): void {
   // Sweep any still-open fx_permission card so it never outlives the
   // driver — process death mid-card (the most common way settleFx runs
   // without ever going through cancelFxTurn's drain loop) would otherwise
-  // leak a registry entry the UI keeps showing a card for forever. Resolved
-  // via the registry (answerFxPermission), never respondRpc — see the file
-  // header's "Settlement invariant" note: the awaiting respondPermissionRequest
-  // call is the only path that ever writes an RPC reply, and it already
-  // checks `state.resolved` (now true) and skips replying once this sweep
-  // wakes it. `answerFxPermission` is idempotent (returns false on an
-  // already-resolved id), so this can't double-resolve a card the user
-  // answered in the same tick.
+  // leak a registry entry the UI keeps showing a card for forever (see
+  // header: Settlement invariant).
   for (const cardId of state.cardIdByRequestId.values()) {
     answerFxPermission(cardId, { cancelled: true });
   }
   state.cardIdByRequestId.clear();
-  state.pendingPermissionIds.clear();
   for (const pending of state.pending.values()) pending.reject(new Error("fx session settled"));
   state.pending.clear();
   state.resolveDone(code);
@@ -878,11 +845,16 @@ function killProc(state: FxSessionState): void {
   state.proc.exited.then(() => clearTimeout(timer)).catch(() => clearTimeout(timer));
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Wait for the turn to settle, or `timeoutMs` to elapse — whichever comes
+ *  first. Races `state.done` (resolved the instant `settleFx` runs, via
+ *  `resolveDone`) against a timer, rather than polling `state.resolved` on
+ *  an interval. */
 async function waitUntilResolved(state: FxSessionState, timeoutMs: number): Promise<void> {
-  const start = Date.now();
-  while (!state.resolved && Date.now() - start < timeoutMs) {
-    await new Promise((r) => setTimeout(r, 50));
-  }
+  await Promise.race([state.done, sleep(timeoutMs)]);
 }
 
 /**
@@ -895,25 +867,15 @@ async function cancelFxTurn(state: FxSessionState): Promise<void> {
   if (state.resolved) return;
   state.cancelRequested = true;
   if (state.sessionId) sendNotification(state, "session/cancel", { sessionId: state.sessionId });
-  // Drain every still-pending permission request. A carded (ask/auto) id
-  // has an open registry entry — resolve it through the registry
-  // (`answerFxPermission`), which unblocks the awaiting
-  // `respondPermissionRequest` call so THAT call is the one that writes the
-  // RPC reply (see the file header's "Settlement invariant"). A non-carded
-  // id (yolo/unknown, which answer synchronously and so in practice are
-  // never still pending by the time this loop runs) is answered directly,
-  // same as before this change — kept as the backstop for a future policy
-  // that introduces an async pre-registration window. Snapshot to an array
-  // first since the carded branch doesn't delete from the set inline (that
-  // happens in respondPermissionRequest once its await resolves).
-  for (const id of Array.from(state.pendingPermissionIds)) {
-    const cardId = state.cardIdByRequestId.get(id);
-    if (cardId) {
-      answerFxPermission(cardId, { cancelled: true });
-    } else {
-      respondRpc(state, id, { outcome: { outcome: "cancelled" } });
-      state.pendingPermissionIds.delete(id);
-    }
+  // Drain every still-open carded (ask/auto) permission request through the
+  // registry (see header: Settlement invariant) — a non-carded (yolo/
+  // unknown) request answers synchronously with no await in between, so it
+  // can never still be pending by the time this runs; `cardIdByRequestId`
+  // alone is a complete picture. Snapshot to an array first since the map
+  // isn't mutated inline here — that happens in respondPermissionRequest
+  // once its await resolves.
+  for (const cardId of Array.from(state.cardIdByRequestId.values())) {
+    answerFxPermission(cardId, { cancelled: true });
   }
 
   await waitUntilResolved(state, CANCEL_WAIT_MS);
@@ -945,6 +907,8 @@ async function runFxTurn(
   try {
     await withTimeout(
       sendRpc(state, "initialize", {
+        // Must be the NUMBER 1, not the string "1" — fx replies -32602
+        // (Invalid params) to a stringified protocolVersion (SPIKE-VERIFIED).
         protocolVersion: 1,
         clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
         clientInfo: { name: "agetor", version: "0" },
@@ -979,6 +943,10 @@ async function runFxTurn(
     }
     if (state.resolved) return;
     if (!resumed) {
+      // fx replays the session's prior `session/update` history while
+      // `session/load` is pending (SCHEMA-DERIVED — unexercised in the
+      // spike) — the run's own persisted events already cover that
+      // history, so it's discarded here rather than double-emitted.
       state.suppressUpdates = true;
       try {
         await withTimeout(
@@ -1065,7 +1033,7 @@ async function runFxTurn(
 }
 
 function isTimeoutError(err: unknown): boolean {
-  return err instanceof Error && /^timed out waiting for/.test(err.message);
+  return err instanceof RpcTimeoutError;
 }
 
 function errMessage(err: unknown): string {
@@ -1085,7 +1053,7 @@ function describeHandshakeFailure(err: unknown, step: string, timeoutMs: number)
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Public surface — mirrors cursor-tmux.ts / gemini-tmux.ts's export shape so
- * the orchestrator/agents.ts wiring that lands in a later task is mechanical.
+ * the orchestrator/agents.ts wiring is mechanical.
  * ────────────────────────────────────────────────────────────────────────── */
 
 export interface FxLaunchOptions {
@@ -1142,6 +1110,14 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
   });
   liveFxProcs.add(proc);
 
+  // Built before `state` so both `resolveDone` and `done` can be assigned
+  // as plain fields on the state object at construction time (the executor
+  // runs synchronously, so `resolveDone` is already the real resolver by
+  // the time the object literal below evaluates it) — `waitUntilResolved`
+  // needs `state.done` to race against, not just a resolver to call.
+  let resolveDone: (code: number) => void = () => { /* replaced synchronously below */ };
+  const done = new Promise<number>((resolve) => { resolveDone = resolve; });
+
   const state: FxSessionState = {
     taskId: opts.taskId,
     runId: opts.runId,
@@ -1155,18 +1131,16 @@ export function spawnFxViaAcp(opts: FxLaunchOptions): SpawnedAgent {
     stderrRing: [],
     sessionId: opts.resumeSessionId ?? null,
     suppressUpdates: false,
-    pendingPermissionIds: new Set(),
     cardIdByRequestId: new Map(),
     seq: 0,
     seenLineUuids: new Set(),
     resolved: false,
     killRequested: false,
     cancelRequested: false,
-    resolveDone: () => { /* replaced below */ },
+    resolveDone,
+    done,
   };
   fxSessions.set(opts.taskId, state);
-
-  const done = new Promise<number>((resolve) => { state.resolveDone = resolve; });
 
   const stdoutPump = pumpStdout(state);
   void pumpStderr(state);

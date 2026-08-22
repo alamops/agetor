@@ -115,11 +115,7 @@ function formatEvent(e: RunEvent): string {
     case "interaction": {
       const r = tryJson(e.data) as { kind?: string } | null;
       if (r?.kind === "fx_permission") {
-        // fx permission requests can only be answered from the app (the
-        // driver's in-process ACP awaiter is unblocked by the fx-permissions
-        // route, which the CLI has no analog for) — advertise that instead
-        // of a CLI/TUI path that would just refuse.
-        return c.yellow("! fx is requesting permission — answer in the app");
+        return c.yellow(`! fx is requesting permission — agetor answer ${e.taskId.slice(0, 8)}`);
       }
       return c.yellow(
         `! needs answer (${r?.kind ?? "?"}) — agetor answer ${e.taskId.slice(0, 8)}`,

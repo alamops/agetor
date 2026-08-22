@@ -1587,11 +1587,15 @@ function RunPanelBody({
   // run rather than stacking queued rows that could strand "running".
   const canSend = !!resumableRunId;
   // While a native modal (question / plan / permission prompt) is pending,
-  // claude is blocked on it in the tmux REPL — a typed message would paste
-  // into the modal instead of reaching claude (and the run would hang
-  // "working"). So gate the send box: answer via the card above, or press Stop
-  // to cancel cleanly first. AskUserQuestion's own card carries a per-question
-  // "Custom answer" field, so custom input isn't lost.
+  // the agent is blocked on it — a typed message would go astray instead of
+  // reaching the agent (and the run would hang "working"). This gate is
+  // kind-agnostic over the `interactions` array: for claude, a typed message
+  // would paste into the live tmux modal instead of reaching claude; for fx,
+  // the turn is parked awaiting the ACP permission reply, so a follow-up
+  // would only sit in `fxTurnQueue` behind an unanswered card. Either way the
+  // gate keeps the UX consistent across kinds: answer via the card above, or
+  // press Stop to cancel cleanly first. AskUserQuestion's own card carries a
+  // per-question "Custom answer" field, so custom input isn't lost.
   const modalPending = interactions.length > 0;
 
   const [input, setInput] = useState("");
@@ -5862,9 +5866,8 @@ function FxPermissionCard({
     }
   };
 
-  // Unconditional deny path — independent of whatever options fx offered.
-  // The server route's `{ cancel: true }` branch already existed; nothing
-  // in the UI called it until now.
+  // Unconditional deny path, independent of whatever options fx offered —
+  // answers the request `cancelled`.
   const dismiss = async () => {
     if (submitting) return;
     setSubmitting(FX_DISMISS_SUBMIT_KEY);

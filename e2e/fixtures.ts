@@ -1,6 +1,13 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { type WriteStream, createWriteStream, existsSync } from "node:fs";
+import {
+  type WriteStream,
+  chmodSync,
+  createWriteStream,
+  existsSync,
+  mkdtempSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -42,6 +49,41 @@ const HEALTH_POLL_INTERVAL_MS = 200;
 const TEARDOWN_GRACE_MS = 4_000;
 const FINAL_KILL_WAIT_MS = 2_000;
 const PREFLIGHT_TIMEOUT_MS = 2_000;
+
+/**
+ * fx's availability probe (`checkHarness` in src/bun/agent-status.ts) is a
+ * DUAL probe — `--version` (generic, same as every other harness) AND
+ * `--help`, whose output must contain "coding agent" — because the bare
+ * name `fx` collides with an unrelated npm JSON-viewer CLI, and `--version`
+ * alone can't tell them apart. That probe runs regardless of
+ * `AGETOR_FX_DRIVER=fake` (the driver override only replaces `spawnAgent`'s
+ * fx branch, not the separate start-task pre-flight), so a bare `/bin/echo`
+ * — good enough for claude's probe below — would fail fx's `--help` check
+ * and `startTask` would reject every fx run before the fake driver ever ran.
+ * This stub script mirrors the one `src/bun/orchestrator-fx.test.ts` writes
+ * for the identical reason, and is written synchronously here (before any
+ * backend spawns) so `AGETOR_FX_BIN` in the env block below always points at
+ * an already-executable file by the time `headless.ts` starts probing it.
+ */
+const fxStubBinDir = mkdtempSync(path.join(tmpdir(), "agetor-e2e-fx-fakebin-"));
+const FX_STUB_BIN_PATH = path.join(fxStubBinDir, "fx");
+writeFileSync(
+  FX_STUB_BIN_PATH,
+  [
+    "#!/bin/sh",
+    'if [ "$1" = "--help" ]; then',
+    '  echo "Fast, native coding agent for the terminal"',
+    "  exit 0",
+    "fi",
+    'if [ "$1" = "--version" ]; then',
+    '  echo "0.0.4-fake"',
+    "  exit 0",
+    "fi",
+    "exit 0",
+    "",
+  ].join("\n"),
+);
+chmodSync(FX_STUB_BIN_PATH, 0o755);
 
 async function tailFile(filePath: string, maxBytes = 4_000): Promise<string> {
   if (!existsSync(filePath)) return `<${filePath} not found>`;
@@ -203,11 +245,20 @@ async function provisionBackend(
       AGETOR_CLAUDE_BIN: "/bin/echo",
       AGETOR_TMUX_BIN: "/bin/echo",
       AGETOR_CLAUDE_ARGS: "",
-      // Same fake-driver treatment for the fx harness — inert for every
-      // spec here (none of them start an fx run) but keeps this fixture
-      // ahead of a future fx-driven spec the way the codex/cursor/gemini
-      // equivalents would if a spec here exercised them.
+      // fx routes through the in-process fake driver (spawnAgent's fx
+      // branch) exactly like claude-code above, and e2e/fx-interactions
+      // .spec.ts exercises it — this is not inert. Unlike claude, whose
+      // start-task pre-flight is satisfied by a binary-shaped `/bin/echo`,
+      // fx's `checkHarness` (agent-status.ts) dual-probes `--version` AND
+      // `--help`, requiring "coding agent" in the `--help` output to
+      // disambiguate Vercel's fx from an unrelated npm JSON-viewer CLI of
+      // the same name — that probe runs regardless of the driver override,
+      // so `AGETOR_FX_BIN` points at the stub script written above (mirrors
+      // `src/bun/orchestrator-fx.test.ts`'s) instead of `/bin/echo`. Note:
+      // codex/cursor/gemini have no equivalent fake-driver wiring in this
+      // fixture — no spec here starts a run on any of them.
       AGETOR_FX_DRIVER: "fake",
+      AGETOR_FX_BIN: FX_STUB_BIN_PATH,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

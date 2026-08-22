@@ -12,8 +12,11 @@ const OTHER = "✎ Other — type a custom answer";
  * `agetor answer`. Walks an ask_questions request question-by-question (↑/↓ to
  * move, space to toggle in multi-select, enter to advance/submit), with an
  * "Other" row that drops into a one-line text field for a free-text answer; or
- * a tmux_prompt as a single choice list. Esc cancels (or backs out of the text
- * field). Mounted only in answer mode, so its useInput owns the keyboard.
+ * a tmux_prompt or fx_permission as a single choice list (fx's trailing row is
+ * "Dismiss (reject)" rather than "Reject / Esc"). Esc always just closes the
+ * overlay (`onCancel`) without answering — the interaction stays pending for
+ * a later `agetor answer` / re-open, it does not submit a rejection to the
+ * server. Mounted only in answer mode, so its useInput owns the keyboard.
  */
 export function AnswerOverlay({
   client,
@@ -116,11 +119,13 @@ export function AnswerOverlay({
       if (key.escape) return onCancel();
       if (key.upArrow || input === "k") {
         setHint("");
-        return setCursor((c) => Math.max(0, c - 1));
+        if (labels.length > 0) setCursor((c) => Math.max(0, c - 1));
+        return;
       }
       if (key.downArrow || input === "j") {
         setHint("");
-        return setCursor((c) => Math.min(labels.length - 1, c + 1));
+        if (labels.length > 0) setCursor((c) => Math.min(labels.length - 1, c + 1));
+        return;
       }
 
       if (req.kind === "ask_questions") {
@@ -151,9 +156,7 @@ export function AnswerOverlay({
         return;
       }
 
-      // tmux_prompt — last entry is the synthetic "reject". fx_permission has
-      // no CLI/TUI answer path yet (RunPanel-only, per the fx interactions
-      // plan) — nothing to do here for that kind.
+      // tmux_prompt — last entry is the synthetic "reject".
       if (key.return && req.kind === "tmux_prompt") {
         const isReject = cursor === req.choices.length;
         setSubmitting(true);
@@ -163,6 +166,21 @@ export function AnswerOverlay({
           .then((r) => onDone(r.ok ? "✓ answered" : `! ${r.error ?? "failed"}`))
           .catch((e) => onDone(`! ${(e as Error).message}`));
       }
+
+      // fx_permission — last entry is the synthetic "Dismiss (reject)".
+      if (key.return && req.kind === "fx_permission") {
+        const isDismiss = cursor === req.options.length;
+        setSubmitting(true);
+        const body = isDismiss
+          ? ({ cancel: true } as const)
+          : { optionId: req.options[cursor]!.optionId };
+        client
+          .answerFxPermission(req.id, body)
+          .then((r) =>
+            onDone(r.ok ? (isDismiss ? "✓ dismissed" : "✓ answered") : "already resolved"),
+          )
+          .catch((e) => onDone(`! ${(e as Error).message}`));
+      }
     },
     { isActive: true },
   );
@@ -170,10 +188,6 @@ export function AnswerOverlay({
   if (loading) return <Text dimColor>loading question…</Text>;
   if (submitting) return <Text dimColor>submitting…</Text>;
   if (!req) return <Text dimColor>nothing pending — esc to close</Text>;
-  if (req.kind === "fx_permission") {
-    // No CLI/TUI answer path yet — answer via the RunPanel.
-    return <Text dimColor>fx permission requests aren't answerable here yet — use the app.</Text>;
-  }
 
   const multi = req.kind === "ask_questions" && !!req.questions[qIndex]?.multiSelect;
   const width = (process.stdout.columns || 80) - 6;
@@ -186,6 +200,12 @@ export function AnswerOverlay({
       </Text>
       {req.kind === "ask_questions" ? (
         <Text wrap="truncate-end">{req.questions[qIndex]?.question}</Text>
+      ) : req.kind === "fx_permission" ? (
+        <Text dimColor wrap="truncate-end">
+          {(req.toolCall.title ?? req.toolCall.kind ?? "tool call") +
+            (req.toolCall.kind ? `  [${req.toolCall.kind}]` : "") +
+            `  (${req.mode})`}
+        </Text>
       ) : (
         <Text dimColor wrap="truncate-end">
           {req.paneText.split("\n").filter(Boolean).slice(-2).join("  ")}
@@ -220,6 +240,8 @@ function optionLabels(req: AnyRequest | null, qIndex: number): string[] {
   if (req.kind === "ask_questions") {
     return [...(req.questions[qIndex]?.options.map((o) => o.label) ?? []), OTHER];
   }
-  if (req.kind === "fx_permission") return []; // no CLI/TUI answer path yet
+  if (req.kind === "fx_permission") {
+    return [...req.options.map((o) => o.name), "Dismiss (reject)"];
+  }
   return [...req.choices.map((ch) => ch.label), "Reject / Esc"];
 }

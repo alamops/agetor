@@ -6,7 +6,7 @@
 | Source | /implement on the fx PR's "Future" follow-ups + owner grill answers |
 | Config | AGENTS_CONFIG.yml (balanced) |
 | Flags | none |
-| Gates | grilled by owner (modes/timeout/usage-UI answered); plan approval pending |
+| Gates | grilled + approved by owner (modes/timeout/usage-UI answered); executed (commits afc074d…dba536d) |
 | Branch | feature/vercel-fx-sh-as-a-new-harness (continues the pushed fx branch) |
 | Base SHA | 5e56f75 (branch tip at plan time; tree clean) |
 
@@ -45,7 +45,7 @@ Done = typecheck green, full suite green, cards behave under cancel/Stop races, 
 
 **Wave 2** (parallel, disjoint; after W1 commit):
 - **T2** — owns `src/bun/fx-acp.ts`: card-mode permission flow per §3.1–3.3 (async await of the registry promise, settlement unification, yolo/unknown-mode paths unchanged); `plan` → TodoWrite synthetic chunk (§3.4); `usage_update` → sentinel status chunk (§3.5); header-comment updates.
-- **T3** — owns `src/bun/server.ts`: `POST /fx-permissions/:id/answer` (validate optionId against the pending request's options — mirror the tmux-prompt route's key validation — or `{cancel: true}`; resolve via `answerFxPermission`; 404 unknown/already-resolved).
+- **T3** — owns `src/bun/server.ts`: `POST /fx-permissions/:id/answer` (validate optionId against the pending request's options — mirror the tmux-prompt route's key validation — or `{cancel: true}`; resolve via `answerFxPermission`; `{ok:false}` at HTTP 200 for unknown/already-resolved — the tmux-route convention, not a 404 — with `400` reserved for validation failures: missing `optionId` and an `optionId` not in the pending request's option set).
 - **T4** — owns `src/mainview/**`: `PendingInteraction` union + `api.answerFxPermission` (lib/api.ts); `FxPermissionCard` matching the existing card shell (tool title/kind, generic rawInput rendering, option buttons by fx's names, reject styled secondary) + `renderInteraction` case (RunPanel.tsx); usage: suppress `FX_USAGE_STATUS_PREFIX` from StatusDivider stream + run-row chip parsing latest usage from that run's events.
 
 **Wave 3** (parallel, disjoint; after W2 commit):
@@ -54,7 +54,7 @@ Done = typecheck green, full suite green, cards behave under cancel/Stop races, 
 
 ## 5. Test work breakdown
 
-Covered by T5 (driver + registry + route). No new e2e spec: the e2e backend runs `AGETOR_FX_DRIVER=fake`, which bypasses the ACP driver, so cards can't be exercised end-to-end without a real ACP child in the e2e harness — recorded as out of scope (the interaction-card UI itself is already e2e-proven via claude's cards sharing the same registry/SSE/panel machinery). Run recipe: `bunx tsc --noEmit`, `bun test`, `bunx playwright test`.
+Covered by T5 (driver + registry + route). No new e2e spec at the time this plan executed: the e2e backend runs `AGETOR_FX_DRIVER=fake`, which bypasses the ACP driver, so cards couldn't be exercised end-to-end without a real ACP child in the e2e harness — recorded as out of scope. That "no e2e coverage" gap was real, not just for fx: no interaction card of any kind (claude's asks/tmux prompts included) had e2e coverage as of this plan. fx gains the first in `docs/plans/fx-branch-finalization.md`, via a fake-driver permission scenario (`AGETOR_FAKE_FX_PERMISSION`) exercised by `e2e/fx-interactions.spec.ts`. The CLI answer path (`agetor answer`, `AnswerOverlay`) was also out of scope here and was later swept into the same finalization plan. Run recipe: `bunx tsc --noEmit`, `bun test`, `bunx playwright test`.
 
 ## 6. Execution waves
 

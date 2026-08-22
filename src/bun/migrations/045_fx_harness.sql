@@ -19,12 +19,12 @@
 --      rebuild ever loses rows the way the prod one did.
 --
 -- The CHECK includes every kind already seeded by an applied migration
--- (claude-code, codex, cursor, gemini) plus 'grok' and 'kimi', which are not
--- seeded by this branch but are in-flight sibling branches' own harness
--- kinds — same reason 032/037's CHECKs already included 'grok' pre-emptively:
--- these table-rebuild migrations must be order-independent, and a rebuild
--- whose CHECK excludes another branch's already-seeded kind would fail the
--- INSERT...SELECT row copy outright.
+-- (claude-code, codex, cursor, gemini) plus 'grok' and 'kimi' — reserved for
+-- harness kinds not shipped here; kept in the CHECK for the same reason
+-- 032/037 included 'grok' pre-emptively: table-rebuild migrations must stay
+-- order-independent regardless of which kind's migration lands first (a
+-- rebuild whose CHECK excludes an already-seeded kind fails its
+-- INSERT...SELECT copy).
 --
 -- fx is seeded disabled (enabled = 0), mirroring codex's 016 rollout posture
 -- and cursor's/gemini's own seeds (parked-by-default; a user re-enables it

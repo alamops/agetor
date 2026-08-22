@@ -324,23 +324,12 @@ const EventLine = memo(function EventLine({ e }: { e: RunEvent }) {
       );
     case "tool_result":
       return <Text dimColor>  ↳ result</Text>;
-    case "interaction": {
-      // fx permission requests have no CLI/TUI answer path (AnswerOverlay
-      // refuses them — see run-logic.ts/AnswerOverlay.tsx) — advertise the
-      // app instead of "press g", which would just dead-end.
-      if (jsonField(e.data, "kind") === "fx_permission") {
-        return (
-          <Text color="yellow" wrap="truncate-end">
-            ! fx is requesting permission — answer in the app
-          </Text>
-        );
-      }
+    case "interaction":
       return (
         <Text color="yellow" wrap="truncate-end">
           ! needs answer — press g
         </Text>
       );
-    }
     case "interaction_resolved":
       return <Text dimColor>✓ answered</Text>;
     default:

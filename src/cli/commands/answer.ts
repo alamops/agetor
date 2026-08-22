@@ -4,7 +4,11 @@ import { usageError } from "../usage.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, isTTY } from "../output.ts";
 import type { AgetorClient } from "../api-client.ts";
-import type { AskQuestionsRequest, TmuxPromptRequest } from "../../bun/interactions.ts";
+import type {
+  AskQuestionsRequest,
+  TmuxPromptRequest,
+  FxPermissionRequest,
+} from "../../bun/interactions.ts";
 import { buildAskAnswer, CUSTOM_OPTION } from "../answer-logic.ts";
 
 export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
@@ -29,8 +33,8 @@ export async function cmdAnswer(args: string[], flags: Flags): Promise<void> {
       const ok = await answerTmux(client, req);
       if (!ok) return;
     } else {
-      // fx_permission has no CLI answer path yet — answer via the app.
-      out(c.dim(`skipping ${req.kind} — not answerable from the CLI yet`));
+      const ok = await answerFx(client, req);
+      if (!ok) return;
     }
   }
 }
@@ -96,6 +100,29 @@ async function answerTmux(client: AgetorClient, req: TmuxPromptRequest): Promise
       ? await client.answerTmuxPrompt(req.id, { reject: true })
       : await client.answerTmuxPrompt(req.id, { key: choice });
   out(res.ok ? c.green("✓ answered") : c.red(res.error ?? "failed to answer"));
+  return true;
+}
+
+async function answerFx(client: AgetorClient, req: FxPermissionRequest): Promise<boolean> {
+  const title = req.toolCall.title ?? req.toolCall.kind ?? "tool call";
+  const kindBadge = req.toolCall.kind ? c.dim(` [${req.toolCall.kind}]`) : "";
+  out(`${title}${kindBadge} ${c.dim(`(${req.mode})`)}`);
+  const choice = await p.select({
+    message: "Choose",
+    options: [
+      ...req.options.map((o) => ({ value: o.optionId, label: o.name })),
+      { value: "__dismiss__", label: "Dismiss (reject)" },
+    ],
+  });
+  // Esc and the explicit "Dismiss (reject)" row both mean the same thing to
+  // fx — reject the tool call — so both route to `{ cancel: true }` rather
+  // than aborting the whole `agetor answer` loop the way ask/tmux's Esc does.
+  const body: { optionId: string } | { cancel: true } =
+    p.isCancel(choice) || choice === "__dismiss__"
+      ? { cancel: true }
+      : { optionId: choice as string };
+  const res = await client.answerFxPermission(req.id, body);
+  out(res.ok ? c.green("✓ answered") : c.dim("already resolved (answered elsewhere or cancelled)"));
   return true;
 }
 

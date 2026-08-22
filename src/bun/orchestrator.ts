@@ -3,7 +3,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
-import { spawnAgent, toClaudeModelArg } from "./agents.ts";
+import { spawnAgent, toClaudeModelArg, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
 import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
@@ -586,29 +586,21 @@ export function reconcileOrphans(): number {
     // by kind: claude needs its JSONL session uuid (`claude_session_id`),
     // codex needs its thread id (`codex_session_id`), cursor needs its
     // `session_id` (`cursor_session_id`), gemini needs its self-issued uuid
-    // (`gemini_session_id`), fx needs its ACP session id (`fx_session_id`)
-    // — the per-run log path is derived from the run id in every case. Note
-    // codex's, cursor's, and gemini's sessions only live WHILE their turn is
-    // in flight, so a reattachable one of those is by definition one that
-    // was still running when agetor restarted. Also: if we already
-    // reattached a newer sibling for this task, orphan the older one — only
-    // one SessionState can drive a given tmux session at a time.
+    // (`gemini_session_id`) — the per-run log path is derived from the run
+    // id in every case. Note codex's, cursor's, gemini's, and fx's sessions
+    // only live WHILE their turn is in flight (one process per turn), so a
+    // reattachable one of those is by definition one that was still running
+    // when agetor restarted. Also: if we already reattached a newer sibling
+    // for this task, orphan the older one — only one SessionState can drive
+    // a given tmux session at a time.
     const reattachKey =
       kind === "claude-code" ? row.claude_session_id
       : kind === "codex" ? row.codex_session_id
       : kind === "cursor" ? row.cursor_session_id
       : kind === "gemini" ? row.gemini_session_id
-      : kind === "fx" ? row.fx_session_id
       : null;
-    // fx is deliberately excluded from `canTryReattach` — it's driven over
-    // ACP/stdio (`fx-acp.ts`), not tmux. Its pipes die with the agetor
-    // process, so there is no live session to reattach to, ever. An fx run
-    // caught mid-flight at boot always falls through to the orphan path
-    // below (status='orphaned', task back to 'ready') — this is by design,
-    // not a gap. `reattachKey` above still computes `fx_session_id` for
-    // completeness/symmetry, but it's inert here since `kind === "fx"` never
-    // satisfies this check, which keeps the reattach-dispatch ternary chain
-    // further down unreachable for fx without needing its own arm.
+    // fx is driven over ACP/stdio, not tmux — nothing to reattach to, so a
+    // `running` fx row at boot always takes the orphaned→ready path.
     const canTryReattach =
       (kind === "claude-code" || kind === "codex" || kind === "cursor" || kind === "gemini")
       && task !== null
@@ -833,6 +825,31 @@ export function reconcileOrphans(): number {
   return orphaned.length;
 }
 
+/**
+ * Wraps `spawnAgent` so a synchronous throw inside it — `buildCommand` can
+ * throw before a process is ever spawned (gemini's argv-size cap, "model is
+ * required", …) — can't strand the run row it was called for. Every call
+ * site below has already inserted the run row and flipped the task to
+ * `running` by the time it calls this, so on a throw there's persisted state
+ * to unwind: emit the error as a stderr chunk, fail the run, and bounce the
+ * task back to `ready` — the same recovery each call site already does for a
+ * missing harness (see the neighboring `if (!harness)` branches). Returns
+ * null on failure so callers can early-return exactly the way they already
+ * do for a missing harness. `args` carries `runId`/`taskId`/`onChunk` itself
+ * (see `SpawnAgentArgs`), so there's no separate parameter for them.
+ */
+function spawnAgentOrFail(args: SpawnAgentArgs): SpawnedAgent | null {
+  try {
+    return spawnAgent(args);
+  } catch (err) {
+    const { runId, taskId, onChunk } = args;
+    const message = err instanceof Error ? err.message : String(err);
+    onChunk("stderr", `failed to start agent: ${message}`);
+    runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
+    tasks.update(taskId, { column: "ready", runId: null });
+    return null;
+  }
+}
 
 export async function startTask(taskId: string): Promise<{ runId: string } | { error: string }> {
   let task = tasks.get(taskId);
@@ -942,7 +959,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // up.
   onChunk("user", normalizeUserText(promptWithRefs));
 
-  const agent = spawnAgent({
+  const agent = spawnAgentOrFail({
     taskId,
     runId,
     harness,
@@ -962,6 +979,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     },
     opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, fast: task.fast, maxMode: task.maxMode },
   });
+  if (!agent) return { error: "failed to start agent — check the run log for details" };
   registerActiveRun(runId, taskId, task, agent);
   emit({
     runId,
@@ -1874,7 +1892,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const agent = spawnAgent({
+  const agent = spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -1893,6 +1911,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
       resumeSessionId: priorThreadId,
     },
   });
+  if (!agent) return newRunId;
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
   return newRunId;
@@ -2021,7 +2040,7 @@ function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const agent = spawnAgent({
+  const agent = spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2045,6 +2064,7 @@ function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
       resumeSessionId: priorSessionId,
     },
   });
+  if (!agent) return newRunId;
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
   return newRunId;
@@ -2172,7 +2192,7 @@ function spawnGeminiTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const agent = spawnAgent({
+  const agent = spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2196,6 +2216,7 @@ function spawnGeminiTurnNow(task: Task, taskId: string, line: string): string {
       resumeSessionId: priorSessionId,
     },
   });
+  if (!agent) return newRunId;
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
   return newRunId;
@@ -2322,7 +2343,7 @@ function spawnFxTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const agent = spawnAgent({
+  const agent = spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2341,6 +2362,7 @@ function spawnFxTurnNow(task: Task, taskId: string, line: string): string {
       resumeSessionId: priorSessionId,
     },
   });
+  if (!agent) return newRunId;
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
   return newRunId;
@@ -2622,7 +2644,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
     tasks.update(taskId, { column: "ready", runId: null });
     return newRunId;
   }
-  const agent = spawnAgent({
+  const agent = spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2641,6 +2663,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
       resumeSessionId: priorSessionId,
     },
   });
+  if (!agent) return newRunId;
 
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);

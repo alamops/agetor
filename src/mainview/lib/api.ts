@@ -260,7 +260,7 @@ export interface PendingFxPermission {
   options: FxPermissionOption[];
   /** The agetor mode (`auto` | `ask`) that caused this request to surface
    *  as a card — `yolo` auto-allows and never reaches here. */
-  mode: string;
+  mode: "auto" | "ask";
 }
 
 export type PendingInteraction =
