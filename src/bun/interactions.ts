@@ -319,6 +319,15 @@ export function registerScrapedAskQuestions(args: {
     broadcast(req);
   } catch (err) {
     askQuestions.delete(id);
+    // Tell the UI the card is gone too — without this, a listener that
+    // throws after an earlier listener already pushed the card over SSE
+    // leaves a zombie card the user can never dismiss. A throw from the
+    // resolved-broadcast itself must not mask the original error.
+    try {
+      fanoutResolved(req);
+    } catch {
+      /* swallow — the original broadcast error below is authoritative */
+    }
     throw err;
   }
   return req;
@@ -407,6 +416,15 @@ export function registerTmuxPrompt(args: {
     broadcast(req);
   } catch (err) {
     tmuxPrompts.delete(id);
+    // Tell the UI the card is gone too — without this, a listener that
+    // throws after an earlier listener already pushed the card over SSE
+    // leaves a zombie card the user can never dismiss. A throw from the
+    // resolved-broadcast itself must not mask the original error.
+    try {
+      fanoutResolved(req);
+    } catch {
+      /* swallow — the original broadcast error below is authoritative */
+    }
     throw err;
   }
   return { id, req, answer };
@@ -484,6 +502,15 @@ export function registerFxPermission(args: {
     broadcast(req);
   } catch (err) {
     fxPermissions.delete(id);
+    // Tell the UI the card is gone too — without this, a listener that
+    // throws after an earlier listener already pushed the card over SSE
+    // leaves a zombie card the user can never dismiss. A throw from the
+    // resolved-broadcast itself must not mask the original error.
+    try {
+      fanoutResolved(req);
+    } catch {
+      /* swallow — the original broadcast error below is authoritative */
+    }
     throw err;
   }
   return { id, req, answer };

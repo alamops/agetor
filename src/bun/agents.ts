@@ -778,6 +778,13 @@ function makeFakeAgent(
   // single-source-of-truth"), so Stop/delete during the fake card doesn't
   // leave a phantom registry entry.
   let fxPermissionCardId: string | undefined;
+  // Set by `kill()` before it settles `done` itself. The fx-permission
+  // scenario's `answer.then` callback below checks this so it never emits
+  // chunks or re-resolves `done` after `kill()` has already torn everything
+  // down (a still-pending `answer` promise can resolve asynchronously after
+  // `kill()` returns, since `answerFxPermission` there just settles the
+  // registry entry — it doesn't synchronously flush this driver's `.then`).
+  let killed = false;
   // Test hook: simulate a claude code API error mid-turn so orchestrator
   // tests can exercise the api-error → `blocked` column flip without having
   // to plumb a real synthetic-message JSONL through the driver. Mirrors what
@@ -933,34 +940,54 @@ function makeFakeAgent(
     // by `kill()` below on Stop/delete), same registry-awaiter discipline as
     // the real driver.
     after(5, () => onChunk("assistant", "requesting permission…"));
-    try {
-      const { id, answer } = registerFxPermission({
-        taskId,
-        runId: fakeOpts.runId ?? "fake-run",
-        toolCall: {
-          toolCallId: "fake-fx-permission-1",
-          title: "Write file",
-          kind: "edit",
-          rawInput: { path: "/tmp/example.txt" },
-        },
-        options: [
-          { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
-          { optionId: "reject-once", name: "Reject", kind: "reject_once" },
-        ],
-        mode: fakeOpts.mode === "ask" ? "ask" : "auto",
-      });
-      fxPermissionCardId = id;
-      answer.then((a) => {
-        onChunk("status", `fake fx permission resolved: ${"optionId" in a ? a.optionId : "cancelled"}`);
+    if (fakeOpts.mode === "yolo") {
+      // Mirror the real driver: `yolo` auto-allows client-side and answers
+      // synchronously without ever reaching `session/request_permission`'s
+      // registry round-trip, so this fake must not register a card for it
+      // either — a yolo task should never surface an `fx_permission` card.
+      after(8, () => {
+        onChunk("status", "fake fx permission auto-allowed (yolo)");
         onChunk("status", "turn complete");
         resolveDone(0);
       });
-    } catch (err) {
-      onChunk(
-        "status",
-        `fake fx permission registration failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      resolveDone(1);
+    } else {
+      try {
+        const { id, answer } = registerFxPermission({
+          taskId,
+          runId: fakeOpts.runId ?? "fake-run",
+          toolCall: {
+            toolCallId: "fake-fx-permission-1",
+            title: "Write file",
+            kind: "edit",
+            rawInput: { path: "/tmp/example.txt" },
+          },
+          options: [
+            { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+            { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+          ],
+          mode: fakeOpts.mode === "ask" ? "ask" : "auto",
+        });
+        fxPermissionCardId = id;
+        answer
+          .then((a) => {
+            // `kill()` may have already cleared the timers and settled
+            // `done` (and answered this same card `cancelled` itself)
+            // before this promise resolves — skip emitting/resolving a
+            // second time so we never double-resolve `resolveDone` or emit
+            // chunks against a run `kill()` already tore down.
+            if (killed) return;
+            onChunk("status", `fake fx permission resolved: ${"optionId" in a ? a.optionId : "cancelled"}`);
+            onChunk("status", "turn complete");
+            resolveDone(0);
+          })
+          .catch(() => {});
+      } catch (err) {
+        onChunk(
+          "status",
+          `fake fx permission registration failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        resolveDone(1);
+      }
     }
   } else {
     after(5, () => onChunk("stdout", `fake response to: ${prompt}`));
@@ -970,6 +997,10 @@ function makeFakeAgent(
     _record: record,
     kill: () => {
       record.push("kill");
+      // Set before anything else so the fx-permission scenario's still-
+      // pending `answer.then` callback (if any) sees it and skips emitting
+      // chunks / re-resolving `done` once that promise settles.
+      killed = true;
       // Clear every pending timer so no further chunks/resolutions fire from
       // them, but still settle `done` immediately (with the same code the
       // timer chain would have used) so a kill never leaves a caller awaiting

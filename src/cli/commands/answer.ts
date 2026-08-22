@@ -107,20 +107,25 @@ async function answerFx(client: AgetorClient, req: FxPermissionRequest): Promise
   const title = req.toolCall.title ?? req.toolCall.kind ?? "tool call";
   const kindBadge = req.toolCall.kind ? c.dim(` [${req.toolCall.kind}]`) : "";
   out(`${title}${kindBadge} ${c.dim(`(${req.mode})`)}`);
+  // Values are indexes into req.options, not fx's wire-provided optionIds —
+  // an fx option literally named "__dismiss__" would otherwise collide with
+  // the sentinel and get misread as a rejection. -1 marks the dismiss row.
+  const DISMISS = -1;
   const choice = await p.select({
     message: "Choose",
     options: [
-      ...req.options.map((o) => ({ value: o.optionId, label: o.name })),
-      { value: "__dismiss__", label: "Dismiss (reject)" },
+      ...req.options.map((o, i) => ({ value: i, label: o.name })),
+      { value: DISMISS, label: "Dismiss (reject)" },
     ],
   });
-  // Esc and the explicit "Dismiss (reject)" row both mean the same thing to
-  // fx — reject the tool call — so both route to `{ cancel: true }` rather
-  // than aborting the whole `agetor answer` loop the way ask/tmux's Esc does.
-  const body: { optionId: string } | { cancel: true } =
-    p.isCancel(choice) || choice === "__dismiss__"
-      ? { cancel: true }
-      : { optionId: choice as string };
+  // Esc mirrors every sibling (answerAsk/answerTmux): it aborts the whole
+  // `agetor answer` loop via cancel(), leaving the interaction pending —
+  // only the explicit "Dismiss (reject)" row posts `{ cancel: true }`.
+  if (p.isCancel(choice)) return cancel();
+  const selected = choice === DISMISS ? null : req.options[choice as number];
+  const body: { optionId: string } | { cancel: true } = selected
+    ? { optionId: selected.optionId }
+    : { cancel: true };
   const res = await client.answerFxPermission(req.id, body);
   out(res.ok ? c.green("✓ answered") : c.dim("already resolved (answered elsewhere or cancelled)"));
   return true;

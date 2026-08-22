@@ -834,20 +834,26 @@ export function reconcileOrphans(): number {
  * to unwind: emit the error as a stderr chunk, fail the run, and bounce the
  * task back to `ready` — the same recovery each call site already does for a
  * missing harness (see the neighboring `if (!harness)` branches). Returns
- * null on failure so callers can early-return exactly the way they already
- * do for a missing harness. `args` carries `runId`/`taskId`/`onChunk` itself
- * (see `SpawnAgentArgs`), so there's no separate parameter for them.
+ * `{ agent: null, message }` on failure so callers can early-return exactly
+ * the way they already did when this returned a bare `null` (`if (!agent)`
+ * still works unchanged after destructuring), while `startTask` — the one
+ * call site that needs to surface *why* — can report `message` instead of a
+ * generic "check the run log" string. `args` carries `runId`/`taskId`/
+ * `onChunk` itself (see `SpawnAgentArgs`), so there's no separate parameter
+ * for them.
  */
-function spawnAgentOrFail(args: SpawnAgentArgs): SpawnedAgent | null {
+function spawnAgentOrFail(
+  args: SpawnAgentArgs,
+): { agent: SpawnedAgent; message?: undefined } | { agent: null; message: string } {
   try {
-    return spawnAgent(args);
+    return { agent: spawnAgent(args) };
   } catch (err) {
     const { runId, taskId, onChunk } = args;
     const message = err instanceof Error ? err.message : String(err);
     onChunk("stderr", `failed to start agent: ${message}`);
     runs.update(runId, { status: "failed", endedAt: Date.now(), exitCode: -1 });
     tasks.update(taskId, { column: "ready", runId: null });
-    return null;
+    return { agent: null, message };
   }
 }
 
@@ -959,7 +965,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   // up.
   onChunk("user", normalizeUserText(promptWithRefs));
 
-  const agent = spawnAgentOrFail({
+  const { agent, message } = spawnAgentOrFail({
     taskId,
     runId,
     harness,
@@ -979,7 +985,7 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     },
     opts: { mode: task.mode, model: task.model ?? DEFAULT_MODEL[harness.kind], effort: task.effort, fast: task.fast, maxMode: task.maxMode },
   });
-  if (!agent) return { error: "failed to start agent — check the run log for details" };
+  if (!agent) return { error: `failed to start agent: ${message}` };
   registerActiveRun(runId, taskId, task, agent);
   emit({
     runId,
@@ -1892,7 +1898,7 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const agent = spawnAgentOrFail({
+  const { agent } = spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -1911,7 +1917,17 @@ function spawnCodexTurnNow(task: Task, taskId: string, line: string): string {
       resumeSessionId: priorThreadId,
     },
   });
-  if (!agent) return newRunId;
+  if (!agent) {
+    // spawnAgentOrFail already failed this run row and bounced the task to
+    // `ready` — attachDoneHandler (the only caller of drainCodexQueue) never
+    // runs, so any follow-ups queued behind this one would otherwise be
+    // stranded and resurface out of order on a later, unrelated turn. The
+    // dropped messages were already recorded as `user` events on their
+    // originating run, so dropping the queue here is more honest than
+    // re-delivering them later.
+    codexTurnQueue.delete(taskId);
+    return newRunId;
+  }
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
   return newRunId;
@@ -2040,7 +2056,7 @@ function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const agent = spawnAgentOrFail({
+  const { agent } = spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2064,7 +2080,14 @@ function spawnCursorTurnNow(task: Task, taskId: string, line: string): string {
       resumeSessionId: priorSessionId,
     },
   });
-  if (!agent) return newRunId;
+  if (!agent) {
+    // See the matching comment in spawnCodexTurnNow: spawnAgentOrFail already
+    // failed this run and attachDoneHandler (the only caller of
+    // drainCursorQueue) never runs, so drop the queue rather than let queued
+    // follow-ups resurface out of order on a later turn.
+    cursorTurnQueue.delete(taskId);
+    return newRunId;
+  }
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
   return newRunId;
@@ -2192,7 +2215,7 @@ function spawnGeminiTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const agent = spawnAgentOrFail({
+  const { agent } = spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2216,7 +2239,15 @@ function spawnGeminiTurnNow(task: Task, taskId: string, line: string): string {
       resumeSessionId: priorSessionId,
     },
   });
-  if (!agent) return newRunId;
+  if (!agent) {
+    // See the matching comment in spawnCodexTurnNow: spawnAgentOrFail already
+    // failed this run and attachDoneHandler (the only caller of
+    // drainGeminiQueue) never runs, so drop the queue rather than let queued
+    // follow-ups resurface out of order on a later turn. Reachable in
+    // practice via GEMINI_PROMPT_ARGV_MAX_BYTES on a long follow-up.
+    geminiTurnQueue.delete(taskId);
+    return newRunId;
+  }
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
   return newRunId;
@@ -2343,7 +2374,7 @@ function spawnFxTurnNow(task: Task, taskId: string, line: string): string {
     return newRunId;
   }
 
-  const agent = spawnAgentOrFail({
+  const { agent } = spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2362,7 +2393,14 @@ function spawnFxTurnNow(task: Task, taskId: string, line: string): string {
       resumeSessionId: priorSessionId,
     },
   });
-  if (!agent) return newRunId;
+  if (!agent) {
+    // See the matching comment in spawnCodexTurnNow: spawnAgentOrFail already
+    // failed this run and attachDoneHandler (the only caller of
+    // drainFxQueue) never runs, so drop the queue rather than let queued
+    // follow-ups resurface out of order on a later turn.
+    fxTurnQueue.delete(taskId);
+    return newRunId;
+  }
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
   return newRunId;
@@ -2644,7 +2682,7 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
     tasks.update(taskId, { column: "ready", runId: null });
     return newRunId;
   }
-  const agent = spawnAgentOrFail({
+  const { agent } = spawnAgentOrFail({
     taskId,
     runId: newRunId,
     harness,
@@ -2663,6 +2701,8 @@ function spawnResumedSession(task: Task, taskId: string, line: string): string {
       resumeSessionId: priorSessionId,
     },
   });
+  // claude has no turn queue (spawnResumedSession is only reached from the
+  // idle branch of sendInput) — nothing to drop on failure here.
   if (!agent) return newRunId;
 
   registerActiveRun(newRunId, taskId, task, agent);

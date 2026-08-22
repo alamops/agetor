@@ -38,24 +38,38 @@ import {
  *     drivers, even though there's no reattach-replay path requiring it.
  *   - **Reaping**: every spawned child is tracked in `liveFxProcs`.
  *     `process.on("exit", …)` covers normal exit and Electrobun's
- *     `Utils.quit()` path; `SIGINT`/`SIGTERM`/`SIGHUP` handlers (installed
- *     only when nothing else already listens for that signal) additionally
- *     cover a bare Ctrl-C or `kill` that `exit` alone would miss.
+ *     `Utils.quit()` path; `SIGINT`/`SIGTERM`/`SIGHUP` handlers are always
+ *     installed and always reap — but ownership of the *exit* is decided at
+ *     signal-delivery time, not at module-load time (see the `FX_REAP_SIGNALS`
+ *     comment below for why that distinction matters: `headless.ts` imports
+ *     this module — and so registers these handlers — before it installs its
+ *     own). A handler only calls `process.exit` itself when
+ *     `process.listenerCount(sig) === 1` at the moment the signal arrives,
+ *     i.e. it's the sole listener; otherwise some other (app-level) handler
+ *     owns the shutdown sequence, and that handler is expected to call the
+ *     exported `reapLiveFxProcs()` itself before it exits.
  *
  * ── Settlement invariant for carded (ask/auto) permission requests ──
  *
- * Exactly one path ever calls `respondRpc` for a given request id: the
- * awaiting `respondPermissionRequest` call, once `registerFxPermission`'s
- * `answer` promise resolves. `cancelFxTurn`'s drain loop and `settleFx`'s
- * card sweep never call `respondRpc` for a carded id — only
- * `answerFxPermission(cardId, {cancelled: true})`, which *unblocks* that
- * awaiting call rather than racing it. The awaiting call is guarded twice
- * after its `await`: if `state.resolved` is already true it skips replying
- * entirely (the stdin pipe may be closing/closed); if `state.cancelRequested`
- * is true a `selected` answer is downgraded to `cancelled` (ACP's
- * cancellation contract). `answerFxPermission` returns `false` on an
- * already-resolved id, so a card answered at the exact moment Stop tears it
- * down degrades to a no-op on whichever side loses the race.
+ * Exactly one reply is ever written for a given request id — `respondRpc` (or
+ * its `respondCancelled` wrapper) never fires twice for the same id. For a
+ * carded request, the awaiting `respondPermissionRequest` call is the sole
+ * writer, once `registerFxPermission`'s `answer` promise resolves.
+ * `cancelFxTurn`'s drain loop and `settleFx`'s card sweep never call
+ * `respondRpc` for a carded id — only `answerFxPermission(cardId, {cancelled:
+ * true})`, which *unblocks* that awaiting call rather than racing it. The
+ * awaiting call is guarded twice after its `await`: if `state.resolved` is
+ * already true it skips replying entirely (the stdin pipe may be
+ * closing/closed); if `state.cancelRequested` is true a `selected` answer is
+ * downgraded to `cancelled` (ACP's cancellation contract). `answerFxPermission`
+ * returns `false` on an already-resolved id, so a card answered at the exact
+ * moment Stop tears it down degrades to a no-op on whichever side loses the
+ * race. The zero-options (uncarded) branch keeps the same invariant by
+ * ordering rather than by construction: it `emit`s its "no options" status
+ * line BEFORE calling `respondCancelled`, so if `emit` throws (e.g. `onChunk`
+ * → `appendEvent` hitting a FK error against a since-deleted run) the
+ * in-branch reply never fires and `handleServerRequest`'s catch-all fallback
+ * writes the sole reply instead.
  *
  * ── Protocol index (verified against fx v0.0.4 + ACP's canonical schema.json) ──
  *
@@ -186,7 +200,7 @@ const fxSessions = new Map<string, FxSessionState>(); // taskId -> state
  *  in `spawnFxViaAcp`, unregistered in `settleFx`. */
 const liveFxProcs = new Set<Subprocess<"pipe", "pipe", "pipe">>();
 
-function reapLiveFxProcs(): void {
+export function reapLiveFxProcs(): void {
   for (const proc of liveFxProcs) {
     try {
       proc.kill("SIGKILL");
@@ -203,24 +217,36 @@ process.on("exit", reapLiveFxProcs);
 // running "exit" listeners, so a bare Ctrl-C on `bun run dev` (SIGINT) or a
 // plain `kill`/service-manager stop (SIGTERM/SIGHUP) would otherwise leak a
 // still-running `fx acp` child with write access to the task's worktree.
-// Only installed when nothing else is already listening for that signal
-// (checked at module load, once) — this repo has no app-level quit handler
-// today (Electrobun's confirm-on-quit path calls `Utils.quit()`, which DOES
-// fire "exit" and is covered by the hook above), but if one is added later
-// it becomes the sole owner of that signal's shutdown sequence rather than
-// racing this one.
+//
+// Ownership of the *exit* is decided at SIGNAL-DELIVERY time, not at
+// module-load time. Module import order runs this file's top-level code (and
+// so registers these handlers) before an app-level shutdown owner gets a
+// chance to register its own — e.g. `headless.ts` imports
+// orchestrator → agents → fx-acp before `runDaemon()` installs its own
+// SIGINT/SIGTERM handlers, so checking `listenerCount(sig) === 0` at module
+// load always found this the sole listener and always exited here first,
+// pre-empting `headless.ts`'s `shutdown()` (which removes the core creds file
+// and logs a "shutting down" line) from ever running. Instead: install
+// unconditionally, always reap, and only call `process.exit` when — AT THE
+// MOMENT THE SIGNAL FIRES — `process.listenerCount(sig) === 1`, i.e. this is
+// still the only listener. When another handler is also registered for the
+// signal, that handler owns the shutdown sequence; it is expected to call the
+// exported `reapLiveFxProcs()` itself before it exits (see `headless.ts`'s
+// `shutdown()`). This repo has no OTHER app-level quit handler today besides
+// `headless.ts` (Electrobun's confirm-on-quit path calls `Utils.quit()`,
+// which DOES fire "exit" and is covered by the hook above), but any future
+// one is likewise free to become the sole owner of a signal's shutdown
+// sequence without racing this one.
 const FX_REAP_SIGNALS: Array<[NodeJS.Signals, number]> = [
   ["SIGINT", 2],
   ["SIGTERM", 15],
   ["SIGHUP", 1],
 ];
 for (const [sig, num] of FX_REAP_SIGNALS) {
-  if (process.listenerCount(sig) === 0) {
-    process.on(sig, () => {
-      reapLiveFxProcs();
-      process.exit(128 + num);
-    });
-  }
+  process.on(sig, () => {
+    reapLiveFxProcs();
+    if (process.listenerCount(sig) === 1) process.exit(128 + num);
+  });
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -473,8 +499,14 @@ async function respondPermissionRequest(
   // answer cancelled up front instead, and say so out loud so a silent
   // cancel is diagnosable rather than looking like the card vanished.
   if (cardOptions.length === 0) {
-    respondCancelled(state, id);
+    // Emit BEFORE replying: if `emit` throws (`onChunk` → `appendEvent` can,
+    // e.g. a FK error against a since-deleted run), the reply below must
+    // never have gone out yet, so `handleServerRequest`'s catch-all fallback
+    // is the only thing that replies — see the file header's "Settlement
+    // invariant" note. Reversing this order would let both this call and the
+    // catch-all's `respondCancelled` write a reply for the same id.
     emit(state, "status", "fx acp: permission request had no options — auto-cancelled");
+    respondCancelled(state, id);
     return;
   }
 
@@ -845,16 +877,19 @@ function killProc(state: FxSessionState): void {
   state.proc.exited.then(() => clearTimeout(timer)).catch(() => clearTimeout(timer));
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /** Wait for the turn to settle, or `timeoutMs` to elapse — whichever comes
  *  first. Races `state.done` (resolved the instant `settleFx` runs, via
  *  `resolveDone`) against a timer, rather than polling `state.resolved` on
- *  an interval. */
+ *  an interval. The timer handle is hoisted so it can be cleared once the
+ *  race settles — otherwise a turn that resolves before `timeoutMs` elapses
+ *  leaves a live timer behind for the remainder of the timeout window. */
 async function waitUntilResolved(state: FxSessionState, timeoutMs: number): Promise<void> {
-  await Promise.race([state.done, sleep(timeoutMs)]);
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  await Promise.race([state.done, timeout]);
+  clearTimeout(timer!);
 }
 
 /**

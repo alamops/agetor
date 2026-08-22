@@ -5,7 +5,7 @@ import {
   chmodSync,
   createWriteStream,
   existsSync,
-  mkdtempSync,
+  mkdirSync,
   writeFileSync,
 } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -61,29 +61,41 @@ const PREFLIGHT_TIMEOUT_MS = 2_000;
  * — good enough for claude's probe below — would fail fx's `--help` check
  * and `startTask` would reject every fx run before the fake driver ever ran.
  * This stub script mirrors the one `src/bun/orchestrator-fx.test.ts` writes
- * for the identical reason, and is written synchronously here (before any
- * backend spawns) so `AGETOR_FX_BIN` in the env block below always points at
- * an already-executable file by the time `headless.ts` starts probing it.
+ * for the identical reason.
+ *
+ * Written inside the given `dataDir` (a subdirectory, so it can't collide
+ * with anything `headless.ts` itself creates there) rather than at its own
+ * module-scope temp dir — `dataDir` is already `rm -rf`'d by
+ * `provisionBackend`'s teardown (both the success and pre-health-check
+ * failure paths), so the stub is cleaned up for free instead of leaking a
+ * bare `mkdtempSync` directory per importing process for the lifetime of the
+ * machine. Callers must invoke this after `dataDir` exists but before
+ * spawning the backend, since `AGETOR_FX_BIN` must already point at an
+ * executable file by the time `headless.ts` starts probing it.
  */
-const fxStubBinDir = mkdtempSync(path.join(tmpdir(), "agetor-e2e-fx-fakebin-"));
-const FX_STUB_BIN_PATH = path.join(fxStubBinDir, "fx");
-writeFileSync(
-  FX_STUB_BIN_PATH,
-  [
-    "#!/bin/sh",
-    'if [ "$1" = "--help" ]; then',
-    '  echo "Fast, native coding agent for the terminal"',
-    "  exit 0",
-    "fi",
-    'if [ "$1" = "--version" ]; then',
-    '  echo "0.0.4-fake"',
-    "  exit 0",
-    "fi",
-    "exit 0",
-    "",
-  ].join("\n"),
-);
-chmodSync(FX_STUB_BIN_PATH, 0o755);
+function writeFxStubBin(dataDir: string): string {
+  const binDir = path.join(dataDir, "fx-stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  const binPath = path.join(binDir, "fx");
+  writeFileSync(
+    binPath,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--help" ]; then',
+      '  echo "Fast, native coding agent for the terminal"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "--version" ]; then',
+      '  echo "0.0.4-fake"',
+      "  exit 0",
+      "fi",
+      "exit 0",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(binPath, 0o755);
+  return binPath;
+}
 
 async function tailFile(filePath: string, maxBytes = 4_000): Promise<string> {
   if (!existsSync(filePath)) return `<${filePath} not found>`;
@@ -208,6 +220,8 @@ async function provisionBackend(
   const dataDir = await mkdtemp(path.join(tmpdir(), "agetor-e2e-"));
   const logFile = path.join(dataDir, "backend.log");
   const daemonLogFile = path.join(dataDir, "daemon.log");
+  // Must happen before the spawn below — see writeFxStubBin's doc comment.
+  const fxStubBinPath = writeFxStubBin(dataDir);
 
   const logStream: WriteStream = createWriteStream(logFile);
   await new Promise<void>((resolve, reject) => {
@@ -253,12 +267,13 @@ async function provisionBackend(
       // `--help`, requiring "coding agent" in the `--help` output to
       // disambiguate Vercel's fx from an unrelated npm JSON-viewer CLI of
       // the same name — that probe runs regardless of the driver override,
-      // so `AGETOR_FX_BIN` points at the stub script written above (mirrors
+      // so `AGETOR_FX_BIN` points at the stub script written into this
+      // backend's own `dataDir` above (mirrors
       // `src/bun/orchestrator-fx.test.ts`'s) instead of `/bin/echo`. Note:
       // codex/cursor/gemini have no equivalent fake-driver wiring in this
       // fixture — no spec here starts a run on any of them.
       AGETOR_FX_DRIVER: "fake",
-      AGETOR_FX_BIN: FX_STUB_BIN_PATH,
+      AGETOR_FX_BIN: fxStubBinPath,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
