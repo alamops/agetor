@@ -76,6 +76,11 @@ describe("mergedPullReplacement", () => {
     expect(parsed).toBeLessThanOrEqual(after);
   });
 
+  test("stamps mergedAt with a freshly-generated ISO when given an empty string", () => {
+    const pr = item({ state: "open", mergedAt: null });
+    expect(isMergedPull(mergedPullReplacement(pr, ""))).toBe(true);
+  });
+
   test("preserves an existing closedAt", () => {
     const pr = item({ state: "open", closedAt: "2026-01-05T00:00:00Z" });
     const result = mergedPullReplacement(pr, "2026-03-04T05:06:07Z");

@@ -70,8 +70,13 @@ import { tokenForHost } from "./github-tokens.ts";
 /** GitHub REST/GraphQL API origin. `AGETOR_GITHUB_API_BASE` is a dev/test-only
  *  override (the Playwright e2e harness points it at a local stub server); unset in
  *  normal use. Mirrors `BITBUCKET_API_BASE` in bitbucket.ts. GitHub Enterprise
- *  (per-host bases) is a separate follow-up — see docs/plans/per-host-git-api-bases.md. */
-const GITHUB_API_BASE = (process.env.AGETOR_GITHUB_API_BASE ?? "https://api.github.com").replace(/\/+$/, "");
+ *  (per-host bases) is a separate follow-up — see docs/plans/per-host-git-api-bases.md.
+ *  `||` (not `??`) so an exported-but-empty env var falls back to the default instead
+ *  of pinning every request to the empty-string origin. Never point this at a
+ *  non-loopback host: `fetchGitHub` sends the user's GitHub token
+ *  (`authorization: Bearer …`) to whatever origin it names, so anything other than
+ *  `https://api.github.com` or a local test stub would leak the token off-machine. */
+const GITHUB_API_BASE = (process.env.AGETOR_GITHUB_API_BASE || "https://api.github.com").replace(/\/+$/, "");
 
 export interface CommandResult {
   ok: boolean;
@@ -4601,11 +4606,21 @@ export async function deleteGitHubRelease(input: DeleteGitHubReleaseInput): Prom
  *  null when the shape isn't a recognizable repo subject URL. */
 function notificationHtmlUrl(subjectUrl: string | null): string | null {
   if (!subjectUrl) return null;
-  const m = /^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/(.+)$/.exec(subjectUrl);
-  if (!m) return null;
-  const [, owner, name, rest] = m;
+  // Derived from the same `GITHUB_API_BASE` seam every other request uses,
+  // rather than a hardcoded `api.github.com` regex — so this keeps working
+  // (and keeps rejecting non-matching origins) when the base is overridden
+  // for dev/test via `AGETOR_GITHUB_API_BASE`. Output host stays
+  // `https://github.com` regardless — that's the real notification web UI.
+  const prefix = `${GITHUB_API_BASE}/repos/`;
+  if (!subjectUrl.startsWith(prefix)) return null;
+  const rest = subjectUrl.slice(prefix.length);
+  const [owner, name, ...pathParts] = rest.split("/");
+  if (!owner || !name || pathParts.length === 0) return null;
   // pulls → pull, commits → commit; issues/releases map straight through.
-  const path = rest!.replace(/^pulls\//, "pull/").replace(/^commits\//, "commit/");
+  const path = pathParts
+    .join("/")
+    .replace(/^pulls\//, "pull/")
+    .replace(/^commits\//, "commit/");
   return `https://github.com/${owner}/${name}/${path}`;
 }
 

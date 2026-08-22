@@ -25,7 +25,10 @@ export function isMergedPull(item: GitHubListItem): boolean {
  *  onto an issue. Returns `item` unchanged for a non-pulls item. */
 export function mergedPullReplacement(item: GitHubListItem, mergedAtIso?: string): GitHubListItem {
   if (item.kind !== "pulls") return item;
-  const stamp = mergedAtIso ?? new Date().toISOString();
+  // `||`, not `??` — an empty string is falsy but not nullish, and must not be
+  // stamped as-is (it would fail `isMergedPull`'s truthiness check, leaving the
+  // "merged" replacement item reporting as not-merged).
+  const stamp = mergedAtIso || new Date().toISOString();
   return {
     ...item,
     state: "closed",
