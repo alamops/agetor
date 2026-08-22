@@ -1233,7 +1233,12 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // model" (root CLAUDE.md). Pin an explicit flagship instead.
   "gemini": "gemini-3-pro-preview",
   // fx's own documented default, per fx.sh — a fast GLM tier tuned for its
-  // agentic loop. Ids are Vercel AI Gateway ids, passed verbatim.
+  // agentic loop. Ids are Vercel AI Gateway ids, passed verbatim. fx is
+  // exempt from the "always default to the best available model" rule
+  // above: the Gateway bills per token to the user's own account, and this
+  // tier is the tuned sweet spot for fx's agentic loop rather than a cost
+  // compromise — flagship tiers (gpt-5.5, claude-sonnet-5/opus-5,
+  // gemini-3-pro) remain one click away in the picker.
   "fx": "zai/glm-5.2-fast",
 };
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
@@ -1597,10 +1602,14 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
   // AGENT_OPTIONS.gemini.modes below labels it the same "Read-only" way.
   "gemini": { code: "auto", plan: "ask" },
   // fx has three of its own permission modes (yolo/auto/ask — see
-  // AGENT_OPTIONS.fx.modes below); Code resolves to its most-permissive
-  // "yolo" (no permission checks, no sandbox), Plan to "ask" (only
-  // pre-approved rules run; unresolved tool calls are rejected).
-  "fx": { code: "yolo", plan: "ask" },
+  // AGENT_OPTIONS.fx.modes below). Like every other kind, Code resolves to
+  // modes[0] — "auto" (fx sandbox + LLM auto-review; unresolved tool calls
+  // surface as approval cards) — the hands-off-but-reviewed default, not
+  // "yolo" (no permission checks, no sandbox): a Plan→Code pill round-trip
+  // must not escalate a task past what it started at. "yolo" stays reachable
+  // only as an explicit picker choice. Plan resolves to "ask" (only
+  // pre-approved rules run; everything else surfaces as an approval card).
+  "fx": { code: "auto", plan: "ask" },
 };
 
 /**
@@ -1846,10 +1855,10 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
     // Vercel AI Gateway ids, passed verbatim.
     models: [
       { id: "zai/glm-5.2-fast", label: "GLM 5.2 Fast", hint: "Recommended default — fx's own default model." },
-      { id: "openai/gpt-5.5", label: "GPT-5.5" },
-      { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5" },
-      { id: "anthropic/claude-opus-5", label: "Claude Opus 5" },
-      { id: "google/gemini-3-pro", label: "Gemini 3 Pro" },
+      { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "OpenAI flagship via the Gateway." },
+      { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Anthropic's fast flagship via the Gateway." },
+      { id: "anthropic/claude-opus-5", label: "Claude Opus 5", hint: "Anthropic's top tier via the Gateway." },
+      { id: "google/gemini-3-pro", label: "Gemini 3 Pro", hint: "Google flagship via the Gateway." },
     ],
     modes: [
       { id: "auto", label: "Auto", hint: "fx sandbox + LLM auto-review; unresolved tool calls surface as approval cards." },

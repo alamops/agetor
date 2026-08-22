@@ -163,11 +163,9 @@ export interface TmuxPromptAnswer {
  * fx's turn until agetor answers the RPC call, so this kind follows the
  * `tmux_prompt` structural pattern exactly: `registerFxPermission` hands the
  * driver a real Promise it awaits directly, and `answerFxPermission` resolves
- * it from whichever of the three settlement paths gets there first (user
- * card answer via the HTTP route, Stop/delete via `cancelPendingForTask`, or
- * the driver's own cancel/teardown path) — see `cancelPendingForTask` below,
- * which is what keeps all three paths converging on the *same* entry instead
- * of each trying to resolve (or double-resolve) the RPC independently.
+ * it from whichever settlement path gets there first. See the "Settlement
+ * invariant" section of `src/bun/fx-acp.ts`'s header for the single
+ * authoritative statement of which path is allowed to win.
  * ────────────────────────────────────────────────────────────────────────── */
 
 /** The ACP tool call a permission request is asking about. Mirrors
@@ -201,11 +199,11 @@ export interface FxPermissionRequest {
   createdAt: number;
   toolCall: FxPermissionToolCall;
   options: FxPermissionOption[];
-  /** The agetor mode (`auto` | `ask`) that caused this request to surface as
-   *  a card in the first place — `yolo` auto-allows and never reaches this
-   *  registry. Carried through so the UI can tailor copy without having to
-   *  re-derive it from the task row. */
-  mode: string;
+  /** The agetor mode that caused this request to surface as a card in the
+   *  first place — `yolo` auto-allows and never reaches this registry.
+   *  Carried through so the UI can tailor copy without having to re-derive
+   *  it from the task row. */
+  mode: "auto" | "ask";
 }
 
 /** `{ optionId }` echoes the user's pick straight back to fx's
@@ -315,7 +313,14 @@ export function registerScrapedAskQuestions(args: {
   };
   // No awaiter — the answer is driven via send-keys, not a promise resolve.
   askQuestions.set(id, { req, resolve: () => { /* scraper-sourced: no hook promise */ } });
-  broadcast(req);
+  // The orchestrator's `emit` fan-out has no per-listener try/catch, so a
+  // throwing listener must not strand this entry as a phantom pending card.
+  try {
+    broadcast(req);
+  } catch (err) {
+    askQuestions.delete(id);
+    throw err;
+  }
   return req;
 }
 
@@ -396,7 +401,14 @@ export function registerTmuxPrompt(args: {
   const answer = new Promise<TmuxPromptAnswer>((resolve) => {
     tmuxPrompts.set(id, { req, resolve });
   });
-  broadcast(req);
+  // The orchestrator's `emit` fan-out has no per-listener try/catch, so a
+  // throwing listener must not strand this entry as a phantom pending card.
+  try {
+    broadcast(req);
+  } catch (err) {
+    tmuxPrompts.delete(id);
+    throw err;
+  }
   return { id, req, answer };
 }
 
@@ -450,7 +462,7 @@ export function registerFxPermission(args: {
   runId: string;
   toolCall: FxPermissionToolCall;
   options: FxPermissionOption[];
-  mode: string;
+  mode: "auto" | "ask";
 }): { id: string; req: FxPermissionRequest; answer: Promise<FxPermissionAnswer> } {
   const id = randomUUID();
   const req: FxPermissionRequest = {
@@ -466,7 +478,14 @@ export function registerFxPermission(args: {
   const answer = new Promise<FxPermissionAnswer>((resolve) => {
     fxPermissions.set(id, { req, resolve });
   });
-  broadcast(req);
+  // The orchestrator's `emit` fan-out has no per-listener try/catch, so a
+  // throwing listener must not strand this entry as a phantom pending card.
+  try {
+    broadcast(req);
+  } catch (err) {
+    fxPermissions.delete(id);
+    throw err;
+  }
   return { id, req, answer };
 }
 

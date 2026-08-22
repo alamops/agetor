@@ -13,6 +13,7 @@ import { spawnCursorViaTmux } from "./cursor-tmux.ts";
 import { dataDir } from "./db.ts";
 import { spawnFxViaAcp, type FxMode } from "./fx-acp.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
+import { answerFxPermission, registerFxPermission } from "./interactions.ts";
 import { gitWritableRootsSync } from "./worktree.ts";
 
 export type { SpawnedAgent };
@@ -743,7 +744,24 @@ export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined 
  */
 export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
 
-function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): SpawnedAgent {
+/**
+ * Prompt-marker trigger for the `fx_permission` card scenario (see
+ * `makeFakeAgent` below), same rationale as `FAKE_CLAUDE_TODOS_PROMPT_MARKER`
+ * above: the e2e suite's worker-scoped backend fixture spawns one
+ * `headless.ts` per worker with a single fixed env block shared by every
+ * test/task in that worker, so a spec can't get its own env var into that
+ * already-running process — but it CAN put anything it wants in
+ * `task.prompt` at task-create time. Exported so an fx-permission e2e spec
+ * can reference the exact string instead of duplicating it.
+ */
+export const FAKE_FX_PERMISSION_PROMPT_MARKER = "__agetor_fake_fx_permission__";
+
+function makeFakeAgent(
+  taskId: string,
+  prompt: string,
+  onChunk: ChunkHandler,
+  fakeOpts: { runId?: string; mode?: string } = {},
+): SpawnedAgent {
   const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
   const done = new Promise<number>((res) => { resolveDone = res; });
@@ -754,6 +772,12 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
   // `SQLITE_CONSTRAINT_FOREIGNKEY` against the cascade-deleted row.
   const timers: ReturnType<typeof setTimeout>[] = [];
   const after = (ms: number, fn: () => void) => { timers.push(setTimeout(fn, ms)); };
+  // Set only by the AGETOR_FAKE_FX_PERMISSION scenario below — `kill()`
+  // needs it to settle a still-open card the same way `dropFxSession` →
+  // `settleFx` does in the real driver (see interactions.ts's "Settlement
+  // single-source-of-truth"), so Stop/delete during the fake card doesn't
+  // leave a phantom registry entry.
+  let fxPermissionCardId: string | undefined;
   // Test hook: simulate a claude code API error mid-turn so orchestrator
   // tests can exercise the api-error → `blocked` column flip without having
   // to plumb a real synthetic-message JSONL through the driver. Mirrors what
@@ -895,6 +919,49 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
     });
     after(23, () => onChunk("assistant", "Starting Phase 1 — Investigate now."));
     after(26, () => { onChunk("status", "turn complete"); resolveDone(0); });
+  } else if (
+    process.env.AGETOR_FAKE_FX_PERMISSION === "1"
+    || prompt.includes(FAKE_FX_PERMISSION_PROMPT_MARKER)
+  ) {
+    // Test hook: simulate fx's ACP `session/request_permission` round-trip
+    // so Playwright/e2e specs can drive the `fx_permission` card
+    // (RunPanel's FxPermissionCard) end to end without the real ACP driver.
+    // Mirrors fx-acp.ts's real handler almost exactly: register the card via
+    // `registerFxPermission` and await its `answer` promise instead of
+    // scheduling a fixed-delay end-of-turn timer — this scenario's turn only
+    // resolves once the card is answered (by the user via the HTTP route, or
+    // by `kill()` below on Stop/delete), same registry-awaiter discipline as
+    // the real driver.
+    after(5, () => onChunk("assistant", "requesting permission…"));
+    try {
+      const { id, answer } = registerFxPermission({
+        taskId,
+        runId: fakeOpts.runId ?? "fake-run",
+        toolCall: {
+          toolCallId: "fake-fx-permission-1",
+          title: "Write file",
+          kind: "edit",
+          rawInput: { path: "/tmp/example.txt" },
+        },
+        options: [
+          { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+          { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+        ],
+        mode: fakeOpts.mode === "ask" ? "ask" : "auto",
+      });
+      fxPermissionCardId = id;
+      answer.then((a) => {
+        onChunk("status", `fake fx permission resolved: ${"optionId" in a ? a.optionId : "cancelled"}`);
+        onChunk("status", "turn complete");
+        resolveDone(0);
+      });
+    } catch (err) {
+      onChunk(
+        "status",
+        `fake fx permission registration failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      resolveDone(1);
+    }
   } else {
     after(5, () => onChunk("stdout", `fake response to: ${prompt}`));
     after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });
@@ -910,6 +977,14 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
       // (clearTimeout on an elapsed timer, resolveDone on an already-settled
       // promise).
       for (const t of timers) clearTimeout(t);
+      // Mirror the real fx driver's settlement discipline: a still-open
+      // fx_permission card must be resolved on teardown, not left dangling
+      // in the registry. `answerFxPermission` is idempotent (returns false
+      // if the card was already answered/cancelled), so this is safe to call
+      // unconditionally whenever this fake spawned one.
+      if (fxPermissionCardId !== undefined) {
+        answerFxPermission(fxPermissionCardId, { cancelled: true });
+      }
       resolveDone(0);
     },
     writeInput: (line) => { record.push(`write:${line}`); return true; },
@@ -1042,7 +1117,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       // Build the command anyway so the fake records the prompt going by;
       // the fake's behaviour doesn't depend on the argv shape.
       buildCommand(harness, prompt, opts);
-      return makeFakeAgent(taskId, prompt, onChunk);
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });
     }
     // Pre-generate a session uuid when we're not resuming. The driver will
     // expect claude to write its JSONL at the deterministic path derived
@@ -1082,7 +1157,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       if (process.env.AGETOR_FAKE_CURSOR_PLAN === "1") {
         return makeFakeCursorPlanAgent(taskId, prompt, onChunk);
       }
-      return makeFakeAgent(taskId, prompt, onChunk);
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });
     }
     const built = buildCommand(harness, prompt, opts);
     return spawnCursorViaTmux({
@@ -1107,7 +1182,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       // stand-in, `fake-codex-thread-${taskId}`).
       const sessionId = opts.resumeSessionId ?? `fake-gemini-session-${taskId}`;
       onSessionId?.(sessionId);
-      return makeFakeAgent(taskId, prompt, onChunk);
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });
     }
     // Pre-generate a session uuid when we're not resuming — mirrors claude's
     // pattern (`--session-id` up front) rather than codex's discover-later
@@ -1144,7 +1219,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       // (see the `onSessionId` doc on `SpawnAgentArgs`), not claude/gemini's
       // pre-generated-uuid pattern.
       onSessionId?.(`fake-fx-session-${taskId}`);
-      return makeFakeAgent(taskId, prompt, onChunk);
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });
     }
     const built = buildCommand(harness, prompt, { ...opts, runId });
     return spawnFxViaAcp({
@@ -1170,7 +1245,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
     // can route follow-ups through `codex exec resume` — mirrors what a real
     // `thread.started` event would deliver.
     onSessionId?.(`fake-codex-thread-${taskId}`);
-    return makeFakeAgent(taskId, prompt, onChunk);
+    return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });
   }
   // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
   // worktree) so a codex `auto` run that has to write there escalates its
