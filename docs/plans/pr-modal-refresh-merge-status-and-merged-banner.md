@@ -55,7 +55,7 @@ Success: `bun run typecheck` green, `bun test` green, review clean, and the merg
 - **T2 — unit tests** (after T1)
   - Files owned: `src/mainview/lib/pull-merged.test.ts` (new)
   - Goal: cover `isMergedPull` (mergedAt set / null / undefined-ish) and `mergedPullReplacement` (state flip, closedAt/mergedAt stamped, other fields preserved, explicit timestamp honored). Follow `mergeability.test.ts` fixture idiom.
-- **e2e: not applicable** — desktop Electrobun app with no e2e harness in the repo; logic is covered by the extracted-pure-helper idiom the codebase standardizes on. Recorded decision, not an omission.
+- ~~**e2e: not applicable**~~ **Superseded by §10** — the repo *does* have a Playwright harness (`e2e/`, per-worker headless backends); the original investigation missed it. `e2e/pr-merged-state.spec.ts` now covers the feature end-to-end against a stubbed GitHub API (see §10.3 T7).
 
 ## 6. Execution waves
 
