@@ -67,6 +67,12 @@ import { contentTypeForPreviewPath, MAX_BLOB_PREVIEW_BYTES } from "../shared/att
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { tokenForHost } from "./github-tokens.ts";
 
+/** GitHub REST/GraphQL API origin. `AGETOR_GITHUB_API_BASE` is a dev/test-only
+ *  override (the Playwright e2e harness points it at a local stub server); unset in
+ *  normal use. Mirrors `BITBUCKET_API_BASE` in bitbucket.ts. GitHub Enterprise
+ *  (per-host bases) is a separate follow-up — see docs/plans/per-host-git-api-bases.md. */
+const GITHUB_API_BASE = (process.env.AGETOR_GITHUB_API_BASE ?? "https://api.github.com").replace(/\/+$/, "");
+
 export interface CommandResult {
   ok: boolean;
   stdout: string;
@@ -718,7 +724,7 @@ function spliceSuggestionLines(content: string, startLine: number, endLine: numb
  *  separators are preserved (the Contents API treats them as directories). */
 function contentsUrl(repo: GitHubRepo, filePath: string): string {
   const encoded = filePath.split("/").map(encodeURIComponent).join("/");
-  return `https://api.github.com/repos/${repo.owner}/${repo.name}/contents/${encoded}`;
+  return `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/contents/${encoded}`;
 }
 
 type IssueUpdatePatch = {
@@ -1286,7 +1292,7 @@ function privateRepoHint(status: number, message: string, repo: GitHubRepo, hadT
 }
 
 async function pullHeadSha(repo: GitHubRepo, token: string | null, number: number): Promise<string | GitHubListError> {
-  const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${number}`;
+  const prUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${number}`;
   const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
   if (!("status" in prRes)) return prRes;
   const pr = await prRes.json().catch(() => null);
@@ -1374,7 +1380,7 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
   const buildPageUrl = (sourcePage: number): string => {
     let url: URL;
     if (useSearch) {
-      url = new URL("https://api.github.com/search/issues");
+      url = new URL(`${GITHUB_API_BASE}/search/issues`);
       url.searchParams.set("q", buildSearchQuery(slug, input));
       url.searchParams.set("per_page", String(perPage));
       url.searchParams.set("page", String(sourcePage));
@@ -1387,7 +1393,7 @@ export async function listGitHubItems(input: ListGitHubItemsInput): Promise<GitH
       }
     } else {
       const endpoint = input.kind === "pulls" ? "pulls" : "issues";
-      url = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/${endpoint}`);
+      url = new URL(`${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/${endpoint}`);
       url.searchParams.set("state", input.state);
       url.searchParams.set("per_page", String(perPage));
       url.searchParams.set("page", String(sourcePage));
@@ -1605,7 +1611,7 @@ export async function createGitHubPull(input: CreateGitHubPullInput): Promise<Gi
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to create a pull request" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls`;
   const res = await fetchGitHub(
     url,
     token,
@@ -1632,7 +1638,7 @@ export async function createGitHubPull(input: CreateGitHubPullInput): Promise<Gi
     return { ok: true, item, message: "Pull request created." };
   }
 
-  const reviewerUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${item.number}/requested_reviewers`;
+  const reviewerUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${item.number}/requested_reviewers`;
   const reviewerRes = await fetchGitHub(
     reviewerUrl,
     token,
@@ -1661,7 +1667,7 @@ export async function getGitHubPullDiff(input: GetGitHubPullDiffInput): Promise<
   }
 
   const token = await githubToken(repo.remoteHost ?? null);
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const res = await fetchGitHub(url, token, "application/vnd.github.v3.diff");
   if (!("status" in res)) return res;
   const contentLength = Number(res.headers.get("content-length") ?? 0);
@@ -1834,7 +1840,7 @@ export async function getGitHubPullBlob(input: GetGitHubPullBlobInput): Promise<
   if (cachedDetail && Date.now() - cachedDetail.fetchedAt < PULL_DETAIL_CACHE_TTL_MS) {
     ({ headSha, baseSha, headRepoFullName, baseRepoFullName } = cachedDetail);
   } else {
-    const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+    const prUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
     const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
     if (!("status" in prRes)) return { ok: false, error: prRes.error, status: 502 };
     const prJson = await prRes.json().catch(() => null);
@@ -1884,7 +1890,7 @@ export async function getGitHubPullBlob(input: GetGitHubPullBlobInput): Promise<
     if (cached) {
       ref = cached;
     } else {
-      const compareUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/compare/`
+      const compareUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/compare/`
         + `${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`;
       const compareRes = await fetchGitHub(compareUrl, token, "application/vnd.github+json");
       if (!("status" in compareRes)) return { ok: false, error: compareRes.error, status: 502 };
@@ -1953,7 +1959,7 @@ export async function getGitHubPullDetail(input: GitHubItemNumberInput): Promise
   }
 
   const token = await githubToken(repo.remoteHost ?? null);
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
@@ -1971,7 +1977,7 @@ export async function listGitHubComments(input: GitHubItemNumberInput): Promise<
   }
 
   const token = await githubToken(repo.remoteHost ?? null);
-  const url = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/comments`);
+  const url = new URL(`${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}/comments`);
   url.searchParams.set("per_page", "100");
   const res = await fetchGitHub(url.toString(), token, "application/vnd.github+json");
   if (!("status" in res)) return res;
@@ -2002,7 +2008,7 @@ export async function createGitHubComment(input: CreateGitHubCommentInput): Prom
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to comment" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/comments`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}/comments`;
   const res = await fetchGitHub(
     url,
     token,
@@ -2046,7 +2052,7 @@ export async function createGitHubPullLineComment(
   const sha = await pullHeadSha(repo, token, input.number);
   if (typeof sha !== "string") return sha;
 
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/comments`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}/comments`;
   const res = await fetchGitHub(
     url,
     token,
@@ -2080,7 +2086,7 @@ export async function listGitHubPullReviewComments(
   }
 
   const token = await githubToken(repo.remoteHost ?? null);
-  const url = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/comments`);
+  const url = new URL(`${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}/comments`);
   url.searchParams.set("per_page", "100");
   const res = await fetchGitHub(url.toString(), token, "application/vnd.github+json");
   if (!("status" in res)) return res;
@@ -2111,7 +2117,7 @@ export async function replyGitHubPullLineComment(
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to reply" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/comments/${input.commentId}/replies`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}/comments/${input.commentId}/replies`;
   const res = await fetchGitHub(
     url,
     token,
@@ -2150,7 +2156,7 @@ export async function applyGitHubSuggestion(input: ApplyGitHubSuggestionInput): 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to apply a suggestion" };
 
-  const reviewCommentUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/comments/${input.commentId}`;
+  const reviewCommentUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/comments/${input.commentId}`;
   const commentRes = await fetchGitHub(reviewCommentUrl, token, "application/vnd.github+json");
   if (!("status" in commentRes)) return commentRes;
   const commentJson = await commentRes.json().catch(() => null);
@@ -2170,7 +2176,7 @@ export async function applyGitHubSuggestion(input: ApplyGitHubSuggestionInput): 
   const parsed = parseSuggestion(range.body);
   if (!parsed) return { ok: false, error: "This comment doesn't contain a suggested change." };
 
-  const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const prUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
   if (!("status" in prRes)) return prRes;
   const prJson = await prRes.json().catch(() => null);
@@ -2246,7 +2252,7 @@ export async function getGitHubPullChecks(input: GitHubItemNumberInput): Promise
   const sha = await pullHeadSha(repo, token, input.number);
   if (typeof sha !== "string") return sha;
 
-  const checksUrl = new URL(`https://api.github.com/repos/${repo.owner}/${repo.name}/commits/${sha}/check-runs`);
+  const checksUrl = new URL(`${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/commits/${sha}/check-runs`);
   checksUrl.searchParams.set("per_page", "100");
   const checksRes = await fetchGitHub(checksUrl.toString(), token, "application/vnd.github+json");
   if (!("status" in checksRes)) return checksRes;
@@ -2281,7 +2287,7 @@ export async function getGitHubCommitStatus(input: GetGitHubCommitStatusInput): 
   if (!ref) return { ok: false, error: "commit ref required" };
 
   const token = await githubToken(repo.remoteHost ?? null);
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/commits/${encodeURIComponent(ref)}/status`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/commits/${encodeURIComponent(ref)}/status`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
@@ -2302,7 +2308,7 @@ export async function listGitHubPullCommits(input: GitHubItemNumberInput): Promi
 
   const token = await githubToken(repo.remoteHost ?? null);
   const commits: GitHubPullCommit[] = [];
-  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/commits?per_page=100`;
+  let next: string | null = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}/commits?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
     const res = await fetchGitHub(next, token, "application/vnd.github+json");
     if (!("status" in res)) return res;
@@ -2331,7 +2337,7 @@ export async function reviewGitHubPull(input: ReviewGitHubPullInput): Promise<Gi
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to review" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/reviews`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}/reviews`;
   const res = await fetchGitHub(
     url,
     token,
@@ -2371,7 +2377,7 @@ export async function mergeGitHubPull(input: MergeGitHubPullInput): Promise<GitH
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to merge" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/merge`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}/merge`;
   const res = await fetchGitHub(
     url,
     token,
@@ -2408,7 +2414,7 @@ export async function closeGitHubPull(input: CloseGitHubPullInput): Promise<GitH
   if (!token) return { ok: false, error: "GitHub authentication required to close a pull request" };
   const comment = input.comment?.trim() ?? "";
 
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const res = await fetchGitHub(
     url,
     token,
@@ -2448,7 +2454,7 @@ export async function createGitHubIssue(input: CreateGitHubIssueInput): Promise<
   if (!token) return { ok: false, error: "GitHub authentication required to create an issue" };
   const labels = input.labels?.map((s) => s.trim()).filter(Boolean) ?? [];
   const assignees = input.assignees?.map((s) => s.trim()).filter(Boolean) ?? [];
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues`;
   const res = await fetchGitHub(
     url,
     token,
@@ -2489,7 +2495,7 @@ export async function updateGitHubIssue(input: UpdateGitHubIssueInput): Promise<
   const built = buildIssueUpdatePatch(input);
   if (!built.ok) return built;
 
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
   const res = await fetchGitHub(
     url,
     token,
@@ -2520,7 +2526,7 @@ export async function requestGitHubPullReviewers(
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to request reviewers" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/requested_reviewers`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}/requested_reviewers`;
   const res = await fetchGitHub(
     url,
     token,
@@ -2588,7 +2594,7 @@ export async function getGitHubPullMergeability(input: GitHubItemNumberInput): P
   }
 
   const token = await githubToken(repo.remoteHost ?? null);
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   // GitHub computes `mergeable` asynchronously — the first read after a push can
   // return null. Poll a couple of times before giving up so the UI usually gets
   // a real verdict without the user hitting refresh.
@@ -2618,7 +2624,7 @@ export async function updateGitHubPullBranch(input: GitHubItemNumberInput): Prom
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to update the branch" };
   // Merges the base branch into the PR head. 202 Accepted with a message body.
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}/update-branch`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}/update-branch`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "PUT", body: "{}" });
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
@@ -2638,7 +2644,7 @@ export async function reopenGitHubPull(input: GitHubItemNumberInput): Promise<Gi
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to reopen a pull request" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const res = await fetchGitHub(
     url,
     token,
@@ -3053,7 +3059,7 @@ export async function setGitHubPullDraft(input: SetGitHubPullDraftInput): Promis
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to change draft state" };
-  const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const prUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
   if (!("status" in prRes)) return prRes;
   const pr = await prRes.json().catch(() => null);
@@ -3066,7 +3072,7 @@ export async function setGitHubPullDraft(input: SetGitHubPullDraftInput): Promis
   const field = input.draft ? "convertPullRequestToDraft" : "markPullRequestReadyForReview";
   const query = `mutation($id: ID!) { ${field}(input: { pullRequestId: $id }) { pullRequest { isDraft } } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { id: nodeId } }) },
@@ -3097,7 +3103,7 @@ export async function setGitHubPullAutoMerge(input: SetGitHubPullAutoMergeInput)
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to change auto-merge" };
-  const prUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
+  const prUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${input.number}`;
   const prRes = await fetchGitHub(prUrl, token, "application/vnd.github+json");
   if (!("status" in prRes)) return prRes;
   const pr = await prRes.json().catch(() => null);
@@ -3114,7 +3120,7 @@ export async function setGitHubPullAutoMerge(input: SetGitHubPullAutoMergeInput)
     ? { id: nodeId, method: (input.mergeMethod ?? "merge").toUpperCase() }
     : { id: nodeId };
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables }) },
@@ -3145,7 +3151,7 @@ export async function setGitHubIssueLock(input: SetGitHubIssueLockInput): Promis
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to lock/unlock" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/lock`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}/lock`;
 
   if (!input.locked) {
     const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "DELETE" });
@@ -3182,7 +3188,7 @@ export async function setGitHubIssuePinned(input: SetGitHubIssuePinnedInput): Pr
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to pin/unpin" };
-  const issueUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
+  const issueUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
   const issueRes = await fetchGitHub(issueUrl, token, "application/vnd.github+json");
   if (!("status" in issueRes)) return issueRes;
   const issue = await issueRes.json().catch(() => null);
@@ -3195,7 +3201,7 @@ export async function setGitHubIssuePinned(input: SetGitHubIssuePinnedInput): Pr
   const field = input.pinned ? "pinIssue" : "unpinIssue";
   const query = `mutation($id: ID!) { ${field}(input: { issueId: $id }) { issue { isPinned } } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { id: nodeId } }) },
@@ -3231,7 +3237,7 @@ export async function getGitHubIssuePinned(input: GitHubItemNumberInput): Promis
   const query = `query($owner:String!,$name:String!,$number:Int!){`
     + `repository(owner:$owner,name:$name){issue(number:$number){isPinned}}}`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name, number: input.number } }) },
@@ -3266,7 +3272,7 @@ export async function listGitHubSubIssues(input: GitHubItemNumberInput): Promise
 
   const token = await githubToken(repo.remoteHost ?? null);
   const subIssues: GitHubSubIssue[] = [];
-  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issues?per_page=100`;
+  let next: string | null = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issues?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
     const res = await fetchGitHub(next, token, "application/vnd.github+json");
     if (!("status" in res)) return res;
@@ -3298,7 +3304,7 @@ export async function addGitHubSubIssue(input: AddGitHubSubIssueInput): Promise<
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to add a sub-issue" };
 
-  const childUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.childNumber}`;
+  const childUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.childNumber}`;
   const childRes = await fetchGitHub(childUrl, token, "application/vnd.github+json");
   if (!("status" in childRes)) return childRes;
   const childJson = await childRes.json().catch(() => null);
@@ -3310,7 +3316,7 @@ export async function addGitHubSubIssue(input: AddGitHubSubIssueInput): Promise<
     : null;
   if (childId === null) return { ok: false, error: "GitHub returned a child issue without an id" };
 
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issues`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issues`;
   const res = await fetchGitHub(
     url,
     token,
@@ -3339,7 +3345,7 @@ export async function removeGitHubSubIssue(input: RemoveGitHubSubIssueInput): Pr
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to remove a sub-issue" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issue`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}/sub_issue`;
   const res = await fetchGitHub(
     url,
     token,
@@ -3371,7 +3377,7 @@ export async function transferGitHubIssue(input: TransferGitHubIssueInput): Prom
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to transfer an issue" };
 
-  const issueUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
+  const issueUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
   const issueRes = await fetchGitHub(issueUrl, token, "application/vnd.github+json");
   if (!("status" in issueRes)) return issueRes;
   const issueJson = await issueRes.json().catch(() => null);
@@ -3383,7 +3389,7 @@ export async function transferGitHubIssue(input: TransferGitHubIssueInput): Prom
 
   const repoIdQuery = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id}}`;
   const repoIdRes = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query: repoIdQuery, variables: { owner: target.owner, name: target.name } }) },
@@ -3400,7 +3406,7 @@ export async function transferGitHubIssue(input: TransferGitHubIssueInput): Prom
 
   const transferQuery = `mutation($id:ID!,$repo:ID!){ transferIssue(input:{issueId:$id,repositoryId:$repo}){ issue { number url } } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query: transferQuery, variables: { id: nodeId, repo: targetId } }) },
@@ -3428,7 +3434,7 @@ export async function listGitHubProjectsV2(input: { dir: string }): Promise<GitH
 
   const query = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){projectsV2(first:20){nodes{id number title url}}}}`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name } }) },
@@ -3460,7 +3466,7 @@ export async function getGitHubProjectItems(input: GetGitHubProjectItemsInput): 
     + `fieldValues(first:20){ nodes{ __typename ... on ProjectV2ItemFieldSingleSelectValue{ optionId name field{ ... on ProjectV2FieldCommon{ id } } } } } } }`
     + `} } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { id: input.projectId } }) },
@@ -3492,7 +3498,7 @@ export async function addGitHubProjectItem(input: AddGitHubProjectItemInput): Pr
   if (!token) return { ok: false, error: "GitHub authentication required to add a project item" };
 
   const segment = input.contentKind === "pr" ? "pulls" : "issues";
-  const contentUrl = `https://api.github.com/repos/${repo.owner}/${repo.name}/${segment}/${input.contentNumber}`;
+  const contentUrl = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/${segment}/${input.contentNumber}`;
   const contentRes = await fetchGitHub(contentUrl, token, "application/vnd.github+json");
   if (!("status" in contentRes)) return contentRes;
   const contentJson = await contentRes.json().catch(() => null);
@@ -3504,7 +3510,7 @@ export async function addGitHubProjectItem(input: AddGitHubProjectItemInput): Pr
 
   const query = `mutation($p:ID!,$c:ID!){ addProjectV2ItemById(input:{ projectId:$p, contentId:$c }){ item{ id } } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { p: input.projectId, c: nodeId } }) },
@@ -3531,7 +3537,7 @@ export async function removeGitHubProjectItem(input: RemoveGitHubProjectItemInpu
 
   const query = `mutation($p:ID!,$i:ID!){ deleteProjectV2Item(input:{ projectId:$p, itemId:$i }){ deletedItemId } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { p: input.projectId, i: input.itemId } }) },
@@ -3561,7 +3567,7 @@ export async function setGitHubProjectItemStatus(input: SetGitHubProjectItemStat
 
   const query = `mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){ updateProjectV2ItemFieldValue(input:{ projectId:$p, itemId:$i, fieldId:$f, value:{ singleSelectOptionId:$o } }){ projectV2Item { id } } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { p: input.projectId, i: input.itemId, f: input.fieldId, o: input.optionId } }) },
@@ -3592,7 +3598,7 @@ export async function listGitHubDiscussions(input: { dir: string }): Promise<Git
     + `discussionCategories(first:25){ nodes{ id name } }`
     + `} }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name } }) },
@@ -3625,7 +3631,7 @@ export async function getGitHubDiscussion(input: GetGitHubDiscussionInput): Prom
     + `discussion(number:$number){ id title body category{ isAnswerable } comments(first:50){ nodes{ id body createdAt isAnswer author{ login } } } }`
     + `} }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name, number: input.number } }) },
@@ -3658,7 +3664,7 @@ export async function createGitHubDiscussion(input: CreateGitHubDiscussionInput)
 
   const repoIdQuery = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id}}`;
   const repoIdRes = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query: repoIdQuery, variables: { owner: repo.owner, name: repo.name } }) },
@@ -3673,7 +3679,7 @@ export async function createGitHubDiscussion(input: CreateGitHubDiscussionInput)
 
   const query = `mutation($r:ID!,$c:ID!,$t:String!,$b:String!){ createDiscussion(input:{ repositoryId:$r, categoryId:$c, title:$t, body:$b }){ discussion{ number url } } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { r: repoId, c: input.categoryId, t: title, b: body } }) },
@@ -3701,7 +3707,7 @@ export async function addGitHubDiscussionComment(input: AddGitHubDiscussionComme
 
   const query = `mutation($d:ID!,$b:String!){ addDiscussionComment(input:{ discussionId:$d, body:$b }){ comment{ id } } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { d: input.discussionId, b: body } }) },
@@ -3731,7 +3737,7 @@ export async function setGitHubDiscussionAnswer(input: SetGitHubDiscussionAnswer
   const field = input.answer ? "markDiscussionCommentAsAnswer" : "unmarkDiscussionCommentAsAnswer";
   const query = `mutation($id:ID!){ ${field}(input:{ id:$id }){ clientMutationId } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { id: input.commentId } }) },
@@ -3757,7 +3763,7 @@ export async function deleteGitHubDiscussion(input: DeleteGitHubDiscussionInput)
 
   const query = `mutation($id:ID!){ deleteDiscussion(input:{ id:$id }){ clientMutationId } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { id: input.discussionId } }) },
@@ -3781,7 +3787,7 @@ export async function deleteGitHubDiscussionComment(input: DeleteGitHubDiscussio
 
   const query = `mutation($id:ID!){ deleteDiscussionComment(input:{ id:$id }){ clientMutationId } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { id: input.commentId } }) },
@@ -3802,7 +3808,7 @@ export async function getGitHubViewer(input: { dir: string }): Promise<GitHubVie
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: true, login: "" };
-  const res = await fetchGitHub("https://api.github.com/user", token, "application/vnd.github+json");
+  const res = await fetchGitHub(`${GITHUB_API_BASE}/user`, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, error: privateRepoHint(res.status, apiError(json, res.status, res.statusText), repo, !!token) };
@@ -3822,7 +3828,7 @@ export async function getGitHubRepoPermissions(input: { dir: string }): Promise<
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: true, push: false, admin: false, maintain: false };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
@@ -3843,7 +3849,7 @@ export async function getGitHubRepoPermissions(input: { dir: string }): Promise<
  *  an inline review comment. GitHub only permits the author (or a maintainer). */
 function commentUrl(repo: GitHubRepo, kind: GitHubCommentKind, commentId: number): string {
   const seg = kind === "review" ? "pulls" : "issues";
-  return `https://api.github.com/repos/${repo.owner}/${repo.name}/${seg}/comments/${commentId}`;
+  return `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/${seg}/comments/${commentId}`;
 }
 
 export async function updateGitHubComment(input: UpdateGitHubCommentInput): Promise<GitHubCommentResponse> {
@@ -3959,7 +3965,7 @@ export async function getGitHubPullReviewThreads(input: GitHubItemNumberInput): 
     + `repository(owner:$owner,name:$name){pullRequest(number:$number){`
     + `reviewThreads(first:100){pageInfo{hasNextPage} nodes{id isResolved isOutdated comments(first:1){nodes{databaseId}}}}}}}`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name, number: input.number } }) },
@@ -3995,7 +4001,7 @@ export async function getGitHubPullLinkedIssues(input: GitHubItemNumberInput): P
     + `repository(owner:$owner,name:$name){pullRequest(number:$number){`
     + `closingIssuesReferences(first:20){nodes{number title url state}}}}}`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { owner: repo.owner, name: repo.name, number: input.number } }) },
@@ -4020,7 +4026,7 @@ export async function setGitHubReviewThreadResolved(
   const field = input.resolved ? "resolveReviewThread" : "unresolveReviewThread";
   const query = `mutation($id:ID!){ ${field}(input:{threadId:$id}){ thread { isResolved } } }`;
   const res = await fetchGitHub(
-    "https://api.github.com/graphql",
+    `${GITHUB_API_BASE}/graphql`,
     token,
     "application/vnd.github+json",
     { method: "POST", body: JSON.stringify({ query, variables: { id: input.threadId } }) },
@@ -4061,7 +4067,7 @@ function normalizeColor(color: string | undefined): string | undefined {
 /** `/repos/:o/:r/labels/:name` — the label name goes in the path, so it must be
  *  URL-encoded ("help wanted", "good first issue", etc. contain spaces). */
 function labelUrl(repo: GitHubRepo, name: string): string {
-  return `https://api.github.com/repos/${repo.owner}/${repo.name}/labels/${encodeURIComponent(name)}`;
+  return `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/labels/${encodeURIComponent(name)}`;
 }
 
 export async function listGitHubLabels(input: { dir: string }): Promise<GitHubLabelsResponse> {
@@ -4070,7 +4076,7 @@ export async function listGitHubLabels(input: { dir: string }): Promise<GitHubLa
 
   const token = await githubToken(repo.remoteHost ?? null);
   const labels: GitHubRepoLabel[] = [];
-  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/labels?per_page=100`;
+  let next: string | null = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/labels?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
     const res = await fetchGitHub(next, token, "application/vnd.github+json");
     if (!("status" in res)) return res;
@@ -4093,7 +4099,7 @@ export async function listGitHubAssignees(input: { dir: string }): Promise<GitHu
 
   const token = await githubToken(repo.remoteHost ?? null);
   const assignees: GitHubUser[] = [];
-  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/assignees?per_page=100`;
+  let next: string | null = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/assignees?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
     const res = await fetchGitHub(next, token, "application/vnd.github+json");
     if (!("status" in res)) return res;
@@ -4119,7 +4125,7 @@ export async function createGitHubLabel(input: CreateGitHubLabelInput): Promise<
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to create a label" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/labels`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/labels`;
   const res = await fetchGitHub(
     url,
     token,
@@ -4228,7 +4234,7 @@ export async function listGitHubMilestones(input: { dir: string }): Promise<GitH
 
   const token = await githubToken(repo.remoteHost ?? null);
   const milestones: GitHubRepoMilestone[] = [];
-  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones?state=all&per_page=100&sort=due_on&direction=asc`;
+  let next: string | null = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/milestones?state=all&per_page=100&sort=due_on&direction=asc`;
   for (let page = 0; next && page < 3; page++) {
     const res = await fetchGitHub(next, token, "application/vnd.github+json");
     if (!("status" in res)) return res;
@@ -4253,7 +4259,7 @@ export async function createGitHubMilestone(input: CreateGitHubMilestoneInput): 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to create a milestone" };
   const dueOn = normalizeDueOn(input.dueOn);
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/milestones`;
   const res = await fetchGitHub(
     url,
     token,
@@ -4296,7 +4302,7 @@ export async function updateGitHubMilestone(input: UpdateGitHubMilestoneInput): 
     return { ok: false, error: "milestone update requires a title, description, due date, or state" };
   }
 
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones/${input.number}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/milestones/${input.number}`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "PATCH", body: JSON.stringify(patch) });
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
@@ -4321,7 +4327,7 @@ const REACTION_CONTENT_ORDER: GitHubReactionContent[] = [
  *  for a conversation comment, `/pulls/comments/:id/reactions` for an inline
  *  review comment. Pure — unit-tested. */
 function reactionSubjectPath(repo: GitHubRepo, subject: GitHubReactionSubject): string {
-  const base = `https://api.github.com/repos/${repo.owner}/${repo.name}`;
+  const base = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}`;
   switch (subject.type) {
     case "issue":
       return `${base}/issues/${subject.id}/reactions`;
@@ -4444,7 +4450,7 @@ export async function deleteGitHubMilestone(input: DeleteGitHubMilestoneInput): 
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to delete a milestone" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/milestones/${input.number}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/milestones/${input.number}`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "DELETE" });
   if (!("status" in res)) return res;
   if (!res.ok) {
@@ -4463,7 +4469,7 @@ export async function listGitHubReleases(input: { dir: string }): Promise<GitHub
 
   const token = await githubToken(repo.remoteHost ?? null);
   const releases: GitHubRelease[] = [];
-  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases?per_page=100`;
+  let next: string | null = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/releases?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
     const res = await fetchGitHub(next, token, "application/vnd.github+json");
     if (!("status" in res)) return res;
@@ -4488,7 +4494,7 @@ export async function listGitHubTags(input: { dir: string }): Promise<GitHubTags
 
   const token = await githubToken(repo.remoteHost ?? null);
   const tags: GitHubTag[] = [];
-  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/tags?per_page=100`;
+  let next: string | null = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/tags?per_page=100`;
   for (let page = 0; next && page < 3; page++) {
     const res = await fetchGitHub(next, token, "application/vnd.github+json");
     if (!("status" in res)) return res;
@@ -4512,7 +4518,7 @@ export async function createGitHubRelease(input: CreateGitHubReleaseInput): Prom
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to create a release" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/releases`;
   const res = await fetchGitHub(
     url,
     token,
@@ -4558,7 +4564,7 @@ export async function updateGitHubRelease(input: UpdateGitHubReleaseInput): Prom
     return { ok: false, error: "release update requires a tag, name, body, draft, or prerelease change" };
   }
 
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases/${input.id}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/releases/${input.id}`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "PATCH", body: JSON.stringify(patch) });
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
@@ -4575,7 +4581,7 @@ export async function deleteGitHubRelease(input: DeleteGitHubReleaseInput): Prom
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to delete a release" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/releases/${input.id}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/releases/${input.id}`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "DELETE" });
   if (!("status" in res)) return res;
   if (!res.ok) {
@@ -4639,7 +4645,7 @@ export async function listGitHubNotifications(input: ListGitHubNotificationsInpu
 
   const notifications: GitHubNotification[] = [];
   const all = input.all === true ? "true" : "false";
-  let next: string | null = `https://api.github.com/repos/${repo.owner}/${repo.name}/notifications?all=${all}&per_page=50`;
+  let next: string | null = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/notifications?all=${all}&per_page=50`;
   for (let page = 0; next && page < 3; page++) {
     const res = await fetchGitHub(next, token, "application/vnd.github+json");
     if (!("status" in res)) return res;
@@ -4666,7 +4672,7 @@ export async function markGitHubNotificationRead(input: GitHubThreadInput): Prom
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to mark a notification read" };
   const res = await fetchGitHub(
-    `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}`,
+    `${GITHUB_API_BASE}/notifications/threads/${encodeURIComponent(threadId)}`,
     token,
     "application/vnd.github+json",
     { method: "PATCH" },
@@ -4689,7 +4695,7 @@ export async function markAllGitHubNotificationsRead(input: { dir: string }): Pr
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to mark notifications read" };
   const res = await fetchGitHub(
-    `https://api.github.com/repos/${repo.owner}/${repo.name}/notifications`,
+    `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/notifications`,
     token,
     "application/vnd.github+json",
     { method: "PUT" },
@@ -4715,7 +4721,7 @@ export async function getGitHubThreadSubscription(input: GitHubThreadInput): Pro
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to view thread subscription" };
   const res = await fetchGitHub(
-    `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
+    `${GITHUB_API_BASE}/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
     token,
     "application/vnd.github+json",
   );
@@ -4739,7 +4745,7 @@ export async function setGitHubThreadSubscription(input: SetGitHubThreadSubscrip
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to update thread subscription" };
   const res = await fetchGitHub(
-    `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
+    `${GITHUB_API_BASE}/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
     token,
     "application/vnd.github+json",
     { method: "PUT", body: JSON.stringify({ ignored: input.ignored === true }) },
@@ -4763,7 +4769,7 @@ export async function unsubscribeGitHubThread(input: GitHubThreadInput): Promise
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to unsubscribe from a thread" };
   const res = await fetchGitHub(
-    `https://api.github.com/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
+    `${GITHUB_API_BASE}/notifications/threads/${encodeURIComponent(threadId)}/subscription`,
     token,
     "application/vnd.github+json",
     { method: "DELETE" },
@@ -4786,7 +4792,7 @@ export async function listGitHubWorkflowRuns(input: { dir: string }): Promise<Gi
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
   const token = await githubToken(repo.remoteHost ?? null);
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/runs?per_page=30`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/actions/runs?per_page=30`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
   const body = await res.json().catch(() => null);
@@ -4807,7 +4813,7 @@ export async function listGitHubWorkflows(input: { dir: string }): Promise<GitHu
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
 
   const token = await githubToken(repo.remoteHost ?? null);
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/workflows?per_page=100`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/actions/workflows?per_page=100`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
   const body = await res.json().catch(() => null);
@@ -4831,7 +4837,7 @@ export async function rerunGitHubWorkflowRun(input: RerunGitHubWorkflowRunInput)
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to re-run a workflow" };
   const segment = input.failedOnly ? "rerun-failed-jobs" : "rerun";
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/runs/${input.runId}/${segment}`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/actions/runs/${input.runId}/${segment}`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "POST" });
   if (!("status" in res)) return res;
   if (!res.ok) {
@@ -4850,7 +4856,7 @@ export async function cancelGitHubWorkflowRun(input: CancelGitHubWorkflowRunInpu
 
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to cancel a workflow run" };
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/runs/${input.runId}/cancel`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/actions/runs/${input.runId}/cancel`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "POST" });
   if (!("status" in res)) return res;
   if (!res.ok) {
@@ -4878,7 +4884,7 @@ export async function dispatchGitHubWorkflow(input: DispatchGitHubWorkflowInput)
   const token = await githubToken(repo.remoteHost ?? null);
   if (!token) return { ok: false, error: "GitHub authentication required to dispatch a workflow" };
   const inputs = input.inputs && Object.keys(input.inputs).length > 0 ? input.inputs : undefined;
-  const url = `https://api.github.com/repos/${repo.owner}/${repo.name}/actions/workflows/${input.workflowId}/dispatches`;
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/actions/workflows/${input.workflowId}/dispatches`;
   const res = await fetchGitHub(url, token, "application/vnd.github+json", {
     method: "POST",
     body: JSON.stringify({ ref, ...(inputs ? { inputs } : {}) }),

@@ -44,6 +44,11 @@ describe("isMergedPull", () => {
     const issue = item({ kind: "issues", mergedAt: "2026-01-02T00:00:00Z", state: "closed" });
     expect(isMergedPull(issue)).toBe(false);
   });
+
+  test("false for a pulls item with mergedAt as an empty string", () => {
+    const pr = item({ kind: "pulls", mergedAt: "", state: "closed" });
+    expect(isMergedPull(pr)).toBe(false);
+  });
 });
 
 describe("mergedPullReplacement", () => {
@@ -88,7 +93,7 @@ describe("mergedPullReplacement", () => {
       number: 42,
       title: "Add feature",
       htmlUrl: "https://github.com/o/r/pull/42",
-      labels: [{ name: "bug", color: "ff0000" } as GitHubListItem["labels"][number]],
+      labels: [{ name: "bug", color: "ff0000" }],
       sourcePath: "/repo/path",
     });
     const result = mergedPullReplacement(pr, "2026-03-04T05:06:07Z");
@@ -105,5 +110,14 @@ describe("mergedPullReplacement", () => {
     const snapshot = { ...pr };
     mergedPullReplacement(pr, "2026-03-04T05:06:07Z");
     expect(pr).toEqual(snapshot);
+  });
+
+  test("leaves an issues-kind item unchanged", () => {
+    const issue = item({ kind: "issues", state: "open", closedAt: null, mergedAt: null });
+    const result = mergedPullReplacement(issue, "2026-03-04T05:06:07Z");
+    expect(result).toBe(issue);
+    expect(result.state).toBe("open");
+    expect(result.mergedAt).toBeNull();
+    expect(result.closedAt).toBeNull();
   });
 });

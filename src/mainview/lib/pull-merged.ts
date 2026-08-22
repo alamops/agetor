@@ -17,8 +17,14 @@ export function isMergedPull(item: GitHubListItem): boolean {
  *  it with GitHub's actual timestamp. `closedAt` is preserved if the item
  *  already carries one; otherwise it's stamped with the same timestamp,
  *  matching what `markPullClosed`'s default replacement does for a plain
- *  close. Every other field on `item` is passed through unchanged. */
+ *  close. Every other field on `item` is passed through unchanged.
+ *
+ *  Same `kind === "pulls"` guard as `isMergedPull` above — a merge action is
+ *  only ever invoked on a pulls item in practice, but keeping the two
+ *  predicates symmetric means a caller can't accidentally stamp merge fields
+ *  onto an issue. Returns `item` unchanged for a non-pulls item. */
 export function mergedPullReplacement(item: GitHubListItem, mergedAtIso?: string): GitHubListItem {
+  if (item.kind !== "pulls") return item;
   const stamp = mergedAtIso ?? new Date().toISOString();
   return {
     ...item,

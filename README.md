@@ -201,6 +201,7 @@ All persistent state lives in `~/.agetor/` (override with `AGETOR_DATA_DIR`):
 | `AGETOR_CODEX_ARGS` | Extra args appended to every Codex spawn. | *(none)* |
 | `AGETOR_TMUX_BIN` | Override the `tmux` binary path. | `tmux` on `PATH` |
 | `AGETOR_CLAUDE_DRIVER` | Set to `fake` to skip tmux + the real CLI (test-only). | unset |
+| `AGETOR_GITHUB_API_BASE` | GitHub API origin override (dev/e2e only; default `https://api.github.com`). | `https://api.github.com` |
 | `AGETOR_DAEMON_IDLE_MS` | CLI daemon: idle-shutdown after this long with no run and no attached client. `0` disables. | `300000` (5 min) |
 
 Per-harness `bin`, `home`, and `env` overrides are configured through the Settings dialog and stored in SQLite — they take precedence over the corresponding env vars.

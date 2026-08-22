@@ -77,3 +77,48 @@ Success: `bun run typecheck` green, `bun test` green, review clean, and the merg
 
 - Silent failure on the detail-refresh fetch (no toast) — chosen for calm UX; flip to a toast if the owner prefers loud failures.
 - Merged-date formatting reuses the file's existing date helper; exact wording "Pull request successfully merged" + "Merged on <date>" per approved preview.
+
+---
+
+## 10. Hardening pass (2026-08-21) — "make sure everything is right and is the best we can do"
+
+| Field | Value |
+| --- | --- |
+| Source | owner follow-up after delivery; 3 fresh investigators (opus correctness re-review, opus UX/design review, sonnet runtime-verification feasibility) |
+| Gates | grilled (card design + e2e decision) + owner approval of this section |
+| Base SHA (this pass) | 46a70fa |
+| Correction to §5 | the repo **does** have a Playwright e2e harness (`e2e/` + `playwright.config.ts`, per-worker headless backends via `e2e/fixtures.ts`). "e2e not applicable" was wrong; e2e **applies** and is added here. Run Playwright as `bun node_modules/@playwright/test/cli.js test …` (the `bunx` shim runs under Node and breaks on `bun:sqlite`). |
+
+### 10.1 Owner decisions (grill)
+- **Card design:** keep the positive headline "Pull request successfully merged" (GitHub's own persistent phrasing) but move to the app's status-card idiom: purple carried by icon + `border-merged/40` + `bg-merged/10`; headline `text-sm font-medium text-foreground`; secondary `text-xs text-muted-foreground` using `fmtRelativeDate` ("Merged today" / "Merged 3d ago" / falls back to full date); `px-3 py-6 min-h-[7.5rem]`; panel label reads "Merge status" when merged. Fixes the dark-mode AA failure of `text-merged/80` (~4.1:1).
+- **E2E:** yes — add a real Playwright spec backed by a stub GitHub API, via a small product seam (`GITHUB_API_BASE` constant + `AGETOR_GITHUB_API_BASE` env override in `src/bun/github.ts`, mirroring Bitbucket's `BITBUCKET_API_BASE` idiom).
+
+### 10.2 Fix list (both reviewers; all accepted unless noted)
+Correctness (GitHubDialog.tsx):
+- C1 **Duplicate mergeability fetch on first entry** — the refresh effect is declared after the mergeability fetch effect, so entry fires GET #1, bumps seq, re-fires GET #2 (3–7 identical `GET /pulls/{n}` incl. server polling). Fix: declare the refresh effect **above** the mergeability effect.
+- C2 **In-app merge of a non-listed PR never shows the card** — `markPullClosed` only patches `result.items`; when the PR isn't in the loaded list `upsertListItem` drops it and `expandedItem` falls back to the frozen snapshot. Fix: `markPullClosed` also patches the view snapshot (`setView(cur => detail && sameItem(cur.item,next) ? openDetail(next) : cur)`) — single choke point for merge/close/reopen.
+- C3 **No refresh affordance for closed/merged PRs; silent failure dead-end** — extract `refreshPullDetail(item)` (entry-refresh body) + `invalidateMergeability(key)` helpers; header button becomes a full "Refresh" (item + mergeability), rendered for every PR state, not just open; effect, manual button, and prefill share the helpers.
+- C4 **Latent item-key shift** — pin identity: `fresh = { ...detail.item, sourcePath: item.sourcePath }`, bail if `itemKey(fresh) !== key`; guard `itemPath === AGGREGATE_PROJECT_PATH`; fix the stale "sourcePath is null in single-repo mode" doc comment (~:230).
+- C5 **Structural update-only** — add an `updateOnly` option to `upsertListItem` evaluated inside the `setResult` updater (fresh state) so the effect no longer reads a stale `result` closure; document the deliberately-narrow deps with the file's `eslint-disable-next-line react-hooks/exhaustive-deps` + why idiom.
+- C6 **itemMutationSeq invariant** — hoist the bump into a `mutateItems()` wrapper used by `upsertListItem` AND the direct `setResult` writers (`editLabel`, `removeLabel`, `editMilestone`, `removeMilestone`, `runTransferIssue`); fix the "every local item write goes through here" comment.
+- C7 **"View PR" double fetch** — prefill part 2 already has the fresh item: set `lastDetailRefreshKeyRef` + call `invalidateMergeability(key)` before `setView(openDetail(result.item))` (dedupe without losing the mergeability refresh).
+- C8 Unify `!detail.ok` and thrown-error paths (both reset the ref for retry). C9 `mergedPullReplacement` gets the `pulls` guard; test for `mergedAt: ""`; drop the unnecessary label cast in the test. C10 one-line comment on the sibling refresh handlers (`onRefreshDiff/Checks/CommitStatus`) noting they're shielded by `disabled={…Loading}`. C11 readability: extract the action grid into a sibling `PullActionGrid` component (or re-indent) so the merged branch reads `{merged ? <MergedPullCard/> : <PullActionGrid/>}`.
+UX (PullActions):
+- U1 card per §10.1; `role="status"`, `aria-hidden` icon; `tabIndex={-1}` + focus the card when it mounts and `document.activeElement === document.body` (focus was dropped by the grid unmounting after an in-app merge).
+- U2 suppress the green `actionMessages` success line when merged (keep the header "Merged" tag + card; error line stays unconditional).
+- U3 "Mergeability unavailable." one-frame flicker: render "Checking mergeability…" whenever `!mergeability && !mergeabilityError`.
+- U4 entry-refresh affordance: `detailRefreshing` state (set around the entry fetch, per key) → `Loader2` spinner in the panel header row + Merge disabled with title "Checking latest state…" while refreshing (only Merge; Approve/Comment/Close stay live). Grid is **not** held (both reviewers agree).
+- U5 queued-review hint copy branches on `merged` (no longer points at Approve/Comment/Request; says the PR is merged so they can no longer be posted; discard under "Pending review" below).
+- U6 `runPullMerge` success clears `reviewDrafts[key]` (mirrors `runClosePull` clearing `closeDrafts`).
+Declined: dropping the header "Merged" tag (kept — compact scan marker, matches list rows); "merged by / into base" (no `mergedBy`/`baseRef` on `GitHubListItem`; server change — different ticket); closed-unmerged state polish (different ticket).
+
+### 10.3 Work breakdown
+- **T5 — dialog polish + correctness** (wave 1). Files: `src/mainview/components/kanban/GitHubDialog.tsx`, `src/mainview/lib/pull-merged.ts`, `src/mainview/lib/pull-merged.test.ts`. Everything in §10.2. Acceptance: typecheck green, `bun test src/mainview/lib` green.
+- **T6 — GitHub API seam + e2e plumbing** (wave 1, disjoint). Files: `src/bun/github.ts` (all 90 `https://api.github.com` literals → `${GITHUB_API_BASE}`; `const GITHUB_API_BASE = process.env.AGETOR_GITHUB_API_BASE ?? "https://api.github.com"`; any origin/Link-header checks derive from it; GraphQL too), `README.md` (env table row), `e2e/fixtures.ts` (per-worker `githubStubPort = 4800 + parallelIndex` exposed on `E2EBackend`; backend env gains `AGETOR_GITHUB_API_BASE=http://127.0.0.1:<port>` and `GITHUB_TOKEN=e2e-github-token` so token resolution never shells out to `gh`), `e2e/github-stub.ts` (new: tiny Node `http` stub — route table keyed by method+path regex, JSON responses, mutable state, per-route call log, 404 JSON + stderr log for unmatched paths). Acceptance: typecheck green; `bun test src/bun/github*.test.ts src/bun/pull-detail.test.ts src/bun/git-host*.test.ts` green; default behavior byte-identical.
+- **T7 — Playwright spec** (wave 2, after T5+T6). File: `e2e/pr-merged-state.spec.ts` (new). Arrange: temp git repo with `origin = https://github.com/e2e-org/e2e-repo.git`, registered as a project via the API; stub routes for `/user`, `/repos/e2e-org/e2e-repo` (permissions.push true), pulls list, labels, `/pulls/42` (detail+mergeability), `PUT /pulls/42/merge`, plus whatever per-item fetches the dialog issues (discover by running with the unmatched-path log). Scenarios: (a) list says open, detail says merged → entering detail shows the `role="status"` card with "Pull request successfully merged", no Merge button; (b) detail open on first entry → grid; back to list; flip stub to merged; re-enter → card; assert `/pulls/42` detail hit count increased (refresh on every entry); (c) open + mergeable → click Merge → stub returns `{merged:true}` → card appears immediately, green success line absent. Run: `bun node_modules/@playwright/test/cli.js test e2e/pr-merged-state.spec.ts`.
+- Then: opus review of `1e5f654..HEAD`, fixes, full `bun test` + full Playwright suite (fixture env change touches every worker).
+
+### 10.4 Risks
+- T6 touches 90 URL sites — mechanical, default unchanged, covered by `github.test.ts`/`github-network.test.ts` (89 literal URL assertions) which must stay green.
+- Refresh effect reordering (C1) changes effect declaration order only; behavior verified by the reviewer's trace.
+- Stub completeness for the dialog's many per-item fetches — unmatched routes 404; sections show their own errors but the Actions card/grid still renders; the spec asserts only on the Actions section.
