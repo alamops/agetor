@@ -68,6 +68,7 @@ import {
 import { cn } from "@/lib/utils";
 import { toRows, type DiffRow } from "@/lib/diff-rows";
 import { mergeabilityView, type MergeTone } from "@/lib/mergeability";
+import { isMergedPull, mergedPullReplacement } from "@/lib/pull-merged";
 import { isCredentialError } from "@/lib/credential-error";
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
@@ -225,9 +226,13 @@ const basename = (p: string) => {
  *  per-repo, so an aggregated list routinely holds two items with the same
  *  kind+number (repo A PR #5 and repo B PR #5). Keying anything on number alone
  *  collides — React row keys, the detail-view lookup, and every per-item state map. The
- *  composite key disambiguates by the item's own repo path. In single-repo mode
- *  `sourcePath` is null, so the key is exactly the historical `${kind}-${number}`
- *  — existing behavior (and tests) unchanged. */
+ *  composite key disambiguates by the item's own repo path. `sourcePath` is
+ *  stamped with that repo's dir on every item regardless of single-repo vs
+ *  aggregate mode — github.ts's `normalizeItem` and the git-host.ts/gitlab.ts
+ *  wrappers' `withSourcePath` both thread `input.dir` through unconditionally
+ *  — so in practice the composite form is always used; the bare
+ *  `${kind}-${number}` fallback only applies to a hand-built item that
+ *  bypasses those paths (none currently do). */
 function itemKey(item: Pick<GitHubListItem, "kind" | "number" | "sourcePath">): string {
   return item.sourcePath
     ? `${item.sourcePath}::${item.kind}-${item.number}`
@@ -666,6 +671,20 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // Bounds the self-healing re-poll when GitHub returns mergeable=null. Keyed by
   // itemKey (G8) so two same-numbered PRs across repos don't share a retry budget.
   const mergeabilityRetries = useRef<Record<string, number>>({});
+  // Tracks the itemKey of the pulls-detail view the refresh-on-entry effect
+  // (below) last refreshed, so it fires once per *entry* into a detail view
+  // rather than on every render — reset to null whenever the dialog closes
+  // or the view leaves "detail", so detail(A) -> list -> detail(A) and a
+  // dialog reopen onto a surviving detail view both refresh again.
+  const lastDetailRefreshKeyRef = useRef<string | null>(null);
+  // Bumped by every local write to `result.items` (see `mutateItems`, which
+  // `upsertListItem` and the other direct writers all route through). The
+  // refresh-on-detail-entry effect below snapshots this before awaiting
+  // `getGitHubPullDetail` and re-checks it before applying the response — if
+  // the user clicks Merge while the entry fetch is in flight, the merge's
+  // local upsert lands first and bumps this ref, so the (now-stale) pre-merge
+  // detail response is dropped instead of reverting the just-merged card.
+  const itemMutationSeq = useRef(0);
   const [view, setView] = useState<GitHubDialogView>({ kind: "list" });
   // Mirrors `view` for the async prefill effect below, which needs to check
   // "has the user navigated away from the list?" from inside a promise
@@ -701,6 +720,25 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   const [mergeability, setMergeability] = useState<Record<string, GitHubPullMergeability | undefined>>({});
   const [mergeabilityLoading, setMergeabilityLoading] = useState<Record<string, boolean | undefined>>({});
   const [mergeabilityErrors, setMergeabilityErrors] = useState<Record<string, string | undefined>>({});
+  // True while `refreshPullDetail` (below) has an in-flight fetch for a given
+  // item — surfaced in the panel header as a spinner and used to hold the
+  // Merge button (only Merge; the other actions stay live) so a user can't
+  // merge against mergeability/state that's mid-refresh.
+  const [detailRefreshing, setDetailRefreshing] = useState<Record<string, boolean | undefined>>({});
+  // Clears the mergeability cache for `key` and defeats any request already
+  // in flight for it. Shared by the manual "Refresh" button, the
+  // refresh-on-detail-entry effect, and the "View PR" prefill path — all
+  // three need the exact same invalidation the old manual-only handler used
+  // to do inline. Bumping `mergeabilitySeq` makes an in-flight request's
+  // .then/.catch/.finally no-ops, which means its `finally` will no longer
+  // clear the loading flag, so it's cleared explicitly here too.
+  const invalidateMergeability = (key: string) => {
+    mergeabilityRetries.current[key] = 0;
+    setMergeability((cur) => ({ ...cur, [key]: undefined }));
+    setMergeabilityErrors((cur) => ({ ...cur, [key]: undefined }));
+    mergeabilitySeq.current += 1;
+    setMergeabilityLoading((cur) => ({ ...cur, [key]: false }));
+  };
   const [commits, setCommits] = useState<Record<string, GitHubPullCommit[] | undefined>>({});
   const [commitsLoading, setCommitsLoading] = useState<Record<string, boolean | undefined>>({});
   const [commitsErrors, setCommitsErrors] = useState<Record<string, string | undefined>>({});
@@ -1191,6 +1229,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         if (normalizePrUrl(result.item.htmlUrl) !== normalizePrUrl(pending.prUrl)) {
           throw new Error("That pull request URL points at a different repository — opening in browser.");
         }
+        // This fetch already IS a fresh detail fetch — mark the entry-refresh
+        // bookkeeping as done for this key so the refresh-on-detail-entry
+        // effect doesn't immediately re-fetch the same thing, while still
+        // invalidating mergeability (that effect only ever fetches
+        // mergeability, never invalidates a cache it didn't populate).
+        lastDetailRefreshKeyRef.current = itemKey(result.item);
+        invalidateMergeability(itemKey(result.item));
         setView(openDetail(result.item));
       } catch (err) {
         if (cancelled || viewRef.current.kind !== "list") return;
@@ -1357,13 +1402,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     setRepoLabels((cur) => sortLabels([...cur.filter((l) => l.name !== name), label]));
     // Reconcile the renamed/recolored label on any loaded item so its badge
     // doesn't show the stale name/color.
-    setResult((cur) => cur && {
+    mutateItems((cur) => ({
       ...cur,
       items: cur.items.map((it) => ({
         ...it,
         labels: it.labels.map((l) => (l.name === name ? { name: label.name, color: label.color } : l)),
       })),
-    });
+    }));
   };
 
   const removeLabel = async (name: string) => {
@@ -1371,10 +1416,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     await api.deleteGitHubLabel({ path: projectPath, name });
     setRepoLabels((cur) => cur.filter((l) => l.name !== name));
     // Drop the deleted label from any loaded item that carried it.
-    setResult((cur) => cur && {
+    mutateItems((cur) => ({
       ...cur,
       items: cur.items.map((it) => ({ ...it, labels: it.labels.filter((l) => l.name !== name) })),
-    });
+    }));
   };
 
   useEffect(() => {
@@ -1427,14 +1472,14 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     const { milestone } = await api.updateGitHubMilestone({ path: projectPath, number, ...patch });
     setRepoMilestones((cur) => sortMilestones(cur.map((m) => (m.number === number ? milestone : m))));
     // Reconcile the renamed milestone on any loaded item so its badge stays fresh.
-    setResult((cur) => cur && {
+    mutateItems((cur) => ({
       ...cur,
       items: cur.items.map((it) =>
         it.milestone && it.milestone.number === number
           ? { ...it, milestone: { number: milestone.number, title: milestone.title } }
           : it,
       ),
-    });
+    }));
   };
 
   const removeMilestone = async (number: number) => {
@@ -1442,12 +1487,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     await api.deleteGitHubMilestone({ path: projectPath, number });
     setRepoMilestones((cur) => cur.filter((m) => m.number !== number));
     // Drop the deleted milestone from any loaded item that carried it.
-    setResult((cur) => cur && {
+    mutateItems((cur) => ({
       ...cur,
       items: cur.items.map((it) =>
         it.milestone && it.milestone.number === number ? { ...it, milestone: null } : it,
       ),
-    });
+    }));
   };
 
   useEffect(() => {
@@ -2247,6 +2292,127 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
       });
   }, [open, projectPath, expandedItem, checks, mergeability, commitStatus, commitStatusLoading, commitStatusErrors]);
 
+  // Fetches a fresh copy of `item` via the same `getGitHubPullDetail`
+  // endpoint the "View PR" prefill effect above uses, and reconciles it into
+  // `result.items` (update-only — never inserts a row that isn't already
+  // loaded/paged, since a "View PR" deep-link can open a PR the current
+  // filters would never have returned) and the view snapshot, if the user is
+  // still looking at this item. Shared by the refresh-on-detail-entry effect
+  // below and the manual header "Refresh" button so there's exactly one
+  // place that knows how to safely apply a fresh pull detail. Silent on
+  // failure — cached data stays on screen, and open PRs have their own
+  // mergeability error surface; a toast on every entry would be noisy
+  // offline.
+  const refreshPullDetail = (item: GitHubListItem, retried = false): Promise<void> => {
+    const key = itemKey(item);
+    const itemPath = item.sourcePath ?? projectPath;
+    // `item.sourcePath` should always be set (see itemKey's doc comment) so
+    // this is a defensive guard, not the common case: never fetch against the
+    // aggregate sentinel.
+    if (!itemPath || itemPath === AGGREGATE_PROJECT_PATH) return Promise.resolve();
+    // Dedupe concurrent same-key refreshes: the entry-effect fetch and a
+    // manual header "Refresh" click can both target the same item, and
+    // without this guard two in-flight fetches would race each other with no
+    // ordering guarantee about which response lands (and gets applied) last.
+    // Only guards the *entry* call — never the internal retry below, which
+    // deliberately runs a second, sequential fetch after this same flag was
+    // already set true by the call it's retrying.
+    if (!retried && detailRefreshing[key]) return Promise.resolve();
+    // Snapshot before the await so a local mutation that lands mid-flight
+    // (e.g. the user clicks Merge while this fetch is in flight) is
+    // detectable once the response comes back — see `itemMutationSeq`.
+    const epoch = itemMutationSeq.current;
+    setDetailRefreshing((cur) => ({ ...cur, [key]: true }));
+    return (async () => {
+      try {
+        const detail = await api.getGitHubPullDetail(itemPath, item.number);
+        if (!detail?.ok || !detail.item) {
+          // Reset the entry-refresh bookkeeping (only if it still points at
+          // this entry — don't clobber a newer entry's) so the next natural
+          // navigation into this detail view retries instead of a
+          // well-formed-but-`ok:false` response sticking forever — same
+          // recovery as the thrown-error path below.
+          if (lastDetailRefreshKeyRef.current === key) lastDetailRefreshKeyRef.current = null;
+          return;
+        }
+        // Pin identity to the cached item's own sourcePath rather than
+        // trusting whatever the response carries, and bail on any resulting
+        // key shift — a shift here would orphan every per-item cache/draft
+        // (mergeability, drafts, action state, ...) keyed off the old key.
+        const fresh = { ...detail.item, sourcePath: item.sourcePath };
+        if (itemKey(fresh) !== key) return;
+        // A local mutation (merge, close, reopen, edit, ...) landed while
+        // this fetch was in flight and already reflects the newer truth —
+        // applying this now-stale response would revert it (e.g. un-merge a
+        // just-merged card). Rather than silently keeping the stale cached
+        // data, retry once — the mutation that just landed is exactly the
+        // post-mutation truth we want, so a fresh fetch right after it should
+        // reconcile cleanly. Bounded to a single retry so a mutation storm
+        // can't loop forever.
+        if (itemMutationSeq.current !== epoch) {
+          if (!retried) {
+            await refreshPullDetail(item, true);
+          } else if (lastDetailRefreshKeyRef.current === key) {
+            // The retry landed stale too (another mutation beat it) — reset
+            // so the next natural entry into this detail view retries from
+            // scratch instead of leaving stale data stuck indefinitely.
+            lastDetailRefreshKeyRef.current = null;
+          }
+          return;
+        }
+        upsertListItem(fresh, false, true, true);
+        if (viewRef.current.kind === "detail" && itemKey(viewRef.current.item) === key) {
+          setView(openDetail(fresh));
+        }
+      } catch {
+        // Silent — cached data stays, mergeability banner surfaces its own
+        // error. Same reset-for-retry as the `!detail.ok` path above.
+        if (lastDetailRefreshKeyRef.current === key) lastDetailRefreshKeyRef.current = null;
+      } finally {
+        setDetailRefreshing((cur) => ({ ...cur, [key]: false }));
+      }
+    })();
+  };
+
+  // Refresh-on-detail-entry: detail views deliberately survive dialog
+  // close/reopen (see the close effect above `resetComposers`), and the
+  // mergeability effect below never invalidates its own cache once
+  // populated — it's gated on the cached item's `state === "open"` and
+  // skips entirely once a value/error/loading flag is already set. So
+  // opening back into a detail view for a PR that was merged (or otherwise
+  // changed) somewhere else — another agetor window, the GitHub web UI —
+  // would show a stale mergeability banner and a live action grid forever.
+  // This effect fires once per *entry* into a pulls detail view (tracked via
+  // `lastDetailRefreshKeyRef`, reset whenever the dialog closes or the view
+  // leaves "detail", so detail(A) -> list -> detail(A) and a dialog reopen
+  // onto a surviving detail view both refresh again) and does two things:
+  // (1) invalidates the mergeability cache via `invalidateMergeability` — the
+  // fetch effect below then refetches on its own for open PRs, and correctly
+  // skips merged/closed ones; (2) fetches a fresh copy of the item itself via
+  // `refreshPullDetail`, since mergeability alone can't detect a PR merged
+  // outside agetor. Declared *above* the mergeability fetch effect on
+  // purpose: on a fresh entry this effect's invalidation must land before the
+  // mergeability effect's own gate is evaluated, or a first entry fires the
+  // mergeability GET once here-triggered and a second time when this effect
+  // bumps the seq.
+  useEffect(() => {
+    if (!open || view.kind !== "detail" || view.item.kind !== "pulls") {
+      lastDetailRefreshKeyRef.current = null;
+      return;
+    }
+    const item = view.item;
+    const key = itemKey(item);
+    if (lastDetailRefreshKeyRef.current === key) return;
+    lastDetailRefreshKeyRef.current = key;
+    invalidateMergeability(key);
+    void refreshPullDetail(item);
+    // Deliberately omits `invalidateMergeability`/`refreshPullDetail` (and
+    // `upsertListItem`, transitively) — none are memoized, so listing them
+    // would refire this effect on every render and defeat the
+    // once-per-entry gating above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, view, projectPath]);
+
   useEffect(() => {
     // Only open PRs surface a mergeability verdict — skip closed/merged ones so
     // we don't burn the server-side poll on data the UI never shows.
@@ -2552,6 +2718,18 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     return true;
   };
 
+  // Patches the view snapshot in place when it's currently showing `next`
+  // (matched via `sameItem`) — a no-op otherwise. `upsertListItem` only
+  // updates `result.items`, but a deep-linked PR/issue may not be in that
+  // list at all (the current filters would never have returned it), and the
+  // open detail subpage renders from its own frozen navigation snapshot, not
+  // from `result.items` — so every mutation site that replaces an item which
+  // might be the one currently open in detail must patch both. Shared by
+  // close/merge (`markPullClosed`), reopen, draft toggle, and lock below.
+  const patchDetailView = (next: GitHubListItem) => {
+    setView((cur) => (cur.kind === "detail" && sameItem(cur.item, next) ? openDetail(next) : cur));
+  };
+
   // Identity is the closed PR itself (kind+number+sourcePath), not just the
   // number — in aggregate mode (G8) two repos can each have a PR #5, and only
   // the one that was actually closed should flip/drop.
@@ -2562,6 +2740,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   const markPullClosed = (target: GitHubListItem, replacement?: GitHubListItem) => {
     const next = replacement ?? { ...target, state: "closed" as const, closedAt: new Date().toISOString() };
     upsertListItem(next, false, true);
+    // Also patch the view snapshot: when the PR isn't in the loaded list,
+    // `upsertListItem` above drops it (filters don't match) and `expandedItem`
+    // falls back to the frozen navigation snapshot — without this, the
+    // merged/closed card would never appear after an in-app merge/close of a
+    // PR outside the current filter.
+    patchDetailView(next);
   };
 
   const runPullReview = async (item: GitHubListItem, event: GitHubPullReviewEvent) => {
@@ -2634,8 +2818,22 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
       const result = await api.mergeGitHubPull({ path: itemPath, number: item.number, method });
-      if (result.merged) markPullClosed(item);
-      setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Pull request merged." }));
+      if (result.merged) {
+        markPullClosed(item, mergedPullReplacement(item));
+        setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Pull request merged." }));
+        // Any queued (unsubmitted) review note is now moot — mirrors
+        // `runPullClose` clearing `closeDrafts` on success.
+        setReviewDrafts((cur) => ({ ...cur, [itemKey(item)]: "" }));
+      } else {
+        // GitHub's merge endpoint can respond 2xx with `merged: false` (e.g. a
+        // required check landed red between the mergeability read and this
+        // call) — that's not success, so surface it as an error instead of
+        // claiming "Pull request merged." and clearing the review draft.
+        setActionErrors((cur) => ({
+          ...cur,
+          [itemKey(item)]: result.message ?? "GitHub did not merge the pull request.",
+        }));
+      }
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
     } finally {
@@ -2715,6 +2913,10 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
       // Keep the row visible even under a "closed" filter so the reopen is
       // legible; it drops out on the next refresh.
       upsertListItem(result.item, false, true);
+      // C2: also patch the detail-view snapshot (see `patchDetailView`'s doc
+      // comment) — a deep-linked PR reopened from detail may not be in the
+      // loaded list.
+      patchDetailView(result.item);
       setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Pull request reopened." }));
       // Now open again — let the mergeability effect fetch a fresh verdict.
       mergeabilityRetries.current[itemKey(item)] = 0;
@@ -2735,7 +2937,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     setActionMessages((cur) => ({ ...cur, [itemKey(item)]: undefined }));
     try {
       const result = await api.setGitHubPullDraft({ path: itemPath, number: item.number, draft: nextDraft });
-      upsertListItem({ ...item, draft: result.draft });
+      const next = { ...item, draft: result.draft };
+      upsertListItem(next);
+      // C2: also patch the detail-view snapshot (see `patchDetailView`'s doc
+      // comment) — a deep-linked PR toggled from detail may not be in the
+      // loaded list.
+      patchDetailView(next);
       setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Draft state updated." }));
       // Draft ↔ ready flips mergeable_state (draft PRs report "draft"), so refresh.
       mergeabilityRetries.current[itemKey(item)] = 0;
@@ -2789,7 +2996,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
         locked: nextLocked,
         lockReason: nextLocked ? (lockReasonDrafts[itemKey(item)] || undefined) : undefined,
       });
-      upsertListItem({ ...item, locked: result.locked }, false, true);
+      const next = { ...item, locked: result.locked };
+      upsertListItem(next, false, true);
+      // C2: also patch the detail-view snapshot (see `patchDetailView`'s doc
+      // comment) — a deep-linked PR/issue locked from detail may not be in
+      // the loaded list.
+      patchDetailView(next);
       setActionMessages((cur) => ({ ...cur, [itemKey(item)]: result.message ?? "Lock state updated." }));
     } catch (e) {
       setActionErrors((cur) => ({ ...cur, [itemKey(item)]: e instanceof Error ? e.message : String(e) }));
@@ -2819,7 +3031,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
       setTransferNotice({ message: result.message ?? `Issue transferred to ${targetRepo}.`, url: result.url });
       // The issue no longer lives in this repo — drop it from the list rather
       // than reconciling it in place.
-      setResult((cur) => cur && { ...cur, items: cur.items.filter((it) => !sameItem(it, item)) });
+      mutateItems((cur) => ({ ...cur, items: cur.items.filter((it) => !sameItem(it, item)) }));
       setView((cur) => (cur.kind === "detail" && sameItem(cur.item, item) ? backToList() : cur));
       setTransferDrafts((cur) => ({ ...cur, [itemKey(item)]: "" }));
       setTransferConfirm((cur) => ({ ...cur, [itemKey(item)]: false }));
@@ -2830,16 +3042,39 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     }
   };
 
+  // Every local write to `result.items` goes through this wrapper — both
+  // `upsertListItem` below and the handful of direct `setResult` writers
+  // (label/milestone reconciliation, issue transfer) — so the
+  // `itemMutationSeq` bump (see its doc comment above) is structurally
+  // guaranteed rather than something each call site has to remember. No-ops
+  // if there's no result to mutate yet.
+  const mutateItems = (updater: (cur: GitHubListResult) => GitHubListResult) => {
+    itemMutationSeq.current += 1;
+    setResult((cur) => (cur ? updater(cur) : cur));
+  };
+
   // `keepIfPresent` updates an existing row in place even when the replacement no
   // longer matches the active filters — used by in-panel state changes (e.g.
   // reopen) so the user sees the result instead of the row silently vanishing;
-  // it drops out naturally on the next refresh.
-  const upsertListItem = (replacement: GitHubListItem, prepend = false, keepIfPresent = false) => {
-    setResult((cur) => {
-      if (!cur) return cur;
+  // it drops out naturally on the next refresh. `updateOnly` is the opposite
+  // shape for the entry-refresh path (`refreshPullDetail`): a "View PR"
+  // deep-link can open a PR that was never in the filtered/paged list, and
+  // inserting it here would append an out-of-sort row, so when the item isn't
+  // already present this does nothing at all (no insert, no removal). Both
+  // flags are evaluated inside the `setResult` updater against the freshest
+  // state rather than a render closure, so a caller doesn't need its own
+  // "is it still present" check racing against concurrent local mutations.
+  const upsertListItem = (
+    replacement: GitHubListItem,
+    prepend = false,
+    keepIfPresent = false,
+    updateOnly = false,
+  ) => {
+    mutateItems((cur) => {
       // Match on kind+number+sourcePath (G8) so a write to repo B's #5 can't
       // overwrite repo A's #5 in an aggregated list.
       const exists = cur.items.some((item) => sameItem(item, replacement));
+      if (updateOnly && !exists) return cur;
       if (!itemMatchesActiveFilters(replacement) && !(keepIfPresent && exists)) {
         return {
           ...cur,
@@ -3629,6 +3864,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
               if (expandedItem.kind !== "pulls") return;
               setCommitStatusErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
             }}
+            // Unlike the full "Refresh" below, these three sibling refresh
+            // handlers don't bump `itemMutationSeq`/a request seq of their
+            // own — their buttons are `disabled` while their own `*Loading`
+            // flag is set, so there's no in-flight request they'd need to
+            // race against. Intentional asymmetry, not an oversight.
             onRefreshDiff={() => {
               if (expandedItem.kind !== "pulls") return;
               setDiffs((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
@@ -3648,12 +3888,13 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
               setCommitStatus((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
               setCommitStatusErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
             }}
-            onRefreshMergeability={() => {
+            onRefresh={() => {
               if (expandedItem.kind !== "pulls") return;
-              mergeabilityRetries.current[itemKey(expandedItem)] = 0;
-              setMergeability((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
-              setMergeabilityErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
+              const key = itemKey(expandedItem);
+              invalidateMergeability(key);
+              void refreshPullDetail(expandedItem);
             }}
+            refreshing={expandedItem.kind === "pulls" ? !!detailRefreshing[itemKey(expandedItem)] : false}
             onRetryCommits={() => {
               if (expandedItem.kind !== "pulls") return;
               setCommitsErrors((cur) => ({ ...cur, [itemKey(expandedItem)]: undefined }));
@@ -6279,7 +6520,7 @@ function GitHubItemRow({
   // Navigates to the detail subpage for this item (GitHubDialogView).
   onToggle: () => void;
 }) {
-  const merged = item.kind === "pulls" && !!item.mergedAt;
+  const merged = isMergedPull(item);
   const stateClass = item.state === "open"
     ? "text-success"
     : merged
@@ -6490,7 +6731,8 @@ function GitHubItemDetail({
   onRefreshDiff,
   onRefreshChecks,
   onRefreshCommitStatus,
-  onRefreshMergeability,
+  onRefresh,
+  refreshing,
   onRetryCommits,
 }: {
   item: GitHubListItem;
@@ -6604,7 +6846,12 @@ function GitHubItemDetail({
   onRefreshDiff: () => void;
   onRefreshChecks: () => void;
   onRefreshCommitStatus: () => void;
-  onRefreshMergeability: () => void;
+  // Full item + mergeability refresh, not just mergeability — see
+  // `refreshPullDetail`/`invalidateMergeability` above. Rendered for every PR
+  // state (open/closed/merged), unlike the old mergeability-only button which
+  // only ever showed for an open PR.
+  onRefresh: () => void;
+  refreshing: boolean;
   onRetryCommits: () => void;
 }) {
   // The item's own author may close/reopen and edit the title/body of their own
@@ -6698,7 +6945,8 @@ function GitHubItemDetail({
             onToggleDraft={onToggleDraft}
             onToggleAutoMerge={onToggleAutoMerge}
             onClosePull={onClosePull}
-            onRefreshMergeability={onRefreshMergeability}
+            onRefresh={onRefresh}
+            refreshing={refreshing}
             canPush={canPush}
             canModifyOwn={canModifyOwn}
           />
@@ -7462,7 +7710,8 @@ function PullActions({
   onToggleDraft,
   onToggleAutoMerge,
   onClosePull,
-  onRefreshMergeability,
+  onRefresh,
+  refreshing,
   canPush,
   canModifyOwn,
 }: {
@@ -7494,16 +7743,47 @@ function PullActions({
   onToggleDraft: () => void;
   onToggleAutoMerge: () => void;
   onClosePull: () => void;
-  onRefreshMergeability: () => void;
+  onRefresh: () => void;
+  refreshing: boolean;
   canPush: boolean;
   // Push access OR being the PR's own author — gates close/reopen only.
   // Merge, auto-merge, update-branch and draft-toggle stay push-only.
   canModifyOwn: boolean;
 }) {
+  // A merged PR replaces the mergeability banner + Review/Merge/Close grid
+  // below with a single positive card — there's nothing actionable left to
+  // show once GitHub has actually merged the branches (as opposed to just
+  // closing the PR unmerged, which keeps today's disabled-grid behavior).
+  const merged = isMergedPull(item);
+  // Tracks the false -> true flip of `merged` *while this component stays
+  // mounted*, so `MergedPullCard`'s focus-reclaim effect can distinguish "the
+  // PR just got merged in front of the user" from "the user navigated into
+  // an already-merged PR's detail view" (the list row is a `<button>` that
+  // unmounts on click, so `document.activeElement === document.body` is true
+  // on the latter too — without this gate the card would steal focus on
+  // every ordinary list -> detail entry into a merged PR, not just the live
+  // transition). Initialized to `merged` itself (not `false`) so a fresh
+  // mount that's already merged never reports a transition. Synced via
+  // `useEffect` rather than an inline mutation (contrast `viewRef` elsewhere
+  // in this file) because this needs the *previous* render's value preserved
+  // across React 18 Strict Mode's dev-only double-render — an inline write
+  // would get consumed by the throwaway first pass and silently suppress
+  // `justMerged` on the render that actually commits.
+  const prevMergedRef = useRef(merged);
+  const justMerged = merged && !prevMergedRef.current;
+  useEffect(() => {
+    prevMergedRef.current = merged;
+  }, [merged]);
   const disabled = item.state !== "open" || !!busy;
   const view = item.state === "open" && mergeability ? mergeabilityView(mergeability) : null;
-  const mergeDisabled = disabled || !canPush || (view ? !view.canMerge : false);
-  const mergeTitle = !canPush ? PUSH_ONLY_TITLE : view && !view.canMerge ? view.label : undefined;
+  // Held while an entry/manual refresh is in flight — merging against a
+  // mergeability verdict or state that's mid-refresh could act on stale
+  // data. Only Merge is held; Approve/Comment/Request/Close stay live since
+  // they don't depend on the mergeability verdict.
+  const mergeDisabled = disabled || !canPush || (view ? !view.canMerge : false) || refreshing;
+  const mergeTitle = refreshing
+    ? "Checking latest state…"
+    : !canPush ? PUSH_ONLY_TITLE : view && !view.canMerge ? view.label : undefined;
   const pushDisabled = disabled || !canPush;
   const pushTitle = canPush ? undefined : PUSH_ONLY_TITLE;
   const ownTitle = canModifyOwn ? undefined : PUSH_ONLY_TITLE;
@@ -7537,71 +7817,117 @@ function PullActions({
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
           <GitPullRequest className="size-3.5" />
-          Actions
+          {merged ? "Merge status" : "Actions"}
         </div>
-        {item.state === "open" && provider === "github" && (
-          <Button size="sm" variant="ghost" className="h-7" disabled={!!busy || !canPush} title={pushTitle} onClick={onToggleDraft}>
-            {busy === "draft" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <FilePen className="mr-2 size-3.5" />}
-            {item.draft ? "Mark ready for review" : "Convert to draft"}
+        {/* Everything after the label is one flex cluster (rather than
+            individual siblings of the label under `justify-between`) so the
+            label stays pinned left and the controls stay pinned right no
+            matter how many of these conditionally render — with more than
+            two direct children, `justify-between` spreads space evenly
+            across all of them instead of keeping "label" and "controls" as
+            two groups. */}
+        <div className="flex items-center gap-2">
+          {item.state === "open" && provider === "github" && (
+            <Button size="sm" variant="ghost" className="h-7" disabled={!!busy || !canPush} title={pushTitle} onClick={onToggleDraft}>
+              {busy === "draft" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <FilePen className="mr-2 size-3.5" />}
+              {item.draft ? "Mark ready for review" : "Convert to draft"}
+            </Button>
+          )}
+          {item.state !== "open" && item.mergedAt && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-merged">
+              <GitMerge className="size-3.5" />
+              Merged
+            </span>
+          )}
+          {item.state !== "open" && !item.mergedAt && (
+            <Button size="sm" variant="outline" className="h-7" disabled={reopenDisabled} title={ownTitle} onClick={onReopenPull}>
+              {busy === "reopen" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitPullRequest className="mr-2 size-3.5" />}
+              Reopen
+            </Button>
+          )}
+          {/* Full item + mergeability refresh (C3) — rendered for every PR
+              state, not just open, so a closed/merged PR that was reopened or
+              re-merged elsewhere has a way to catch up without leaving the
+              detail view. */}
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-6"
+            title="Refresh"
+            aria-label="Refresh"
+            disabled={refreshing}
+            onClick={onRefresh}
+          >
+            {refreshing ? <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-hidden /> : <RefreshCw className="size-3.5" />}
           </Button>
-        )}
-        {item.state !== "open" && item.mergedAt && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-merged">
-            <GitMerge className="size-3.5" />
-            Merged
-          </span>
-        )}
-        {item.state !== "open" && !item.mergedAt && (
-          <Button size="sm" variant="outline" className="h-7" disabled={reopenDisabled} title={ownTitle} onClick={onReopenPull}>
-            {busy === "reopen" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitPullRequest className="mr-2 size-3.5" />}
-            Reopen
-          </Button>
-        )}
-        {message && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-success">
-            <CheckCircle2 className="size-3.5" />
-            {message}
-          </span>
-        )}
-        {error && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-danger">
-            <AlertCircle className="size-3.5" />
-            {error}
-          </span>
-        )}
+          {/* Suppressed once merged — the purple "Merged" tag above and the
+              card below already say everything a success line would; the
+              error line stays unconditional since a failed action still needs
+              surfacing regardless of merge state. */}
+          {message && !merged && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-success">
+              <CheckCircle2 className="size-3.5" />
+              {message}
+            </span>
+          )}
+          {error && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-danger">
+              <AlertCircle className="size-3.5" />
+              {error}
+            </span>
+          )}
+        </div>
       </div>
 
       {item.state === "open" && (
         <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-border/50 bg-background/40 px-3 py-2">
-          {mergeabilityLoading && !mergeability ? (
-            <span className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
-              <Loader2 className="size-3.5 animate-spin" /> Checking mergeability…
-            </span>
-          ) : mergeabilityError ? (
+          {mergeabilityError ? (
             <span className="inline-flex items-center gap-1.5 text-[11px] text-danger">
               <AlertCircle className="size-3.5" /> {mergeabilityError}
             </span>
-          ) : view ? (
-            <>
-              <span className={cn("inline-flex items-center gap-1.5 text-[11px]", MERGE_TONE_CLASS[view.tone])}>
-                <span className={cn("size-2 shrink-0 rounded-full bg-current")} />
-                {view.label}
-              </span>
-              {canResolveConflicts && (
-                <Button size="sm" variant="outline" onClick={() => setResolveOpen(true)}>
-                  <GitMerge className="mr-2 size-3.5" />
-                  Resolve with Agetor
-                </Button>
-              )}
-              {resolveConfirmed && (
-                <span className="inline-flex items-center gap-1 text-[11px] text-success">
-                  <CheckCircle2 className="size-3.5" />
-                  Task created and started — check the board
-                </span>
-              )}
-            </>
+          ) : !mergeability ? (
+            // Covers both the initial fetch and the brief window right after
+            // an invalidation (entry-refresh, manual Refresh) clears the
+            // cache but before the mergeability effect's own request has set
+            // `mergeabilityLoading` back to true — without this, that one
+            // frame fell through to "Mergeability unavailable." below.
+            <span className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              <Loader2 className="size-3.5 animate-spin" /> Checking mergeability…
+            </span>
           ) : (
-            <span className="text-[11px] text-muted-foreground">Mergeability unavailable.</span>
+            // No third "Mergeability unavailable." fallback here (dead code
+            // after U3): this branch only renders when `mergeabilityError` is
+            // unset AND `mergeability` is truthy, and the banner itself only
+            // renders for `item.state === "open"` (see the wrapping block
+            // above) — so `mergeabilityView(mergeability)` is unconditionally
+            // defined at this point. Recomputed locally (rather than reusing
+            // the `view` computed above, which is typed nullable because it
+            // also covers non-open states for `mergeDisabled`/`mergeTitle`)
+            // purely to let TypeScript see that non-null-ness without a `!`
+            // assertion.
+            (() => {
+              const bannerView = mergeabilityView(mergeability);
+              return (
+                <>
+                  <span className={cn("inline-flex items-center gap-1.5 text-[11px]", MERGE_TONE_CLASS[bannerView.tone])}>
+                    <span className={cn("size-2 shrink-0 rounded-full bg-current")} />
+                    {bannerView.label}
+                  </span>
+                  {canResolveConflicts && (
+                    <Button size="sm" variant="outline" onClick={() => setResolveOpen(true)}>
+                      <GitMerge className="mr-2 size-3.5" />
+                      Resolve with Agetor
+                    </Button>
+                  )}
+                  {resolveConfirmed && (
+                    <span className="inline-flex items-center gap-1 text-[11px] text-success">
+                      <CheckCircle2 className="size-3.5" />
+                      Task created and started — check the board
+                    </span>
+                  )}
+                </>
+              );
+            })()
           )}
           <div className="ml-auto flex items-center gap-2">
             {caps.updateBranch && view?.showUpdateBranch && (
@@ -7610,153 +7936,46 @@ function PullActions({
                 Update branch
               </Button>
             )}
-            <Button
-              size="icon"
-              variant="ghost"
-              className="size-6"
-              title="Refresh mergeability"
-              aria-label="Refresh mergeability"
-              disabled={mergeabilityLoading}
-              onClick={onRefreshMergeability}
-            >
-              {mergeabilityLoading ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-            </Button>
           </div>
         </div>
       )}
 
-      <div className="grid gap-3 lg:grid-cols-3">
-        <div className="min-w-0">
-          <div className="mb-1 flex items-center justify-between gap-2">
-            <span className="text-[11px] font-medium uppercase text-muted-foreground">Review</span>
-            {pendingCount > 0 && (
-              <span className="inline-flex items-center gap-1 text-[11px] text-info">
-                <MessageSquare className="size-3 shrink-0" />
-                {pendingCount} inline comment{pendingCount === 1 ? "" : "s"} queued
-              </span>
-            )}
-          </div>
-          <Textarea
-            value={reviewDraft}
-            onChange={(e) => onReviewDraftChange(e.target.value)}
-            placeholder={pendingCount > 0 ? "Optional review summary — submits the queued comments" : "Review note..."}
-            className="min-h-20 resize-y text-xs"
-            disabled={disabled}
-          />
-          <div className="mt-2 flex flex-wrap gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={disabled}
-              onClick={() => onReview("APPROVE")}
-            >
-              {busy === "APPROVE" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <CheckCircle2 className="mr-2 size-3.5" />}
-              Approve
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={disabled || (!reviewDraft.trim() && pendingCount === 0)}
-              onClick={() => onReview("COMMENT")}
-            >
-              {busy === "COMMENT" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}
-              Comment
-            </Button>
-            {caps.requestChanges && (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={disabled || (!reviewDraft.trim() && pendingCount === 0)}
-                onClick={() => onReview("REQUEST_CHANGES")}
-              >
-                {busy === "REQUEST_CHANGES" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
-                Request
-              </Button>
-            )}
-          </div>
-        </div>
-
-        <div className="min-w-0">
-          <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Merge</div>
-          <Select
-            value={mergeMethod}
-            onChange={(e) => onMergeMethodChange(e.target.value as GitHubPullMergeMethod)}
-            className="h-8 text-xs"
-            disabled={disabled}
-            title="Merge method"
-            aria-label="Merge method"
-          >
-            {caps.mergeMethods.map((method) => (
-              <option key={method} value={method}>
-                {mergeMethodLabel(method, provider)}
-              </option>
-            ))}
-          </Select>
-          <Button
-            size="sm"
-            className="mt-2"
-            disabled={mergeDisabled}
-            title={mergeTitle}
-            onClick={onMerge}
-          >
-            {busy === "merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
-            Merge
-          </Button>
-          {item.state === "open" && caps.autoMerge && (
-            <div className="mt-2 flex items-center gap-2">
-              {mergeability?.autoMerge ? (
-                <>
-                  <span className="inline-flex items-center gap-1 text-[11px] text-success">
-                    <CheckCircle2 className="size-3.5" /> Auto-merge enabled
-                  </span>
-                  <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onToggleAutoMerge}>
-                    {busy === "auto-merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : null}
-                    Disable
-                  </Button>
-                </>
-              ) : (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={pushDisabled || !mergeability}
-                  title={!canPush ? PUSH_ONLY_TITLE : !mergeability ? "Waiting for mergeability…" : undefined}
-                  onClick={onToggleAutoMerge}
-                >
-                  {busy === "auto-merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
-                  Enable auto-merge
-                </Button>
-              )}
-            </div>
-          )}
-        </div>
-
-        <div className="min-w-0">
-          <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Close</div>
-          <Textarea
-            value={closeDraft}
-            onChange={(e) => onCloseDraftChange(e.target.value)}
-            placeholder="Optional close comment..."
-            className="min-h-20 resize-y text-xs"
-            disabled={disabled}
-          />
-          <Button
-            size="sm"
-            variant="outline"
-            className="mt-2"
-            disabled={closeDisabled}
-            title={ownTitle}
-            onClick={onClosePull}
-          >
-            {busy === "close" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
-            Close PR
-          </Button>
-        </div>
-      </div>
+      {merged ? (
+        <MergedPullCard item={item} justMerged={justMerged} />
+      ) : (
+        <PullActionGrid
+          caps={caps}
+          provider={provider}
+          item={item}
+          reviewDraft={reviewDraft}
+          onReviewDraftChange={onReviewDraftChange}
+          pendingCount={pendingCount}
+          disabled={disabled}
+          busy={busy}
+          onReview={onReview}
+          mergeMethod={mergeMethod}
+          onMergeMethodChange={onMergeMethodChange}
+          mergeDisabled={mergeDisabled}
+          mergeTitle={mergeTitle}
+          onMerge={onMerge}
+          mergeability={mergeability}
+          pushDisabled={pushDisabled}
+          pushTitle={pushTitle}
+          onToggleAutoMerge={onToggleAutoMerge}
+          closeDraft={closeDraft}
+          onCloseDraftChange={onCloseDraftChange}
+          closeDisabled={closeDisabled}
+          ownTitle={ownTitle}
+          onClosePull={onClosePull}
+        />
+      )}
 
       {pendingCount > 0 && (
         <div className="mt-3 flex items-start gap-1.5 text-[11px] text-warning">
           <AlertCircle className="mt-px size-3.5 shrink-0" />
-          {pendingCount} review comment{pendingCount === 1 ? "" : "s"} queued — submit via Approve / Comment / Request; merging or closing won't post {pendingCount === 1 ? "it" : "them"}.
+          {merged
+            ? <>{pendingCount} review comment{pendingCount === 1 ? "" : "s"} queued but never submitted — this pull request is merged, so {pendingCount === 1 ? "it" : "they"} can no longer be posted. Discard {pendingCount === 1 ? "it" : "them"} under "Pending review" below.</>
+            : <>{pendingCount} review comment{pendingCount === 1 ? "" : "s"} queued — submit via Approve / Comment / Request; merging or closing won't post {pendingCount === 1 ? "it" : "them"}.</>}
         </div>
       )}
       <ResolveConflictsDialog
@@ -7768,6 +7987,235 @@ function PullActions({
           setTimeout(() => setResolveConfirmed(false), 5_000);
         }}
       />
+    </div>
+  );
+}
+
+/** The Review/Merge/Close 3-column action grid — split out of `PullActions`
+ *  (C11) so the merged/unmerged branch reads as a plain ternary between two
+ *  named components instead of an un-indented else-branch. Receives the
+ *  derived enable/disable flags and titles `PullActions` already computed
+ *  (mergeDisabled, pushDisabled, ...) rather than recomputing them, so
+ *  there's exactly one place that owns that logic. */
+function PullActionGrid({
+  caps,
+  provider,
+  item,
+  reviewDraft,
+  onReviewDraftChange,
+  pendingCount,
+  disabled,
+  busy,
+  onReview,
+  mergeMethod,
+  onMergeMethodChange,
+  mergeDisabled,
+  mergeTitle,
+  onMerge,
+  mergeability,
+  pushDisabled,
+  pushTitle,
+  onToggleAutoMerge,
+  closeDraft,
+  onCloseDraftChange,
+  closeDisabled,
+  ownTitle,
+  onClosePull,
+}: {
+  caps: ProviderCaps;
+  provider: GitProvider | "mixed" | null;
+  item: GitHubListItem;
+  reviewDraft: string;
+  onReviewDraftChange: (body: string) => void;
+  pendingCount: number;
+  disabled: boolean;
+  busy?: string;
+  onReview: (event: GitHubPullReviewEvent) => void;
+  mergeMethod: GitHubPullMergeMethod;
+  onMergeMethodChange: (method: GitHubPullMergeMethod) => void;
+  mergeDisabled: boolean;
+  mergeTitle?: string;
+  onMerge: () => void;
+  mergeability?: GitHubPullMergeability;
+  pushDisabled: boolean;
+  pushTitle?: string;
+  onToggleAutoMerge: () => void;
+  closeDraft: string;
+  onCloseDraftChange: (body: string) => void;
+  closeDisabled: boolean;
+  ownTitle?: string;
+  onClosePull: () => void;
+}) {
+  return (
+    <div className="grid gap-3 lg:grid-cols-3">
+      <div className="min-w-0">
+        <div className="mb-1 flex items-center justify-between gap-2">
+          <span className="text-[11px] font-medium uppercase text-muted-foreground">Review</span>
+          {pendingCount > 0 && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-info">
+              <MessageSquare className="size-3 shrink-0" />
+              {pendingCount} inline comment{pendingCount === 1 ? "" : "s"} queued
+            </span>
+          )}
+        </div>
+        <Textarea
+          value={reviewDraft}
+          onChange={(e) => onReviewDraftChange(e.target.value)}
+          placeholder={pendingCount > 0 ? "Optional review summary — submits the queued comments" : "Review note..."}
+          className="min-h-20 resize-y text-xs"
+          disabled={disabled}
+        />
+        <div className="mt-2 flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={disabled}
+            onClick={() => onReview("APPROVE")}
+          >
+            {busy === "APPROVE" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <CheckCircle2 className="mr-2 size-3.5" />}
+            Approve
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={disabled || (!reviewDraft.trim() && pendingCount === 0)}
+            onClick={() => onReview("COMMENT")}
+          >
+            {busy === "COMMENT" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <MessageSquare className="mr-2 size-3.5" />}
+            Comment
+          </Button>
+          {caps.requestChanges && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={disabled || (!reviewDraft.trim() && pendingCount === 0)}
+              onClick={() => onReview("REQUEST_CHANGES")}
+            >
+              {busy === "REQUEST_CHANGES" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
+              Request
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="min-w-0">
+        <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Merge</div>
+        <Select
+          value={mergeMethod}
+          onChange={(e) => onMergeMethodChange(e.target.value as GitHubPullMergeMethod)}
+          className="h-8 text-xs"
+          disabled={disabled}
+          title="Merge method"
+          aria-label="Merge method"
+        >
+          {caps.mergeMethods.map((method) => (
+            <option key={method} value={method}>
+              {mergeMethodLabel(method, provider)}
+            </option>
+          ))}
+        </Select>
+        <Button
+          size="sm"
+          className="mt-2"
+          disabled={mergeDisabled}
+          title={mergeTitle}
+          onClick={onMerge}
+        >
+          {busy === "merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
+          Merge
+        </Button>
+        {item.state === "open" && caps.autoMerge && (
+          <div className="mt-2 flex items-center gap-2">
+            {mergeability?.autoMerge ? (
+              <>
+                <span className="inline-flex items-center gap-1 text-[11px] text-success">
+                  <CheckCircle2 className="size-3.5" /> Auto-merge enabled
+                </span>
+                <Button size="sm" variant="outline" disabled={pushDisabled} title={pushTitle} onClick={onToggleAutoMerge}>
+                  {busy === "auto-merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : null}
+                  Disable
+                </Button>
+              </>
+            ) : (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={pushDisabled || !mergeability}
+                title={pushTitle ?? (!mergeability ? "Waiting for mergeability…" : undefined)}
+                onClick={onToggleAutoMerge}
+              >
+                {busy === "auto-merge" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <GitMerge className="mr-2 size-3.5" />}
+                Enable auto-merge
+              </Button>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="min-w-0">
+        <div className="mb-1 text-[11px] font-medium uppercase text-muted-foreground">Close</div>
+        <Textarea
+          value={closeDraft}
+          onChange={(e) => onCloseDraftChange(e.target.value)}
+          placeholder="Optional close comment..."
+          className="min-h-20 resize-y text-xs"
+          disabled={disabled}
+        />
+        <Button
+          size="sm"
+          variant="outline"
+          className="mt-2"
+          disabled={closeDisabled}
+          title={ownTitle}
+          onClick={onClosePull}
+        >
+          {busy === "close" ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <XCircle className="mr-2 size-3.5" />}
+          Close PR
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/** Replaces the mergeability banner + `PullActionGrid` once a PR has
+ *  actually been merged (as opposed to closed-unmerged, which keeps the
+ *  ordinary grid via `isMergedPull`'s guard) — there's nothing actionable
+ *  left to show once GitHub has merged the branches. `role="status"` +
+ *  `tabIndex={-1}` so it can take focus itself: when an in-app merge
+ *  unmounts the grid, the browser drops focus to `<body>`, and the effect
+ *  below reclaims it for keyboard/screen-reader users rather than leaving
+ *  them stranded on the document body. */
+function MergedPullCard({ item, justMerged }: { item: GitHubListItem; justMerged: boolean }) {
+  const cardRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // Only steal focus on the actual open -> merged transition (`justMerged`,
+    // computed by the caller) that happens while this card is mounted — never
+    // on an ordinary mount. The list row is a `<button>` that unmounts on
+    // click, so `document.activeElement === document.body` is ALSO true when
+    // the user simply navigates into an already-merged PR's detail view;
+    // without the `justMerged` gate this effect would steal focus on every
+    // such entry, not just the moment a PR flips to merged in front of the
+    // user. No `preventScroll` on the `.focus()` call (dropped from the
+    // previous `{ preventScroll: true }`) so the browser's default
+    // scroll-into-view behavior kicks in — a focus target hidden below the
+    // fold defeats the point of moving focus to it.
+    if (justMerged && document.activeElement === document.body) {
+      cardRef.current?.focus();
+    }
+  }, [justMerged]);
+  const mergedWhen = fmtRelativeDate(item.mergedAt ?? "");
+  return (
+    <div
+      ref={cardRef}
+      role="status"
+      tabIndex={-1}
+      className="flex min-h-[7.5rem] flex-col items-center justify-center gap-2 rounded-md border border-merged/40 bg-merged/10 px-3 py-6 text-center"
+    >
+      <GitMerge className="size-6 text-merged" aria-hidden />
+      <span className="text-sm font-medium text-foreground">Pull request successfully merged</span>
+      {/* Only render once `fmtRelativeDate` produces something — an
+          unparsable `mergedAt` would otherwise leave a dangling "Merged ". */}
+      {mergedWhen && <span className="text-xs text-muted-foreground">Merged {mergedWhen}</span>}
     </div>
   );
 }
