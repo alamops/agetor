@@ -1115,14 +1115,12 @@ function AppInner() {
   }, [taskMenu, tasks]);
 
   // Exhaustive dispatch from a `TaskMenuAction` (buildTaskContextMenu's pure
-  // output) to the real App.tsx handler. `snapshot` is the frozen task the
-  // menu was built from (see `taskMenu` above); re-resolve the live task
-  // from `tasksRef` here so the action itself always acts on current state
-  // (e.g. `cancel` sees the current `runId`), falling back to the snapshot
-  // if the task has since vanished. The non-null assertions on
-  // branch/worktreePath/prUrl are safe: `buildTaskContextMenu` only emits
-  // `copy-branch`/`copy-worktree-path`/`view-pr` when those fields are set.
-  const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) => {
+  // output) to the real App.tsx handler. State-transition actions target the
+  // LIVE task (e.g. `cancel` needs the current `runId`); field-derived ones
+  // (`view-pr` / `copy-*`) read the field from the SNAPSHOT the entry was
+  // gated on, falling back to the live task — the live value can't be
+  // trusted to still be set, and a `!` would only hide that.
+const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) => {
     const t = tasksRef.current.find((x) => x.id === snapshot.id) ?? snapshot;
     switch (action) {
       case "open":
@@ -1149,21 +1147,30 @@ function AppInner() {
       case "open-in-finder":
         openInFinder(t);
         break;
-      case "view-pr":
-        viewPullRequest({ projectPath: t.workdir, prUrl: t.prUrl! });
+      case "view-pr": {
+        // Field-derived entries were gated on the SNAPSHOT (the menu the
+        // user saw), so read the field from there and only fall back to the
+        // live task — the live value can't be trusted to still be set.
+        const prUrl = snapshot.prUrl ?? t.prUrl;
+        if (prUrl) viewPullRequest({ projectPath: t.workdir, prUrl });
         break;
+      }
       case "mark-read":
         void markRead(t);
         break;
       case "mark-unread":
         void markUnread(t);
         break;
-      case "copy-branch":
-        void copyToClipboard(t.branch!, "branch name");
+      case "copy-branch": {
+        const branch = snapshot.branch ?? t.branch;
+        if (branch) void copyToClipboard(branch, "branch name");
         break;
-      case "copy-worktree-path":
-        void copyToClipboard(t.worktreePath!, "worktree path");
+      }
+      case "copy-worktree-path": {
+        const worktreePath = snapshot.worktreePath ?? t.worktreePath;
+        if (worktreePath) void copyToClipboard(worktreePath, "worktree path");
         break;
+      }
       case "delete":
         void del(t);
         break;

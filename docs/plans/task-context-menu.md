@@ -371,3 +371,12 @@ on the New Task prompt `textarea` → `false`.
   exists (`hasTextSelection(window.getSelection())`), since that menu is the
   only mouse path to Copy / Look Up / Search With… on selected assistant
   output. Task cards are unaffected (their handler prevents default first).
+- Post-delivery `/code-review` (fresh pass on the final state) — all four
+  findings applied: the menu dismisses on user `wheel` (capture, outside the
+  panel) instead of any `scroll`, because RunPanel's stream auto-pin and
+  xterm output fire programmatic `scroll` events that were closing a fresh
+  menu; the panel prevents default on its own `contextmenu` so a stale text
+  selection can't let the native menu open over ours; field-derived actions
+  (`view-pr`/`copy-*`) read the snapshot they were gated on instead of the
+  live task with `!`; and keyboard navigation (Arrow/Home/End/Enter/Tab +
+  focus restore) got an e2e case.

@@ -169,21 +169,13 @@ function menuItem(page: Page, action: string): Locator {
 
 /**
  * Bring a card fully into view and let `.kanban-scroll`'s horizontal scroll
- * settle before it gets right-clicked. Needed for any card in a column that
- * starts beyond the fixed 1280px test viewport (Review, Done at 6 columns
- * wide): scrolling it into view AND right-clicking it within one
- * Playwright `.click()` call leaves a couple of `scroll` events trailing
- * the click by tens of ms — the browser's native "keep the newly-focused
- * element in view" adjustment (mousedown focuses the card's `tabindex="0"`
- * root) stacked on top of Playwright's own pre-click auto-scroll — landing
- * right in the window where the context menu that click just opened is
- * already listening for a scroll to close itself (by design, matching
- * `InfoTip`). Doing the scroll — and waiting for it to fully settle —
- * *before* the click means neither auto-scroll has anything left to do at
- * click time, so no trailing scroll event races the freshly opened menu.
- * Confirmed empirically: without this, right-clicking a Review-column card
- * opens the menu and then immediately closes it before any assertion can
- * observe it.
+ * settle before it gets right-clicked, so the click lands on a card that is
+ * not moving (cards in the Review/Done columns start beyond the fixed 1280px
+ * test viewport). This used to be load-bearing against the menu's old
+ * close-on-any-`scroll` listener — Playwright's pre-click auto-scroll left
+ * `scroll` events trailing the click by tens of ms, dismissing the menu it
+ * had just opened. The menu now dismisses on user `wheel` only, so this is
+ * purely about deterministic click coordinates.
  */
 async function scrollCardIntoView(page: Page, title: string): Promise<void> {
   const card = taskCard(page, title);
@@ -440,6 +432,55 @@ test.describe("task context menu", () => {
 
     // Cancelled, not confirmed — the card is still on the board.
     await expect(page.getByText(title, { exact: true }).first()).toBeVisible();
+  });
+
+  test("keyboard: arrows/Home/End move focus, Enter activates the focused entry, Tab closes and restores focus", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `ctxmenu-kb ${randomUUID()}`;
+    const task = await createTask(request, backend, { title, prompt: title, workdir: tmpdir() });
+
+    await gotoApp(page, backend.bootBase);
+    await rightClickCard(page, title);
+    await expect(menuItem(page, "open")).toBeFocused();
+
+    // Roving focus over the fresh-backlog entry order from case (a) —
+    // open, start, diff, open-in-finder, delete: Down → second, End → last,
+    // Home → first, Up from the first wraps to the last.
+    await page.keyboard.press("ArrowDown");
+    await expect(menuItem(page, "start")).toBeFocused();
+    await page.keyboard.press("End");
+    await expect(menuItem(page, "delete")).toBeFocused();
+    await page.keyboard.press("Home");
+    await expect(menuItem(page, "open")).toBeFocused();
+    await page.keyboard.press("ArrowUp");
+    await expect(menuItem(page, "delete")).toBeFocused();
+
+    // Tab closes without activating anything and hands focus back to what
+    // had it before the menu opened — the document body here, since a
+    // right-click deliberately does not focus the card.
+    await page.keyboard.press("Tab");
+    await expect(menu(page)).toBeHidden();
+    expect(await page.evaluate(() => document.activeElement === document.body)).toBe(true);
+
+    // Enter activates the FOCUSED entry, not the first one: Down lands on
+    // "Run", Enter starts the task (fake driver), and it leaves Backlog.
+    await rightClickCard(page, title);
+    await expect(menuItem(page, "open")).toBeFocused();
+    await page.keyboard.press("ArrowDown");
+    await expect(menuItem(page, "start")).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(menu(page)).toBeHidden();
+    await expect(async () => {
+      const res = await request.get(`${backend.apiBase}/tasks/${task.id}`, {
+        headers: { authorization: `Bearer ${backend.apiToken}` },
+      });
+      expect(res.ok()).toBeTruthy();
+      const row = (await res.json()) as { column: string };
+      expect(row.column).not.toBe("backlog");
+    }).toPass({ timeout: 10_000 });
   });
 
   test("suppresses the native context menu everywhere except editable text, and opens our own menu on a task card", async ({

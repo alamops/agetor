@@ -160,7 +160,16 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
       e.stopPropagation();
       onCloseRef.current();
     };
-    const onScroll = (e: Event) => {
+    const onWheel = (e: WheelEvent) => {
+      // Dismiss on USER scrolling only. A `scroll` listener (InfoTip's
+      // convention) would also fire for programmatic scrolls elsewhere on
+      // the page — RunPanel's stream auto-pin (`el.scrollTop =
+      // el.scrollHeight` on every chunk) and xterm output — and dismiss a
+      // freshly-opened menu the moment a streaming task produces output.
+      // The menu is cursor-anchored, not element-anchored, so it doesn't
+      // drift when something else scrolls; `wheel` captures trackpad/mouse
+      // scrolling, scrollbar drags already dismiss via the outside-mousedown
+      // path, and keyboard scrolling can't happen while the menu owns focus.
       if (panelRef.current && e.target instanceof Node && panelRef.current.contains(e.target)) return;
       onCloseRef.current();
     };
@@ -170,14 +179,14 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
     document.addEventListener("mousedown", onMouseDown);
     document.addEventListener("contextmenu", onContextMenuOutside, true);
     document.addEventListener("keydown", onKey);
-    document.addEventListener("scroll", onScroll, true);
+    document.addEventListener("wheel", onWheel, { capture: true, passive: true });
     window.addEventListener("resize", onResize);
     window.addEventListener("blur", onBlur);
     return () => {
       document.removeEventListener("mousedown", onMouseDown);
       document.removeEventListener("contextmenu", onContextMenuOutside, true);
       document.removeEventListener("keydown", onKey);
-      document.removeEventListener("scroll", onScroll, true);
+      document.removeEventListener("wheel", onWheel, { capture: true });
       window.removeEventListener("resize", onResize);
       window.removeEventListener("blur", onBlur);
     };
@@ -242,6 +251,11 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
       tabIndex={-1}
       onKeyDown={onKeyDown}
       onClick={(e) => e.stopPropagation()}
+      // The menu always owns right-clicks on itself: App's document-level
+      // suppressor deliberately lets the native menu through while read-only
+      // text is selected, and a stale selection elsewhere on the page must
+      // not let WebKit's menu open on top of ours.
+      onContextMenu={(e) => e.preventDefault()}
       style={pos ? { top: pos.top, left: pos.left } : { top: 0, left: 0, visibility: "hidden" }}
       className="fixed z-50 max-h-[calc(100vh-16px)] min-w-44 overflow-y-auto rounded-md border border-border bg-card p-1 text-sm text-card-foreground shadow-xl"
     >

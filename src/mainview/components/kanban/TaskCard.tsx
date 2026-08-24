@@ -104,9 +104,9 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
       // The card is focusable (dnd-kit's `attributes` below add
       // `tabIndex=0`), so a right-click would otherwise focus it and WebKit
       // scrolls a partially-visible card into view inside `.kanban-scroll`;
-      // the trailing `scroll` events then hit the freshly-opened menu's
-      // scroll-close listener and dismiss it before the user sees it. Only
-      // suppress the default for the right button — left-click focus/drag
+      // the board would visibly jump (and focus would land on the card)
+      // under the freshly-opened menu. Only suppress the default for the
+      // right button — left-click focus/drag
       // behavior (dnd-kit's `PointerSensor`, wired via `{...listeners}`
       // below as `onPointerDown`, so there's no prop collision here) is
       // untouched, and `contextmenu` still fires after a default-prevented
