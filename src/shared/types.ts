@@ -854,6 +854,15 @@ export interface Task {
    * dedicated mark-seen route.
    */
   unread?: boolean;
+  /**
+   * Derived, never stored: `last_assistant_event_id != null` — the task has
+   * observed at least one top-level `assistant` event, so there is something
+   * a "Mark as unread" (`DELETE /tasks/:id/seen`) can honestly re-flag. The
+   * board's task context menu gates that entry on this so the "New messages"
+   * dot is never shown for a task with no assistant messages. Optional and
+   * server-managed for exactly the same reasons as `unread` above.
+   */
+  hasAssistantMessages?: boolean;
   createdAt: number;
   updatedAt: number;
   /**
