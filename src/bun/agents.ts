@@ -880,7 +880,12 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler, ru
     const settleMs = Number.isFinite(parsedSettleMs)
       ? Math.max(FAKE_CLAUDE_MONITOR_MIN_SETTLE_MS, parsedSettleMs)
       : FAKE_CLAUDE_MONITOR_DEFAULT_SETTLE_MS;
-    const monitorId = `fake-monitor-${taskId}`;
+    // Keyed on the RUN, not the task: `subagentsDb.insertIfAbsent` is
+    // INSERT OR IGNORE, so a task-keyed id would collide with the already-
+    // `completed` row from a previous run (an e2e retry, Stop→Start, a re-run
+    // of the marker prompt) and silently degrade to a plain fake turn with no
+    // hold. Same reasoning as `fakePlanCallCounter` in the cursor fake.
+    const monitorId = `fake-monitor-${runId ?? taskId}`;
     after(5, () => {
       onChunk(
         "tool_use",

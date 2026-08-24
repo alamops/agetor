@@ -128,6 +128,33 @@ async function insertRunningBgShell(taskId: string): Promise<string> {
   return id;
 }
 
+/** Mirrors `insertRunningBgShell` for a `parentKind: "monitor"` row — the
+ *  DB/hold-gate representation of a live Claude Code `Monitor` tool call
+ *  (see docs/plans/claude-code-monitors-hold-running.md §3). `hasRunning`
+ *  and the release predicate are kind-agnostic, so this should hold/release
+ *  identically to a `"subagent"`/`"bg_session"` row. `sourcePath` is empty —
+ *  a monitor has no transcript file of its own; its `toolUseId` is the
+ *  correlation key back to the launch `tool_use` block. */
+async function insertRunningMonitor(taskId: string): Promise<string> {
+  const { subagents } = await import("./db.ts");
+  const id = `monitor-${randomUUID()}`;
+  subagents.insertIfAbsent({
+    id,
+    taskId,
+    runId: null,
+    parentKind: "monitor",
+    agentType: "monitor",
+    description: "test monitor",
+    spawnDepth: 1,
+    sourcePath: "",
+    toolUseId: `toolu-${randomUUID()}`,
+    status: "running",
+    startedAt: Date.now(),
+    endedAt: null,
+  });
+  return id;
+}
+
 test("hold: a succeeded run with a running subagent keeps the task in running", async () => {
   const { startTask } = await import("./orchestrator.ts");
   const { tasks, runs } = await import("./db.ts");
@@ -474,4 +501,140 @@ test("Stop on a held task releases it: cancelRun orphans subagents and moves the
   const task = tasks.get(taskId);
   expect(task?.column).toBe("review");
   expect(subagents.hasRunning(taskId)).toBe(false);
+});
+
+// ── monitor (Claude Code Monitor) hold coverage ─────────────────────────────
+// docs/plans/claude-code-monitors-hold-running.md §3: a live Claude Code
+// `Monitor` tool call is tracked as a `parentKind: "monitor"` subagents row
+// and must hold/release exactly like a `"subagent"`/`"bg_session"` row —
+// `hasRunning` and the release predicate are kind-agnostic by design (no
+// orchestrator/db changes needed for the hold itself).
+
+test("hold: a succeeded run with a running monitor row keeps the task in running and emits the hold breadcrumb", async () => {
+  const { startTask, subscribe } = await import("./orchestrator.ts");
+  const { tasks, runs } = await import("./db.ts");
+
+  const taskId = await createClaudeTask("hold-monitor");
+  await insertRunningMonitor(taskId);
+
+  // Capture live-broadcast status events the same way
+  // "createTask + startTask runs to completion and emits stdout" does —
+  // the hold breadcrumb (orchestrator.ts, the `holdForSubagents` branch) is
+  // only ever `emit()`-ed for SSE fan-out, never `runs.appendEvent`-persisted,
+  // so it must be caught in flight via `subscribe`, not read back from
+  // `runs.eventsForTask`.
+  const statuses: string[] = [];
+  const unsub = subscribe((e) => {
+    if (e.stream === "status") statuses.push(e.data);
+  });
+
+  const res = await startTask(taskId);
+  if (!("runId" in res)) throw new Error("expected the run to start");
+  const runId = res.runId;
+
+  await wait(250);
+  unsub();
+
+  const task = tasks.get(taskId);
+  expect(task?.column).toBe("running");
+  const run = runs.get(runId);
+  expect(run?.status).toBe("succeeded");
+
+  // Pinned UI-facing copy — assert on it verbatim, don't paraphrase it.
+  expect(statuses).toContain("background agents still running (1) — holding in running");
+});
+
+test("release: settleSubagentById(id, \"completed\", \"receipt\") on a monitor row releases the task to review", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, subagents } = await import("./db.ts");
+  const { settleSubagentById } = await import("./claude-subagents.ts");
+
+  const taskId = await createClaudeTask("hold-monitor-release");
+  const monitorId = await insertRunningMonitor(taskId);
+
+  const res = await startTask(taskId);
+  if (!("runId" in res)) throw new Error("expected the run to start");
+  await wait(250);
+
+  // Sanity: confirm the task is actually held before driving the release.
+  expect(tasks.get(taskId)?.column).toBe("running");
+  expect(subagents.hasRunning(taskId)).toBe(true);
+
+  // Drive the same externally-detected-completion path a live monitor
+  // terminal `<task-notification>` (or the restart-safe journal scan) takes:
+  // `settleSubagentById(..., "receipt")` settles the row and fires the
+  // orchestrator's release hook (`maybeReleaseHeldTask`) itself.
+  const changed = settleSubagentById(monitorId, "completed", "receipt");
+  expect(changed).toBe(true);
+
+  expect(subagents.hasRunning(taskId)).toBe(false);
+  const task = tasks.get(taskId);
+  expect(task?.column).toBe("review");
+});
+
+test("hasRunning treats monitor and bg_session rows alike: settling one leaves the hold intact, settling both releases (count-agnostic)", async () => {
+  const { startTask } = await import("./orchestrator.ts");
+  const { tasks, subagents } = await import("./db.ts");
+  const { settleSubagentById } = await import("./claude-subagents.ts");
+
+  const taskId = await createClaudeTask("hold-monitor-mixed");
+  const monitorId = await insertRunningMonitor(taskId);
+  const bgId = await insertRunningBgShell(taskId);
+
+  const res = await startTask(taskId);
+  if (!("runId" in res)) throw new Error("expected the run to start");
+  await wait(250);
+
+  expect(tasks.get(taskId)?.column).toBe("running");
+  expect(subagents.hasRunning(taskId)).toBe(true);
+  expect(subagents.runningCountForTask(taskId)).toBe(2);
+
+  // Settle only the monitor row — the bg_session row is still running, so
+  // the mixed-kind hold must stay intact and the task must not release.
+  const monitorChanged = settleSubagentById(monitorId, "completed", "receipt");
+  expect(monitorChanged).toBe(true);
+
+  expect(subagents.hasRunning(taskId)).toBe(true);
+  expect(tasks.get(taskId)?.column).toBe("running");
+
+  // Now settle the bg_session row too — the last hold clears, task releases,
+  // regardless of how many rows or which kinds were involved.
+  const bgChanged = settleSubagentById(bgId, "completed");
+  expect(bgChanged).toBe(true);
+
+  expect(subagents.hasRunning(taskId)).toBe(false);
+  expect(tasks.get(taskId)?.column).toBe("review");
+});
+
+test("cancelled wins over a monitor hold: task goes to ready, not running", async () => {
+  const { startTask, cancelRun } = await import("./orchestrator.ts");
+  const { tasks } = await import("./db.ts");
+
+  const taskId = await createClaudeTask("hold-monitor-cancel");
+  await insertRunningMonitor(taskId);
+
+  const res = await startTask(taskId);
+  if (!("runId" in res)) throw new Error("expected the run to start");
+  const runId = res.runId;
+
+  // Cancel immediately — the fake driver's success path doesn't resolve
+  // `done()` until ~20ms, so this races ahead of it deterministically.
+  const cancelled = cancelRun(runId);
+  expect(cancelled).toBe(true);
+
+  await wait(250);
+
+  const task = tasks.get(taskId);
+  expect(task?.column).toBe("ready");
+});
+
+test("subagents.runningCountForTask and runningCountsByTask count a monitor row — what the board badge shows", async () => {
+  const { subagents } = await import("./db.ts");
+
+  const taskId = await createClaudeTask("hold-monitor-count");
+  await insertRunningMonitor(taskId);
+
+  expect(subagents.runningCountForTask(taskId)).toBe(1);
+  const counts = subagents.runningCountsByTask();
+  expect(counts.get(taskId)).toBe(1);
 });

@@ -2560,7 +2560,7 @@ export type SubagentStatus =
  * session (`"bg_session"`); a Claude Code Workflow (`/workflow`) run's container
  * row (`"workflow"` — id = the workflow's background taskId, sourcePath = its
  * transcriptDir, no event stream of its own — exists to hold the task in
- * `running` for the workflow's lifetime); and one agent inside a workflow
+ * `running` for the workflow's lifetime); one agent inside a workflow
  * (`"workflow_agent"` — a normal sidechain transcript rendered as a read-only
  * tab); and a Claude Code `Monitor` the main agent armed (`"monitor"` — id =
  * the monitor's `taskId` from its launch stub, no source file of its own, its

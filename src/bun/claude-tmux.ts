@@ -4004,7 +4004,7 @@ const WORKING_LINE_RE = new RegExp(
     `^\\s*${SPINNER_GLYPH}\\s+Waiting for \\d+ background agent`,
     "\\d+\\s+shells?\\s+still\\s+running",
     "·\\s*\\d+\\s+shells?\\s*(?:·|$)",
-    "\\d+\\s+monitors?\\s+still\\s+running",
+    `^\\s*${SPINNER_GLYPH}[^\\n]*·\\s*\\d+\\s+monitors?\\s+still\\s+running`,
     "·\\s*\\d+\\s+monitors?\\s*(?:·|$)",
   ].join("|"),
   "i",
