@@ -4,11 +4,11 @@ import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
   Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, RefreshCw, Search, Send, Slash, SquareSlash,
+  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Radar, RefreshCw, Search, Send, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
-import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
+import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { EXPAND_EVENT, isExpandTargetFor } from "@/lib/expand-on-jump";
@@ -1467,6 +1467,40 @@ function RunPanelBody({
     return runs.some((r) => r.status === "running") ? "active" : "off";
   }, [activeStream, subagentList, interactions.length, runs]);
 
+  /** Summary for the "Holding in running" line on the Main stream: the turn
+   *  itself has resolved (no run is `running`, no interaction card is up) but
+   *  the card is still parked in the `running` column because background work
+   *  (a Monitor, a bg shell, a workflow, or an in-session subagent) hasn't
+   *  settled yet — see `holdForSubagents` in orchestrator.ts, the DB-side
+   *  predicate this line explains to the user. `null` whenever nothing is
+   *  held, so the render site can gate on a single truthy check. Cheap: one
+   *  pass over `subagentList`, which the 2s poll already rebuilds regardless.
+   */
+  const holdSummary = useMemo(() => {
+    if (activeStream !== "main") return null;
+    if (task.column !== "running") return null;
+    if (interactions.length > 0) return null;
+    if (runs.some((r) => r.status === "running")) return null;
+    if (!anySubagentRunning(subagentList)) return null;
+    const running = subagentList.filter((s) => s.status === "running");
+    let monitors = 0;
+    let shells = 0;
+    let workflows = 0;
+    let agents = 0;
+    for (const s of running) {
+      if (s.parentKind === "monitor") monitors++;
+      else if (s.parentKind === "bg_session") shells++;
+      else if (s.parentKind === "workflow") workflows++;
+      else agents++;
+    }
+    const parts: string[] = [];
+    if (monitors > 0) parts.push(`${monitors} monitor${monitors > 1 ? "s" : ""}`);
+    if (shells > 0) parts.push(`${shells} shell${shells > 1 ? "s" : ""}`);
+    if (workflows > 0) parts.push(`${workflows} workflow${workflows > 1 ? "s" : ""}`);
+    if (agents > 0) parts.push(`${agents} agent${agents > 1 ? "s" : ""}`);
+    return parts.length > 0 ? `Holding in running — ${parts.join(" · ")} still active` : null;
+  }, [activeStream, task.column, interactions.length, runs, subagentList]);
+
   // The run-status RunEventList uses to gate its bottom heartbeat. On a
   // background-agent tab this must reflect THAT subagent's status, not the main
   // run's — otherwise a subagent still running after the parent turn resolved
@@ -2685,6 +2719,7 @@ function RunPanelBody({
                 onInteractionResolved={dismissInteraction}
                 runStatus={activeRunStatus}
                 indicatorMode={indicatorMode}
+                holdSummary={holdSummary}
                 taskId={task.id}
                 plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
                 onOpenPlan={onOpenPlan}
@@ -3360,8 +3395,12 @@ function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean
           Task-tool subagents in a mixed strip. Keyed on parentKind — the
           actual discriminator for "is this a bg shell" — rather than
           agentType, which is just the literal string bg shells happen to
-          carry. */}
+          carry. A Claude Code Monitor (parentKind "monitor") gets its own
+          radar glyph for the same reason — its label already reads "monitor"
+          via the `agentType ?? "agent"` fallback above, but the icon still
+          needs to read as distinct from a plain Task-tool subagent tab. */}
       {s.parentKind === "bg_session" && <Terminal className="size-3 shrink-0 text-muted-foreground" />}
+      {s.parentKind === "monitor" && <Radar className="size-3 shrink-0 text-muted-foreground" />}
       <span className="max-w-[10rem] truncate">{label}</span>
       {s.description && (
         <span className="max-w-[12rem] truncate text-muted-foreground/70">· {s.description}</span>
@@ -3597,6 +3636,7 @@ function RunEventList({
   onInteractionResolved,
   runStatus,
   indicatorMode = "off",
+  holdSummary = null,
   taskId,
   plans = [],
   onOpenPlan,
@@ -3607,6 +3647,13 @@ function RunEventList({
   onInteractionResolved?: (id: string) => void;
   runStatus?: Run["status"] | null;
   indicatorMode?: RunIndicatorMode;
+  /** Non-null when the Main stream's turn has resolved but the task is still
+   *  held in `running` by background work (a Monitor, a bg shell, a workflow,
+   *  or a subagent) — rendered as a `HoldingIndicator` instead of the regular
+   *  `RunningIndicator`, mutually exclusive with it. Computed by the caller
+   *  (`holdSummary` in `RunPanelBody`) since it needs `task.column` and
+   *  `runs`, neither of which this component has. */
+  holdSummary?: string | null;
   /** Threaded through to each `UserMessageBlock`'s `AttachmentChips` so a
    *  relative attachment ref can resolve against the task's worktree/workdir
    *  when the user clicks it. */
@@ -3906,6 +3953,7 @@ function RunEventList({
         </section>
       ))}
       {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
+      {holdSummary && <HoldingIndicator text={holdSummary} />}
     </div>
   );
 }
@@ -3925,6 +3973,25 @@ function RunningIndicator() {
         <span className="relative inline-flex size-2 rounded-full bg-success" />
       </span>
       <span>Agent is working…</span>
+    </div>
+  );
+}
+
+/**
+ * Pinned-at-bottom explainer for the "held in running" state: the turn itself
+ * has resolved but the card stays in `running` because background work (a
+ * Monitor, a bg shell, a workflow, or a subagent) hasn't settled yet — see
+ * `holdSummary` above for the gating. Deliberately mutually exclusive with
+ * `RunningIndicator` (only one of the two is ever rendered) and visually
+ * quieter — a steady dot rather than `RunningIndicator`'s pulsing one, since
+ * nothing is happening on the Main stream right now; the activity is
+ * elsewhere, in the background tabs this line points at.
+ */
+function HoldingIndicator({ text }: { text: string }) {
+  return (
+    <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+      <span className="inline-flex size-2 shrink-0 rounded-full bg-info" />
+      <span>{text}</span>
     </div>
   );
 }

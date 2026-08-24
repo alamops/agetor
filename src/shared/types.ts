@@ -2562,7 +2562,10 @@ export type SubagentStatus =
  * transcriptDir, no event stream of its own — exists to hold the task in
  * `running` for the workflow's lifetime); and one agent inside a workflow
  * (`"workflow_agent"` — a normal sidechain transcript rendered as a read-only
- * tab).
+ * tab); and a Claude Code `Monitor` the main agent armed (`"monitor"` — id =
+ * the monitor's `taskId` from its launch stub, no source file of its own, its
+ * tab streams each `<event>` the monitor reports; holds the task in `running`
+ * until the monitor times out or is stopped).
  */
 export interface Subagent {
   /** Claude's agentId — the basename of `subagents/agent-<id>.jsonl`. */
@@ -2570,7 +2573,7 @@ export interface Subagent {
   taskId: string;
   /** Parent run that was in flight when this subagent was spawned. */
   runId: string | null;
-  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent";
+  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent" | "monitor";
   /** Registered subagent type, e.g. "Explore" / "general-purpose". */
   agentType: string | null;
   /** Short human label from the spawning Agent tool call. */

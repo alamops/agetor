@@ -171,6 +171,131 @@
  * Gated behind `AGETOR_TRACK_BG_SHELLS`, nested under `ENABLED` exactly like
  * `WORKFLOWS_ENABLED` — see `BG_SHELLS_ENABLED`.
  *
+ * ── Monitors (the `Monitor` tool) ──────────────────────────────────────────
+ *
+ * A `Monitor` tool call is claude's own long-running-watch primitive — what
+ * `/loop` and "watch this log" workflows use. The model arms a shell command
+ * (`tail -f a build log`, `poll a CI run`) and gets notified on every event
+ * the command produces, without polling or sleeping itself. Structurally it
+ * is the closest existing kind to a background shell: no sidecar transcript
+ * file, no `subagents/` dir entry — just two lines in the MAIN session
+ * JSONL to correlate a launch, and a `<task-notification>` for every event
+ * afterwards. Unlike a bg shell, though, a monitor's own notifications are
+ * NOT a stub-then-done story: a monitor typically fires MANY notifications
+ * over its life (one per event it observes) and only the LAST one is a
+ * completion — every prior one is pure activity the card must stay `running`
+ * through, not a receipt to settle on.
+ *
+ * Verified live shapes (claude-code 2.1.241):
+ *   - Launch, half 1 — assistant `tool_use`:
+ *       {"type":"assistant","message":{"content":[{"type":"tool_use",
+ *        "id":"toolu_01…","name":"Monitor","input":{"command":"tail -f …",
+ *        "description":"serial re-run of 3 specs","timeout_ms":1500000,
+ *        "persistent":false}}]}}
+ *     `persistent:true` means no timeout — the monitor ends only via
+ *     TaskStop.
+ *   - Launch, half 2 — the immediate stub `tool_result`:
+ *       {"type":"user","message":{"content":[{"tool_use_id":"toolu_01…",
+ *        "type":"tool_result","content":"Monitor started (task bvkdtb50u,
+ *        timeout 1500000ms). You will be notified on each event. Keep
+ *        working — do not poll or sleep. …"}]},
+ *        "toolUseResult":{"taskId":"bvkdtb50u","timeoutMs":1500000,
+ *        "persistent":false},"timestamp":"2026-08-24T17:29:33.236Z"}
+ *     The correlation key is `taskId` — NOT `backgroundTaskId` (bg shells)
+ *     — and it is also the row PK / the `<task-id>` every later
+ *     notification for this monitor carries.
+ *   - Event — a `queue-operation`/`enqueue` line AND a synthetic `user` line
+ *     tagged `origin.kind:"task-notification"` (the SAME dual-shape ordinary
+ *     background-task notifications use), both carrying:
+ *       <task-notification>
+ *         <task-id>bvkdtb50u</task-id>
+ *         <summary>Monitor event: "serial re-run of 3 specs"</summary>
+ *         <event>Error: expect(locator).toBeVisible() failed …</event>
+ *       </task-notification>
+ *     Critically, an ordinary event carries NO `<status>` tag — the presence
+ *     of a `<status>` (or its absence) can't distinguish an event from a
+ *     completion the way it does for every other notified kind.
+ *   - Terminal (timeout) — the identical envelope with
+ *     `<event>[Monitor timed out — re-arm if needed.]</event>`. A TaskStop'd
+ *     monitor's exact shape is unverified — inferred to carry either a
+ *     terminal `<status>` (the CLI's generic "was stopped" template) or
+ *     another bracketed `[Monitor …]` event, hence `MONITOR_TERMINAL_EVENT_RE`
+ *     recognising several verbs defensively, not just "timed out".
+ *   - There is NO heartbeat line at all while a monitor is alive between
+ *     events — a quiet monitor produces zero bytes anywhere this module can
+ *     see, which is exactly why it needs its own ceiling (below) rather than
+ *     the file-backed staleness backstop (`checkStale`) that assumes a
+ *     transcript to go quiet.
+ *
+ * We model a monitor as one `subagents` row (`parentKind: "monitor"`,
+ * `agentType: "monitor"`, id = the launch stub's `taskId`), tracked in its
+ * OWN map (`monitors`, a `MonitorState` — deliberately NOT a `FileState`,
+ * mirroring `WorkflowState`/`BgShellState`'s "own map, never `files`"
+ * posture: there is no transcript file to tail, so none of `FileState`'s
+ * uuid-dedup/end_turn-detection/mapper machinery applies). Row creation is
+ * the same two-line launch correlation the bg-shell half uses —
+ * `scanLineForMonitorLaunch` (prefilters on `"name":"Monitor"`, remembers
+ * `{description, timeoutMs, persistent}` under the tool_use id in a capped
+ * pending map) then `scanLineForMonitorStub` (prefilters on `"taskId"` +
+ * `Monitor started`, correlates via the enclosing `tool_use_id`, inserts the
+ * row) — both called from `scanMainSignals` alongside the bg-shell scans.
+ *
+ * The ONE monitor-specific piece of logic is the receipt rule
+ * (`applyMonitorNotification`, plus its DB-only twin
+ * `applyMonitorNotificationForRow` for a watcher-less task): a notification
+ * naming a tracked monitor is TERMINAL iff its `<status>` is one of
+ * `TERMINAL_NOTIFICATION_STATUSES` OR its `<event>` text matches
+ * `MONITOR_TERMINAL_EVENT_RE` — anything else is ACTIVITY, not completion.
+ * Terminal settles the row exactly like every other kind
+ * (`settleSubagentById(id, "completed", "receipt")`, latching
+ * `receiptSettled` first — same unconditional-latch posture bg shells use,
+ * see review fix R2 in `scanLineForTaskNotification`'s doc — so a
+ * ceiling-settled row can never be resurrected by a stray trailing receipt).
+ * Activity bumps `lastActivityAt`, persists+emits the `<event>` text as a
+ * `stdout` line on the monitor's own tab (dedup key
+ * `monitor:<id>:<fnv1aHex(block)>` — a content hash, not an offset, because
+ * the SAME event legitimately arrives via two adjacent lines — the
+ * `queue-operation` enqueue and the `user`/origin line — in one scan pass,
+ * not just across a restart replay), and flips a ceiling-settled (never
+ * receipt-settled) row back to `running`, mirroring
+ * `checkBgShellCeiling`'s flip-back for the same "the ceiling was only a
+ * guess" reason.
+ *
+ * `checkMonitorCeiling` is the bounded-hold half: a monitor has no file to
+ * grow, so its ceiling has no growth-watch counterpart to
+ * `checkBgShellCeiling`'s — flip-back happens ONLY through
+ * `applyMonitorNotification` reacting to a later event, never a per-tick
+ * `statSync`. A timed monitor (`persistent === false`, `timeoutMs` known)
+ * settles once `now > startedAt + timeoutMs + MONITOR_TIMEOUT_MARGIN_MS` —
+ * claude itself kills the monitor at its own deadline, so this only fires
+ * when that termination's notification is lost. A persistent monitor, or
+ * one rehydrated after a restart (`timeoutMs`/`persistent` are in-memory
+ * only, never persisted — a reattached row always falls into this branch),
+ * settles once `now - lastActivityAt > MONITOR_DEFAULT_STALE_MS` — the same
+ * activity-anchored staleness posture `checkStale`/`checkBgShellCeiling`
+ * both use, since a persistent monitor's lifetime legitimately spans long
+ * idle gaps between events with no other terminal signal besides TaskStop.
+ *
+ * Live dispatch (`handleBackgroundTaskNotification`, the module export the
+ * orchestrator's `setBackgroundTaskSettledHandler` wiring calls in place of
+ * `settleSubagentById` directly) routes a notification to the task's
+ * attached watcher's own `applyMonitorNotification` when it already tracks
+ * the id as a monitor — the cheapest, most in-sync path — and only falls
+ * back to the DB-only `applyMonitorNotificationForRow` when no watcher
+ * knows the id yet (a spawn/first-notification race, or a genuine gap in
+ * coverage). Every OTHER id — the overwhelming majority, since only
+ * monitors get this treatment — keeps today's exact behavior:
+ * `settleSubagentById(id, "completed", "receipt")` unconditionally, since a
+ * notification for a subagent/workflow/bg-shell row IS always terminal.
+ *
+ * Rehydration routes a `parentKind === "monitor"` DB row into `monitors`
+ * (never `files`), seeding `lastActivityAt` to the rehydration timestamp and
+ * `receiptSettled` to whatever the DB status already implies (`!== "running"`)
+ * — mirroring `BgShellState`'s rehydration posture exactly.
+ *
+ * Gated behind `AGETOR_TRACK_MONITORS`, nested under `ENABLED` exactly like
+ * `BG_SHELLS_ENABLED`/`WORKFLOWS_ENABLED` — see `MONITORS_ENABLED`.
+ *
  * This module is READ-ONLY w.r.t. the agent: it watches files and tails them.
  * It never spawns, signals, or tears down a tmux session — `detach()` only
  * closes fs watchers + the poll timer.
@@ -178,9 +303,10 @@
  * The format is internal to claude and the docs warn it can change between
  * versions, so everything here is defensive (missing dir / meta / fields all
  * degrade gracefully) and gated behind AGETOR_TRACK_SUBAGENTS (default on),
- * with the workflow half additionally gated behind AGETOR_TRACK_WORKFLOWS and
- * the bg-shell half behind AGETOR_TRACK_BG_SHELLS (both default on, nested
- * under the former — see `WORKFLOWS_ENABLED` / `BG_SHELLS_ENABLED`).
+ * with the workflow half additionally gated behind AGETOR_TRACK_WORKFLOWS,
+ * the bg-shell half behind AGETOR_TRACK_BG_SHELLS, and the monitor half
+ * behind AGETOR_TRACK_MONITORS (all default on, nested under the former —
+ * see `WORKFLOWS_ENABLED` / `BG_SHELLS_ENABLED` / `MONITORS_ENABLED`).
  * A parse error on one subagent file can never affect the main stream — it is
  * isolated to that file's tail.
  * ────────────────────────────────────────────────────────────────────────── */
@@ -233,6 +359,22 @@ const WORKFLOWS_ENABLED = ENABLED && process.env.AGETOR_TRACK_WORKFLOWS !== "0";
  *  constant's doc for the cache-busting re-import idiom a test needs to flip
  *  this after the module has already loaded). */
 const BG_SHELLS_ENABLED = ENABLED && process.env.AGETOR_TRACK_BG_SHELLS !== "0";
+
+/** Monitor tracking (the `Monitor` tool — what `/loop` and "watch this log"
+ *  workflows use), off only when explicitly disabled — and implicitly off
+ *  whenever subagent tracking as a whole is. Nested exactly like
+ *  `BG_SHELLS_ENABLED`/`WORKFLOWS_ENABLED`: a Monitor is a *kind* of
+ *  background agent, so disabling the outer switch must disable this too. A
+ *  Monitor writes no sidecar file `discover()`'s glob could ever find (its
+ *  whole lifecycle lives in lines of the MAIN session JSONL, exactly like a
+ *  bg shell — see the module header's "Monitors" section), so
+ *  `AGETOR_TRACK_MONITORS=0` restores the pre-feature behavior exactly (no
+ *  rows → no hold → no tab) — the rollback lever if a future claude CLI
+ *  change breaks the on-disk assumptions documented there. Read once at
+ *  module load, mirroring `BG_SHELLS_ENABLED` (see that constant's doc for
+ *  the cache-busting re-import idiom a test needs to flip this after the
+ *  module has already loaded). */
+const MONITORS_ENABLED = ENABLED && process.env.AGETOR_TRACK_MONITORS !== "0";
 
 /** Directory (under `<sessionId>/subagents/`) claude writes workflow transcript
  *  dirs into — one `<wf_runId>/` subdir per launched workflow. Created lazily,
@@ -353,6 +495,46 @@ const BG_SHELL_PENDING_MAX = 50;
  *  own starting offset). No env override — this is an internal safety valve,
  *  not a tunable, mirroring `BG_SHELL_TIMEOUT_MARGIN_MS`'s posture. */
 const BG_SHELL_BATCH_MAX_BYTES = 256 * 1024;
+
+/** Grace margin added on top of a TIMED monitor's own `timeout_ms` (from its
+ *  launch line) before `checkMonitorCeiling` infers completion — mirrors
+ *  `BG_SHELL_TIMEOUT_MARGIN_MS` exactly, for the identical reason: gives
+ *  claude's own timeout enforcement (and the `[Monitor timed out…]`
+ *  notification it triggers) a head start to arrive first, so the common
+ *  case never touches the ceiling at all. */
+const MONITOR_TIMEOUT_MARGIN_MS = 2 * 60_000;
+
+/** Ceiling for a PERSISTENT monitor (`persistent: true`, no `timeout_ms` to
+ *  key off) or a REHYDRATED one (a restart loses the in-memory-only
+ *  `MonitorState.timeoutMs`/`persistent` — no columns for either, mirroring
+ *  `BgShellState.timeoutMs`'s posture): `checkMonitorCeiling` settles such a
+ *  row once it has produced no activity (a notification event, not just a
+ *  heartbeat — monitors have none) for this long. Same NaN/0-falls-through
+ *  posture as `STALE_SUBAGENT_SETTLE_MS`/`BG_SHELL_DEFAULT_TIMEOUT_MS`:
+ *  `Number(...)` on an unset/invalid `AGETOR_MONITOR_STALE_MS` yields `NaN`,
+ *  and `NaN || default` falls through silently rather than crashing the
+ *  watcher or disabling the ceiling — there is no env-var kill switch for
+ *  the ceiling itself, only for the whole feature (`AGETOR_TRACK_MONITORS=0`).
+ *  Read once at module load, mirroring `STALE_SUBAGENT_SETTLE_MS`. */
+const MONITOR_DEFAULT_STALE_MS = Number(process.env.AGETOR_MONITOR_STALE_MS) || 60 * 60_000;
+
+/** Recognises a Monitor `<event>` text as a TERMINAL event — the second half
+ *  of `applyMonitorNotification`'s receipt rule alongside `<status>` (see
+ *  the module header's "Monitors" section). Only `"timed out"` is verified
+ *  live (`[Monitor timed out — re-arm if needed.]`); the other verbs are
+ *  defensive, covering a TaskStop'd monitor's unverified shape — a false
+ *  negative here just falls through to `checkMonitorCeiling`'s bounded
+ *  backstop instead of a false-terminal misread settling a monitor that's
+ *  still reporting real events. */
+const MONITOR_TERMINAL_EVENT_RE = /^\s*\[Monitor (?:timed out|stopped|exited|ended|killed|finished)\b/i;
+
+/** Cap on `monitorPending` (the toolUseId -> {description,timeoutMs,persistent}
+ *  map bridging a Monitor launch line to its immediate stub, see
+ *  `scanLineForMonitorLaunch`). Mirrors `BG_SHELL_PENDING_MAX` exactly —
+ *  entries are pruned on consumption by the stub half, so this only matters
+ *  if a stub is ever lost; the oldest entry is evicted to make room once at
+ *  the cap. */
+const MONITOR_PENDING_MAX = 50;
 
 /**
  * SSE sink, injected once by the orchestrator at startup (which owns the
@@ -630,6 +812,20 @@ export interface SubagentWatcherHandle {
    *  so `tailFile`'s flip-back narrows to user-line-only resurrection for this
    *  row; omitted/`"inferred"` leaves the row's existing flippability alone. */
   syncSettled(id: string, status: SubagentStatus, endedAt: number, source?: "receipt" | "inferred"): void;
+  /** True when this watcher currently tracks `id` in its own `monitors` map
+   *  (running or already settled) — used by `handleBackgroundTaskNotification`
+   *  to decide whether to delegate to `applyMonitorNotification` below (the
+   *  live, in-memory path) or fall back to the DB-only
+   *  `applyMonitorNotificationForRow` for a watcher that doesn't (yet) know
+   *  this id. */
+  hasMonitor(id: string): boolean;
+  /** Apply a Monitor task-notification's `body` for `id` through this
+   *  watcher's own tracked state — see the module header's "Monitors"
+   *  section for the terminal-vs-activity rule. Only meaningful when
+   *  `hasMonitor(id)` is true; a harmless no-op returning `false` otherwise
+   *  (production never calls it in that case — `handleBackgroundTaskNotification`
+   *  checks `hasMonitor` first — but tests may call it directly). */
+  applyMonitorNotification(id: string, body: string): boolean;
 }
 
 /** One live watcher per task, tops — a second `attachSubagentWatcher` for the
@@ -815,6 +1011,193 @@ function toBgShellShape(b: BgShellState, taskId: string): Subagent {
   };
 }
 
+/**
+ * In-memory twin of a tracked Monitor row (see the module header's
+ * "Monitors" section). Deliberately NOT a `FileState`, for the same reason
+ * as `BgShellState`: a monitor has no transcript of its own — its whole
+ * lifecycle lives in lines of the MAIN session JSONL — so none of
+ * `FileState`'s uuid-dedup/end_turn-detection/mapper machinery applies.
+ */
+interface MonitorState {
+  /** = the launch stub's `toolUseResult.taskId` — also the row PK, and the
+   *  `<task-id>` every `<task-notification>` for this monitor carries. */
+  id: string;
+  runId: string;
+  /** The launching Monitor tool_use id. Kept for reference/debugging only —
+   *  mirrors `BgShellState.toolUseId`'s posture: nothing here correlates a
+   *  SECOND `tool_result` against it, since a monitor's completion arrives
+   *  as a `<task-notification>`, not a second tool_result. */
+  toolUseId: string | null;
+  description: string | null;
+  /** Monitor `input.timeout_ms` from the launch line, when the model set
+   *  one. `null` after rehydration (not persisted — no column for it) or
+   *  when the monitor is `persistent` — either way `checkMonitorCeiling`
+   *  falls back to the activity-anchored `MONITOR_DEFAULT_STALE_MS`. */
+  timeoutMs: number | null;
+  /** Monitor `input.persistent` from the launch line. `null` after
+   *  rehydration (not persisted) — treated the same as `true` by
+   *  `checkMonitorCeiling` (no known timeout to key a TIMED ceiling off). */
+  persistent: boolean | null;
+  status: SubagentStatus;
+  startedAt: number;
+  endedAt: number | null;
+  /** The ceiling's anchor AND the flip-back gate's activity clock — bumped by
+   *  `applyMonitorNotification`/`applyMonitorNotificationForRow` on every
+   *  NON-terminal event, seeded to `startedAt` at row creation and to the
+   *  rehydration `attachedAt` on reattach. `checkMonitorCeiling` reads this
+   *  (never `startedAt`) for a PERSISTENT/rehydrated monitor's staleness
+   *  check — mirrors `BgShellState.lastAppendAt`'s own rationale (review fix
+   *  R1): anchoring on immutable `startedAt` would settle an actively-firing
+   *  monitor the moment its total runtime crosses the threshold and then
+   *  flip it right back on the very next event. */
+  lastActivityAt: number;
+  /** Set once `checkMonitorCeiling` infers completion from silence — the
+   *  ONLY flip-back gate for a monitor (there is no output file to grow, so
+   *  no per-tick `statSync` watch the way `checkBgShellCeiling` has;
+   *  flip-back happens exactly once, reactively, inside
+   *  `applyMonitorNotification` when a later event proves the row wrong).
+   *  Cleared on that flip-back. */
+  ceilingSettled: boolean;
+  /** Set once an AUTHORITATIVE completion notification settles this row —
+   *  mirrors `BgShellState.receiptSettled`'s "harder to resurrect" posture:
+   *  a receipt-settled monitor can never flip back (the harness already
+   *  said it's over); only a ceiling-settled (inferred) one can. */
+  receiptSettled: boolean;
+}
+
+function toMonitorShape(m: MonitorState, taskId: string): Subagent {
+  return {
+    id: m.id,
+    taskId,
+    runId: m.runId,
+    parentKind: "monitor",
+    agentType: "monitor",
+    description: m.description,
+    spawnDepth: 1,
+    // No transcript/output file of its own — mirrors a workflow container's
+    // empty-content posture more than a bg shell's real output path.
+    sourcePath: "",
+    toolUseId: m.toolUseId,
+    status: m.status,
+    startedAt: m.startedAt,
+    endedAt: m.endedAt,
+  };
+}
+
+/** Small FNV-1a (32-bit) hash of a Monitor notification block's raw text —
+ *  used only to build a stable dedup key (`monitor:<id>:<hash>`) for
+ *  `runs.appendEvent`'s `line_uuid`. A monitor event legitimately arrives
+ *  via TWO adjacent lines carrying byte-identical content (a
+ *  `queue-operation` enqueue line and a synthetic `user`/`origin.kind:
+ *  "task-notification"` line — see the module header), not just across a
+ *  restart replay, so hashing the block's own text (rather than a
+ *  line-offset the way `bgshell:<id>:<offset>` does) gives both occurrences
+ *  of the SAME event the SAME key, letting the `(run_id, line_uuid)` partial
+ *  unique index collapse them to one persisted row. Reimplemented locally
+ *  (rather than imported) to keep this module's only cross-import from
+ *  claude-tmux.ts (`mapJsonlEventToChunks`/`formatApiErrorDetail`)
+ *  unchanged — mirrors `claude-tmux.ts`'s own `syntheticNotificationUuid`. */
+function fnv1aHex(text: string): string {
+  let hash = 0x811c9dc5; // FNV-1a 32-bit offset basis
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193); // FNV-1a 32-bit prime
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Pull the `<task-notification>` block for `id` out of `body`. Tolerant of
+ * the two shapes a caller may hand in: (1) one or more FULL
+ * `<task-notification>…</task-notification>` blocks concatenated — the
+ * shape `handleBackgroundTaskNotification`'s live caller hands in
+ * (claude-tmux's `taskNotificationContent`, which is the JSONL line's own
+ * `content`/`message.content` string verbatim, wrapper tags included, and
+ * can itself carry several notifications on one batched `queue-operation`
+ * enqueue line); (2) an already-unwrapped SINGLE block's inner content —
+ * what `scanLineForTaskNotification`'s own `matchAll` loop has already
+ * sliced out (no wrapper tags at all) before it calls
+ * `applyMonitorNotification`. Shape (1) is matched by regex; when NO
+ * `<task-notification>` tag is found at all, `body` is shape (2) and is
+ * returned as-is, trusting the caller's own id correlation. Returns `null`
+ * only for a genuine shape-(1) miss — a multi-block body where none of the
+ * blocks names `id`.
+ */
+function extractNotificationBlockForId(body: string, id: string): string | null {
+  let sawAnyBlock = false;
+  for (const nm of body.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)) {
+    sawAnyBlock = true;
+    const inner = nm[1]!;
+    const idMatch = /<task-id>([^<]+)<\/task-id>/.exec(inner);
+    if (idMatch && idMatch[1]!.trim() === id) return inner;
+  }
+  if (sawAnyBlock) return null; // multi-block body, none named this id
+  return body;
+}
+
+/** Parse a Monitor notification block (the inner content between
+ *  `<task-notification>`/`</task-notification>`) into the two facts
+ *  `applyMonitorNotification`/`applyMonitorNotificationForRow` need: whether
+ *  it's TERMINAL (see `MONITOR_TERMINAL_EVENT_RE`'s doc and the module
+ *  header's "Monitors" section for the exact rule) and its `<event>` text,
+ *  if any, to persist onto the monitor's tab. Pure — no side effects, so
+ *  both call sites (the live watcher path and the DB-only fallback) can
+ *  share it without either owning the other's state. */
+function parseMonitorNotificationBlock(block: string): { isTerminal: boolean; eventText: string | null } {
+  const statusMatch = /<status>([^<]+)<\/status>/.exec(block);
+  const statusRaw = statusMatch ? statusMatch[1]!.trim() : null;
+  const eventMatch = /<event>([\s\S]*?)<\/event>/.exec(block);
+  const eventText = eventMatch ? eventMatch[1]!.trim() : null;
+  const isTerminal =
+    (statusRaw !== null && TERMINAL_NOTIFICATION_STATUSES.has(statusRaw)) ||
+    (eventText !== null && MONITOR_TERMINAL_EVENT_RE.test(eventText));
+  return { isTerminal, eventText };
+}
+
+/** Persist + emit one Monitor event line onto its own tab — shared by
+ *  `applyMonitorNotification` (the live watcher path) and
+ *  `applyMonitorNotificationForRow` (the DB-only fallback), so the exact
+ *  same dedup/format rule applies regardless of which path a given
+ *  notification is handled by. `runs.appendEvent`'s `INSERT OR IGNORE`
+ *  return value gates the `emitFn` call: a `null` return means this exact
+ *  content (by hash) was already persisted — the duplicate enqueue/user
+ *  line pair, a reattach replay, or the live path and this module's own
+ *  `scanMainSignals` both reaching the same line — and re-emitting it to
+ *  the live SSE stream on top of a DB-level no-op would show the same
+ *  event twice in one session even though only one row was ever written. */
+function persistMonitorEvent(runId: string, taskId: string, id: string, block: string, eventText: string): void {
+  const now = Date.now();
+  const text = `[${new Date(now).toISOString()}] ${eventText}\n`;
+  const lineUuid = `monitor:${id}:${fnv1aHex(block)}`;
+  const inserted = runs.appendEvent(runId, "stdout", text, lineUuid, id);
+  if (inserted === null) return;
+  emitFn?.({ runId, taskId, stream: "stdout", data: text, ts: now, subagentId: id });
+}
+
+/**
+ * DB-only fallback half of the monitor receipt rule, for
+ * `handleBackgroundTaskNotification` when no watcher is attached to this
+ * monitor's task (or the attached watcher's `monitors` map doesn't — yet —
+ * know this id): a spawn/first-notification race, or a genuine coverage
+ * gap. Mirrors `applyMonitorNotification`'s terminal-vs-activity logic
+ * exactly but writes only what a bare DB row + its own `runId` allow: on
+ * terminal, settle via `settleSubagentById`; on activity, persist the event
+ * line and stop there — there is no in-memory `MonitorState` here to bump
+ * `lastActivityAt` or flip a ceiling-settled row back, so that bookkeeping
+ * is left for the next watcher attach (boot reconciliation, or a fresh
+ * `attachSubagentWatcher`) to reconcile from the DB status alone.
+ */
+function applyMonitorNotificationForRow(row: Subagent, body: string): void {
+  // Already settled — nothing left to flip, and persisting another event
+  // line onto a closed row would misleadingly suggest it's still live.
+  if (row.status !== "running" || !row.runId) return;
+  const block = extractNotificationBlockForId(body, row.id);
+  if (block === null) return;
+  const { isTerminal, eventText } = parseMonitorNotificationBlock(block);
+  if (eventText) persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText);
+  if (isTerminal) settleSubagentById(row.id, "completed", "receipt");
+}
+
 /** Same lifecycle-event shape `emitLifecycle` builds from a live `FileState`,
  *  but built straight off a DB row instead — needed for callers (like
  *  `orphanRunningSubagents` below) that fire for a task with no attached
@@ -907,6 +1290,60 @@ export function pumpWatcherForHoldCheck(taskId: string): void {
 }
 
 /**
+ * Live dispatch entry point for a background-task/agent completion
+ * notification — the module export the orchestrator's
+ * `setBackgroundTaskSettledHandler` wiring calls INSTEAD OF
+ * `settleSubagentById` directly, so a Monitor id gets the terminal-vs-
+ * activity receipt rule (see the module header's "Monitors" section)
+ * instead of being unconditionally settled on its very first event. `body`
+ * is the raw notification payload claude-tmux extracted from the JSONL line
+ * (`taskNotificationContent(evt)` — the line's own `content`/
+ * `message.content` string, wrapper tags included; may carry SEVERAL
+ * `<task-notification>` blocks on one batched `queue-operation` enqueue
+ * line).
+ *
+ * Routing: if `taskId`'s watcher is attached and already tracks `id` as a
+ * monitor, delegate to that watcher's own `applyMonitorNotification` — the
+ * cheapest path, and the one that keeps `lastActivityAt`/ceiling state
+ * current. Otherwise (no watcher for this task — tracking disabled, or a
+ * spawn/first-notification race — or a watcher that simply doesn't know
+ * this id yet), fall back to a DB lookup by id: a `monitor`-kind row still
+ * gets the exact same terminal-vs-activity rule applied via
+ * `applyMonitorNotificationForRow`; any OTHER kind of row (or an id this
+ * module has never heard of at all) keeps today's EXACT behavior —
+ * `settleSubagentById(id, "completed", "receipt")` unconditionally, since a
+ * notification for a subagent/workflow/bg-shell row is always terminal.
+ */
+export function handleBackgroundTaskNotification(taskId: string, id: string, body: string): void {
+  const watcher = watchers.get(taskId);
+  if (watcher?.hasMonitor(id)) {
+    try {
+      watcher.applyMonitorNotification(id, body);
+    } catch (e) {
+      console.error(`[claude-subagents] monitor notification apply failed for ${id}:`, e);
+    }
+    return;
+  }
+  if (MONITORS_ENABLED) {
+    let row: Subagent | null = null;
+    try {
+      row = subagentsDb.get(id);
+    } catch (e) {
+      console.error(`[claude-subagents] DB lookup failed for background-task id ${id}:`, e);
+    }
+    if (row?.parentKind === "monitor") {
+      try {
+        applyMonitorNotificationForRow(row, body);
+      } catch (e) {
+        console.error(`[claude-subagents] monitor notification (DB fallback) failed for ${id}:`, e);
+      }
+      return;
+    }
+  }
+  settleSubagentById(id, "completed", "receipt");
+}
+
+/**
  * Start watching `<sessionId>/subagents/` for the given task. The directory is
  * derived from the main session's `jsonlPath` so it tracks whatever layout
  * (fresh vs legacy configDir) that path resolved to. Returns a handle whose
@@ -937,7 +1374,15 @@ export function attachSubagentWatcher(opts: {
   // spawn) gets torn down before we build the new one.
   detachWatcherFor(taskId);
 
-  if (!ENABLED) return { detach() { /* disabled */ }, pump() { /* disabled */ }, syncSettled() { /* disabled */ } };
+  if (!ENABLED) {
+    return {
+      detach() { /* disabled */ },
+      pump() { /* disabled */ },
+      syncSettled() { /* disabled */ },
+      hasMonitor() { return false; },
+      applyMonitorNotification() { return false; },
+    };
+  }
 
   const sessionId = path.basename(opts.jsonlPath, ".jsonl");
   const subagentsDir = path.join(path.dirname(opts.jsonlPath), sessionId, "subagents");
@@ -964,6 +1409,16 @@ export function attachSubagentWatcher(opts: {
   // (deleted) by the stub half; also capped at `BG_SHELL_PENDING_MAX` so a
   // session whose stub is ever lost can't grow this unboundedly.
   const bgShellPending = new Map<string, { description: string | null; timeoutMs: number | null }>();
+  // Monitors (the `Monitor` tool) this watcher knows about, keyed by the
+  // launch stub's `taskId` (= row PK). Like `bgShells`, NEVER merged into
+  // `files` — a monitor has no transcript of its own (see `MonitorState`,
+  // and the module header's "Monitors" section).
+  const monitors = new Map<string, MonitorState>();
+  // Pending monitor launches, `toolUseId -> {description, timeoutMs,
+  // persistent}` — bridges the assistant launch line to the immediate stub
+  // that follows it (see `scanLineForMonitorLaunch`/`scanLineForMonitorStub`).
+  // Mirrors `bgShellPending` exactly, including the `MONITOR_PENDING_MAX` cap.
+  const monitorPending = new Map<string, { description: string | null; timeoutMs: number | null; persistent: boolean | null }>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let dirWatcher: FSWatcher | null = null;
   let detached = false;
@@ -1067,6 +1522,45 @@ export function attachSubagentWatcher(opts: {
             // this row's settle-relevant signal replays.
             settleFloor: null,
             receiptSettled: false,
+          });
+        }
+        continue;
+      }
+      if (row.parentKind === "monitor") {
+        // Route to `monitors`, never `files` — a monitor has no transcript
+        // of its own (see `MonitorState`, and the module header's
+        // "Monitors" section).
+        if (MONITORS_ENABLED) {
+          monitors.set(row.id, {
+            id: row.id,
+            runId: row.runId ?? resolveRunId(taskId) ?? row.id,
+            toolUseId: row.toolUseId ?? null,
+            description: row.description,
+            // Neither is persisted — a restart loses the specific
+            // `timeout_ms`/`persistent` from the launch line;
+            // `checkMonitorCeiling` falls back to the activity-anchored
+            // `MONITOR_DEFAULT_STALE_MS`.
+            timeoutMs: null,
+            persistent: null,
+            status: row.status,
+            startedAt: row.startedAt,
+            endedAt: row.endedAt,
+            lastActivityAt: attachedAt,
+            ceilingSettled: false,
+            // Unlike most `receiptSettled` seeds elsewhere in this file
+            // (never rehydrated, always `false`), a monitor's is derived
+            // from the DB status: a rehydrated row that's already NOT
+            // `running` is treated as receipt-settled (harder to
+            // resurrect) rather than ceiling-settled (flippable) — whether
+            // it was actually settled via a receipt or the ceiling is lost
+            // across a restart either way, and `ceilingSettled` (never
+            // rehydrated, always `false` here) already means the flip-back
+            // gate in `applyMonitorNotification`
+            // (`m.ceilingSettled && !m.receiptSettled`) can't fire for this
+            // row regardless of this value — so this only matters for a
+            // hypothetical future reader of the flag, and the conservative
+            // choice ("don't presume resurrectable") is the safer default.
+            receiptSettled: row.status !== "running",
           });
         }
         continue;
@@ -2262,7 +2756,16 @@ export function attachSubagentWatcher(opts: {
         b.receiptSettled = true;
         b.settleFloor = null;
         if (b.status === "running") settleSubagentById(id, "completed", "receipt");
+        continue;
       }
+      // Nor a `bgShells` row — check `monitors` (the module header's
+      // "Monitors" section). UNLIKE every lookup above, this branch must
+      // NEVER call `settleSubagentById` unconditionally: an ordinary Monitor
+      // event notification is activity, not completion, and
+      // `applyMonitorNotification` is the one place that owns the
+      // terminal-vs-activity distinction — this is just the dispatch to it.
+      const mon = monitors.get(id);
+      if (mon) applyMonitorNotification(id, body);
     }
   }
 
@@ -2463,14 +2966,273 @@ export function attachSubagentWatcher(opts: {
   }
 
   /**
+   * Monitor LAUNCH detection, half 1 of 2: an assistant `tool_use` block for
+   * `Monitor`. Its own line carries only the tool_use id + description/
+   * timeout_ms/persistent — the id that actually PKs the row (the launch
+   * stub's `taskId`) doesn't exist yet; claude mints it on the immediate stub
+   * `tool_result` that follows in a LATER main-JSONL line
+   * (`scanLineForMonitorStub`). So this half only remembers
+   * `{description, timeoutMs, persistent}` under the tool_use id, in
+   * `monitorPending`, for the stub half to pick up once it arrives. Mirrors
+   * `scanLineForBgShellLaunch` exactly.
+   *
+   * Verified live shape (see the module header's "Monitors" section):
+   *   {"type":"assistant","message":{"content":[{"type":"tool_use",
+   *    "id":…,"name":"Monitor","input":{"command":…,"description":…,
+   *    "timeout_ms":1500000,"persistent":false}}]}}
+   */
+  function scanLineForMonitorLaunch(line: string): void {
+    // Cheap prefilter before any JSON.parse — the overwhelming majority of
+    // main-JSONL lines don't mention this substring at all.
+    if (!line.includes('"name":"Monitor"')) return;
+    let parsed: { type?: unknown; message?: { content?: unknown } };
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return; // one bad line must not abort the scan of the rest
+    }
+    if (parsed.type !== "assistant") return;
+    const content = parsed.message?.content;
+    if (!Array.isArray(content)) return;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const b = block as { type?: unknown; id?: unknown; name?: unknown; input?: unknown };
+      if (b.type !== "tool_use" || b.name !== "Monitor" || typeof b.id !== "string") continue;
+      const input = b.input && typeof b.input === "object" ? (b.input as Record<string, unknown>) : null;
+      // Prune the oldest entry before inserting a new one once at the cap —
+      // see `MONITOR_PENDING_MAX`'s doc.
+      if (!monitorPending.has(b.id) && monitorPending.size >= MONITOR_PENDING_MAX) {
+        const oldest = monitorPending.keys().next().value;
+        if (oldest !== undefined) monitorPending.delete(oldest);
+      }
+      // Description prefers the model's own `input.description`; falls back
+      // to the command, truncated, so a monitor tab is never unlabelled.
+      const rawDescription = typeof input?.description === "string" ? input.description : null;
+      const rawCommand = typeof input?.command === "string" ? input.command : null;
+      const description =
+        rawDescription ?? (rawCommand !== null
+          ? (rawCommand.length > 80 ? `${rawCommand.slice(0, 80)}…` : rawCommand)
+          : null);
+      monitorPending.set(b.id, {
+        description,
+        timeoutMs: typeof input?.timeout_ms === "number" ? input.timeout_ms : null,
+        persistent: typeof input?.persistent === "boolean" ? input.persistent : null,
+      });
+    }
+  }
+
+  /**
+   * Monitor LAUNCH detection, half 2 of 2: the immediate stub `tool_result`
+   * claude writes the moment a `Monitor` call is accepted. Verified live
+   * shape (see the module header's "Monitors" section):
+   *   {"type":"user","message":{"content":[{"tool_use_id":…,
+   *    "type":"tool_result","content":"Monitor started (task bvkdtb50u,
+   *    timeout 1500000ms). You will be notified on each event. Keep working
+   *    — do not poll or sleep. …"}]},"toolUseResult":{"taskId":"bvkdtb50u",
+   *    "timeoutMs":1500000,"persistent":false},
+   *    "timestamp":"2026-08-24T17:29:33.236Z"}
+   * `toolUseResult.taskId` IS the row PK — the same id every later
+   * `<task-notification>` for this monitor carries in its `<task-id>` tag,
+   * which is what `scanLineForTaskNotification`'s `monitors` lookup and
+   * `handleBackgroundTaskNotification`'s live dispatch both key off
+   * unchanged. Row creation must NEVER depend on the human-readable
+   * "Monitor started" text alone — the prefilter below only uses it to
+   * narrow which lines are worth a full parse; the structural
+   * `toolUseResult.taskId` field is what actually creates the row.
+   *
+   * `timeoutMs`/`persistent` prefer the `monitorPending` entry (the launch
+   * line's own `input.timeout_ms`/`input.persistent`) and fall back to the
+   * stub's own `toolUseResult.timeoutMs`/`toolUseResult.persistent` — a
+   * belt-and-braces source for the same values, present on the verified
+   * live shape, in case the launch half's line was ever missed (a
+   * replay-window edge, a future ordering change).
+   *
+   * Mirrors `scanLineForBgShellStub`'s R6/R7 postures: every tool_result
+   * block on a coalesced `user` line is considered (best match: the block
+   * whose own `content` names this stub's `taskId`, else a block whose
+   * `tool_use_id` is a launch this watcher is waiting on, else the first
+   * block) and the matched `monitorPending` entry is consumed BEFORE the
+   * replay early-return, so a replayed stub can't permanently strand a slot
+   * of the pending map's cap.
+   */
+  function scanLineForMonitorStub(line: string): void {
+    if (!line.includes('"taskId"') || !line.includes("Monitor started")) return;
+    let parsed: {
+      type?: unknown;
+      message?: { content?: unknown };
+      toolUseResult?: unknown;
+      timestamp?: unknown;
+    };
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (parsed.type !== "user") return;
+    const tr = parsed.toolUseResult;
+    const trObj = tr && typeof tr === "object" ? (tr as Record<string, unknown>) : null;
+    const id = typeof trObj?.taskId === "string" ? trObj.taskId : null;
+    if (!id) return;
+
+    const content = parsed.message?.content;
+    const toolResultBlocks: { toolUseId: string | null; content: string | null }[] = [];
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (!block || typeof block !== "object") continue;
+        const cb = block as { type?: unknown; tool_use_id?: unknown; content?: unknown };
+        if (cb.type !== "tool_result") continue;
+        toolResultBlocks.push({
+          toolUseId: typeof cb.tool_use_id === "string" ? cb.tool_use_id : null,
+          content: typeof cb.content === "string" ? cb.content : null,
+        });
+      }
+    }
+    const chosen =
+      toolResultBlocks.find((r) => r.content !== null && r.content.includes(id)) ??
+      toolResultBlocks.find((r) => r.toolUseId !== null && monitorPending.has(r.toolUseId)) ??
+      toolResultBlocks[0] ??
+      null;
+    const toolUseId = chosen?.toolUseId ?? null;
+
+    // Consume the pending entry BEFORE the replay early-return below, not
+    // after — mirrors `scanLineForBgShellStub`'s review fix R7.
+    const pending = toolUseId ? monitorPending.get(toolUseId) : undefined;
+    if (toolUseId) monitorPending.delete(toolUseId);
+
+    if (monitors.has(id)) return; // replay of an already-known id
+
+    const runId = resolveRunId(taskId);
+    if (!runId) return; // same defensive skip every other launch scan makes
+
+    const now = Date.now();
+    // Prefer the line's own timestamp over the scan-time `now` for
+    // `startedAt`/initial `lastActivityAt` — mirrors `scanLineForBgShellStub`'s
+    // review fix R5 (a stub replayed on restart was WRITTEN whenever claude
+    // actually launched the monitor, not when this scan happens to run).
+    const lineTs = typeof parsed.timestamp === "string" ? Date.parse(parsed.timestamp) : NaN;
+    const startedAt = Number.isFinite(lineTs) && lineTs > 0 && lineTs <= now ? lineTs : now;
+    const m: MonitorState = {
+      id,
+      runId,
+      toolUseId,
+      description: pending?.description ?? null,
+      timeoutMs: pending?.timeoutMs ?? (typeof trObj?.timeoutMs === "number" ? trObj.timeoutMs : null),
+      persistent: pending?.persistent ?? (typeof trObj?.persistent === "boolean" ? trObj.persistent : null),
+      status: "running",
+      startedAt,
+      endedAt: null,
+      lastActivityAt: startedAt,
+      ceilingSettled: false,
+      receiptSettled: false,
+    };
+    monitors.set(id, m);
+    lastChangeAt = Date.now();
+    subagentsDb.insertIfAbsent(toMonitorShape(m, taskId));
+    emitLifecycleForRow(toMonitorShape(m, taskId), "started");
+    fireParkedDiscovery(taskId);
+  }
+
+  /**
+   * The ONE monitor-aware receipt rule (see the module header's "Monitors"
+   * section and `parseMonitorNotificationBlock`'s doc): apply a
+   * `<task-notification>` naming a tracked monitor `id`. `body` may be
+   * either a multi-block payload or an already-unwrapped single block — see
+   * `extractNotificationBlockForId`. Returns whether the notification was
+   * TERMINAL (i.e. settled the row this call); `false` for both "not
+   * terminal — just activity" and "id not tracked here at all / no matching
+   * block", so the return value alone is NOT the right way to distinguish
+   * those two — callers that need to (`handleBackgroundTaskNotification`'s
+   * routing) check `monitors.has(id)` (or the handle's `hasMonitor`) FIRST.
+   */
+  function applyMonitorNotification(id: string, body: string): boolean {
+    const m = monitors.get(id);
+    if (!m) return false;
+    const block = extractNotificationBlockForId(body, id);
+    if (block === null) return false;
+    const { isTerminal, eventText } = parseMonitorNotificationBlock(block);
+    if (eventText) persistMonitorEvent(m.runId, taskId, id, block, eventText);
+
+    if (isTerminal) {
+      // Unconditional receipt latch, mirroring `scanLineForTaskNotification`'s
+      // bg-shell branch (review fix R2): even if `checkMonitorCeiling` already
+      // settled this row `completed` before the notification arrived, latching
+      // `receiptSettled` here keeps a later stray line from ever flipping it
+      // back — the harness's own authoritative receipt outranks the guess.
+      m.receiptSettled = true;
+      if (m.status === "running") settleSubagentById(id, "completed", "receipt");
+      return true;
+    }
+
+    // Activity: bump the ceiling's anchor, and flip a ceiling-settled
+    // (never receipt-settled) row back to `running` — the ceiling was only
+    // a guess, and this event proves it wrong. Mirrors
+    // `checkBgShellCeiling`'s flip-back exactly, just reactive (on the next
+    // event) instead of a per-tick `statSync` watch, since a monitor has no
+    // file to poll.
+    m.lastActivityAt = Date.now();
+    if (m.ceilingSettled && !m.receiptSettled) {
+      m.status = "running";
+      m.endedAt = null;
+      m.ceilingSettled = false;
+      subagentsDb.setStatus(id, "running", null);
+      emitLifecycleForRow(toMonitorShape(m, taskId), "started");
+      fireParkedDiscovery(taskId);
+    }
+    return false;
+  }
+
+  /**
+   * Bounded ceiling for a tracked Monitor (see the module header's
+   * "Monitors" section) — the "the hold is bounded" half of the feature. A
+   * `running` monitor produces no bytes anywhere this module can see between
+   * events (no heartbeat, no file to grow), so without this a lost
+   * completion notification would hold its task in `running` forever.
+   *
+   * TIMED (`persistent === false`, `timeoutMs` known): settle once
+   * `now > startedAt + timeoutMs + MONITOR_TIMEOUT_MARGIN_MS` — claude
+   * itself kills the monitor at its own deadline, so this only fires when
+   * that termination's notification is lost.
+   *
+   * PERSISTENT, or rehydrated/unknown (`timeoutMs`/`persistent` lost across
+   * a restart — never persisted): settle once
+   * `now - lastActivityAt > MONITOR_DEFAULT_STALE_MS` — the same
+   * activity-anchored staleness posture `checkStale`/`checkBgShellCeiling`
+   * use, since a persistent monitor's lifetime legitimately spans long idle
+   * gaps between events.
+   *
+   * Unlike `checkBgShellCeiling`, there is no per-tick flip-back watch here
+   * — a monitor has no output file to `statSync`. Flip-back happens only
+   * reactively, inside `applyMonitorNotification`, when a later event proves
+   * a ceiling-settled row wrong.
+   */
+  function checkMonitorCeiling(now: number): void {
+    for (const m of monitors.values()) {
+      if (m.status !== "running") continue;
+      const timed = m.persistent === false && m.timeoutMs != null;
+      const expired = timed
+        ? now > m.startedAt + m.timeoutMs! + MONITOR_TIMEOUT_MARGIN_MS
+        : now - m.lastActivityAt > MONITOR_DEFAULT_STALE_MS;
+      if (!expired) continue;
+      m.status = "completed";
+      m.endedAt = now;
+      m.ceilingSettled = true;
+      subagentsDb.setStatus(m.id, "completed", now);
+      emitLifecycleForRow(toMonitorShape(m, taskId), "finished");
+      fireSettle(taskId);
+    }
+  }
+
+  /**
    * Single pass over the bytes appended to the MAIN session JSONL since the
    * last pass, feeding every signal this watcher derives from it: tool_result
    * correlation settles (above); when workflows are tracked, workflow launch
    * detection; when bg shells are tracked, the two-line bg-shell launch
-   * correlation (`scanLineForBgShellLaunch` + `scanLineForBgShellStub`); and
-   * the generalized task-notification backstop (W3,
-   * `scanLineForTaskNotification`), which now settles workflow containers,
-   * ordinary rows, AND bg shells.
+   * correlation (`scanLineForBgShellLaunch` + `scanLineForBgShellStub`); when
+   * monitors are tracked, the same two-line correlation for `Monitor`
+   * (`scanLineForMonitorLaunch` + `scanLineForMonitorStub`); and the
+   * generalized task-notification backstop (W3, `scanLineForTaskNotification`),
+   * which now settles workflow containers, ordinary rows, AND bg shells, and
+   * applies the terminal-vs-activity rule for monitors.
    *
    * One shared `mainOffset` cursor, one read, one split. The early return is
    * deliberately narrow: bailing on `pending.length === 0` (as this did when
@@ -2506,7 +3268,7 @@ export function attachSubagentWatcher(opts: {
    */
   function scanMainSignals(): void {
     const pending = [...files.values()].filter((fs) => fs.status === "running" && fs.toolUseId);
-    if (pending.length === 0 && !WORKFLOWS_ENABLED && !BG_SHELLS_ENABLED) return;
+    if (pending.length === 0 && !WORKFLOWS_ENABLED && !BG_SHELLS_ENABLED && !MONITORS_ENABLED) return;
 
     const { text, next } = readAppendedSync(opts.jsonlPath, mainOffset);
     if (!text) return;
@@ -2523,14 +3285,22 @@ export function attachSubagentWatcher(opts: {
         // notification — so a workflow that started and finished while agetor
         // was down is registered and then settled within one pass, never left
         // holding the card. Same ordering argument applies to the bg-shell
-        // pair below.
+        // and monitor pairs below.
         scanLineForWorkflowLaunch(line);
       }
       if (BG_SHELLS_ENABLED) {
         scanLineForBgShellLaunch(line);
         scanLineForBgShellStub(line);
       }
-      if (WORKFLOWS_ENABLED || (BG_SHELLS_ENABLED && bgShells.size > 0)) {
+      if (MONITORS_ENABLED) {
+        scanLineForMonitorLaunch(line);
+        scanLineForMonitorStub(line);
+      }
+      if (
+        WORKFLOWS_ENABLED ||
+        (BG_SHELLS_ENABLED && bgShells.size > 0) ||
+        (MONITORS_ENABLED && monitors.size > 0)
+      ) {
         scanLineForTaskNotification(line);
       }
     }
@@ -2605,6 +3375,7 @@ export function attachSubagentWatcher(opts: {
       checkDone(now);
       checkStale(now);
       if (BG_SHELLS_ENABLED) checkBgShellCeiling(now);
+      if (MONITORS_ENABLED) checkMonitorCeiling(now);
     } catch { /* swallow — never crash the timer */ }
   }
 
@@ -2615,20 +3386,22 @@ export function attachSubagentWatcher(opts: {
     // A live workflow CONTAINER counts as "running" for cadence purposes even
     // when no agent file is open right now: between waves it is the only thing
     // holding the card, and the next wave's files should be picked up on the
-    // fast tier, not four seconds late. A `running` bg shell is the same case
-    // between its launch and its settle — there is no file to open at all.
+    // fast tier, not four seconds late. A `running` bg shell (or monitor) is
+    // the same case between its launch and its settle — there is no file to
+    // open at all.
     const anyRunning =
       [...files.values()].some((f) => f.status === "running") ||
       [...workflows.values()].some((w) => w.status === "running") ||
-      [...bgShells.values()].some((b) => b.status === "running");
+      [...bgShells.values()].some((b) => b.status === "running") ||
+      [...monitors.values()].some((m) => m.status === "running");
     let delay: number;
     if (anyRunning) {
       delay = FAST_POLL_MS;
     } else if (files.size === 0 && workflows.size === 0 && wfJournals.size === 0 && bgShells.size === 0
-               && now - lastChangeAt >= DEEP_IDLE_AFTER_MS) {
-      // Never discovered a subagent, a workflow, OR a bg shell and nothing's
-      // happened for a while — back off further than the ordinary idle
-      // cadence.
+               && monitors.size === 0 && now - lastChangeAt >= DEEP_IDLE_AFTER_MS) {
+      // Never discovered a subagent, a workflow, a bg shell, OR a monitor and
+      // nothing's happened for a while — back off further than the ordinary
+      // idle cadence.
       delay = DEEP_IDLE_POLL_MS;
     } else {
       delay = SLOW_POLL_MS;
@@ -2690,16 +3463,37 @@ export function attachSubagentWatcher(opts: {
       // `scanLineForTaskNotification`'s own unconditional latch (review fix
       // R2), since it never reaches here.
       const b = bgShells.get(id);
-      if (!b) return;
-      b.status = status;
-      b.endedAt = endedAt;
-      if (source === "receipt") {
-        b.receiptSettled = true;
-        // Review fix R2 — clear `settleFloor` alongside the latch so a
-        // receipt landing through THIS path also fully retires the
-        // ceiling's flip-back state, not just the boolean flag.
-        b.settleFloor = null;
+      if (b) {
+        b.status = status;
+        b.endedAt = endedAt;
+        if (source === "receipt") {
+          b.receiptSettled = true;
+          // Review fix R2 — clear `settleFloor` alongside the latch so a
+          // receipt landing through THIS path also fully retires the
+          // ceiling's flip-back state, not just the boolean flag.
+          b.settleFloor = null;
+        }
+        return;
       }
+      // Monitors live in their own map too (no file to back them — see
+      // `MonitorState`). This is what `applyMonitorNotification`'s terminal
+      // branch flows through (via `settleSubagentById`), and — mirroring the
+      // `bgShells` branch above — an EXTERNAL settle (boot-reconciliation
+      // orphaning, or a test driving `settleSubagentById` directly) also
+      // needs the same sync: latching `receiptSettled` on `"receipt"` keeps
+      // a stray later event from ever flipping this row back via the
+      // `applyMonitorNotification` flip-back gate.
+      const mon = monitors.get(id);
+      if (!mon) return;
+      mon.status = status;
+      mon.endedAt = endedAt;
+      if (source === "receipt") mon.receiptSettled = true;
+    },
+    hasMonitor(id: string): boolean {
+      return monitors.has(id);
+    },
+    applyMonitorNotification(id: string, body: string): boolean {
+      return applyMonitorNotification(id, body);
     },
   };
   watchers.set(taskId, handle);

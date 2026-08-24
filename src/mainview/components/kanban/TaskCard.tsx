@@ -133,7 +133,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               <Badge
                 variant="outline"
                 className="gap-1 text-[10px]"
-                title={`${runningSubagents} background agent${runningSubagents > 1 ? "s" : ""} running`}
+                title={`${runningSubagents} background task${runningSubagents > 1 ? "s" : ""} running`}
               >
                 <Bot className="size-3" />
                 {runningSubagents}

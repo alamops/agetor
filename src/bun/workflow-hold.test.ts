@@ -368,17 +368,23 @@ test("notification: the real setBackgroundTaskSettledHandler wiring settles a co
   expect(subagents.hasRunning(taskId)).toBe(true);
 
   // Grab the REAL handler orchestrator.ts wired at module load —
-  //   (_taskId, agentId) => settleSubagentById(agentId, "completed")
+  //   (taskId, agentId, body) => handleBackgroundTaskNotification(taskId, agentId, body)
   // — through the setBackgroundTaskSettledHandler seam (read-modify-restore),
-  // then invoke it with (taskId, containerId): this is exactly what
+  // then invoke it with (taskId, containerId, payload): this is exactly what
   // claude-tmux's dispatchLine does when it parses a live
   // `<task-notification><task-id>…</task-id></task-notification>` line whose
-  // id matches the workflow's container row.
+  // id matches the workflow's container row. For a non-monitor row any
+  // notification naming the id is the completion receipt, so the body's
+  // contents don't gate the settle — it's passed for shape fidelity.
   const real = setBackgroundTaskSettledHandler(() => {});
   setBackgroundTaskSettledHandler(real);
   if (!real) throw new Error("expected orchestrator.ts to have installed a real background-task-settled handler");
 
-  real(taskId, containerId);
+  real(
+    taskId,
+    containerId,
+    `<task-notification>\n<task-id>${containerId}</task-id>\n<status>completed</status>\n<summary>Workflow finished</summary>\n</task-notification>`,
+  );
 
   expect(subagents.get(containerId)?.status).toBe("completed");
   expect(subagents.hasRunning(taskId)).toBe(false);
