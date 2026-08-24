@@ -513,6 +513,18 @@ function AppInner() {
   // this same effect, after reading its pre-update value, so it always
   // holds "the id that was open before this transition".
   const prevMarkSeenIdRef = useRef<string | null>(null);
+  // Per-task counter guarding read-state (`unread`) response merges against
+  // out-of-order arrival — bumped before every mark-seen/markRead/markUnread
+  // call below so a stale in-flight response (e.g. this effect's
+  // fire-and-forget close-time `markTaskSeen` landing after a later "Mark as
+  // unread" click on the same task) is detected and dropped instead of
+  // clobbering the newer value.
+  const readStateGen = useRef(new Map<string, number>());
+  const bumpReadStateGen = useCallback((id: string) => {
+    const next = (readStateGen.current.get(id) ?? 0) + 1;
+    readStateGen.current.set(id, next);
+    return next;
+  }, []);
   useEffect(() => {
     const currentId = selected?.id ?? null;
     const previousId = prevMarkSeenIdRef.current;
@@ -520,8 +532,11 @@ function AppInner() {
     if (currentId) idsToMark.add(currentId);
     if (previousId) idsToMark.add(previousId);
     for (const id of idsToMark) {
+      const gen = bumpReadStateGen(id);
       api.markTaskSeen(id)
         .then((updated) => {
+          // Stale response guard — see `readStateGen` above.
+          if (readStateGen.current.get(id) !== gen) return;
           // Optimistic reconcile — don't wait for the next 2s poll to clear
           // the dot. Merges ONLY the `unread` field: `updated` is a snapshot
           // taken server-side at POST time and lands asynchronously, so a
@@ -538,7 +553,7 @@ function AppInner() {
         });
     }
     prevMarkSeenIdRef.current = currentId;
-  }, [selected?.id]);
+  }, [selected?.id, bumpReadStateGen]);
 
   // `panelMounted` follows `selected !== null` on open but lags by the
   // RunPanel's exit animation on close, so the Toaster doesn't snap back to
@@ -1034,26 +1049,32 @@ function AppInner() {
   // server rejected doesn't stick.
   const markRead = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, unread: false } : x)));
+    const gen = bumpReadStateGen(t.id);
     try {
       setError(null);
       const updated = await api.markTaskSeen(t.id);
+      // Stale response guard — see `readStateGen`'s doc comment above.
+      if (readStateGen.current.get(t.id) !== gen) return;
       setTasks((cur) => cur.map((x) => (x.id === updated.id ? { ...x, unread: updated.unread } : x)));
     } catch (e) {
       surfaceError(e);
       await refresh();
     }
-  }, [refresh, surfaceError]);
+  }, [refresh, surfaceError, bumpReadStateGen]);
   const markUnread = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, unread: true } : x)));
+    const gen = bumpReadStateGen(t.id);
     try {
       setError(null);
       const updated = await api.markTaskUnread(t.id);
+      // Stale response guard — see `readStateGen`'s doc comment above.
+      if (readStateGen.current.get(t.id) !== gen) return;
       setTasks((cur) => cur.map((x) => (x.id === updated.id ? { ...x, unread: updated.unread } : x)));
     } catch (e) {
       surfaceError(e);
       await refresh();
     }
-  }, [refresh, surfaceError]);
+  }, [refresh, surfaceError, bumpReadStateGen]);
 
   // Clipboard copy for the menu's "Copy branch name" / "Copy worktree path"
   // entries — same idiom as `md-components.tsx`'s code-block copy button.
@@ -1066,28 +1087,40 @@ function AppInner() {
     }
   }, []);
 
-  // Task context menu (right-click on a board card). `taskMenu` holds only
-  // the task id + anchor position — the live `Task` is resolved from
-  // `tasks` on every render (below) so the menu's entries track the 2s
-  // poll instead of freezing a stale snapshot from the moment it opened.
-  const [taskMenu, setTaskMenu] = useState<{ taskId: string; x: number; y: number } | null>(null);
+  // Task context menu (right-click on a board card). `taskMenu` freezes a
+  // snapshot of the task (and whether it was the open one) at the moment the
+  // menu opens, rather than re-resolving from `tasks` on every render — the
+  // board polls every 2s, and re-resolving would let a task's column change
+  // (e.g. `running` settling to `review`) rewrite the menu's entries *under
+  // the user's cursor*: Stop/Archive disappear, Mark done and a whole read
+  // group appear, `Delete…` moves — and a click the user already committed
+  // to lands on a different action than the one they saw. Freezing at open
+  // time means the entries never shift while the menu is up; the live task
+  // is resolved only when an action actually fires (see `runTaskMenuAction`
+  // below), so actions still act on current state (e.g. `cancel` sees the
+  // current `runId`) even though the menu itself is a snapshot.
+  const [taskMenu, setTaskMenu] = useState<{ task: Task; isOpen: boolean; x: number; y: number } | null>(null);
   const openTaskMenu = useCallback((t: Task, pos: { x: number; y: number }) => {
-    setTaskMenu({ taskId: t.id, x: pos.x, y: pos.y });
+    setTaskMenu({ task: t, isOpen: t.id === selectedIdRef.current, x: pos.x, y: pos.y });
   }, []);
   const closeTaskMenu = useCallback(() => setTaskMenu(null), []);
-  const menuTask = taskMenu ? (tasks.find((t) => t.id === taskMenu.taskId) ?? null) : null;
   // The task the menu was opened for got deleted (by this client or another
   // one) while the menu was still open — close it rather than leave a menu
   // full of handlers pointing at a task that no longer exists.
   useEffect(() => {
-    if (taskMenu && !menuTask) setTaskMenu(null);
-  }, [taskMenu, menuTask]);
+    if (taskMenu && !tasks.some((t) => t.id === taskMenu.task.id)) setTaskMenu(null);
+  }, [taskMenu, tasks]);
 
   // Exhaustive dispatch from a `TaskMenuAction` (buildTaskContextMenu's pure
-  // output) to the real App.tsx handler. The non-null assertions on
+  // output) to the real App.tsx handler. `snapshot` is the frozen task the
+  // menu was built from (see `taskMenu` above); re-resolve the live task
+  // from `tasksRef` here so the action itself always acts on current state
+  // (e.g. `cancel` sees the current `runId`), falling back to the snapshot
+  // if the task has since vanished. The non-null assertions on
   // branch/worktreePath/prUrl are safe: `buildTaskContextMenu` only emits
   // `copy-branch`/`copy-worktree-path`/`view-pr` when those fields are set.
-  const runTaskMenuAction = useCallback((action: TaskMenuAction, t: Task) => {
+  const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) => {
+    const t = tasksRef.current.find((x) => x.id === snapshot.id) ?? snapshot;
     switch (action) {
       case "open":
         setSelected(t);
@@ -1141,9 +1174,12 @@ function AppInner() {
   // Maps `buildTaskContextMenu`'s pure entries onto the primitive's
   // `ContextMenuItem[]`, inserting a separator whenever the group changes
   // (per the entries' own ordering — see `TaskMenuGroup`'s doc comment).
+  // Built from the frozen `taskMenu` snapshot (task + isOpen), not `tasks`/
+  // `selected` directly, so the entries can't shift under the cursor while
+  // the menu is open (see `taskMenu`'s doc comment above).
   const taskMenuItems = useMemo<ContextMenuItem[]>(() => {
-    if (!menuTask) return [];
-    const entries = buildTaskContextMenu(menuTask, { isOpen: menuTask.id === selected?.id });
+    if (!taskMenu) return [];
+    const entries = buildTaskContextMenu(taskMenu.task, { isOpen: taskMenu.isOpen });
     const items: ContextMenuItem[] = [];
     let prevGroup: TaskMenuGroup | null = null;
     for (const entry of entries) {
@@ -1155,12 +1191,12 @@ function AppInner() {
         label: entry.label,
         danger: entry.danger,
         icon: ICON_BY_ACTION[entry.action],
-        onSelect: () => runTaskMenuAction(entry.action, menuTask),
+        onSelect: () => runTaskMenuAction(entry.action, taskMenu.task),
       });
       prevGroup = entry.group;
     }
     return items;
-  }, [menuTask, selected?.id, runTaskMenuAction]);
+  }, [taskMenu, runTaskMenuAction]);
 
   // Shared by GitHubDialog's `onClose` and `onOpenSettings` (the latter also
   // opens SettingsDialog) so the three-setter teardown can't drift out of
@@ -1453,7 +1489,7 @@ function AppInner() {
         onClose={() => setDiffTask(null)}
       />
       <ContextMenu
-        open={menuTask != null}
+        open={taskMenu != null}
         x={taskMenu?.x ?? 0}
         y={taskMenu?.y ?? 0}
         items={taskMenuItems}

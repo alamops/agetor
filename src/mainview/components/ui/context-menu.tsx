@@ -112,8 +112,11 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
       const first = moveMenuIndex(-1, 1, enabled);
       if (first !== -1) setActiveIndex(first);
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, x, y, items.length]);
+    // `items` is frozen for the lifetime of one open (App hands a stable
+    // array identity that only changes when the menu (re)opens), so this
+    // only recomputes positioning + first-item focus on open/reopen, not on
+    // every render.
+  }, [open, x, y, items]);
 
   useEffect(() => {
     if (activeIndex === -1) return;
@@ -125,18 +128,25 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
     if (!open) return;
 
     const onMouseDown = (e: MouseEvent) => {
+      // Right-button dismissal is deferred to the capture-phase contextmenu
+      // listener below, not handled here. WebKit's right-click order is
+      // pointerdown → mousedown → contextmenu → mouseup, so a bubble-phase
+      // mousedown fires BEFORE contextmenu — closing the menu here would make
+      // the contextmenu listener dead code and cycle `open` false→true on
+      // every right-click, re-running the focus-restore cleanup each time.
+      if (e.button === 2) return;
       if (panelRef.current?.contains(e.target as Node)) return;
       onCloseRef.current();
     };
     const onContextMenuOutside = (e: MouseEvent) => {
       // A fresh right-click elsewhere should replace this menu, not stack —
       // close here and let App's own contextmenu handler open the new one.
-      // Registered in the CAPTURE phase so this runs BEFORE React's root
-      // listener dispatches the card's onContextMenu: both state updates
-      // then batch within the same event (close → open at the new card) and
-      // the new menu wins. In the bubble phase this would run AFTER the card
-      // handler and the batch would settle on "closed" — a right-click on a
-      // second card would dismiss the menu instead of moving it.
+      // This is where right-button dismissal actually happens (mousedown
+      // above ignores button 2): registered in the CAPTURE phase, this runs
+      // BEFORE React's root listener dispatches the card's onContextMenu, so
+      // both state updates batch within the same event (close → open at the
+      // new card) and the menu moves instead of flashing closed. Left/middle
+      // clicks and Ctrl+click still dismiss via mousedown above.
       if (panelRef.current?.contains(e.target as Node)) return;
       onCloseRef.current();
     };
@@ -213,6 +223,7 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
         break;
       }
       case "Tab": {
+        e.preventDefault();
         onCloseRef.current();
         break;
       }
@@ -230,10 +241,9 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
       data-testid={testId}
       tabIndex={-1}
       onKeyDown={onKeyDown}
-      onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
       style={pos ? { top: pos.top, left: pos.left } : { top: 0, left: 0, visibility: "hidden" }}
-      className="fixed z-50 min-w-44 rounded-md border border-border bg-card p-1 text-sm text-card-foreground shadow-xl"
+      className="fixed z-50 max-h-[calc(100vh-16px)] min-w-44 overflow-y-auto rounded-md border border-border bg-card p-1 text-sm text-card-foreground shadow-xl"
     >
       {items.map((item, index) => {
         if (item.type === "separator") {
@@ -251,10 +261,13 @@ export function ContextMenu({ open, x, y, items, onClose, label = "Context menu"
             disabled={item.disabled}
             tabIndex={isActive ? 0 : -1}
             onClick={() => selectItem(item)}
+            onMouseEnter={item.disabled ? undefined : () => setActiveIndex(index)}
             className={cn(
               "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left outline-none transition-colors",
               "hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground",
+              isActive && "bg-accent text-accent-foreground",
               item.danger && "text-destructive hover:text-destructive focus-visible:text-destructive",
+              isActive && item.danger && "text-destructive",
               item.disabled && "pointer-events-none opacity-50",
             )}
           >

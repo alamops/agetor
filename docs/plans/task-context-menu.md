@@ -149,9 +149,10 @@ Done means:
   consumer.
 - **Entries are a pure builder** — `buildTaskContextMenu(task, { isOpen })`
   in `src/mainview/lib/task-context-menu.ts` returns
-  `{ action, label, group, danger? }[]`; App maps `action → handler` and
-  inserts separators on group change. The visibility matrix is unit-tested
-  without a DOM.
+  `{ action, label, group, danger? }[]` (`group`: `primary | inspect |
+  utility | danger` — four groups, three separators, matching the §1 table);
+  App maps `action → handler` and inserts separators on group change. The
+  visibility matrix is unit-tested without a DOM.
 - **Run precedence mirrors the card exactly** (Answer > Stop > Open > Run,
   `TaskCard.tsx:41-51`): "Run" is hidden once a task has an openable run —
   same as the hover button — rather than exposing a re-run the card doesn't.
@@ -212,7 +213,7 @@ Done means:
   comments in the `lib/pull-merged.ts` style.
 - `lib/task-context-menu.ts`: `TaskMenuAction` union, `TaskMenuEntry`,
   `buildTaskContextMenu(task, { isOpen })` implementing the §1 table exactly
-  (labels, groups `primary | inspect | read | copy | danger`, `danger` flag on
+  (labels, groups `primary | inspect | utility | danger`, `danger` flag on
   delete). Pure — no React, no `api`.
 - `ui/context-menu.tsx`: controlled `<ContextMenu>` per §3 — portal to
   `document.body`, `fixed z-50`, `role="menu"`, `aria-label`,
@@ -350,3 +351,18 @@ on the New Task prompt `textarea` → `false`.
   best-effort by anchoring to the card rect; not e2e-tested.
 - E2E clipboard assertion falls back to the toast if `readText` is
   unavailable in the test browser.
+- **Review-time reconciliation**: T2/T3 originally implemented five groups
+  (`primary | inspect | read | copy | danger`), which drew a fourth separator
+  between the read/unread and copy entries — the §1 table shows only three.
+  The §1 table was authoritative; `read` and `copy` were collapsed into one
+  `utility` group so the four entries render as the single block the table
+  specifies.
+- Entries are frozen at the moment the menu opens (the live `Task` is
+  re-resolved only when an action actually fires); this was chosen over
+  live-tracking the entry list against the 2s poll because rows shifting
+  under the cursor while the menu is open risks a mis-click landing on
+  `Delete…`.
+- The card's right-button `mousedown` is default-prevented, so a
+  partially-visible card isn't scrolled into view under the freshly opened
+  menu — a scroll would trigger the menu's own scroll-close handler and
+  dismiss it before the user could act.

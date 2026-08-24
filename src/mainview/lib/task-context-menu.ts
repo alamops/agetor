@@ -22,8 +22,12 @@ export type TaskMenuAction =
 
 /** Visual/semantic grouping — T3 inserts a separator between consecutive
  *  entries whose `group` differs, so the order below also defines where the
- *  dividers land. */
-export type TaskMenuGroup = "primary" | "inspect" | "read" | "copy" | "danger";
+ *  dividers land. Per the plan's §1 table, the read/unread pair and the copy
+ *  entries form a single visual block (three separators total: after
+ *  `primary`, after `inspect`, and before `danger`) — they share the
+ *  `utility` group rather than being split into two groups that would each
+ *  draw their own divider. */
+export type TaskMenuGroup = "primary" | "inspect" | "utility" | "danger";
 
 export interface TaskMenuEntry {
   action: TaskMenuAction;
@@ -86,22 +90,22 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
     entries.push({ action: "view-pr", label: "View pull request", group: "inspect" });
   }
 
-  // read — "unread" is only ever honest to flip when the task has actually
-  // produced an assistant message; `hasAssistantMessages` is what lets
-  // "Mark as unread" avoid re-flagging a task that never said anything.
+  // utility — read/unread + copy entries share one group so they render as a
+  // single block (see the `TaskMenuGroup` doc comment). "unread" is only
+  // ever honest to flip when the task has actually produced an assistant
+  // message; `hasAssistantMessages` is what lets "Mark as unread" avoid
+  // re-flagging a task that never said anything.
   if (task.unread === true && !ctx.isOpen) {
-    entries.push({ action: "mark-read", label: "Mark as read", group: "read" });
+    entries.push({ action: "mark-read", label: "Mark as read", group: "utility" });
   }
   if (!task.unread && !ctx.isOpen && task.hasAssistantMessages === true) {
-    entries.push({ action: "mark-unread", label: "Mark as unread", group: "read" });
+    entries.push({ action: "mark-unread", label: "Mark as unread", group: "utility" });
   }
-
-  // copy
   if (task.branch) {
-    entries.push({ action: "copy-branch", label: "Copy branch name", group: "copy" });
+    entries.push({ action: "copy-branch", label: "Copy branch name", group: "utility" });
   }
   if (task.worktreePath) {
-    entries.push({ action: "copy-worktree-path", label: "Copy worktree path", group: "copy" });
+    entries.push({ action: "copy-worktree-path", label: "Copy worktree path", group: "utility" });
   }
 
   // danger — always last.
