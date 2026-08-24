@@ -219,10 +219,12 @@ function activeRunProbeSafe(taskId: string): string | null {
  * again for its terminal one — the callee needs the body to tell the two
  * apart instead of treating every naming of the id as a completion receipt.
  */
-let backgroundTaskSettledFn: ((taskId: string, agentId: string, body: string) => void) | null = null;
+let backgroundTaskSettledFn:
+  | ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void)
+  | null = null;
 export function setBackgroundTaskSettledHandler(
-  fn: ((taskId: string, agentId: string, body: string) => void) | null,
-): ((taskId: string, agentId: string, body: string) => void) | null {
+  fn: ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void) | null,
+): ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void) | null {
   const prev = backgroundTaskSettledFn;
   backgroundTaskSettledFn = fn;
   return prev;
@@ -232,9 +234,14 @@ export function setBackgroundTaskSettledHandler(
  *  reach the tailer — mirrors `fireSettle` in claude-subagents.ts; the hook
  *  runs orchestrator logic we don't control, and a bad handler must not
  *  take the JSONL tail down. */
-function fireBackgroundTaskSettled(taskId: string, agentId: string, body: string): void {
+function fireBackgroundTaskSettled(
+  taskId: string,
+  agentId: string,
+  body: string,
+  lineTimestampMs: number | null = null,
+): void {
   try {
-    backgroundTaskSettledFn?.(taskId, agentId, body);
+    backgroundTaskSettledFn?.(taskId, agentId, body, lineTimestampMs);
   } catch (e) {
     console.error(`[claude-tmux] background-task-settled hook threw for task ${taskId}:`, e);
   }
@@ -475,6 +482,12 @@ interface UserMessage {
  * until we add a renderer for it.
  */
 interface ParsedJsonlEvent {
+  /** ISO-8601 write time claude stamps on every line — forwarded (as epoch ms)
+   *  to the background-task-notification handler so claude-subagents can
+   *  derive the same time-bucketed dedup key for a Monitor event that its
+   *  own restart-safe scan of this line derives; without it the live and
+   *  scan paths would persist the same event under two keys. */
+  timestamp?: string;
   type?: string;
   /** Claude 2.1.x system events carry a `subtype` discriminator — observed
    *  values: `turn_duration` (durationMs + messageCount, emitted right after
@@ -3136,7 +3149,10 @@ function dispatchLine(state: SessionState, line: string): void {
   if (state.taskId !== "__rebuild__") {
     if (notifContent) {
       const agentId = extractTaskNotificationAgentId(notifContent);
-      if (agentId) fireBackgroundTaskSettled(state.taskId, agentId, notifContent);
+      if (agentId) {
+        const lineTs = typeof evt.timestamp === "string" ? Date.parse(evt.timestamp) : NaN;
+        fireBackgroundTaskSettled(state.taskId, agentId, notifContent, Number.isFinite(lineTs) ? lineTs : null);
+      }
     }
   }
 

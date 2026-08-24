@@ -305,8 +305,8 @@ setActiveRunProbe((taskId) => {
 // its completion, so a `monitor` row settles only on a terminal receipt and
 // records everything else as activity. Tolerant by design: an id matching no
 // row, or a duplicate fired again on reattach replay, is a no-op.
-setBackgroundTaskSettledHandler((taskId, agentId, body) => {
-  handleBackgroundTaskNotification(taskId, agentId, body);
+setBackgroundTaskSettledHandler((taskId, agentId, body, lineTimestampMs) => {
+  handleBackgroundTaskNotification(taskId, agentId, body, lineTimestampMs);
 });
 
 /**

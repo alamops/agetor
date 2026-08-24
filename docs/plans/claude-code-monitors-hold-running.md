@@ -112,3 +112,20 @@ One-way doors: none (additive rows, no migration, kill switch, no contract chang
 ## 9. Completeness ledger
 
 Not requested (`--no-follow-ups` off). Swept in anyway because they are remainders of this change, not adjacent features: the busy-pane regex for monitors; the badge title wording; the hold line. Left out deliberately: daemon-jobs "agents" hold (different feature, unverified).
+
+## 10. What actually shipped — deviations from §3
+
+- **Gates:** the owner's question tool returned no answer in an unattended session, so the grill was run autonomously (§8) and the plan self-approved. Decisions to check first: Q2 (monitor tab) and Q4 (hold line).
+- **Review round** (opus, `code-review` skill, 9 findings, all applied):
+  1. Timed ceiling now requires the deadline **and** ≥ `MONITOR_TIMEOUT_MARGIN_MS` of silence, and a flip-back nulls `timeoutMs`/`persistent` so the row drops to the activity-anchored rule — an immutable deadline alone re-settled a flipped-back row on the next tick (the bg-shell R1 class of bug).
+  2. `MONITOR_TERMINAL_EVENT_RE` is anchored on both ends (`/^\[Monitor (…)\b[^\]]*\]$/i` on the trimmed `<event>`), since a false terminal latches `receiptSettled` and is unrecoverable.
+  3. Flip-back survives restarts and the watcher-less path: terminal events persist under `monitor:<id>:terminal:<hash>`; rehydration derives `receiptSettled` from `runs.seenLineUuidsForSubagent`; `applyMonitorNotificationForRow` flips a ceiling-settled DB row back only on a genuinely **new** event (never a replayed line).
+  4. The restart-safe scan dispatches monitors before its unknown-`<status>` guard.
+  5. Event dedup key is `monitor:<id>:<hash>:<floor(lineTs/10s)>`; the live path now forwards the line's timestamp (`ParsedJsonlEvent.timestamp` → `fireBackgroundTaskSettled(taskId, id, body, lineTimestampMs)` → orchestrator → `handleBackgroundTaskNotification`).
+  6. Fake monitor row id is keyed on the run (`fake-monitor-<runId>`), not the task.
+  7. The `N monitors still running` pane arm is anchored to the spinner chrome; the pre-existing shells arm was left as-is (separate change).
+  8. `hasAnyMonitor()` short-circuits the DB probe for tasks with no monitors.
+  9. `isTabbable` / `Subagent.parentKind` doc comments.
+- **Found while pinning #5:** the scan hashes the block as it sits in the *raw* JSON line (escape sequences intact) while the live path gets the *parsed* payload — same event, two keys, and literal `\n` in scan-persisted text. `decodeJsonStringFragment` at the scan's monitor dispatch restores parity; the test drives both paths on one line.
+- **Tests:** 28 (watcher unit) + 10 (live path + pane regex) + 10 (hold/tabs) + 2 e2e specs. Full `bun test` 3102 pass / 0 fail; e2e green on four invocations. `terminals.test.ts` flaked twice under a 40–57 load average and passed at ~30 — file untouched by this change.
+- **Deliberately not done:** any hold keyed on the status bar's "N agents" (other local sessions); anchoring the shells pane arm.

@@ -117,6 +117,32 @@ test("dispatchLine forwards a live monitor event (queue-operation/enqueue shape)
   }
 });
 
+test("dispatchLine forwards the notification line's own timestamp as epoch ms in the 4th handler argument, and null when the line carries none", () => {
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  const monitorId = `mon-${randomUUID()}`;
+  const content =
+    `<task-notification><task-id>${monitorId}</task-id>`
+    + `<summary>Monitor event: "watch build"</summary><event>1 passed</event></task-notification>`;
+  const stamps: (number | null | undefined)[] = [];
+  const prev = setBackgroundTaskSettledHandler((_tid, _agentId, _body, lineTimestampMs) => {
+    stamps.push(lineTimestampMs);
+  });
+  try {
+    const iso = "2026-08-24T17:40:12.911Z";
+    __forTest.dispatchLine(
+      state,
+      JSON.stringify({ type: "queue-operation", operation: "enqueue", uuid: "uuid-mon-ts-1", timestamp: iso, content }) + "\n",
+    );
+    __forTest.dispatchLine(state, queueOperationMonitorLine(content, "uuid-mon-ts-2"));
+
+    expect(stamps).toEqual([Date.parse(iso), null]);
+  } finally {
+    setBackgroundTaskSettledHandler(prev);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
 test("dispatchLine forwards a live monitor event (user/origin.kind=task-notification shape) to the installed background-task-settled handler with the raw payload", () => {
   const { taskId, jsonlPath } = freshSession();
   const state = __forTest.installSession(taskId, jsonlPath);

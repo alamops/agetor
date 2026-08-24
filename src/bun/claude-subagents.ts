@@ -244,34 +244,51 @@
  * (`applyMonitorNotification`, plus its DB-only twin
  * `applyMonitorNotificationForRow` for a watcher-less task): a notification
  * naming a tracked monitor is TERMINAL iff its `<status>` is one of
- * `TERMINAL_NOTIFICATION_STATUSES` OR its `<event>` text matches
- * `MONITOR_TERMINAL_EVENT_RE` — anything else is ACTIVITY, not completion.
- * Terminal settles the row exactly like every other kind
- * (`settleSubagentById(id, "completed", "receipt")`, latching
- * `receiptSettled` first — same unconditional-latch posture bg shells use,
- * see review fix R2 in `scanLineForTaskNotification`'s doc — so a
- * ceiling-settled row can never be resurrected by a stray trailing receipt).
- * Activity bumps `lastActivityAt`, persists+emits the `<event>` text as a
- * `stdout` line on the monitor's own tab (dedup key
- * `monitor:<id>:<fnv1aHex(block)>` — a content hash, not an offset, because
- * the SAME event legitimately arrives via two adjacent lines — the
- * `queue-operation` enqueue and the `user`/origin line — in one scan pass,
- * not just across a restart replay), and flips a ceiling-settled (never
- * receipt-settled) row back to `running`, mirroring
+ * `TERMINAL_NOTIFICATION_STATUSES` OR its `<event>` text (trimmed) matches
+ * `MONITOR_TERMINAL_EVENT_RE` — a both-ends-anchored match against the
+ * verified live shape (`[Monitor timed out — re-arm if needed.]`), not a
+ * prefix match, so an ordinary event that merely STARTS with bracketed
+ * status-looking text can't be misread as terminal (code review finding #2).
+ * Anything else is ACTIVITY, not completion. Terminal settles the row
+ * exactly like every other kind (`settleSubagentById(id, "completed",
+ * "receipt")`, latching `receiptSettled` first — same unconditional-latch
+ * posture bg shells use, see review fix R2 in
+ * `scanLineForTaskNotification`'s doc — so a ceiling-settled row can never be
+ * resurrected by a stray trailing receipt). Activity bumps `lastActivityAt`,
+ * persists+emits the `<event>` text as a `stdout` line on the monitor's own
+ * tab (dedup key `monitor:<id>:<fnv1aHex(block)>[:<bucket>]` for an ordinary
+ * event, `monitor:<id>:terminal:<fnv1aHex(block)>` for a terminal one — see
+ * `persistMonitorEvent`'s doc for the `terminal:` marker's purpose (finding
+ * #3) and the timestamp-bucket's (finding #5); a content hash, not an
+ * offset, because the SAME event legitimately arrives via two adjacent
+ * lines — the `queue-operation` enqueue and the `user`/origin line — in one
+ * scan pass, not just across a restart replay), and flips a ceiling-settled
+ * (never receipt-settled) row back to `running`, mirroring
  * `checkBgShellCeiling`'s flip-back for the same "the ceiling was only a
- * guess" reason.
+ * guess" reason — ALSO discarding the row's own `timeoutMs`/`persistent`
+ * (code review finding #1(b)) so it falls to the activity-anchored ceiling
+ * rule from here on, exactly like a rehydrated row; see `checkMonitorCeiling`
+ * below for why that matters.
  *
  * `checkMonitorCeiling` is the bounded-hold half: a monitor has no file to
  * grow, so its ceiling has no growth-watch counterpart to
  * `checkBgShellCeiling`'s — flip-back happens ONLY through
  * `applyMonitorNotification` reacting to a later event, never a per-tick
  * `statSync`. A timed monitor (`persistent === false`, `timeoutMs` known)
- * settles once `now > startedAt + timeoutMs + MONITOR_TIMEOUT_MARGIN_MS` —
- * claude itself kills the monitor at its own deadline, so this only fires
- * when that termination's notification is lost. A persistent monitor, or
- * one rehydrated after a restart (`timeoutMs`/`persistent` are in-memory
- * only, never persisted — a reattached row always falls into this branch),
- * settles once `now - lastActivityAt > MONITOR_DEFAULT_STALE_MS` — the same
+ * settles once its deadline has passed AND it has additionally gone quiet
+ * for a margin (`now > startedAt + timeoutMs + MONITOR_TIMEOUT_MARGIN_MS &&
+ * now - lastActivityAt > MONITOR_TIMEOUT_MARGIN_MS`) — claude itself kills
+ * the monitor at its own deadline, so this only fires when that
+ * termination's notification is lost. The silence requirement (code review
+ * finding #1(a)) exists alongside the flip-back's `timeoutMs` reset above
+ * for a reason: the deadline half of the check is otherwise IMMUTABLE, so
+ * without BOTH fixes together, the very next tick after a flip-back would
+ * immediately re-settle the row right back (the deadline is still in the
+ * past) — an oscillation, not a one-time false settle. A persistent
+ * monitor, or one rehydrated after a restart or flipped back from a ceiling
+ * settle (`timeoutMs`/`persistent` are in-memory only, never persisted — a
+ * reattached OR flipped-back row always falls into this branch), settles
+ * once `now - lastActivityAt > MONITOR_DEFAULT_STALE_MS` — the same
  * activity-anchored staleness posture `checkStale`/`checkBgShellCeiling`
  * both use, since a persistent monitor's lifetime legitimately spans long
  * idle gaps between events with no other terminal signal besides TaskStop.
@@ -283,15 +300,31 @@
  * the id as a monitor — the cheapest, most in-sync path — and only falls
  * back to the DB-only `applyMonitorNotificationForRow` when no watcher
  * knows the id yet (a spawn/first-notification race, or a genuine gap in
- * coverage). Every OTHER id — the overwhelming majority, since only
- * monitors get this treatment — keeps today's exact behavior:
- * `settleSubagentById(id, "completed", "receipt")` unconditionally, since a
- * notification for a subagent/workflow/bg-shell row IS always terminal.
+ * coverage). A watcher that's attached but tracks NO monitors at all skips
+ * even the DB lookup (`hasAnyMonitor()`, code review finding #8) — cheaper
+ * than probing for an id that structurally cannot be a monitor row for this
+ * task. Every OTHER id — the overwhelming majority, since only monitors get
+ * this treatment — keeps today's exact behavior: `settleSubagentById(id,
+ * "completed", "receipt")` unconditionally, since a notification for a
+ * subagent/workflow/bg-shell row IS always terminal.
  *
  * Rehydration routes a `parentKind === "monitor"` DB row into `monitors`
- * (never `files`), seeding `lastActivityAt` to the rehydration timestamp and
- * `receiptSettled` to whatever the DB status already implies (`!== "running"`)
- * — mirroring `BgShellState`'s rehydration posture exactly.
+ * (never `files`), seeding `lastActivityAt` to the rehydration timestamp. Its
+ * flip-back gate (`ceilingSettled`/`receiptSettled`) is derived from what's
+ * actually on record in `run_events`, not just the DB `status` column (code
+ * review finding #3(b)): a `monitor:<id>:terminal:*` line_uuid on record
+ * means an AUTHORITATIVE receipt closed this row (`receiptSettled: true`,
+ * never flips back); its absence on an otherwise-`completed` row means only
+ * `checkMonitorCeiling`'s GUESS closed it (`ceilingSettled: true`, flip-back
+ * gate stays open) — see `attachSubagentWatcher`'s `parentKind === "monitor"`
+ * branch. This is what makes flip-back survive a restart: the guarantee is
+ * precisely "a REPLAYED line (already in `run_events`, by its dedup key)
+ * never flips a row back, on ANY path; a genuinely NEW non-terminal event
+ * DOES flip it back — whether or not a watcher is attached, and whether or
+ * not agetor has restarted since the row was settled" (code review finding
+ * #3, all three sub-parts together: the `terminal:` line_uuid marker, this
+ * rehydration derivation, and `applyMonitorNotificationForRow`'s own
+ * watcher-less flip-back for the no-watcher-attached case).
  *
  * Gated behind `AGETOR_TRACK_MONITORS`, nested under `ENABLED` exactly like
  * `BG_SHELLS_ENABLED`/`WORKFLOWS_ENABLED` — see `MONITORS_ENABLED`.
@@ -525,8 +558,23 @@ const MONITOR_DEFAULT_STALE_MS = Number(process.env.AGETOR_MONITOR_STALE_MS) || 
  *  defensive, covering a TaskStop'd monitor's unverified shape — a false
  *  negative here just falls through to `checkMonitorCeiling`'s bounded
  *  backstop instead of a false-terminal misread settling a monitor that's
- *  still reporting real events. */
-const MONITOR_TERMINAL_EVENT_RE = /^\s*\[Monitor (?:timed out|stopped|exited|ended|killed|finished)\b/i;
+ *  still reporting real events.
+ *
+ *  Finding #2 (code review) — BOTH-ENDS anchored to the whole (trimmed)
+ *  `<event>` text, not just a prefix match: the verified live shape is a
+ *  single bracketed marker and nothing else
+ *  (`[Monitor timed out — re-arm if needed.]`), so `^\[Monitor …\][^\]]*\]$`
+ *  requires the marker to BE the entire event, allowing only trailing prose
+ *  INSIDE the brackets (the verified shape's own "— re-arm if needed."). A
+ *  bare prefix match (the old regex) would misread an ordinary, still-live
+ *  monitor event that merely STARTS with a bracketed status-looking phrase
+ *  (e.g. `[Monitor stopped] 3 failed, 1 passed` — real output quoting a log
+ *  line) as terminal, latching `receiptSettled` on a row that's still very
+ *  much alive and can never be resurrected afterward (receipt-settled rows
+ *  never flip back, by design). A false NEGATIVE here is still safe (falls
+ *  through to `checkMonitorCeiling`'s bounded backstop); a false POSITIVE
+ *  under the old regex was not. */
+const MONITOR_TERMINAL_EVENT_RE = /^\[Monitor (?:timed out|stopped|exited|ended|killed|finished)\b[^\]]*\]$/i;
 
 /** Cap on `monitorPending` (the toolUseId -> {description,timeoutMs,persistent}
  *  map bridging a Monitor launch line to its immediate stub, see
@@ -824,8 +872,21 @@ export interface SubagentWatcherHandle {
    *  section for the terminal-vs-activity rule. Only meaningful when
    *  `hasMonitor(id)` is true; a harmless no-op returning `false` otherwise
    *  (production never calls it in that case — `handleBackgroundTaskNotification`
-   *  checks `hasMonitor` first — but tests may call it directly). */
-  applyMonitorNotification(id: string, body: string): boolean;
+   *  checks `hasMonitor` first — but tests may call it directly).
+   *  `lineTimestampMs` (finding #5) is optional — only
+   *  `scanLineForTaskNotification`'s internal call has one to pass; threaded
+   *  through here too for interface uniformity, `undefined` falls back to
+   *  the hash-only dedup key. */
+  applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): boolean;
+  /** True when this watcher tracks AT LEAST ONE monitor at all (running or
+   *  already settled) — finding #8 (code review): lets
+   *  `handleBackgroundTaskNotification` skip its `subagents.get(id)` DB probe
+   *  entirely when an attached watcher confidently reports it tracks NO
+   *  monitors for this task, since an id it fired a background-task
+   *  notification for can only be a monitor row if some monitor exists for
+   *  this task in the first place. Cheaper and coarser than `hasMonitor(id)`
+   *  — a `true` here does NOT imply `hasMonitor(id)` is also true. */
+  hasAnyMonitor(): boolean;
 }
 
 /** One live watcher per task, tops — a second `attachSubagentWatcher` for the
@@ -1154,24 +1215,121 @@ function parseMonitorNotificationBlock(block: string): { isTerminal: boolean; ev
   return { isTerminal, eventText };
 }
 
+/** Extract the top-level `timestamp` field from a raw main-JSONL line (both
+ *  the `queue-operation` enqueue shape and the synthetic `user`/origin shape
+ *  carry one verbatim — see the module header's "Monitors" section) WITHOUT
+ *  a full `JSON.parse` — a cheap regex is enough since only
+ *  `persistMonitorEvent`'s dedup bucket (finding #5) needs the value, and a
+ *  wrong/missing match degrades gracefully to "no bucket" rather than a hard
+ *  failure. The first `"timestamp":"…"` occurrence in the line is trusted to
+ *  be the top-level field: both verified shapes place it before the
+ *  `content`/`message` field that carries the `<task-notification>` block
+ *  itself (JSON key order is preserved by `JSON.stringify`), and that block
+ *  is plain bracketed/XML-ish text, never JSON, so it can't contain a
+ *  competing `"timestamp":"…"` match of its own. Returns `null` on no match
+ *  or an unparseable value — never throws. */
+/**
+ * Decode a `<task-notification>…</task-notification>` fragment that was cut
+ * straight out of a RAW main-JSONL line (the restart-safe scan deliberately
+ * never `JSON.parse`s whole lines) back into the string claude actually
+ * wrote: the fragment is a substring of a JSON string literal, so wrapping
+ * it in quotes and parsing it turns `\n` / `\"` escape sequences into the
+ * real characters. The live path (`claude-tmux` → `handleBackgroundTaskNotification`)
+ * hands over the already-parsed payload, so without this the two paths would
+ * hash different bytes for the same event — two `stdout` rows per event —
+ * and the scan-persisted text would carry literal backslash-n sequences into
+ * the tab. Falls back to the raw fragment if it somehow isn't a valid string
+ * body (a cut boundary can only ever land on a literal tag, never inside an
+ * escape, so this is defensive).
+ */
+function decodeJsonStringFragment(raw: string): string {
+  if (!raw.includes("\\")) return raw; // nothing escaped — common for short tags-only bodies
+  try {
+    const decoded = JSON.parse(`"${raw}"`);
+    return typeof decoded === "string" ? decoded : raw;
+  } catch {
+    return raw;
+  }
+}
+function extractLineTimestampMs(line: string): number | null {
+  const m = /"timestamp"\s*:\s*"([^"]+)"/.exec(line);
+  if (!m) return null;
+  const ms = Date.parse(m[1]!);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 /** Persist + emit one Monitor event line onto its own tab — shared by
  *  `applyMonitorNotification` (the live watcher path) and
  *  `applyMonitorNotificationForRow` (the DB-only fallback), so the exact
  *  same dedup/format rule applies regardless of which path a given
  *  notification is handled by. `runs.appendEvent`'s `INSERT OR IGNORE`
  *  return value gates the `emitFn` call: a `null` return means this exact
- *  content (by hash) was already persisted — the duplicate enqueue/user
- *  line pair, a reattach replay, or the live path and this module's own
- *  `scanMainSignals` both reaching the same line — and re-emitting it to
- *  the live SSE stream on top of a DB-level no-op would show the same
- *  event twice in one session even though only one row was ever written. */
-function persistMonitorEvent(runId: string, taskId: string, id: string, block: string, eventText: string): void {
+ *  content (by key, not just by hash — see below) was already persisted —
+ *  the duplicate enqueue/user line pair, a reattach replay, or the live path
+ *  and this module's own `scanMainSignals` both reaching the same line — and
+ *  re-emitting it to the live SSE stream on top of a DB-level no-op would
+ *  show the same event twice in one session even though only one row was
+ *  ever written. Returns whether this call actually inserted a NEW row
+ *  (`false` for that same dedup no-op) — `applyMonitorNotificationForRow`'s
+ *  watcher-less flip-back (finding #3(c)) needs this to tell a genuinely new
+ *  event from a replayed one.
+ *
+ *  Finding #3(a) (code review) — `isTerminal` picks the line_uuid's PREFIX:
+ *  a TERMINAL event gets `monitor:<id>:terminal:<hash>`, distinguishable
+ *  from an ordinary event's `monitor:<id>:<hash>[:<bucket>]`. This is what
+ *  lets rehydration (see the `parentKind === "monitor"` branch in
+ *  `attachSubagentWatcher`) tell "this row's flip-back gate should be OPEN
+ *  (settled only by the ceiling's guess)" from "CLOSED (settled by an
+ *  authoritative receipt)" purely from `run_events` — no DB column needed —
+ *  after a restart has thrown away the in-memory `receiptSettled` flag.
+ *
+ *  Finding #5 (code review) — an ORDINARY event's key additionally buckets
+ *  by `lineTimestampMs` (the JSONL line's own `timestamp`, 10s granularity:
+ *  `Math.floor(lineTimestampMs / 10_000)`) rather than hashing the block's
+ *  text alone. A pure content-hash key (the original design) collapses TWO
+ *  genuinely distinct occurrences of byte-identical event text (a monitored
+ *  command legitimately reporting the exact same line twice, e.g. two
+ *  consecutive `0 failed, 12 passed` heartbeats from a flaky watch loop)
+ *  into one persisted row — silently dropping real activity. Bucketing lets
+ *  a repeat more than ~10s later persist as its own row while still
+ *  collapsing the SAME event's two adjacent lines (the `queue-operation`
+ *  enqueue and the synthetic `user`/origin twin, which land within
+ *  milliseconds of each other and so always share a bucket). Accepted
+ *  trade-off, spelled out because it's asymmetric: an identical event
+ *  repeated WITHIN the same 10s bucket still collapses to one row (rare
+ *  enough at monitor-event cadence not to matter), and a twin whose two
+ *  lines straddle a bucket boundary (a few-ms race right at a boundary)
+ *  yields a harmless DUPLICATE line instead of collapsing — judged better
+ *  than the alternative (a real repeat silently vanishing). Falls back to
+ *  the hash-only key (today's pre-fix behavior) when `lineTimestampMs` is
+ *  absent/unparseable (`undefined`/`null`) — the live orchestrator dispatch
+ *  path (`handleBackgroundTaskNotification`) has no line to read a
+ *  timestamp from at all, so it always takes this fallback. */
+function persistMonitorEvent(
+  runId: string,
+  taskId: string,
+  id: string,
+  block: string,
+  eventText: string,
+  isTerminal: boolean,
+  lineTimestampMs?: number | null,
+): boolean {
   const now = Date.now();
   const text = `[${new Date(now).toISOString()}] ${eventText}\n`;
-  const lineUuid = `monitor:${id}:${fnv1aHex(block)}`;
+  const hash = fnv1aHex(block);
+  const bucket =
+    typeof lineTimestampMs === "number" && Number.isFinite(lineTimestampMs)
+      ? Math.floor(lineTimestampMs / 10_000)
+      : null;
+  const lineUuid = isTerminal
+    ? `monitor:${id}:terminal:${hash}`
+    : bucket !== null
+      ? `monitor:${id}:${hash}:${bucket}`
+      : `monitor:${id}:${hash}`;
   const inserted = runs.appendEvent(runId, "stdout", text, lineUuid, id);
-  if (inserted === null) return;
+  if (inserted === null) return false;
   emitFn?.({ runId, taskId, stream: "stdout", data: text, ts: now, subagentId: id });
+  return true;
 }
 
 /**
@@ -1179,23 +1337,67 @@ function persistMonitorEvent(runId: string, taskId: string, id: string, block: s
  * `handleBackgroundTaskNotification` when no watcher is attached to this
  * monitor's task (or the attached watcher's `monitors` map doesn't — yet —
  * know this id): a spawn/first-notification race, or a genuine coverage
- * gap. Mirrors `applyMonitorNotification`'s terminal-vs-activity logic
- * exactly but writes only what a bare DB row + its own `runId` allow: on
+ * gap. Mirrors `applyMonitorNotification`'s terminal-vs-activity logic, but
+ * writes only what a bare DB row + its own `runId` allow — there is no
+ * in-memory `MonitorState` here to bump `lastActivityAt`.
+ *
+ * A `running` row keeps the original, pre-finding-#3 behavior exactly: on
  * terminal, settle via `settleSubagentById`; on activity, persist the event
- * line and stop there — there is no in-memory `MonitorState` here to bump
- * `lastActivityAt` or flip a ceiling-settled row back, so that bookkeeping
- * is left for the next watcher attach (boot reconciliation, or a fresh
- * `attachSubagentWatcher`) to reconcile from the DB status alone.
+ * line and stop.
+ *
+ * Finding #3(c) (code review) — a NON-running row is no longer ignored
+ * outright. Before this fix, flip-back was completely dead on this path: a
+ * ceiling-settled row with no watcher attached (a restart mid-hold, or a
+ * task whose watcher never got armed) could NEVER be proven wrong by a later
+ * live event, because this function's old early return (`row.status !==
+ * "running"`) discarded every notification for an already-settled row
+ * outright. Now:
+ *   - A TERMINAL body just re-persists the terminal line (idempotent via its
+ *     `terminal:`-prefixed line_uuid — a replayed terminal receipt is a
+ *     harmless no-op) and returns; the row is already settled, correctly.
+ *   - A NON-terminal body persists the event (mirrors
+ *     `applyMonitorNotification`'s "always persist, regardless of outcome"
+ *     posture — the tab should show it either way), then flips the row back
+ *     to `running` — but ONLY when BOTH: (1) this row has no authoritative
+ *     terminal receipt already on record (a `monitor:<id>:terminal:*`
+ *     line_uuid — mirrors `applyMonitorNotification`'s `!m.receiptSettled`
+ *     gate: a receipt-settled row never resurrects, only a ceiling-settled
+ *     one does), and (2) `persistMonitorEvent` reports this event as
+ *     genuinely NEW (its `true` return) — a REPLAYED (already-persisted)
+ *     body must never flip a row back, or every reattach/restart replaying
+ *     the exact same trailing event would resurrect an already-correctly-
+ *     settled row forever.
  */
-function applyMonitorNotificationForRow(row: Subagent, body: string): void {
-  // Already settled — nothing left to flip, and persisting another event
-  // line onto a closed row would misleadingly suggest it's still live.
-  if (row.status !== "running" || !row.runId) return;
+function applyMonitorNotificationForRow(row: Subagent, body: string, lineTimestampMs?: number | null): void {
+  // No `runId` at all — nowhere to persist the event line, regardless of
+  // status. Mirrors every other kind's defensive posture in this file.
+  if (!row.runId) return;
   const block = extractNotificationBlockForId(body, row.id);
   if (block === null) return;
   const { isTerminal, eventText } = parseMonitorNotificationBlock(block);
-  if (eventText) persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText);
-  if (isTerminal) settleSubagentById(row.id, "completed", "receipt");
+
+  if (row.status === "running") {
+    if (eventText) persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
+    if (isTerminal) settleSubagentById(row.id, "completed", "receipt");
+    return;
+  }
+
+  // Non-running, no attached watcher — the flip-back half of finding #3(c).
+  if (isTerminal) {
+    if (eventText) persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
+    return;
+  }
+  if (!eventText) return;
+
+  const alreadyReceiptSettled = [...runs.seenLineUuidsForSubagent(row.id)].some((u) =>
+    u.startsWith(`monitor:${row.id}:terminal:`),
+  );
+  const isNew = persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
+  if (alreadyReceiptSettled || !isNew) return; // receipt-closed, or a replayed line — never resurrect
+
+  subagentsDb.setStatus(row.id, "running", null);
+  emitLifecycleForRow({ ...row, status: "running", endedAt: null }, "started");
+  fireParkedDiscovery(row.taskId);
 }
 
 /** Same lifecycle-event shape `emitLifecycle` builds from a live `FileState`,
@@ -1314,14 +1516,37 @@ export function pumpWatcherForHoldCheck(taskId: string): void {
  * `settleSubagentById(id, "completed", "receipt")` unconditionally, since a
  * notification for a subagent/workflow/bg-shell row is always terminal.
  */
-export function handleBackgroundTaskNotification(taskId: string, id: string, body: string): void {
+export function handleBackgroundTaskNotification(
+  taskId: string,
+  id: string,
+  body: string,
+  lineTimestampMs: number | null = null,
+): void {
   const watcher = watchers.get(taskId);
   if (watcher?.hasMonitor(id)) {
     try {
-      watcher.applyMonitorNotification(id, body);
+      watcher.applyMonitorNotification(id, body, lineTimestampMs);
     } catch (e) {
       console.error(`[claude-subagents] monitor notification apply failed for ${id}:`, e);
     }
+    return;
+  }
+  // Finding #8 (code review, nice-to-have) — skip the `subagents.get(id)` DB
+  // probe below when a watcher IS attached to this task and confidently
+  // reports it tracks NO monitors at all: an id this task fired a
+  // background-task notification for can only be a `monitor`-kind row if
+  // some monitor exists for this task, so the DB lookup below could not
+  // possibly find what `hasMonitor(id)` above didn't already rule out. Every
+  // OTHER case still pays the probe, unchanged: no watcher attached at all
+  // (the DB is the only source of truth for a watcher-less task); and a
+  // watcher that DOES track at least one monitor, just not this particular
+  // id — a monitor row can exist in the DB for a task whose current watcher
+  // was armed before that row's insert (a fresh `attachSubagentWatcher` call
+  // racing a not-yet-rehydrated row is the general shape of that gap), so
+  // `hasAnyMonitor()` true does not imply `hasMonitor(id)` true and the probe
+  // still earns its keep there.
+  if (watcher && !watcher.hasAnyMonitor()) {
+    settleSubagentById(id, "completed", "receipt");
     return;
   }
   if (MONITORS_ENABLED) {
@@ -1333,7 +1558,7 @@ export function handleBackgroundTaskNotification(taskId: string, id: string, bod
     }
     if (row?.parentKind === "monitor") {
       try {
-        applyMonitorNotificationForRow(row, body);
+        applyMonitorNotificationForRow(row, body, lineTimestampMs);
       } catch (e) {
         console.error(`[claude-subagents] monitor notification (DB fallback) failed for ${id}:`, e);
       }
@@ -1381,6 +1606,7 @@ export function attachSubagentWatcher(opts: {
       syncSettled() { /* disabled */ },
       hasMonitor() { return false; },
       applyMonitorNotification() { return false; },
+      hasAnyMonitor() { return false; },
     };
   }
 
@@ -1531,6 +1757,39 @@ export function attachSubagentWatcher(opts: {
         // of its own (see `MonitorState`, and the module header's
         // "Monitors" section).
         if (MONITORS_ENABLED) {
+          // Finding #3(b) (code review) — superseded the old "any non-running
+          // row is receiptSettled" seed, which made flip-back permanently
+          // DEAD across a restart: `ceilingSettled` was always seeded
+          // `false` here (never persisted), and `applyMonitorNotification`'s
+          // flip-back gate is `m.ceilingSettled && !m.receiptSettled` — so a
+          // row that was only EVER settled by the ceiling's guess (never an
+          // authoritative receipt) rehydrated with its flip-back gate
+          // structurally impossible to open.
+          //
+          // Now the gate is derived from what's actually on record in
+          // `run_events`, which — unlike the in-memory `MonitorState` flags —
+          // survives a restart: `persistMonitorEvent` (finding #3(a)) marks a
+          // TERMINAL event's line_uuid with a `monitor:<id>:terminal:`
+          // prefix that no ordinary (activity) event ever carries, so its
+          // presence for this row IS the authoritative-receipt signal.
+          //   - A receipt on record ⇒ `receiptSettled: true` (closed,
+          //     mirrors the old behavior for a harness-terminated monitor).
+          //   - No receipt on record AND the DB says `completed` ⇒ this row
+          //     was settled only by `checkMonitorCeiling`'s GUESS ⇒
+          //     `ceilingSettled: true` so a later live event can flip it back
+          //     — restoring the guarantee the in-memory-only flags used to
+          //     lose on every restart.
+          //   - `running` (no receipt possible while running, by
+          //     construction) ⇒ both `false`, unchanged from before.
+          //   - Any OTHER terminal-ish status (e.g. `orphaned`, settled by a
+          //     wholly different path than either receipt or ceiling) ⇒ both
+          //     `false` — conservative: neither gate opens, so it can't be
+          //     resurrected by a stray later event, matching this module's
+          //     "don't presume resurrectable" default for a status this
+          //     rule doesn't otherwise recognise.
+          const receiptSettled = [...runs.seenLineUuidsForSubagent(row.id)].some((u) =>
+            u.startsWith(`monitor:${row.id}:terminal:`),
+          );
           monitors.set(row.id, {
             id: row.id,
             runId: row.runId ?? resolveRunId(taskId) ?? row.id,
@@ -1546,21 +1805,8 @@ export function attachSubagentWatcher(opts: {
             startedAt: row.startedAt,
             endedAt: row.endedAt,
             lastActivityAt: attachedAt,
-            ceilingSettled: false,
-            // Unlike most `receiptSettled` seeds elsewhere in this file
-            // (never rehydrated, always `false`), a monitor's is derived
-            // from the DB status: a rehydrated row that's already NOT
-            // `running` is treated as receipt-settled (harder to
-            // resurrect) rather than ceiling-settled (flippable) — whether
-            // it was actually settled via a receipt or the ceiling is lost
-            // across a restart either way, and `ceilingSettled` (never
-            // rehydrated, always `false` here) already means the flip-back
-            // gate in `applyMonitorNotification`
-            // (`m.ceilingSettled && !m.receiptSettled`) can't fire for this
-            // row regardless of this value — so this only matters for a
-            // hypothetical future reader of the flag, and the conservative
-            // choice ("don't presume resurrectable") is the safer default.
-            receiptSettled: row.status !== "running",
+            ceilingSettled: row.status === "completed" && !receiptSettled,
+            receiptSettled,
           });
         }
         continue;
@@ -2698,9 +2944,39 @@ export function attachSubagentWatcher(opts: {
    * completion receipt, so a row it settles should resist resurrection by a
    * trailing non-`user` line the way an inferred (`checkDone`/`checkStale`/
    * real-`tool_result`) settle does not.
+   *
+   * Finding #4 (code review) — the `monitors` lookup and dispatch now runs
+   * BEFORE the unknown-`<status>` guard, not after. A Monitor owns its own
+   * complete terminal-vs-activity rule end-to-end
+   * (`parseMonitorNotificationBlock`, which inspects `<status>` itself — see
+   * the module header's "Monitors" section) and is the ONE kind here for
+   * which an "unrecognised `<status>`" is not a reason to skip anything: fix
+   * 9's guard below only makes sense for a kind whose ENTIRE settle decision
+   * is "does `<status>` say terminal" — for those kinds, an unknown value is
+   * correctly treated as "can't tell, don't guess". A Monitor's notification
+   * envelope, by contrast, is defined to ALSO carry ordinary ACTIVITY (most
+   * of its notifications aren't completions at all), so before this fix a
+   * Monitor event whose `<status>` happened to be an unrecognised value (a
+   * hypothetical future harness status this code doesn't know about yet, or
+   * any garbage value) was silently DROPPED by the guard's `continue` —
+   * never reaching `applyMonitorNotification` at all, so `lastActivityAt`
+   * never advanced and the event was never persisted to the tab. Moving
+   * monitors above the guard fixes this: they always reach their own rule,
+   * and any `<status>` they can't interpret as terminal is correctly folded
+   * into activity by `parseMonitorNotificationBlock` rather than discarded.
+   * The guard itself is UNCHANGED for every other kind — workflow
+   * containers, plain rows, and bg shells still skip (and log) on an
+   * unrecognised `<status>` exactly as before.
    */
   function scanLineForTaskNotification(line: string): void {
     if (!line.includes("<task-notification>") || !line.includes("<task-id>")) return;
+    // Finding #5 — the enclosing line's own `timestamp`, read once per line
+    // (not once per notification block — every block on one batched line
+    // shares the same enclosing envelope) and threaded into
+    // `applyMonitorNotification` to bucket its dedup key. `null` when
+    // absent/unparseable, which `persistMonitorEvent` treats as "no bucket,
+    // hash-only key" — today's pre-fix behavior.
+    const lineTimestampMs = extractLineTimestampMs(line);
     // Match each whole `<task-notification>…</task-notification>` block, not
     // just each `<task-id>` tag: fix 9 needs each notification's OWN
     // `<status>`, and a batched enqueue line can carry more than one
@@ -2712,6 +2988,20 @@ export function attachSubagentWatcher(opts: {
       const idMatch = /<task-id>([^<]+)<\/task-id>/.exec(body);
       if (!idMatch) continue;
       const id = idMatch[1]!.trim();
+
+      // Finding #4 — dispatch to a tracked monitor BEFORE the
+      // unknown-`<status>` guard below; see this function's doc for why.
+      // Mirrors the `bgShells` branch's posture of "never call
+      // `settleSubagentById` unconditionally" — an ordinary Monitor event is
+      // activity, not completion, and `applyMonitorNotification` is the one
+      // place that owns that distinction; this is just the dispatch to it.
+      const mon = monitors.get(id);
+      if (mon) {
+        // The scan works on raw line text; decode the fragment so the hash
+        // and the persisted event text match what the live path sees.
+        applyMonitorNotification(id, decodeJsonStringFragment(body), lineTimestampMs);
+        continue;
+      }
 
       const statusMatch = /<status>([^<]+)<\/status>/.exec(body);
       const statusRaw = statusMatch ? statusMatch[1]!.trim() : null;
@@ -2756,16 +3046,7 @@ export function attachSubagentWatcher(opts: {
         b.receiptSettled = true;
         b.settleFloor = null;
         if (b.status === "running") settleSubagentById(id, "completed", "receipt");
-        continue;
       }
-      // Nor a `bgShells` row — check `monitors` (the module header's
-      // "Monitors" section). UNLIKE every lookup above, this branch must
-      // NEVER call `settleSubagentById` unconditionally: an ordinary Monitor
-      // event notification is activity, not completion, and
-      // `applyMonitorNotification` is the one place that owns the
-      // terminal-vs-activity distinction — this is just the dispatch to it.
-      const mon = monitors.get(id);
-      if (mon) applyMonitorNotification(id, body);
     }
   }
 
@@ -3143,14 +3424,21 @@ export function attachSubagentWatcher(opts: {
    * block", so the return value alone is NOT the right way to distinguish
    * those two — callers that need to (`handleBackgroundTaskNotification`'s
    * routing) check `monitors.has(id)` (or the handle's `hasMonitor`) FIRST.
+   *
+   * `lineTimestampMs` (finding #5) — the enclosing main-JSONL line's own
+   * `timestamp`, when the caller has one (only `scanLineForTaskNotification`
+   * does; the live orchestrator dispatch does not — see
+   * `handleBackgroundTaskNotification`'s doc). Threaded straight through to
+   * `persistMonitorEvent` to bucket its dedup key; `undefined` here falls
+   * back to that function's hash-only key.
    */
-  function applyMonitorNotification(id: string, body: string): boolean {
+  function applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): boolean {
     const m = monitors.get(id);
     if (!m) return false;
     const block = extractNotificationBlockForId(body, id);
     if (block === null) return false;
     const { isTerminal, eventText } = parseMonitorNotificationBlock(block);
-    if (eventText) persistMonitorEvent(m.runId, taskId, id, block, eventText);
+    if (eventText) persistMonitorEvent(m.runId, taskId, id, block, eventText, isTerminal, lineTimestampMs);
 
     if (isTerminal) {
       // Unconditional receipt latch, mirroring `scanLineForTaskNotification`'s
@@ -3174,6 +3462,19 @@ export function attachSubagentWatcher(opts: {
       m.status = "running";
       m.endedAt = null;
       m.ceilingSettled = false;
+      // Finding #1(b) (code review) — once THIS event has proven the
+      // harness's own timed deadline wrong, stop trusting that deadline: a
+      // monitor that outlived its nominal `timeout_ms` is, empirically, not
+      // bound by it anymore (claude re-armed it, or the deadline notification
+      // was simply lost and the monitor kept right on running). Falling to
+      // the activity-anchored `MONITOR_DEFAULT_STALE_MS` rule — exactly the
+      // rule a REHYDRATED row uses, since a restart loses `timeoutMs`/
+      // `persistent` the same way — is both correct on its own terms and
+      // (paired with #1(a) above) what stops `checkMonitorCeiling`'s TIMED
+      // branch from immediately re-settling this row on its very next check
+      // within the same tick (the oscillation this finding is about).
+      m.timeoutMs = null;
+      m.persistent = null;
       subagentsDb.setStatus(id, "running", null);
       emitLifecycleForRow(toMonitorShape(m, taskId), "started");
       fireParkedDiscovery(taskId);
@@ -3204,13 +3505,30 @@ export function attachSubagentWatcher(opts: {
    * — a monitor has no output file to `statSync`. Flip-back happens only
    * reactively, inside `applyMonitorNotification`, when a later event proves
    * a ceiling-settled row wrong.
+   *
+   * Finding #1(a) (code review) — the TIMED branch's deadline
+   * (`startedAt + timeoutMs + MARGIN`) is otherwise IMMUTABLE: once past, it
+   * stays past forever, so on the very next tick after
+   * `applyMonitorNotification`'s flip-back resurrects a row, THIS check
+   * would immediately re-settle it right back — an oscillation, not a bug
+   * the flip-back logic alone can prevent (the bg-shell "review fix R1"
+   * class of bug, recurring here for a deadline instead of an offset). The
+   * fix requires a MARGIN of actual silence too
+   * (`now - lastActivityAt > MONITOR_TIMEOUT_MARGIN_MS`), not just the
+   * deadline having elapsed — a monitor that's still actively firing events
+   * can't be silent long enough to satisfy this even once its nominal
+   * deadline has passed. Paired with fix #1(b) below (nulling `timeoutMs`/
+   * `persistent` on flip-back, so a resurrected row falls out of this
+   * TIMED branch entirely on its very next check), this closes the
+   * oscillation for good rather than just narrowing its window.
    */
   function checkMonitorCeiling(now: number): void {
     for (const m of monitors.values()) {
       if (m.status !== "running") continue;
       const timed = m.persistent === false && m.timeoutMs != null;
       const expired = timed
-        ? now > m.startedAt + m.timeoutMs! + MONITOR_TIMEOUT_MARGIN_MS
+        ? now > m.startedAt + m.timeoutMs! + MONITOR_TIMEOUT_MARGIN_MS &&
+          now - m.lastActivityAt > MONITOR_TIMEOUT_MARGIN_MS
         : now - m.lastActivityAt > MONITOR_DEFAULT_STALE_MS;
       if (!expired) continue;
       m.status = "completed";
@@ -3492,8 +3810,11 @@ export function attachSubagentWatcher(opts: {
     hasMonitor(id: string): boolean {
       return monitors.has(id);
     },
-    applyMonitorNotification(id: string, body: string): boolean {
-      return applyMonitorNotification(id, body);
+    applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): boolean {
+      return applyMonitorNotification(id, body, lineTimestampMs);
+    },
+    hasAnyMonitor(): boolean {
+      return monitors.size > 0;
     },
   };
   watchers.set(taskId, handle);
