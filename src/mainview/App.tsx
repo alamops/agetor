@@ -1,11 +1,32 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
-import { AlertTriangle, FolderGit2, GitPullRequest, Settings, X } from "lucide-react";
+import {
+  AlertTriangle,
+  Archive,
+  ArchiveRestore,
+  CheckCircle2,
+  Copy,
+  FolderGit2,
+  FolderOpen,
+  Folder,
+  GitBranch,
+  GitCompare,
+  GitPullRequest,
+  Mail,
+  MailOpen,
+  Play,
+  Settings,
+  Square,
+  Trash2,
+  X,
+  type LucideIcon,
+} from "lucide-react";
 import { api, type AgentModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
+import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
 import { DiffDialog } from "@/components/kanban/DiffDialog";
 import { GitHubDialog, type GitHubPullDetailPrefill, type GitHubPullPrefill } from "@/components/kanban/GitHubDialog";
 import { UsageMeter } from "@/components/usage/UsageMeter";
@@ -31,6 +52,8 @@ import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
 import { parseThemePreference } from "@/lib/theme";
 import { parsePullNumber } from "@/lib/pr-url";
+import { keepsNativeContextMenu } from "@/lib/context-menu";
+import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@/lib/task-context-menu";
 import { cn } from "@/lib/utils";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
 import type { SettingsSectionId } from "@/lib/settings-dialog-view";
@@ -152,6 +175,27 @@ const EMPTY_COLUMN_HINT: Partial<Record<ColumnId, string>> = {
   ready: "Tasks return here when a run needs another go",
   running: "Agents working right now",
   blocked: "Needs your attention",
+};
+
+/** One icon per `TaskMenuAction`, for the task context menu built from
+ *  `buildTaskContextMenu`'s pure entries (see the `taskMenuItems` memo
+ *  below). Keyed exhaustively so a new action added to the union surfaces
+ *  as a type error here instead of rendering an icon-less menu item. */
+const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
+  open: FolderOpen,
+  start: Play,
+  stop: Square,
+  "mark-done": CheckCircle2,
+  archive: Archive,
+  unarchive: ArchiveRestore,
+  diff: GitCompare,
+  "open-in-finder": Folder,
+  "view-pr": GitPullRequest,
+  "mark-read": MailOpen,
+  "mark-unread": Mail,
+  "copy-branch": GitBranch,
+  "copy-worktree-path": Copy,
+  delete: Trash2,
 };
 
 /**
@@ -425,6 +469,22 @@ function AppInner() {
       if (defaultsTimer) clearTimeout(defaultsTimer);
     };
   }, [refresh, refreshAgents, refreshAgentModels, refreshProjects]);
+
+  // Suppress WebKit's native right-click menu everywhere except editable
+  // text and the xterm terminal (owner decision D2 (b) in
+  // docs/plans/task-context-menu.md) — our own `<ContextMenu>` (below) is
+  // the replacement on task cards; elsewhere a right-click now just does
+  // nothing. Cmd+C/V/X/Z keep working everywhere regardless of this — those
+  // come from the Edit-menu roles `src/bun/index.ts` installs, not from the
+  // native context menu.
+  useEffect(() => {
+    const onCtx = (e: MouseEvent) => {
+      if (keepsNativeContextMenu(e.target)) return;
+      e.preventDefault();
+    };
+    document.addEventListener("contextmenu", onCtx);
+    return () => document.removeEventListener("contextmenu", onCtx);
+  }, []);
 
   // Keep the selected task in sync as the list refreshes.
   useEffect(() => {
@@ -938,6 +998,170 @@ function AppInner() {
     }
   }, [confirm, refresh, surfaceError]);
 
+  // Best-effort "reveal in Finder" — same fire-and-forget idiom as
+  // RunPanel's own Open button (`RunPanel.tsx`'s `api.openPath` call): a
+  // failure here has no useful recovery, so it's swallowed rather than
+  // routed through `surfaceError`.
+  const openInFinder = useCallback((t: Task) => {
+    void api.openPath({ path: t.worktreePath ?? t.workdir, taskId: t.id }).catch(() => { /* best-effort */ });
+  }, []);
+
+  // Shared by RunPanel's `onViewPullRequest` prop and the task context
+  // menu's "View pull request" entry — extracted so the two call sites
+  // can't drift: parse the PR number out of the URL and drive the in-app
+  // GitHub detail subpage when possible, else fall back to opening the URL
+  // in the OS browser.
+  const viewPullRequest = useCallback(({ projectPath, prUrl }: { projectPath: string; prUrl: string }) => {
+    const number = parsePullNumber(prUrl);
+    if (number == null) {
+      // Can't drive the in-app detail subpage without a parsed PR number —
+      // fall back to the plain external link rather than silently doing
+      // nothing.
+      void api.openExternal(prUrl).catch((err: unknown) => {
+        toast.error(err instanceof Error ? err.message : "Could not open link");
+      });
+      return;
+    }
+    setGithubPullDetailPrefill({ projectPath, number, prUrl });
+    setGithubPullPrefill(null);
+    setGithubOpen(true);
+  }, []);
+
+  // `markRead`/`markUnread`: optimistic single-field `unread` merge (never
+  // the whole `Task` snapshot — see the mark-seen effect above for why),
+  // then reconcile from the server response, same single-field merge.
+  // `surfaceError` + `refresh()` on failure so an optimistic flip that the
+  // server rejected doesn't stick.
+  const markRead = useCallback(async (t: Task) => {
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, unread: false } : x)));
+    try {
+      setError(null);
+      const updated = await api.markTaskSeen(t.id);
+      setTasks((cur) => cur.map((x) => (x.id === updated.id ? { ...x, unread: updated.unread } : x)));
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  }, [refresh, surfaceError]);
+  const markUnread = useCallback(async (t: Task) => {
+    setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, unread: true } : x)));
+    try {
+      setError(null);
+      const updated = await api.markTaskUnread(t.id);
+      setTasks((cur) => cur.map((x) => (x.id === updated.id ? { ...x, unread: updated.unread } : x)));
+    } catch (e) {
+      surfaceError(e);
+      await refresh();
+    }
+  }, [refresh, surfaceError]);
+
+  // Clipboard copy for the menu's "Copy branch name" / "Copy worktree path"
+  // entries — same idiom as `md-components.tsx`'s code-block copy button.
+  const copyToClipboard = useCallback(async (text: string, what: "branch name" | "worktree path") => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success(`Copied ${what}`);
+    } catch {
+      toast.error("Couldn't copy to clipboard");
+    }
+  }, []);
+
+  // Task context menu (right-click on a board card). `taskMenu` holds only
+  // the task id + anchor position — the live `Task` is resolved from
+  // `tasks` on every render (below) so the menu's entries track the 2s
+  // poll instead of freezing a stale snapshot from the moment it opened.
+  const [taskMenu, setTaskMenu] = useState<{ taskId: string; x: number; y: number } | null>(null);
+  const openTaskMenu = useCallback((t: Task, pos: { x: number; y: number }) => {
+    setTaskMenu({ taskId: t.id, x: pos.x, y: pos.y });
+  }, []);
+  const closeTaskMenu = useCallback(() => setTaskMenu(null), []);
+  const menuTask = taskMenu ? (tasks.find((t) => t.id === taskMenu.taskId) ?? null) : null;
+  // The task the menu was opened for got deleted (by this client or another
+  // one) while the menu was still open — close it rather than leave a menu
+  // full of handlers pointing at a task that no longer exists.
+  useEffect(() => {
+    if (taskMenu && !menuTask) setTaskMenu(null);
+  }, [taskMenu, menuTask]);
+
+  // Exhaustive dispatch from a `TaskMenuAction` (buildTaskContextMenu's pure
+  // output) to the real App.tsx handler. The non-null assertions on
+  // branch/worktreePath/prUrl are safe: `buildTaskContextMenu` only emits
+  // `copy-branch`/`copy-worktree-path`/`view-pr` when those fields are set.
+  const runTaskMenuAction = useCallback((action: TaskMenuAction, t: Task) => {
+    switch (action) {
+      case "open":
+        setSelected(t);
+        break;
+      case "start":
+        void start(t);
+        break;
+      case "stop":
+        void cancel(t);
+        break;
+      case "mark-done":
+        void markDone(t);
+        break;
+      case "archive":
+        void archive(t);
+        break;
+      case "unarchive":
+        void unarchive(t);
+        break;
+      case "diff":
+        setDiffTask(t);
+        break;
+      case "open-in-finder":
+        openInFinder(t);
+        break;
+      case "view-pr":
+        viewPullRequest({ projectPath: t.workdir, prUrl: t.prUrl! });
+        break;
+      case "mark-read":
+        void markRead(t);
+        break;
+      case "mark-unread":
+        void markUnread(t);
+        break;
+      case "copy-branch":
+        void copyToClipboard(t.branch!, "branch name");
+        break;
+      case "copy-worktree-path":
+        void copyToClipboard(t.worktreePath!, "worktree path");
+        break;
+      case "delete":
+        void del(t);
+        break;
+      default: {
+        const exhaustive: never = action;
+        return exhaustive;
+      }
+    }
+  }, [start, cancel, markDone, archive, unarchive, openInFinder, viewPullRequest, markRead, markUnread, copyToClipboard, del]);
+
+  // Maps `buildTaskContextMenu`'s pure entries onto the primitive's
+  // `ContextMenuItem[]`, inserting a separator whenever the group changes
+  // (per the entries' own ordering — see `TaskMenuGroup`'s doc comment).
+  const taskMenuItems = useMemo<ContextMenuItem[]>(() => {
+    if (!menuTask) return [];
+    const entries = buildTaskContextMenu(menuTask, { isOpen: menuTask.id === selected?.id });
+    const items: ContextMenuItem[] = [];
+    let prevGroup: TaskMenuGroup | null = null;
+    for (const entry of entries) {
+      if (prevGroup !== null && entry.group !== prevGroup) {
+        items.push({ type: "separator", id: `sep-${entry.group}` });
+      }
+      items.push({
+        id: entry.action,
+        label: entry.label,
+        danger: entry.danger,
+        icon: ICON_BY_ACTION[entry.action],
+        onSelect: () => runTaskMenuAction(entry.action, menuTask),
+      });
+      prevGroup = entry.group;
+    }
+    return items;
+  }, [menuTask, selected?.id, runTaskMenuAction]);
+
   // Shared by GitHubDialog's `onClose` and `onOpenSettings` (the latter also
   // opens SettingsDialog) so the three-setter teardown can't drift out of
   // sync between the two call sites — both must clear the dialog's own open
@@ -1174,6 +1398,7 @@ function AppInner() {
                       onUnarchive={unarchive}
                       emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
                       selectedTaskId={selected?.id ?? null}
+                      onContextMenu={openTaskMenu}
                     />
                   ))}
                 </div>
@@ -1220,26 +1445,21 @@ function AppInner() {
           setGithubPullDetailPrefill(null);
           setGithubOpen(true);
         }}
-        onViewPullRequest={({ projectPath, prUrl }) => {
-          const number = parsePullNumber(prUrl);
-          if (number == null) {
-            // Can't drive the in-app detail subpage without a parsed PR
-            // number — fall back to the plain external link rather than
-            // silently doing nothing.
-            void api.openExternal(prUrl).catch((err: unknown) => {
-              toast.error(err instanceof Error ? err.message : "Could not open link");
-            });
-            return;
-          }
-          setGithubPullDetailPrefill({ projectPath, number, prUrl });
-          setGithubPullPrefill(null);
-          setGithubOpen(true);
-        }}
+        onViewPullRequest={viewPullRequest}
       />
       <DiffDialog
         open={!!diffTask}
         task={diffTask ? (tasks.find((t) => t.id === diffTask.id) ?? diffTask) : null}
         onClose={() => setDiffTask(null)}
+      />
+      <ContextMenu
+        open={menuTask != null}
+        x={taskMenu?.x ?? 0}
+        y={taskMenu?.y ?? 0}
+        items={taskMenuItems}
+        onClose={closeTaskMenu}
+        label="Task actions"
+        testId="task-context-menu"
       />
       <GitHubDialog
         open={githubOpen}
