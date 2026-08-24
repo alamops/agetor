@@ -97,3 +97,23 @@ export function keepsNativeContextMenu(target: EventTarget | null): boolean {
   const el = target as { closest?: (selector: string) => unknown } | null | undefined;
   return Boolean(el?.closest?.(NATIVE_CONTEXT_MENU_SELECTOR));
 }
+
+/**
+ * Whether the user currently has a non-empty text selection — the other
+ * surface the native menu must keep serving (owner decision D2 (b), widened
+ * at review time): for selected read-only text (an assistant reply, a diff
+ * hunk, a PR body) the native menu is the only mouse path to Copy / Look Up /
+ * Search With…, and Cmd+C alone doesn't cover the latter two. Duck-typed on
+ * the `Selection` contract (`isCollapsed` + `toString`) so it's unit-testable
+ * without a DOM; a whitespace-only selection doesn't count (nothing worth
+ * copying). Task cards are unaffected: `TaskCard`'s own `onContextMenu`
+ * calls `preventDefault()` before the document-level suppressor consults
+ * this, so our menu still wins on a card even with stale selected text
+ * elsewhere on the page.
+ */
+export function hasTextSelection(
+  selection: { isCollapsed: boolean; toString(): string } | null | undefined,
+): boolean {
+  if (!selection || selection.isCollapsed) return false;
+  return selection.toString().trim().length > 0;
+}

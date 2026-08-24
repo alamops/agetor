@@ -52,7 +52,7 @@ import { PendingInputTracker } from "@/lib/pending-input-tracker";
 import { findTaskById } from "@/lib/notification-open";
 import { parseThemePreference } from "@/lib/theme";
 import { parsePullNumber } from "@/lib/pr-url";
-import { keepsNativeContextMenu } from "@/lib/context-menu";
+import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
 import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@/lib/task-context-menu";
 import { cn } from "@/lib/utils";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
@@ -471,15 +471,18 @@ function AppInner() {
   }, [refresh, refreshAgents, refreshAgentModels, refreshProjects]);
 
   // Suppress WebKit's native right-click menu everywhere except editable
-  // text and the xterm terminal (owner decision D2 (b) in
-  // docs/plans/task-context-menu.md) — our own `<ContextMenu>` (below) is
-  // the replacement on task cards; elsewhere a right-click now just does
-  // nothing. Cmd+C/V/X/Z keep working everywhere regardless of this — those
-  // come from the Edit-menu roles `src/bun/index.ts` installs, not from the
-  // native context menu.
+  // text, the xterm terminal, and while read-only text is selected (owner
+  // decision D2 (b) in docs/plans/task-context-menu.md, widened at review
+  // time for the selection case — the native menu is the only mouse path to
+  // Copy / Look Up on selected assistant output). Our own `<ContextMenu>`
+  // (below) is the replacement on task cards; elsewhere a right-click now
+  // just does nothing. Cmd+C/V/X/Z keep working everywhere regardless of
+  // this — those come from the Edit-menu roles `src/bun/index.ts` installs,
+  // not from the native context menu.
   useEffect(() => {
     const onCtx = (e: MouseEvent) => {
       if (keepsNativeContextMenu(e.target)) return;
+      if (hasTextSelection(window.getSelection())) return;
       e.preventDefault();
     };
     document.addEventListener("contextmenu", onCtx);

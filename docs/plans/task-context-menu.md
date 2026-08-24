@@ -366,3 +366,8 @@ on the New Task prompt `textarea` → `false`.
   partially-visible card isn't scrolled into view under the freshly opened
   menu — a scroll would trigger the menu's own scroll-close handler and
   dismiss it before the user could act.
+- Post-review widening of D2 (b), approved by the owner: the suppressor also
+  lets the native menu through while a non-empty read-only text selection
+  exists (`hasTextSelection(window.getSelection())`), since that menu is the
+  only mouse path to Copy / Look Up / Search With… on selected assistant
+  output. Task cards are unaffected (their handler prevents default first).

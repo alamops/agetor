@@ -472,6 +472,31 @@ test.describe("task context menu", () => {
     });
     expect(textareaPrevented).toBe(false);
 
+    // Selected read-only text: the native menu is the only mouse path to
+    // Copy / Look Up there, so the suppressor lets it through while a
+    // non-empty selection exists — and suppresses again once it collapses.
+    // A column header is plain, selectable text (cards are `select-none`).
+    const heading = page.locator("main h2").first();
+    await expect(heading).toBeVisible();
+    const withSelection = await heading.evaluate((el) => {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const sel = window.getSelection()!;
+      sel.removeAllRanges();
+      sel.addRange(range);
+      const selectedText = sel.toString();
+      const ev = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+      document.body.dispatchEvent(ev);
+      const prevented = ev.defaultPrevented;
+      sel.removeAllRanges();
+      const after = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+      document.body.dispatchEvent(after);
+      return { selectedText, prevented, preventedAfterCollapse: after.defaultPrevented };
+    });
+    expect(withSelection.selectedText.trim().length).toBeGreaterThan(0);
+    expect(withSelection.prevented).toBe(false);
+    expect(withSelection.preventedAfterCollapse).toBe(true);
+
     const card = taskCard(page, title);
     const cardPrevented = await card.evaluate((el) => {
       const ev = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });

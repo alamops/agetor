@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  hasTextSelection,
   keepsNativeContextMenu,
   moveMenuIndex,
   NATIVE_CONTEXT_MENU_SELECTOR,
@@ -213,5 +214,26 @@ describe("NATIVE_CONTEXT_MENU_SELECTOR", () => {
     for (const type of ["button", "checkbox", "radio", "submit", "range", "file"]) {
       expect(NATIVE_CONTEXT_MENU_SELECTOR).toContain(`:not([type="${type}"])`);
     }
+  });
+});
+
+describe("hasTextSelection", () => {
+  test("null / undefined selection → false", () => {
+    expect(hasTextSelection(null)).toBe(false);
+    expect(hasTextSelection(undefined)).toBe(false);
+  });
+
+  test("a collapsed selection is not a selection, even if toString has text", () => {
+    expect(hasTextSelection({ isCollapsed: true, toString: () => "abc" })).toBe(false);
+  });
+
+  test("non-collapsed but empty or whitespace-only → false", () => {
+    expect(hasTextSelection({ isCollapsed: false, toString: () => "" })).toBe(false);
+    expect(hasTextSelection({ isCollapsed: false, toString: () => "  \n\t " })).toBe(false);
+  });
+
+  test("non-collapsed with real text → true", () => {
+    expect(hasTextSelection({ isCollapsed: false, toString: () => "Starting Phase 1" })).toBe(true);
+    expect(hasTextSelection({ isCollapsed: false, toString: () => " x " })).toBe(true);
   });
 });
