@@ -69,6 +69,7 @@ import { AttachmentChips } from "./AttachmentChips";
 import {
   ReferencesPicker,
   captureDroppedOrPastedItems,
+  dropHintMessage,
   mergeRefs,
   type CapturedItem,
 } from "./ReferencesPicker";
@@ -2391,13 +2392,17 @@ function RunPanelBody({
     if (!canSend) { setSendDragging(false); return; }
     if (e.currentTarget === e.target) setSendDragging(false);
   };
-  const reportSendCapture = ({ items, skipped, error }: {
+  const reportSendCapture = (result: {
     items: CapturedItem[];
     skipped: number;
+    skippedFolders: number;
     error?: string;
   }) => {
-    if (error) setSendHint(`Couldn't save screenshot: ${error}`);
-    else if (skipped && !items.length) setSendHint("Nothing to attach — drag a file from Finder, or a screenshot blob.");
+    setSendHint(dropHintMessage(result, {
+      partialFolder: "Attached the files — one folder couldn't be attached; use the folder picker.",
+      allFolder: "Couldn't attach the folder — use the folder picker instead.",
+      nothingToAttach: "Nothing to attach — drag a file from Finder, or paste a screenshot.",
+    }));
   };
   const onSendDrop = async (e: React.DragEvent) => {
     // preventDefault unconditionally so a stray drop while !canSend doesn't
@@ -2406,7 +2411,7 @@ function RunPanelBody({
     setSendDragging(false);
     if (!canSend) return;
     setSendHint(null);
-    const result = await captureDroppedOrPastedItems(e.dataTransfer);
+    const result = await captureDroppedOrPastedItems(e.dataTransfer, { kind: "drop" });
     reportSendCapture(result);
     applySendCaptured(result.items);
   };
@@ -2417,7 +2422,7 @@ function RunPanelBody({
     if (!hasFile) return;
     e.preventDefault();
     setSendHint(null);
-    const result = await captureDroppedOrPastedItems(cd);
+    const result = await captureDroppedOrPastedItems(cd, { kind: "paste" });
     reportSendCapture(result);
     applySendCaptured(result.items);
   };
@@ -2604,8 +2609,6 @@ function RunPanelBody({
           </Button>
         </div>
       )}
-
-      <FileMentions task={task} events={events} />
 
       {/* Task details. Editable inline when the task is idle — agent / mode /
           model / effort each PATCH the task on change, and if a live claude
@@ -3366,70 +3369,6 @@ function BacklogItemRow({
 }
 
 /**
- * Heuristic file-path harvester. Pulls likely file paths out of the streamed
- * log so the user can one-click open them (plan files, freshly-written
- * artifacts, the file the agent just edited). Two patterns:
- *   1. Absolute paths starting with `/` (macOS / Linux).
- *   2. Inside a worktree, paths that include known file-extension hints
- *      (`.md`, `.ts`, `.tsx`, `.json`, `.txt`, …) — these are resolved
- *      relative to the worktree's cwd on click.
- *
- * Extension allow-list rather than open-ended: a bare word with a dot in it
- * (e.g. `1.5x`) would otherwise false-positive. Surfaces results as small
- * clickable chips above the log; dedup'd and ordered by first appearance.
- */
-const FILE_EXTENSIONS = [
-  "md", "mdx", "txt", "json", "yaml", "yml", "toml",
-  "ts", "tsx", "js", "jsx", "mjs", "cjs",
-  "py", "rb", "go", "rs", "java", "kt", "swift", "c", "cc", "cpp", "h", "hpp",
-  "sql", "sh", "css", "scss", "html",
-];
-const ABS_PATH_RE = /(\/(?:[\w.\-]+\/)+[\w.\-]+)/g;
-const REL_PATH_RE = new RegExp(
-  `(?:^|[\\s\\(\\[])([\\w./\\-]+\\.(?:${FILE_EXTENSIONS.join("|")}))(?=[\\s,\\):;]|$)`,
-  "gm",
-);
-
-// Internal paths claude/agetor write to as part of normal operation —
-// session JSONLs, our own data dir scratch files. The user didn't ask the
-// agent to work on these; surfacing them in the "Files mentioned" chip row
-// is just noise.
-function isInternalPath(p: string): boolean {
-  return (
-    // Claude's own per-session transcript: ~/.claude/projects/<encoded>/<uuid>.jsonl
-    /\/\.claude\/projects\/[^/]+\/[^/]+\.jsonl$/.test(p)
-    // Agetor's own data dir scratch: ~/.agetor/**
-    || /\/\.agetor\//.test(p)
-  );
-}
-
-function extractFileMentions(events: RunEvent[]): string[] {
-  if (events.length === 0) return [];
-  const order: string[] = [];
-  const seen = new Set<string>();
-  const push = (p: string) => {
-    if (seen.has(p) || isInternalPath(p)) return;
-    seen.add(p);
-    order.push(p);
-  };
-  // Concatenate the data strings into one corpus so the existing regex
-  // pair (absolute path + extension-anchored relative path) keeps working.
-  // Skips interaction-stream JSON noise.
-  const corpus = events
-    .filter((e) => e.stream !== "interaction")
-    .map((e) => e.data)
-    .join("\n");
-  for (const m of corpus.matchAll(ABS_PATH_RE)) push(m[1]!);
-  for (const m of corpus.matchAll(REL_PATH_RE)) push(m[1]!);
-  return order.slice(0, 20);
-}
-
-function basename(p: string): string {
-  const i = p.lastIndexOf("/");
-  return i >= 0 ? p.slice(i + 1) : p;
-}
-
-/**
  * Read-only tab strip for switching the log between the task's own (Main)
  * agent stream and each background/sub agent it has spawned. Shown only while
  * background agents are active (see `showSubagentTabs`). The Main tab is always
@@ -3680,38 +3619,6 @@ function RunsList({ runs, usageByRun }: { runs: Run[]; usageByRun?: Map<string, 
         </ul>
       )}
     </div>
-  );
-}
-
-function FileMentions({ task, events }: { task: Task; events: RunEvent[] }) {
-  const files = useMemo(() => extractFileMentions(events), [events]);
-  if (files.length === 0) return null;
-  return (
-    <details className="border-b border-border/60 px-3 py-2 text-xs">
-      <summary className="cursor-pointer text-muted-foreground">
-        <span className="text-[10px] uppercase tracking-wide">
-          Files mentioned <span className="font-mono normal-case">({files.length})</span>
-        </span>
-      </summary>
-      <div className="mt-2 flex flex-wrap gap-1">
-        {files.map((f) => (
-          <button
-            key={f}
-            type="button"
-            onClick={() =>
-              void api
-                .openPath({ path: f, taskId: task.id })
-                .catch(() => { /* surfaced elsewhere — chip just no-ops */ })
-            }
-            title={`Open ${f}`}
-            className="flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-card px-2 py-0.5 text-[11px] hover:bg-accent/40"
-          >
-            <FileText className="size-3 shrink-0 opacity-70" />
-            <span className="truncate font-mono">{basename(f)}</span>
-          </button>
-        ))}
-      </div>
-    </details>
   );
 }
 

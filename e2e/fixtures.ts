@@ -32,6 +32,12 @@ export interface E2EBackend {
   apiBase: string;
   bootBase: string;
   dataDir: string;
+  /** Port the per-worker/per-test stub GitHub API server should (or does)
+   *  listen on — see `e2e/github-stub.ts`. The backend is launched with
+   *  `AGETOR_GITHUB_API_BASE` pointed at this port, so a spec that starts
+   *  `startGitHubStub(backend.githubStubPort, routes)` transparently becomes
+   *  the app's GitHub API for the lifetime of that backend. */
+  githubStubPort: number;
 }
 
 const REPO_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
@@ -210,6 +216,7 @@ async function killGracefully(child: ChildProcess): Promise<void> {
 async function provisionBackend(
   apiPort: number,
   apiToken: string,
+  githubStubPort: number,
   logLabel: string,
   use: (backend: E2EBackend) => Promise<void>,
 ): Promise<void> {
@@ -274,6 +281,16 @@ async function provisionBackend(
       // fixture — no spec here starts a run on any of them.
       AGETOR_FX_DRIVER: "fake",
       AGETOR_FX_BIN: fxStubBinPath,
+      // Points every GitHub REST/GraphQL call this backend makes at a local
+      // stub server instead of the real api.github.com (see
+      // src/bun/github.ts's `GITHUB_API_BASE` seam and e2e/github-stub.ts).
+      // Specs that never open the Git dialog never hit this — it's inert
+      // until something calls startGitHubStub(backend.githubStubPort, ...).
+      AGETOR_GITHUB_API_BASE: `http://127.0.0.1:${githubStubPort}`,
+      // So `githubToken()` resolves this literal token from env and never
+      // shells out to `gh auth token` on the dev machine (which could hang,
+      // fail, or leak a real token into a test run).
+      GITHUB_TOKEN: "e2e-github-token",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -341,6 +358,7 @@ async function provisionBackend(
     apiBase,
     bootBase: `${E2E_BASE_URL}/#api=${apiPort}&token=${apiToken}`,
     dataDir,
+    githubStubPort,
   };
 
   await use(backend);
@@ -370,6 +388,13 @@ async function provisionBackend(
 // these run concurrently even on a many-worker machine.
 const FRESH_BASE_API_PORT = 4700;
 
+// Disjoint from BASE_API_PORT (4600+) and FRESH_BASE_API_PORT (4700+) above —
+// each worker's (and each freshBackend test's) stub GitHub API server gets
+// its own port so parallel workers/tests never collide on it, mirroring how
+// the two API-port ranges stay disjoint from each other.
+const GITHUB_STUB_BASE_PORT = 4800;
+const FRESH_GITHUB_STUB_BASE_PORT = 4900;
+
 export const test = base.extend<{ freshBackend: E2EBackend }, { backend: E2EBackend }>({
   backend: [
     async ({}, use, workerInfo) => {
@@ -386,7 +411,8 @@ export const test = base.extend<{ freshBackend: E2EBackend }, { backend: E2EBack
       // raced it. A random token makes any such impostor fail auth loudly
       // instead.
       const apiToken = `e2e-w${workerInfo.parallelIndex}-${randomUUID()}`;
-      await provisionBackend(apiPort, apiToken, `worker ${workerInfo.parallelIndex}`, use);
+      const githubStubPort = GITHUB_STUB_BASE_PORT + workerInfo.parallelIndex;
+      await provisionBackend(apiPort, apiToken, githubStubPort, `worker ${workerInfo.parallelIndex}`, use);
     },
     { scope: "worker" },
   ],
@@ -408,6 +434,7 @@ export const test = base.extend<{ freshBackend: E2EBackend }, { backend: E2EBack
   freshBackend: async ({}, use, testInfo) => {
     const apiPort = FRESH_BASE_API_PORT + testInfo.parallelIndex;
     const apiToken = `e2e-fresh-w${testInfo.parallelIndex}-${randomUUID()}`;
-    await provisionBackend(apiPort, apiToken, `test "${testInfo.title}"`, use);
+    const githubStubPort = FRESH_GITHUB_STUB_BASE_PORT + testInfo.parallelIndex;
+    await provisionBackend(apiPort, apiToken, githubStubPort, `test "${testInfo.title}"`, use);
   },
 });

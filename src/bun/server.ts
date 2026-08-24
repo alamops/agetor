@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -25,6 +25,7 @@ import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, createTask, deleteOrphanWorktree, deleteTask, listWorktrees, startTask, cancelRun, reconcileTaskSession, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
+import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
   buildHarnessTerminalCommand,
@@ -259,6 +260,66 @@ function refsFromPaths(rawPaths: unknown[]): TaskReference[] {
     refs.push({ path: abs, isDirectory: st.isDirectory() });
   }
   return refs;
+}
+
+// Turn the caller-supplied `?name=` for /attachments into a safe basename
+// that can't escape `${dataDir}/attachments/`. Stripping null bytes and path
+// separators before `path.basename` is defense in depth (`path.basename`
+// alone already drops any `/`-delimited directory component); trimming
+// leading dots keeps the result from landing as a hidden dotfile-looking
+// name. The stem is capped at 120 UTF-8 bytes — `?name=` is caller-supplied
+// and macOS caps filenames at 255 bytes — trimmed a character at a time
+// (never mid-byte-sequence) so multi-byte UTF-8 names don't come out
+// mangled. Uniquification against what's already on disk happens at write
+// time (see `writeAttachmentAtomic` below), not here — an existsSync probe
+// here would leave a TOCTOU gap for concurrent same-name uploads.
+function sanitizeAttachmentBasename(rawName: string): { stem: string; ext: string } {
+  const cleaned = rawName
+    .replace(/\0/g, "")
+    .replace(/[/\\]/g, "-");
+  let safe = path.basename(cleaned).replace(/^\.+/, "");
+  if (!safe) safe = "attachment";
+  const ext = path.extname(safe);
+  let stem = ext ? safe.slice(0, -ext.length) : safe;
+  if (!stem) stem = "attachment";
+  const MAX_STEM_BYTES = 120;
+  while (Buffer.byteLength(stem, "utf8") > MAX_STEM_BYTES) {
+    stem = stem.slice(0, -1);
+  }
+  if (!stem) stem = "attachment";
+  return { stem, ext };
+}
+
+// Write `buf` under `dir` as `${stem}${ext}`, using an atomic exclusive
+// create (`wx`) so two concurrent uploads that sanitize to the same
+// basename (the client fires same-basename uploads via `Promise.all`)
+// can't race an existsSync-then-write check-then-act gap and silently
+// clobber each other. On EEXIST, fall back once to a unique-by-construction
+// name; if even that collides, the error propagates to the route's catch.
+function writeAttachmentAtomic(
+  dir: string,
+  stem: string,
+  ext: string,
+  buf: ArrayBuffer,
+): { abs: string; basename: string } {
+  const createExclusive = (basename: string): string => {
+    const abs = path.join(dir, basename);
+    const fd = openSync(abs, "wx");
+    try {
+      writeSync(fd, Buffer.from(buf));
+    } finally {
+      closeSync(fd);
+    }
+    return abs;
+  };
+  const primary = `${stem}${ext}`;
+  try {
+    return { abs: createExclusive(primary), basename: primary };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    const fallback = `${stem}-${crypto.randomUUID().slice(0, 8)}${ext}`;
+    return { abs: createExclusive(fallback), basename: fallback };
+  }
 }
 
 // We bind to 127.0.0.1 so CORS is mostly belt-and-suspenders. We still echo
@@ -3843,6 +3904,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // WKWebView drops carry no `file://` URL for non-image files/folders
+      // (see the header comment in ./drag-pasteboard.ts), so there's nothing
+      // for the webview to hand `/refs/resolve`. This route reads the macOS
+      // drag pasteboard directly instead — it always reflects the drag that
+      // just ended, since a drop event fires the instant that drag ends.
+      "/refs/drag": {
+        POST: authed((req) => {
+          return json({ refs: refsFromPaths(readDragPasteboardPaths()) }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // Persist a screenshot blob to `${dataDir}/screenshots/` and return its
       // absolute path. Backs the textarea drag/drop + paste flows on the
       // webview — macOS floating-thumbnail drags and clipboard pastes carry
@@ -3894,6 +3966,57 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const abs = path.join(dir, basename);
           await Bun.write(abs, buf);
           return json({ path: abs, basename }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Persist an arbitrary-content-type blob to `${dataDir}/attachments/`
+      // and return its absolute path. Backs non-image file/folder drops
+      // whose source isn't Finder (so there's no drag-pasteboard path to
+      // recover — e.g. a browser or another app's internal drag) and pasted
+      // non-image blobs: both carry bytes but no filesystem path, so — same
+      // rationale as `/screenshots` above — the only way to give an agent a
+      // path to read is to write the bytes out ourselves. Unlike
+      // `/screenshots`, any content type is accepted (there's no fixed set
+      // of "file" mime types to gate on) and the filename comes from the
+      // caller via `?name=`, sanitized to a safe basename below.
+      "/attachments": {
+        POST: authed(async (req) => {
+          try {
+            const MAX = 25 * 1024 * 1024;
+            const claimed = Number(req.headers.get("content-length") ?? "");
+            if (Number.isFinite(claimed) && claimed > MAX) {
+              return json(
+                { error: `attachment exceeds ${MAX} bytes` },
+                { status: 413, headers: corsHeaders(req) },
+              );
+            }
+            const buf = await req.arrayBuffer();
+            if (buf.byteLength > MAX) {
+              return json(
+                { error: `attachment exceeds ${MAX} bytes` },
+                { status: 413, headers: corsHeaders(req) },
+              );
+            }
+            if (buf.byteLength === 0) {
+              return json({ error: "empty body" }, { status: 400, headers: corsHeaders(req) });
+            }
+            const url = new URL(req.url);
+            const rawName = url.searchParams.get("name") ?? "";
+            const dir = path.join(dataDir, "attachments");
+            // mkdirSync must run before any name computation that touches the
+            // dir (the atomic `wx` create below stats/creates inside it).
+            mkdirSync(dir, { recursive: true });
+            const { stem, ext } = sanitizeAttachmentBasename(rawName);
+            const { abs, basename } = writeAttachmentAtomic(dir, stem, ext, buf);
+            return json({ path: abs, basename }, { headers: corsHeaders(req) });
+          } catch (e) {
+            const msg = (e as Error).message ?? String(e);
+            console.error("[agetor] /attachments failed:", e);
+            return json(
+              { error: `attachment write failed: ${msg}` },
+              { status: 500, headers: corsHeaders(req) },
+            );
+          }
         }),
       },
 
@@ -4232,6 +4355,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const blocked = backlogGuard(req);
           if (blocked) return blocked;
           const updated = backlog.remove(req.params.id, req.params.itemId);
+          return updated
+            ? json(updated, { headers: corsHeaders(req) })
+            : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Unread-messages indicator: mark a task's watermark caught up.
+      // Intentionally NOT gated by `backlogGuard`/an archived check — marking
+      // seen is user-side read state, not a task mutation, and the archived
+      // board view still needs to be able to clear a dot (plan §3/§4).
+      "/tasks/:id/seen": {
+        POST: authed((req) => {
+          const updated = tasks.markSeen(req.params.id);
           return updated
             ? json(updated, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });

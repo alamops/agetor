@@ -543,14 +543,21 @@ test("queuePaste: settle window holds the next paste for slash commands", async 
 
 test("queuePaste: pastes for different taskIds don't block each other", async () => {
   await withFakeTmuxBin(async () => {
-    const SETTLE = 120;
+    // Settle chosen large: task-B's elapsed includes a fake-tmux process
+    // spawn whose cost under a loaded full-suite run has been observed at
+    // 70ms+, so the bound must dwarf spawn latency while staying well
+    // under SETTLE. 400/2 = 200ms gives ~3x headroom over the worst
+    // observed spawn without weakening the serialization signal.
+    const SETTLE = 400;
     const prev = __forTest.setSlashCommandSettleMs(SETTLE);
     try {
       const taskA = randomUUID();
       const taskB = randomUUID();
 
-      // Task A's slash command holds a 120ms settle window.
+      // Task A's slash command holds a SETTLE ms settle window.
       const slashA = __forTest.queuePaste(taskA, "sess-a", "/model X", SETTLE);
+      let aResolved = false;
+      void slashA.then(() => { aResolved = true; });
       const t0 = performance.now();
       // Task B's paste should be able to run immediately — independent
       // chain. If we accidentally globalized the lock, this would wait
@@ -558,8 +565,11 @@ test("queuePaste: pastes for different taskIds don't block each other", async ()
       await __forTest.queuePaste(taskB, "sess-b", "user msg", 0);
       const elapsed = performance.now() - t0;
 
-      // Generous upper bound — proves task-B is NOT serialized behind
-      // task-A's settle. On a healthy run elapsed is ~0–5ms.
+      // Clock-free serialization detector: were the chains shared, B could
+      // only complete after A's settle window — i.e. after slashA resolved.
+      // A still pending here proves B never waited on A.
+      expect(aResolved).toBe(false);
+      // Belt-and-braces upper bound — on a healthy run elapsed is ~0–5ms.
       expect(elapsed).toBeLessThan(SETTLE / 2);
       await slashA;
     } finally {
@@ -991,11 +1001,13 @@ test("queuePaste(image): gap scales linearly with the number of image paths", as
 });
 
 test("queuePaste(image): non-image bracketed paste does NOT take the long gap (uses base bracketed gap instead)", async () => {
-  // Bloat the image settle to a value that would blow the test budget if
-  // the detector misfired. Base bracketed gap is a small non-zero value
-  // — small enough that the bracketed test above's GAP - TOLERANCE math
-  // doesn't apply — proving the path went through `bracketedEnterGapMs`
-  // and not through the scaled image settle.
+  // Bloat the image settle to a value the detector must NOT pick, and set
+  // the base bracketed gap to a distinctive small value. Two independent
+  // assertions then pin which path `queuePaste` chose: the recorded
+  // `lastBracketedGapMs` (deterministic), plus the delete-buffer → Enter
+  // delta from the tmux log (log-derived, NOT total wall clock — the old
+  // `elapsed < 500` bound flaked at 500–880 ms under scheduler load because
+  // it also absorbed several recording-tmux-stub spawns).
   const IMG = 20_000;
   await withRecordingTmuxBin(async (logPath) => {
     const prevImg = __forTest.setImageAttachSettleMs(IMG);
@@ -1011,19 +1023,15 @@ test("queuePaste(image): non-image bracketed paste does NOT take the long gap (u
         undefined,
         { bracketed: true },
       );
-      // Assert on the delete-buffer → send-keys Enter delta from the
-      // recording tmux bin (like the gap-floor tests above), NOT on total
-      // wall-clock around queuePaste: the wall-clock version accumulated
-      // four sub-bun spawn round-trips + interpreter startup and hovered
-      // at its 500 ms budget under full-suite load (a long-standing flake).
-      // The delta spans exactly one scheduled gap plus one spawn start —
-      // ~20 ms + spawn latency on the fast path, >= IMG - tolerance if the
-      // image detector misfired — so IMG / 2 is orders of magnitude of
-      // headroom in both directions regardless of machine load.
-      // Locate the calls by predicate rather than fixed index — pinning to
-      // entries[2]/entries[3] silently breaks if an earlier step ever grows
-      // an extra tmux call, without failing loudly on the intent being
-      // tested (delete-buffer → the Enter that follows it).
+      // The non-image paste must have taken the base bracketed gap (20),
+      // not the IMG image settle — the recorded gap deterministically
+      // pins which path `queuePaste` chose.
+      expect(__forTest.getLastBracketedGapMs()).toBe(20);
+      // Belt-and-braces on the *observed* timing: the delete-buffer → Enter
+      // gap from the tmux log stays orders of magnitude under a misfired
+      // image settle (>= IMG - tolerance). Locate the calls by predicate
+      // rather than fixed index — pinning to entries[2]/entries[3] silently
+      // breaks if an earlier step ever grows an extra tmux call.
       const entries = readTmuxLog(logPath);
       const deleteBufferIdx = entries.findIndex((e) => e.argv[0] === "delete-buffer");
       const deleteBuffer = entries[deleteBufferIdx]!;
@@ -1032,8 +1040,7 @@ test("queuePaste(image): non-image bracketed paste does NOT take the long gap (u
         .find((e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "Enter")!;
       expect(deleteBuffer.argv[0]).toBe("delete-buffer");
       expect(sendKeys.argv[sendKeys.argv.length - 1]).toBe("Enter");
-      const deltaMs = sendKeys.ms - deleteBuffer.ms;
-      expect(deltaMs).toBeLessThan(IMG / 2);
+      expect(sendKeys.ms - deleteBuffer.ms).toBeLessThan(IMG / 2);
       // Trailing send-keys Enter still fires exactly once.
       const enterCalls = entries
         .filter((e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "Enter");

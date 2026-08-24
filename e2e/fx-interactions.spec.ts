@@ -35,7 +35,7 @@ const FAKE_FX_PERMISSION_PROMPT_MARKER = "__agetor_fake_fx_permission__";
  * of production wiring (orchestrator → SSE → RunPanel → the answer route),
  * not a stubbed component.
  *
- * fx ships disabled by default (migration 045, `enabled=0` — same house
+ * fx ships disabled by default (migration 046, `enabled=0` — same house
  * style as codex/cursor) so every test here needs the harness enabled first;
  * done once per worker in `beforeAll` since `backend` is worker-scoped and
  * the toggle is idempotent/persists across this file's serial tests.

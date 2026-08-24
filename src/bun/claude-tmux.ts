@@ -1842,6 +1842,12 @@ interface SessionState {
    *  flickers past during normal output. Reset whenever the pane no
    *  longer matches any signature. */
   scrapeLastFingerprint: string | null;
+  /** Consecutive scrape ticks the CURRENT unparsable-fallback fingerprint has
+   *  held. `matchUnparsableModal` registers only at `UNPARSABLE_STABILITY_TICKS`
+   *  — a stricter gate than the generic two-tick one, because a footer/watchdog
+   *  sighting IS the whole trigger (no parsed choice set behind it), so a 1–2
+   *  tick blip from an animating modal or a spinner blink must never card. */
+  scrapeUnparsableStreak: number;
   /** `Date.now()` stamp of the most recent successful JSONL append the
    *  flusher dispatched. The scraper consults it to (a) suppress
    *  matches that happened while claude was actively writing (the
@@ -2075,6 +2081,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     lastActivityAt: Date.now(),
     scrapeLastPaneText: null,
     scrapeLastFingerprint: null,
+    scrapeUnparsableStreak: 0,
     lastJsonlAppendAt: 0,
     lastIdleScrapeAt: 0,
     recentlyAnsweredFingerprints: new Map(),
@@ -3559,27 +3566,27 @@ const MODAL_FOOTER_RE = /esc to cancel|enter to confirm|enter to continue/i;
 const STUCK_TURN_FALLBACK_MS = 60_000;
 
 /** Pure decision for the watchdog arm of `matchUnparsableModal` — exposed via
- *  `__forTest` so the in-flight/quiet/spinner/ask truth table is unit-
+ *  `__forTest` so the in-flight/quiet/working/ask truth table is unit-
  *  testable without a live tmux pane. True only when ALL of: a turn is
  *  actually in flight (there's a "running" run to protect), the session has
  *  written JSONL before (a `0` timestamp means we've never seen a turn
  *  start — nothing to be stuck on), it's been quiet past the threshold, the
- *  raw pane tail does NOT show claude's `esc to interrupt` working spinner
- *  (a long-running tool call is busy, not stuck — the spinner repaints even
- *  when no JSONL line has landed yet), and no AskUserQuestion card/collection
- *  is already live (that path owns the pane and has its own give-up ladder,
- *  see `askFallbackAllowed`). */
+ *  pane shows claude working (see `paneShowsClaudeWorking`) is FALSE (a
+ *  long-running tool call, a background-agent wait, or a live shell is busy,
+ *  not stuck — that chrome repaints even when no JSONL line has landed yet),
+ *  and no AskUserQuestion card/collection is already live (that path owns the
+ *  pane and has its own give-up ladder, see `askFallbackAllowed`). */
 function stuckTurnFallbackArmed(p: {
   turnInFlight: boolean;
   lastJsonlAppendAt: number;
   now: number;
-  tailHasSpinner: boolean;
+  paneWorking: boolean;
   askCardLive: boolean;
 }): boolean {
   return p.turnInFlight
     && p.lastJsonlAppendAt !== 0
     && p.now - p.lastJsonlAppendAt > STUCK_TURN_FALLBACK_MS
-    && !p.tailHasSpinner
+    && !p.paneWorking
     && !p.askCardLive;
 }
 
@@ -3591,11 +3598,15 @@ function stuckTurnFallbackArmed(p: {
  * keystroke this scraper can plan, so the UI's job is just "tell the user to
  * go answer it in the attached terminal", not drive an answer back.
  *
- * Fires under either of two independent arms:
+ * Fires under either of two independent arms, both gated at the call site on
+ * `!paneShowsClaudeWorking(tail)` (a real prompt/wizard replaces the working
+ * chrome, so this can't hide a genuine one — see `paneShowsClaudeWorking`):
  *   (1) Footer arm — the last 3 NON-BLANK tail lines contain a recognised
- *       modal footer (`MODAL_FOOTER_RE`). Non-blank, not a fixed raw-line
- *       slice, because `tmux capture-pane` pads trailing blank rows (same
- *       reasoning as `matchNumberedModal`'s high-confidence check).
+ *       modal footer (`MODAL_FOOTER_RE`) AND none of those same lines is a
+ *       usage-limit auto-continue notice (`MODAL_NOTICE_RE`) — claude resumes
+ *       those on its own, nothing for the user to answer. Non-blank, not a
+ *       fixed raw-line slice, because `tmux capture-pane` pads trailing blank
+ *       rows (same reasoning as `matchNumberedModal`'s high-confidence check).
  *   (2) Watchdog arm — `watchdogArmed` (the caller pre-computes this via
  *       `stuckTurnFallbackArmed`, since it needs session state this pure
  *       matcher doesn't have).
@@ -3603,10 +3614,12 @@ function stuckTurnFallbackArmed(p: {
  * Deliberately never `highConfidence` (see `ScrapeMatch.unparsable`): unlike
  * `matchNumberedModal`'s footer fast-path, footer presence here IS the
  * trigger itself, not extra confidence layered on top of an already-parsed
- * choice set — so a single-tick sighting must not register a card. Skipping
- * the two-tick gate would let a mid-repaint transient (a real modal's frame
- * still animating in, a paste in flight) flash a fallback card the user
- * never needed.
+ * choice set — so a single-tick sighting must not register a card. The caller
+ * (`scrapeOnce`) holds this to `UNPARSABLE_STABILITY_TICKS` (3) consecutive
+ * equal-fingerprint sightings, stricter than the generic two-tick gate —
+ * skipping it would let a mid-repaint transient (a real modal's frame still
+ * animating in, a paste in flight) flash a fallback card the user never
+ * needed.
  *
  * The fingerprint is sha1 of the SAME trailing lines used for `paneText`
  * (not the full scrape tail), with blank lines and volatile chrome
@@ -3624,13 +3637,28 @@ function stuckTurnFallbackArmed(p: {
 function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch | null {
   const lines = tail.split("\n");
   const nonBlank = lines.filter((l) => l.trim().length > 0);
-  const footerFires = nonBlank.slice(-3).some((l) => MODAL_FOOTER_RE.test(l));
-  if (!footerFires && !watchdogArmed) return null;
-
+  const last3 = nonBlank.slice(-3);
+  // The card's own window: the last 12 meaningful lines (blank + volatile
+  // chrome stripped FIRST — see the fingerprint note above). Computed before
+  // the arm logic because the notice veto below scans this same window.
   const paneLines = lines
     .map((l) => l.trimEnd())
     .filter((l) => l.length > 0 && !VOLATILE_PANE_LINE_RE.test(l))
     .slice(-12);
+  // Usage-limit auto-continue notice (`continuing automatically/shortly · esc
+  // to cancel`): claude resumes on its own, so there's nothing to card — veto
+  // BOTH arms here, before the footer/watchdog split. A mid-turn limit pause
+  // keeps the turn in flight and the pane quiet, so a footer-only veto would
+  // still let the stuck-turn watchdog arm surface the notice as a card. The
+  // veto scans the SAME 12-line window the card is built from, not just the
+  // last 3 lines: claude draws notice-class lines in the hint slot ABOVE the
+  // input box (observed 5 non-blank lines from the bottom for the weekly-limit
+  // hint), which is outside the footer window but squarely inside the card's.
+  // A genuinely wedged TUI never carries a `continuing …` line.
+  if (paneLines.some((l) => MODAL_NOTICE_RE.test(l))) return null;
+  const footerFires = last3.some((l) => MODAL_FOOTER_RE.test(l));
+  if (!footerFires && !watchdogArmed) return null;
+
   const paneText = paneLines.join("\n");
   const fingerprint = sha1(`unparsable:${paneText}`);
   return { paneText, choices: [], cursorIndex: 0, fingerprint, unparsable: true };
@@ -3797,6 +3825,27 @@ const STARTUP_DIALOG_POLL_MS = 350;
  *  generous on a busy machine but cheap to wait through.  */
 const RECENTLY_ANSWERED_TTL_MS = 3_000;
 
+/** Consecutive equal-fingerprint scrape ticks an unparsable fallback match
+ *  must hold before it registers a card (vs. the 2-tick gate parseable modals
+ *  use). See `SessionState.scrapeUnparsableStreak`. */
+const UNPARSABLE_STABILITY_TICKS = 3;
+
+/** Pure streak step for the unparsable fallback's stability gate: the streak
+ *  grows only while this tick's fingerprint equals the previous tick's;
+ *  any change restarts it at 1 (this sighting counts). The caller resets it
+ *  to 0 on every tick with no unparsable match (a null match, a parseable
+ *  match, an answered prompt, session teardown). Exposed via `__forTest` so
+ *  the A,A,A / A,B,A / A,A,∅,A,A sequences are unit-testable without a tmux
+ *  pane. */
+function nextUnparsableStreak(prevStreak: number, sameFingerprintAsLastTick: boolean): number {
+  return sameFingerprintAsLastTick ? prevStreak + 1 : 1;
+}
+
+/** Whether an unparsable streak has held long enough to register a card. */
+function unparsableStreakCleared(streak: number): boolean {
+  return streak >= UNPARSABLE_STABILITY_TICKS;
+}
+
 /** A scrape tick is skipped when the JSONL has been written to this
  *  recently — claude is mid-stream, so whatever's on the pane is
  *  likely transient output (a numbered list being printed) and not a
@@ -3881,19 +3930,119 @@ function decideScrapeTick(p: {
   return { run: true, stampIdle: true };
 }
 
-/** Claude's working-spinner line ("esc to interrupt"). Single source of truth
- *  for the phrase — it feeds both `VOLATILE_PANE_LINE_RE` below and the
- *  stuck-turn watchdog's `tailHasSpinner` input in `scrapeOnce`, which must
- *  never drift apart (a spinner the watchdog can't see would false-trip the
- *  fallback card mid-turn). */
-const SPINNER_RE = /esc to interrupt/i;
+/** Shared line-shape fragments for claude's 2.1.239 pane chrome, kept in one
+ *  place so `WORKING_LINE_RE` and `VOLATILE_PANE_LINE_RE` can't drift on the
+ *  literals they share (this supersedes the old standalone `SPINNER_RE`, whose
+ *  sole `esc to interrupt` phrase now lives in `ESC_TO_INTERRUPT`). Spinner
+ *  glyphs are matched only at line start — the `·` glyph doubles as a mid-line
+ *  separator/bullet in claude's prose, so anchoring is what stops a stray
+ *  `foo · bar…` from reading as a spinner. */
+const ESC_TO_INTERRUPT = "esc to interrupt";
+/** The rotating spinner glyph set claude draws at the start of its working /
+ *  elapsed / background-agent lines (`✻→✽→✶→✳→✢→·`, with two rarer starbursts
+ *  seen in older captures). */
+const SPINNER_GLYPH = "[✻✽✶✳✢·⚹✴]";
+/** Present-participle spinner, e.g. `✽ Frosting… (2m 52s · ↓ 12.1k tokens)` /
+ *  `· Prestidigitating… (1h 21m…)` / `✻ Determining…` — a leading glyph, ONE
+ *  word, a trailing `…`, then either the `(elapsed · tokens)` parenthetical or
+ *  end of line. The tail anchor keeps a prose bullet that merely starts with
+ *  `· Loading… more text` out. Animated (the glyph cycles), so it's volatile
+ *  as well as busy. */
+const SPINNER_ACTIVE_LINE = `^\\s*${SPINNER_GLYPH}\\s+\\S+…(?:\\s*\\(|\\s*$)`;
+/** Elapsed spinner summary, e.g. `✻ Cooked for 2m 18s`, `✻ Brewed for 9s`,
+ *  `✻ Cogitated for 5s` — no ellipsis. Still "busy" while a turn is in flight
+ *  (a long non-shell tool call whose only pane signal is the elapsed timer).
+ *  The `\d+[smh]` unit anchor keeps prose like `· foo for 3 reasons` out. */
+const SPINNER_ELAPSED_LINE = `^\\s*${SPINNER_GLYPH}\\s+\\S+\\s+for\\s+\\d+[smh]`;
+/** Ticking token counter that rides the spinner line and the background-agent
+ *  roster, e.g. `… · ↓ 12.1k tokens`, `general-purpose  10s · ↓ 46.2k tokens`.
+ *  Anchored to the `·`-separator + arrow so a bare `↓ 5 tokens` in prose can't
+ *  match. */
+const TOKEN_COUNTER_LINE = "·\\s*(?:↓|↑)\\s*[0-9.]+k?\\s*tokens";
+
+/** Lines that prove claude is actively working on the pane in Claude Code
+ *  2.1.239. Evidence (captured live): the present-participle spinner
+ *  (`SPINNER_ACTIVE_LINE`) and its elapsed summary (`SPINNER_ELAPSED_LINE`);
+ *  the ticking token counter (`TOKEN_COUNTER_LINE`); the status-bar
+ *  `esc to interrupt`; a background-agent wait `✻ Waiting for 1 background
+ *  agent to finish`; and a live shell `✻ Brewed for 9s · 1 shell still
+ *  running` / status-bar `· 1 shell ·`. Unlike 1 Hz-blinking `esc to
+ *  interrupt` alone, this union stays true across a working turn's quiet-JSONL
+ *  windows (background agents, long tool calls) — exactly when the old
+ *  watchdog false-fired. Every arm is anchored to the chrome shape it came
+ *  from (leading glyph, `·`-separated status-bar item, `still running`) so
+ *  look-alike transcript prose — `· 3 shell scripts were updated`, `Waiting
+ *  for 2 background agents to report back.` — can't read as working. Add a
+ *  form only with a captured pane to back it. */
+const WORKING_LINE_RE = new RegExp(
+  [
+    ESC_TO_INTERRUPT,
+    SPINNER_ACTIVE_LINE,
+    SPINNER_ELAPSED_LINE,
+    TOKEN_COUNTER_LINE,
+    `^\\s*${SPINNER_GLYPH}\\s+Waiting for \\d+ background agent`,
+    "\\d+\\s+shells?\\s+still\\s+running",
+    "·\\s*\\d+\\s+shells?\\s*(?:·|$)",
+  ].join("|"),
+  "i",
+);
+
+/** How many trailing NON-BLANK pane lines `paneShowsClaudeWorking` inspects.
+ *  Working chrome lives in the bottom widget area — spinner/elapsed line, the
+ *  hint line, the `Tip:` banner, the input box (3 rows), the status bar, the
+ *  `✔ Update installed` notice and the background-agent roster (`⏺ main` +
+ *  one `◯` row per agent) — which in the deepest live capture ran 13 non-blank
+ *  rows (4 agents). 16 covers that with slack while keeping the scrollback
+ *  transcript above it out of the decision: a tool result that echoes claude
+ *  chrome (an agent inspecting tmux panes — agetor dogfooding), or prose that
+ *  resembles a spinner line, must not be able to hide a genuine prompt that
+ *  renders below it. */
+const WORKING_CHROME_WINDOW_LINES = 16;
+
+/** Usage-limit AUTO-CONTINUE notices, which carry a `MODAL_FOOTER_RE` phrase
+ *  (`… · esc to cancel`) but need no user action — claude resumes on its own.
+ *  Evidence (2.1.239 binary): `Usage limit reached · continuing automatically
+ *  at 8am · esc to cancel`, `… continuing shortly · esc to cancel`, `…
+ *  continuing automatically when it resets · esc to cancel`.
+ *  `matchUnparsableModal` vetoes on these on BOTH arms, over the card's own
+ *  12-line window, so they never surface a card — a mid-turn limit pause keeps
+ *  the turn in flight and the pane quiet, which would otherwise arm the
+ *  stuck-turn watchdog. `Usage limit has reset · press enter to continue` is
+ *  deliberately NOT here — it is genuinely actionable. Note that when it
+ *  renders in the hint slot above the input box it sits outside the footer
+ *  arm's last-3-line window, so it reaches the user via the watchdog arm
+ *  (turn still in flight, pane quiet, no working chrome) rather than
+ *  instantly — acceptable for a "go press Enter in the terminal" card. */
+const MODAL_NOTICE_RE = /continuing automatically|continuing shortly/i;
 
 /** Pane chrome that repaints on a fixed cadence independent of anything
- *  meaningful happening — claude's "esc to interrupt" spinner/status footer
- *  (its elapsed-time-and-token-count portion ticks every render) and its
- *  rotating "Tip: …" hint banner. Matched against a line AFTER trailing
- *  whitespace has already been trimmed off (see `normalizePaneForActivity`). */
-const VOLATILE_PANE_LINE_RE = new RegExp(`${SPINNER_RE.source}|^\\s*Tip:`, "i");
+ *  meaningful — the animated spinner line and its token counter (shared with
+ *  `WORKING_LINE_RE`) and the rotating `Tip:` banner. Matched AFTER trailing
+ *  whitespace is trimmed (see `normalizePaneForActivity`). Filtering these
+ *  before fingerprinting is what keeps the stability gate and the `__external__`
+ *  sweep from jittering on the animated `✻→✽→✶` glyph and the ticking
+ *  `↓ N tokens` counter. */
+const VOLATILE_PANE_LINE_RE = new RegExp(
+  [ESC_TO_INTERRUPT, SPINNER_ACTIVE_LINE, SPINNER_ELAPSED_LINE, TOKEN_COUNTER_LINE, "^\\s*Tip:"].join("|"),
+  "i",
+);
+
+/** True when the live pane shows claude actively working (see
+ *  `WORKING_LINE_RE`), checked over the last `WORKING_CHROME_WINDOW_LINES`
+ *  non-blank lines of the scrape tail — the bottom widget area, NOT the
+ *  scrollback transcript above it. Gates BOTH arms of `matchUnparsableModal`:
+ *  a real prompt/wizard REPLACES the working chrome (verified against live
+ *  2.1.239 panes), so suppressing the fallback whenever working chrome is
+ *  present cannot hide a genuine prompt, but it does kill the false card on
+ *  normal long-quiet-JSONL turns. Bounding the window is what keeps that
+ *  safety claim honest: the transcript can legitimately contain chrome-shaped
+ *  text (a tool result echoing a pane, prose resembling a spinner line) above
+ *  a real modal. Pure/exported so the truth table is unit-testable without a
+ *  live tmux pane. */
+function paneShowsClaudeWorking(tail: string): boolean {
+  const nonBlank = tail.split("\n").filter((l) => l.trim().length > 0);
+  return nonBlank.slice(-WORKING_CHROME_WINDOW_LINES).some((l) => WORKING_LINE_RE.test(l));
+}
 
 /**
  * Normalize a captured pane tail into the form used for the "did the pane
@@ -4038,15 +4187,20 @@ function scrapeOnce(state: SessionState): void {
   // wrong-index risk, just a less structured card.
   const askUnrecoverable = askOnPane && askFallbackAllowed(state.askGrowAttempts, state.askCardId !== null);
 
+  // Computed once and passed through even into the branch that skips the
+  // unparsable matcher entirely (see below) — `stuckTurnFallbackArmed`'s
+  // signature stays honest about what it was actually gated on, rather than
+  // silently hardcoding `false` at the call site.
+  const paneWorking = paneShowsClaudeWorking(tail);
   const match = (claudeIsWriting || (askOnPane && !askUnrecoverable))
     ? null
-    : (matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchUnparsableModal(tail, stuckTurnFallbackArmed({
+    : (matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? (paneWorking ? null : matchUnparsableModal(tail, stuckTurnFallbackArmed({
         turnInFlight: turnInFlight(state),
         lastJsonlAppendAt: state.lastJsonlAppendAt,
         now,
-        tailHasSpinner: SPINNER_RE.test(tail),
+        paneWorking,
         askCardLive: state.askCardId !== null,
-      })));
+      }))));
 
   // Auto-cancel: any registered prompt for this task whose fingerprint
   // is NOT what we see now has been dismissed (either externally via
@@ -4070,6 +4224,7 @@ function scrapeOnce(state: SessionState): void {
 
   if (!match) {
     state.scrapeLastFingerprint = null;
+    state.scrapeUnparsableStreak = 0;
     return;
   }
 
@@ -4091,9 +4246,23 @@ function scrapeOnce(state: SessionState): void {
   // the turn resolved to `review` registers in ~two idle ticks rather than ~2s;
   // the AskUserQuestion path above and any high-confidence match skip the gate
   // and surface on the first idle capture.
-  const cleared = clearedStabilityGate(match, state.scrapeLastFingerprint);
-  state.scrapeLastFingerprint = match.fingerprint;
-  if (!cleared) return;
+  //
+  // The unparsable fallback (`match.unparsable`) uses its OWN stricter gate —
+  // `UNPARSABLE_STABILITY_TICKS` (3) consecutive equal-fingerprint sightings,
+  // tracked in `scrapeUnparsableStreak` — instead of the generic two-tick one:
+  // for that matcher, footer/watchdog presence IS the whole trigger (there's
+  // no already-parsed choice set behind it), so a 1–2 tick blip must not card.
+  const sameAsLast = state.scrapeLastFingerprint === match.fingerprint;
+  if (match.unparsable) {
+    state.scrapeUnparsableStreak = nextUnparsableStreak(state.scrapeUnparsableStreak, sameAsLast);
+    state.scrapeLastFingerprint = match.fingerprint;
+    if (!unparsableStreakCleared(state.scrapeUnparsableStreak)) return;
+  } else {
+    state.scrapeUnparsableStreak = 0;
+    const cleared = clearedStabilityGate(match, state.scrapeLastFingerprint);
+    state.scrapeLastFingerprint = match.fingerprint;
+    if (!cleared) return;
+  }
 
   // Already registered? Nothing to do — the previous tick's broadcast
   // is what the UI is showing.
@@ -4136,6 +4305,7 @@ export function markTmuxPromptAnswered(taskId: string, fingerprint: string): voi
   // claude immediately printed an identical-looking dialog), without
   // racing the registration.
   state.scrapeLastFingerprint = null;
+  state.scrapeUnparsableStreak = 0;
 }
 
 /** Install or refresh the scraper interval for a session. Called from
@@ -4890,8 +5060,13 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           // Footer arm only — no turn is in flight during boot, so the
           // stuck-turn watchdog arm doesn't apply here (see
           // `matchUnparsableModal`). This is the fix for the screenshotted
-          // 2.1.234 auto-mode wizard, which appears pre-JSONL.
-          const generic = matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchUnparsableModal(tail, false);
+          // 2.1.234 auto-mode wizard, which appears pre-JSONL. Same working-
+          // chrome gate as the runtime scraper (`paneShowsClaudeWorking`) — a
+          // real startup wizard has no working chrome, so it still surfaces;
+          // the `MODAL_NOTICE_RE` auto-continue veto lives inside
+          // `matchUnparsableModal` itself, so it already applies here too.
+          const generic = matchNumberedModal(tail) ?? matchYesNoModal(tail)
+            ?? (paneShowsClaudeWorking(tail) ? null : matchUnparsableModal(tail, false));
           if (!generic) { lastGenericFingerprint = null; continue; }
           // External dismissal: a previously surfaced startup prompt whose
           // content no longer matches the pane (user answered it from a real
@@ -5593,6 +5768,7 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   state.deathTimer = null;
   clearContinuationWatchdog(state);
   state.scrapeLastFingerprint = null;
+  state.scrapeUnparsableStreak = 0;
   // Release the subagent watcher's fs.watch + poll timer. Read-only teardown:
   // this stops us TAILING the subagent files, never the agent itself.
   state.subagentWatcher?.detach();
@@ -5695,6 +5871,16 @@ export const __forTest = {
   stuckTurnFallbackArmed,
   MODAL_FOOTER_RE,
   STUCK_TURN_FALLBACK_MS,
+  /** Working-chrome detection (2.1.239) that gates both fallback arms, the
+   *  auto-continue notice veto, and the unparsable stability streak length —
+   *  exposed so the truth table is unit-testable without a live tmux pane. */
+  WORKING_LINE_RE,
+  MODAL_NOTICE_RE,
+  paneShowsClaudeWorking,
+  WORKING_CHROME_WINDOW_LINES,
+  UNPARSABLE_STABILITY_TICKS,
+  nextUnparsableStreak,
+  unparsableStreakCleared,
   /** Pure idle-throttle decision used by `scrapeOnce` — exposed so the
    *  regression test can assert a JSONL-idle session keeps scraping (at the
    *  throttled cadence) instead of stopping forever, which would strand a
@@ -5788,6 +5974,10 @@ export const __forTest = {
     return prev;
   },
   getImageAttachSettleMs(): number { return imageAttachSettleMs; },
+  /** The gap the last bracketed `queuePaste` actually chose (base gap vs
+   *  scaled image settle). Lets tests pin the detector's path decision
+   *  deterministically instead of upper-bounding wall-clock elapsed. */
+  getLastBracketedGapMs(): number | null { return lastBracketedGapMs; },
   /** Image-path detection used by `queuePaste` to decide whether to
    *  take the long (image-attach) gap. Re-exported for unit tests so the
    *  rule can be asserted without reaching into the regex literal. */
@@ -5990,6 +6180,13 @@ let slashCommandSettleMs = 700;
  */
 let bracketedEnterGapMs = 80;
 
+/** Gap (ms) chosen by the most recent `queuePaste` bracketed branch —
+ *  the base `bracketedEnterGapMs` or the scaled image-attach settle.
+ *  Recorded so tests can assert WHICH path the image detector picked
+ *  without an upper-bound wall-clock assertion (those flake under
+ *  scheduler load). Never read by production code. */
+let lastBracketedGapMs: number | null = null;
+
 /**
  * Append a tmux operation to the per-task chain. The `fn` thunk runs
  * after every prior op for the same task has settled. Errors thrown by
@@ -6150,6 +6347,7 @@ function queuePaste(
       const gap = imageCount > 0
         ? Math.min(imageAttachSettleMs * imageCount, IMAGE_ATTACH_SETTLE_MAX_MS)
         : bracketedEnterGapMs;
+      lastBracketedGapMs = gap;
       if (gap > 0) await Bun.sleep(gap);
       if (!stillCurrent()) return;
       const enter = tmux(["send-keys", "-t", sessionName, "Enter"]);

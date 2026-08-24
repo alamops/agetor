@@ -211,6 +211,7 @@ All persistent state lives in `~/.agetor/` (override with `AGETOR_DATA_DIR`):
 | `AGETOR_CURSOR_DRIVER` | Same, for Cursor (test-only). | unset |
 | `AGETOR_GEMINI_DRIVER` | Same, for Gemini (test-only). | unset |
 | `AGETOR_FX_DRIVER` | Same, for fx — skips spawning the ACP child entirely (test-only). | unset |
+| `AGETOR_GITHUB_API_BASE` | GitHub REST/GraphQL API origin. Dev/e2e only — see `e2e/github-stub.ts`; never point it at a non-loopback host (the GitHub token is sent there). | `https://api.github.com` |
 | `AGETOR_DAEMON_IDLE_MS` | CLI daemon: idle-shutdown after this long with no run and no attached client. `0` disables. | `300000` (5 min) |
 
 Per-harness `bin`, `home`, and `env` overrides are configured through the Settings dialog and stored in SQLite — they take precedence over the corresponding env vars.

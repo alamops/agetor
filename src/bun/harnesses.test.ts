@@ -199,7 +199,7 @@ test("insert accepts kind:'gemini' and round-trips a gemini alias", () => {
 });
 
 test("fx is a built-in row (carve-out setEnabled toggle works like every other built-in)", () => {
-  // 045_fx_harness.sql seeds fx with enabled=0 (mirrors codex's 016 /
+  // 046_fx_harness.sql seeds fx with enabled=0 (mirrors codex's 016 /
   // cursor's / gemini's disabled-by-default rollout posture) — not
   // re-asserted here for the same reason the gemini test above doesn't
   // re-assert it: this file's beforeEach unconditionally re-enables every
@@ -249,7 +249,7 @@ test("getByIdOrKind synthesises a built-in fx row for legacy id without a matchi
 });
 
 test("insert rejects kind:'grok'/'kimi' even though the harnesses.kind CHECK constraint permits them", () => {
-  // migrations/045_fx_harness.sql widens the `harnesses.kind` CHECK to admit
+  // migrations/046_fx_harness.sql widens the `harnesses.kind` CHECK to admit
   // 'grok' and 'kimi' — reserved kinds the migration's own comment documents
   // as not shipped here, kept in the CHECK so the table-rebuild recipe's
   // INSERT...SELECT row copy stays order-independent regardless of which

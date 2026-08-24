@@ -495,6 +495,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ paths }),
     }).then((r) => r.refs),
+  /** Recover the real paths of the drag/drop that just ended, off the macOS
+   *  drag pasteboard — WKWebView exposes no `file://` URLs on a drop, so this
+   *  is the fallback for non-image files/folders dragged from Finder. The
+   *  server stats each (directory-ness correct, nonexistent dropped). */
+  dragRefs: () =>
+    j<{ refs: TaskReference[] }>("/refs/drag", { method: "POST" }).then((r) => r.refs),
   listBranches: (dir: string) =>
     j<BranchInfo[]>(`/projects/branches?path=${encodeURIComponent(dir)}`),
   /** `git fetch --all --prune` on the project so newly pushed remote branches
@@ -1268,6 +1274,13 @@ export const api = {
       { method: "POST", body: JSON.stringify({ line }) },
       { retry: false },
     ),
+  /** Bumps the task's read watermark to its latest assistant event, clearing
+   *  `task.unread`. Called on opening/switching/closing the run panel — see
+   *  App.tsx's `selected`-tracking effect. Returns the full updated Task so
+   *  the caller can reconcile it into board state immediately (optimistic —
+   *  don't wait for the next poll). Idempotent; safe to fire-and-forget. */
+  markTaskSeen: (taskId: string) =>
+    j<Task>(`/tasks/${taskId}/seen`, { method: "POST" }),
 
   // Messages backlog — saved, not-yet-sent draft messages parked on a task.
   // Every mutation returns the full updated Task so the caller can re-sync.
@@ -1440,6 +1453,30 @@ export const api = {
    *  body is raw bytes, not JSON. */
   uploadScreenshot: async (blob: Blob): Promise<{ path: string; basename: string }> => {
     const res = await fetch(`${BASE}/screenshots`, {
+      method: "POST",
+      headers: {
+        "content-type": blob.type || "application/octet-stream",
+        "authorization": `Bearer ${API_TOKEN}`,
+      },
+      body: blob,
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const msg = body && typeof body === "object" && "error" in body && body.error
+        ? String((body as { error: unknown }).error)
+        : `${res.status} ${res.statusText}`;
+      throw new Error(msg);
+    }
+    return body as { path: string; basename: string };
+  },
+
+  /** Byte-copy fallback for a path-less non-image file (dropped or pasted)
+   *  that has no recoverable original path — the server writes the raw bytes
+   *  to `dataDir/attachments/` and returns the on-disk path. Bypasses `j()`
+   *  because the body is raw bytes, not JSON; same shape as
+   *  `uploadScreenshot`. */
+  uploadAttachment: async (blob: Blob, name: string): Promise<{ path: string; basename: string }> => {
+    const res = await fetch(`${BASE}/attachments?name=${encodeURIComponent(name)}`, {
       method: "POST",
       headers: {
         "content-type": blob.type || "application/octet-stream",

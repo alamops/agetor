@@ -59,8 +59,9 @@ import m041 from "./041_task_plans.sql" with { type: "text" };
 import m042 from "./042_subagents_running_idx.sql" with { type: "text" };
 import m043 from "./043_harness_usage.sql" with { type: "text" };
 import m044 from "./044_todo_progress.sql" with { type: "text" };
-import m045 from "./045_fx_harness.sql" with { type: "text" };
-import m046 from "./046_fx_session_id.sql" with { type: "text" };
+import m045 from "./045_unread_watermarks.sql" with { type: "text" };
+import m046 from "./046_fx_harness.sql" with { type: "text" };
+import m047 from "./047_fx_session_id.sql" with { type: "text" };
 
 import type { Migration } from "../migrate.ts";
 
@@ -109,6 +110,11 @@ export const migrations: Migration[] = [
   { id: "042_subagents_running_idx", sql: m042 },
   { id: "043_harness_usage", sql: m043, aliases: ["042_harness_usage"] },
   { id: "044_todo_progress", sql: m044 },
-  { id: "045_fx_harness", sql: m045 },
-  { id: "046_fx_session_id", sql: m046 },
+  { id: "045_unread_watermarks", sql: m045 },
+  // fx's two migrations were authored as 045/046 on their branch while main
+  // claimed 045 for the unread watermarks; renumbered on merge (house rule:
+  // whoever merges second renumbers) with the original ids kept as aliases
+  // so a dev DB that already applied them is not re-migrated.
+  { id: "046_fx_harness", sql: m046, aliases: ["045_fx_harness"] },
+  { id: "047_fx_session_id", sql: m047, aliases: ["046_fx_session_id"] },
 ];

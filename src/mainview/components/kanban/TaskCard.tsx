@@ -21,9 +21,14 @@ interface Props {
   onMarkDone: (t: Task) => void;
   onArchive: (t: Task) => void;
   onUnarchive: (t: Task) => void;
+  /** True when this task is the one currently open in the run panel — App.tsx
+   *  passes `task.id === selected?.id`. Suppresses the unread dot while the
+   *  user is actively watching the task (messages streamed while open are
+   *  marked seen on close, not shown as unread in the meantime). */
+  isOpen?: boolean;
 }
 
-function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive }: Props) {
+function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, isOpen }: Props) {
   const archived = task.archivedAt != null;
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
@@ -70,7 +75,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
       ref={setNodeRef}
       style={style}
       className={cn(
-        "cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
+        "relative cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
         type.borderClass,
         isDragging && "opacity-50",
         awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background animate-awaiting-pulse motion-reduce:animate-none",
@@ -80,6 +85,21 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
       {...listeners}
       {...attributes}
     >
+      {task.unread && !isOpen && (
+        // Static dot for "has assistant messages you haven't read yet" —
+        // deliberately unanimated (the amber awaiting-pulse ring is the only
+        // animated attention state). Pinned to the corner so it coexists
+        // with that ring (an outline) without visual conflict, and sits
+        // above the header badge stack in the DOM/paint order.
+        <span
+          // -1.5 offsets keep the dot's background halo clear of the
+          // awaiting state's ring-offset outline instead of notching it.
+          className="absolute -top-1.5 -right-1.5 size-2.5 rounded-full bg-info ring-2 ring-background"
+          title="New messages"
+          role="img"
+          aria-label="New messages"
+        />
+      )}
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
           <div className="flex min-w-0 flex-1 items-start gap-1.5">

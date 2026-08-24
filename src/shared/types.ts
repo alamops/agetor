@@ -880,6 +880,25 @@ export interface Task {
    * runtime code can treat a missing key the same as `null`.
    */
   todoProgress?: { completed: number; total: number } | null;
+  /**
+   * Whether this task has assistant messages the user hasn't seen yet —
+   * `last_assistant_event_id > last_seen_event_id` (both watermarks live on
+   * the `tasks` row, migration 045), computed in `db.ts`'s `toTask` and
+   * never stored as its own column. `last_assistant_event_id` is bumped by
+   * the orchestrator's chunk handler on every top-level (non-subagent)
+   * `assistant` stream event; `last_seen_event_id` is bumped by
+   * `POST /tasks/:id/seen` when the run panel opens or closes. Drives the
+   * kanban card's colored corner dot.
+   *
+   * Optional (rather than required) for the same reason as `todoProgress`:
+   * the many hand-built `Task` fixtures in `src/bun/*.test.ts` predate this
+   * field and shouldn't all need a mechanical `unread: false` edit — `db.ts`
+   * always populates it on read, so runtime code can treat a missing key the
+   * same as `false`. Server-managed: not patchable, excluded from
+   * `ALLOWED_PATCH_FIELDS`; the only writers are the chunk handler and the
+   * dedicated mark-seen route.
+   */
+  unread?: boolean;
   createdAt: number;
   updatedAt: number;
   /**
