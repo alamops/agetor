@@ -75,7 +75,7 @@ import {
  *
  *   - `initialize`                  SPIKE-VERIFIED             handshake; unauth fails here (see describeHandshakeFailure)
  *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?, configOptions?}; mode nudge is best-effort (see runFxTurn)
- *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602, but NOT on -32600 (see runFxTurn)
+ *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602/-32600 alike (see runFxTurn)
  *   - `session/prompt`              SPIKE-VERIFIED shape       sole completion signal, no timeout (see runFxTurn)
  *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate)
  *   - `session/request_permission`  SCHEMA-DERIVED, UNVERIFIED-LIVE card flow  (see respondPermissionRequest)
@@ -94,10 +94,21 @@ import {
  *     only at `initialize`; either call can return `-32600` mid-session with
  *     the same "Fx needs access to Vercel AI Gateway…" text or a
  *     provider-specific variant (e.g. "Fx needs a Codex subscription login
- *     for this model. Run fx login codex."). Both catches in `runFxTurn`
- *     surface that message verbatim rather than wrapping or (for resume)
- *     retrying via `session/load` — the same credential gate would just fail
- *     identically there too.
+ *     for this model. Run fx login codex."). `-32600` is JSON-RPC's generic
+ *     "Invalid Request" code, not an auth-specific one — fx merely reuses it
+ *     for credential failures — so `session/resume`'s `-32600` is treated
+ *     exactly like its `-32601`/`-32602` siblings in `runFxTurn`: it falls
+ *     through to the `session/load` fallback rather than failing the turn
+ *     immediately. If `session/load` in turn also answers `-32600`, that's
+ *     authoritative either way it reads: the same credential gate, hit again
+ *     (load can't do any better than resume did), or a non-auth "Invalid
+ *     Request" (e.g. fx rejecting resume as unsupported) for which
+ *     `session/load` is precisely the graceful path — so that catch surfaces
+ *     fx's message verbatim via `RpcError.rawMessage`, with no `fx acp:
+ *     failed to resume session…` wrapper. `session/prompt`'s `-32600` catch
+ *     is unaffected by any of this — mid-turn there's nothing to fall back
+ *     to, so it still fails the turn immediately, also surfacing fx's
+ *     message verbatim via `rawMessage`.
  *   - **`configOptions` on `session/new`/`session/resume`/`session/load`
  *     results (0.0.5+, additive)** — a `{id, name, category, type,
  *     currentValue, options}[]` array; an entry with `id: "provider"` names
@@ -365,13 +376,20 @@ class RpcTimeoutError extends Error {}
  *  every other protocol error, without re-parsing `message`. The message
  *  text itself is UNCHANGED from before this class existed
  *  (`"<fx message> (code <n>)"`) so every existing message-based assertion
- *  still holds — `code` is purely additive. */
+ *  still holds — `code` is purely additive. `rawMessage` is fx's error
+ *  message BYTE-FOR-BYTE, with no `(code <n>)` suffix appended — callers
+ *  that need to surface fx's own text verbatim (the `session/load` and
+ *  `session/prompt` `-32600` catches in `runFxTurn`) read `rawMessage`
+ *  instead of `message`. Falls back to the composed `message` on the rare
+ *  reply that omits `error.message` entirely. */
 class RpcError extends Error {
   code: number | undefined;
-  constructor(message: string, code: number | undefined) {
+  rawMessage: string;
+  constructor(message: string, code: number | undefined, rawMessage?: string) {
     super(message);
     this.name = "RpcError";
     this.code = code;
+    this.rawMessage = rawMessage ?? message;
   }
 }
 
@@ -423,8 +441,9 @@ function handleLine(state: FxSessionState, line: string): void {
     if (!pending) return; // stale/unknown id — ignore
     state.pending.delete(id);
     if (msg.error) {
+      const rawMessage = msg.error.message ?? "fx acp error";
       pending.reject(
-        new RpcError(`${msg.error.message ?? "fx acp error"} (code ${msg.error.code ?? "?"})`, msg.error.code),
+        new RpcError(`${rawMessage} (code ${msg.error.code ?? "?"})`, msg.error.code, rawMessage),
       );
     } else {
       pending.resolve(msg.result);
@@ -1002,7 +1021,16 @@ export function extractFxProviderValue(result: unknown): string | null {
     if (!entry || typeof entry !== "object") continue;
     const id = (entry as { id?: unknown }).id;
     const currentValue = (entry as { currentValue?: unknown }).currentValue;
-    if (id === "provider" && typeof currentValue === "string" && currentValue.length > 0) {
+    // Bounded: this string rides straight into a run-row chip with no
+    // truncation of its own — an absurdly long value (bug, or a hostile/
+    // misbehaving fx binary) would blow out the chip's layout, so anything
+    // over 64 chars is treated the same as absent.
+    if (
+      id === "provider" &&
+      typeof currentValue === "string" &&
+      currentValue.length > 0 &&
+      currentValue.length <= 64
+    ) {
       return currentValue;
     }
   }
@@ -1063,15 +1091,14 @@ async function runFxTurn(
         failTurn(state, describeHandshakeFailure(err, "session/resume", RPC_HANDSHAKE_TIMEOUT_MS));
         return;
       }
-      if (err instanceof RpcError && err.code === -32600) {
-        // Credential re-check failed (0.0.5+, see the file header) — the
-        // same gate would just fail identically on session/load, so don't
-        // bother trying; surface fx's actionable auth message verbatim.
-        failTurn(state, errMessage(err));
-        return;
-      }
-      // Method-not-found / invalid-params (or any other resume error) —
-      // fall back to session/load below.
+      // Method-not-found / invalid-params / -32600 (or any other resume
+      // error) — fall back to session/load below. `-32600` is JSON-RPC's
+      // generic "Invalid Request" code, not an auth-specific one — fx
+      // merely reuses it for credential failures (0.0.5+, see the file
+      // header) — so it gets no special early-exit here: whether this
+      // -32600 was the credential gate or fx rejecting resume as
+      // unsupported, `session/load`'s own outcome (below) is what decides
+      // the turn.
     }
     if (state.resolved) return;
     if (!resumed) {
@@ -1091,6 +1118,13 @@ async function runFxTurn(
         state.suppressUpdates = false;
         if (isTimeoutError(err)) {
           failTurn(state, describeHandshakeFailure(err, "session/load", RPC_HANDSHAKE_TIMEOUT_MS));
+        } else if (err instanceof RpcError && err.code === -32600) {
+          // Credential re-check failed here too (0.0.5+, see the file
+          // header) — authoritative either way it reads: the same gate
+          // resume just hit (load can't do better), or a non-auth "Invalid
+          // Request" for which `session/load` was precisely the graceful
+          // path to try. Surface fx's text verbatim, no wrapper.
+          failTurn(state, err.rawMessage);
         } else {
           failTurn(state, `fx acp: failed to resume session ${opts.resumeSessionId}: ${errMessage(err)}`);
         }
@@ -1144,9 +1178,9 @@ async function runFxTurn(
     if (err instanceof RpcError && err.code === -32600) {
       // Credential re-check failed mid-prompt (0.0.5+, see the file
       // header) — fx's text is user-actionable on its own; surface it
-      // verbatim instead of wrapping it in our own "session/prompt
-      // failed:" prefix.
-      failTurn(state, errMessage(err));
+      // verbatim (via rawMessage, with no "(code -32600)" suffix) instead
+      // of wrapping it in our own "session/prompt failed:" prefix.
+      failTurn(state, err.rawMessage);
     } else {
       failTurn(state, `fx acp: session/prompt failed: ${errMessage(err)}`);
     }

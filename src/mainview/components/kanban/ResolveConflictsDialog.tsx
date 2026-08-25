@@ -17,6 +17,7 @@ import {
   type Harness,
 } from "../../../shared/types.ts";
 import { AgentIcon } from "./AgentIcon";
+import { HarnessAuthHint } from "./HarnessAuthHint";
 import { buildResolveConflictsPrompt } from "@/lib/resolve-conflicts-prompt";
 
 const initialMode = (kind: AgentKind) => AGENT_OPTIONS[kind].modes[0]?.id ?? "auto";
@@ -295,6 +296,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
                 {availableHarnesses.map((h) => {
                   const status = agents.find((s) => s.harnessId === h.id);
                   const available = status?.available ?? false;
+                  const loggedOut = available && status?.loggedIn === false;
                   return (
                     <Button
                       key={h.id}
@@ -302,7 +304,14 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
                       variant={agent === h.id ? "default" : "outline"}
                       onClick={() => switchAgent(h.id)}
                       title={
-                        [status?.reason, status?.path, status?.version].filter(Boolean).join(" — ") || h.id
+                        [
+                          status?.reason,
+                          status?.loggedIn === false ? (status.authHelp ?? "Not logged in") : null,
+                          status?.path,
+                          status?.version,
+                        ]
+                          .filter(Boolean)
+                          .join(" — ") || h.id
                       }
                       className="justify-start"
                     >
@@ -311,7 +320,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
                       <span
                         className={cn(
                           "ml-auto inline-block size-1.5 rounded-full",
-                          available ? "bg-success-solid" : "bg-danger-solid",
+                          !available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid",
                         )}
                       />
                     </Button>
@@ -326,6 +335,7 @@ export function ResolveConflictsDialog({ open, onClose, context, onCreated }: Pr
                   )}
                 </div>
               )}
+              <HarnessAuthHint status={selectedStatus} />
             </div>
 
             <div className="space-y-1">

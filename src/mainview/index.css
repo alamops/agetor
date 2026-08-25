@@ -60,11 +60,14 @@
        Unlike the four status tokens above, these are NOT text/icon colors —
        they're small filled circles that must read correctly on both a
        near-black and a near-white surface, so (unusually) they carry the
-       *same* value in :root and .dark: Tailwind's own emerald-500 / red-500,
-       reproducing today's dark-mode dot exactly instead of drifting onto the
-       *-400 status-token shades (which would turn the red dot salmon-pink). */
+       *same* value in :root and .dark: Tailwind's own emerald-500 / red-500 /
+       amber-500, reproducing today's dark-mode dot exactly instead of
+       drifting onto the *-400 status-token shades (which would turn the red
+       dot salmon-pink). --warning-solid is the third state (harness
+       available but logged out) alongside success/danger. */
     --success-solid: 160.1 84.1% 39.4%; /* emerald-500 */
     --danger-solid: 0 84.2% 60.2%; /* red-500 */
+    --warning-solid: 37.7 92.1% 50.2%; /* amber-500 */
   }
 
   .dark {
@@ -107,6 +110,7 @@
        theme-invariant. */
     --success-solid: 160.1 84.1% 39.4%; /* emerald-500 */
     --danger-solid: 0 84.2% 60.2%; /* red-500 */
+    --warning-solid: 37.7 92.1% 50.2%; /* amber-500 */
   }
 
   * { @apply border-border; }

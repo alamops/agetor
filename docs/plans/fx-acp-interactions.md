@@ -10,13 +10,15 @@
 | Branch | feature/vercel-fx-sh-as-a-new-harness (continues the pushed fx branch) |
 | Base SHA | 5e56f75 (branch tip at plan time; tree clean) |
 
+> **Superseded in part** by `docs/plans/fx-0.0.6-compat.md`: the §8 A1 open question below ("does fx actually emit `plan`/`usage_update`?") is now answered — spike-verified against both v0.0.4 and v0.0.6, fx's real ACP stream never emits them (nor `agent_thought_chunk`). The mappings below (§1 items 2 and 3) are implemented and unit-tested exactly as described, but are **dormant** against real fx, not exercised in production use — see the inline notes in §1.
+
 ## 1. Objective & success criteria
 
 Three fx-driver enhancements, all schema-grounded (canonical ACP schema.json) and codebase-seam-verified:
 
 1. **Interactive permission cards**: an fx `session/request_permission` arriving in **ask or auto** mode (owner decision) surfaces as a RunPanel card showing the tool call (title/kind/rawInput when present) and fx's own option labels; the user's pick answers fx over JSON-RPC. `yolo` keeps auto-allow; unknown mode ids keep fail-closed auto-reject. **No timeout** (owner decision) — Stop remains the escape and answers `cancelled`.
-2. **Plan → TODO tracker**: ACP `plan` snapshots (currently ignored) feed the existing TODO surfaces — pinned RunPanel card + board badge — via the legacy-`TodoWrite` event shape, with zero new UI.
-3. **Usage chip**: latest `usage_update` (`used`/`size` tokens, optional `cost`) renders as a small chip on the run's summary row (owner decision), via the established status-sentinel + transcript-suppression pattern.
+2. **Plan → TODO tracker**: ACP `plan` snapshots (currently ignored) feed the existing TODO surfaces — pinned RunPanel card + board badge — via the legacy-`TodoWrite` event shape, with zero new UI. *(superseded — see fx-0.0.6-compat.md: implemented and unit-tested exactly as described, but fx has never been observed to send a `plan` update in either v0.0.4 or v0.0.6 — this mapping is DORMANT against real fx.)*
+3. **Usage chip**: latest `usage_update` (`used`/`size` tokens, optional `cost`) renders as a small chip on the run's summary row (owner decision), via the established status-sentinel + transcript-suppression pattern. *(superseded — see fx-0.0.6-compat.md: implemented and unit-tested exactly as described, but fx has never been observed to send a `usage_update` in either v0.0.4 or v0.0.6 — this mapping is DORMANT against real fx. A real provider chip, driven by `configOptions`, was added instead in the same follow-up plan.)*
 
 Done = typecheck green, full suite green, cards behave under cancel/Stop races, docs updated.
 
@@ -70,7 +72,7 @@ W1 {T1} → commit → W2 {T2,T3,T4} → commit → review → W3 {T5,T6} → co
 
 ## 8. Open questions / assumptions
 
-- **A1** (low): fx actually emits `plan`/`usage_update` over ACP (undocumented on fx's page; schema variants exist). If it never does, the mapping is dormant code with test coverage — no harm.
+- **A1** (low) — RESOLVED (see fx-0.0.6-compat.md): fx does NOT emit `plan`/`usage_update` over ACP in either v0.0.4 or v0.0.6 (spike-verified — fx's source defines exactly six `session/update` kinds and neither is among them). The mapping is dormant code with test coverage, exactly as this assumption anticipated — no harm, confirmed rather than merely hoped.
 - **A2** (low): auto-mode requests are rare (fx's LLM review resolves most) — if live use shows spam, the owner can flip auto back to auto-allow in one policy line.
 - Live verification still pending owner credentials (unchanged from the base PR).
 

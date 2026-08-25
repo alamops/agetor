@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { mapFxUpdate } from "./fx-acp.ts";
+import { extractFxProviderValue, mapFxUpdate } from "./fx-acp.ts";
 import { FX_USAGE_STATUS_PREFIX } from "../shared/types.ts";
 import { deriveTodoProgress } from "../shared/todo-progress.ts";
 
@@ -301,6 +301,92 @@ describe("usage_update → FX_USAGE_STATUS_PREFIX status chunk", () => {
     expect(mapFxUpdate({ sessionUpdate: "usage_update", used: 10, size: "nope" }, ctx)).toEqual([]);
     expect(mapFxUpdate({ sessionUpdate: "usage_update", used: 10 }, ctx)).toEqual([]);
     expect(mapFxUpdate({ sessionUpdate: "usage_update" }, ctx)).toEqual([]);
+  });
+});
+
+describe("extractFxProviderValue", () => {
+  test("well-formed configOptions with a provider entry returns its currentValue", () => {
+    expect(
+      extractFxProviderValue({
+        configOptions: [{ id: "provider", currentValue: "gateway", options: ["gateway", "codex", "grok"] }],
+      }),
+    ).toBe("gateway");
+  });
+
+  test("returns the value when configOptions sits at the top level of a full session/new-shaped result, alongside sibling fields", () => {
+    // The exact shape fx sends back from session/new/session/resume/session/load
+    // — sessionId and modes are siblings of configOptions at the top level,
+    // not nested under some other key. extractFxProviderValue reads
+    // `result.configOptions` directly, so this pins that it isn't expecting
+    // some wrapper object.
+    expect(
+      extractFxProviderValue({
+        sessionId: "sess-1",
+        modes: { availableModes: [{ id: "code" }, { id: "ask" }] },
+        configOptions: [{ id: "provider", currentValue: "codex" }],
+      }),
+    ).toBe("codex");
+  });
+
+  test("finds the provider entry even when it isn't first in the array", () => {
+    expect(
+      extractFxProviderValue({
+        configOptions: [
+          { id: "some-other-option", currentValue: "x" },
+          { id: "provider", currentValue: "grok" },
+        ],
+      }),
+    ).toBe("grok");
+  });
+
+  test("configOptions missing entirely returns null", () => {
+    expect(extractFxProviderValue({ sessionId: "sess-1" })).toBeNull();
+    expect(extractFxProviderValue({})).toBeNull();
+  });
+
+  test("configOptions present but non-array returns null", () => {
+    expect(extractFxProviderValue({ configOptions: "not-an-array" })).toBeNull();
+    expect(extractFxProviderValue({ configOptions: { id: "provider", currentValue: "gateway" } })).toBeNull();
+    expect(extractFxProviderValue({ configOptions: 42 })).toBeNull();
+    expect(extractFxProviderValue({ configOptions: null })).toBeNull();
+  });
+
+  test("entries without an id (or a non-object entry) are skipped, not fatal", () => {
+    expect(
+      extractFxProviderValue({
+        configOptions: [null, "a string", 42, { currentValue: "gateway" }, { id: "not-provider", currentValue: "x" }],
+      }),
+    ).toBeNull();
+  });
+
+  test("a provider entry with a non-string currentValue returns null", () => {
+    expect(extractFxProviderValue({ configOptions: [{ id: "provider", currentValue: 42 }] })).toBeNull();
+    expect(extractFxProviderValue({ configOptions: [{ id: "provider", currentValue: null }] })).toBeNull();
+    expect(extractFxProviderValue({ configOptions: [{ id: "provider", currentValue: undefined }] })).toBeNull();
+    expect(extractFxProviderValue({ configOptions: [{ id: "provider", currentValue: { nested: true } }] })).toBeNull();
+    expect(extractFxProviderValue({ configOptions: [{ id: "provider" }] })).toBeNull();
+  });
+
+  test("a provider entry with an empty-string currentValue returns null, not the empty string", () => {
+    expect(extractFxProviderValue({ configOptions: [{ id: "provider", currentValue: "" }] })).toBeNull();
+  });
+
+  test("a currentValue over 64 chars returns null; exactly 64 chars is still returned", () => {
+    const at64 = "p".repeat(64);
+    const over64 = "p".repeat(65);
+    expect(extractFxProviderValue({ configOptions: [{ id: "provider", currentValue: at64 }] })).toBe(at64);
+    expect(extractFxProviderValue({ configOptions: [{ id: "provider", currentValue: over64 }] })).toBeNull();
+  });
+
+  test("result itself being null, a primitive, or an array still returns null rather than throwing", () => {
+    expect(extractFxProviderValue(null)).toBeNull();
+    expect(extractFxProviderValue(undefined)).toBeNull();
+    expect(extractFxProviderValue("gateway")).toBeNull();
+    expect(extractFxProviderValue(42)).toBeNull();
+    // An array is `typeof "object"`, so this exercises that Array.isArray on
+    // its (nonexistent) .configOptions property fails closed rather than
+    // throwing.
+    expect(extractFxProviderValue([{ id: "provider", currentValue: "gateway" }])).toBeNull();
   });
 });
 

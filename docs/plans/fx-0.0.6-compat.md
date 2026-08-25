@@ -77,10 +77,25 @@ W1 {T1..T4} → commit → W2 {T5..T8} → commit → opus review → fixes → 
 
 ## 8. Open questions / assumptions
 
-- A1: the authenticated `status --json` `auth` value is unverified (no credentials); the rule is deliberately "missing ⇒ logged out, else proceed".
+- A1 — **RESOLVED (post-review, empirical)**: `fx status --json` (v0.0.6, `HOME` pointed at an empty dir, zero files written) reports `auth:"missing"` + `auth_help` with no credentials, `auth:"AI_GATEWAY_API_KEY"` when that env var is set, and `auth:"VERCEL_OIDC_TOKEN"` for that one — env-var auth IS reflected, and the probe runs with the same `harnessEnv(harness)` the spawn uses, so a key-authenticated user is never gated out. The rule stays "missing ⇒ logged out, else proceed"; the subscription-login (`fx login codex|grok`) value is still unobserved but can only be a non-`missing` string (fail-open).
 - A2: `session/resume`'s response carrying `configOptions` is source-inferred for `session/load`; resume may omit it — handled by tolerance (badge only when present).
 - Live authenticated smoke turn still pending (unchanged).
 
 ## 9. Completeness ledger
 
 n/a.
+
+## 10. Review outcome (opus, `ef601a5..c701841`) and dispositions
+
+0 critical · 1 high · 3 medium · 6 low. Fixed in the post-review wave unless noted.
+
+- **high — auth gate could refuse an `AI_GATEWAY_API_KEY` user** → not a defect: settled empirically (A1 above); gate kept, observed values recorded in `probeStatus`'s doc comment and above the `startTask` gate.
+- **medium — resume `-32600` skipped the `session/load` fallback for *every* Invalid-Request error** → fixed: resume `-32600` now falls through to `session/load` like `-32601`/`-32602`; a `-32600` from `session/load` (the same credential gate) surfaces fx's message verbatim; any other load error keeps the `failed to resume session` wrapper. Text-independent — no message-shape sniffing.
+- **medium — `discoverFx` could reject (live DB read outside try) and `Promise.all` would strand every kind's cache + surface an unhandled rejection at boot; module gained DB/signal-handler side effects** → fixed: fx resolved like codex/cursor (`AGETOR_FX_BIN` → `Bun.which`), `./db.ts`/`./agents.ts` imports dropped, body try/catch → `[]`, `refreshDiscoveredModels` uses `Promise.allSettled`.
+- **medium — `status --json` probe uncached and serial on Start + the 15s `/harnesses` poll** → fixed: `probeHelp` ‖ `probeStatus` concurrently (fx budget stays 4s worst-case), 60s TTL cache per `harness.id:path`; `startTask` passes `freshAuth: true` so a just-logged-in user is never refused by a stale `false`.
+- **low — `parseFxModels` didn't dedupe** → fixed (sibling `seen` Set).
+- **low — verbatim `-32600` on prompt drops call attribution** → accepted: a bare non-auth `-32600` on `session/prompt` means our own params were malformed (driver bug caught by tests), and message-shape sniffing is more fragile than the attribution loss. `RpcError.rawMessage` now carries fx's untouched text so "verbatim" is byte-exact (no ` (code -32600)` suffix) on both verbatim paths.
+- **low — `agent-discovery.ts` import side effects** → fixed with the discovery item.
+- **low — logged-out state missing from `ResolveConflictsDialog`, RunPanel's harness switcher, and the header dot** → fixed: shared `HarnessAuthHint` (also replaces NewTaskForm's inline block), tri-state dots (`danger`/`warning`/`success`), ` (not logged in)` option suffix.
+- **low — `ProviderChip` rendered an unbounded external string** → fixed: `extractFxProviderValue` rejects values > 64 chars; chip truncates.
+- **low — `isInternalStatusSentinel` JSDoc listed two sentinels** → fixed.

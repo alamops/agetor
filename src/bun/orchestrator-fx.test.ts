@@ -19,6 +19,15 @@ process.env.AGETOR_FX_DRIVER = "fake";
 // agent" (disambiguating Vercel's fx from the unrelated npm JSON-viewer CLI
 // of the same name — see agent-status.ts's FX_HELP_MARKER). Write a tiny
 // fake binary that satisfies both probes.
+// `checkHarness`'s fx-only login pre-flight (agent-status.ts's probeStatus)
+// additionally runs `fx status --json` once the --help/--version dual-probe
+// above passes. The stub answers it from two env vars set per-test —
+// AGETOR_FAKE_FX_STATUS_JSON (stdout) / AGETOR_FAKE_FX_STATUS_EXIT (exit
+// code, default 0) — so individual tests can flip between "logged out",
+// "logged in", and "doesn't implement the subcommand at all" (the default,
+// unset state every pre-existing test in this file already relies on:
+// `status` falls through to `exit 0` with empty stdout, which probeStatus
+// treats as fail-open loggedIn:null — see agent-status.ts).
 const fxBinDir = mkdtempSync(path.join(tmpdir(), "agetor-fx-fakebin-"));
 const fxBinPath = path.join(fxBinDir, "fx");
 writeFileSync(
@@ -31,6 +40,13 @@ writeFileSync(
     "fi",
     'if [ "$1" = "--version" ]; then',
     '  echo "0.0.4-fake"',
+    "  exit 0",
+    "fi",
+    'if [ "$1" = "status" ]; then',
+    '  if [ -n "$AGETOR_FAKE_FX_STATUS_JSON" ]; then',
+    '    echo "$AGETOR_FAKE_FX_STATUS_JSON"',
+    '    exit "${AGETOR_FAKE_FX_STATUS_EXIT:-0}"',
+    "  fi",
     "  exit 0",
     "fi",
     "exit 0",
@@ -66,7 +82,7 @@ async function settle(ms = 80) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-test("createTask (fx) defaults model to zai/glm-5.2-fast, no effort, and lands in backlog", async () => {
+test("createTask (fx) defaults model to moonshotai/kimi-k3, no effort, and lands in backlog", async () => {
   const { createTask } = await import("./orchestrator.ts");
 
   const created = await createTask({
@@ -80,12 +96,122 @@ test("createTask (fx) defaults model to zai/glm-5.2-fast, no effort, and lands i
   if ("error" in created) throw new Error(created.error);
 
   expect(created.task.agent).toBe("fx");
-  expect(created.task.model).toBe("zai/glm-5.2-fast");
+  expect(created.task.model).toBe("moonshotai/kimi-k3");
   // fx has no per-invocation effort flag — every model in MODEL_EFFORT_SUPPORT.fx
   // reports an empty supported-effort list, so createTask leaves effort null
   // rather than defaulting it (see orchestrator.ts's createTask default logic).
   expect(created.task.effort).toBeNull();
   expect(created.task.column).toBe("backlog");
+});
+
+/* ── T5: startTask's logged-out pre-flight (orchestrator.ts's
+ * `status.loggedIn === false` gate) ─────────────────────────────────────── */
+
+async function withFxStatusJson<T>(
+  json: string | null,
+  exitCode: number | null,
+  run: () => Promise<T>,
+): Promise<T> {
+  const prevJson = process.env.AGETOR_FAKE_FX_STATUS_JSON;
+  const prevExit = process.env.AGETOR_FAKE_FX_STATUS_EXIT;
+  if (json === null) delete process.env.AGETOR_FAKE_FX_STATUS_JSON;
+  else process.env.AGETOR_FAKE_FX_STATUS_JSON = json;
+  if (exitCode === null) delete process.env.AGETOR_FAKE_FX_STATUS_EXIT;
+  else process.env.AGETOR_FAKE_FX_STATUS_EXIT = String(exitCode);
+  try {
+    return await run();
+  } finally {
+    if (prevJson === undefined) delete process.env.AGETOR_FAKE_FX_STATUS_JSON;
+    else process.env.AGETOR_FAKE_FX_STATUS_JSON = prevJson;
+    if (prevExit === undefined) delete process.env.AGETOR_FAKE_FX_STATUS_EXIT;
+    else process.env.AGETOR_FAKE_FX_STATUS_EXIT = prevExit;
+  }
+}
+
+test("startTask (fx) is blocked with an actionable error when the harness reports logged-out (auth:missing) — task stays in its pre-start column, no run row inserted", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, runs, harnesses } = await import("./db.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx logged out",
+    prompt: "do a thing",
+    agent: "fx",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+  const preStartColumn = created.task.column;
+
+  await withFxStatusJson(
+    JSON.stringify({ auth: "missing", auth_help: "Run fx login" }),
+    null,
+    async () => {
+      const started = await startTask(taskId);
+      expect("error" in started).toBe(true);
+      if ("error" in started) {
+        expect(started.error).toMatch(/isn't logged in/);
+        expect(started.error).toContain("Run fx login");
+      }
+    },
+  );
+
+  const task = tasks.get(taskId);
+  expect(task?.column).toBe(preStartColumn);
+  expect(task?.runId).toBeNull();
+  expect(runs.listForTask(taskId).length).toBe(0);
+});
+
+test("startTask (fx) proceeds normally when the stub doesn't implement status --json at all (fail-open, loggedIn:null) — the default every other test in this file relies on", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { runs, harnesses } = await import("./db.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx fail-open",
+    prompt: "do a thing",
+    agent: "fx",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await withFxStatusJson(null, null, () => startTask(taskId));
+  expect("error" in started).toBe(false);
+
+  await settle();
+  const list = runs.listForTask(taskId);
+  expect(list.length).toBe(1);
+  expect(list[0]?.status).toBe("succeeded");
+});
+
+test("startTask (fx) proceeds when the harness reports logged-in (auth:ok) — the loggedIn===false gate only fires on an explicit false", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { runs, harnesses } = await import("./db.ts");
+  harnesses.setEnabled("fx", true);
+
+  const created = await createTask({
+    title: "fx logged in",
+    prompt: "do a thing",
+    agent: "fx",
+    workdir: process.cwd(),
+    isolation: "none",
+    taskType: "task",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const started = await withFxStatusJson(JSON.stringify({ auth: "ok" }), null, () => startTask(taskId));
+  expect("error" in started).toBe(false);
+
+  await settle();
+  const list = runs.listForTask(taskId);
+  expect(list.length).toBe(1);
+  expect(list[0]?.status).toBe("succeeded");
 });
 
 test("startTask (fx) sets tmux_session (inert, for row-shape symmetry) + persists the discovered session id as fx_session_id", async () => {

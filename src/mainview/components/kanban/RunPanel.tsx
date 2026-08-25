@@ -3543,7 +3543,10 @@ function UsageChip({ usage }: { usage: FxUsageData }) {
  *  unreleased provider id still renders sensibly. */
 function ProviderChip({ provider }: { provider: string }) {
   return (
-    <span className="text-muted-foreground" title="fx provider">
+    <span
+      className="inline-block max-w-[10rem] truncate align-bottom text-muted-foreground"
+      title="fx provider"
+    >
       {provider}
     </span>
   );
@@ -5347,10 +5350,13 @@ function AgentSelect({
       className="h-6 text-[11px]"
     >
       {harnesses.map((h) => {
-        const available = agents.find((a) => a.harnessId === h.id)?.available ?? true;
+        const status = agents.find((a) => a.harnessId === h.id);
+        const available = status?.available ?? true;
+        const loggedOut = available && status?.loggedIn === false;
+        const suffix = !available ? " (unavailable)" : loggedOut ? " (not logged in)" : "";
         return (
           <option key={h.id} value={h.id}>
-            {h.label}{available ? "" : " (unavailable)"}
+            {h.label}{suffix}
           </option>
         );
       })}

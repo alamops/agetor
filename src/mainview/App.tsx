@@ -982,11 +982,12 @@ function AppInner() {
               const harness = harnesses.find((h) => h.id === a.harnessId);
               const displayName = harness?.label ?? a.harnessId;
               const q = usage[a.harnessId];
+              const loggedOut = a.available && a.loggedIn === false;
               const dot = (
                 <span
                   className={
                     "inline-block size-1.5 rounded-full " +
-                    (a.available ? "bg-success-solid" : "bg-danger-solid")
+                    (!a.available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid")
                   }
                 />
               );
@@ -1008,7 +1009,7 @@ function AppInner() {
               const chip = (
                 <span
                   className="flex items-center gap-1"
-                  title={a.reason ?? a.path ?? ""}
+                  title={loggedOut ? (a.authHelp ?? "Not logged in") : (a.reason ?? a.path ?? "")}
                 >
                   <AgentIcon kind={a.kind} className="size-3" />
                   {displayName}

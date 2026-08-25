@@ -121,6 +121,14 @@ async function probeJson(bin: string, args: string[], env: Record<string, string
  * Only `auth === "missing"` (from a real fx binary that answered the probe)
  * is treated as a positive "logged out" signal; every other parseable value
  * is treated as logged in.
+ *
+ * Empirically verified auth values (real fx v0.0.6 binary, `HOME` pointed at
+ * an empty dir so no ambient credentials leak in): no credentials at all →
+ * `auth:"missing"` + `auth_help`; `AI_GATEWAY_API_KEY` set → `auth:
+ * "AI_GATEWAY_API_KEY"`; `VERCEL_OIDC_TOKEN` set → `auth:"VERCEL_OIDC_TOKEN"`
+ * — i.e. env-var auth IS reflected in the probe's output, and since this
+ * probe runs with the same `harnessEnv(harness)` a real spawn uses, a
+ * key-authenticated user is never gated out here. The probe writes no files.
  */
 async function probeStatus(bin: string, env: Record<string, string>): Promise<{ loggedIn: boolean | null; authHelp: string | null }> {
   const out = await probeJson(bin, ["status", "--json"], env);
@@ -146,6 +154,41 @@ async function probeStatus(bin: string, env: Record<string, string>): Promise<{ 
   }
 
   return { loggedIn: true, authHelp: null };
+}
+
+type StatusProbeResult = { loggedIn: boolean | null; authHelp: string | null };
+
+const STATUS_CACHE_TTL_MS = 60_000;
+const statusCache = new Map<string, { value: StatusProbeResult; expiresAt: number }>();
+
+/**
+ * Memoized wrapper around `probeStatus`, keyed by `${harness.id}:${path}` (the
+ * resolved binary path, not just the harness id — an alias whose `bin`
+ * changes mid-session shouldn't inherit a stale entry keyed only on id).
+ * `checkAllHarnesses()` runs every 15s (`App.tsx`'s poll) and, until this
+ * cache existed, each tick re-spawned `fx status --json` for every fx
+ * harness forever — auth state changes rarely enough that a 60s staleness
+ * window is an easy trade for cutting that to one spawn per minute.
+ *
+ * `freshAuth: true` bypasses the cache read (a user who just ran `fx login`
+ * must not be told "still logged out" for up to 60s), but the freshly-probed
+ * result is still written back to the cache so the *next* poll tick benefits
+ * from it instead of immediately re-probing.
+ */
+async function getCachedStatus(
+  harness: Harness,
+  path: string,
+  env: Record<string, string>,
+  opts: { freshAuth?: boolean } | undefined,
+): Promise<StatusProbeResult> {
+  const key = `${harness.id}:${path}`;
+  if (!opts?.freshAuth) {
+    const cached = statusCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+  }
+  const value = await probeStatus(path, env);
+  statusCache.set(key, { value, expiresAt: Date.now() + STATUS_CACHE_TTL_MS });
+  return value;
 }
 
 const FX_HELP_MARKER = "coding agent";
@@ -180,7 +223,15 @@ function resolveBinPath(bin: string): string | null {
  */
 const TMUX_INSTALL_HINT = "brew install tmux (macOS) or apt install tmux (Debian/Ubuntu)";
 
-export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
+/**
+ * `opts.freshAuth` bypasses the fx auth-status cache (see `getCachedStatus`
+ * above) for this one call. Start (`orchestrator.ts`'s `startTask`) passes
+ * `{ freshAuth: true }` — a user who just ran `fx login` must not be refused
+ * for up to `STATUS_CACHE_TTL_MS` by a stale cached `false`. The 15s
+ * `/harnesses` poll can tolerate that staleness (it's just painting a status
+ * dot), so it omits the option and reads from cache.
+ */
+export async function checkHarness(harness: Harness, opts?: { freshAuth?: boolean }): Promise<HarnessStatus> {
   const bin = resolveBin(harness);
   const path = resolveBinPath(bin);
   if (!path) {
@@ -232,9 +283,22 @@ export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
   let authHelp: string | null = null;
 
   if (harness.kind === "fx" && version !== null) {
-    const helpOutput = await probeHelp(path, harnessEnv(harness));
+    const env = harnessEnv(harness);
+    // Run concurrently, not sequentially: probeStatus doesn't actually depend
+    // on probeHelp's outcome to execute (only on whether we end up trusting
+    // its result), so serializing them just to preserve read order was
+    // costing an extra ~2s worst-case per fx check (3 sequential 2s-budget
+    // probes vs. version's 2s + max(help, status)'s 2s = 4s total).
+    const [helpOutput, status] = await Promise.all([
+      probeHelp(path, env),
+      getCachedStatus(harness, path, env, opts),
+    ]);
     const looksLikeFx = helpOutput?.toLowerCase().includes(FX_HELP_MARKER) ?? false;
     if (!looksLikeFx) {
+      // `status` was still fetched (and cached) above, but this binary isn't
+      // confirmed to be Vercel's fx, so its auth state is meaningless here —
+      // discarded in favor of the null/null the wrong-binary path always
+      // reported.
       return {
         harnessId: harness.id,
         kind: harness.kind,
@@ -249,7 +313,7 @@ export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
       };
     }
 
-    ({ loggedIn, authHelp } = await probeStatus(path, harnessEnv(harness)));
+    ({ loggedIn, authHelp } = status);
   }
 
   return {
@@ -272,5 +336,10 @@ export async function checkHarness(harness: Harness): Promise<HarnessStatus> {
  * each probe times out independently after VERSION_PROBE_TIMEOUT_MS.
  */
 export function checkAllHarnesses(): Promise<HarnessStatus[]> {
-  return Promise.all(harnesses.list().map(checkHarness));
+  return Promise.all(harnesses.list().map((h) => checkHarness(h)));
 }
+
+// Exposed for tests: clears the fx auth-status memoization (see
+// `getCachedStatus`/`statusCache` above) so a test isn't left racing a TTL
+// window set by an earlier test's probe against the same harness id + path.
+export const __testing = { clearStatusCache: () => statusCache.clear() };

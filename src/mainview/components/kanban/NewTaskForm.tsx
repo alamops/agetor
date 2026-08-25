@@ -37,6 +37,7 @@ import {
 } from "../../../shared/types.ts";
 import { BranchNamingDialog } from "@/components/settings/BranchNamingDialog";
 import { AgentIcon } from "./AgentIcon";
+import { HarnessAuthHint } from "./HarnessAuthHint";
 import { BranchPicker } from "./BranchPicker";
 import { ProjectPicker } from "./ProjectPicker";
 import {
@@ -1032,14 +1033,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
               {/* Not blocking — Create/Run still work and the run pre-flight
                   reports the actionable error if the turn actually needs
                   credentials. This is a heads-up, not a disable. */}
-              {selectedStatus && selectedStatus.available && selectedStatus.loggedIn === false && (
-                <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
-                  <div className="font-medium">Not logged in</div>
-                  {selectedStatus.authHelp && (
-                    <div className="mt-1 opacity-80">{selectedStatus.authHelp}</div>
-                  )}
-                </div>
-              )}
+              <HarnessAuthHint status={selectedStatus} />
             </div>
 
             <div className="flex shrink-0 gap-2 border-t border-border/60 px-4 py-3">

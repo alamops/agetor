@@ -19,7 +19,12 @@ import {
   type FxLaunchOptions,
   type FxMode,
 } from "./fx-acp.ts";
-import { FX_USAGE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX, type RunEventStream } from "../shared/types.ts";
+import {
+  FX_PROVIDER_STATUS_PREFIX,
+  FX_USAGE_STATUS_PREFIX,
+  SESSION_DIED_STATUS_PREFIX,
+  type RunEventStream,
+} from "../shared/types.ts";
 // fx-acp.ts's own permission driving is the thing under test here, but the
 // tests themselves need to reach into the SAME in-memory registry the driver
 // awaits on — there is no other way to answer a carded fx_permission request
@@ -127,13 +132,29 @@ const FAKE_ACP_SERVER_SRC = [
   "function handleSessionNew(id, params) {",
   "  sessionCounter = sessionCounter + 1;",
   '  const sessionId = "sess-" + scenario + "-" + sessionCounter;',
-  '  ok(id, { sessionId: sessionId, modes: { availableModes: [{ id: "code" }, { id: "ask" }] } });',
+  '  const result = { sessionId: sessionId, modes: { availableModes: [{ id: "code" }, { id: "ask" }] } };',
+  '  if (scenario === "provider") {',
+  '    result.configOptions = [{ id: "provider", currentValue: "gateway", options: ["gateway", "codex", "grok"] }];',
+  "  }",
+  "  ok(id, result);",
   "}",
   "",
   "function handleSessionResume(id, params) {",
   '  capture("session/resume", params);',
   '  if (scenario === "resume-fallback") {',
   '    fail(id, -32601, "Method not found (fake, forcing fallback)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-fallback-32602") {',
+  '    fail(id, -32602, "Invalid params (fake, forcing fallback)");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-auth-error" || scenario === "resume-auth-error-load-ok") {',
+  '    fail(id, -32600, "Fx needs a Codex subscription login to continue. Run fx login codex.");',
+  "    return;",
+  "  }",
+  '  if (scenario === "provider") {',
+  '    ok(id, { configOptions: [{ id: "provider", currentValue: "gateway", options: ["gateway", "codex", "grok"] }] });',
   "    return;",
   "  }",
   "  ok(id, {});",
@@ -146,6 +167,17 @@ const FAKE_ACP_SERVER_SRC = [
   "    setTimeout(function () { ok(id, {}); }, 15);",
   "    return;",
   "  }",
+  '  if (scenario === "resume-auth-error") {',
+  "    // A DIFFERENT message than session/resume's, so a test asserting on",
+  "    // this text can prove it's session/load's response that decided the",
+  "    // outcome, not resume's.",
+  '    fail(id, -32600, "Fx still needs a Codex subscription login after session/load. Run fx login codex.");',
+  "    return;",
+  "  }",
+  '  if (scenario === "resume-auth-error-load-ok") {',
+  "    ok(id, {});",
+  "    return;",
+  "  }",
   "  ok(id, {});",
   "}",
   "",
@@ -155,6 +187,14 @@ const FAKE_ACP_SERVER_SRC = [
   '  if (scenario === "happy" || scenario === "resume" || scenario === "resume-fallback") {',
   "    streamHappyUpdates();",
   '    endTurn(id, 20, "end_turn");',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-auth-error") {',
+  '    fail(id, -32600, "Fx needs access to Vercel AI Gateway. Run fx login to authenticate.");',
+  "    return;",
+  "  }",
+  '  if (scenario === "prompt-other-error") {',
+  '    fail(id, -32603, "Internal error (fake)");',
   "    return;",
   "  }",
   '  if (scenario === "permission") {',
@@ -547,6 +587,207 @@ describe("resume fallback (session/load)", () => {
     },
     10_000,
   );
+
+  test(
+    "also falls back to session/load on -32602 (invalid params) — same tolerance as -32601",
+    async () => {
+      const resumeId = "resume-existing-id-32602";
+      const { agent, chunks, captureFile } = spawnFake("resume-fallback-32602", { resumeSessionId: resumeId });
+
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      const loadReq = entries.find((e) => e.label === "session/load");
+      expect(loadReq).toBeDefined();
+      expect((loadReq!.msg as { sessionId?: string }).sessionId).toBe(resumeId);
+
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello ")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 3b. Resume credential re-check failure (-32600) — falls through to
+ *     session/load exactly like -32601/-32602, since -32600 is JSON-RPC's
+ *     generic "Invalid Request" code, not auth-specific — fx merely reuses it
+ *     for credential failures.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("resume credential re-check failure (-32600)", () => {
+  test(
+    "attempts session/load after a resume -32600 (not an early exit); when load also answers -32600, fx's verbatim load-response text is what surfaces — not resume's — with no wrapper and no '(code -32600)' suffix",
+    async () => {
+      const resumeId = "resume-auth-err-1";
+      const { agent, chunks, captureFile } = spawnFake("resume-auth-error", { resumeSessionId: resumeId });
+
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      // Settled exactly once: failTurn emits exactly one status chunk before
+      // settleFx, and settleFx's own `state.resolved` guard means a second
+      // failure path (were one to race in) could never emit a second.
+      expect(statusChunks).toHaveLength(1);
+      // Byte-identical to session/load's error message (RpcError.rawMessage,
+      // not `message`) — no "session/resume failed:" / "fx acp: failed to
+      // resume session ...:" wrapper, and no trailing "(code -32600)". The
+      // fake gives session/load a DIFFERENT auth-error string than
+      // session/resume's, so this also proves it's load's response deciding
+      // the outcome, not resume's.
+      expect(statusChunks[0]!.data).toBe(
+        "Fx still needs a Codex subscription login after session/load. Run fx login codex.",
+      );
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      // The fix under test: -32600 on resume no longer skips the
+      // session/load fallback the way -32601/-32602 never did.
+      expect(entries.some((e) => e.label === "session/load")).toBe(true);
+      expect(entries.some((e) => e.label === "session/prompt")).toBe(false);
+
+      // The child process was actually torn down (SIGTERM observed by the
+      // fake), not merely forgotten about in the map.
+      await waitFor(() => readCaptured(captureFile).some((e) => e.label === "sigterm"));
+    },
+    10_000,
+  );
+
+  test(
+    "when session/load succeeds after a resume -32600, the turn proceeds normally — session/prompt runs and the response streams as usual",
+    async () => {
+      const resumeId = "resume-auth-err-load-ok-1";
+      const { agent, chunks, captureFile } = spawnFake("resume-auth-error-load-ok", { resumeSessionId: resumeId });
+
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const entries = readCaptured(captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+      expect(entries.some((e) => e.label === "session/load")).toBe(true);
+      expect(entries.some((e) => e.label === "session/prompt")).toBe(true);
+
+      expect(chunks.some((c) => c.stream === "assistant" && c.data === "Hello ")).toBe(true);
+      // No spurious credential-failure status chunk leaked through.
+      expect(chunks.some((c) => c.stream === "status" && c.data.includes("Codex subscription"))).toBe(false);
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 3c. Prompt credential re-check failure (-32600) vs. every other prompt
+ *      error (kept wrapped, unchanged behavior).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("prompt credential re-check failure (-32600)", () => {
+  test(
+    "fails the turn with fx's byte-identical message (via RpcError.rawMessage — no 'session/prompt failed:' wrapper and no trailing '(code -32600)'), once",
+    async () => {
+      const { agent, chunks } = spawnFake("prompt-auth-error");
+
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks).toHaveLength(1);
+      expect(statusChunks[0]!.data).toBe("Fx needs access to Vercel AI Gateway. Run fx login to authenticate.");
+      expect(statusChunks[0]!.data.startsWith("fx acp: session/prompt failed:")).toBe(false);
+      expect(statusChunks[0]!.data.endsWith("(code -32600)")).toBe(false);
+    },
+    10_000,
+  );
+});
+
+describe("prompt non-auth error keeps the existing wrapper", () => {
+  test(
+    "a non -32600 session/prompt error (e.g. -32603) is still wrapped as 'fx acp: session/prompt failed: ...' — unchanged from before RpcError existed",
+    async () => {
+      const { agent, chunks } = spawnFake("prompt-other-error");
+
+      const code = await agent.done;
+      expect(code).toBe(1);
+
+      const statusChunks = chunks.filter((c) => c.stream === "status");
+      expect(statusChunks).toHaveLength(1);
+      expect(statusChunks[0]!.data).toBe("fx acp: session/prompt failed: Internal error (fake) (code -32603)");
+    },
+    10_000,
+  );
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 3d. Provider sentinel — `configOptions` on session/new / session/resume.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("provider sentinel (configOptions)", () => {
+  test(
+    "session/new configOptions with a provider entry emits exactly one FX_PROVIDER_STATUS_PREFIX status chunk, carrying a unique line_uuid",
+    async () => {
+      const { agent, chunks } = spawnFake("provider");
+
+      const code = await agent.done;
+      expect(code).toBe(0);
+
+      const providerChunks = chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_PROVIDER_STATUS_PREFIX),
+      );
+      expect(providerChunks).toHaveLength(1);
+      expect(providerChunks[0]!.data).toBe(FX_PROVIDER_STATUS_PREFIX + "gateway");
+      expect(providerChunks[0]!.lineUuid).toBeTruthy();
+
+      // Unique among every line_uuid this turn emitted — the dedup gate in
+      // `emit()` never had to drop a second identical provider chunk.
+      const allLineUuids = chunks.map((c) => c.lineUuid).filter((u): u is string => Boolean(u));
+      expect(new Set(allLineUuids).size).toBe(allLineUuids.length);
+    },
+    10_000,
+  );
+
+  test(
+    "a second (resumed) turn on the same session emits the provider sentinel again — once per turn, not once per run",
+    async () => {
+      // Each turn is its own spawned process (see the file header: fx-acp.ts
+      // has no persistent session across turns, only the sessionId carries
+      // continuity) — so this spawns a second, independent fake server
+      // process with resumeSessionId set, mirroring how the orchestrator
+      // would drive a real follow-up turn.
+      const firstTurn = spawnFake("provider");
+      const firstCode = await firstTurn.agent.done;
+      expect(firstCode).toBe(0);
+      const firstSessionId = firstTurn.sessionIds[0]!;
+
+      const secondTurn = spawnFake("provider", { resumeSessionId: firstSessionId });
+      const secondCode = await secondTurn.agent.done;
+      expect(secondCode).toBe(0);
+
+      const providerChunks = secondTurn.chunks.filter(
+        (c) => c.stream === "status" && c.data.startsWith(FX_PROVIDER_STATUS_PREFIX),
+      );
+      expect(providerChunks).toHaveLength(1);
+      expect(providerChunks[0]!.data).toBe(FX_PROVIDER_STATUS_PREFIX + "gateway");
+
+      // Confirms the resume path (not session/new) is what produced it this
+      // time — no sessionId re-announcement on a resumed turn.
+      expect(secondTurn.sessionIds).toEqual([]);
+      const entries = readCaptured(secondTurn.captureFile);
+      expect(entries.some((e) => e.label === "session/resume")).toBe(true);
+    },
+    10_000,
+  );
+});
+
+describe("provider sentinel absent", () => {
+  test("no configOptions on session/new produces no provider status chunk at all", async () => {
+    const { agent, chunks } = spawnFake("happy");
+
+    const code = await agent.done;
+    expect(code).toBe(0);
+
+    expect(chunks.some((c) => c.stream === "status" && c.data.startsWith(FX_PROVIDER_STATUS_PREFIX))).toBe(false);
+  }, 10_000);
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *

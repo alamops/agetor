@@ -66,15 +66,20 @@ async function enableFxHarness(backend: E2EBackend): Promise<void> {
  *  (isolation "none", a plain non-git temp dir as workdir — the fake driver
  *  never touches the filesystem) and start it. Mirrors todo-progress.spec
  *  .ts's `createAndStartFakeTodoTask`, parametrized by agent + marker so it
- *  covers both fake scenarios this file exercises. */
+ *  covers both fake scenarios this file exercises. `promptMarker` is
+ *  optional — omitting it produces a bare prompt that matches neither
+ *  `FAKE_CLAUDE_TODOS_PROMPT_MARKER` nor `FAKE_FX_PERMISSION_PROMPT_MARKER`,
+ *  so `makeFakeAgent` (src/bun/agents.ts) falls through to its generic
+ *  echo-back scenario — the one used below to exercise the provider chip
+ *  without pulling in either marked scenario. */
 async function createAndStartFakeFxTask(
   request: APIRequestContext,
   backend: E2EBackend,
   title: string,
-  promptMarker: string,
+  promptMarker?: string,
 ): Promise<TaskRow> {
   const auth = { authorization: `Bearer ${backend.apiToken}` };
-  const prompt = `${promptMarker} ${title}`;
+  const prompt = promptMarker ? `${promptMarker} ${title}` : title;
   const createRes = await request.post(`${backend.apiBase}/tasks`, {
     headers: auth,
     data: { title, prompt, agent: "fx", isolation: "none", workdir: tmpdir() },
@@ -181,5 +186,48 @@ test.describe("fx interactions", () => {
 
     await expect(panel.getByText("fake fx permission resolved: cancelled", { exact: true })).toBeVisible();
     await expect(panel.getByText("Fx is requesting permission")).toHaveCount(0);
+  });
+
+  test("fx run's provider sentinel renders the RunsList provider chip and stays out of the transcript", async ({
+    page,
+    request,
+    backend,
+  }) => {
+    const title = `fx-provider-chip-e2e ${randomUUID()}`;
+    // No fake-driver marker — falls into `makeFakeAgent`'s generic fallback
+    // scenario (src/bun/agents.ts), which — only for `kind: "fx"` — emits the
+    // `fx-provider: gateway` status chunk before any turn content, mirroring
+    // fx-acp.ts's real `maybeEmitProvider`. Every fx fake scenario in this
+    // file shares that emission (the permission scenario above emits it too),
+    // but this one is the least entangled: no card, no todo tracker, just the
+    // sentinel + a plain echo, so the assertions below are about the chip and
+    // nothing else.
+    await createAndStartFakeFxTask(request, backend, title);
+
+    await gotoApp(page, backend.bootBase);
+    const panel = await openTask(page, title);
+
+    // Proof the turn actually ran and completed via the generic echo
+    // scenario — same "whole turn streamed and was persisted" rationale as
+    // the todo test's `getByText` assertion above.
+    await expect(panel.getByText(`fake response to: ${title}`, { exact: true })).toBeVisible();
+
+    // --- RunsList: provider chip on the (only, so always-visible-without-
+    // expanding) run's summary row. No `data-testid` exists on `ProviderChip`
+    // (src/mainview/components/kanban/RunPanel.tsx) — a testid would be a
+    // sturdier locator than text + title, but per this task's scope src/ is
+    // not touched to add one, so this locates by the chip's exact visible
+    // text, scoped to the run panel to avoid matching an unrelated "gateway"
+    // occurrence elsewhere on the page.
+    const providerChip = panel.getByText("gateway", { exact: true });
+    await expect(providerChip).toBeVisible();
+    await expect(providerChip).toHaveAttribute("title", "fx provider");
+
+    // --- Transcript: the raw sentinel line must never render — RunPanel's
+    // `isInternalStatusSentinel` suppression (shared/types.ts) is what keeps
+    // it out, and this is the load-bearing assertion that guards against a
+    // future change letting it leak back into the scrollback as a
+    // StatusDivider.
+    await expect(panel.getByText("fx-provider: gateway", { exact: true })).toHaveCount(0);
   });
 });

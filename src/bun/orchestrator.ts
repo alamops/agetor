@@ -885,13 +885,22 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
   if (!harness.enabled) {
     return { error: `${harness.label} is disabled — re-enable it in Settings to start new runs.` };
   }
-  const status = await checkHarness(harness);
+  // `freshAuth: true` bypasses agent-status.ts's fx status-cache (60s TTL) —
+  // a Start click must never be refused by a stale cached "logged out" from
+  // before the user ran `fx login`. The 15s `/harnesses` poll that paints the
+  // header status dots is the only caller that tolerates the cached value.
+  const status = await checkHarness(harness, { freshAuth: true });
   if (!status.available) {
     const hint = status.installHint ? ` Install it with: ${status.installHint}` : "";
     return { error: `${harness.label} is not available — ${status.reason}.${hint}` };
   }
   // Fail-open: only an explicit `false` means the CLI positively reported
   // it's logged out. `null` (not probed / unknown) must never block a run.
+  // Empirically (real fx v0.0.6, HOME pointed at an empty dir): env-var auth
+  // IS reflected by the probe (AI_GATEWAY_API_KEY / VERCEL_OIDC_TOKEN both
+  // report a non-"missing" `auth` value) — since the probe runs with the same
+  // harnessEnv(harness) a real spawn uses, a key-authenticated user is never
+  // gated out here (see agent-status.ts's probeStatus doc comment).
   if (status.loggedIn === false) {
     return { error: `${harness.label} isn't logged in — ${status.authHelp ?? "run its login command"}` };
   }

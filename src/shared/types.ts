@@ -52,8 +52,9 @@ export const FX_PROVIDER_STATUS_PREFIX = "fx-provider: ";
 /**
  * True for `status`-stream chunks that are UI-internal sentinel channels, not
  * transcript content: currently `PERMISSION_MODE_STATUS_PREFIX` (fed a chip,
- * now suppressed-only) and `FX_USAGE_STATUS_PREFIX` (feeds the run-row usage
- * chip). Every renderer of raw status events — RunPanel's status dividers,
+ * now suppressed-only), `FX_USAGE_STATUS_PREFIX` (feeds the run-row usage
+ * chip), and `FX_PROVIDER_STATUS_PREFIX` (feeds the run-row provider chip).
+ * Every renderer of raw status events — RunPanel's status dividers,
  * the CLI's `agetor logs` formatter, and the TUI dashboard — must consult
  * this ONE predicate instead of maintaining its own prefix list, so a new
  * sentinel can't silently leak verbatim into one surface while another
