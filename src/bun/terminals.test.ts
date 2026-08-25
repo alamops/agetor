@@ -1,4 +1,4 @@
-import { test, expect, afterEach } from "bun:test";
+import { test, expect, afterEach, beforeAll, afterAll } from "bun:test";
 import { mkdtempSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -21,6 +21,39 @@ const {
 import type { Task } from "../shared/types.ts";
 import type { ServerWebSocket } from "bun";
 import type { TerminalSocketData } from "./terminals.ts";
+
+/** The manager spawns `$SHELL -l`. Under test, pin that to `/bin/sh`: the
+ *  assertions below are about the MANAGER (a PTY round-trip, exit-driven
+ *  removal), not about the developer's own shell — a `zsh -l` that sources
+ *  a heavyweight profile (nvm, brew shellenv, a banner) can take seconds to
+ *  even reach its first prompt on a loaded machine, which is exactly the
+ *  flake this file used to have. Restored after the file so nothing else
+ *  in the shared `bun test` process sees the override. */
+const SAVED_SHELL = process.env.SHELL;
+beforeAll(() => { process.env.SHELL = "/bin/sh"; });
+afterAll(() => {
+  if (SAVED_SHELL === undefined) delete process.env.SHELL;
+  else process.env.SHELL = SAVED_SHELL;
+});
+
+/** Deadline-based readiness wait — polls `pred` every `intervalMs` until it
+ *  holds or `timeoutMs` elapses. A generous ceiling costs nothing when the
+ *  condition lands quickly (the common case) and absorbs a slow login shell
+ *  on a loaded box instead of failing at a fixed 2s the way the old
+ *  `40 × 50ms` loops did. */
+async function waitFor(pred: () => boolean, timeoutMs: number, intervalMs = 50): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pred()) return true;
+    await Bun.sleep(intervalMs);
+  }
+  return pred();
+}
+
+/** How long a spawned login shell gets to start, run a command, and (for the
+ *  exit test) terminate — far above the expected sub-second path, so only a
+ *  genuine manager bug trips it. */
+const SHELL_READY_MS = 20_000;
 
 let taskCounter = 0;
 function makeTask(workdir: string, extra: Partial<Task> = {}): Task {
@@ -112,19 +145,15 @@ test("createTerminal spawns a shell, streams output, and tracks count", async ()
   expect(attachSocket(created.id, sock.ws)).toBe(true);
   writeTerminal(created.id, "echo TERMINAL_MARKER_42\r");
 
-  // Poll for the echoed marker (real PTY round-trip).
-  let seen = false;
-  for (let i = 0; i < 40 && !seen; i++) {
-    await Bun.sleep(50);
-    if (decodeAll(sock.binary).includes("TERMINAL_MARKER_42")) seen = true;
-  }
+  // Wait for the echoed marker (real PTY round-trip).
+  const seen = await waitFor(() => decodeAll(sock.binary).includes("TERMINAL_MARKER_42"), SHELL_READY_MS);
   expect(seen).toBe(true);
 
   // Closing the tab drops the count.
   expect(closeTerminal(created.id)).toBe(true);
   expect(countTerminals(task.id)).toBe(0);
   expect(tasks.get(task.id)!.openTerminalCount).toBe(0);
-});
+}, SHELL_READY_MS + 10_000);
 
 test("createTerminal enforces the per-task limit", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-term-limit-"));
@@ -204,11 +233,7 @@ test("a shell that exits is auto-removed from the manager", async () => {
 
   // Tell the shell to exit; the manager should drop the entry on process exit.
   writeTerminal(created.id, "exit\r");
-  let gone = false;
-  for (let i = 0; i < 40 && !gone; i++) {
-    await Bun.sleep(50);
-    if (countTerminals(task.id) === 0) gone = true;
-  }
+  const gone = await waitFor(() => countTerminals(task.id) === 0, SHELL_READY_MS);
   expect(gone).toBe(true);
   expect(tasks.get(task.id)!.openTerminalCount).toBe(0);
-});
+}, SHELL_READY_MS + 10_000);
