@@ -329,3 +329,40 @@ settle.
 
 **Unverified because the owner was absent:** Q4's settle-vs-ignore choice and Q6's Enter-vs-`s`
 are the two answers a human should check first; both are single-line flips.
+
+## 9. Post-review addendum (2026-08-25)
+
+Opus review (via the `code-review` skill) on the wave 1+2 diff returned *request changes*;
+every valid finding was applied in commit `9b29bf6` and re-verified. Net changes on top of §3:
+
+- **Identity-checked settle (must-fix).** The stdout staging tested *whether* the head slot
+  was a slash turn, not *which* command — a `/implement …` task whose owner flipped the effort
+  dropdown mid-run (or folded a `/effort x` follow-up) would have been settled by the foreign
+  `<local-command-stdout>`. `SessionState.lastLocalCommandName` now records the
+  `<command-name>` line that always precedes a command's stdout (`localCommandNameOf`, both
+  JSONL shapes), and staging requires `slot.slashCommand === lastLocalCommandName`; the name
+  is cleared on stage, `popEndOfTurn`, and dispose.
+- **Idle gate anchored on chrome, not a row count.** `IDLE_CHROME_WINDOW_LINES = 4` failed
+  *open* whenever a `Tip:` banner, `✔ Update installed` notice, or the `⏺ main`/`◯` agent
+  roster sat in the widget area (up to 13 rows per `WORKING_CHROME_WINDOW_LINES`'s evidence).
+  `paneShowsIdleInputBox` now requires the `STATUS_BAR_RE` line to be one of the last two
+  non-blank lines, rejects a bar carrying `esc to interrupt` (a working pane shows the same
+  `(shift+tab to cycle)` phrase; the blink-off tick is still covered by
+  `paneShowsClaudeWorking`), and searches `IDLE_PROMPT_SEARCH_LINES` (8) rows above it for
+  the bare `❯`.
+- **Real slider track required.** `SLIDER_TRACK_MIN_CHARS = 10` — a lone `▲` in prose or a
+  dogfooded pane echo could otherwise have become a *drivable* horizontal card.
+- **Confirm poll early-exit.** `sendSlashCommand({ autoConfirm })` returns after
+  `SLASH_CONFIRM_IDLE_BREAK_TICKS` (2) consecutive idle polls instead of holding the task's
+  tmux chain for the full 2 s on the common inline path.
+- **Idle-settle is explained.** `signalIdleSettle` emits `IDLE_SETTLE_STATUS_TEXT` before the
+  `turn complete` banner so the transcript shows the run was closed by agetor, not by claude.
+- `nav` dropped from the hand-mirrored `PendingTmuxPrompt` (the webview never reads it; the
+  server owns the driving).
+- **Not taken:** F4 — a confirm that first paints *after* the 2 s window could be accepted by
+  the next queued op's Enter. Same hazard class as any modal racing a paste today, and the
+  confirm renders within a few hundred ms in every capture; noted as a follow-up candidate.
+
+Verification after the addendum: `bun run typecheck` clean; driver + interactions files
+364 pass / 0 fail; full `bun test` 3131 pass / 3 skip / 0 fail (fix agent's run; the haiku
+Phase 7 run is recorded in the final report).
