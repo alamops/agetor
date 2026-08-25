@@ -2,7 +2,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import type { Subprocess } from "bun";
 import type { RunEventStream } from "../shared/types.ts";
-import { FX_USAGE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
+import { FX_PROVIDER_STATUS_PREFIX, FX_USAGE_STATUS_PREFIX, SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import type { ChunkHandler, SpawnedAgent } from "./claude-tmux.ts";
 import {
   answerFxPermission,
@@ -71,16 +71,49 @@ import {
  * in-branch reply never fires and `handleServerRequest`'s catch-all fallback
  * writes the sole reply instead.
  *
- * ── Protocol index (verified against fx v0.0.4 + ACP's canonical schema.json) ──
+ * ── Protocol index (verified against fx v0.0.4 and v0.0.6 + ACP's canonical schema.json) ──
  *
  *   - `initialize`                  SPIKE-VERIFIED             handshake; unauth fails here (see describeHandshakeFailure)
- *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?}; mode nudge is best-effort (see runFxTurn)
- *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602 (see runFxTurn)
+ *   - `session/new`                 SPIKE-VERIFIED             → {sessionId, modes?, configOptions?}; mode nudge is best-effort (see runFxTurn)
+ *   - `session/resume`/`load`       SCHEMA-DERIVED             resume falls back to load on -32601/-32602, but NOT on -32600 (see runFxTurn)
  *   - `session/prompt`              SPIKE-VERIFIED shape       sole completion signal, no timeout (see runFxTurn)
  *   - `session/update`              SPIKE-VERIFIED envelope    variant → chunk mapping (see mapFxUpdate)
  *   - `session/request_permission`  SCHEMA-DERIVED, UNVERIFIED-LIVE card flow  (see respondPermissionRequest)
  *   - `session/cancel`              SCHEMA-DERIVED             notification, no reply expected (see cancelFxTurn)
  *   - death                         —                          unexpected exit before settlement (see the `exited` watcher)
+ *
+ * ── Facts verified against fx 0.0.5/0.0.6 (spike + release notes + Zig source diff) ──
+ *
+ *   - **No sandbox since 0.0.5** — fx retired its command sandbox; approved
+ *     tool calls run as ordinary host subprocesses. Agetor's permission mode
+ *     (`session/set_mode` + this driver's `session/request_permission`
+ *     policy, see `respondPermissionRequest`) is the ONLY gate fx has left —
+ *     there is no `sandbox_denied` outcome to parse and never was one here.
+ *   - **Credential re-checks on `session/prompt` AND `session/resume`
+ *     (0.0.5+)** — an unauthenticated/deauthorized binary no longer fails
+ *     only at `initialize`; either call can return `-32600` mid-session with
+ *     the same "Fx needs access to Vercel AI Gateway…" text or a
+ *     provider-specific variant (e.g. "Fx needs a Codex subscription login
+ *     for this model. Run fx login codex."). Both catches in `runFxTurn`
+ *     surface that message verbatim rather than wrapping or (for resume)
+ *     retrying via `session/load` — the same credential gate would just fail
+ *     identically there too.
+ *   - **`configOptions` on `session/new`/`session/resume`/`session/load`
+ *     results (0.0.5+, additive)** — a `{id, name, category, type,
+ *     currentValue, options}[]` array; an entry with `id: "provider"` names
+ *     the active auth provider (`"gateway"` | `"codex"` | `"grok"`). This
+ *     driver emits its `currentValue` once per turn as a
+ *     `FX_PROVIDER_STATUS_PREFIX` status chunk (see `maybeEmitProvider` in
+ *     `runFxTurn`) — RunPanel renders it as a small provider chip. Absence
+ *     (0.0.4 binaries, or a response that omits the array) is tolerated
+ *     silently; no chip that turn.
+ *   - **Exactly six `session/update` kinds are emitted, in both 0.0.4 and
+ *     0.0.6**: `agent_message_chunk`, `user_message_chunk`, `tool_call`,
+ *     `tool_call_update`, `available_commands_update`, `session_info_update`.
+ *     `mapFxUpdate`'s `agent_thought_chunk`/`plan`/`usage_update` branches
+ *     are ACP-spec-correct and stay (forward-compatible, unit-tested), but
+ *     are DORMANT — fx has never been observed to send any of the three, so
+ *     those three chunk kinds never reach a real run today.
  */
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -325,6 +358,23 @@ function answerByKind(
  *  happens to start with the same words (see `isTimeoutError`). */
 class RpcTimeoutError extends Error {}
 
+/** Rejection shape for a real JSON-RPC error reply from fx (as opposed to
+ *  `RpcTimeoutError`, which is ours). `code` is the JSON-RPC error code —
+ *  callers use it to distinguish a credential re-check failure (`-32600`,
+ *  see the header's "Facts verified against fx 0.0.5/0.0.6" section) from
+ *  every other protocol error, without re-parsing `message`. The message
+ *  text itself is UNCHANGED from before this class existed
+ *  (`"<fx message> (code <n>)"`) so every existing message-based assertion
+ *  still holds — `code` is purely additive. */
+class RpcError extends Error {
+  code: number | undefined;
+  constructor(message: string, code: number | undefined) {
+    super(message);
+    this.name = "RpcError";
+    this.code = code;
+  }
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new RpcTimeoutError(`timed out waiting for ${label} (${ms}ms)`)), ms);
@@ -373,7 +423,9 @@ function handleLine(state: FxSessionState, line: string): void {
     if (!pending) return; // stale/unknown id — ignore
     state.pending.delete(id);
     if (msg.error) {
-      pending.reject(new Error(`${msg.error.message ?? "fx acp error"} (code ${msg.error.code ?? "?"})`));
+      pending.reject(
+        new RpcError(`${msg.error.message ?? "fx acp error"} (code ${msg.error.code ?? "?"})`, msg.error.code),
+      );
     } else {
       pending.resolve(msg.result);
     }
@@ -934,10 +986,47 @@ function acpModeIdFor(mode: FxMode): string | null {
   return null; // yolo — no session/set_mode call
 }
 
+/** Pull the active provider id out of a `session/new`/`session/resume`/
+ *  `session/load` result's `configOptions` array (0.0.5+, additive — see
+ *  the file header's "Facts verified against fx 0.0.5/0.0.6" section).
+ *  Pure and exported for the same reason `mapFxUpdate` is: unit-testable
+ *  against a raw result object without spawning a child. Tolerates a
+ *  missing/non-array `configOptions` (0.0.4 binaries, or a response that
+ *  omits it) and any entry shape ACP's schema doesn't guarantee — returns
+ *  `null` rather than throwing. */
+export function extractFxProviderValue(result: unknown): string | null {
+  if (!result || typeof result !== "object") return null;
+  const configOptions = (result as { configOptions?: unknown }).configOptions;
+  if (!Array.isArray(configOptions)) return null;
+  for (const entry of configOptions) {
+    if (!entry || typeof entry !== "object") continue;
+    const id = (entry as { id?: unknown }).id;
+    const currentValue = (entry as { currentValue?: unknown }).currentValue;
+    if (id === "provider" && typeof currentValue === "string" && currentValue.length > 0) {
+      return currentValue;
+    }
+  }
+  return null;
+}
+
 async function runFxTurn(
   state: FxSessionState,
   opts: { cwd: string; promptText: string; resumeSessionId?: string },
 ): Promise<void> {
+  // Emits the `FX_PROVIDER_STATUS_PREFIX` status chunk at most once per
+  // turn, from whichever of session/new|resume|load's results carries a
+  // `configOptions` provider entry first — see the file header's "Facts
+  // verified against fx 0.0.5/0.0.6" section.
+  let providerEmitted = false;
+  function maybeEmitProvider(result: unknown): void {
+    if (providerEmitted) return;
+    const value = extractFxProviderValue(result);
+    if (value) {
+      emit(state, "status", FX_PROVIDER_STATUS_PREFIX + value, `fx:${state.runId}:${state.seq++}`);
+      providerEmitted = true;
+    }
+  }
+
   // 1. initialize
   try {
     await withTimeout(
@@ -962,15 +1051,23 @@ async function runFxTurn(
     state.sessionId = opts.resumeSessionId;
     let resumed = false;
     try {
-      await withTimeout(
+      const resumeResult = await withTimeout(
         sendRpc(state, "session/resume", { sessionId: opts.resumeSessionId }),
         RPC_HANDSHAKE_TIMEOUT_MS,
         "session/resume",
       );
+      maybeEmitProvider(resumeResult);
       resumed = true;
     } catch (err) {
       if (isTimeoutError(err)) {
         failTurn(state, describeHandshakeFailure(err, "session/resume", RPC_HANDSHAKE_TIMEOUT_MS));
+        return;
+      }
+      if (err instanceof RpcError && err.code === -32600) {
+        // Credential re-check failed (0.0.5+, see the file header) — the
+        // same gate would just fail identically on session/load, so don't
+        // bother trying; surface fx's actionable auth message verbatim.
+        failTurn(state, errMessage(err));
         return;
       }
       // Method-not-found / invalid-params (or any other resume error) —
@@ -984,11 +1081,12 @@ async function runFxTurn(
       // history, so it's discarded here rather than double-emitted.
       state.suppressUpdates = true;
       try {
-        await withTimeout(
+        const loadResult = await withTimeout(
           sendRpc(state, "session/load", { sessionId: opts.resumeSessionId, cwd: opts.cwd, mcpServers: [] }),
           RPC_HANDSHAKE_TIMEOUT_MS,
           "session/load",
         );
+        maybeEmitProvider(loadResult);
       } catch (err) {
         state.suppressUpdates = false;
         if (isTimeoutError(err)) {
@@ -1002,7 +1100,9 @@ async function runFxTurn(
     }
     if (state.resolved) return;
   } else {
-    let sessionResult: { sessionId?: string; modes?: { availableModes?: Array<{ id?: string }> } } | undefined;
+    let sessionResult:
+      | { sessionId?: string; modes?: { availableModes?: Array<{ id?: string }> }; configOptions?: unknown }
+      | undefined;
     try {
       sessionResult = (await withTimeout(
         sendRpc(state, "session/new", { cwd: opts.cwd, mcpServers: [] }),
@@ -1022,6 +1122,7 @@ async function runFxTurn(
     }
     state.sessionId = sessionId;
     state.onSessionId?.(sessionId);
+    maybeEmitProvider(sessionResult);
 
     // Best-effort mode nudge — never blocks or fails the turn.
     const desiredModeId = acpModeIdFor(state.mode);
@@ -1040,7 +1141,15 @@ async function runFxTurn(
     })) as typeof promptResult;
   } catch (err) {
     if (state.resolved) return; // already settled via cancel/death
-    failTurn(state, `fx acp: session/prompt failed: ${errMessage(err)}`);
+    if (err instanceof RpcError && err.code === -32600) {
+      // Credential re-check failed mid-prompt (0.0.5+, see the file
+      // header) — fx's text is user-actionable on its own; surface it
+      // verbatim instead of wrapping it in our own "session/prompt
+      // failed:" prefix.
+      failTurn(state, errMessage(err));
+    } else {
+      failTurn(state, `fx acp: session/prompt failed: ${errMessage(err)}`);
+    }
     return;
   }
   if (state.resolved) return; // cancel/death already settled us

@@ -1,5 +1,5 @@
 import path from "node:path";
-import { cursorModelArg, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
+import { cursorModelArg, FX_PROVIDER_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
@@ -760,7 +760,7 @@ function makeFakeAgent(
   taskId: string,
   prompt: string,
   onChunk: ChunkHandler,
-  fakeOpts: { runId?: string; mode?: string } = {},
+  fakeOpts: { runId?: string; mode?: string; kind?: AgentKind } = {},
 ): SpawnedAgent {
   const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
@@ -939,6 +939,12 @@ function makeFakeAgent(
     // resolves once the card is answered (by the user via the HTTP route, or
     // by `kill()` below on Stop/delete), same registry-awaiter discipline as
     // the real driver.
+    //
+    // Mirrors the real driver's `maybeEmitProvider` (fx-acp.ts): the
+    // `configOptions` provider id rides a `FX_PROVIDER_STATUS_PREFIX` status
+    // chunk once per turn, emitted before any turn content, so the run-row
+    // provider chip is e2e-visible under this fake too.
+    if (fakeOpts.kind === "fx") onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
     after(5, () => onChunk("assistant", "requesting permission…"));
     if (fakeOpts.mode === "yolo") {
       // Mirror the real driver: `yolo` auto-allows client-side and answers
@@ -990,6 +996,10 @@ function makeFakeAgent(
       }
     }
   } else {
+    // Generic fallback, shared with claude's fake driver — only fx turns get
+    // the provider sentinel (mirrors `maybeEmitProvider` in fx-acp.ts; see
+    // the fx-permission scenario above for the same comment in full).
+    if (fakeOpts.kind === "fx") onChunk("status", `${FX_PROVIDER_STATUS_PREFIX}gateway`);
     after(5, () => onChunk("stdout", `fake response to: ${prompt}`));
     after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });
   }
@@ -1250,7 +1260,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       // (see the `onSessionId` doc on `SpawnAgentArgs`), not claude/gemini's
       // pre-generated-uuid pattern.
       onSessionId?.(`fake-fx-session-${taskId}`);
-      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto" });
+      return makeFakeAgent(taskId, prompt, onChunk, { runId, mode: opts.mode ?? "auto", kind: "fx" });
     }
     const built = buildCommand(harness, prompt, { ...opts, runId });
     return spawnFxViaAcp({

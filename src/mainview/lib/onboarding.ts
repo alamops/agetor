@@ -34,6 +34,13 @@ export function deriveOnboardingSteps(input: {
   const harnessDone = statuses.some(
     (status) =>
       status.available === true &&
+      // A harness the CLI itself reports as logged out (fx's `status --json`
+      // `auth:"missing"` today) isn't actually usable yet — treat it the same
+      // as "not available" for step completion. `loggedIn === null` (no
+      // login probe for this kind, or the probe failed/was unparseable) and
+      // `loggedIn === true` both count as ready, matching the fail-open rule
+      // `HarnessStatus.loggedIn` documents.
+      status.loggedIn !== false &&
       (enabledHarnessIds === null || enabledHarnessIds.has(status.harnessId)),
   );
   const projectDone = projectCount > 0;

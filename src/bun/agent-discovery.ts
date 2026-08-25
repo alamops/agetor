@@ -1,4 +1,8 @@
+import { existsSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import type { AgentKind } from "../shared/types.ts";
+import { harnessEnv, resolveBin } from "./agents.ts";
+import { harnesses } from "./db.ts";
 
 /**
  * A model id (and optional human label) surfaced by the agent CLI itself.
@@ -14,13 +18,19 @@ export interface DiscoveredModel {
  * Run an external command with a 3-second timeout. Designed for cheap CLI
  * probes where blocking the API boot is unacceptable — if the CLI hangs (e.g.
  * waiting for an auth flow) we give up rather than freezing app startup.
+ *
+ * `env`, when given, is merged on top of `process.env` (never replaces it) —
+ * same pattern as `probeVersion` in agent-status.ts, so a harness alias's
+ * HOME override (fx's isolation story — see agents.ts:harnessEnv) is
+ * respected during discovery too.
  */
-async function runProbe(cmd: string[]): Promise<{ ok: boolean; stdout: string }> {
+async function runProbe(cmd: string[], env?: Record<string, string>): Promise<{ ok: boolean; stdout: string }> {
   try {
     const proc = Bun.spawn(cmd, {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
+      ...(env ? { env: { ...process.env, ...env } } : {}),
     });
     const timer = setTimeout(() => { try { proc.kill(); } catch { /* already exited */ } }, 3_000);
     const stdout = await new Response(proc.stdout).text();
@@ -134,6 +144,68 @@ async function discoverGemini(): Promise<DiscoveredModel[]> {
   return [];
 }
 
+/**
+ * Parse `fx models --json` output. Unlike codex/cursor (whose CLI output
+ * format isn't formally specified, hence the loose line-heuristic parsers
+ * above), fx's shape here IS known precisely — spike-verified against the
+ * real 0.0.6 binary: exactly one JSON object on stdout,
+ * `{kind:"models", count, shown_count, more_count, private_models_hidden,
+ * ids: string[]}`. `ids` is the complete Gateway catalog (`shown_count ===
+ * count`; no pagination flag exists, `--all` is rejected) — 228 ids at spike
+ * time. We only trust `ids`; any other shape (non-JSON, missing/malformed
+ * `ids`, non-string entries) yields an empty list rather than throwing —
+ * discovery is best-effort, never a hard dependency for the picker.
+ */
+function parseFxModels(stdout: string): DiscoveredModel[] {
+  try {
+    const parsed: unknown = JSON.parse(stdout.trim());
+    if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { ids?: unknown }).ids)) {
+      return [];
+    }
+    const out: DiscoveredModel[] = [];
+    for (const id of (parsed as { ids: unknown[] }).ids) {
+      if (typeof id === "string" && id.length > 0) out.push({ id });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * `fx models --json` is spike-verified (against binary v0.0.6) to run
+ * unauthenticated with zero filesystem writes — no `fx login` needed for
+ * discovery to work, unlike the pre-flight auth check gating task starts.
+ * The catalog is Gateway-wide (228 ids at spike time) and deliberately not
+ * curated: the hardcoded `AGENT_OPTIONS.fx.models` stays the labeled/hinted
+ * subset shown first in the picker, and merges with this list the same way
+ * the codex/cursor discovered lists merge with their own curated arrays
+ * (nothing fx-specific to change on the UI side).
+ *
+ * No labels come back from fx's CLI, so every discovered entry is `{id}`
+ * only — the picker falls back to rendering the bare id, same as codex.
+ */
+async function discoverFx(): Promise<DiscoveredModel[]> {
+  // Resolve through the same building blocks agent-status.ts uses to spawn
+  // fx: `resolveBin` against the built-in fx harness row (per-harness `bin`
+  // override → AGETOR_FX_BIN → PATH lookup) and `harnessEnv` for the HOME
+  // override an isolated fx alias would carry. `getByIdOrKind` falls back to
+  // a synthetic built-in harness when no row exists yet (fresh DB), so this
+  // never depends on the harnesses table having been seeded.
+  const harness = harnesses.getByIdOrKind("fx");
+  if (!harness) return [];
+  const bin = resolveBin(harness);
+  // Confirm the binary actually resolves before spending a probe on it —
+  // an unresolvable name (fx not installed) would otherwise just make
+  // Bun.spawn throw inside runProbe, which is caught there too, but bailing
+  // here skips the spawn attempt entirely and reads clearer as "skipped".
+  const resolvable = isAbsolute(bin) ? existsSync(bin) : Bun.which(bin, { PATH: process.env.PATH }) !== null;
+  if (!resolvable) return [];
+  const probe = await runProbe([bin, "models", "--json"], harnessEnv(harness));
+  if (!probe.ok || !probe.stdout) return [];
+  return parseFxModels(probe.stdout);
+}
+
 const cache = new Map<AgentKind, DiscoveredModel[]>();
 let inflight: Promise<void> | null = null;
 
@@ -150,19 +222,21 @@ export function getDiscoveredModels(agent: AgentKind): DiscoveredModel[] {
 export async function refreshDiscoveredModels(): Promise<void> {
   if (inflight) return inflight;
   inflight = (async () => {
-    const [codex, claude, cursor, gemini] = await Promise.all([
+    const [codex, claude, cursor, gemini, fx] = await Promise.all([
       discoverCodex(),
       discoverClaude(),
       discoverCursor(),
       discoverGemini(),
+      discoverFx(),
     ]);
     cache.set("codex", codex);
     cache.set("claude-code", claude);
     cache.set("cursor", cursor);
     cache.set("gemini", gemini);
+    cache.set("fx", fx);
   })().finally(() => { inflight = null; });
   return inflight;
 }
 
 // Exposed for tests that want to feed in synthetic CLI output.
-export const __testing = { parseCodexModels, parseCursorModels };
+export const __testing = { parseCodexModels, parseCursorModels, parseFxModels };

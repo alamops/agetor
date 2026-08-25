@@ -40,6 +40,16 @@ export const PERMISSION_MODE_STATUS_PREFIX = "permission-mode: ";
 export const FX_USAGE_STATUS_PREFIX = "fx-usage: ";
 
 /**
+ * Sentinel prefix for the `status` chunk fx-acp.ts emits once per turn with
+ * the provider fx reports in its `session/new` / resume `configOptions`
+ * (`{id:"provider", currentValue:"gateway"|"codex"|"grok"}` — fx ≥0.0.5
+ * multi-provider auth). Payload is the bare provider value. Suppressed from
+ * transcripts via `isInternalStatusSentinel`; RunPanel derives a small
+ * run-row chip from the latest one.
+ */
+export const FX_PROVIDER_STATUS_PREFIX = "fx-provider: ";
+
+/**
  * True for `status`-stream chunks that are UI-internal sentinel channels, not
  * transcript content: currently `PERMISSION_MODE_STATUS_PREFIX` (fed a chip,
  * now suppressed-only) and `FX_USAGE_STATUS_PREFIX` (feeds the run-row usage
@@ -52,7 +62,8 @@ export const FX_USAGE_STATUS_PREFIX = "fx-usage: ";
 export function isInternalStatusSentinel(data: string): boolean {
   return (
     data.startsWith(PERMISSION_MODE_STATUS_PREFIX) ||
-    data.startsWith(FX_USAGE_STATUS_PREFIX)
+    data.startsWith(FX_USAGE_STATUS_PREFIX) ||
+    data.startsWith(FX_PROVIDER_STATUS_PREFIX)
   );
 }
 
@@ -142,8 +153,8 @@ export interface Harness {
    *    is joined onto that), so unlike codex there's no need to touch the
    *    real `HOME` at all.
    *  - fx: emitted as a plain HOME=<home> override — fx has no dedicated
-   *    config-dir env var (verified against binary v0.0.4 — no FX_HOME or
-   *    FX_CONFIG_DIR in its strings), and its state lives hardcoded at
+   *    config-dir env var (verified against fx v0.0.4 and v0.0.6 — no FX_HOME
+   *    or FX_CONFIG_DIR in its strings), and its state lives hardcoded at
    *    `~/.fx/*`, so isolating an additional account's login/config means
    *    re-homing the whole process, same approach as cursor.
    *  NULL means "inherit the agetor process env". */
@@ -198,6 +209,18 @@ export interface HarnessStatus {
   reason: string | null;
   /** Suggested install command when missing. */
   installHint: string | null;
+  /**
+   * Login state, when the kind's probe can determine it cheaply and without
+   * side effects — today only fx (`fx status --json` reports `auth`). Strictly
+   * fail-open: `false` ONLY when the probe positively reported "missing";
+   * `true` for any other reported value; `null` when the kind has no login
+   * probe, the probe failed, or its output wasn't parseable — `null` must
+   * never block a run.
+   */
+  loggedIn: boolean | null;
+  /** The CLI's own login guidance (verbatim, e.g. fx's `auth_help`) when
+   *  `loggedIn === false`; otherwise null. */
+  authHelp: string | null;
 }
 
 /**
@@ -1251,14 +1274,15 @@ export const DEFAULT_MODEL: Record<AgentKind, string> = {
   // for simple prompts, which fails "always default to the best available
   // model" (root CLAUDE.md). Pin an explicit flagship instead.
   "gemini": "gemini-3-pro-preview",
-  // fx's own documented default, per fx.sh — a fast GLM tier tuned for its
-  // agentic loop. Ids are Vercel AI Gateway ids, passed verbatim. fx is
-  // exempt from the "always default to the best available model" rule
-  // above: the Gateway bills per token to the user's own account, and this
-  // tier is the tuned sweet spot for fx's agentic loop rather than a cost
-  // compromise — flagship tiers (gpt-5.5, claude-sonnet-5/opus-5,
-  // gemini-3-pro) remain one click away in the picker.
-  "fx": "zai/glm-5.2-fast",
+  // fx's own compiled default since 0.0.6 — Kimi K3 (Fast mode on),
+  // following fx's own default rather than picking one ourselves. Ids are
+  // Vercel AI Gateway ids, passed verbatim. fx is exempt from the "always
+  // default to the best available model" rule above: the Gateway bills per
+  // token to the user's own account, and this tier is the tuned sweet spot
+  // for fx's agentic loop rather than a cost compromise — flagship tiers
+  // (gpt-5.5, claude-sonnet-5/opus-5, gemini-3.1-pro-preview) remain one
+  // click away in the picker.
+  "fx": "moonshotai/kimi-k3",
 };
 export const DEFAULT_EFFORT: Record<AgentKind, string> = {
   "claude-code": "high",
@@ -1622,12 +1646,13 @@ export const CODE_PLAN_MODE: Record<AgentKind, { code: string; plan: string }> =
   "gemini": { code: "auto", plan: "ask" },
   // fx has three of its own permission modes (yolo/auto/ask — see
   // AGENT_OPTIONS.fx.modes below). Like every other kind, Code resolves to
-  // modes[0] — "auto" (fx sandbox + LLM auto-review; unresolved tool calls
-  // surface as approval cards) — the hands-off-but-reviewed default, not
-  // "yolo" (no permission checks, no sandbox): a Plan→Code pill round-trip
-  // must not escalate a task past what it started at. "yolo" stays reachable
-  // only as an explicit picker choice. Plan resolves to "ask" (only
-  // pre-approved rules run; everything else surfaces as an approval card).
+  // modes[0] — "auto" (fx's LLM auto-review resolves most tool calls;
+  // anything unresolved surfaces as an approval card) — the
+  // hands-off-but-reviewed default, not "yolo" (permission checks disabled
+  // entirely): a Plan→Code pill round-trip must not escalate a task past
+  // what it started at. "yolo" stays reachable only as an explicit picker
+  // choice. Plan resolves to "ask" (only pre-approved rules run; everything
+  // else surfaces as an approval card).
   "fx": { code: "auto", plan: "ask" },
 };
 
@@ -1729,11 +1754,13 @@ export const MODEL_EFFORT_SUPPORT: Record<AgentKind, Record<string, string[]>> =
   // its models route through the Vercel AI Gateway verbatim with no CLI-level
   // knob to tune. Same treatment as gemini above.
   fx: {
+    "moonshotai/kimi-k3": [],
+    "moonshotai/kimi-k3-fast": [],
     "zai/glm-5.2-fast": [],
-    "openai/gpt-5.5": [],
-    "anthropic/claude-sonnet-5": [],
     "anthropic/claude-opus-5": [],
-    "google/gemini-3-pro": [],
+    "anthropic/claude-sonnet-5": [],
+    "openai/gpt-5.5": [],
+    "google/gemini-3.1-pro-preview": [],
   },
 };
 
@@ -1873,15 +1900,17 @@ export const AGENT_OPTIONS: Record<AgentKind, AgentOptions> = {
   fx: {
     // Vercel AI Gateway ids, passed verbatim.
     models: [
-      { id: "zai/glm-5.2-fast", label: "GLM 5.2 Fast", hint: "Recommended default — fx's own default model." },
-      { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "OpenAI flagship via the Gateway." },
-      { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Anthropic's fast flagship via the Gateway." },
+      { id: "moonshotai/kimi-k3", label: "Kimi K3", hint: "fx's compiled default since 0.0.6 — Fast mode." },
+      { id: "moonshotai/kimi-k3-fast", label: "Kimi K3 Fast", hint: "Fast variant of fx's default." },
+      { id: "zai/glm-5.2-fast", label: "GLM 5.2 Fast", hint: "Cheap, fast tier via the Gateway." },
       { id: "anthropic/claude-opus-5", label: "Claude Opus 5", hint: "Anthropic's top tier via the Gateway." },
-      { id: "google/gemini-3-pro", label: "Gemini 3 Pro", hint: "Google flagship via the Gateway." },
+      { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", hint: "Anthropic's fast flagship via the Gateway." },
+      { id: "openai/gpt-5.5", label: "GPT-5.5", hint: "OpenAI flagship via the Gateway." },
+      { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", hint: "Google flagship via the Gateway." },
     ],
     modes: [
-      { id: "auto", label: "Auto", hint: "fx sandbox + LLM auto-review; unresolved tool calls surface as approval cards." },
-      { id: "yolo", label: "Yolo", hint: "No permission checks, no sandbox — full access." },
+      { id: "auto", label: "Auto", hint: "fx's LLM auto-review resolves most tool calls; anything unresolved surfaces as an approval card." },
+      { id: "yolo", label: "Yolo", hint: "Disables fx permission checks — full access." },
       { id: "ask", label: "Read-only-ish", hint: "Only pre-approved rules run; everything else surfaces as an approval card." },
     ],
     // No model in MODEL_EFFORT_SUPPORT.fx accepts the effort flag, so the

@@ -890,6 +890,11 @@ export async function startTask(taskId: string): Promise<{ runId: string } | { e
     const hint = status.installHint ? ` Install it with: ${status.installHint}` : "";
     return { error: `${harness.label} is not available — ${status.reason}.${hint}` };
   }
+  // Fail-open: only an explicit `false` means the CLI positively reported
+  // it's logged out. `null` (not probed / unknown) must never block a run.
+  if (status.loggedIn === false) {
+    return { error: `${harness.label} isn't logged in — ${status.authHelp ?? "run its login command"}` };
+  }
 
   // Pass the branches other tasks have pinned. If materializing this task's
   // branch hits a create-time uniqueness race, the recovery re-pins to a name

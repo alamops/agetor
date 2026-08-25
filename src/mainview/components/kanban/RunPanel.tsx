@@ -32,6 +32,7 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   EVENTS_WINDOW_MAX,
+  FX_PROVIDER_STATUS_PREFIX,
   FX_USAGE_STATUS_PREFIX,
   isInternalStatusSentinel,
   cursorModelIdCoveredByCatalog,
@@ -1267,6 +1268,23 @@ function RunPanelBody({
       const parsed = safeParse<FxUsageData>(e.data.slice(FX_USAGE_STATUS_PREFIX.length));
       if (!parsed || typeof parsed.used !== "number" || typeof parsed.size !== "number") continue;
       m.set(e.runId, parsed);
+    }
+    return m;
+  }, [events, kind]);
+
+  /** Latest fx `fx-provider: <value>` per run, keyed by `runId` — sibling
+   *  derivation to {@link usageByRunId} above, same fx gating and the same
+   *  windowed-events caveat (an older run's chip disappears once its events
+   *  slide out of the kept window). Feeds the small provider chip in
+   *  `RunsList`, rendered beside the usage chip. */
+  const providerByRunId = useMemo(() => {
+    const m = new Map<string, string>();
+    if (kind !== "fx") return m;
+    for (const e of events) {
+      if (e.stream !== "status" || !e.data.startsWith(FX_PROVIDER_STATUS_PREFIX)) continue;
+      const value = e.data.slice(FX_PROVIDER_STATUS_PREFIX.length).trim();
+      if (!value) continue;
+      m.set(e.runId, value);
     }
     return m;
   }, [events, kind]);
@@ -2623,7 +2641,7 @@ function RunPanelBody({
         tmuxSession={latestRun?.tmuxSession ?? null}
       />
 
-      <RunsList runs={runs} usageByRun={usageByRunId} />
+      <RunsList runs={runs} usageByRun={usageByRunId} providerByRun={providerByRunId} />
 
       <TerminalsSection task={task} />
 
@@ -3519,7 +3537,27 @@ function UsageChip({ usage }: { usage: FxUsageData }) {
   );
 }
 
-function RunsList({ runs, usageByRun }: { runs: Run[]; usageByRun?: Map<string, FxUsageData> }) {
+/** Small muted chip naming the provider fx routed a turn through
+ *  (`gateway`/`codex`/`grok`), rendered beside {@link UsageChip} on a run's
+ *  summary row. Text is the bare value fx reported — no relabeling, so an
+ *  unreleased provider id still renders sensibly. */
+function ProviderChip({ provider }: { provider: string }) {
+  return (
+    <span className="text-muted-foreground" title="fx provider">
+      {provider}
+    </span>
+  );
+}
+
+function RunsList({
+  runs,
+  usageByRun,
+  providerByRun,
+}: {
+  runs: Run[];
+  usageByRun?: Map<string, FxUsageData>;
+  providerByRun?: Map<string, string>;
+}) {
   const [open, setOpen] = useState(false);
 
   if (runs.length === 0) {
@@ -3576,6 +3614,7 @@ function RunsList({ runs, usageByRun }: { runs: Run[]; usageByRun?: Map<string, 
             <span className="text-destructive">exit {latest.exitCode}</span>
           )}
           {usageByRun?.get(latest.id) && <UsageChip usage={usageByRun.get(latest.id)!} />}
+          {providerByRun?.get(latest.id) && <ProviderChip provider={providerByRun.get(latest.id)!} />}
           {canExpand && (
             <span className="text-muted-foreground">{open ? "▲" : "▼"}</span>
           )}
@@ -3613,6 +3652,7 @@ function RunsList({ runs, usageByRun }: { runs: Run[]; usageByRun?: Map<string, 
                   )}
                 </span>
                 {usageByRun?.get(r.id) && <UsageChip usage={usageByRun.get(r.id)!} />}
+                {providerByRun?.get(r.id) && <ProviderChip provider={providerByRun.get(r.id)!} />}
               </span>
             </li>
           ))}
@@ -3927,12 +3967,14 @@ function RunEventList({
           // chip is gone, but the suppression is NOT dead code — claude
           // emits one of these at every turn start and every mid-turn
           // Shift+Tab, so dropping this guard would spam a divider into the
-          // scrollback for each one) and `FX_USAGE_STATUS_PREFIX` (feeds the
+          // scrollback for each one), `FX_USAGE_STATUS_PREFIX` (feeds the
           // run-row usage chip — `RunsList`'s `UsageChip`, derived in the
           // parent from the raw `events` state — not the transcript; fx's
           // `usage_update` cadence is unspecified ("MAY"), so leaving this
           // unsuppressed would spam a divider into the scrollback on every
-          // update). Single shared predicate so a new sentinel can't leak
+          // update), and `FX_PROVIDER_STATUS_PREFIX` (same story, one per
+          // turn — feeds `RunsList`'s `ProviderChip` via `providerByRunId`).
+          // Single shared predicate so a new sentinel can't leak
           // into one surface while another suppresses it.
           if (isInternalStatusSentinel(e.data)) return [];
           return [wrap(key, evid, <StatusDivider text={e.data} />)];

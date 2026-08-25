@@ -841,6 +841,14 @@ function HarnessesSection({
                         experimental
                       </span>
                     )}
+                    {status?.loggedIn === false && (
+                      <span
+                        className="rounded bg-warning/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning"
+                        title={status.authHelp ?? "Not logged in"}
+                      >
+                        not logged in
+                      </span>
+                    )}
                     <span
                       className={cn(
                         "inline-block size-1.5 rounded-full",
@@ -854,6 +862,11 @@ function HarnessesSection({
                     {h.home && <> · HOME={abbreviateHome(h.home, homeDir)}</>}
                     {status?.version && <> · {status.version}</>}
                   </div>
+                  {status?.loggedIn === false && status.authHelp && (
+                    <div className="truncate text-[11px] text-warning" title={status.authHelp}>
+                      {status.authHelp}
+                    </div>
+                  )}
                 </div>
                 <Switch
                   checked={pendingToggle[h.id] ?? h.enabled}

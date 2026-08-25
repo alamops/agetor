@@ -862,7 +862,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
                         variant={agent === h.id ? "default" : "outline"}
                         onClick={() => switchAgent(h.id)}
                         title={
-                          [status?.reason, status?.path, status?.version]
+                          [
+                            status?.reason,
+                            status?.loggedIn === false ? (status.authHelp ?? "Not logged in") : null,
+                            status?.path,
+                            status?.version,
+                          ]
                             .filter(Boolean)
                             .join(" — ") || h.id
                         }
@@ -1020,6 +1025,18 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, focusNon
                     <div className="mt-1 font-mono opacity-80">
                       {selectedStatus.installHint}
                     </div>
+                  )}
+                </div>
+              )}
+
+              {/* Not blocking — Create/Run still work and the run pre-flight
+                  reports the actionable error if the turn actually needs
+                  credentials. This is a heads-up, not a disable. */}
+              {selectedStatus && selectedStatus.available && selectedStatus.loggedIn === false && (
+                <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+                  <div className="font-medium">Not logged in</div>
+                  {selectedStatus.authHelp && (
+                    <div className="mt-1 opacity-80">{selectedStatus.authHelp}</div>
                   )}
                 </div>
               )}
