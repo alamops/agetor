@@ -411,3 +411,23 @@ Phase 7 run is recorded in the final report).
 
 **Not swept in (different tickets):** `/compact` turns (no stdout, unsettled today);
 reattach replay of a local-command run (idle-settle covers it).
+
+**§10 review + verification (2026-08-25).** Opus review of `c72714f` (via the `code-review`
+skill) returned *request changes* with 15 findings (6 should-fix, 9 nice-to-have); all 15 were
+applied in `b628fe7`. The ones that changed behaviour: the effort sync is outcome-first
+(claude's `Set effort level to …` line is required; the typed arg is only a fallback — a
+declined confirm can no longer write it) and validated against `supportedEfforts(model)`, with
+a model sync cascading RunPanel's effort fallback into the same update; `Kept model as …`
+syncs (drift correction) and unrepresentable values (`ultracode`, an unknown display name)
+leave a breadcrumb instead of vanishing; withheld pastes are never reported as success —
+`cycleToMode`'s `/plan` returns `paste withheld` (so the PreToolUse matcher is not narrowed
+for a mode claude never entered), the dropdown mirror and a folded follow-up leave
+breadcrumbs (the follow-up's text is re-stashed into the backlog tray); the bracketed path
+re-reads the pane after the Enter gap (a modal painting inside the up-to-3 s image-attach
+gap can no longer receive the Enter); the boot deferred paste keeps the check with a zero
+grace instead of opting out; `paneShowsBlockingPrompt` mirrors `scrapeOnce`'s working-pane
+gate. Known-benign: when the mirror paste itself is withheld, the queued auto-confirm op
+still takes one pane read before bailing (no keystroke is ever sent).
+Verification: `bun run typecheck` clean; `claude-tmux-local-command` + `claude-tmux-queue`
+100/100, `claude-local-setting` + `orchestrator` + `agents` 144/144; full `bun test`
+3197 pass / 3 skip / 0 fail (Fix-D's run; the haiku Phase 7 run is in the final report).
