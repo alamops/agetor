@@ -734,8 +734,12 @@ function parseLocalCommandLine(evt: ParsedJsonlEvent): { name: string; args: str
   return { name, args };
 }
 
-/** Thin wrapper over `parseLocalCommandLine` for callers (and existing
- *  tests) that only need the command token, not its args. */
+/** Test-only convenience wrapper over `parseLocalCommandLine` — no runtime
+ *  call site needs just the token without the args (`dispatchLine` calls
+ *  `parseLocalCommandLine` directly since it needs `args` too, for
+ *  `lastLocalCommandArgs` / `LocalSettingInfo`). Kept around, and exposed via
+ *  `__forTest`, purely so existing tests that only care about the token can
+ *  assert against it without also matching on args. */
 function localCommandNameOf(evt: ParsedJsonlEvent): string | null {
   return parseLocalCommandLine(evt)?.name ?? null;
 }
@@ -1633,9 +1637,13 @@ export function getCurrentPermissionMode(taskId: string): string | null {
  * Latency: serialized behind any in-flight tmux op for the same task
  * (paste-prompts included), so a click that lands while a `/model X`
  * settle window is still elapsing waits up to `slashCommandSettleMs`
- * (default 700ms) before the first keystroke goes out. The server route
- * at `server.ts:1420` awaits this Promise, so the modal-click HTTP
- * response inherits the wait.
+ * (default 700ms) before the first keystroke goes out. A click queued
+ * behind a paste that's polling `queuePaste`'s modal guard
+ * (docs/plans/model-effort-local-command-turns.md §10) waits out that
+ * guard too — up to `PASTE_MODAL_GRACE_MS` (default 1500ms) — before
+ * either the guarded paste lands or is withheld and this click's op
+ * becomes current. The server route at `server.ts:1420` awaits this
+ * Promise, so the modal-click HTTP response inherits the wait.
  */
 export async function dismissTmuxPrompt(
   taskId: string,
@@ -2169,7 +2177,7 @@ interface SessionState {
   /**
    * Command token (e.g. `"/effort"`) of the MOST RECENT `<command-name>…
    * </command-name>` line `dispatchLine` has seen this session, via
-   * `localCommandNameOf` — independent of any turn slot, so it tracks a
+   * `parseLocalCommandLine` — independent of any turn slot, so it tracks a
    * local command run by ANY path (the task's own prompt, a folded
    * `pasteFollowUp`, or the dropdown mirror's `sendSlashCommand`, none of
    * which own the head slot the same way).
@@ -3524,7 +3532,7 @@ function dispatchLine(state: SessionState, line: string): void {
     //      null`) can never settle here at all.
     //   2. that slot's `slashCommand` must equal `state.lastLocalCommandName`
     //      — the command token parsed off the MOST RECENT `<command-name>…
-    //      </command-name>` line this session has seen (`localCommandNameOf`,
+    //      </command-name>` line this session has seen (`parseLocalCommandLine`,
     //      mirrored a few lines up in this function). This is what actually
     //      rules out the wrong-turn case check (1) alone can't: a task whose
     //      OWN prompt began with `/` (e.g. `/implement …`, `/code-review`) is
@@ -4269,8 +4277,10 @@ function matchSlashConfirmModal(tail: string, kind: "model" | "effort"): ScrapeM
 
 /**
  * Pure predicate: does this pane tail show a modal the scraper would
- * register a card for? Exactly the matcher union `scrapeOnce` tries, in the
- * same order (docs/plans/model-effort-local-command-turns.md §10):
+ * register a card for? Mirrors the matcher union `scrapeOnce` tries — same
+ * order, same `paneWorking` gate on the footer arm — but is deliberately NOT
+ * a full replica of `scrapeOnce`'s gate (docs/plans/model-effort-local-
+ * command-turns.md §10):
  *
  *   - `matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)`
  *     non-null — a numbered / yes-no / slider modal is on screen.
@@ -4284,7 +4294,32 @@ function matchSlashConfirmModal(tail: string, kind: "model" | "effort"): ScrapeM
  *     forced `false` — this function has no `SessionState` to compute
  *     `stuckTurnFallbackArmed` from, and doesn't need one: the watchdog arm
  *     exists to catch a turn that's been silently stuck for 60s+, a
- *     different question from "is a modal drawn on the pane right now").
+ *     different question from "is a modal drawn on the pane right now"),
+ *     but ONLY when `!paneShowsClaudeWorking(tail)` — mirroring `scrapeOnce`'s
+ *     own `paneWorking ? null : matchUnparsableModal(...)` gate on that same
+ *     arm. Without it, a long-running tool call's own footer-ish output
+ *     (`esc to cancel`, a busy spinner's chrome) could false-fire the guard
+ *     while claude is plainly still working, not blocked on a modal.
+ *
+ * Two things this function deliberately does NOT replicate from
+ * `scrapeOnce`'s full gate, and why that's fine for THIS caller:
+ *   - `scrapeOnce`'s top-level `claudeIsWriting || (askOnPane &&
+ *     !askUnrecoverable) ? null : …` short-circuit, which suppresses ALL
+ *     matchers (including numbered/yes-no/slider) while claude is actively
+ *     streaming assistant text. A real modal replaces that streaming chrome
+ *     entirely, so the matchers above wouldn't spuriously hit mid-stream
+ *     anyway — the short-circuit exists to avoid a stale sighting further up
+ *     the same tail, not to change whether a modal on THIS tick is real.
+ *   - `matchUnparsableModal`'s `UNPARSABLE_STABILITY_TICKS` (3 consecutive
+ *     equal-fingerprint sightings) requirement before `scrapeOnce` ever
+ *     registers a card off it. This function has no per-call state to track
+ *     ticks across, and doesn't need one: `scrapeOnce` holds that bar
+ *     because carding a transient repaint would drive a WRONG keystroke into
+ *     a modal that isn't really there. `queuePaste`'s modal guard only ever
+ *     WITHHOLDS on a hit — no keystroke goes anywhere — and a false-positive
+ *     withhold self-heals the moment the caller resends (or the guard's own
+ *     next poll tick sees the pane clear); an under-strict, single-tick
+ *     over-fire here costs a retry, not a wrong action.
  *
  * Used by `queuePaste`'s modal guard (see `capturePastePane` /
  * `PASTE_MODAL_GRACE_MS`) to decide whether a pending paste would land IN a
@@ -4297,6 +4332,9 @@ function matchSlashConfirmModal(tail: string, kind: "model" | "effort"): ScrapeM
 function paneShowsBlockingPrompt(tail: string): boolean {
   if (matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)) return true;
   if (detectAskModal(tail) === "question") return true;
+  // Mirrors `scrapeOnce`'s `paneWorking ? null : matchUnparsableModal(...)`:
+  // never treat working chrome as a blocking modal.
+  if (paneShowsClaudeWorking(tail)) return false;
   if (matchUnparsableModal(tail, false)) return true;
   return false;
 }
@@ -5789,11 +5827,19 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           // `readPaneMode` confirmed an idle composer (or the readiness
           // window timed out with no answerable prompt left), re-arming
           // instead of pasting whenever `activeTmuxPromptsForTask` still has
-          // something pending. A second, independent modal guard here would
-          // be redundant at best — and could withhold the very prompt this
-          // poller already waited (up to `DEFERRED_PROMPT_TIMEOUT_MS`) to
-          // deliver.
-          skipModalGuard: true,
+          // something pending. BUT that give-up branch — the readiness
+          // window timing out with `activeTmuxPromptsForTask` already empty
+          // — reaches this paste with NO card registered for whatever is
+          // actually on the pane: precisely the un-carded, footer-armed case
+          // `paneShowsBlockingPrompt`'s guard exists to catch (finding #6,
+          // docs/plans/model-effort-local-command-turns.md §10). So this
+          // does NOT fully `skipModalGuard`: the CHECK must still run once,
+          // even though a WAIT would be pointless — this poller already
+          // spent up to `DEFERRED_PROMPT_TIMEOUT_MS` deciding the pane was
+          // safe, so a fresh multi-second grace window here would just
+          // delay a prompt that's already known to be ready (or already
+          // given up waiting).
+          modalGuardGraceMs: 0,
           onPasteFailure: () => {
             // Mirror `sendTurn`'s onPasteFailure idiom exactly: guard against
             // the (theoretical) race where the slot already popped normally
@@ -6224,8 +6270,19 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
  * the active run early. So we set the hold, paste, and nothing else.
  *
  * Returns false when no live session exists (caller falls back to spawning).
+ *
+ * @param opts.onPasteFailure Forwarded verbatim to the underlying
+ * `queuePaste` — fires when the paste (including a withheld one, from
+ * `queuePaste`'s modal guard) doesn't land. Unlike `sendTurn`, this path
+ * pushes no turn slot to settle, so the orchestrator's callback has nothing
+ * to reject; it re-stashes `prompt` back into the task's backlog instead, so
+ * a message folded in while a live claude modal is up isn't silently lost.
  */
-export function pasteFollowUp(taskId: string, prompt: string): boolean {
+export function pasteFollowUp(
+  taskId: string,
+  prompt: string,
+  opts?: { onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void },
+): boolean {
   const state = sessions.get(taskId);
   if (!state) return false;
   // A folded-in follow-up paste is a life signal — reset the idle clock and
@@ -6240,7 +6297,10 @@ export function pasteFollowUp(taskId: string, prompt: string): boolean {
   // has already gone JSONL-quiet before claude replays it (plan limitation
   // L1 in docs/plans/catch-unknown-command-error.md).
   state.pendingSlashToken = slashTokenOf(prompt);
-  void queuePaste(taskId, state.sessionName, prompt, 0, state, { bracketed: true });
+  void queuePaste(taskId, state.sessionName, prompt, 0, state, {
+    bracketed: true,
+    onPasteFailure: opts?.onPasteFailure,
+  });
   return true;
 }
 
@@ -6327,6 +6387,17 @@ const PASTE_MODAL_GRACE_MS = 1_500;
  * claude asked, so the user answers via the ordinary numbered `tmux_prompt`
  * card `matchNumberedModal` still registers for it in the scrape chains.
  *
+ * `opts.onPasteFailure` is forwarded verbatim to the underlying `queuePaste`
+ * (finding #4, docs/plans/model-effort-local-command-turns.md §10) — fires
+ * when the mirror paste is withheld by `queuePaste`'s modal guard (or fails
+ * outright). This function pushes no turn slot, so there's nothing here to
+ * settle; the orchestrator's callback is what surfaces a
+ * "… not applied — claude is waiting on a prompt" status on the task's
+ * latest run. `queuePaste`'s own status emit (through
+ * `expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk`) still
+ * fires independently of this — it's a no-op when no handler is listening,
+ * so the orchestrator's callback is simply the visible one in practice.
+ *
  * When `opts.autoConfirm` is set, a follow-up op is enqueued through the
  * SAME per-task tmux-op chain (`queueTmuxOp` reads `pasteChains.get(taskId)`,
  * which the `queuePaste` call just above set — calling `queueTmuxOp` again
@@ -6354,7 +6425,14 @@ const PASTE_MODAL_GRACE_MS = 1_500;
  * ticks (not one) guards against a single transient idle-looking frame
  * mid-repaint; Enter is still never sent on this path.
  */
-export function sendSlashCommand(taskId: string, line: string, opts?: { autoConfirm?: "model" | "effort" }): boolean {
+export function sendSlashCommand(
+  taskId: string,
+  line: string,
+  opts?: {
+    autoConfirm?: "model" | "effort";
+    onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void;
+  },
+): boolean {
   const state = sessions.get(taskId);
   if (!state) return false;
   // Settle delay after slash commands: claude's TUI takes ~hundreds of ms
@@ -6363,7 +6441,9 @@ export function sendSlashCommand(taskId: string, line: string, opts?: { autoConf
   // racing on localhost) lands during the transient state and gets
   // silently dropped — see the `Turn Ended Bug` repro where a
   // `/code-review` paste sat invisible for 49s after a model change.
-  void queuePaste(taskId, state.sessionName, line, slashCommandSettleMs, state);
+  void queuePaste(taskId, state.sessionName, line, slashCommandSettleMs, state, {
+    onPasteFailure: opts?.onPasteFailure,
+  });
   if (opts?.autoConfirm) {
     const kind = opts.autoConfirm;
     void queueTmuxOp(taskId, async (stillCurrent) => {
@@ -6421,7 +6501,8 @@ export type CycleFailureReason =
   | "current mode unknown"
   | "mode not in cycle"
   | "verification timed out"
-  | "verification mismatch";
+  | "verification mismatch"
+  | "paste withheld";
 
 export type CycleResult =
   | { ok: true; presses: number; via: "noop" | "slash-plan" | "shift-tab" }
@@ -6563,6 +6644,9 @@ async function waitForPaneMode(state: SessionState, from: string, target: string
  *     when the status bar never confirmed the new mode after our keystrokes.
  *   - `{ ok: false, reason: "verification mismatch", attempts, lastObserved }`
  *     when every attempt landed somewhere other than the target.
+ *   - `{ ok: false, reason: "paste withheld" }` when the `/plan` paste itself
+ *     was withheld by `queuePaste`'s modal guard (a live claude modal was
+ *     already up) or otherwise failed to land — see the `/plan` branch below.
  */
 async function cycleToModeInner(taskId: string, targetAgetorMode: string): Promise<CycleResult> {
   const state = sessions.get(taskId);
@@ -6570,14 +6654,30 @@ async function cycleToModeInner(taskId: string, targetAgetorMode: string): Promi
   const target = toClaudeModeString(targetAgetorMode);
 
   // `/plan` works from any state, no cycle math needed. Prefer it.
-  // Fire-and-forget — `queuePaste`'s tmux load-buffer / paste-buffer /
-  // send-keys helpers swallow errors, and verifying via the JSONL would
-  // require the same listener machinery the Shift+Tab path uses; for
-  // `plan` the slash command is reliable enough that the added complexity
-  // doesn't pay for itself. Uses the slash-command settle window so a
-  // racing user paste lands after claude has processed the mode switch.
+  // Verifying the mode actually changed via the JSONL would require the
+  // same listener machinery the Shift+Tab path uses; for `plan` the slash
+  // command is reliable enough on its own that the added complexity doesn't
+  // pay for itself. Uses the slash-command settle window so a racing user
+  // paste lands after claude has processed the mode switch.
+  //
+  // NOT fire-and-forget, though (finding #3, docs/plans/model-effort-local-
+  // command-turns.md §10): `queuePaste`'s modal guard can WITHHOLD this
+  // paste outright when a live claude modal is already up on the pane, and
+  // that outcome must be visible to the caller — `reconcileTaskSession`
+  // calls `ensureInstalledForCwd(cwd, "plan")` right after a successful
+  // cycle, which is the exact deadlock this guard exists to prevent if a
+  // withheld `/plan` still reported `{ ok: true, via: "slash-plan" }` as
+  // though it landed. `onPasteFailure` runs synchronously inside
+  // `queuePaste`'s queued op, before its returned promise settles, so by
+  // the time this `await` resolves `pasteFailed` already reflects whatever
+  // happened (a genuine tmux failure gets the same treatment — any
+  // `onPasteFailure` call here means `/plan` did not reach claude).
   if (target === CLAUDE_MODE_PLAN) {
-    void queuePaste(taskId, state.sessionName, "/plan", slashCommandSettleMs, state);
+    let pasteFailed = false;
+    await queuePaste(taskId, state.sessionName, "/plan", slashCommandSettleMs, state, {
+      onPasteFailure: () => { pasteFailed = true; },
+    });
+    if (pasteFailed) return { ok: false, reason: "paste withheld" };
     return { ok: true, presses: 0, via: "slash-plan" };
   }
 
@@ -7028,10 +7128,12 @@ export const __forTest = {
    *  local-command and idle-settle-net truth tables are unit-testable
    *  without a live tmux pane or a real claude JSONL stream. */
   isLocalCommandStdoutEvent,
-  /** Pure `<command-name>…</command-name>` token extractor — the identity
-   *  half of the local-command settle gate (paired with
-   *  `isLocalCommandStdoutEvent` and `SessionState.lastLocalCommandName`).
-   *  Exposed so the truth table is unit-testable without a live tmux pane. */
+  /** Test-only convenience over `parseLocalCommandLine` (see its own doc) —
+   *  production's identity half of the local-command settle gate (paired
+   *  with `isLocalCommandStdoutEvent` and `SessionState.lastLocalCommandName`)
+   *  calls `parseLocalCommandLine` directly, below. Exposed so tests that
+   *  only care about the token (not `args`) can assert against it without a
+   *  live tmux pane. */
   localCommandNameOf,
   /** Extracts BOTH the command token and its raw `<command-args>` payload
    *  from a `<command-name>…</command-name>` line (`localCommandNameOf` is
@@ -7149,15 +7251,17 @@ const IMAGE_ATTACH_SETTLE_MAX_MS = 3_000;
  * Callers go through `queuePaste` so back-to-back pastes for the same
  * task can't interleave at the tmux layer. See `queuePaste` for why.
  *
- * Returns a `PasteOutcome` so a persistent tmux failure (socket gone, server
- * wedged, …) is visible to the caller instead of silently swallowed — see
- * `queuePaste`'s handling of a non-`ok` result.
+ * Returns a `{ ok: true } | TmuxPasteFailure` (the subset of `PasteOutcome`
+ * an actual tmux call can produce — see `TmuxPasteFailure`'s doc) so a
+ * persistent tmux failure (socket gone, server wedged, …) is visible to the
+ * caller instead of silently swallowed — see `queuePaste`'s handling of a
+ * non-`ok` result.
  */
 function pastePromptSync(
   sessionName: string,
   text: string,
   opts: { bracketed?: boolean; skipEnter?: boolean } = {},
-): PasteOutcome {
+): { ok: true } | TmuxPasteFailure {
   // load-buffer reads from stdin; -b names a tmux buffer we can target.
   const buf = `agetor-${sessionName}`;
   const load = tmux(["load-buffer", "-b", buf, "-"], { stdinText: text });
@@ -7189,20 +7293,41 @@ function pastePromptSync(
 }
 
 /** Result of `pastePromptSync` / the deferred bracketed-paste Enter in
- *  `queuePaste`. `ok: false` means the tmux subprocess for `op` exited
- *  non-zero — a real signal that the paste didn't land (dead server, socket
- *  gone, session vanished mid-op), not just "nothing happened yet". */
+ *  `queuePaste`, PLUS the guard's own synthesized withhold. `ok: false` for
+ *  `op: "load-buffer" | "paste-buffer" | "send-keys"` means the tmux
+ *  subprocess for `op` exited non-zero — a real signal that the paste didn't
+ *  land (dead server, socket gone, session vanished mid-op), not just
+ *  "nothing happened yet". `op: "modal-guard"` is different in kind: it's
+ *  synthesized by `queuePaste` itself (never by `pastePromptSync`, and never
+ *  the result of an actual tmux call) when the paste — or its deferred
+ *  bracketed Enter — is withheld because a live claude modal is still on the
+ *  pane after the guard's grace window; see the guard blocks in `queuePaste`.
+ *  Modeled as one union member per `op` (rather than a single failure member
+ *  with a union-typed `op` field) specifically so `TmuxPasteFailure` below
+ *  can `Exclude` the synthesized member and leave real narrowing behind —
+ *  see its own doc. */
 type PasteOutcome =
   | { ok: true }
-  | {
-      ok: false;
-      /** `"modal-guard"` is synthesized by `queuePaste` itself (never by
-       *  `pastePromptSync`) when the paste is withheld because a live claude
-       *  modal is still on the pane after `PASTE_MODAL_GRACE_MS` — see the
-       *  guard block at the top of `queuePaste`'s queued op. */
-      op: "load-buffer" | "paste-buffer" | "send-keys" | "modal-guard";
-      stderr: string;
-    };
+  | { ok: false; op: "load-buffer"; stderr: string }
+  | { ok: false; op: "paste-buffer"; stderr: string }
+  | { ok: false; op: "send-keys"; stderr: string }
+  | { ok: false; op: "modal-guard"; stderr: string };
+
+/**
+ * The subset of `PasteOutcome` failures that actually came from a tmux
+ * subprocess call (`pastePromptSync`'s three failure ops, or the manually
+ * constructed `"send-keys"` outcome for the deferred bracketed Enter) — i.e.
+ * every `PasteOutcome` failure except the guard's own synthesized
+ * `"modal-guard"`. Used as `pastePromptSync`'s return type, so its declared
+ * type itself proves (no cast needed) that it can never produce
+ * `modal-guard`, and to narrow `reportPasteFailure`'s parameter (finding
+ * #11, docs/plans/model-effort-local-command-turns.md §10) so its
+ * `"tmux <op> — …"` template can never render an op that was never a tmux
+ * call. The guard's own withhold emits its own status message inline at
+ * both call sites in `queuePaste` and deliberately never goes through
+ * `reportPasteFailure`.
+ */
+type TmuxPasteFailure = Exclude<Extract<PasteOutcome, { ok: false }>, { op: "modal-guard" }>;
 
 /**
  * Settle window after a slash-command paste before releasing the chain.
@@ -7361,17 +7486,32 @@ function queueTmuxOp(
  * **Modal guard** (docs/plans/model-effort-local-command-turns.md §10):
  * right before either paste path runs, when `expectedState` is set and
  * `opts.skipModalGuard` isn't, the queued op polls `capturePastePane`
- * (`PASTE_MODAL_POLL_MS`, up to `PASTE_MODAL_GRACE_MS`) until
- * `paneShowsBlockingPrompt` reports the pane clear. This is what stops a
- * paste from ever typing Enter into a live claude modal — the confirm the
- * user hasn't answered yet would swallow the pasted text and/or confirm
- * whatever the cursor happens to be on, neither of which is "deliver this
- * as the next chat message." If the modal is still there after the grace
- * window, the paste is WITHHELD (no `pastePromptSync` call at all): a
- * `status` chunk + console log surface it, and `opts.onPasteFailure` fires
- * with `{ ok: false, op: "modal-guard" }` exactly like any other paste
- * failure, so a caller with a turn slot (`sendTurn`) settles it as
- * failed instead of leaving the run stuck `running`.
+ * (`PASTE_MODAL_POLL_MS`, up to `opts.modalGuardGraceMs ??
+ * PASTE_MODAL_GRACE_MS`) until `paneShowsBlockingPrompt` reports the pane
+ * clear. This is what stops a paste from ever typing Enter into a live
+ * claude modal — the confirm the user hasn't answered yet would swallow the
+ * pasted text and/or confirm whatever the cursor happens to be on, neither
+ * of which is "deliver this as the next chat message." If the modal is
+ * still there after the grace window, the paste is WITHHELD (no
+ * `pastePromptSync` call at all): a `status` chunk + console log surface
+ * it, and `opts.onPasteFailure` fires with `{ ok: false, op: "modal-guard"
+ * }` exactly like any other paste failure, so a caller with a turn slot
+ * (`sendTurn`) settles it as failed instead of leaving the run stuck
+ * `running`.
+ *
+ * The SAME guard re-runs a second time — one-shot, no polling — right
+ * before the deferred bracketed Enter (when `opts.bracketed`), still gated
+ * on `expectedState && !opts.skipModalGuard`. A TOCTOU window opens between
+ * the pre-paste guard clearing and the Enter actually going out: the
+ * `bracketedEnterGapMs` / image-attach sleep and the `stillCurrent()`
+ * re-gate both land in between, and either can outlast a NEW blocking modal
+ * appearing (a permission prompt claude's own tool call raises mid-paste,
+ * for instance) that the pre-paste guard never saw. By this point the text
+ * is ALREADY sitting in claude's input buffer — the paste itself already
+ * landed — so a hit here withholds only the Enter, with the same
+ * `{ ok: false, op: "modal-guard" }` outcome but a status message that says
+ * so explicitly (answer the new prompt, then check the input box) rather
+ * than repeating the pre-paste wording.
  */
 function queuePaste(
   taskId: string,
@@ -7389,17 +7529,29 @@ function queuePaste(
      *  + log side of this) always runs regardless of whether this is set. */
     onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void;
     /**
-     * Skip the modal guard for this paste. Set ONLY by the boot-time
-     * deferred-prompt paste in `spawnClaudeViaTmux`: that poller already
-     * confirms `readPaneMode(state) !== null` (composer idle) before
-     * arming its own paste, and separately re-checks
-     * `activeTmuxPromptsForTask` and re-arms a fresh window rather than
-     * pasting over an unanswered startup dialog — i.e. it already owns
-     * deciding when the pane is safe to paste into, so a second,
-     * independent guard here would be redundant at best and could stall
-     * the very paste that poller already waited to send. Every other
-     * `queuePaste` caller (`sendTurn`, `pasteFollowUp`, `sendSlashCommand`,
-     * `/plan`, the reattached/generic `writeInput` paths) keeps the guard.
+     * Override the modal guard's grace window (default `PASTE_MODAL_GRACE_MS`)
+     * for this paste only. Pass `0` to still RUN the guard check — unlike
+     * `skipModalGuard`, which skips it outright — but never actually wait
+     * for a hit to clear: see the boot-time deferred-prompt paste in
+     * `spawnClaudeViaTmux`, the one caller that needs exactly this (finding
+     * #6, docs/plans/model-effort-local-command-turns.md §10).
+     */
+    modalGuardGraceMs?: number;
+    /**
+     * Skip the modal guard for this paste ENTIRELY — no pane check runs at
+     * all, not even a zero-wait one (contrast `modalGuardGraceMs: 0`, which
+     * still checks, just never waits). No production caller sets this
+     * today: the boot-time deferred-prompt paste looked like a candidate —
+     * that poller already confirms `readPaneMode(state) !== null` (composer
+     * idle) before arming its own paste, and separately re-arms a fresh
+     * window rather than pasting over an unanswered startup dialog — but its
+     * own give-up branch can still reach the paste with NO card registered
+     * for whatever's on the pane, which is precisely the un-carded,
+     * footer-armed case this guard exists to catch. So it uses
+     * `modalGuardGraceMs: 0` instead of this flag: the check must still run
+     * once, even though a wait would be pointless. `skipModalGuard` remains
+     * an explicit, fully-skipping opt-out for tests and any future caller
+     * that genuinely owns pane safety some other way.
      */
     skipModalGuard?: boolean;
   } = {},
@@ -7448,14 +7600,15 @@ function queuePaste(
     // the grace window covers that without waiting anywhere near long
     // enough to feel like the paste silently vanished.
     if (expectedState && !opts.skipModalGuard) {
-      const guardDeadline = Date.now() + PASTE_MODAL_GRACE_MS;
+      const graceMs = opts.modalGuardGraceMs ?? PASTE_MODAL_GRACE_MS;
+      const guardDeadline = Date.now() + graceMs;
       while (paneShowsBlockingPrompt(capturePastePane(expectedState))) {
         if (Date.now() >= guardDeadline) {
           const outcome: Extract<PasteOutcome, { ok: false }> =
             { ok: false, op: "modal-guard", stderr: "claude modal on pane" };
           const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
           const message =
-            "paste withheld: claude is waiting on a prompt — answer the card (or the terminal) and resend";
+            "paste withheld: claude is waiting on a prompt — answer it in the card or the terminal and resend";
           onChunk?.("status", message);
           console.error(`[claude-tmux] ${message} (task ${taskId})`);
           opts.onPasteFailure?.(outcome);
@@ -7479,9 +7632,28 @@ function queuePaste(
       lastBracketedGapMs = gap;
       if (gap > 0) await Bun.sleep(gap);
       if (!stillCurrent()) return;
+      // TOCTOU re-check (finding #5, docs/plans/model-effort-local-command-
+      // turns.md §10): the gap we just slept through — and stillCurrent()'s
+      // own re-gate above — is exactly enough time for a NEW blocking modal
+      // to appear that the pre-paste guard above never saw (e.g. a
+      // permission prompt claude's own tool call raises mid-paste). The
+      // pasted text is ALREADY in claude's input buffer at this point (the
+      // paste itself already landed) — only the Enter is at risk of
+      // confirming the wrong thing — so withhold just the Enter and say so.
+      if (expectedState && !opts.skipModalGuard && paneShowsBlockingPrompt(capturePastePane(expectedState))) {
+        const outcome: Extract<PasteOutcome, { ok: false }> =
+          { ok: false, op: "modal-guard", stderr: "claude modal on pane" };
+        const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
+        const message =
+          "paste withheld before Enter: claude opened a prompt — answer it, then check the input box and resend if needed";
+        onChunk?.("status", message);
+        console.error(`[claude-tmux] ${message} (task ${taskId})`);
+        opts.onPasteFailure?.(outcome);
+        return;
+      }
       const enter = tmux(["send-keys", "-t", sessionName, "Enter"]);
       if (!enter.ok) {
-        const outcome: Extract<PasteOutcome, { ok: false }> =
+        const outcome: TmuxPasteFailure =
           { ok: false, op: "send-keys", stderr: enter.stderr };
         reportPasteFailure(taskId, expectedState, outcome);
         opts.onPasteFailure?.(outcome);
@@ -7515,11 +7687,18 @@ function queuePaste(
  * moving the whole task would be too broad a blast radius. Settling the
  * *run* (when a slot exists) is the caller's job via `onPasteFailure` — see
  * `sendTurn`.
+ *
+ * `outcome` is typed as `TmuxPasteFailure` (finding #11, docs/plans/model-
+ * effort-local-command-turns.md §10) — never the guard's own synthesized
+ * `"modal-guard"` — so the `"tmux <op> — …"` template below can never render
+ * an op that was never an actual tmux call. The guard withholds via its own
+ * inline status message at both call sites in `queuePaste`, never through
+ * this function.
  */
 function reportPasteFailure(
   taskId: string,
   state: SessionState | undefined,
-  outcome: Extract<PasteOutcome, { ok: false }>,
+  outcome: TmuxPasteFailure,
 ): void {
   const onChunk = state?.turnQueue[0]?.onChunk ?? state?.lastChunk;
   const detail = outcome.stderr || "(no stderr)";

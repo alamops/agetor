@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { db, tasks, runs, harnesses, projects, subagents } from "./db.ts";
+import { db, tasks, runs, harnesses, projects, subagents, backlog } from "./db.ts";
 import { spawnAgent, toClaudeModelArg } from "./agents.ts";
 import { checkHarness } from "./agent-status.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
@@ -19,6 +19,7 @@ import {
   TASK_TYPES,
   branchPattern,
   renderBranchTemplate,
+  supportedEfforts,
   validateBranchName,
   type AgentKind,
   type Harness,
@@ -71,7 +72,11 @@ import {
   setLocalSettingChangedHandler,
   type LocalSettingInfo,
 } from "./claude-tmux.ts";
-import { parseClaudeLocalSetting, describeLocalSettingSync } from "./claude-local-setting.ts";
+import {
+  parseClaudeLocalSetting,
+  describeLocalSettingSync,
+  describeUnrepresentableLocalSetting,
+} from "./claude-local-setting.ts";
 import {
   dropCodexSession,
   reattachCodexSession,
@@ -1561,12 +1566,70 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   // already made the choice in the dropdown, so the driver auto-accepts
   // that specific modal (and only that modal) rather than leaving a card
   // for them to click through for a decision they've already made.
+  //
+  // `onPasteFailure` covers T7's paste guard (docs/plans/model-effort-local-
+  // command-turns.md §10): if a blocking claude modal was still on the pane
+  // when the queued paste's grace window elapsed, the `/model`/`/effort`
+  // keystrokes were never delivered — the DB row already carries the new
+  // value (the PATCH landed before this call), but the live session never
+  // saw it. Surface that drift on the run instead of leaving the user to
+  // discover it only when claude's next reply doesn't match the dropdown.
   if (before.model !== after.model && after.model) {
-    sendSlashCommand(taskId, `/model ${toClaudeModelArg(after.model)}`, { autoConfirm: "model" });
+    const modelId = after.model;
+    sendSlashCommand(taskId, `/model ${toClaudeModelArg(modelId)}`, {
+      autoConfirm: "model",
+      onPasteFailure: () => emitLocalSettingPasteWithheld(taskId, "model", modelId),
+    });
   }
   if (before.effort !== after.effort && after.effort) {
-    sendSlashCommand(taskId, `/effort ${after.effort}`, { autoConfirm: "effort" });
+    const effortId = after.effort;
+    sendSlashCommand(taskId, `/effort ${effortId}`, {
+      autoConfirm: "effort",
+      onPasteFailure: () => emitLocalSettingPasteWithheld(taskId, "effort", effortId),
+    });
   }
+}
+
+/**
+ * Surface a `sendSlashCommand` dropdown-mirror paste that was withheld
+ * because a blocking claude modal was still on the pane (T7's paste guard,
+ * docs/plans/model-effort-local-command-turns.md §10). The task row already
+ * moved to the new value — the PATCH that triggered this mirror already
+ * committed — but the live tmux session never saw the `/model`/`/effort`
+ * keystrokes, so the row and the session disagree until the user answers
+ * whatever claude is waiting on and the dropdown mirror runs again. Mirrors
+ * `emitModeChangeStatus`'s append+emit pattern.
+ */
+function emitLocalSettingPasteWithheld(taskId: string, setting: "model" | "effort", id: string): void {
+  const recent = runs.listForTask(taskId)[0];
+  if (!recent) return;
+  const data = `⚠️ ${setting} change not applied — claude is waiting on a prompt; the task's ${setting} is ${id} but the session kept its previous one`;
+  runs.appendEvent(recent.id, "status", data);
+  emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+}
+
+/**
+ * Mirrors kanban/RunPanel.tsx's own effort-fallback effect (~4917-4928)
+ * EXACTLY: when a task's model changes, the previously-saved effort may no
+ * longer be valid for the new model (Haiku 4.5 takes no effort param at all;
+ * Sonnet 4.6 has no `xhigh`). `undefined` means "no change needed" — the
+ * current effort (even `null`) is already valid for `model`. Otherwise this
+ * is the value the effort column should be patched to alongside the model
+ * (including `null`, for the "model accepts no effort at all" case).
+ */
+function effortFallbackForModelChange(
+  kind: AgentKind,
+  model: string,
+  currentEffort: string | null,
+): string | null | undefined {
+  const supportedEffortsForModel = supportedEfforts(kind, model);
+  const allowed = new Set(supportedEffortsForModel.map((o) => o.id));
+  if (currentEffort && allowed.has(currentEffort)) return undefined;
+  if (supportedEffortsForModel.length === 0) {
+    return currentEffort !== null ? null : undefined;
+  }
+  const fallback = allowed.has(DEFAULT_EFFORT[kind]) ? DEFAULT_EFFORT[kind] : supportedEffortsForModel[0]!.id;
+  return currentEffort !== fallback ? fallback : undefined;
 }
 
 /**
@@ -1582,11 +1645,21 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
  * confirm off the very update we're recording.
  *
  * No-op (returns false) when: the task doesn't exist, its agent isn't
- * claude-code, the stdout doesn't parse to a known setting, or the parsed
- * value is unchanged. Model equality is checked both by raw id AND via
- * `toClaudeModelArg` so an alias (e.g. claude reporting "sonnet" resolved to
- * agetor id `sonnet-5`) can never flip the stored id against an
- * already-equivalent one.
+ * claude-code, the stdout doesn't parse to a known setting, the parsed
+ * value is unchanged, claude landed on a value agetor can't represent
+ * (`kind: "unrepresentable"` — a breadcrumb is still emitted so the drift
+ * isn't silent), or — for an effort outcome — the parsed id isn't supported
+ * by the task's current model (`MODEL_EFFORT_SUPPORT`/`supportedEfforts`,
+ * the same table the RunPanel picker filters against). Model equality is
+ * checked both by raw id AND via `toClaudeModelArg` so an alias (e.g. claude
+ * reporting "sonnet" resolved to agetor id `sonnet-5`) can never flip the
+ * stored id against an already-equivalent one.
+ *
+ * A model sync that lands on a model which no longer supports the task's
+ * saved effort adjusts the effort in the SAME `tasks.update` — mirroring
+ * `effortFallbackForModelChange` above (itself a mirror of the RunPanel's
+ * own effect) — rather than leaving a row with an impossible (model,
+ * effort) pair until the next unrelated PATCH happens to fix it.
  *
  * Returns true when a row actually changed (and a status breadcrumb was
  * attempted on the task's most recent run, if one exists).
@@ -1596,19 +1669,58 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
   if (!task) return false;
   if ((resolveHarness(task.agent)?.kind ?? null) !== "claude-code") return false;
 
-  const next = parseClaudeLocalSetting(info);
-  if (!next) return false;
+  const outcome = parseClaudeLocalSetting(info);
+  if (!outcome) return false;
+
+  const recent = runs.listForTask(taskId)[0];
+  const announce = (data: string) => {
+    if (!recent) return;
+    runs.appendEvent(recent.id, "status", data);
+    emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  };
+
+  if (outcome.kind === "unrepresentable") {
+    const current = outcome.setting === "model" ? task.model : task.effort;
+    announce(describeUnrepresentableLocalSetting(outcome, current));
+    return false;
+  }
 
   let patch: Partial<Task>;
-  if ("model" in next) {
+  let breadcrumb: string;
+
+  if (outcome.kind === "model") {
     const unchanged =
-      next.model === task.model
-      || toClaudeModelArg(next.model) === toClaudeModelArg(task.model ?? "");
+      outcome.id === task.model
+      || toClaudeModelArg(outcome.id) === toClaudeModelArg(task.model ?? "");
     if (unchanged) return false;
-    patch = { model: next.model };
+
+    patch = { model: outcome.id };
+    breadcrumb = describeLocalSettingSync(outcome);
+
+    const effortFallback = effortFallbackForModelChange("claude-code", outcome.id, task.effort);
+    if (effortFallback !== undefined) {
+      patch.effort = effortFallback;
+      breadcrumb += effortFallback === null
+        ? `; effort cleared (not supported on ${outcome.id})`
+        : `; effort adjusted to ${effortFallback} (not supported on ${outcome.id})`;
+    }
   } else {
-    if (next.effort === task.effort) return false;
-    patch = { effort: next.effort };
+    // outcome.kind === "effort" — validate against the (agent, model) pair
+    // before writing, same table the RunPanel picker filters against. A
+    // representable-but-unsupported id (claude accepted `/effort xhigh` on
+    // a model whose agetor entry doesn't list it) must not silently widen
+    // the task row past what the picker would ever allow.
+    const allowed = new Set(supportedEfforts("claude-code", task.model).map((o) => o.id));
+    if (!allowed.has(outcome.id)) {
+      const modelLabel = task.model ?? DEFAULT_MODEL["claude-code"];
+      announce(
+        `effort "${outcome.id}" isn't supported on ${modelLabel} in agetor — left as ${task.effort ?? "unset"}`,
+      );
+      return false;
+    }
+    if (outcome.id === task.effort) return false;
+    patch = { effort: outcome.id };
+    breadcrumb = describeLocalSettingSync(outcome);
   }
 
   // Direct DB update — deliberately NOT `reconcileTaskSession` /
@@ -1617,12 +1729,7 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
   const updated = tasks.update(taskId, patch);
   if (!updated) return false;
 
-  const recent = runs.listForTask(taskId)[0];
-  if (recent) {
-    const data = describeLocalSettingSync(next);
-    runs.appendEvent(recent.id, "status", data);
-    emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
-  }
+  announce(breadcrumb);
   return true;
 }
 
@@ -1700,6 +1807,15 @@ function formatModeChangeFailure(agetorMode: string, result: Extract<CycleResult
     case "no live session":
     case "current mode unknown":
       return `⚠️ mode change to ${agetorMode} skipped: ${result.reason} — stop the run and start again to apply.`;
+    // T7's paste guard (docs/plans/model-effort-local-command-turns.md §10):
+    // `cycleToMode`'s `/plan` path withheld its own paste because a blocking
+    // claude modal (permission prompt, AskUserQuestion, another confirm) was
+    // still on the pane when the grace window elapsed — no keystrokes were
+    // sent at all, so the mode never changed. `ensureInstalledForCwd` is
+    // correctly skipped for this case too: it only runs under `result.ok`
+    // above, and this branch is exclusively reachable via `result.ok === false`.
+    case "paste withheld":
+      return `⚠️ ${agetorMode} mode not applied — claude is waiting on a prompt; answer it (or the terminal), then change the mode again.`;
   }
 }
 
@@ -2353,18 +2469,30 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
   // forever. `active.has(task.runId)` is true iff the latest run hasn't
   // resolved yet (registerActiveRun adds; attachDoneHandler deletes on done) —
   // a more reliable "in flight" signal than the polled `task.column`.
-  if (task.runId && active.has(task.runId) && pasteFollowUp(taskId, line)) {
-    const runId = task.runId;
-    const data = normalizeUserText(line);
-    // Record the user bubble optimistically — `pasteFollowUp` only confirms a
-    // live session exists, not that claude consumed the keystrokes. If the
-    // user hits Stop before claude drains its input buffer, Ctrl+C clears the
-    // queued message (see `cancelRun`) and this bubble has no reply. That's the
-    // same optimism `sendTurn` already runs with; the bubble correctly reflects
-    // that the user did send the message.
-    runs.appendEvent(runId, "user", data);
-    emit({ runId, taskId, stream: "user", data, ts: Date.now() });
-    return runId;
+  if (task.runId && active.has(task.runId)) {
+    const activeRunId = task.runId;
+    // `onPasteFailure` covers T7's paste guard (docs/plans/model-effort-
+    // local-command-turns.md §10): a blocking claude modal was still on the
+    // pane when the queued paste's grace window elapsed, so this follow-up
+    // was never actually delivered to the live session — re-stash it into
+    // the task's backlog tray (rather than lose it outright) and say so on
+    // the run, since the "user" bubble below is appended optimistically
+    // before the paste's real outcome is known.
+    const delivered = pasteFollowUp(taskId, line, {
+      onPasteFailure: () => handleFoldedFollowUpPasteWithheld(taskId, activeRunId, line),
+    });
+    if (delivered) {
+      const data = normalizeUserText(line);
+      // Record the user bubble optimistically — `pasteFollowUp` only confirms a
+      // live session exists, not that claude consumed the keystrokes. If the
+      // user hits Stop before claude drains its input buffer, Ctrl+C clears the
+      // queued message (see `cancelRun`) and this bubble has no reply. That's the
+      // same optimism `sendTurn` already runs with; the bubble correctly reflects
+      // that the user did send the message.
+      runs.appendEvent(activeRunId, "user", data);
+      emit({ runId: activeRunId, taskId, stream: "user", data, ts: Date.now() });
+      return activeRunId;
+    }
   }
 
   // Idle (or the paste raced a vanishing session): one run row per user turn —
@@ -2405,6 +2533,28 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
   return newRunId;
+}
+
+/**
+ * `pasteFollowUp`'s `onPasteFailure` hook for the fold-while-busy path
+ * (`sendTurnInExistingSession` above): a blocking claude modal (T7's paste
+ * guard, docs/plans/model-effort-local-command-turns.md §10) was still on
+ * the pane when the queued paste's grace window elapsed, so the follow-up
+ * was never delivered to the live session. The optimistic "user" bubble
+ * `sendTurnInExistingSession` already appended stays in the transcript
+ * (matching every other optimistic-paste case — see its own comment), but
+ * the message text itself would otherwise be lost entirely. Re-stash it
+ * into the task's backlog tray so the user can resend it once they've
+ * answered whatever claude is waiting on, and say so on the active run.
+ * `text` is already the fully-composed message (references, if any, are
+ * flattened into it client-side before it ever reaches `sendInput` — see
+ * the `/runs/:id/input` route), so there's nothing further to pass through.
+ */
+function handleFoldedFollowUpPasteWithheld(taskId: string, runId: string, text: string): void {
+  backlog.add(taskId, { text });
+  const data = "message saved to your backlog — claude is waiting on a prompt; answer it and send the message from the tray";
+  runs.appendEvent(runId, "status", data);
+  emit({ runId, taskId, stream: "status", data, ts: Date.now() });
 }
 
 /**
