@@ -873,10 +873,11 @@ export interface SubagentWatcherHandle {
    *  `hasMonitor(id)` is true; a harmless no-op returning `false` otherwise
    *  (production never calls it in that case — `handleBackgroundTaskNotification`
    *  checks `hasMonitor` first — but tests may call it directly).
-   *  `lineTimestampMs` (finding #5) is optional — only
-   *  `scanLineForTaskNotification`'s internal call has one to pass; threaded
-   *  through here too for interface uniformity, `undefined` falls back to
-   *  the hash-only dedup key. */
+   *  `lineTimestampMs` (finding #5) is the enclosing JSONL line's own
+   *  `timestamp` as epoch ms — the restart-safe scan reads it off the raw
+   *  line, the live dispatch forwards the one claude-tmux parsed — so both
+   *  paths bucket the same event under the same dedup key; `undefined`/
+   *  `null` falls back to the hash-only key. */
   applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): boolean;
   /** True when this watcher tracks AT LEAST ONE monitor at all (running or
    *  already settled) — finding #8 (code review): lets
@@ -1215,19 +1216,6 @@ function parseMonitorNotificationBlock(block: string): { isTerminal: boolean; ev
   return { isTerminal, eventText };
 }
 
-/** Extract the top-level `timestamp` field from a raw main-JSONL line (both
- *  the `queue-operation` enqueue shape and the synthetic `user`/origin shape
- *  carry one verbatim — see the module header's "Monitors" section) WITHOUT
- *  a full `JSON.parse` — a cheap regex is enough since only
- *  `persistMonitorEvent`'s dedup bucket (finding #5) needs the value, and a
- *  wrong/missing match degrades gracefully to "no bucket" rather than a hard
- *  failure. The first `"timestamp":"…"` occurrence in the line is trusted to
- *  be the top-level field: both verified shapes place it before the
- *  `content`/`message` field that carries the `<task-notification>` block
- *  itself (JSON key order is preserved by `JSON.stringify`), and that block
- *  is plain bracketed/XML-ish text, never JSON, so it can't contain a
- *  competing `"timestamp":"…"` match of its own. Returns `null` on no match
- *  or an unparseable value — never throws. */
 /**
  * Decode a `<task-notification>…</task-notification>` fragment that was cut
  * straight out of a RAW main-JSONL line (the restart-safe scan deliberately
@@ -1251,6 +1239,20 @@ function decodeJsonStringFragment(raw: string): string {
     return raw;
   }
 }
+
+/** Extract the top-level `timestamp` field from a raw main-JSONL line (both
+ *  the `queue-operation` enqueue shape and the synthetic `user`/origin shape
+ *  carry one verbatim — see the module header's "Monitors" section) WITHOUT
+ *  a full `JSON.parse` — a cheap regex is enough since only
+ *  `persistMonitorEvent`'s dedup bucket (finding #5) needs the value, and a
+ *  wrong/missing match degrades gracefully to "no bucket" rather than a hard
+ *  failure. The first `"timestamp":"…"` occurrence in the line is trusted to
+ *  be the top-level field even though the `user`/origin shape places it
+ *  AFTER `message`: the `<task-notification>` block lives inside a JSON
+ *  string literal, so any `"timestamp":` text a monitored command echoed
+ *  into an `<event>` is escaped (`\"timestamp\":`) on the raw line and can
+ *  never satisfy this unescaped match. Returns `null` on no match
+ *  or an unparseable value — never throws. */
 function extractLineTimestampMs(line: string): number | null {
   const m = /"timestamp"\s*:\s*"([^"]+)"/.exec(line);
   if (!m) return null;
@@ -1301,10 +1303,13 @@ function extractLineTimestampMs(line: string): number | null {
  *  lines straddle a bucket boundary (a few-ms race right at a boundary)
  *  yields a harmless DUPLICATE line instead of collapsing — judged better
  *  than the alternative (a real repeat silently vanishing). Falls back to
- *  the hash-only key (today's pre-fix behavior) when `lineTimestampMs` is
- *  absent/unparseable (`undefined`/`null`) — the live orchestrator dispatch
- *  path (`handleBackgroundTaskNotification`) has no line to read a
- *  timestamp from at all, so it always takes this fallback. */
+ *  the hash-only key when `lineTimestampMs` is absent/unparseable
+ *  (`undefined`/`null`). Both paths normally supply it — the restart-safe
+ *  scan via `extractLineTimestampMs`, the live dispatch via the parsed
+ *  line's own `timestamp` that claude-tmux forwards through
+ *  `handleBackgroundTaskNotification` — which is what keeps the two paths
+ *  deriving the SAME key for the same line; the fallback exists only for a
+ *  line with no parseable timestamp at all. */
 function persistMonitorEvent(
   runId: string,
   taskId: string,
@@ -1314,21 +1319,34 @@ function persistMonitorEvent(
   isTerminal: boolean,
   lineTimestampMs?: number | null,
 ): boolean {
-  const now = Date.now();
-  const text = `[${new Date(now).toISOString()}] ${eventText}\n`;
+  const hasLineTs = typeof lineTimestampMs === "number" && Number.isFinite(lineTimestampMs);
+  // Stamp the tab line (and the emitted event) with when claude WROTE the
+  // notification, not when this scan happened to read it — a restart replay
+  // or lookback catch-up would otherwise date every backlogged event to the
+  // restart.
+  const at = hasLineTs ? lineTimestampMs! : Date.now();
+  const text = `[${new Date(at).toISOString()}] ${eventText}\n`;
   const hash = fnv1aHex(block);
-  const bucket =
-    typeof lineTimestampMs === "number" && Number.isFinite(lineTimestampMs)
-      ? Math.floor(lineTimestampMs / 10_000)
-      : null;
+  const bucket = hasLineTs ? Math.floor(lineTimestampMs! / 10_000) : null;
   const lineUuid = isTerminal
     ? `monitor:${id}:terminal:${hash}`
     : bucket !== null
       ? `monitor:${id}:${hash}:${bucket}`
       : `monitor:${id}:${hash}`;
-  const inserted = runs.appendEvent(runId, "stdout", text, lineUuid, id);
+  let inserted: number | null;
+  try {
+    inserted = runs.appendEvent(runId, "stdout", text, lineUuid, id);
+  } catch (e) {
+    // A throw here (the run row cascade-deleted out from under a live scan —
+    // INSERT OR IGNORE does not cover a foreign-key failure) must cost one
+    // event, not the rest of `scanMainSignals`'s batch: that loop's cursor
+    // has already advanced past every line in the read, so an exception
+    // escaping it would silently lose the later lines for good.
+    console.error(`[claude-subagents] failed to persist monitor event for ${id}:`, e);
+    return false;
+  }
   if (inserted === null) return false;
-  emitFn?.({ runId, taskId, stream: "stdout", data: text, ts: now, subagentId: id });
+  emitFn?.({ runId, taskId, stream: "stdout", data: text, ts: at, subagentId: id });
   return true;
 }
 
@@ -1358,7 +1376,10 @@ function persistMonitorEvent(
  *   - A NON-terminal body persists the event (mirrors
  *     `applyMonitorNotification`'s "always persist, regardless of outcome"
  *     posture — the tab should show it either way), then flips the row back
- *     to `running` — but ONLY when BOTH: (1) this row has no authoritative
+ *     to `running` — but ONLY when ALL of: (0) the row is `completed` — the
+ *     only status `checkMonitorCeiling`'s guess ever produces; an `orphaned`
+ *     or otherwise-closed row stays closed, exactly as the rehydration
+ *     branch treats those statuses; (1) this row has no authoritative
  *     terminal receipt already on record (a `monitor:<id>:terminal:*`
  *     line_uuid — mirrors `applyMonitorNotification`'s `!m.receiptSettled`
  *     gate: a receipt-settled row never resurrects, only a ceiling-settled
@@ -1389,11 +1410,15 @@ function applyMonitorNotificationForRow(row: Subagent, body: string, lineTimesta
   }
   if (!eventText) return;
 
-  const alreadyReceiptSettled = [...runs.seenLineUuidsForSubagent(row.id)].some((u) =>
-    u.startsWith(`monitor:${row.id}:terminal:`),
-  );
+  // The event always reaches the tab; whether it may ALSO resurrect the row
+  // depends on how the row was closed. Only a `completed` row can have been
+  // settled by the ceiling's guess — `orphaned` (session death, boot
+  // reconciliation) and every other terminal status were closed by a path
+  // that knows better than a stray later event, mirroring the rehydration
+  // branch's "don't presume resurrectable" posture for those statuses.
   const isNew = persistMonitorEvent(row.runId, row.taskId, row.id, block, eventText, isTerminal, lineTimestampMs);
-  if (alreadyReceiptSettled || !isNew) return; // receipt-closed, or a replayed line — never resurrect
+  if (row.status !== "completed" || !isNew) return; // not a ceiling settle, or a replayed line
+  if (runs.hasLineUuidPrefixForSubagent(row.id, `monitor:${row.id}:terminal:`)) return; // receipt-closed — never resurrect
 
   subagentsDb.setStatus(row.id, "running", null);
   emitLifecycleForRow({ ...row, status: "running", endedAt: null }, "started");
@@ -1787,9 +1812,7 @@ export function attachSubagentWatcher(opts: {
           //     resurrected by a stray later event, matching this module's
           //     "don't presume resurrectable" default for a status this
           //     rule doesn't otherwise recognise.
-          const receiptSettled = [...runs.seenLineUuidsForSubagent(row.id)].some((u) =>
-            u.startsWith(`monitor:${row.id}:terminal:`),
-          );
+          const receiptSettled = runs.hasLineUuidPrefixForSubagent(row.id, `monitor:${row.id}:terminal:`);
           monitors.set(row.id, {
             id: row.id,
             runId: row.runId ?? resolveRunId(taskId) ?? row.id,
@@ -3426,11 +3449,12 @@ export function attachSubagentWatcher(opts: {
    * routing) check `monitors.has(id)` (or the handle's `hasMonitor`) FIRST.
    *
    * `lineTimestampMs` (finding #5) — the enclosing main-JSONL line's own
-   * `timestamp`, when the caller has one (only `scanLineForTaskNotification`
-   * does; the live orchestrator dispatch does not — see
-   * `handleBackgroundTaskNotification`'s doc). Threaded straight through to
-   * `persistMonitorEvent` to bucket its dedup key; `undefined` here falls
-   * back to that function's hash-only key.
+   * `timestamp`: `scanLineForTaskNotification` reads it off the raw line,
+   * and the live orchestrator dispatch forwards the one claude-tmux parsed
+   * (`handleBackgroundTaskNotification`'s fourth argument), so both paths
+   * bucket the same line under the same dedup key. Threaded straight
+   * through to `persistMonitorEvent`; `undefined`/`null` falls back to that
+   * function's hash-only key.
    */
   function applyMonitorNotification(id: string, body: string, lineTimestampMs?: number | null): boolean {
     const m = monitors.get(id);

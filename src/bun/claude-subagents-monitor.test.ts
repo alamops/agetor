@@ -1324,3 +1324,60 @@ test("a Monitor event dispatched live with the line's timestamp and then read by
 
   w.detach();
 });
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * Review follow-ups: escaped event text round-trips decoded through the scan;
+ * an orphaned row is never resurrected on the watcher-less path
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("an <event> carrying quotes and backslashes reaches the tab decoded via the scan path, stamped with the line's own time, and the live path agrees on one row", async () => {
+  const { subagents } = await import("./db.ts");
+  const { attachSubagentWatcher, setSubagentEmitter, handleBackgroundTaskNotification } = await import("./claude-subagents.ts");
+  const { taskId, jsonlPath } = await seed();
+  setSubagentEmitter(() => { /* drain */ });
+
+  const toolUseId = "toolu_esc1";
+  const id = "mon_esc1";
+  writeFileSync(jsonlPath, launchLine({ toolUseId, description: "watch build" }) + stubLine({ toolUseId, id }));
+  const w = attachSubagentWatcher({ taskId, jsonlPath, manual: true });
+  const t0 = Date.now();
+  w.pump(t0);
+
+  // JSON.stringify escapes both the quotes and the backslashes on the raw
+  // line; the scan must hand the DECODED text to the hash and the tab.
+  const timestamp = "2026-08-24T17:31:00.000Z";
+  const summary = 'Monitor event: "watch build"';
+  const event = 'Error: expected "ok" at C:\\build\\log.txt';
+  appendFileSync(jsonlPath, eventLines({ id, summary, event, timestamp }));
+  w.pump(t0 + 1);
+  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, summary, event }), Date.parse(timestamp));
+
+  expect(subagents.get(id)!.status).toBe("running");
+  const rows = await stdoutEvents(id);
+  expect(rows.length).toBe(1);
+  expect(rows[0]!.data).toContain('expected "ok" at C:\\build\\log.txt');
+  expect(rows[0]!.data.startsWith(`[${timestamp}]`)).toBe(true);
+
+  w.detach();
+});
+
+test("handleBackgroundTaskNotification persists a fresh non-terminal event for an orphaned DB row but does NOT resurrect it, with no watcher attached", async () => {
+  const { subagents } = await import("./db.ts");
+  const { handleBackgroundTaskNotification } = await import("./claude-subagents.ts");
+  const { taskId, runId } = await seed();
+
+  const id = "mon_dborphan1";
+  const now = Date.now();
+  subagents.insertIfAbsent({
+    id, taskId, runId, parentKind: "monitor",
+    agentType: "monitor", description: "db-only orphaned monitor", spawnDepth: 1,
+    sourcePath: "", toolUseId: null,
+    status: "orphaned", startedAt: now - 10_000, endedAt: now, // closed by session death, not the ceiling
+  });
+
+  handleBackgroundTaskNotification(taskId, id, notificationBlock({ id, event: "3 passed" }));
+
+  expect(subagents.get(id)!.status).toBe("orphaned");
+  expect(subagents.hasRunning(taskId)).toBe(false);
+  expect((await stdoutEvents(id)).length).toBe(1);
+});
