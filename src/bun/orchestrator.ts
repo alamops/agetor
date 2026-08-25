@@ -68,7 +68,10 @@ import {
   setHeldSessionProbe,
   setActiveRunProbe,
   setBackgroundTaskSettledHandler,
+  setLocalSettingChangedHandler,
+  type LocalSettingInfo,
 } from "./claude-tmux.ts";
+import { parseClaudeLocalSetting, describeLocalSettingSync } from "./claude-local-setting.ts";
 import {
   dropCodexSession,
   reattachCodexSession,
@@ -292,6 +295,20 @@ setActiveRunProbe((taskId) => {
   const task = tasks.get(taskId);
   if (!task?.runId) return null;
   return active.has(task.runId) ? task.runId : null;
+});
+
+// Local-command setting sync (§10 of the model/effort local-command plan):
+// claude answers `/model` and `/effort` inside its own TUI and never writes
+// an `assistant`/`end_turn` for them — the driver parses the
+// `<local-command-stdout>` outcome and fires this regardless of whether the
+// change came from the dropdown mirror, a typed command, a picker/slider
+// card answer, or a terminal-side edit. `applyClaudeLocalSetting` syncs
+// `task.model`/`task.effort` from that outcome WITHOUT re-mirroring back
+// into the session (that would be `reconcileTaskSession`'s job, and calling
+// it here would bounce a spurious second confirm off the very update we're
+// recording).
+setLocalSettingChangedHandler((taskId, info) => {
+  applyClaudeLocalSetting(taskId, info);
 });
 
 // Background-task settle signal: a parent task-notification JSONL line named
@@ -1550,6 +1567,63 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
   if (before.effort !== after.effort && after.effort) {
     sendSlashCommand(taskId, `/effort ${after.effort}`, { autoConfirm: "effort" });
   }
+}
+
+/**
+ * Sync `task.model` / `task.effort` from claude's OWN `/model` / `/effort`
+ * outcome (a typed command, a picker/slider card answer, or a terminal-side
+ * change — see `docs/plans/model-effort-local-command-turns.md` §10). This
+ * is the mirror image of `reconcileTaskSession`'s `/model`/`/effort`
+ * branch: that path takes an agetor-side change and pushes it INTO the
+ * session; this path takes a session-side change and pulls it back onto the
+ * task row. It must never call `reconcileTaskSession` / `sendSlashCommand`
+ * — the change already happened in the live session, so re-mirroring it
+ * would pop a spurious second "Switch model?"/"Change effort level?"
+ * confirm off the very update we're recording.
+ *
+ * No-op (returns false) when: the task doesn't exist, its agent isn't
+ * claude-code, the stdout doesn't parse to a known setting, or the parsed
+ * value is unchanged. Model equality is checked both by raw id AND via
+ * `toClaudeModelArg` so an alias (e.g. claude reporting "sonnet" resolved to
+ * agetor id `sonnet-5`) can never flip the stored id against an
+ * already-equivalent one.
+ *
+ * Returns true when a row actually changed (and a status breadcrumb was
+ * attempted on the task's most recent run, if one exists).
+ */
+export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo): boolean {
+  const task = tasks.get(taskId);
+  if (!task) return false;
+  if ((resolveHarness(task.agent)?.kind ?? null) !== "claude-code") return false;
+
+  const next = parseClaudeLocalSetting(info);
+  if (!next) return false;
+
+  let patch: Partial<Task>;
+  if ("model" in next) {
+    const unchanged =
+      next.model === task.model
+      || toClaudeModelArg(next.model) === toClaudeModelArg(task.model ?? "");
+    if (unchanged) return false;
+    patch = { model: next.model };
+  } else {
+    if (next.effort === task.effort) return false;
+    patch = { effort: next.effort };
+  }
+
+  // Direct DB update — deliberately NOT `reconcileTaskSession` /
+  // `sendSlashCommand`. The change came FROM claude; pushing it back in
+  // would re-trigger the very confirm modal we just resolved.
+  const updated = tasks.update(taskId, patch);
+  if (!updated) return false;
+
+  const recent = runs.listForTask(taskId)[0];
+  if (recent) {
+    const data = describeLocalSettingSync(next);
+    runs.appendEvent(recent.id, "status", data);
+    emit({ runId: recent.id, taskId, stream: "status", data, ts: Date.now() });
+  }
+  return true;
 }
 
 /**

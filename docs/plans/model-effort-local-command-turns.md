@@ -366,3 +366,48 @@ every valid finding was applied in commit `9b29bf6` and re-verified. Net changes
 Verification after the addendum: `bun run typecheck` clean; driver + interactions files
 364 pass / 0 fail; full `bun test` 3131 pass / 3 skip / 0 fail (fix agent's run; the haiku
 Phase 7 run is recorded in the final report).
+
+## 10. Completeness addendum — swept-in follow-ups (owner: "include them", 2026-08-25)
+
+| Item | Disposition | Owner task |
+| --- | --- | --- |
+| Review F4 — a confirm that paints after the auto-confirm window is accepted by the next queued paste's Enter | **In this run**, generalized: no `queuePaste` may ever type Enter into a live claude modal | T7 |
+| `task.model` / `task.effort` drift after a typed `/model x` / `/effort x`, a picker/slider/confirm card answer, or a terminal-side change | **In this run**: sync the task row from claude's own `<local-command-stdout>` outcome | T7 + T8 |
+
+**Design.**
+- **Paste guard (T7).** Pure `paneShowsBlockingPrompt(tail)` = numbered ∨ yes/no ∨ slider ∨
+  `detectAskModal` ∨ footer-armed `matchUnparsableModal(tail, false)` — exactly the set the
+  scraper would card. `queuePaste` captures the pane (new `capturePastePane` seam, default
+  `captureTail`) right before `pastePromptSync`; while a blocking prompt is showing it polls
+  every `PASTE_MODAL_POLL_MS` (250) for at most `PASTE_MODAL_GRACE_MS` (1 500) — the grace
+  covers a repaint after an auto-confirm, but must stay short because the card click that
+  clears the modal (`dismissTmuxPrompt`) is queued on the **same** per-task tmux chain and
+  would otherwise wait behind us. If the prompt is still there, the paste is **withheld**:
+  `reportPasteFailure`-style status (`paste withheld: claude is waiting on a prompt — answer
+  the card (or the terminal) and resend`) + `onPasteFailure({ op: "modal-guard" })`, so
+  `sendTurn` settles its slot (run `failed` → task `ready`) instead of losing the message and
+  silently confirming whatever the cursor was on. The boot-time deferred paste opts out
+  (`skipModalGuard`) — the boot poller already owns startup modals. The auto-confirm poll
+  also stops when a *foreign* blocking prompt appears (left to the scraper).
+- **Setting sync (T7 + T8).** The driver's `lastLocalCommand` now keeps `{ name, args }` from
+  the `<command-name>` line; on a `<local-command-stdout>` for `/model` or `/effort` it fires
+  `setLocalSettingChangedHandler` (orchestrator-injected seam, same shape as
+  `setBackgroundTaskSettledHandler`) with `{ setting, args, stdout }` — regardless of slot,
+  so the dropdown mirror, a typed command, a card answer and a terminal-side change all
+  flow through one path. New `src/bun/claude-local-setting.ts` (pure, unit-tested):
+  `parseClaudeLocalSetting(info)` → `{ model } | { effort } | null`. Model: an arg equal to a
+  `CLAUDE_MODEL_FLAG` value maps back to its agetor id; otherwise the stdout display name
+  (`Set model to <name> …`, qualifiers `(1M context)` / `(default)` and ANSI bold stripped)
+  is matched case-insensitively against `AGENT_OPTIONS["claude-code"].models[].label`; a raw
+  `claude-…` id passes through verbatim; `Kept model as …` → null. Effort: arg or
+  `Set effort level to <id>` restricted to the claude-supported ids
+  (`max|xhigh|high|medium|low`); `ultracode` / `Cancelled` → null. Orchestrator
+  `applyClaudeLocalSetting(taskId, info)`: claude-code tasks only; no-op when the value is
+  unchanged (model compared through `toClaudeModelArg` so an alias can't flip the id);
+  `tasks.update` directly (the PATCH route is the only `reconcileTaskSession` caller, so this
+  never re-mirrors) + a status breadcrumb on the latest run (`model synced from claude: …`).
+  Consequence accepted: the Task Details effort-fallback effect may follow a model sync with
+  a legitimate `/effort <supported>` mirror — same rule the picker already enforces.
+
+**Not swept in (different tickets):** `/compact` turns (no stdout, unsettled today);
+reattach replay of a local-command run (idle-settle covers it).

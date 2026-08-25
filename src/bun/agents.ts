@@ -137,6 +137,27 @@ export function toClaudeModelArg(id: string): string {
 }
 
 /**
+ * Inverse of `toClaudeModelArg`/`CLAUDE_MODEL_FLAG`: given a `/model <arg>`
+ * argument as claude itself would echo it back (or as agetor's own dropdown
+ * mirror sent it — see `reconcileTaskSession`), resolve it to the agetor
+ * model id whose flag matches exactly. Falls back to the arg itself when it
+ * already looks like a raw claude model id (`claude-…`), so a future
+ * curated id "just works" before `CLAUDE_MODEL_FLAG` catches up.
+ *
+ * Deliberately does NOT resolve claude's own aliases (`sonnet`, `opus`,
+ * `default`, …) — those map many-to-one onto a model family and can't be
+ * inverted losslessly from the arg alone. Callers that need to resolve an
+ * alias must fall back to the `<local-command-stdout>` display name instead
+ * (see `claudeModelIdFromDisplayName` in `claude-local-setting.ts`).
+ */
+export function claudeModelIdFromArg(arg: string): string | null {
+  for (const [id, flag] of Object.entries(CLAUDE_MODEL_FLAG)) {
+    if (flag === arg) return id;
+  }
+  return /^claude-/.test(arg) ? arg : null;
+}
+
+/**
  * Effort → `CLAUDE_CODE_EFFORT_LEVEL` env var on the spawned process. Same
  * lever the `/effort` slash command uses internally, so it works on every
  * claude model rather than relying on per-model API support. Unknown ids are

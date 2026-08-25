@@ -234,6 +234,55 @@ function fireBackgroundTaskSettled(taskId: string, agentId: string): void {
   }
 }
 
+/**
+ * Payload `fireLocalSettingChanged` hands the orchestrator when claude
+ * itself resolves a `/model` or `/effort` local command (docs/plans/
+ * model-effort-local-command-turns.md §10). `args` is the raw
+ * `<command-args>` text off that command's own `<command-name>` line
+ * (`""` for a bare `/model`/`/effort` with no argument); `stdout` is the
+ * raw inner text of the matching `<local-command-stdout>` line, ANSI
+ * escapes left as-is — the orchestrator's `parseClaudeLocalSetting` is
+ * what strips/interprets both.
+ */
+export interface LocalSettingInfo {
+  setting: "model" | "effort";
+  args: string;
+  stdout: string;
+}
+
+/**
+ * Handler the orchestrator installs to learn that claude itself just
+ * resolved a `/model` or `/effort` local command — fired from
+ * `dispatchLine` on that command's own `<local-command-stdout>` line,
+ * regardless of which path drove it (a typed `/model x` / `/effort x`, a
+ * picker/slider/confirm card answer, the orchestrator's own dropdown
+ * mirror via `sendSlashCommand`, or a terminal-side change the user made
+ * directly) — so `task.model`/`task.effort` can be kept in sync with
+ * claude's own record of the outcome rather than trusting whichever
+ * agetor-side action triggered it. Mirrors `backgroundTaskSettledFn`
+ * exactly.
+ */
+let localSettingChangedFn: ((taskId: string, info: LocalSettingInfo) => void) | null = null;
+export function setLocalSettingChangedHandler(
+  fn: ((taskId: string, info: LocalSettingInfo) => void) | null,
+): ((taskId: string, info: LocalSettingInfo) => void) | null {
+  const prev = localSettingChangedFn;
+  localSettingChangedFn = fn;
+  return prev;
+}
+
+/** Call the local-setting-changed hook, never letting a throwing hook
+ *  reach the tailer — mirrors `fireBackgroundTaskSettled` immediately
+ *  above; the hook runs orchestrator logic (a DB write) we don't control,
+ *  and a bad handler must not take the JSONL tail down. */
+function fireLocalSettingChanged(taskId: string, info: LocalSettingInfo): void {
+  try {
+    localSettingChangedFn?.(taskId, info);
+  } catch (e) {
+    console.error(`[claude-tmux] local-setting-changed hook threw for task ${taskId}:`, e);
+  }
+}
+
 export interface ClaudeLaunchOptions {
   taskId: string;
   /**
@@ -617,15 +666,46 @@ function isLocalCommandStdoutEvent(evt: ParsedJsonlEvent): boolean {
 }
 
 /**
- * Extract the command token (e.g. `"/effort"`) from a JSONL line carrying
- * `<command-name>/effort</command-name>…`, or `null` when `evt` isn't one of
- * the two shapes claude uses to land a local command's name. Claude ALWAYS
- * writes this line immediately before that command's own
- * `<local-command-stdout>` line (verified: claude 2.1.245 spike, both the
- * `user`-wrapped and fresh-session `system`/`subtype:"local_command"`
- * shapes) — this is what lets `dispatchLine` confirm a stdout line actually
- * belongs to the head slot's own command rather than a foreign one (see
- * `SessionState.lastLocalCommandName` and this function's call site).
+ * Extract the raw inner text of a `<local-command-stdout>…</local-command-
+ * stdout>` line — ANSI bold/color escapes left as-is (the orchestrator's
+ * `parseClaudeLocalSetting`, docs/plans/model-effort-local-command-turns.md
+ * §10, is the one that strips them, not this driver). Same two shapes
+ * `isLocalCommandStdoutEvent` recognises. Returns "" when `evt` doesn't
+ * actually carry the tag — this is only ever called after
+ * `isLocalCommandStdoutEvent(evt)` has already confirmed it does, so "" is
+ * unreachable in practice, but the function stays total rather than
+ * assuming the two shape-checks can never drift apart.
+ */
+function extractLocalCommandStdout(evt: ParsedJsonlEvent): string {
+  let content: unknown;
+  if (evt.type === "user" && evt.isMeta !== true) {
+    content = evt.message?.content;
+  } else if (evt.type === "system" && evt.subtype === "local_command") {
+    content = evt.content;
+  } else {
+    return "";
+  }
+  if (typeof content !== "string") return "";
+  return /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/.exec(content)?.[1] ?? "";
+}
+
+/**
+ * Extract BOTH the command token (e.g. `"/effort"`) AND its raw
+ * `<command-args>…</command-args>` payload from a JSONL line carrying
+ * `<command-name>/effort</command-name>\n<command-message>effort</command-
+ * message>\n<command-args>high</command-args>` — `args` is `""` when the
+ * `<command-args>` tag itself is empty (a bare `/model` with no argument),
+ * or when the line carries no `<command-args>` tag at all. Returns `null`
+ * when `evt` isn't one of the two shapes claude uses to land a local
+ * command's name. Claude ALWAYS writes this line immediately before that
+ * command's own `<local-command-stdout>` line (verified: claude 2.1.245
+ * spike, both the `user`-wrapped and fresh-session
+ * `system`/`subtype:"local_command"` shapes) — this is what lets
+ * `dispatchLine` confirm a stdout line actually belongs to the head slot's
+ * own command rather than a foreign one (see `SessionState.
+ * lastLocalCommandName` / `lastLocalCommandArgs` and this function's call
+ * site), and what feeds `args` into `LocalSettingInfo` for the
+ * local-setting-sync seam.
  *
  * Same two shapes `isLocalCommandStdoutEvent` recognises:
  *
@@ -637,7 +717,7 @@ function isLocalCommandStdoutEvent(evt: ParsedJsonlEvent): boolean {
  * Null for: the stdout line itself, the `isMeta:true` caveat, every
  * `assistant` line, and any other shape.
  */
-function localCommandNameOf(evt: ParsedJsonlEvent): string | null {
+function parseLocalCommandLine(evt: ParsedJsonlEvent): { name: string; args: string } | null {
   let content: unknown;
   if (evt.type === "user" && evt.isMeta !== true) {
     content = evt.message?.content;
@@ -647,7 +727,17 @@ function localCommandNameOf(evt: ParsedJsonlEvent): string | null {
     return null;
   }
   if (typeof content !== "string") return null;
-  return /^<command-name>([^<]*)<\/command-name>/.exec(content.trimStart())?.[1] ?? null;
+  const trimmed = content.trimStart();
+  const name = /^<command-name>([^<]*)<\/command-name>/.exec(trimmed)?.[1];
+  if (name === undefined) return null;
+  const args = /<command-args>([^<]*)<\/command-args>/.exec(trimmed)?.[1] ?? "";
+  return { name, args };
+}
+
+/** Thin wrapper over `parseLocalCommandLine` for callers (and existing
+ *  tests) that only need the command token, not its args. */
+function localCommandNameOf(evt: ParsedJsonlEvent): string | null {
+  return parseLocalCommandLine(evt)?.name ?? null;
 }
 
 /**
@@ -2103,6 +2193,19 @@ interface SessionState {
    * Null when no command-name line has been observed yet.
    */
   lastLocalCommandName: string | null;
+  /**
+   * The `<command-args>…</command-args>` payload from the SAME
+   * `<command-name>…</command-name>` line that set `lastLocalCommandName`
+   * (via `parseLocalCommandLine` — empty string when the tag itself is
+   * empty, e.g. a bare `/model` with no argument). Kept in lockstep with
+   * `lastLocalCommandName`: set together, cleared together (`popEndOfTurn`,
+   * the local-command settle stage, `disposeSessionState`). Forwarded as
+   * `LocalSettingInfo.args` when `dispatchLine` fires the local-setting-
+   * changed seam on that command's own `<local-command-stdout>` line — see
+   * `fireLocalSettingChanged`. Null when no command-name line has been
+   * observed yet (distinct from "" — an observed-but-argless command).
+   */
+  lastLocalCommandArgs: string | null;
   /** Watches `<sessionId>/subagents/` for background/sub agents this session
    *  spawns, tailing each into the task's event stream (tagged by subagent id)
    *  for the run panel's read-only tabs. Armed in `attachTailer`, released in
@@ -2273,6 +2376,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     holdUntilIdle: false,
     pendingSlashToken: null,
     lastLocalCommandName: null,
+    lastLocalCommandArgs: null,
     subagentWatcher: null,
     continuationWatchdog: null,
     paneGrowInFlight: false,
@@ -2404,6 +2508,7 @@ function popEndOfTurn(state: SessionState): void {
   // is scoped to the turn that just settled — a fresh command name has to be
   // observed again before another local-command settle can stage.
   state.lastLocalCommandName = null;
+  state.lastLocalCommandArgs = null;
   // A turn resolving through the normal end-turn machinery means any
   // notification-triggered continuation watchdog has nothing left to guard
   // against — cancel it. Safe unconditionally: the watchdog is only ever
@@ -3333,14 +3438,50 @@ function dispatchLine(state: SessionState, line: string): void {
   }
 
   // Mirror the most recent `<command-name>…</command-name>` line's own
-  // command token into `state.lastLocalCommandName` — the identity half of
-  // the local-command settle gate below. Unconditional (not gated on the
-  // head slot at all): a foreign local command mirrored in via
-  // `sendSlashCommand` (which pushes no slot) or folded into an in-flight
-  // turn via `pasteFollowUp` (which carries that turn's ORIGINAL slot) must
-  // still update this, since it's exactly the case the gate exists to catch.
-  const commandName = localCommandNameOf(evt);
-  if (commandName !== null) state.lastLocalCommandName = commandName;
+  // command token AND raw args into `state.lastLocalCommandName` /
+  // `lastLocalCommandArgs` — the identity half of the local-command settle
+  // gate below, plus the payload the local-setting-sync seam (just below)
+  // forwards to the orchestrator. Unconditional (not gated on the head slot
+  // at all): a foreign local command mirrored in via `sendSlashCommand`
+  // (which pushes no slot) or folded into an in-flight turn via
+  // `pasteFollowUp` (which carries that turn's ORIGINAL slot) must still
+  // update this, since it's exactly the case the gate exists to catch. A
+  // stdout line itself never matches `parseLocalCommandLine`'s shape, so
+  // this is a no-op on the very line the seam below reads these fields for
+  // — they retain whatever the command's own preceding `<command-name>`
+  // line set.
+  const localCommandLine = parseLocalCommandLine(evt);
+  if (localCommandLine !== null) {
+    state.lastLocalCommandName = localCommandLine.name;
+    state.lastLocalCommandArgs = localCommandLine.args;
+  }
+
+  // Local-setting sync seam — independent of the settle-staging branch
+  // further down (which additionally gates on `slot.slashCommand`): fires
+  // for a `/model`/`/effort` command's own `<local-command-stdout>` line
+  // regardless of turn-slot identity, because the paths that most need this
+  // signal are exactly the ones with no matching (or no) slot — the
+  // dropdown mirror (`sendSlashCommand`) pushes no slot at all, and a
+  // command folded into an in-flight turn via `pasteFollowUp` carries a
+  // FOREIGN slot. Gating this on `slot.slashCommand` the way the settle
+  // branch does would silently drop those. Never fires for any other local
+  // command (`/cost`, …) — only `/model` and `/effort` carry a task setting
+  // to sync. Skipped on the synthetic `__rebuild__` replay state for the
+  // same reason `fireBackgroundTaskSettled` is gated above: a read-only
+  // JSONL replay for the UI must not re-apply a setting change that already
+  // landed when the run was live (and a REAL reattach's seen-uuid replay
+  // never reaches this point at all — see the early return above).
+  if (
+    state.taskId !== "__rebuild__"
+    && isLocalCommandStdoutEvent(evt)
+    && (state.lastLocalCommandName === "/model" || state.lastLocalCommandName === "/effort")
+  ) {
+    fireLocalSettingChanged(state.taskId, {
+      setting: state.lastLocalCommandName === "/model" ? "model" : "effort",
+      args: state.lastLocalCommandArgs ?? "",
+      stdout: extractLocalCommandStdout(evt),
+    });
+  }
 
   const slot = state.turnQueue[0];
   // A real content line reaching the adopted (still-active) turn means
@@ -3415,6 +3556,7 @@ function dispatchLine(state: SessionState, line: string): void {
     // This command has now been accounted for — clear so a LATER, unrelated
     // local command in the same session can't match against a stale name.
     state.lastLocalCommandName = null;
+    state.lastLocalCommandArgs = null;
   }
 
   // Interrupt force-end: a user-interrupt tool_result (Esc on a modal / Ctrl+C)
@@ -4123,6 +4265,40 @@ function matchSlashConfirmModal(tail: string, kind: "model" | "effort"): ScrapeM
   const nonBlank = tail.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
   if (!nonBlank.some((l) => headerRe.test(l))) return null;
   return m;
+}
+
+/**
+ * Pure predicate: does this pane tail show a modal the scraper would
+ * register a card for? Exactly the matcher union `scrapeOnce` tries, in the
+ * same order (docs/plans/model-effort-local-command-turns.md §10):
+ *
+ *   - `matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)`
+ *     non-null — a numbered / yes-no / slider modal is on screen.
+ *   - `detectAskModal(tail) === "question"` — a live AskUserQuestion
+ *     question screen (the OTHER kind, `"review"`, is deliberately excluded
+ *     here, mirroring `scrapeOnce`'s own `askOnPane` gate: a review screen's
+ *     `❯ 1. Submit answers` / `2. Cancel` already satisfies the numbered-modal
+ *     arm above, so this function would already have returned `true` for it
+ *     via that arm regardless).
+ *   - the FOOTER arm of `matchUnparsableModal(tail, false)` (watchdogArmed
+ *     forced `false` — this function has no `SessionState` to compute
+ *     `stuckTurnFallbackArmed` from, and doesn't need one: the watchdog arm
+ *     exists to catch a turn that's been silently stuck for 60s+, a
+ *     different question from "is a modal drawn on the pane right now").
+ *
+ * Used by `queuePaste`'s modal guard (see `capturePastePane` /
+ * `PASTE_MODAL_GRACE_MS`) to decide whether a pending paste would land IN a
+ * live modal instead of claude's composer — pasting text into a modal
+ * confirms whatever the cursor happens to be on (or is silently swallowed),
+ * neither of which is "deliver this as the next chat message." Naming
+ * mirrors `paneShowsClaudeWorking` / `paneShowsIdleInputBox`: a pane-state
+ * question, not an action.
+ */
+function paneShowsBlockingPrompt(tail: string): boolean {
+  if (matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)) return true;
+  if (detectAskModal(tail) === "question") return true;
+  if (matchUnparsableModal(tail, false)) return true;
+  return false;
 }
 
 /**
@@ -5608,6 +5784,16 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
         bumpActivity(state);
         void queuePaste(opts.taskId, sessionName, deferredPrompt, 0, state, {
           bracketed: true,
+          // The boot poller above already owns deciding when the pane is
+          // safe to paste into: it only reaches this call once
+          // `readPaneMode` confirmed an idle composer (or the readiness
+          // window timed out with no answerable prompt left), re-arming
+          // instead of pasting whenever `activeTmuxPromptsForTask` still has
+          // something pending. A second, independent modal guard here would
+          // be redundant at best — and could withhold the very prompt this
+          // poller already waited (up to `DEFERRED_PROMPT_TIMEOUT_MS`) to
+          // deliver.
+          skipModalGuard: true,
           onPasteFailure: () => {
             // Mirror `sendTurn`'s onPasteFailure idiom exactly: guard against
             // the (theoretical) race where the slot already popped normally
@@ -6091,6 +6277,37 @@ const SLASH_CONFIRM_IDLE_BREAK_TICKS = 2;
 let captureConfirmPane: (state: SessionState) => string = captureTail;
 
 /**
+ * Test seam: how `queuePaste`'s modal guard reads the live pane before
+ * pasting. Production captures the tmux pane tail; the unit suite swaps in
+ * a synthetic pane so it can drive the guard without a real tmux session.
+ * Mirrors `captureConfirmPane` immediately above exactly — a SEPARATE seam,
+ * deliberately: overriding one must never silently redirect the other.
+ */
+let capturePastePane: (state: SessionState) => string = captureTail;
+
+/**
+ * How often `queuePaste`'s modal guard re-captures the pane while a
+ * blocking claude modal (`paneShowsBlockingPrompt`) is showing. Mirrors
+ * `SLASH_CONFIRM_POLL_MS`'s role for `sendSlashCommand`'s confirm poll.
+ */
+const PASTE_MODAL_POLL_MS = 250;
+
+/**
+ * Total window `queuePaste`'s modal guard waits for a blocking modal to
+ * clear before withholding the paste (docs/plans/model-effort-local-
+ * command-turns.md §10). Short on purpose: this grace only needs to cover
+ * a REPAINT — e.g. the brief window right after `sendSlashCommand`'s
+ * auto-confirm step sends its own Enter, before the pane repaints back to
+ * an idle composer — not a genuine wait for the user to answer a card. It
+ * MUST stay short because `dismissTmuxPrompt` (the card click that actually
+ * clears a modal) is serialized on the SAME per-task `queueTmuxOp` chain
+ * this guard runs inside: while the guard is polling, a queued dismiss
+ * click sits behind it, so a long grace here would make answering the very
+ * modal this guard is waiting on feel stuck.
+ */
+const PASTE_MODAL_GRACE_MS = 1_500;
+
+/**
  * Send a slash-command (or any literal keystroke line) to the task's tmux
  * session. The line is pasted via load-buffer + paste-buffer + Enter just like
  * a user prompt, so multi-word commands and embedded spaces survive intact.
@@ -6167,6 +6384,17 @@ export function sendSlashCommand(taskId: string, line: string, opts?: { autoConf
           }
           return;
         }
+        // A DIFFERENT blocking modal than the confirm we're polling for — a
+        // permission prompt that popped mid-turn, an AskUserQuestion, or the
+        // WRONG-kind confirm (`matchSlashConfirmModal` above already ruled
+        // out the matching kind, but a numbered modal with some other header
+        // still satisfies `paneShowsBlockingPrompt`). Never our confirm, and
+        // never safe to press Enter into — that would confirm whatever
+        // that OTHER modal's cursor happens to be on. Leave it for the
+        // scraper's own matcher chain to card in the usual way; bail out of
+        // this poll now instead of spending the rest of the window on a pane
+        // this step isn't going to act on.
+        if (paneShowsBlockingPrompt(tail)) return;
         // Not the confirm (most commonly: the inline no-confirm path already
         // went through) — keep polling. Never send Enter on anything else.
         // Early exit: two consecutive idle-input-box sightings mean claude
@@ -6531,6 +6759,7 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   state.onEndOfTurn = null;
   state.pendingEndTurn = null;
   state.lastLocalCommandName = null;
+  state.lastLocalCommandArgs = null;
   const err = new Error("session killed");
   for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
   // Drop the chain map entry — the identity gate inside `queueTmuxOp`
@@ -6804,6 +7033,11 @@ export const __forTest = {
    *  `isLocalCommandStdoutEvent` and `SessionState.lastLocalCommandName`).
    *  Exposed so the truth table is unit-testable without a live tmux pane. */
   localCommandNameOf,
+  /** Extracts BOTH the command token and its raw `<command-args>` payload
+   *  from a `<command-name>…</command-name>` line (`localCommandNameOf` is
+   *  a thin wrapper over this). Exposed so the args half of the identity
+   *  gate — and `LocalSettingInfo.args` — is unit-testable directly. */
+  parseLocalCommandLine,
   paneShowsIdleInputBox,
   STATUS_BAR_RE,
   IDLE_PROMPT_SEARCH_LINES,
@@ -6813,6 +7047,31 @@ export const __forTest = {
    *  assert on it rather than hardcoding the wording, and so it can be
    *  checked against the other status-prefix sentinels. */
   IDLE_SETTLE_STATUS_TEXT,
+  /** Pure predicate behind `queuePaste`'s modal guard — exactly the set of
+   *  panes the scraper would card (numbered / yes-no / slider modal, a live
+   *  AskUserQuestion question screen, or the footer arm of
+   *  `matchUnparsableModal`). Exposed so its truth table is unit-testable
+   *  without a live tmux pane. */
+  paneShowsBlockingPrompt,
+  /** Tuning constants for `queuePaste`'s modal guard — exposed so tests can
+   *  compute expected poll counts / windows rather than hardcoding them. */
+  PASTE_MODAL_POLL_MS,
+  PASTE_MODAL_GRACE_MS,
+  /** Override how `queuePaste`'s modal guard reads the live pane before
+   *  pasting (production captures the tmux pane tail). Tests inject a
+   *  synthetic modal (or idle) pane so the guard can be driven without a
+   *  real tmux session. Returns the previous reader so the test can restore
+   *  it in `afterEach` (mirrors `setCaptureConfirmPane`). */
+  setCapturePastePane(fn: (state: SessionState) => string): (state: SessionState) => string {
+    const prev = capturePastePane;
+    capturePastePane = fn;
+    return prev;
+  },
+  /** Orchestrator injection seam for claude's own `/model`/`/effort`
+   *  outcome — re-exported (it's already a top-level `export`) so tests
+   *  can install/restore it via the same `__forTest` surface as every other
+   *  seam in this file. */
+  setLocalSettingChangedHandler,
 };
 
 /**
@@ -6935,7 +7194,15 @@ function pastePromptSync(
  *  gone, session vanished mid-op), not just "nothing happened yet". */
 type PasteOutcome =
   | { ok: true }
-  | { ok: false; op: "load-buffer" | "paste-buffer" | "send-keys"; stderr: string };
+  | {
+      ok: false;
+      /** `"modal-guard"` is synthesized by `queuePaste` itself (never by
+       *  `pastePromptSync`) when the paste is withheld because a live claude
+       *  modal is still on the pane after `PASTE_MODAL_GRACE_MS` — see the
+       *  guard block at the top of `queuePaste`'s queued op. */
+      op: "load-buffer" | "paste-buffer" | "send-keys" | "modal-guard";
+      stderr: string;
+    };
 
 /**
  * Settle window after a slash-command paste before releasing the chain.
@@ -7090,6 +7357,21 @@ function queueTmuxOp(
  * sits unsubmitted. The deferred Enter is re-gated through
  * `stillCurrent()` so a `dropSession` landing during the gap can't
  * leak the keystroke into a respawned pane.
+ *
+ * **Modal guard** (docs/plans/model-effort-local-command-turns.md §10):
+ * right before either paste path runs, when `expectedState` is set and
+ * `opts.skipModalGuard` isn't, the queued op polls `capturePastePane`
+ * (`PASTE_MODAL_POLL_MS`, up to `PASTE_MODAL_GRACE_MS`) until
+ * `paneShowsBlockingPrompt` reports the pane clear. This is what stops a
+ * paste from ever typing Enter into a live claude modal — the confirm the
+ * user hasn't answered yet would swallow the pasted text and/or confirm
+ * whatever the cursor happens to be on, neither of which is "deliver this
+ * as the next chat message." If the modal is still there after the grace
+ * window, the paste is WITHHELD (no `pastePromptSync` call at all): a
+ * `status` chunk + console log surface it, and `opts.onPasteFailure` fires
+ * with `{ ok: false, op: "modal-guard" }` exactly like any other paste
+ * failure, so a caller with a turn slot (`sendTurn`) settles it as
+ * failed instead of leaving the run stuck `running`.
  */
 function queuePaste(
   taskId: string,
@@ -7106,6 +7388,20 @@ function queuePaste(
      *  run stuck `running` forever. `reportPasteFailure` (the visible-chunk
      *  + log side of this) always runs regardless of whether this is set. */
     onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void;
+    /**
+     * Skip the modal guard for this paste. Set ONLY by the boot-time
+     * deferred-prompt paste in `spawnClaudeViaTmux`: that poller already
+     * confirms `readPaneMode(state) !== null` (composer idle) before
+     * arming its own paste, and separately re-checks
+     * `activeTmuxPromptsForTask` and re-arms a fresh window rather than
+     * pasting over an unanswered startup dialog — i.e. it already owns
+     * deciding when the pane is safe to paste into, so a second,
+     * independent guard here would be redundant at best and could stall
+     * the very paste that poller already waited to send. Every other
+     * `queuePaste` caller (`sendTurn`, `pasteFollowUp`, `sendSlashCommand`,
+     * `/plan`, the reattached/generic `writeInput` paths) keeps the guard.
+     */
+    skipModalGuard?: boolean;
   } = {},
 ): Promise<void> {
   // Non-bracketed path: load-buffer + paste-buffer + delete-buffer +
@@ -7144,6 +7440,31 @@ function queuePaste(
   // failure that still succeeds on `.ok` behaves exactly as before this
   // change; only genuine `.ok === false` results take the new path.
   return queueTmuxOp(taskId, async (stillCurrent) => {
+    // Modal guard — see this function's doc. Runs BEFORE either paste path,
+    // and only when there's a real SessionState to gate on (the identity
+    // check `queueTmuxOp` already relies on) and the caller hasn't opted
+    // out. Loop rather than a single check: an auto-confirm's Enter (or any
+    // other keystroke) can leave the pane mid-repaint for a tick or two —
+    // the grace window covers that without waiting anywhere near long
+    // enough to feel like the paste silently vanished.
+    if (expectedState && !opts.skipModalGuard) {
+      const guardDeadline = Date.now() + PASTE_MODAL_GRACE_MS;
+      while (paneShowsBlockingPrompt(capturePastePane(expectedState))) {
+        if (Date.now() >= guardDeadline) {
+          const outcome: Extract<PasteOutcome, { ok: false }> =
+            { ok: false, op: "modal-guard", stderr: "claude modal on pane" };
+          const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
+          const message =
+            "paste withheld: claude is waiting on a prompt — answer the card (or the terminal) and resend";
+          onChunk?.("status", message);
+          console.error(`[claude-tmux] ${message} (task ${taskId})`);
+          opts.onPasteFailure?.(outcome);
+          return;
+        }
+        await Bun.sleep(PASTE_MODAL_POLL_MS);
+        if (!stillCurrent()) return;
+      }
+    }
     if (opts.bracketed) {
       const result = pastePromptSync(sessionName, text, { bracketed: true, skipEnter: true });
       if (!result.ok) {
