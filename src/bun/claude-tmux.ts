@@ -1522,9 +1522,10 @@ export async function dismissTmuxPrompt(
     /**
      * Which arrow pair drives the cursor — `"vertical"` (Down/Up, the
      * default when omitted) for a numbered/yes-no modal, `"horizontal"`
-     * (Right/Left) for a slider-style widget. Accepted but unused for now —
-     * every matcher today registers a vertical-nav prompt; a follow-up task
-     * wires this through `matchSliderModal` and drives Right/Left below.
+     * (Right/Left) for a slider-style widget — claude 2.1.245's bare
+     * `/effort` slider, which reads "←/→ to adjust · Enter to confirm"
+     * (`matchSliderModal`, registered with `nav: "horizontal"`). Every other
+     * matcher today registers a vertical-nav (or nav-less y/N) prompt.
      */
     nav?: "vertical" | "horizontal";
   },
@@ -1540,7 +1541,11 @@ export async function dismissTmuxPrompt(
   if (targetIndex < 0) return false;
   const useArrowNav = typeof ctx.cursorIndex === "number";
   const delta = useArrowNav ? targetIndex - ctx.cursorIndex! : 0;
-  const arrow = delta >= 0 ? "Down" : "Up";
+  // `ctx.nav === "horizontal"` is the slider's own cursor axis — claude's
+  // Ink slider only responds to Left/Right, not Up/Down. Every other
+  // matcher leaves `nav` undefined/"vertical" and keeps the original
+  // Down/Up pair.
+  const arrow = ctx.nav === "horizontal" ? (delta >= 0 ? "Right" : "Left") : (delta >= 0 ? "Down" : "Up");
   const stepCount = Math.abs(delta);
   // Routed through `queueTmuxOp` so our navigation + Enter sequence can't
   // interleave with an in-flight `queuePaste` for the same session — a
@@ -3519,6 +3524,14 @@ interface ScrapeMatch {
    *  index 0 (option 1), but the model picker / auth re-prompts open
    *  with the cursor on the *current* value, anywhere in the list. */
   cursorIndex?: number;
+  /** Which arrow-key pair `dismissTmuxPrompt` presses to walk the cursor
+   *  from `cursorIndex` to the chosen index. `undefined` ⇒ `"vertical"`
+   *  (`Down`/`Up` — every numbered/yes-no modal). `"horizontal"` ⇒
+   *  `Right`/`Left` — claude 2.1.245's `/effort` slider, which reads
+   *  "←/→ to adjust · Enter to confirm" (`matchSliderModal`). Threaded
+   *  through `registerTmuxPrompt` → `TmuxPromptRequest.nav` (interactions.ts)
+   *  → the server route → `dismissTmuxPrompt`'s `ctx.nav`. */
+  nav?: "vertical" | "horizontal";
   /** Stable hash that survives across consecutive scrapes as long as the
    *  modal stays on screen unchanged. */
   fingerprint: string;
@@ -3688,6 +3701,123 @@ function sha1(s: string): string {
   return createHash("sha1").update(s).digest("hex").slice(0, 16);
 }
 
+/** Track-line shape of claude 2.1.245's bare `/effort` slider — a run of
+ *  `─`/`┆` characters with exactly one `▲` cursor marker, captured verbatim:
+ *  `──────────────────────────────▲────────────┆──────────────────`
+ *  (docs/plans/model-effort-local-command-turns.md §2). The character class
+ *  on either side of the `▲` excludes `▲` itself, so a second marker on the
+ *  same line fails the whole-line match — "exactly one `▲`" falls out of the
+ *  regex shape rather than needing a separate count check. */
+const SLIDER_TRACK_RE = /^\s*[─┆]*▲[─┆]*\s*$/;
+
+/** Footer claude's slider draws below the label row — captured verbatim as
+ *  `←/→ to adjust · Enter to confirm · Esc to cancel` (plan §2). One of the
+ *  slider matcher's three required, independent signals (plan §3.4/§7). */
+const SLIDER_FOOTER_RE = /←\/→ to adjust/;
+
+/**
+ * Recognise claude 2.1.245's bare `/effort` slider widget — captured
+ * verbatim (docs/plans/model-effort-local-command-turns.md §2):
+ *
+ *   Effort
+ *
+ *                              Faster                                                 Smarter
+ *                              ──────────────────────────────▲────────────┆──────────────────
+ *                              low     medium     high     xhigh      max       ultracode
+ *                                                                           xhigh + workflows
+ *
+ *    ←/→ to adjust · Enter to confirm · Esc to cancel
+ *
+ * (cursor on `xhigh` at `▲` column 59; a second capture with the `▲` at
+ * column 49 lands on `high`). Unlike `matchNumberedModal`, there is no
+ * numbered text on screen at all — the effort levels are read off the label
+ * row beneath the track and keyed `"1".."N"` positionally so the existing
+ * generic tmux_prompt card can render them as ordinary buttons; clicking one
+ * drives `dismissTmuxPrompt` through its horizontal nav (`nav: "horizontal"`
+ * below) instead of the default vertical Down/Up.
+ *
+ * Three independent signals, ALL required — mirrors the discipline of
+ * `matchUnparsableModal`'s footer/watchdog arms, where a single loose signal
+ * would risk matching ordinary transcript output:
+ *   (a) a track line matching `SLIDER_TRACK_RE` (exactly one `▲`), searched
+ *       from the bottom of the tail so a stale frame further up a long pane
+ *       can't win over a live one (same tail-anchored posture every other
+ *       matcher here takes);
+ *   (b) the next NON-BLANK line below it is a label row of at least two
+ *       tokens matching `[a-z][a-z0-9+]*`, separated by at least two spaces
+ *       — the sub-label row under the last entry (`xhigh + workflows`) sits
+ *       on a DIFFERENT, later line and is never consulted;
+ *   (c) a footer matching `SLIDER_FOOTER_RE` within the last 3 non-blank
+ *       tail lines — the same window `matchNumberedModal`'s high-confidence
+ *       check and `matchUnparsableModal`'s footer arm use.
+ *
+ * `cursorIndex` is the label whose horizontal centre column is nearest the
+ * `▲` column (ties broken toward the lower index via strict `<`) — the `▲`
+ * sits between labels far more often than exactly under one, so "nearest"
+ * is what makes the mapping stable across every discrete slider position.
+ * `highConfidence: true`: unlike `matchNumberedModal`'s footer fast-path
+ * (extra confidence layered on an already-parsed choice set), the footer
+ * here (signal c) is a REQUIRED condition for a match to exist at all, so a
+ * first sighting is already as trustworthy as a stable one — same reasoning
+ * `matchUnparsableModal`'s doc gives for why IT is never `highConfidence`,
+ * applied in the opposite direction. `nav: "horizontal"` is what tells
+ * `dismissTmuxPrompt` to send `Right`/`Left` instead of `Down`/`Up`.
+ */
+function matchSliderModal(tail: string): ScrapeMatch | null {
+  const lines = tail.split("\n");
+
+  // (a) Track line.
+  let trackIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (SLIDER_TRACK_RE.test(lines[i]!)) { trackIdx = i; break; }
+  }
+  if (trackIdx < 0) return null;
+  const arrowCol = lines[trackIdx]!.indexOf("▲");
+  if (arrowCol < 0) return null; // unreachable — SLIDER_TRACK_RE guarantees one
+
+  // (b) Label row — the next non-blank line below the track.
+  let labelIdx = -1;
+  for (let i = trackIdx + 1; i < lines.length; i++) {
+    if (lines[i]!.trim().length > 0) { labelIdx = i; break; }
+  }
+  if (labelIdx < 0) return null;
+  const labelLine = lines[labelIdx]!;
+  const tokens = labelLine.split(/\s{2,}/).map((s) => s.trim()).filter((s) => s.length > 0);
+  if (tokens.length < 2) return null;
+  if (!tokens.every((t) => /^[a-z][a-z0-9+]*$/.test(t))) return null;
+  // Column of each label's start on the label line, walked left-to-right so
+  // the search-from cursor always advances past the token just found.
+  const labels: Array<{ label: string; start: number }> = [];
+  let searchFrom = 0;
+  for (const t of tokens) {
+    const idx = labelLine.indexOf(t, searchFrom);
+    if (idx < 0) return null; // unreachable — every token came from this line
+    labels.push({ label: t, start: idx });
+    searchFrom = idx + t.length;
+  }
+
+  // (c) Footer within the last 3 non-blank tail lines.
+  const nonBlank = lines.filter((l) => l.trim().length > 0);
+  if (!nonBlank.slice(-3).some((l) => SLIDER_FOOTER_RE.test(l))) return null;
+
+  // Nearest-centre cursor mapping. Strict `<` keeps a tie on the lower index.
+  let cursorIndex = 0;
+  let bestDist = Infinity;
+  labels.forEach((l, i) => {
+    const center = l.start + l.label.length / 2;
+    const dist = Math.abs(center - arrowCol);
+    if (dist < bestDist) {
+      bestDist = dist;
+      cursorIndex = i;
+    }
+  });
+
+  const choices: TmuxPromptChoice[] = labels.map((l, i) => ({ key: String(i + 1), label: l.label }));
+  const paneText = lines.slice(-12).join("\n").trimEnd();
+  const fingerprint = sha1(`slider:${labels.map((l) => l.label).join("/")}|@${cursorIndex}`);
+  return { paneText, choices, cursorIndex, fingerprint, highConfidence: true, nav: "horizontal" };
+}
+
 /**
  * Footer phrasings claude's Ink modals draw. Every entry is evidence-backed —
  * a false hit here gates the user's composer, so this allow-list only carries
@@ -3740,12 +3870,17 @@ function stuckTurnFallbackArmed(p: {
 }
 
 /**
- * Last-resort fallback for a pane no other matcher parsed: an unnumbered
- * arrow-key widget, a free-text/device-code prompt, a single-option modal
- * (`matchNumberedModal` requires ≥2), a prose confirmation, or a genuinely
- * wedged turn. Registers a `tmux_prompt` with empty `choices` — there's no
- * keystroke this scraper can plan, so the UI's job is just "tell the user to
- * go answer it in the attached terminal", not drive an answer back.
+ * Last-resort fallback for a pane no other matcher parsed: strictly after
+ * `matchNumberedModal`, `matchYesNoModal`, AND `matchSliderModal` have all
+ * had a chance (both chain sites — the runtime scraper and the boot poller —
+ * try this only once none of the three real matchers hit). What's left by
+ * then is an unnumbered arrow-key widget, a free-text/device-code prompt, a
+ * single-option modal (`matchNumberedModal` requires ≥2), a slider-shaped
+ * pane missing one of `matchSliderModal`'s three required signals, a prose
+ * confirmation, or a genuinely wedged turn. Registers a `tmux_prompt` with
+ * empty `choices` — there's no keystroke this scraper can plan, so the UI's
+ * job is just "tell the user to go answer it in the attached terminal", not
+ * drive an answer back.
  *
  * Fires under either of two independent arms, both gated at the call site on
  * `!paneShowsClaudeWorking(tail)` (a real prompt/wizard replaces the working
@@ -3811,6 +3946,63 @@ function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch
   const paneText = paneLines.join("\n");
   const fingerprint = sha1(`unparsable:${paneText}`);
   return { paneText, choices: [], cursorIndex: 0, fingerprint, unparsable: true };
+}
+
+/**
+ * Recognise claude 2.1.245's mid-conversation confirm modal for `/model` /
+ * `/effort` — captured verbatim (docs/plans/model-effort-local-command-
+ * turns.md §2), and pops only when the value actually changes AND an
+ * assistant turn has run since the last switch:
+ *
+ *   Change effort level?
+ *   Your next response will be slower and use more tokens
+ *
+ *   This conversation is cached for the current effort level. Switching to
+ *   low means the full history gets re-read on your next message.
+ *
+ *   ❯ 1. Yes, switch to low
+ *     2. No, go back
+ *
+ *   Switch model?
+ *   Your next response will be slower and use more tokens
+ *
+ *   This conversation is cached for the current model. Switching to Opus 5
+ *   means the full history gets re-read on your next message.
+ *
+ *   ❯ 1. Yes, switch to Opus 5
+ *     2. No, go back
+ *
+ * Built ON `matchNumberedModal` (same footer-less numbered shape) rather
+ * than re-parsing the pane from scratch, so any future tightening of that
+ * matcher's choice/cursor extraction is inherited automatically. This is
+ * `sendSlashCommand`'s auto-accept step, NOT the runtime/boot scrape chains —
+ * `matchNumberedModal` itself still parses this pane there too, so the
+ * confirm still shows up as an ordinary numbered `tmux_prompt` card for a
+ * user-typed `/model`/`/effort` (plan §3.5/§7: "user-typed keeps relaying the
+ * confirm as a normal numbered card").
+ *
+ * Requires ALL of, so this can never fire on an unrelated numbered modal (a
+ * permission prompt's option 1 never reads "Yes, switch to ", and neither
+ * header string appears anywhere else in claude's UI — plan §7):
+ *   - `matchNumberedModal(tail)` matches at all;
+ *   - exactly 2 choices;
+ *   - the cursor is on choice 0 ("Yes, switch to …" is always claude's
+ *     pre-selected default here);
+ *   - choice 0's label starts with `Yes, switch to `;
+ *   - a header line among the tail's trimmed non-blank lines equal to
+ *     exactly `Switch model?` (kind `"model"`) or `Change effort level?`
+ *     (kind `"effort"`) — anchored `^…\?$`, not a substring test.
+ */
+function matchSlashConfirmModal(tail: string, kind: "model" | "effort"): ScrapeMatch | null {
+  const m = matchNumberedModal(tail);
+  if (!m) return null;
+  if (m.cursorIndex !== 0) return null;
+  if (m.choices.length !== 2) return null;
+  if (!/^Yes, switch to /.test(m.choices[0]!.label)) return null;
+  const headerRe = kind === "model" ? /^Switch model\?$/ : /^Change effort level\?$/;
+  const nonBlank = tail.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+  if (!nonBlank.some((l) => headerRe.test(l))) return null;
+  return m;
 }
 
 /**
@@ -4399,7 +4591,7 @@ function scrapeOnce(state: SessionState): void {
   const paneIdle = paneShowsIdleInputBox(tail);
   const match = (claudeIsWriting || (askOnPane && !askUnrecoverable))
     ? null
-    : (matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? (paneWorking ? null : matchUnparsableModal(tail, stuckTurnFallbackArmed({
+    : (matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail) ?? (paneWorking ? null : matchUnparsableModal(tail, stuckTurnFallbackArmed({
         turnInFlight: turnInFlight(state),
         lastJsonlAppendAt: state.lastJsonlAppendAt,
         now,
@@ -4520,6 +4712,7 @@ function scrapeOnce(state: SessionState): void {
     paneText: match.paneText,
     choices: match.choices,
     cursorIndex: match.cursorIndex,
+    nav: match.nav,
     fingerprint: match.fingerprint,
     unparsable: match.unparsable,
   });
@@ -5359,7 +5552,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           // real startup wizard has no working chrome, so it still surfaces;
           // the `MODAL_NOTICE_RE` auto-continue veto lives inside
           // `matchUnparsableModal` itself, so it already applies here too.
-          const generic = matchNumberedModal(tail) ?? matchYesNoModal(tail)
+          const generic = matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)
             ?? (paneShowsClaudeWorking(tail) ? null : matchUnparsableModal(tail, false));
           if (!generic) { lastGenericFingerprint = null; continue; }
           // External dismissal: a previously surfaced startup prompt whose
@@ -5394,6 +5587,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
             paneText: generic.paneText,
             choices: generic.choices,
             cursorIndex: generic.cursorIndex,
+            nav: generic.nav,
             fingerprint: generic.fingerprint,
             unparsable: generic.unparsable,
           });
@@ -5701,6 +5895,31 @@ export function pasteFollowUp(taskId: string, prompt: string): boolean {
   return true;
 }
 
+/** How often `sendSlashCommand`'s auto-confirm step re-captures the pane
+ *  while waiting for claude's "Switch model?" / "Change effort level?"
+ *  confirm (2.1.245) to render. Mirrors `modePollIntervalMs`'s role for
+ *  `cycleToMode` — short enough that the common inline (no-confirm) path,
+ *  which spends the WHOLE window polling a pane that never shows the modal,
+ *  stays cheap. */
+const SLASH_CONFIRM_POLL_MS = 200;
+
+/** Total window `sendSlashCommand`'s auto-confirm step waits for the confirm
+ *  modal before giving up as a no-op. Claude only pops this confirm when the
+ *  value actually changed AND an assistant turn ran since the last switch
+ *  (plan §2) — the inline path with no confirm at all is the common case, so
+ *  most calls spend this entire window polling nothing. Long enough to
+ *  outlast claude's render latency for the confirm without stalling the next
+ *  queued tmux op for long. */
+const SLASH_CONFIRM_WINDOW_MS = 2_000;
+
+/**
+ * Test seam: how `sendSlashCommand`'s auto-confirm step reads the live pane.
+ * Production captures the tmux pane tail (mirrors `captureModePane`'s role
+ * for `cycleToMode`); the unit suite swaps in a synthetic pane so it can
+ * drive the confirm-detection step without a real claude session.
+ */
+let captureConfirmPane: (state: SessionState) => string = captureTail;
+
 /**
  * Send a slash-command (or any literal keystroke line) to the task's tmux
  * session. The line is pasted via load-buffer + paste-buffer + Enter just like
@@ -5714,11 +5933,29 @@ export function pasteFollowUp(taskId: string, prompt: string): boolean {
  * the conversation context across config changes.
  *
  * @param opts `autoConfirm` names which config dimension this mirror is for
- * (`"model"` / `"effort"`) so a follow-up can auto-accept claude's "Switch
+ * (`"model"` / `"effort"`) so a follow-up auto-accepts claude's "Switch
  * model?" / "Change effort level?" confirm on 2.1.245 — the user already
- * chose via the dropdown, so that confirm shouldn't need a second click.
- * Accepted but INERT for now: nothing reads it yet, a follow-up task wires
- * up the confirm-detection + auto-accept step inside the queued paste op.
+ * chose via the Task Details dropdown, so that confirm shouldn't need a
+ * second click. Left `undefined` for a user-typed `/model x` / `/effort x`:
+ * claude asked, so the user answers via the ordinary numbered `tmux_prompt`
+ * card `matchNumberedModal` still registers for it in the scrape chains.
+ *
+ * When `opts.autoConfirm` is set, a follow-up op is enqueued through the
+ * SAME per-task tmux-op chain (`queueTmuxOp` reads `pasteChains.get(taskId)`,
+ * which the `queuePaste` call just above set — calling `queueTmuxOp` again
+ * synchronously, with no `await` in between, chains this step directly
+ * behind the paste AND its `slashCommandSettleMs` settle window without this
+ * function needing to await anything itself). That step polls the pane
+ * every `SLASH_CONFIRM_POLL_MS` for up to `SLASH_CONFIRM_WINDOW_MS`; on the
+ * first `matchSlashConfirmModal(tail, kind)` hit it stamps the fingerprint
+ * answered (`markTmuxPromptAnswered` — so a `tmux_prompt` the scraper may
+ * have raced into existence for it is not ghost-registered on the next
+ * tick) and sends Enter, then resolves any already-registered prompt for
+ * that exact fingerprint immediately (`answerTmuxPrompt(..., { key:
+ * "__external__" })`) rather than waiting for the next scrape's auto-cancel
+ * sweep to notice it's gone. Anything else on the pane — the inline
+ * no-confirm path is the COMMON case on 2.1.245 — is a no-op: Enter is
+ * NEVER sent on unmatched pane content, and the window just elapses.
  */
 export function sendSlashCommand(taskId: string, line: string, opts?: { autoConfirm?: "model" | "effort" }): boolean {
   const state = sessions.get(taskId);
@@ -5730,6 +5967,32 @@ export function sendSlashCommand(taskId: string, line: string, opts?: { autoConf
   // silently dropped — see the `Turn Ended Bug` repro where a
   // `/code-review` paste sat invisible for 49s after a model change.
   void queuePaste(taskId, state.sessionName, line, slashCommandSettleMs, state);
+  if (opts?.autoConfirm) {
+    const kind = opts.autoConfirm;
+    void queueTmuxOp(taskId, async (stillCurrent) => {
+      const attempts = Math.ceil(SLASH_CONFIRM_WINDOW_MS / SLASH_CONFIRM_POLL_MS);
+      for (let i = 0; i < attempts; i++) {
+        if (!stillCurrent()) return;
+        const tail = captureConfirmPane(state);
+        const match = matchSlashConfirmModal(tail, kind);
+        if (match) {
+          markTmuxPromptAnswered(taskId, match.fingerprint);
+          if (!stillCurrent()) return;
+          if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
+          for (const pending of activeTmuxPromptsForTask(taskId)) {
+            if (pending.fingerprint === match.fingerprint) {
+              answerTmuxPrompt(pending.id, { key: "__external__" });
+            }
+          }
+          return;
+        }
+        // Not the confirm (most commonly: the inline no-confirm path already
+        // went through) — keep polling. Never send Enter on anything else.
+        if (i < attempts - 1) await Bun.sleep(SLASH_CONFIRM_POLL_MS);
+      }
+      // Window elapsed with no confirm modal — the common case. No-op.
+    }, state);
+  }
   return true;
 }
 
@@ -6170,6 +6433,13 @@ export const __forTest = {
   matchYesNoModal,
   matchStartupConsentDialog,
   clearedStabilityGate,
+  /** The bare `/effort` slider matcher plus its two tuning regexes — exposed
+   *  so the scraper test suite can pin the nearest-centre cursor mapping and
+   *  the three-signal (track/label/footer) requirement without a live tmux
+   *  pane. */
+  matchSliderModal,
+  SLIDER_TRACK_RE,
+  SLIDER_FOOTER_RE,
   /** Fallback matcher for prompts no real matcher parsed, plus its pure
    *  watchdog-arm decision and tuning constants — exposed so the scraper
    *  test suite can assert footer/watchdog firing and non-firing without a
@@ -6178,6 +6448,11 @@ export const __forTest = {
   stuckTurnFallbackArmed,
   MODAL_FOOTER_RE,
   STUCK_TURN_FALLBACK_MS,
+  /** `/model` / `/effort` mid-conversation confirm-modal matcher used by
+   *  `sendSlashCommand`'s auto-confirm step — exposed so a test can assert
+   *  it fires only for the matching kind, never the other, and never on the
+   *  model picker or a numbered modal whose cursor sits on "No". */
+  matchSlashConfirmModal,
   /** Working-chrome detection (2.1.239) that gates both fallback arms, the
    *  auto-continue notice veto, and the unparsable stability streak length —
    *  exposed so the truth table is unit-testable without a live tmux pane. */
@@ -6249,6 +6524,21 @@ export const __forTest = {
     return prev;
   },
   readPaneMode,
+  /** Override how `sendSlashCommand`'s auto-confirm step reads the live pane
+   *  (production captures the tmux pane tail). Tests inject a synthetic
+   *  confirm-modal pane so the confirm-poll step can be driven without a
+   *  real tmux session. Returns the previous reader so the test can restore
+   *  it in `afterEach` (mirrors `setCaptureModePane`). */
+  setCaptureConfirmPane(fn: (state: SessionState) => string): (state: SessionState) => string {
+    const prev = captureConfirmPane;
+    captureConfirmPane = fn;
+    return prev;
+  },
+  /** Tuning constants for `sendSlashCommand`'s auto-confirm poll — exposed
+   *  so tests can compute expected attempt counts / windows rather than
+   *  hardcoding them. */
+  SLASH_CONFIRM_POLL_MS,
+  SLASH_CONFIRM_WINDOW_MS,
   /** Max attempts cycleToMode will make before reporting `verification
    *  mismatch`. Exposed so tests can assert against the constant rather
    *  than hardcoding "3". */
