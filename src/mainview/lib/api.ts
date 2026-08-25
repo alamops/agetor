@@ -214,9 +214,6 @@ export interface PendingTmuxPrompt {
   runId: string;
   paneText: string;
   choices: Array<{ key: string; label: string }>;
-  /** Which arrow-key pair the server drives to move the cursor (informational
-   *  only here — the server does the actual driving). */
-  nav?: "vertical" | "horizontal";
   fingerprint: string;
   createdAt: number;
   /** True when the scraper couldn't parse this modal into choices (footer-

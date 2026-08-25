@@ -436,3 +436,91 @@ test("answer* paths emit on the resolved broadcaster", async () => {
   expect(seen.map((s) => s.kind)).toEqual(["ask_questions", "tmux_prompt", "tmux_prompt"]);
   expect(seen.map((s) => s.id)).toEqual([q.id, t.id, t2.id]);
 });
+
+/* ── nav passthrough (claude 2.1.245 /effort slider) ──────────────────── */
+
+test("registerTmuxPrompt with nav:\"horizontal\" carries it through req, broadcast, and listPendingForTask, and it survives JSON serialization", async () => {
+  const { registerTmuxPrompt, listPendingForTask, answerTmuxPrompt, setBroadcaster } =
+    await import("./interactions.ts");
+  const broadcasted: unknown[] = [];
+  setBroadcaster((req) => broadcasted.push(req));
+
+  const { id, req, answer } = registerTmuxPrompt({
+    taskId: "tNavHorizontal", runId: "rNH",
+    paneText: "←/→ to adjust · Enter to confirm",
+    choices: [{ key: "1", label: "low" }, { key: "2", label: "high" }],
+    cursorIndex: 1,
+    nav: "horizontal",
+    fingerprint: "fp-nav-horizontal",
+  });
+
+  expect(req.nav).toBe("horizontal");
+
+  // Broadcast payload carries the flag.
+  expect(broadcasted).toHaveLength(1);
+  expect((broadcasted[0] as { nav?: string }).nav).toBe("horizontal");
+
+  // listPendingForTask (the SSE-replay / snapshot path) carries it too.
+  const pending = listPendingForTask("tNavHorizontal");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { nav?: string }).nav).toBe("horizontal");
+
+  // Must survive JSON round-tripping the way the SSE path serializes events.
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect(roundTripped.nav).toBe("horizontal");
+
+  answerTmuxPrompt(id, { key: "2" });
+  await answer;
+});
+
+test("registerTmuxPrompt without nav leaves it undefined (back-compat; dismissal path treats undefined as vertical)", async () => {
+  const { registerTmuxPrompt, listPendingForTask, answerTmuxPrompt } =
+    await import("./interactions.ts");
+
+  const { id, req, answer } = registerTmuxPrompt({
+    taskId: "tNavUndefined", runId: "rNU",
+    paneText: "Do you want to proceed?",
+    choices: [{ key: "1", label: "Yes" }, { key: "2", label: "No" }],
+    fingerprint: "fp-nav-undefined",
+  });
+
+  expect(req.nav).toBeUndefined();
+
+  const pending = listPendingForTask("tNavUndefined");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { nav?: string }).nav).toBeUndefined();
+
+  // Round-tripping through JSON must not invent the key (JSON.stringify
+  // drops `undefined` properties, matching how the SSE payload would look).
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect("nav" in roundTripped).toBe(false);
+
+  answerTmuxPrompt(id, { key: "1" });
+  await answer;
+});
+
+test("registerTmuxPrompt with nav:\"vertical\" explicitly is preserved as \"vertical\"", async () => {
+  const { registerTmuxPrompt, listPendingForTask, answerTmuxPrompt } =
+    await import("./interactions.ts");
+
+  const { id, req, answer } = registerTmuxPrompt({
+    taskId: "tNavVertical", runId: "rNV",
+    paneText: "Choose an option:",
+    choices: [{ key: "1", label: "A" }, { key: "2", label: "B" }],
+    cursorIndex: 0,
+    nav: "vertical",
+    fingerprint: "fp-nav-vertical",
+  });
+
+  expect(req.nav).toBe("vertical");
+
+  const pending = listPendingForTask("tNavVertical");
+  expect(pending).toHaveLength(1);
+  expect((pending[0] as { nav?: string }).nav).toBe("vertical");
+
+  const roundTripped = JSON.parse(JSON.stringify(pending[0]));
+  expect(roundTripped.nav).toBe("vertical");
+
+  answerTmuxPrompt(id, { key: "1" });
+  await answer;
+});
