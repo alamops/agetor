@@ -115,6 +115,12 @@ export interface TmuxPromptRequest {
    *  anywhere. Undefined for prompts where arrow nav doesn't apply
    *  (y/N modals — the literal `y`/`n` keystroke goes in directly). */
   cursorIndex?: number;
+  /** Which arrow-key pair the dismissal path presses to walk the cursor
+   *  from `cursorIndex` to the chosen index. `undefined`/`"vertical"` ⇒
+   *  `Down`/`Up` (Ink select-input: permission modals, numbered pickers).
+   *  `"horizontal"` ⇒ `Right`/`Left` (claude 2.1.245's `/effort` slider,
+   *  which reads "←/→ to adjust · Enter to confirm"). */
+  nav?: "vertical" | "horizontal";
   /** Stable hash of the matched block — used to debounce duplicate
    *  registrations across consecutive scrapes and to detect external
    *  dismissal (the prompt disappeared from the pane). */
@@ -282,6 +288,7 @@ export function registerTmuxPrompt(args: {
   paneText: string;
   choices: TmuxPromptChoice[];
   cursorIndex?: number;
+  nav?: "vertical" | "horizontal";
   fingerprint: string;
   unparsable?: boolean;
 }): { id: string; req: TmuxPromptRequest; answer: Promise<TmuxPromptAnswer> } {
@@ -303,6 +310,7 @@ export function registerTmuxPrompt(args: {
     paneText: args.paneText,
     choices: args.choices,
     cursorIndex: args.cursorIndex,
+    nav: args.nav,
     fingerprint: args.fingerprint,
     createdAt: Date.now(),
     unparsable: args.unparsable,

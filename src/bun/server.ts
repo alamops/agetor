@@ -4207,6 +4207,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const delivered = await dismissTmuxPrompt(pending.taskId, key, {
             choices: pending.choices,
             cursorIndex: pending.cursorIndex,
+            nav: pending.nav,
           });
           if (!delivered) {
             return json(

@@ -524,7 +524,7 @@ test("firing a watchdog whose armed slot is no longer the active turn is a no-op
       const displaced = state.turnQueue.shift();
       expect(displaced).toBe(armed!.slot);
       let bResolved = false;
-      const bSlot = { onChunk: () => {}, resolve: () => { bResolved = true; }, reject: () => {} };
+      const bSlot = { onChunk: () => {}, resolve: () => { bResolved = true; }, reject: () => {}, slashCommand: null };
       state.turnQueue.push(bSlot as unknown as (typeof state.turnQueue)[number]);
 
       __forTest.fireContinuationWatchdog(state);

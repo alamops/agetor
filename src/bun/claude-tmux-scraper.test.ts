@@ -729,6 +729,7 @@ const ALL_ARMED = {
   now: WATCHDOG_NOW,
   paneWorking: false,
   askCardLive: false,
+  paneIdle: false,
 };
 
 test("stuckTurnFallbackArmed — all conditions true → armed", () => {

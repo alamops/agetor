@@ -1539,11 +1539,16 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
       if (!refreshed) emitMatcherRefreshFailure(taskId, cwd);
     }
   }
+  // claude 2.1.245 pops a "Switch model?" / "Change effort level?" Yes/No
+  // confirm mid-conversation when the value actually changes. The user
+  // already made the choice in the dropdown, so the driver auto-accepts
+  // that specific modal (and only that modal) rather than leaving a card
+  // for them to click through for a decision they've already made.
   if (before.model !== after.model && after.model) {
-    sendSlashCommand(taskId, `/model ${toClaudeModelArg(after.model)}`);
+    sendSlashCommand(taskId, `/model ${toClaudeModelArg(after.model)}`, { autoConfirm: "model" });
   }
   if (before.effort !== after.effort && after.effort) {
-    sendSlashCommand(taskId, `/effort ${after.effort}`);
+    sendSlashCommand(taskId, `/effort ${after.effort}`, { autoConfirm: "effort" });
   }
 }
 

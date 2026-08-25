@@ -578,6 +578,45 @@ function isEndOfTurnEvent(evt: ParsedJsonlEvent): boolean {
 }
 
 /**
+ * True for a JSONL line that is a local slash command's OWN terminal
+ * output — `<local-command-stdout>…</local-command-stdout>` — the only
+ * signal a `/model`/`/effort` turn ever produces. Claude never follows one
+ * with an `assistant`/`stop_reason:"end_turn"` line (verified: claude
+ * 2.1.245 spike, 0 end_turn lines across three captured transcripts of
+ * `/model <id>`, bare `/model`, and `/effort <id>`). Used by `dispatchLine`
+ * to stage a settle for the turn — see that call site for the `TurnSlot.
+ * slashCommand` gate that keeps this from firing on the wrong turn.
+ *
+ * Two shapes, matching the two JSONL forms claude 2.1.245 emits for a local
+ * command:
+ *
+ *   1. `type:"user"`, `isMeta` NOT `true`, string `message.content` whose
+ *      TRIMMED text starts with `<local-command-stdout>` — the common case
+ *      (every command after the session's first).
+ *   2. `type:"system"`, `subtype:"local_command"`, string top-level
+ *      `content` CONTAINING `<local-command-stdout>` — the first-command-
+ *      in-a-fresh-session variant, where claude hasn't yet switched to the
+ *      `user`-wrapped shape and instead emits a flat envelope with no
+ *      `message` wrapper.
+ *
+ * False for: the `isMeta:true` `<local-command-caveat>` breadcrumb claude
+ * injects just before running the command (a note, not the result — see
+ * `mapParsedEventToChunks`'s isMeta branch, which silences it entirely); the
+ * `<command-name>…</command-name>` line the command itself lands on; any
+ * `tool_result` array; and every `assistant` line.
+ */
+function isLocalCommandStdoutEvent(evt: ParsedJsonlEvent): boolean {
+  if (evt.type === "user" && evt.isMeta !== true) {
+    const content = evt.message?.content;
+    return typeof content === "string" && content.trimStart().startsWith("<local-command-stdout>");
+  }
+  if (evt.type === "system" && evt.subtype === "local_command") {
+    return typeof evt.content === "string" && evt.content.includes("<local-command-stdout>");
+  }
+  return false;
+}
+
+/**
  * True when `next` proves that a staged end_turn was spurious — i.e. the
  * turn is still in progress. Two cases:
  *
@@ -894,8 +933,19 @@ function mapParsedEventToChunks(
         if (imageSourceMetaPath(text) !== null) {
           return { endOfTurn: false, lineUuid: uuid };
         }
-        // Strip a leading wrapper tag (`<local-command-caveat>`, `<task-notification>`,
-        // …) so the breadcrumb reads as prose rather than raw markup.
+        // Local-command caveat: claude injects this isMeta entry right
+        // before running a `/model`/`/effort`/… local command —
+        // `<local-command-caveat>Caveat: The messages below were generated
+        // by the user while running local commands. DO NOT respond to
+        // these messages…</local-command-caveat>`. It's claude's note to
+        // itself, not user-relevant — silence it entirely, same treatment
+        // as the image marker just above, rather than stripping the tag and
+        // surfacing the caveat prose as a status breadcrumb.
+        if (text.trimStart().startsWith("<local-command-caveat>")) {
+          return { endOfTurn: false, lineUuid: uuid };
+        }
+        // Strip a leading wrapper tag (`<task-notification>`, …) so the
+        // breadcrumb reads as prose rather than raw markup.
         // Split on any newline form — tmux/claude can leak `\r`-only
         // separators into synthetic entries (same root cause as the
         // human-turn CR normalization above), and `split("\n")` alone
@@ -1046,6 +1096,21 @@ function mapParsedEventToChunks(
       // "permission-mode: auto" chips don't spam the stream after every turn.
       if (evt.permissionMode && evt.permissionMode !== lastPermissionMode) {
         onChunk("status", `${PERMISSION_MODE_STATUS_PREFIX}${evt.permissionMode}`, uuid);
+      }
+      // Local-command twin: the FIRST local command run in a fresh session
+      // arrives as `type:"system", subtype:"local_command"` with a FLAT
+      // top-level `content` (no `message` wrapper) — every later command in
+      // the same session uses the `user`-shaped envelope the `case "user"`
+      // branch above already renders. Render this flat variant as a `user`
+      // chunk too (CR-normalised like the human-turn path — tmux can leak
+      // `\r`-only line endings into these lines the same way it does for
+      // real prompts) so the webview's command-message parser produces the
+      // identical command/command-output bubbles regardless of which shape
+      // claude happened to use. See `isLocalCommandStdoutEvent` for the
+      // matching settle-detection half of this.
+      if (evt.type === "system" && evt.subtype === "local_command"
+        && typeof evt.content === "string" && evt.content.length > 0) {
+        onChunk("user", evt.content.replace(/\r\n?/g, "\n"), uuid);
       }
       // Independent `if` (not `else if`): a mode-bearing event and a
       // turn-duration event are conceptually unrelated fields on the same
@@ -1451,7 +1516,18 @@ export function getCurrentPermissionMode(taskId: string): string | null {
 export async function dismissTmuxPrompt(
   taskId: string,
   key: string,
-  ctx: { choices: TmuxPromptChoice[]; cursorIndex?: number },
+  ctx: {
+    choices: TmuxPromptChoice[];
+    cursorIndex?: number;
+    /**
+     * Which arrow pair drives the cursor — `"vertical"` (Down/Up, the
+     * default when omitted) for a numbered/yes-no modal, `"horizontal"`
+     * (Right/Left) for a slider-style widget. Accepted but unused for now —
+     * every matcher today registers a vertical-nav prompt; a follow-up task
+     * wires this through `matchSliderModal` and drives Right/Left below.
+     */
+    nav?: "vertical" | "horizontal";
+  },
 ): Promise<boolean> {
   const state = sessions.get(taskId);
   if (!state) return false;
@@ -1848,6 +1924,18 @@ interface SessionState {
    *  sighting IS the whole trigger (no parsed choice set behind it), so a 1–2
    *  tick blip from an animating modal or a spinner blink must never card. */
   scrapeUnparsableStreak: number;
+  /** Consecutive scrape ticks the idle-settle condition (turn in flight,
+   *  quiet past `STUCK_TURN_FALLBACK_MS`, pane idle at the input box, no
+   *  ask card, no live tmux prompt for the task) has held. Mirrors
+   *  `scrapeUnparsableStreak`'s stability gate exactly — held to
+   *  `UNPARSABLE_STABILITY_TICKS` before `signalIdleSettle` fires, so a
+   *  single transient idle-looking frame can't settle a run that's actually
+   *  still busy. Reset to 0 on every tick the condition doesn't hold
+   *  (`scrapeOnce`), and wherever `scrapeUnparsableStreak` itself is reset
+   *  (`markTmuxPromptAnswered`, `disposeSessionState`) — an answered prompt
+   *  or a torn-down session both mean whatever streak was accruing no
+   *  longer applies. */
+  scrapeIdleSettleStreak: number;
   /** `Date.now()` stamp of the most recent successful JSONL append the
    *  flusher dispatched. The scraper consults it to (a) suppress
    *  matches that happened while claude was actively writing (the
@@ -1990,6 +2078,27 @@ interface TurnSlot {
   /** Resolves the SpawnedAgent.done promise on this turn's end_turn. */
   resolve: ((code: number) => void) | null;
   reject: ((err: Error) => void) | null;
+  /**
+   * First whitespace-delimited token of THIS turn's own opening prompt, iff
+   * its first line starts with `/` (via `slashTokenOf`) — null otherwise.
+   * Set at the turn's own push site: the initial spawn prompt
+   * (`spawnClaudeViaTmux`'s `initialSlot`) and `sendTurn`'s fresh slot. Left
+   * `null` for a slot that was never pushed FOR a human-typed prompt of its
+   * own — the adopted-continuation slot (`maybeAdoptContinuation`, which
+   * fires off claude's own follow-up content/notifications, not a prompt we
+   * sent) and the reattach/test helper slot.
+   *
+   * Read by `dispatchLine` to gate the local-command settle: a
+   * `<local-command-stdout>` line only ends the CURRENT head slot's turn
+   * when that slot's own prompt was the slash command in question — see
+   * `isLocalCommandStdoutEvent`'s call site. This is the safety valve that
+   * keeps a `/effort x` folded into a real in-flight turn via
+   * `pasteFollowUp` (which carries the ORIGINAL turn's slot, not a fresh
+   * one) from ever settling that turn early, and keeps the dropdown
+   * mirror's `sendSlashCommand` (which pushes no slot at all) from being
+   * able to settle anything.
+   */
+  slashCommand: string | null;
 }
 
 const sessions = new Map<string, SessionState>(); // taskId → state
@@ -2082,6 +2191,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     scrapeLastPaneText: null,
     scrapeLastFingerprint: null,
     scrapeUnparsableStreak: 0,
+    scrapeIdleSettleStreak: 0,
     lastJsonlAppendAt: 0,
     lastIdleScrapeAt: 0,
     recentlyAnsweredFingerprints: new Map(),
@@ -2971,7 +3081,10 @@ function maybeAdoptContinuation(
   // unchanged.
   if (!hooks) return;
 
-  const adopted: TurnSlot = { onChunk: hooks.onChunk, resolve: null, reject: null };
+  // slashCommand: null — this slot was never pushed for a prompt WE sent
+  // (it's adopted off claude's own follow-up content or a task-notification
+  // it noticed on its own), so it can never gate the local-command settle.
+  const adopted: TurnSlot = { onChunk: hooks.onChunk, resolve: null, reject: null, slashCommand: null };
   const done = new Promise<number>((resolve, reject) => {
     adopted.resolve = resolve;
     adopted.reject = reject;
@@ -3170,6 +3283,33 @@ function dispatchLine(state: SessionState, line: string): void {
       emitBanner: true,
       stagedAt: Date.now(),
     };
+  } else if (slot?.slashCommand && isLocalCommandStdoutEvent(evt)) {
+    // Local-command settle: a local command's `<local-command-stdout>` line
+    // is its OWN terminal signal — no assistant/end_turn line ever follows
+    // one (see `isLocalCommandStdoutEvent`'s doc). Gated on the HEAD SLOT's
+    // OWN prompt (`TurnSlot.slashCommand`, set at the turn's push site via
+    // `slashTokenOf`), not merely "a slash command appeared somewhere" — that
+    // gate is the safety valve: a `/effort x` folded into a REAL in-flight
+    // turn via `pasteFollowUp` carries that turn's ORIGINAL slot (whose own
+    // `slashCommand` is null, or names a different command), so this can
+    // never settle the wrong turn early; and the dropdown mirror's
+    // `sendSlashCommand` paste path pushes no slot at all, so it can't
+    // settle anything either. Reuses the existing confirm-or-idle-fire
+    // machinery unchanged: the next line fires this staged pending unless
+    // `isEndTurnContinuation` says otherwise (moot in practice — a local
+    // command's stdout is never a same-message continuation target), and
+    // `flush`'s idle-fire after END_TURN_IDLE_FIRE_MS closes it out when the
+    // stdout line is the last thing written. No "turn complete" banner —
+    // there's nothing to divide from; the user just watched the command's
+    // own output print inline (contrast `signalIdleSettle`, which DOES emit
+    // one, since that settle is agetor's own judgment call, not visible in
+    // claude's output).
+    state.pendingEndTurn = {
+      messageId: null,
+      uuid,
+      emitBanner: false,
+      stagedAt: Date.now(),
+    };
   }
 
   // Interrupt force-end: a user-interrupt tool_result (Esc on a modal / Ctrl+C)
@@ -3213,7 +3353,9 @@ export function rebuildEventsFromJsonl(text: string, onChunk: ChunkHandler): voi
     sessionName: "__rebuild__",
     cwd: "/",
     jsonlPath: "/__rebuild__",
-    turnQueue: [{ onChunk, resolve: null, reject: null }],
+    // slashCommand: null — a read-only replay of a finished session's JSONL
+    // has no "current prompt" of its own to gate a settle on.
+    turnQueue: [{ onChunk, resolve: null, reject: null, slashCommand: null }],
     lastChunk: onChunk,
   });
   for (const line of text.split("\n")) {
@@ -3566,7 +3708,7 @@ const MODAL_FOOTER_RE = /esc to cancel|enter to confirm|enter to continue/i;
 const STUCK_TURN_FALLBACK_MS = 60_000;
 
 /** Pure decision for the watchdog arm of `matchUnparsableModal` — exposed via
- *  `__forTest` so the in-flight/quiet/working/ask truth table is unit-
+ *  `__forTest` so the in-flight/quiet/working/ask/idle truth table is unit-
  *  testable without a live tmux pane. True only when ALL of: a turn is
  *  actually in flight (there's a "running" run to protect), the session has
  *  written JSONL before (a `0` timestamp means we've never seen a turn
@@ -3574,20 +3716,27 @@ const STUCK_TURN_FALLBACK_MS = 60_000;
  *  pane shows claude working (see `paneShowsClaudeWorking`) is FALSE (a
  *  long-running tool call, a background-agent wait, or a live shell is busy,
  *  not stuck — that chrome repaints even when no JSONL line has landed yet),
- *  and no AskUserQuestion card/collection is already live (that path owns the
- *  pane and has its own give-up ladder, see `askFallbackAllowed`). */
+ *  no AskUserQuestion card/collection is already live (that path owns the
+ *  pane and has its own give-up ladder, see `askFallbackAllowed`), and the
+ *  pane is NOT idle at claude's input box (`paneShowsIdleInputBox`) — an idle
+ *  input box is proof the turn is over, not a stuck/unparsable modal, so
+ *  carding it would be wrong; `scrapeOnce`'s separate idle-settle net
+ *  (`signalIdleSettle`) closes that case out instead. Signature kept honest
+ *  about every input it's actually gated on, same posture as `paneWorking`. */
 function stuckTurnFallbackArmed(p: {
   turnInFlight: boolean;
   lastJsonlAppendAt: number;
   now: number;
   paneWorking: boolean;
   askCardLive: boolean;
+  paneIdle: boolean;
 }): boolean {
   return p.turnInFlight
     && p.lastJsonlAppendAt !== 0
     && p.now - p.lastJsonlAppendAt > STUCK_TURN_FALLBACK_MS
     && !p.paneWorking
-    && !p.askCardLive;
+    && !p.askCardLive
+    && !p.paneIdle;
 }
 
 /**
@@ -4044,6 +4193,57 @@ function paneShowsClaudeWorking(tail: string): boolean {
   return nonBlank.slice(-WORKING_CHROME_WINDOW_LINES).some((l) => WORKING_LINE_RE.test(l));
 }
 
+/** Bottom-of-pane status-bar text when claude is idle at its input box.
+ *  Evidence (2.1.245, five captured variants — the trailing `· ← 1 agent`
+ *  suffix is optional, present only when a background agent is running, so
+ *  it is NOT anchored here):
+ *    `⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`
+ *    `⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`
+ *    `⏸ manual mode on · ? for shortcuts · ← 1 agent` (no shift+tab hint)
+ *    `⏵⏵ accept edits on (shift+tab to cycle) · ← 1 agent`
+ *    `⏸ plan mode on (shift+tab to cycle) · ← 1 agent`
+ *  Anchored on the leading mode glyph (`⏵⏵`/`⏸`) plus either cycle hint —
+ *  narrower than `readPaneMode`'s per-mode regexes (which must tell the five
+ *  modes APART) because this only has to answer "is the bottom line a status
+ *  bar at all", not which mode it names. Used only in combination with the
+ *  bare-prompt-line check in `paneShowsIdleInputBox`, never alone — see that
+ *  function's doc for how the pairing (plus the bounded window) keeps this
+ *  from mis-firing on a working pane whose OWN status bar can carry the same
+ *  `(shift+tab to cycle)` phrase with an `esc to interrupt` segment spliced
+ *  in (that variant is caught by `paneShowsClaudeWorking` at both of
+ *  `scrapeOnce`'s call sites, which is what those callers gate on too). */
+const STATUS_BAR_RE = /^\s*(?:⏵⏵|⏸)\s.*(?:\(shift\+tab to cycle\)|\? for shortcuts)/;
+
+/** How many trailing NON-BLANK pane lines `paneShowsIdleInputBox` inspects.
+ *  The idle chrome is exactly `{ top border, bare "❯ " prompt, bottom
+ *  border, status bar }` — 4 rows, no slack needed — and every modal
+ *  captured (numbered picker, effort slider, both "Switch model?"/"Change
+ *  effort level?" confirms, the auto-mode wizard) REPLACES the input box +
+ *  status bar entirely rather than co-rendering with it. Keeping the window
+ *  this tight is what guarantees a status-bar-shaped line sitting in
+ *  scrollback ABOVE a real modal can never be mistaken for the live one. */
+const IDLE_CHROME_WINDOW_LINES = 4;
+
+/** True when the pane's last `IDLE_CHROME_WINDOW_LINES` non-blank lines show
+ *  claude idle at its input box: a status-bar line matching `STATUS_BAR_RE`
+ *  with a bare prompt line (`❯` and nothing else typed) ABOVE it within that
+ *  same window. Both signals are required together — `STATUS_BAR_RE` alone
+ *  cannot tell an idle status bar apart from a working one whose text merely
+ *  echoes into scrollback, but the bounded window plus the bare-prompt
+ *  requirement means a real modal (which replaces both the prompt row and
+ *  the status bar) can never satisfy this. Gates the stuck-turn watchdog
+ *  (`stuckTurnFallbackArmed`'s `paneIdle` param) — claude idle at the input
+ *  box is proof a turn ended without ever writing an `end_turn` line, not a
+ *  stuck/unparsable modal; see `signalIdleSettle` for how that gets settled
+ *  instead of carded. */
+function paneShowsIdleInputBox(tail: string): boolean {
+  const nonBlank = tail.split("\n").filter((l) => l.trim().length > 0);
+  const window = nonBlank.slice(-IDLE_CHROME_WINDOW_LINES);
+  const barIndex = window.findIndex((l) => STATUS_BAR_RE.test(l));
+  if (barIndex === -1) return false;
+  return window.slice(0, barIndex).some((l) => /^\s*❯\s*$/.test(l));
+}
+
 /**
  * Normalize a captured pane tail into the form used for the "did the pane
  * meaningfully change" activity signal in `scrapeOnce`. Mirrors the
@@ -4192,6 +4392,11 @@ function scrapeOnce(state: SessionState): void {
   // signature stays honest about what it was actually gated on, rather than
   // silently hardcoding `false` at the call site.
   const paneWorking = paneShowsClaudeWorking(tail);
+  // Claude idle at its own input box (see `paneShowsIdleInputBox`) is proof a
+  // turn is over even when no `end_turn` JSONL line ever confirmed it — used
+  // below to keep the watchdog arm from carding an idle pane, and to drive
+  // the idle-settle net that closes such a turn out instead.
+  const paneIdle = paneShowsIdleInputBox(tail);
   const match = (claudeIsWriting || (askOnPane && !askUnrecoverable))
     ? null
     : (matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? (paneWorking ? null : matchUnparsableModal(tail, stuckTurnFallbackArmed({
@@ -4200,7 +4405,41 @@ function scrapeOnce(state: SessionState): void {
         now,
         paneWorking,
         askCardLive: state.askCardId !== null,
+        paneIdle,
       }))));
+
+  // Idle-settle net: the SAME conditions that would arm the stuck-turn
+  // watchdog above, but with the pane genuinely idle at the input box
+  // (`paneIdle`) instead of showing a stuck/unparsable modal, and with no
+  // tmux_prompt already registered for this task (a real prompt still needs
+  // an answer, not a settle out from under the user). Recomputed with
+  // `paneIdle: false` so this reads the "other" watchdog conditions
+  // (in-flight, quiet past `STUCK_TURN_FALLBACK_MS`, not working, no ask
+  // card) independent of the idle gate — `paneIdle` above already carries
+  // the real idle signal for this branch. Held to the same
+  // `UNPARSABLE_STABILITY_TICKS` stability bar `matchUnparsableModal` uses,
+  // so a single transient idle-looking frame can't settle a run that's
+  // actually still busy. This is the version-proof net for any turn that
+  // never gets an `end_turn` line — see `signalIdleSettle`.
+  const idleSettleEligible = paneIdle
+    && activeTmuxPromptsForTask(state.taskId).length === 0
+    && stuckTurnFallbackArmed({
+      turnInFlight: turnInFlight(state),
+      lastJsonlAppendAt: state.lastJsonlAppendAt,
+      now,
+      paneWorking,
+      askCardLive: state.askCardId !== null,
+      paneIdle: false,
+    });
+  if (idleSettleEligible) {
+    state.scrapeIdleSettleStreak += 1;
+    if (state.scrapeIdleSettleStreak >= UNPARSABLE_STABILITY_TICKS) {
+      state.scrapeIdleSettleStreak = 0;
+      signalIdleSettle(state);
+    }
+  } else {
+    state.scrapeIdleSettleStreak = 0;
+  }
 
   // Auto-cancel: any registered prompt for this task whose fingerprint
   // is NOT what we see now has been dismissed (either externally via
@@ -4306,6 +4545,9 @@ export function markTmuxPromptAnswered(taskId: string, fingerprint: string): voi
   // racing the registration.
   state.scrapeLastFingerprint = null;
   state.scrapeUnparsableStreak = 0;
+  // Same defensive re-stabilise for the idle-settle streak — an answered
+  // prompt means whatever idle-looking run was accruing no longer applies.
+  state.scrapeIdleSettleStreak = 0;
 }
 
 /** Install or refresh the scraper interval for a session. Called from
@@ -4573,6 +4815,44 @@ function signalUnknownCommand(state: SessionState): void {
     state.onEndOfTurn = null;
     handler();
   }
+}
+
+/**
+ * Settle an in-flight turn because the watchdog observed claude idle at its
+ * own input box (`paneShowsIdleInputBox`) for `STUCK_TURN_FALLBACK_MS`, with
+ * `scrapeIdleSettleStreak` stable for `UNPARSABLE_STABILITY_TICKS` — proof
+ * the turn is over even though no `end_turn` JSONL line ever confirmed it.
+ * This is the version-proof net: any future case where claude stops emitting
+ * an `end_turn` for a turn that's genuinely finished (not just today's local
+ * commands, which `dispatchLine` already settles directly off their own
+ * `<local-command-stdout>` line — see that call site) gets closed out here
+ * instead of stranding the run `running` forever behind the old "card an
+ * idle pane" behavior.
+ *
+ * Mirrors `signalUnknownCommand`'s settle mechanics but simpler: clear the
+ * staging fields, emit "turn complete" through the live handler — UNLIKE the
+ * local-command stdout settle, this one DOES earn the banner, since the run
+ * is being closed by agetor's own judgment call rather than by something the
+ * user already watched claude print — then `popEndOfTurn`, which itself
+ * clears `holdUntilIdle` / `pendingSlashToken` / the continuation watchdog
+ * and advances the queue (resolves the `SpawnedAgent.done` promise, or fires
+ * the reattach `onEndOfTurn` callback).
+ *
+ * Called from `scrapeOnce`'s idle-settle net once `scrapeIdleSettleStreak`
+ * reaches `UNPARSABLE_STABILITY_TICKS` — see that call site for the full
+ * gating (turn in flight, quiet past `STUCK_TURN_FALLBACK_MS`, pane
+ * genuinely idle at the input box, no ask card, no live tmux prompt for the
+ * task).
+ */
+function signalIdleSettle(state: SessionState): void {
+  state.pendingEndTurn = null;
+  state.holdUntilIdle = false;
+  state.pendingSlashToken = null;
+  clearContinuationWatchdog(state);
+  const slot = state.turnQueue[0];
+  const onChunk = slot?.onChunk ?? state.lastChunk ?? (() => {});
+  onChunk("status", "turn complete");
+  popEndOfTurn(state);
 }
 
 /** Whether a turn is currently in flight on this session — a live head slot
@@ -4855,7 +5135,12 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
   // only reliable "has this launch been cancelled?" signal — and (b) settle
   // this exact slot on a paste failure instead of leaving the run `running`
   // forever.
-  const initialSlot: TurnSlot = { onChunk: opts.onChunk, resolve: null, reject: null };
+  // slashCommand seeded null here and filled in a few lines down (both the
+  // embedded-argv and deferred-paste branches below), once we actually know
+  // the initial prompt text — see `TurnSlot.slashCommand`'s doc. Safe: this
+  // is plain synchronous object mutation, so it's settled before any JSONL
+  // line for this turn could possibly reach `dispatchLine`.
+  const initialSlot: TurnSlot = { onChunk: opts.onChunk, resolve: null, reject: null, slashCommand: null };
   const done = new Promise<number>((resolve, reject) => {
     initialSlot.resolve = resolve;
     initialSlot.reject = reject;
@@ -4880,7 +5165,10 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
     const embeddedPrompt = argv.length >= 2 && argv[argv.length - 2] === "--"
       ? argv[argv.length - 1]
       : undefined;
-    state.pendingSlashToken = embeddedPrompt ? slashTokenOf(embeddedPrompt) : null;
+    const embeddedSlashCommand = embeddedPrompt ? slashTokenOf(embeddedPrompt) : null;
+    state.pendingSlashToken = embeddedSlashCommand;
+    // Same derivation feeds the turn slot itself — see `TurnSlot.slashCommand`.
+    initialSlot.slashCommand = embeddedSlashCommand;
   }
 
   // Large-prompt delivery: `buildCommand` (agents.ts) omits any prompt over
@@ -4948,7 +5236,13 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
         // arms right after SessionState is created instead, since its
         // "paste" already happened via the launch argv before this function
         // even returned.)
-        state.pendingSlashToken = slashTokenOf(deferredPrompt);
+        const deferredSlashCommand = slashTokenOf(deferredPrompt);
+        state.pendingSlashToken = deferredSlashCommand;
+        // Same derivation feeds the turn slot itself — see `TurnSlot.slashCommand`.
+        // Safe to set here, still ahead of the actual paste below: nothing
+        // can dispatch a JSONL line for this turn before the prompt is
+        // physically delivered into the pane.
+        initialSlot.slashCommand = deferredSlashCommand;
         // Prompt paste is a life signal — matters here specifically because
         // boot (and the readiness wait above) can take up to
         // DEFERRED_PROMPT_TIMEOUT_MS, well past the construction-time stamp
@@ -5326,7 +5620,9 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
   // (a turn already in flight folds through `pasteFollowUp` instead, which
   // pushes no slot), so `turnQueue` is empty before this push and the slot
   // we just pushed is unambiguously the one at the head.
-  const slot: TurnSlot = { onChunk, resolve: null, reject: null };
+  // slashCommand reuses the exact value just computed for pendingSlashToken
+  // above (`slashTokenOf(prompt)`, same input) — see `TurnSlot.slashCommand`.
+  const slot: TurnSlot = { onChunk, resolve: null, reject: null, slashCommand: state.pendingSlashToken };
   const done = new Promise<number>((resolve, reject) => {
     slot.resolve = resolve;
     slot.reject = reject;
@@ -5416,8 +5712,15 @@ export function pasteFollowUp(taskId: string, prompt: string): boolean {
  * session: `/model <id>`, `/effort <id>`. (Permission-mode changes don't have
  * a slash command — see `cycleToMode`.) Keeping the session alive preserves
  * the conversation context across config changes.
+ *
+ * @param opts `autoConfirm` names which config dimension this mirror is for
+ * (`"model"` / `"effort"`) so a follow-up can auto-accept claude's "Switch
+ * model?" / "Change effort level?" confirm on 2.1.245 — the user already
+ * chose via the dropdown, so that confirm shouldn't need a second click.
+ * Accepted but INERT for now: nothing reads it yet, a follow-up task wires
+ * up the confirm-detection + auto-accept step inside the queued paste op.
  */
-export function sendSlashCommand(taskId: string, line: string): boolean {
+export function sendSlashCommand(taskId: string, line: string, opts?: { autoConfirm?: "model" | "effort" }): boolean {
   const state = sessions.get(taskId);
   if (!state) return false;
   // Settle delay after slash commands: claude's TUI takes ~hundreds of ms
@@ -5769,6 +6072,7 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   clearContinuationWatchdog(state);
   state.scrapeLastFingerprint = null;
   state.scrapeUnparsableStreak = 0;
+  state.scrapeIdleSettleStreak = 0;
   // Release the subagent watcher's fs.watch + poll timer. Read-only teardown:
   // this stops us TAILING the subagent files, never the agent itself.
   state.subagentWatcher?.detach();
@@ -5839,7 +6143,10 @@ export const __forTest = {
   uninstallSession(taskId: string) { sessions.delete(taskId); },
   pushTurnSlot(state: SessionState, onChunk: ChunkHandler): Promise<number> {
     return new Promise<number>((resolve, reject) => {
-      state.turnQueue.push({ onChunk, resolve, reject });
+      // slashCommand: null — this generic test helper drives non-slash-turn
+      // scenarios; a dedicated local-command test constructs its own slot
+      // (or extends this) rather than overloading this shared helper.
+      state.turnQueue.push({ onChunk, resolve, reject, slashCommand: null });
     });
   },
   flushSync,
@@ -6005,6 +6312,17 @@ export const __forTest = {
    *  doc comment above). Exposed so tests can compute the expected key for a
    *  given payload rather than hardcoding a hash literal. */
   syntheticNotificationUuid,
+  /** Local-command turn settle — the pure stdout-line detector
+   *  (`isLocalCommandStdoutEvent`), the idle-input-box pane detector
+   *  (`paneShowsIdleInputBox`) plus its tuning regex/window constant, and the
+   *  idle-settle signal (`signalIdleSettle`) itself — exposed so the
+   *  local-command and idle-settle-net truth tables are unit-testable
+   *  without a live tmux pane or a real claude JSONL stream. */
+  isLocalCommandStdoutEvent,
+  paneShowsIdleInputBox,
+  STATUS_BAR_RE,
+  IDLE_CHROME_WINDOW_LINES,
+  signalIdleSettle,
 };
 
 /**

@@ -60,7 +60,7 @@ test(
     state.pendingEndTurn = { messageId: "m1", uuid: "u1", emitBanner: true, stagedAt: Date.now() };
     state.holdUntilIdle = true;
     const watchdogTimer = setTimeout(() => {}, 60_000);
-    state.continuationWatchdog = { timer: watchdogTimer, slot: { onChunk: () => {}, resolve: null, reject: null } };
+    state.continuationWatchdog = { timer: watchdogTimer, slot: { onChunk: () => {}, resolve: null, reject: null, slashCommand: null } };
     // Run association is exercised here too — don't rely on the probe being
     // unset (a leaked orchestrator-installed probe from another test file in
     // the shared `bun test` process would otherwise report "no active run"
