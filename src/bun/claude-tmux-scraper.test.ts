@@ -28,11 +28,12 @@ const {
   unparsableStreakCleared,
   matchSliderModal,
   SLIDER_TRACK_RE,
+  SLIDER_TRACK_MIN_CHARS,
   SLIDER_FOOTER_RE,
   matchSlashConfirmModal,
   paneShowsIdleInputBox,
   STATUS_BAR_RE,
-  IDLE_CHROME_WINDOW_LINES,
+  IDLE_PROMPT_SEARCH_LINES,
 } = __forTest;
 
 /** Real tmux pane captures of claude-code 2.1.161's AskUserQuestion modal —
@@ -1274,6 +1275,36 @@ test("matchSliderModal — track + label present but no ←/→ to adjust footer
   expect(matchSliderModal(pane)).toBeNull();
 });
 
+/** Same slider shape as `EFFORT_SLIDER_XHIGH_PANE` (real label row + real
+ *  footer), but with a caller-supplied track line — lets the
+ *  SLIDER_TRACK_MIN_CHARS tests isolate signal (a) without also having to
+ *  reconstruct the label/footer rows. */
+function sliderPaneWithTrack(track: string): string {
+  return `   Effort
+
+                             Faster                                                 Smarter
+                             ${track}
+                             low     medium     high     xhigh      max       ultracode
+                                                                          xhigh + workflows
+
+   ←/→ to adjust · Enter to confirm · Esc to cancel`;
+}
+
+test("matchSliderModal — a lone ▲ (no real track) never looks like the slider, even with a real label row and footer", () => {
+  expect(matchSliderModal(sliderPaneWithTrack("▲"))).toBeNull();
+});
+
+test("SLIDER_TRACK_MIN_CHARS — a 9-char track (one short of the minimum) still fails to parse", () => {
+  const track = "─".repeat(SLIDER_TRACK_MIN_CHARS - 1) + "▲";
+  expect(track.length).toBe(SLIDER_TRACK_MIN_CHARS); // sanity: 9 dashes + the ▲ itself
+  expect(matchSliderModal(sliderPaneWithTrack(track))).toBeNull();
+});
+
+test("SLIDER_TRACK_MIN_CHARS — a 10-char track (meets the minimum) parses normally", () => {
+  const track = "─".repeat(SLIDER_TRACK_MIN_CHARS) + "▲";
+  expect(matchSliderModal(sliderPaneWithTrack(track))).not.toBeNull();
+});
+
 test("matchSliderModal — a working pane (spinner + esc-to-interrupt) never looks like the slider", () => {
   const pane = `✳ Working… (esc to interrupt · 12s · 1.2k tokens)`;
   expect(matchSliderModal(pane)).toBeNull();
@@ -1289,6 +1320,10 @@ ${EFFORT_SLIDER_HIGH_PANE}
 
 ${idlePane("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent")}`;
   expect(matchSliderModal(pane)).toBeNull();
+});
+
+test("SLIDER_TRACK_MIN_CHARS is 10", () => {
+  expect(SLIDER_TRACK_MIN_CHARS).toBe(10);
 });
 
 test("SLIDER_TRACK_RE — matches a track line with exactly one ▲, not a bare border or a two-marker line", () => {
@@ -1398,12 +1433,11 @@ test("paneShowsIdleInputBox — false for both slash confirms", () => {
   expect(paneShowsIdleInputBox(MODEL_CONFIRM_PANE)).toBe(false);
 });
 
-test("paneShowsIdleInputBox — false for a working pane (spinner above the status bar, no bare-prompt row above it)", () => {
-  // STATUS_BAR_RE alone can't distinguish an idle status bar from a working
-  // one carrying the same "(shift+tab to cycle)" hint with "esc to interrupt"
-  // spliced in (see STATUS_BAR_RE's doc comment) — it's the bare-"❯"-row
-  // requirement inside the same 4-line window that keeps this false without
-  // this function needing to also consult paneShowsClaudeWorking.
+test("paneShowsIdleInputBox — false for a working pane (spinner above the status bar, whose bar carries 'esc to interrupt')", () => {
+  // A working pane's OWN status bar carries the same "(shift+tab to cycle)"
+  // hint STATUS_BAR_RE matches, with "esc to interrupt" spliced in (see
+  // STATUS_BAR_RE's doc comment) — that's rejected directly (check b), so
+  // this reads false regardless of whether a bare "❯" happens to sit above it.
   const pane = `✽ Frosting… (2m 52s · ↓ 12.1k tokens)
 
   ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 1 agent`;
@@ -1417,14 +1451,69 @@ ${EFFORT_CONFIRM_PANE}`;
   expect(paneShowsIdleInputBox(pane)).toBe(false);
 });
 
-test("IDLE_CHROME_WINDOW_LINES is 4 (top border, bare prompt, bottom border, status bar)", () => {
-  expect(IDLE_CHROME_WINDOW_LINES).toBe(4);
+test("paneShowsIdleInputBox — false when the status bar is NOT in the last two non-blank lines (two ordinary transcript rows follow it)", () => {
+  const pane = `${idlePane("⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent")}
+some later transcript line one
+some later transcript line two`;
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — true with a 'Tip: …' row and an '✔ Update installed' row sitting between the input box and the status bar", () => {
+  const pane = `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+${IDLE_BORDER}
+❯
+${IDLE_BORDER}
+  Tip: Ask Claude to make a plan before coding
+  ✔ Update installed · restart to apply
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+});
+
+test("paneShowsIdleInputBox — true with a 2-row background-agent roster (⏺ main / ◯ explorer) sitting between the input box and the status bar", () => {
+  const pane = `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+${IDLE_BORDER}
+❯
+${IDLE_BORDER}
+⏺ main
+◯ explorer
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+});
+
+test("paneShowsIdleInputBox — false when the bare ❯ prompt sits 9+ non-blank rows above the bar (outside IDLE_PROMPT_SEARCH_LINES)", () => {
+  const filler = Array.from({ length: IDLE_PROMPT_SEARCH_LINES + 1 }, (_, i) => `filler line ${i}`).join("\n");
+  const pane = `❯ \n${filler}\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+});
+
+test("paneShowsIdleInputBox — true when the bare ❯ prompt sits exactly IDLE_PROMPT_SEARCH_LINES non-blank rows above the bar (boundary)", () => {
+  const filler = Array.from({ length: IDLE_PROMPT_SEARCH_LINES - 1 }, (_, i) => `filler line ${i}`).join("\n");
+  const pane = `❯ \n${filler}\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`;
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+});
+
+test("IDLE_PROMPT_SEARCH_LINES is 8", () => {
+  expect(IDLE_PROMPT_SEARCH_LINES).toBe(8);
 });
 
 // ── stuckTurnFallbackArmed / matchUnparsableModal — idle interplay ──────────
 
 test("stuckTurnFallbackArmed — idle at the input box disarms the watchdog even when everything else is armed", () => {
   expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneIdle: true })).toBe(false);
+});
+
+test("stuckTurnFallbackArmed — a working pane on the esc-to-interrupt blink-OFF tick (paneIdle reads true) still never arms", () => {
+  // paneShowsIdleInputBox's "esc to interrupt" text blinks at ~1 Hz in
+  // claude's real TUI, so paneIdle can legitimately read true on the
+  // blink-off tick of an otherwise-busy pane (see that function's doc).
+  // paneShowsClaudeWorking (the spinner line) is what actually protects the
+  // settle path — stuckTurnFallbackArmed's own `!paneWorking` term holds
+  // regardless of what paneIdle says.
+  expect(stuckTurnFallbackArmed({ ...ALL_ARMED, paneWorking: true, paneIdle: true })).toBe(false);
 });
 
 test("matchUnparsableModal — the idle input box never trips the footer arm (idle is proof the turn ended, not an unparsable modal)", () => {

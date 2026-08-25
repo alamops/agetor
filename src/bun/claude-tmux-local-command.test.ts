@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import —
 // mirrors claude-tmux-unknown-command.test.ts / claude-tmux-queue.test.ts. A
@@ -10,9 +11,23 @@ import { randomUUID } from "node:crypto";
 // wrong data dir (db.ts reads the env var at module load).
 process.env.AGETOR_DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-tmux-local-cmd-"));
 
-const { __forTest, dismissTmuxPrompt, sendSlashCommand } = await import("./claude-tmux.ts");
+const {
+  __forTest,
+  dismissTmuxPrompt,
+  sendSlashCommand,
+  CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
+  CLAUDE_API_ERROR_STATUS_PREFIX,
+} = await import("./claude-tmux.ts");
 
-const { isLocalCommandStdoutEvent, dispatchLine, flush, signalIdleSettle } = __forTest;
+const {
+  isLocalCommandStdoutEvent,
+  localCommandNameOf,
+  dispatchLine,
+  flush,
+  signalIdleSettle,
+  IDLE_SETTLE_STATUS_TEXT,
+  SLASH_CONFIRM_POLL_MS,
+} = __forTest;
 
 /* ────────────────────────────────────────────────────────────────────────── *
  * Shared test scaffolding — mirrors claude-tmux-unknown-command.test.ts /
@@ -201,12 +216,53 @@ describe("isLocalCommandStdoutEvent — truth table", () => {
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *
+ * localCommandNameOf — truth table (F1: the identity half of the
+ * local-command settle gate)
+ * ────────────────────────────────────────────────────────────────────────── */
+
+describe("localCommandNameOf — truth table", () => {
+  test("user <command-name> line → the command token", () => {
+    expect(localCommandNameOf(JSON.parse(commandNameLine))).toBe("/effort");
+  });
+
+  test("system/local_command <command-name> line → the command token", () => {
+    expect(localCommandNameOf(JSON.parse(freshSessionCommandNameLine))).toBe("/model");
+  });
+
+  test("user <local-command-stdout> line → null", () => {
+    expect(localCommandNameOf(JSON.parse(stdoutLine))).toBeNull();
+  });
+
+  test("system/local_command <local-command-stdout> line → null", () => {
+    expect(localCommandNameOf(JSON.parse(freshSessionStdoutLine))).toBeNull();
+  });
+
+  test("isMeta <local-command-caveat> breadcrumb → null", () => {
+    expect(localCommandNameOf(JSON.parse(caveatLine))).toBeNull();
+  });
+
+  test("assistant line → null", () => {
+    expect(localCommandNameOf({
+      type: "assistant",
+      message: {
+        content: [{ type: "text", text: "<command-name>/effort</command-name>" }],
+      },
+    })).toBeNull();
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
  * Local-command turn settle — dispatchLine's slot.slashCommand gate
  * ────────────────────────────────────────────────────────────────────────── */
 
 test("slash slot: caveat is silent, command-name + stdout emit 'user' chunks, and stdout stages a bannerless pending that idle-fires the slot", async () => {
   const { taskId, state } = freshSession();
   try {
+    // Sanity: this fixture's command-name token really is "/effort" — the
+    // slot below is pushed with `slashCommand: "/effort"` specifically so it
+    // matches, and a drifted fixture would silently defeat that.
+    expect(localCommandNameOf(JSON.parse(commandNameLine))).toBe("/effort");
+
     const rec = recorder();
     const done = new Promise<number>((resolve, reject) => {
       state.turnQueue.push({ onChunk: rec.onChunk, resolve, reject, slashCommand: "/effort" });
@@ -215,9 +271,12 @@ test("slash slot: caveat is silent, command-name + stdout emit 'user' chunks, an
     dispatchLine(state, caveatLine);
     // The caveat is claude's note-to-self — silenced entirely, no chunk at all.
     expect(rec.out.length).toBe(0);
+    expect(state.lastLocalCommandName).toBeNull();
 
     dispatchLine(state, commandNameLine);
     expect(rec.out.some((c) => c.stream === "user" && c.data.includes("<command-name>/effort</command-name>"))).toBe(true);
+    // The command-name line is what arms the identity gate.
+    expect(state.lastLocalCommandName).toBe("/effort");
 
     dispatchLine(state, stdoutLine);
     expect(rec.out.some((c) => c.stream === "user" && c.data.includes("<local-command-stdout>Set effort level to high"))).toBe(true);
@@ -227,6 +286,9 @@ test("slash slot: caveat is silent, command-name + stdout emit 'user' chunks, an
     expect(state.pendingEndTurn).not.toBeNull();
     expect(state.pendingEndTurn!.emitBanner).toBe(false);
     expect(state.turnQueue.length).toBe(1);
+    // Cleared the moment the stage fired — a later, unrelated command can't
+    // match against a stale name.
+    expect(state.lastLocalCommandName).toBeNull();
 
     // Drive the idle-fire the way claude-tmux-queue.test.ts does: force the
     // staged pending past END_TURN_IDLE_FIRE_MS and let `flush` notice there's
@@ -239,6 +301,49 @@ test("slash slot: caveat is silent, command-name + stdout emit 'user' chunks, an
     // No "turn complete" banner for a local-command settle — nothing to
     // divide from; the user just watched the command's own output print.
     expect(rec.out.some((c) => c.stream === "status" && c.data === "turn complete")).toBe(false);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("F1 safety valve: slot's own prompt was '/implement' (slashCommand set) — a FOREIGN '/effort' command-name + its stdout must NOT settle the turn", () => {
+  const { taskId, state } = freshSession();
+  try {
+    const rec = recorder();
+    // The task's own prompt began with a slash too (e.g. `/implement …`), so
+    // `slot.slashCommand` is truthy — but it names a DIFFERENT command than
+    // the one whose command-name/stdout lines are about to arrive mid-turn
+    // (mirrors a dropdown-mirrored `sendSlashCommand` or a folded
+    // `pasteFollowUp`, neither of which own this slot).
+    state.turnQueue.push({ onChunk: rec.onChunk, resolve: () => {}, reject: () => {}, slashCommand: "/implement" });
+
+    dispatchLine(state, commandNameLine); // <command-name>/effort</command-name>
+    expect(state.lastLocalCommandName).toBe("/effort");
+
+    dispatchLine(state, stdoutLine); // <local-command-stdout>...
+    // Names differ ("/implement" !== "/effort") — must NOT stage, and the
+    // /implement turn's slot must still be sitting there waiting for its
+    // OWN real end_turn.
+    expect(state.pendingEndTurn).toBeNull();
+    expect(state.turnQueue.length).toBe(1);
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("a stdout line with NO preceding command-name line this session → no pending stage", () => {
+  const { taskId, state } = freshSession();
+  try {
+    const rec = recorder();
+    state.turnQueue.push({ onChunk: rec.onChunk, resolve: () => {}, reject: () => {}, slashCommand: "/effort" });
+    expect(state.lastLocalCommandName).toBeNull();
+
+    // No command-name line ever seen this session — the stdout line arrives
+    // "cold".
+    dispatchLine(state, stdoutLine);
+
+    expect(state.pendingEndTurn).toBeNull();
+    expect(state.turnQueue.length).toBe(1);
   } finally {
     __forTest.uninstallSession(taskId);
   }
@@ -334,7 +439,7 @@ test("fresh-session system/local_command shape: two system lines settle the slot
  * signalIdleSettle — the idle-settle net's settlement mechanics
  * ────────────────────────────────────────────────────────────────────────── */
 
-test("signalIdleSettle: pops the slot, emits exactly one 'turn complete' status, and clears all staging fields", async () => {
+test("signalIdleSettle: pops the slot, emits IDLE_SETTLE_STATUS_TEXT then 'turn complete' (in that order), and clears all staging fields", async () => {
   const { taskId, state } = freshSession();
   try {
     const rec = recorder();
@@ -344,20 +449,35 @@ test("signalIdleSettle: pops the slot, emits exactly one 'turn complete' status,
     state.pendingEndTurn = { messageId: null, uuid: undefined, emitBanner: true, stagedAt: Date.now() };
     state.holdUntilIdle = true;
     state.pendingSlashToken = "/x";
+    // Set to a non-null value so popEndOfTurn (called by signalIdleSettle)
+    // clearing it is actually observable, not vacuously true.
+    state.lastLocalCommandName = "/effort";
 
     signalIdleSettle(state);
 
-    const statusChunks = rec.out.filter((c) => c.stream === "status" && c.data === "turn complete");
-    expect(statusChunks.length).toBe(1);
+    // F6: an idle-settle must be explained in the transcript, not read as an
+    // indistinguishable real end_turn — the explanatory text lands FIRST,
+    // immediately before the "turn complete" banner.
+    const statusTexts = rec.out.filter((c) => c.stream === "status").map((c) => c.data);
+    expect(statusTexts).toEqual([IDLE_SETTLE_STATUS_TEXT, "turn complete"]);
 
     await expect(done).resolves.toBe(0);
     expect(state.turnQueue.length).toBe(0);
     expect(state.pendingEndTurn).toBeNull();
     expect(state.holdUntilIdle).toBe(false);
     expect(state.pendingSlashToken).toBeNull();
+    // F1: popEndOfTurn (invoked at the end of signalIdleSettle) clears the
+    // local-command identity gate too, alongside the other staging fields.
+    expect(state.lastLocalCommandName).toBeNull();
   } finally {
     __forTest.uninstallSession(taskId);
   }
+});
+
+test("IDLE_SETTLE_STATUS_TEXT does not start with any other status-prefix sentinel (unknown-command / session-died / api-error)", () => {
+  expect(IDLE_SETTLE_STATUS_TEXT.startsWith(CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX)).toBe(false);
+  expect(IDLE_SETTLE_STATUS_TEXT.startsWith(SESSION_DIED_STATUS_PREFIX)).toBe(false);
+  expect(IDLE_SETTLE_STATUS_TEXT.startsWith(CLAUDE_API_ERROR_STATUS_PREFIX)).toBe(false);
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -548,6 +668,49 @@ test("sendSlashCommand({autoConfirm}): an idle pane (no modal at all) is never a
     } finally {
       __forTest.setCaptureConfirmPane(prevCapture);
       __forTest.setSlashCommandSettleMs(prevSettle);
+    }
+  });
+});
+
+test("sendSlashCommand({autoConfirm}): two consecutive idle-input-box polls break the loop early — no Enter sent, and the op finishes well before the full SLASH_CONFIRM_WINDOW_MS", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const { taskId } = freshSession();
+    let captureCalls = 0;
+    const prevCapture = __forTest.setCaptureConfirmPane(() => {
+      captureCalls++;
+      return idlePane;
+    });
+    try {
+      const start = Date.now();
+      const ok = sendSlashCommand(taskId, "/effort low", { autoConfirm: "effort" });
+      expect(ok).toBe(true);
+
+      // Let the op run to completion on its own — no manual uninstall this
+      // time — to prove the EARLY EXIT itself is what ends the poll, not a
+      // teardown race.
+      await __forTest.pasteChains.get(taskId);
+      const elapsed = Date.now() - start;
+
+      // Two idle sightings and done: at most a couple more captures for
+      // scheduling slack, nowhere near the ~10 captures a full
+      // SLASH_CONFIRM_WINDOW_MS/SLASH_CONFIRM_POLL_MS window would need.
+      expect(captureCalls).toBeLessThanOrEqual(3);
+      // Comfortably under the full window (2s), and under 2 * SLASH_CONFIRM_POLL_MS
+      // plus slack — this is the point of the early exit.
+      expect(elapsed).toBeLessThan(1_000);
+      expect(elapsed).toBeLessThan(SLASH_CONFIRM_POLL_MS * 5);
+
+      const enters = readTmuxLog(logPath).filter(
+        (e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "Enter",
+      );
+      // Only the paste's own submit Enter — never a confirm Enter on the
+      // idle (no-confirm) path.
+      expect(enters.length).toBe(1);
+    } finally {
+      __forTest.setCaptureConfirmPane(prevCapture);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+      __forTest.uninstallSession(taskId);
     }
   });
 });
