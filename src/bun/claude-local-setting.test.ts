@@ -62,6 +62,7 @@ test("model: an arg-less stdout display name resolves via AGENT_OPTIONS labels (
     setting: "model",
     args: "sonnet",
     stdout: "Set model to \x1b[1mSonnet 5\x1b[22m and saved as your default for new sessions",
+    viaMirror: false,
   });
   // args="sonnet" doesn't resolve via claudeModelIdFromArg (it's an alias,
   // not a CLAUDE_MODEL_FLAG value), so this exercises the stdout fallback.
@@ -73,6 +74,7 @@ test("model: 'opus' arg + ANSI-wrapped stdout display name resolves to opus-5", 
     setting: "model",
     args: "opus",
     stdout: "Set model to \x1b[1mOpus 5\x1b[22m and saved as your default for new sessions",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "model", id: "opus-5" });
 });
@@ -82,6 +84,7 @@ test("model: qualifiers like '(1M context)' and '(default)' are stripped before 
     setting: "model",
     args: "",
     stdout: "Set model to Opus 5 (1M context) (default) and saved as your default for new sessions",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "model", id: "opus-5" });
 });
@@ -91,6 +94,7 @@ test("model: an arg matching CLAUDE_MODEL_FLAG wins over the stdout display name
     setting: "model",
     args: "claude-opus-4-8",
     stdout: "Set model to Opus 4.8 and saved as your default for new sessions",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "model", id: "opus-4.8" });
 });
@@ -104,6 +108,7 @@ test("model: only the FIRST LINE of stdout is matched against 'Set model to …'
     setting: "model",
     args: "",
     stdout: "Set model to Opus 5\nNote: this session was already using a compatible context window",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "model", id: "opus-5" });
 });
@@ -117,8 +122,9 @@ test("model: 'Kept model as …' is a real outcome, not a no-op — it's synced 
     setting: "model",
     args: "",
     stdout: "Kept model as Opus 4.8",
+    viaMirror: false,
   });
-  expect(result).toEqual({ kind: "model", id: "opus-4.8" });
+  expect(result).toEqual({ kind: "model", id: "opus-4.8", kept: true });
 });
 
 test("model: a display name absent from AGENT_OPTIONS resolves to 'unrepresentable', not null", () => {
@@ -132,6 +138,7 @@ test("model: a display name absent from AGENT_OPTIONS resolves to 'unrepresentab
     setting: "model",
     args: "",
     stdout: "Set model to Opus 6 and saved as your default for new sessions",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "unrepresentable", setting: "model", raw: "Opus 6" });
 });
@@ -141,6 +148,7 @@ test("model: a raw claude-<id> stdout display name passes through verbatim", () 
     setting: "model",
     args: "",
     stdout: "Set model to claude-opus-6 and saved as your default for new sessions",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "model", id: "claude-opus-6" });
 });
@@ -178,6 +186,7 @@ test("model: 'Opus 5.1 (1M context) and saved …' resolves to 'unrepresentable'
     setting: "model",
     args: "",
     stdout: "Set model to Opus 5.1 (1M context) and saved as your default for new sessions",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "unrepresentable", setting: "model", raw: "Opus 5.1" });
 });
@@ -187,6 +196,7 @@ test("model: 'Haiku 4.5.1' (no qualifiers, no 'and saved' suffix) resolves to 'u
     setting: "model",
     args: "",
     stdout: "Set model to Haiku 4.5.1",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "unrepresentable", setting: "model", raw: "Haiku 4.5.1" });
 });
@@ -196,6 +206,7 @@ test("model: 'Kept model as Opus 6 (1M context)' strips the qualifier from 'raw'
     setting: "model",
     args: "",
     stdout: "Kept model as Opus 6 (1M context)",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "unrepresentable", setting: "model", raw: "Opus 6" });
 });
@@ -214,6 +225,7 @@ test("model: 'Cancelled' resolves to null even with a raw claude-* arg", () => {
     setting: "model",
     args: "claude-opus-4-7",
     stdout: "Cancelled",
+    viaMirror: false,
   });
   expect(result).toBeNull();
 });
@@ -223,6 +235,7 @@ test("model: a confirmed 'Set model to' outcome resolves via the matching claude
     setting: "model",
     args: "claude-opus-4-7",
     stdout: "Set model to Opus 4.7 and saved as your default for new sessions",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "model", id: "opus-4.7" });
 });
@@ -232,8 +245,9 @@ test("model: 'Kept model as' is still checked first — args is never consulted 
     setting: "model",
     args: "claude-opus-5",
     stdout: "Kept model as Opus 4.8",
+    viaMirror: false,
   });
-  expect(result).toEqual({ kind: "model", id: "opus-4.8" });
+  expect(result).toEqual({ kind: "model", id: "opus-4.8", kept: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -248,6 +262,7 @@ test("model: a session-only suffix with no 'and saved' clause still resolves via
     setting: "model",
     args: "",
     stdout: "Set model to Sonnet 5 for this session",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "model", id: "sonnet-5" });
 });
@@ -257,6 +272,7 @@ test("model: a session-only suffix AND a parenthesized qualifier both resolve vi
     setting: "model",
     args: "",
     stdout: "Set model to Opus 5 (1M context) for this session only",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "model", id: "opus-5" });
 });
@@ -266,6 +282,7 @@ test("model: an unrecognized name with the known 'and saved' suffix still report
     setting: "model",
     args: "",
     stdout: "Set model to Opus 6 and saved as your default for new sessions",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "unrepresentable", setting: "model", raw: "Opus 6" });
 });
@@ -283,6 +300,7 @@ test("effort: stdout governs even when args is differently-cased — 'HIGH' arg 
     setting: "effort",
     args: "HIGH",
     stdout: "Set effort level to high (saved as your default for new sessions): …",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "effort", id: "high" });
 });
@@ -291,7 +309,7 @@ test("effort: a declined confirm ('Cancelled') resolves to null even though args
   // Verified bug this fixes: today's "args wins" behavior would write
   // `low` here even though the stdout says the change never happened
   // (e.g. the user answered "No, go back" on "Change effort level?").
-  const result = parseClaudeLocalSetting({ setting: "effort", args: "low", stdout: "Cancelled" });
+  const result = parseClaudeLocalSetting({ setting: "effort", args: "low", stdout: "Cancelled", viaMirror: false });
   expect(result).toBeNull();
 });
 
@@ -300,6 +318,7 @@ test("effort: parses 'Set effort level to <id>' from stdout when args is empty",
     setting: "effort",
     args: "",
     stdout: "Set effort level to xhigh (saved as your default for new sessions): …",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "effort", id: "xhigh" });
 });
@@ -309,12 +328,13 @@ test("effort: 'ultracode' (a slider label claude offers but agetor doesn't track
     setting: "effort",
     args: "",
     stdout: "Set effort level to ultracode (saved as your default for new sessions): …",
+    viaMirror: false,
   });
   expect(result).toEqual({ kind: "unrepresentable", setting: "effort", raw: "ultracode" });
 });
 
 test("effort: 'Cancelled' (Esc out of the slider) resolves to null", () => {
-  const result = parseClaudeLocalSetting({ setting: "effort", args: "", stdout: "Cancelled" });
+  const result = parseClaudeLocalSetting({ setting: "effort", args: "", stdout: "Cancelled", viaMirror: false });
   expect(result).toBeNull();
 });
 
@@ -325,12 +345,12 @@ test("effort: garbage stdout resolves to null EVEN WITH a valid arg — outcome-
   // confirm any change happened (this is the same class of bug as the
   // declined-confirm case above — the guard now bails on stdout FIRST,
   // regardless of args).
-  const result = parseClaudeLocalSetting({ setting: "effort", args: "medium", stdout: "garbage" });
+  const result = parseClaudeLocalSetting({ setting: "effort", args: "medium", stdout: "garbage", viaMirror: false });
   expect(result).toBeNull();
 });
 
 test("effort: an arg that isn't a claude id (minimal — Cursor/Codex-only) also resolves to null via garbage stdout", () => {
-  const result = parseClaudeLocalSetting({ setting: "effort", args: "minimal", stdout: "garbage" });
+  const result = parseClaudeLocalSetting({ setting: "effort", args: "minimal", stdout: "garbage", viaMirror: false });
   expect(result).toBeNull();
 });
 
@@ -417,6 +437,7 @@ test("applyClaudeLocalSetting syncs task.model from a typed alias and advances u
     setting: "model",
     args: "sonnet",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
+    viaMirror: false,
   });
 
   expect(changed).toBe(true);
@@ -434,6 +455,7 @@ test("applyClaudeLocalSetting is a no-op when the parsed model already matches t
     setting: "model",
     args: "sonnet",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
+    viaMirror: false,
   });
 
   expect(changed).toBe(false);
@@ -456,6 +478,7 @@ test("applyClaudeLocalSetting does not flip an already-equivalent model id repor
     setting: "model",
     args: "claude-opus-5",
     stdout: "Set model to Opus 5 and saved as your default for new sessions",
+    viaMirror: false,
   });
   expect(changed).toBe(false);
   expect(tasks.get(task.id)?.model).toBe("opus-5");
@@ -473,10 +496,73 @@ test("applyClaudeLocalSetting 'Kept model as' corrects a row that already drifte
     setting: "model",
     args: "",
     stdout: "Kept model as Opus 4.8",
+    // agetor's own dropdown mirror is what provoked this "Switch model?" —
+    // that's the ONLY condition under which a `kept: true` outcome is
+    // allowed to correct the row (see the gate in `applyClaudeLocalSetting`).
+    viaMirror: true,
   });
   expect(changed).toBe(true);
   expect(tasks.get(task.id)?.model).toBe("opus-4.8");
   expect(latestStatus(task.id).some((d) => d === "model synced from claude: opus-4.8")).toBe(true);
+});
+
+test("applyClaudeLocalSetting 'Kept model as' with viaMirror: false leaves a drifted row alone and breadcrumbs the split", async () => {
+  // Mirror image of the test above: no agetor-driven mirror provoked this
+  // "Switch model?" — the user opened a bare `/model` themselves and pressed
+  // Esc. Claude restates the live session's model ("Sonnet 5"), which
+  // disagrees with the row's deliberately-chosen "opus-4.8" (typically a
+  // model the installed picker can't even select) — that choice must survive
+  // untouched, and the split is explained via `describeKeptModelNotSynced`.
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const changed = applyClaudeLocalSetting(task.id, {
+    setting: "model",
+    args: "",
+    stdout: "Kept model as Sonnet 5",
+    viaMirror: false,
+  });
+  expect(changed).toBe(false);
+  expect(tasks.get(task.id)?.model).toBe("opus-4.8");
+  expect(
+    latestStatus(task.id).some(
+      (d) => d === "claude kept sonnet-5 for this session — the task's model opus-4.8 still applies on the next run",
+    ),
+  ).toBe(true);
+});
+
+test("applyClaudeLocalSetting 'Kept model as' with viaMirror: false is a silent no-op when it already agrees with the row", async () => {
+  // Same bare `/model` + Esc scenario, but this time claude restates a model
+  // that already matches the row — the `unchanged` early return fires before
+  // the `viaMirror` gate is ever reached, so there is nothing to explain and
+  // no breadcrumb should be emitted (a status line on every ordinary
+  // open-and-dismiss would be pure noise).
+  const task = await makeClaudeTaskWithRun("sonnet-5", "xhigh");
+  const changed = applyClaudeLocalSetting(task.id, {
+    setting: "model",
+    args: "",
+    stdout: "Kept model as Sonnet 5",
+    viaMirror: false,
+  });
+  expect(changed).toBe(false);
+  expect(tasks.get(task.id)?.model).toBe("sonnet-5");
+  expect(latestStatus(task.id)).toHaveLength(0);
+});
+
+test("applyClaudeLocalSetting 'Set model to' with viaMirror: false still syncs — the gate only applies to 'Kept model as'", async () => {
+  // Contrast with the two tests above: `info.viaMirror` only gates a `kept:
+  // true` outcome. A real "Set model to" change (`kept` absent) is an
+  // unconditional sync regardless of who or what provoked it — the user
+  // could have typed `/model sonnet` directly in the terminal, with no
+  // agetor mirror involved at all, and the row must still follow it.
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const changed = applyClaudeLocalSetting(task.id, {
+    setting: "model",
+    args: "",
+    stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
+    viaMirror: false,
+  });
+  expect(changed).toBe(true);
+  expect(tasks.get(task.id)?.model).toBe("sonnet-5");
+  expect(latestStatus(task.id).some((d) => d === "model synced from claude: sonnet-5")).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
@@ -511,6 +597,7 @@ test("applyClaudeLocalSetting: 'Kept model as <default>' on a null-model task is
     setting: "model",
     args: "",
     stdout: `Kept model as ${defaultLabel}`,
+    viaMirror: false,
   });
 
   expect(changed).toBe(false);
@@ -524,6 +611,7 @@ test("applyClaudeLocalSetting: a genuine model change on a null-model task still
     setting: "model",
     args: "",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
+    viaMirror: false,
   });
 
   expect(changed).toBe(true);
@@ -537,6 +625,7 @@ test("applyClaudeLocalSetting syncs task.effort; an unsupported claude id and a 
     setting: "effort",
     args: "high",
     stdout: "Set effort level to high (saved as your default for new sessions): …",
+    viaMirror: false,
   });
   expect(changed).toBe(true);
   expect(tasks.get(task.id)?.effort).toBe("high");
@@ -545,6 +634,7 @@ test("applyClaudeLocalSetting syncs task.effort; an unsupported claude id and a 
     setting: "effort",
     args: "",
     stdout: "Set effort level to ultracode (saved as your default for new sessions): …",
+    viaMirror: false,
   });
   expect(afterUnrepresentable).toBe(false);
   expect(tasks.get(task.id)?.effort).toBe("high"); // untouched
@@ -556,6 +646,7 @@ test("applyClaudeLocalSetting syncs task.effort; an unsupported claude id and a 
     setting: "effort",
     args: "",
     stdout: "Cancelled",
+    viaMirror: false,
   });
   expect(afterCancel).toBe(false);
   expect(tasks.get(task.id)?.effort).toBe("high"); // untouched
@@ -573,6 +664,7 @@ test("applyClaudeLocalSetting rejects an effort claude reports that isn't suppor
     setting: "effort",
     args: "",
     stdout: "Set effort level to xhigh (saved as your default for new sessions): …",
+    viaMirror: false,
   });
 
   expect(changed).toBe(false);
@@ -593,6 +685,7 @@ test("applyClaudeLocalSetting adjusts an unsupported effort in the SAME update w
     setting: "model",
     args: "",
     stdout: "Set model to Sonnet 4.6 and saved as your default for new sessions",
+    viaMirror: false,
   });
 
   expect(changed).toBe(true);
@@ -615,6 +708,7 @@ test("applyClaudeLocalSetting clears the effort in the SAME update when the new 
     setting: "model",
     args: "",
     stdout: "Set model to Haiku 4.5 and saved as your default for new sessions",
+    viaMirror: false,
   });
 
   expect(changed).toBe(true);
@@ -633,6 +727,7 @@ test("applyClaudeLocalSetting: an unrepresentable model (unknown display name) i
     setting: "model",
     args: "",
     stdout: "Set model to Opus 6 and saved as your default for new sessions",
+    viaMirror: false,
   });
 
   expect(changed).toBe(false);
@@ -661,6 +756,7 @@ test("applyClaudeLocalSetting no-ops for a non-claude-code task and leaves the r
     setting: "model",
     args: "sonnet",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
+    viaMirror: false,
   });
 
   expect(changed).toBe(false);
@@ -675,6 +771,7 @@ test("applyClaudeLocalSetting returns false for an unknown task id", () => {
     setting: "model",
     args: "sonnet",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
+    viaMirror: false,
   });
   expect(changed).toBe(false);
 });
@@ -704,6 +801,7 @@ test("applyClaudeLocalSetting appends a 'synced from claude' status breadcrumb t
     setting: "model",
     args: "sonnet",
     stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
+    viaMirror: false,
   });
 
   expect(changed).toBe(true);
@@ -722,6 +820,7 @@ test("applyClaudeLocalSetting still returns true and updates the row (without th
       setting: "model",
       args: "sonnet",
       stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
+      viaMirror: false,
     });
   }).not.toThrow();
 
@@ -758,6 +857,7 @@ test("applyClaudeLocalSetting never re-mirrors the change back into a live claud
       setting: "effort",
       args: "high",
       stdout: "Set effort level to high (saved as your default for new sessions): …",
+      viaMirror: false,
     });
   }).not.toThrow();
 
@@ -865,12 +965,14 @@ test("handlePasteWithheld: two 'pre-enter' withholds with identical text dedupe 
   expect(after?.backlog).toHaveLength(1);
 });
 
-test("handlePasteWithheld: a genuine tmux subprocess failure (op !== 'modal-guard', no phase) re-stashes with tmux-failure wording, not the modal wording", async () => {
+test("handlePasteWithheld: a genuine tmux subprocess failure (op !== 'modal-guard', no phase) re-stashes with the driver's own stderr, not the modal wording", async () => {
   // finding #5, §10 re-review: load-buffer/paste-buffer/send-keys exiting
   // non-zero is a REAL tmux failure, not a modal withhold — it must be
   // checked BEFORE the phase-based branches, and its wording must not claim
   // "claude is waiting on a prompt" (that's the pre-paste/no-phase modal
-  // wording) since no modal was ever involved.
+  // wording) since no modal was ever involved. The status line prefers the
+  // driver's own descriptive `outcome.stderr` (e.g. a dropped-op message)
+  // over the generic fallback — see `handlePasteWithheld`'s doc.
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
   const run = runs.listForTask(task.id)[0]!;
 
@@ -885,12 +987,12 @@ test("handlePasteWithheld: a genuine tmux subprocess failure (op !== 'modal-guar
   expect(after?.backlog[0]?.text).toBe("hello claude");
   expect(
     latestStatus(task.id).some(
-      (d) => d === "message saved to your backlog — the paste to claude's session failed; resend from the tray",
+      (d) => d === "message saved to your backlog — no server running on socket; resend from the tray",
     ),
   ).toBe(true);
 });
 
-test("handlePasteWithheld: tmux-failure outcomes with 'load-buffer' or 'paste-buffer' ops also use the tmux-failure wording", async () => {
+test("handlePasteWithheld: tmux-failure outcomes with 'load-buffer' or 'paste-buffer' ops also thread the driver's stderr through", async () => {
   const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
   const run = runs.listForTask(task.id)[0]!;
 
@@ -907,10 +1009,30 @@ test("handlePasteWithheld: tmux-failure outcomes with 'load-buffer' or 'paste-bu
 
   const statuses = latestStatus(task.id);
   expect(
-    statuses.filter(
-      (d) => d === "message saved to your backlog — the paste to claude's session failed; resend from the tray",
-    ).length,
+    statuses.filter((d) => d === "message saved to your backlog — boom; resend from the tray").length,
   ).toBe(2);
+});
+
+test("handlePasteWithheld: a tmux-failure outcome with an EMPTY stderr falls back to the generic wording", async () => {
+  // `outcome.stderr || "the paste to claude's session failed"` — an empty
+  // string is falsy, so the generic fallback phrase is what actually reaches
+  // the status line when the driver has nothing descriptive to report.
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const run = runs.listForTask(task.id)[0]!;
+
+  __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
+    ok: false,
+    op: "send-keys",
+    stderr: "",
+  });
+
+  const after = tasks.get(task.id);
+  expect(after?.backlog).toHaveLength(1);
+  expect(
+    latestStatus(task.id).some(
+      (d) => d === "message saved to your backlog — the paste to claude's session failed; resend from the tray",
+    ),
+  ).toBe(true);
 });
 
 test("handlePasteWithheld: 'composer-dirty' re-stashes the NEW text with its own status wording", async () => {

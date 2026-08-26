@@ -5,6 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { SESSION_DIED_STATUS_PREFIX } from "../shared/types.ts";
 import type { LocalSettingInfo } from "./claude-tmux.ts";
+import { registerTmuxPrompt, activeTmuxPromptsForTask } from "./interactions.ts";
 
 // Pre-set AGETOR_DATA_DIR before claude-tmux.ts's transitive db.ts import —
 // mirrors claude-tmux-unknown-command.test.ts / claude-tmux-queue.test.ts. A
@@ -20,6 +21,7 @@ const {
   dropSession,
   markTmuxPromptAnswered,
   rebuildEventsFromJsonl,
+  mirrorModelViaPicker,
   CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
   CLAUDE_API_ERROR_STATUS_PREFIX,
 } = await import("./claude-tmux.ts");
@@ -38,6 +40,8 @@ const {
   idleSettleTick,
   SLASH_CONFIRM_IDLE_BREAK_TICKS,
   setLocalSettingChangedHandler,
+  matchNumberedModal,
+  MODEL_MIRROR_ATTRIBUTION_MS,
 } = __forTest;
 
 // Real type for a withheld-paste outcome, derived from `sendTurn`'s own
@@ -211,8 +215,15 @@ function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T
   writeFileSync(
     binPath,
     `#!${process.execPath}\n` +
-      `import { appendFileSync } from "node:fs";\n` +
-      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv: process.argv.slice(2) }) + "\\n");\n`,
+      `import { appendFileSync, readFileSync } from "node:fs";\n` +
+      // Drain stdin too (best-effort — most invocations pass none, in which
+      // case `tmux()` spawns with `stdin: "ignore"` and this reads EOF
+      // immediately) so `load-buffer -b <buf> -` invocations (the paste
+      // path) can be inspected for their actual pasted text, not just argv.
+      // Mirrors claude-turn-routing.test.ts's fake bin.
+      `let stdin = "";\n` +
+      `try { stdin = readFileSync(0, "utf8"); } catch {}\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv: process.argv.slice(2), stdin }) + "\\n");\n`,
   );
   chmodSync(binPath, 0o755);
   const prevBin = process.env.AGETOR_TMUX_BIN;
@@ -223,7 +234,7 @@ function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T
   });
 }
 
-function readTmuxLog(logPath: string): Array<{ ms: number; argv: string[] }> {
+function readTmuxLog(logPath: string): Array<{ ms: number; argv: string[]; stdin?: string }> {
   let raw: string;
   try {
     raw = readFileSync(logPath, "utf8");
@@ -658,6 +669,10 @@ describe("setLocalSettingChangedHandler — local-setting-sync seam", () => {
         stdout:
           "Set effort level to high (saved as your default for new sessions): " +
           "Comprehensive implementation with extensive testing and documentation",
+        // No mirror ran on this session (state.lastModelMirrorAt is still its
+        // 0 initial value) — well outside MODEL_MIRROR_ATTRIBUTION_MS, so the
+        // seam reports viaMirror: false.
+        viaMirror: false,
       });
     } finally {
       setLocalSettingChangedHandler(prev);
@@ -1386,6 +1401,555 @@ test("sendSlashCommand({autoConfirm}): a blocked pane withholds the mirror paste
       __forTest.uninstallSession(taskId);
     }
   });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * mirrorModelViaPicker (wave 5) — drives the BARE `/model` picker + `s`
+ * (session-only) rather than typing `/model <id>` (a global write). Verbatim
+ * 2.1.246 picker rows from the function's own doc comment in claude-tmux.ts.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+// 5 rows, cursor "❯" on the CURRENT model (Sonnet, marked ✔) — matches the
+// function's doc comment verbatim, footer offers the session-only confirm
+// key ("s") that SESSION_ONLY_CONFIRM_RE (claude-tmux-scraper.test.ts) also
+// pins.
+const PICKER_246_PANE = [
+  "   Select model",
+  "   Switch between Claude models. Your pick becomes the default for new sessions.",
+  "",
+  "  1. Default (recommended)  Opus 5 with 1M context, best for complex work",
+  "  2. Opus (1M context)      Opus 5 with 1M context, best for complex work",
+  "  3. Fable                  Fable 5, most capable for your hardest and longest-running tasks",
+  "❯ 4. Sonnet ✔               Sonnet 5, efficient for routine tasks",
+  "  5. Haiku                  Haiku 4.5, fastest for quick answers",
+  "",
+  "Enter to set as default · s to use this session only · Esc to cancel",
+].join("\n");
+
+// Same picker shape, but with NO Fable row at all — 4 choices.
+const PICKER_246_NO_FABLE_PANE = [
+  "  1. Default (recommended)  Opus 5 with 1M context, best for complex work",
+  "❯ 2. Opus (1M context)      Opus 5 with 1M context, best for complex work",
+  "  3. Sonnet ✔               Sonnet 5, efficient for routine tasks",
+  "  4. Haiku                  Haiku 4.5, fastest for quick answers",
+  "",
+  "Enter to set as default · s to use this session only · Esc to cancel",
+].join("\n");
+
+test("mirrorModelViaPicker: cursor on Sonnet ✔ (index 3), target Opus — walks Up,Up, sends 's', accepts the 'Switch model?' confirm with Enter, returns { ok: true, chosen: 'Opus' }, resolves a pre-registered card, and pastes a BARE /model", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const { taskId } = freshSession();
+    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    // Same seam drives both the picker-detection poll AND the subsequent
+    // autoConfirmSlashModal poll (both read captureConfirmPane) — key off
+    // whether the session-only confirm key ("s") has actually been sent yet,
+    // rather than a manual call counter, so this reflects the real state
+    // transition mirrorModelViaPicker drives.
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => {
+      const sSent = readTmuxLog(logPath).some(
+        (e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "s",
+      );
+      return sSent ? switchModelConfirmPane : PICKER_246_PANE;
+    });
+
+    const pickerMatch = matchNumberedModal(PICKER_246_PANE)!;
+    const { answer } = registerTmuxPrompt({
+      taskId,
+      runId: "run-picker-a",
+      paneText: pickerMatch.paneText,
+      choices: pickerMatch.choices,
+      cursorIndex: pickerMatch.cursorIndex,
+      fingerprint: pickerMatch.fingerprint,
+      confirmKey: pickerMatch.confirmKey,
+    });
+
+    try {
+      const result = await mirrorModelViaPicker(taskId, "Opus");
+      expect(result).toEqual({ ok: true, chosen: "Opus" });
+
+      const entries = readTmuxLog(logPath);
+      const sendKeys = entries
+        .filter((e) => e.argv[0] === "send-keys")
+        .map((e) => e.argv[e.argv.length - 1]);
+      // The opening "/model" paste is NOT bracketed (a plain slash command),
+      // so `pastePromptSync` submits it with its own synchronous Enter
+      // first. Then: cursorIndex 3 (Sonnet) -> targetIndex 1 (Opus): delta
+      // -2 -> Up,Up. Then "s" (session-only confirm), then Enter (the
+      // "Switch model?" mid-conversation confirm, auto-accepted).
+      expect(sendKeys).toEqual(["Enter", "Up", "Up", "s", "Enter"]);
+
+      // The opening paste was a BARE "/model" — never "/model <id>" (the
+      // global-write form this driver replaced).
+      const loadBuffer = entries.find((e) => e.argv[0] === "load-buffer");
+      expect(loadBuffer?.stdin).toBe("/model");
+
+      // The pre-registered card is resolved as an external dismissal.
+      await expect(answer).resolves.toEqual({ key: "__external__" });
+      expect(activeTmuxPromptsForTask(taskId)).toEqual([]);
+    } finally {
+      __forTest.setCapturePastePane(prevPastePane);
+      __forTest.setCaptureConfirmPane(prevConfirmPane);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("mirrorModelViaPicker: target family not offered by the picker — sends Escape only (no walk, no confirm), returns { ok: false, reason: 'target not offered' }, and resolves the pre-registered card", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const { taskId } = freshSession();
+    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => PICKER_246_NO_FABLE_PANE);
+
+    const pickerMatch = matchNumberedModal(PICKER_246_NO_FABLE_PANE)!;
+    const { answer } = registerTmuxPrompt({
+      taskId,
+      runId: "run-picker-b",
+      paneText: pickerMatch.paneText,
+      choices: pickerMatch.choices,
+      cursorIndex: pickerMatch.cursorIndex,
+      fingerprint: pickerMatch.fingerprint,
+      confirmKey: pickerMatch.confirmKey,
+    });
+
+    try {
+      const result = await mirrorModelViaPicker(taskId, "Fable");
+      expect(result).toEqual({ ok: false, reason: "target not offered" });
+
+      const sendKeys = readTmuxLog(logPath)
+        .filter((e) => e.argv[0] === "send-keys")
+        .map((e) => e.argv[e.argv.length - 1]);
+      // The opening "/model" paste's own submit Enter, then no cursor walk,
+      // no session-only confirm — just the cancel.
+      expect(sendKeys).toEqual(["Enter", "Escape"]);
+
+      await expect(answer).resolves.toEqual({ key: "__external__" });
+      expect(activeTmuxPromptsForTask(taskId)).toEqual([]);
+    } finally {
+      __forTest.setCapturePastePane(prevPastePane);
+      __forTest.setCaptureConfirmPane(prevConfirmPane);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("mirrorModelViaPicker: idle pane throughout — the poll window elapses with { ok: false, reason: 'picker not shown' } and NO keystroke beyond the opening paste", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const { taskId } = freshSession();
+    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => idlePane);
+    try {
+      const result = await mirrorModelViaPicker(taskId, "Opus");
+      expect(result).toEqual({ ok: false, reason: "picker not shown" });
+
+      const entries = readTmuxLog(logPath);
+      // The opening "/model" paste itself still happened (a non-bracketed
+      // paste submits with its own synchronous Enter) — only the picker
+      // itself never showed up, so mirrorModelViaPicker sends no arrow/
+      // confirm/escape keystroke of its own beyond that single submit Enter.
+      const sendKeys = entries.filter((e) => e.argv[0] === "send-keys").map((e) => e.argv[e.argv.length - 1]);
+      expect(sendKeys).toEqual(["Enter"]);
+      expect(entries.some((e) => e.argv[0] === "load-buffer")).toBe(true);
+    } finally {
+      __forTest.setCapturePastePane(prevPastePane);
+      __forTest.setCaptureConfirmPane(prevConfirmPane);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("mirrorModelViaPicker: a live modal blocks the opening /model paste — returns { ok: false, reason: 'paste withheld' } and fires onPasteFailure", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevGrace = __forTest.setPasteModalGraceMs(20);
+    const prevPoll = __forTest.setPasteModalPollMs(5);
+    const { taskId } = freshSession();
+    const prevPastePane = __forTest.setCapturePastePane(() => PICKER_PANE);
+    const failures: PasteFailureOutcome[] = [];
+    try {
+      const result = await mirrorModelViaPicker(taskId, "Opus", {
+        onPasteFailure: (outcome) => failures.push(outcome),
+      });
+      expect(result).toEqual({ ok: false, reason: "paste withheld" });
+
+      expect(failures.length).toBe(1);
+      assertModalGuard(failures[0]!);
+      expect(failures[0]!.phase).toBe("pre-paste");
+      // The picker never opened — no load-buffer at all.
+      expect(readTmuxLog(logPath).some((e) => e.argv[0] === "load-buffer")).toBe(false);
+    } finally {
+      __forTest.setCapturePastePane(prevPastePane);
+      __forTest.setPasteModalPollMs(prevPoll);
+      __forTest.setPasteModalGraceMs(prevGrace);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("mirrorModelViaPicker: no live session for the task — { ok: false, reason: 'no live session' }", async () => {
+  const result = await mirrorModelViaPicker(randomUUID(), "Opus");
+  expect(result).toEqual({ ok: false, reason: "no live session" });
+});
+
+test("mirrorModelViaPicker: a turn already in flight (a live head slot) — { ok: false, reason: 'turn in flight' }, no paste at all", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const { taskId, state } = freshSession();
+    const rec = recorder();
+    // A live head slot (real `resolve`) makes `turnInFlight(state)` true —
+    // the entry check mirrorModelViaPicker's doc describes.
+    __forTest.pushTurnSlot(state, rec.onChunk);
+    try {
+      const result = await mirrorModelViaPicker(taskId, "Opus");
+      expect(result).toEqual({ ok: false, reason: "turn in flight" });
+      // Never even opened the picker — no tmux call of any kind, including
+      // the opening "/model" paste.
+      expect(readTmuxLog(logPath).length).toBe(0);
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("mirrorModelViaPicker: idle turnQueue but the pane shows claude working (background-agent activity) — { ok: false, reason: 'turn in flight' }, no paste", async () => {
+  // Same entry check, other half: `paneShowsClaudeWorking(capturePastePane(state))`
+  // catches working chrome even with no turn slot at all.
+  await withRecordingTmuxBin(async (logPath) => {
+    const { taskId } = freshSession();
+    const prevPastePane = __forTest.setCapturePastePane(() => COMPOSER_WORKING_NONBARE_PANE);
+    try {
+      const result = await mirrorModelViaPicker(taskId, "Opus");
+      expect(result).toEqual({ ok: false, reason: "turn in flight" });
+      expect(readTmuxLog(logPath).length).toBe(0);
+    } finally {
+      __forTest.setCapturePastePane(prevPastePane);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("mirrorModelViaPicker: state.drivingPrompt is true for every confirm-pane poll during the driving op and false once it settles (finding #3, wave-5 re-review)", async () => {
+  // `scrapeOnce` itself has no `__forTest` seam to invoke directly against a
+  // synthetic session (only its pure per-tick helpers — `decideScrapeTick`,
+  // `idleSettleTick`, `pickScrapeMatch` — are exposed, and there is no way to
+  // fire a real scrape tick without a live tmux pane/timer this file doesn't
+  // stand up). So this pins the flag transition ONLY — true on every
+  // `captureConfirmPane` read while the driving op runs, false again once
+  // `mirrorModelViaPicker` resolves — and does NOT exercise scrapeOnce's own
+  // `if (state.drivingPrompt) return` gate.
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const { taskId, state } = freshSession();
+    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    const drivingSightings: boolean[] = [];
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => {
+      drivingSightings.push(state.drivingPrompt);
+      const sSent = readTmuxLog(logPath).some(
+        (e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "s",
+      );
+      return sSent ? switchModelConfirmPane : PICKER_246_PANE;
+    });
+
+    const pickerMatch = matchNumberedModal(PICKER_246_PANE)!;
+    const { answer } = registerTmuxPrompt({
+      taskId,
+      runId: "run-picker-driving",
+      paneText: pickerMatch.paneText,
+      choices: pickerMatch.choices,
+      cursorIndex: pickerMatch.cursorIndex,
+      fingerprint: pickerMatch.fingerprint,
+      confirmKey: pickerMatch.confirmKey,
+    });
+
+    try {
+      expect(state.drivingPrompt).toBe(false);
+      const result = await mirrorModelViaPicker(taskId, "Opus");
+      expect(result).toEqual({ ok: true, chosen: "Opus" });
+      // Every poll sighting during the driving op observed the flag true.
+      expect(drivingSightings.length).toBeGreaterThan(0);
+      expect(drivingSightings.every(Boolean)).toBe(true);
+      // The try/finally clears it once the op settles, on every exit path.
+      expect(state.drivingPrompt).toBe(false);
+      await answer;
+    } finally {
+      __forTest.setCapturePastePane(prevPastePane);
+      __forTest.setCaptureConfirmPane(prevConfirmPane);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+/**
+ * Recording tmux stub that fails a SINGLE-key `send-keys ... Escape`
+ * invocation (`send-keys -t <session> Escape`, i.e. the last two argv
+ * entries are NOT both "Escape") while succeeding every other invocation —
+ * including the DOUBLE `Escape,Escape` composer-clear keystroke, which this
+ * stub deliberately does not match (that's `withFailingComposerClearTmuxBin`'s
+ * job, in a different test file section). Used to simulate
+ * `mirrorModelViaPicker`'s own `target not offered` cancel-Escape failing at
+ * the tmux level (finding #4, wave-5 re-review).
+ */
+function withFailingSingleEscapeTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-failesc-"));
+  const binPath = path.join(dir, "tmux");
+  const logPath = path.join(dir, "log.jsonl");
+  writeFileSync(
+    binPath,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync } from "node:fs";\n` +
+      `const argv = process.argv.slice(2);\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv }) + "\\n");\n` +
+      `const isSingleEscape = argv.includes("send-keys") && argv[argv.length - 1] === "Escape" && argv[argv.length - 2] !== "Escape";\n` +
+      `if (isSingleEscape) process.exit(1);\n`,
+  );
+  chmodSync(binPath, 0o755);
+  const prevBin = process.env.AGETOR_TMUX_BIN;
+  process.env.AGETOR_TMUX_BIN = binPath;
+  return fn(logPath).finally(() => {
+    if (prevBin === undefined) delete process.env.AGETOR_TMUX_BIN;
+    else process.env.AGETOR_TMUX_BIN = prevBin;
+  });
+}
+
+test("mirrorModelViaPicker: target not offered AND the closing Escape's send-keys itself fails — no clearRegisteredPrompt, the pre-registered card stays pending, result is still 'target not offered' (finding #4, wave-5 re-review)", async () => {
+  await withFailingSingleEscapeTmuxBin(async (logPath) => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const { taskId } = freshSession();
+    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => PICKER_246_NO_FABLE_PANE);
+
+    const pickerMatch = matchNumberedModal(PICKER_246_NO_FABLE_PANE)!;
+    registerTmuxPrompt({
+      taskId,
+      runId: "run-picker-escfail",
+      paneText: pickerMatch.paneText,
+      choices: pickerMatch.choices,
+      cursorIndex: pickerMatch.cursorIndex,
+      fingerprint: pickerMatch.fingerprint,
+      confirmKey: pickerMatch.confirmKey,
+    });
+
+    try {
+      const result = await mirrorModelViaPicker(taskId, "Fable");
+      expect(result).toEqual({ ok: false, reason: "target not offered" });
+
+      const sendKeys = readTmuxLog(logPath)
+        .filter((e) => e.argv[0] === "send-keys")
+        .map((e) => e.argv[e.argv.length - 1]);
+      // The cancel Escape was attempted (and failed at the tmux level) —
+      // never a cursor walk or a confirm.
+      expect(sendKeys).toEqual(["Enter", "Escape"]);
+
+      // The Escape's own send-keys failed, so `clearRegisteredPrompt` must
+      // never run: the fingerprint stays un-stamped and the pre-registered
+      // card stays pending — mirroring the same symmetry
+      // `autoConfirmSlashModal` applies to its own confirm Enter.
+      expect(activeTmuxPromptsForTask(taskId)).toHaveLength(1);
+    } finally {
+      __forTest.setCapturePastePane(prevPastePane);
+      __forTest.setCaptureConfirmPane(prevConfirmPane);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * mirrorModelViaPicker × SessionState.lastModelMirrorAt / LocalSettingInfo.
+ * viaMirror — the attribution stamp `mirrorModelViaPicker`'s session-only
+ * confirm key writes, and the window (MODEL_MIRROR_ATTRIBUTION_MS) during
+ * which the local-setting-sync seam credits a following `Kept model as …` to
+ * agetor's own mirror rather than a user-driven bare `/model` + Esc.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("mirrorModelViaPicker success stamps SessionState.lastModelMirrorAt, and a /model stdout dispatched right after fires the seam with viaMirror: true", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const { taskId, state } = freshSession();
+    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => {
+      const sSent = readTmuxLog(logPath).some(
+        (e) => e.argv[0] === "send-keys" && e.argv[e.argv.length - 1] === "s",
+      );
+      return sSent ? switchModelConfirmPane : PICKER_246_PANE;
+    });
+
+    const pickerMatch = matchNumberedModal(PICKER_246_PANE)!;
+    const { answer } = registerTmuxPrompt({
+      taskId,
+      runId: "run-picker-stamp",
+      paneText: pickerMatch.paneText,
+      choices: pickerMatch.choices,
+      cursorIndex: pickerMatch.cursorIndex,
+      fingerprint: pickerMatch.fingerprint,
+      confirmKey: pickerMatch.confirmKey,
+    });
+
+    const calls: LocalSettingInfo[] = [];
+    const prevHandler = setLocalSettingChangedHandler((_tid, info) => calls.push(info));
+
+    try {
+      // Never touched before the mirror runs — SessionState's own zero
+      // initializer.
+      expect(state.lastModelMirrorAt).toBe(0);
+
+      const result = await mirrorModelViaPicker(taskId, "Opus");
+      expect(result).toEqual({ ok: true, chosen: "Opus" });
+
+      // Stamped the moment the session-only "s" confirm keystroke landed —
+      // the function's ONLY write site for this field.
+      expect(state.lastModelMirrorAt).toBeGreaterThan(0);
+      expect(Date.now() - state.lastModelMirrorAt).toBeLessThan(MODEL_MIRROR_ATTRIBUTION_MS);
+
+      // claude reports its own outcome for the mirrored change — dispatched
+      // well within the attribution window, so the seam must credit agetor's
+      // own mirror.
+      dispatchLine(state, freshSessionCommandNameLine); // <command-name>/model</command-name>
+      dispatchLine(state, freshSessionStdoutLine); // <local-command-stdout>Kept model as Opus 4.8</local-command-stdout>
+
+      expect(calls.length).toBe(1);
+      expect(calls[0]!.setting).toBe("model");
+      expect(calls[0]!.viaMirror).toBe(true);
+
+      await expect(answer).resolves.toEqual({ key: "__external__" });
+    } finally {
+      setLocalSettingChangedHandler(prevHandler);
+      __forTest.setCapturePastePane(prevPastePane);
+      __forTest.setCaptureConfirmPane(prevConfirmPane);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("mirrorModelViaPicker 'target not offered' (Escape) never stamps lastModelMirrorAt — a /model stdout right after still fires viaMirror: false", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const prevSettle = __forTest.setSlashCommandSettleMs(0);
+    const { taskId, state } = freshSession();
+    const prevPastePane = __forTest.setCapturePastePane(() => idlePane);
+    const prevConfirmPane = __forTest.setCaptureConfirmPane(() => PICKER_246_NO_FABLE_PANE);
+
+    const pickerMatch = matchNumberedModal(PICKER_246_NO_FABLE_PANE)!;
+    const { answer } = registerTmuxPrompt({
+      taskId,
+      runId: "run-picker-noescstamp",
+      paneText: pickerMatch.paneText,
+      choices: pickerMatch.choices,
+      cursorIndex: pickerMatch.cursorIndex,
+      fingerprint: pickerMatch.fingerprint,
+      confirmKey: pickerMatch.confirmKey,
+    });
+
+    const calls: LocalSettingInfo[] = [];
+    const prevHandler = setLocalSettingChangedHandler((_tid, info) => calls.push(info));
+
+    try {
+      const result = await mirrorModelViaPicker(taskId, "Fable");
+      expect(result).toEqual({ ok: false, reason: "target not offered" });
+
+      // Neither the opening paste nor the cancel Escape is a write site for
+      // this field — the picker never got as far as committing to a change.
+      expect(state.lastModelMirrorAt).toBe(0);
+
+      dispatchLine(state, freshSessionCommandNameLine);
+      dispatchLine(state, freshSessionStdoutLine);
+
+      expect(calls.length).toBe(1);
+      expect(calls[0]!.viaMirror).toBe(false);
+
+      await expect(answer).resolves.toEqual({ key: "__external__" });
+    } finally {
+      setLocalSettingChangedHandler(prevHandler);
+      __forTest.setCapturePastePane(prevPastePane);
+      __forTest.setCaptureConfirmPane(prevConfirmPane);
+      __forTest.setSlashCommandSettleMs(prevSettle);
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("a /model stdout dispatched more than MODEL_MIRROR_ATTRIBUTION_MS after a mirror stamp fires the seam with viaMirror: false", () => {
+  const { taskId, state } = freshSession();
+  const calls: LocalSettingInfo[] = [];
+  const prevHandler = setLocalSettingChangedHandler((_tid, info) => calls.push(info));
+  try {
+    // One tick past the attribution window's expiry — an unrelated bare
+    // `/model` + Esc a while after agetor's own mirror ran must not still be
+    // credited to it.
+    state.lastModelMirrorAt = Date.now() - MODEL_MIRROR_ATTRIBUTION_MS - 1;
+
+    dispatchLine(state, freshSessionCommandNameLine);
+    dispatchLine(state, freshSessionStdoutLine);
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.viaMirror).toBe(false);
+  } finally {
+    setLocalSettingChangedHandler(prevHandler);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("sendTurn: bumpKeystroke fires at ENQUEUE time — state.lastKeystrokeAt is already advanced synchronously once sendTurn returns, before the queued paste op itself ever runs (finding #1, wave-5 re-review)", async () => {
+  const prevGrace = __forTest.setPasteModalGraceMs(200);
+  const prevPoll = __forTest.setPasteModalPollMs(5);
+  const { taskId, state } = freshSession();
+  // A persistently blocking pane so the queued paste op withholds once it
+  // eventually runs — this test only cares about the ENQUEUE-time bump,
+  // which (per queuePaste's doc) happens before the op ever reaches
+  // queueTmuxOp, so what the op itself does afterward is irrelevant here.
+  const prevPastePane = __forTest.setCapturePastePane(() => PICKER_PANE);
+  try {
+    const before = state.lastKeystrokeAt;
+    await new Promise((r) => setTimeout(r, 5)); // let Date.now() tick forward
+    const agent = sendTurn(taskId, "hello", () => {});
+    // Read synchronously, before awaiting anything: sendTurn's own
+    // `void queuePaste(...)` call runs queuePaste's body inline up to (and
+    // past) its enqueue-time `bumpKeystroke` before sendTurn ever returns —
+    // well before the queued op's async guard loop gets a turn on the event
+    // loop.
+    expect(state.lastKeystrokeAt).toBeGreaterThan(before);
+
+    // Swallow the expected rejection (withheld paste) and let the guard's
+    // grace window elapse so nothing leaks into a later test.
+    agent.done.catch(() => {});
+    await __forTest.pasteChains.get(taskId);
+  } finally {
+    __forTest.setCapturePastePane(prevPastePane);
+    __forTest.setPasteModalPollMs(prevPoll);
+    __forTest.setPasteModalGraceMs(prevGrace);
+    __forTest.uninstallSession(taskId);
+  }
+});
+
+test("PASTE_DROPPED_OUTCOME: a session torn down before the queued paste ever runs resolves a pasteOutcome whose stderr starts with 'paste dropped:'", async () => {
+  // Mirrors claude-tmux-queue.test.ts's own PASTE_DROPPED_OUTCOME test (that
+  // file owns the broader queue/dropped-op contract) — pinned here too since
+  // this task's boundary is this file specifically.
+  const { taskId } = freshSession();
+  const agent = sendTurn(taskId, "hello", () => {});
+  // Irrelevant to this test's assertion (the dropped-op outcome's stderr
+  // wording) — swallow it so it doesn't surface as an unhandled rejection.
+  agent.done.catch(() => {});
+  // Tear down SYNCHRONOUSLY, before the queued tmux op's microtask runs —
+  // queueTmuxOp's identity gate then drops the op body entirely, so the
+  // chain settles via the unconditional PASTE_DROPPED_OUTCOME backstop with
+  // no tmux call (and no fake tmux bin) needed at all.
+  __forTest.uninstallSession(taskId);
+
+  const outcome = await Promise.race([
+    agent.pasteOutcome!,
+    new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("pasteOutcome never settled")), 2000);
+    }),
+  ]);
+  expect(outcome.ok).toBe(false);
+  if (!outcome.ok) {
+    expect(outcome.stderr.startsWith("paste dropped:")).toBe(true);
+  }
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *

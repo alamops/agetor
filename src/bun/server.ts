@@ -4116,6 +4116,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             }));
             const plan = planAskAnswers(specs, sanitised);
             let ok = false;
+            // Only the custom/free-text path routes through `sendInput`
+            // (which is the only thing capable of reporting a withhold — the
+            // "drive" path types keys straight into an already-open modal via
+            // tmux send-keys, with no composer paste for a blocking modal to
+            // hold up). Left undefined on the drive path; the response only
+            // carries these when the free-text branch actually ran.
+            let withheld: true | undefined;
+            let savedToBacklog: true | undefined;
+            let reason: string | undefined;
             if (plan.mode === "drive") {
               ok = await driveAskAnswers(pending.taskId, plan);
             } else {
@@ -4127,15 +4136,36 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               // REPL prompt before the paste lands, so it isn't eaten by the
               // dismissing modal.
               await Bun.sleep(150);
-              ok = (await sendInput(pending.runId, plan.text)).delivered;
+              const r = await sendInput(pending.runId, plan.text);
+              ok = r.delivered;
+              // This used to report `ok = r.delivered` alone — a withheld
+              // paste (e.g. a DIFFERENT blocking modal came up while the
+              // Escape above was settling) read to the UI as an ordinary
+              // failure with no indication the answer was safely saved to
+              // the backlog tray rather than lost outright. Thread the full
+              // shape through so the UI can toast the informational
+              // "saved to backlog" framing exactly like `sendRunInput`'s
+              // withheld branch, instead of a bare error.
+              if (!r.delivered) {
+                withheld = r.withheld;
+                savedToBacklog = r.savedToBacklog;
+                reason = r.reason;
+              }
             }
-            // Drop the card. `resolveAskCard` also clears the session's
-            // `askCardId` tracker, so if a drive FAILED and the modal is still
-            // on the pane the scraper re-collects a fresh card on its next tick
+            // Drop the card either way — including a withheld free-text
+            // answer. The Escape above already dismissed the ORIGINAL
+            // AskUserQuestion modal (that's what `plan.text` is answering);
+            // a withhold here means some OTHER blocking modal came up while
+            // delivering the follow-up turn, which is an unrelated, separate
+            // problem the "saved to backlog" toast covers — keeping this card
+            // up wouldn't let the user retry answering a modal that's already
+            // gone. `resolveAskCard` also clears the session's `askCardId`
+            // tracker, so if a drive FAILED and the modal is still on the
+            // pane the scraper re-collects a fresh card on its next tick
             // (without clearing it, the `!askCardId` gate would block
             // re-registration and strand the modal with no card).
             resolveAskCard(req.params.id, pending.taskId);
-            return json({ ok }, { headers: corsHeaders(req) });
+            return json({ ok, withheld, savedToBacklog, reason }, { headers: corsHeaders(req) });
           }
           // No scraper-sourced card matched this id (and there are no
           // hook-sourced ask cards any more) — nothing to drive.

@@ -70,6 +70,28 @@ export interface SpawnedAgent {
    * or when JSONL discovery fails on the initial spawn.
    */
   done: Promise<number>;
+  /**
+   * Terminal outcome of the PASTE that delivered this turn's prompt into
+   * claude's composer — `{ ok: true }` once the text (and, on the bracketed
+   * path, its trailing Enter) actually went out, else the failing
+   * `PasteOutcome` (a tmux error, or one of `queuePaste`'s modal-guard
+   * withholds). NEVER rejects, and always settles exactly once, including
+   * when the queued tmux op is dropped without running (see
+   * `PASTE_DROPPED_OUTCOME`).
+   *
+   * Distinct from `done`, which reports what CLAUDE did with the turn: this
+   * reports whether the turn's text ever reached claude at all. A caller that
+   * needs to know "did my message land" — to decide whether to keep an
+   * optimistic user bubble, re-stash the text, or word a status line — should
+   * await this rather than inferring it from `done`'s rejection.
+   *
+   * Optional because only the paths that actually paste populate it: today
+   * `sendTurn` (via `makeAgent`'s third argument). `spawnClaudeViaTmux`,
+   * `reattachSession` and `rejectedAgent` leave it undefined — the first
+   * usually embeds its prompt in argv rather than pasting, and the other two
+   * never paste at all.
+   */
+  pasteOutcome?: Promise<PasteOutcome>;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -243,12 +265,43 @@ function fireBackgroundTaskSettled(taskId: string, agentId: string): void {
  * raw inner text of the matching `<local-command-stdout>` line, ANSI
  * escapes left as-is — the orchestrator's `parseClaudeLocalSetting` is
  * what strips/interprets both.
+ *
+ * `viaMirror` answers "did AGETOR drive this outcome?" — true iff
+ * `mirrorModelViaPicker` sent the picker's session-only confirm for this task
+ * within the last `MODEL_MIRROR_ATTRIBUTION_MS` (see
+ * `SessionState.lastModelMirrorAt`). It is only MEANINGFUL for
+ * `setting: "model"`, and only for a `Kept model as <X>` outcome — the one
+ * shape that is either "the user declined agetor's own switch confirm"
+ * (sync the row back) or "the user opened a bare `/model` and pressed Esc"
+ * (leave the row's deliberate next-run choice alone). Computed uniformly at
+ * the seam for both settings anyway, so the payload stays a plain snapshot
+ * rather than a conditional one; the effort branch simply never reads it.
  */
 export interface LocalSettingInfo {
   setting: "model" | "effort";
   args: string;
   stdout: string;
+  viaMirror: boolean;
 }
+
+/**
+ * How long after `mirrorModelViaPicker`'s session-only confirm keystroke a
+ * `/model` outcome is still attributed to agetor's own mirror
+ * (`LocalSettingInfo.viaMirror`).
+ *
+ * Sized off the mirror's own choreography, not guessed: the confirm key is
+ * sent, `autoConfirmSlashModal` then polls for `Switch model?` for up to
+ * `SLASH_CONFIRM_WINDOW_MS`, the user answers it (or agetor auto-confirms),
+ * and only then does claude write the `<local-command-stdout>` line the JSONL
+ * tailer has to notice and dispatch. 15 s covers that chain with room for a
+ * slow write/tail without being so wide that an unrelated bare `/model` +
+ * Esc a minute later could still be credited to the mirror. Erring long is
+ * the cheaper mistake in only one direction — a mis-attributed sync writes
+ * the model claude actually kept, whereas a mis-attributed SKIP would leave
+ * the row disagreeing with a switch the user really did decline — but both
+ * are corrected by the next real outcome, so the window stays tight.
+ */
+const MODEL_MIRROR_ATTRIBUTION_MS = 15_000;
 
 /**
  * Handler the orchestrator installs to learn that claude itself just
@@ -858,6 +911,25 @@ function syntheticNotificationUuid(content: string): string {
  * talking). A plain status-only line that is NEITHER of those two shapes (a
  * mode banner, a turn-duration footer, an unrelated `isMeta` breadcrumb)
  * must NOT open a new run on its own.
+ *
+ * **Local-command twins are never continuation content** (smoke evidence,
+ * claude 2.1.246): flipping the effort dropdown on an IDLE task makes the
+ * orchestrator mirror `/effort max` through `sendSlashCommand`, which pushes
+ * NO turn slot — so claude's two JSONL twins for it (`<command-name>/effort…`
+ * and `<local-command-stdout>…`) arrive on a session with an empty
+ * `turnQueue` and, under the old "any non-meta `user` line is content" rule,
+ * were adopted as an `origin: "continuation"` run. Nothing can ever settle
+ * such a run: the local-command settle in `dispatchLine` requires a head slot
+ * whose OWN prompt named the same command (`TurnSlot.slashCommand`), and the
+ * adopted slot's `slashCommand` is `null` by construction. The observed run
+ * sat `running` for 6 minutes with claude parked at a bare `❯`.
+ *
+ * A `/model`/`/effort` twin is claude ANSWERING a local command, not claude
+ * continuing work — so both shapes are excluded here and route instead to
+ * `state.lastChunk` (the previous run's handler), where they render as the
+ * command / command-output bubbles `lib/command-message.ts` already knows how
+ * to draw. The `isMeta` `<local-command-caveat>` breadcrumb is already
+ * excluded by the `isMeta` check just above.
  */
 function isContinuationContentEvent(evt: ParsedJsonlEvent): boolean {
   if (evt.type === "assistant") return true;
@@ -867,6 +939,9 @@ function isContinuationContentEvent(evt: ParsedJsonlEvent): boolean {
     // content on their own.
     if (evt.origin?.kind === "task-notification") return false;
     if (evt.isMeta === true) return false;
+    // The two local-command twins — see this function's doc.
+    if (parseLocalCommandLine(evt) !== null) return false;
+    if (isLocalCommandStdoutEvent(evt)) return false;
     return true;
   }
   return false;
@@ -1368,6 +1443,29 @@ export function sessionIdleInfo(taskId: string): { idleMs: number } | null {
   return { idleMs: Date.now() - state.lastActivityAt };
 }
 
+/**
+ * The reasoning-effort id the LIVE claude process for `taskId` was launched
+ * with — the `CLAUDE_CODE_EFFORT_LEVEL` its spawn env carried (see
+ * `SessionState.launchEffort`). `null` when there is no live session, when the
+ * session was reattached rather than spawned by this process (no launch env to
+ * read), or when the launch carried no effort at all.
+ *
+ * The orchestrator's breadcrumb needs this to say something honest when
+ * `task.effort` and the live session disagree: the env var is fixed for the
+ * lifetime of the process, so a task row that has since been changed —
+ * whether from the dropdown or synced back from claude's own `/effort` — is
+ * describing the NEXT spawn, not the one currently running ("this session is
+ * pinned to <launchEffort> by CLAUDE_CODE_EFFORT_LEVEL").
+ *
+ * Deliberately reports the LAUNCH value, never the live one. Claude's
+ * in-session `/effort` does change what claude actually uses, but it cannot
+ * change the env var, and it is precisely that split the breadcrumb exists to
+ * explain — so this must not be updated when a `/effort` outcome syncs.
+ */
+export function getSessionLaunchEffort(taskId: string): string | null {
+  return sessions.get(taskId)?.launchEffort ?? null;
+}
+
 /** Name-keyed variant for callers that hold a persisted session name (e.g.
  *  `runs.tmux_session`) and don't want to recompute it from a task id.
  *  Exact-match `=` prefix — see `sessionExists`. */
@@ -1712,19 +1810,10 @@ export async function dismissTmuxPrompt(
       // Numbered modal: arrow-key from cursorIndex to targetIndex.
       // delta === 0 → no arrow at all, the trailing Enter alone
       // confirms the current selection.
-      for (let i = 0; i < stepCount; i++) {
-        if (!tmux(["send-keys", "-t", state.sessionName, arrow]).ok) return;
-        // Small gap between arrow presses — defensive splitting that
-        // mirrors what the original `digit + Enter` path needed:
-        // bursting two arrow events as a single read into Ink's stdin
-        // has been observed (rarely) to coalesce into one cursor
-        // advance. The gap also lets the per-keystroke `stillCurrent()`
-        // re-gate fire if a `dropSession` lands mid-navigation.
-        await Bun.sleep(30);
-        if (!stillCurrent()) return;
-      }
+      if (!(await walkCursor(state, arrow, stepCount, stillCurrent))) return;
     } else {
       // y/n style: send the literal keystroke.
+      bumpKeystroke(state);
       if (!tmux(["send-keys", "-t", state.sessionName, key]).ok) return;
       await Bun.sleep(50);
       if (!stillCurrent()) return;
@@ -1740,9 +1829,47 @@ export async function dismissTmuxPrompt(
     // function doc above. The y/n path above already sent its own literal
     // keystroke and always confirms with a plain Enter here.
     const finalKey = useArrowNav ? (ctx.confirmKey ?? "Enter") : "Enter";
+    bumpKeystroke(state);
     ok = tmux(["send-keys", "-t", state.sessionName, finalKey]).ok;
   }, state);
   return ok;
+}
+
+/**
+ * Walk claude's modal cursor `steps` positions in the `arrow` direction, one
+ * `send-keys` per press. Factored out of `dismissTmuxPrompt` (its original
+ * home) so `mirrorModelViaPicker` drives the `/model` picker's cursor through
+ * the exact same choreography rather than a second hand-rolled copy of it.
+ *
+ * MUST be called from inside a `queueTmuxOp` body — it takes that op's own
+ * `stillCurrent` predicate and re-checks it after every gap, so a
+ * `dropSession` landing mid-navigation aborts instead of leaking the
+ * remaining arrows (and, worse, the caller's trailing confirm key) into a
+ * respawned pane.
+ *
+ * The 30 ms inter-press gap is defensive splitting: bursting two arrow events
+ * as a single read into Ink's stdin has been observed (rarely) to coalesce
+ * into one cursor advance. It also gives the `stillCurrent()` re-gate
+ * something to fire between.
+ *
+ * Returns false when a `send-keys` failed or the session stopped being
+ * current — in both cases the caller must NOT send its confirm keystroke,
+ * since the cursor is not where it thinks it is. `steps === 0` is a no-op
+ * that returns true (the cursor already sits on the target).
+ */
+async function walkCursor(
+  state: SessionState,
+  arrow: string,
+  steps: number,
+  stillCurrent: () => boolean,
+): Promise<boolean> {
+  for (let i = 0; i < steps; i++) {
+    bumpKeystroke(state);
+    if (!tmux(["send-keys", "-t", state.sessionName, arrow]).ok) return false;
+    await Bun.sleep(30);
+    if (!stillCurrent()) return false;
+  }
+  return true;
 }
 
 /**
@@ -1771,6 +1898,7 @@ export async function sendModalKeys(taskId: string, keys: NavKey[]): Promise<boo
   let ok = false;
   await queueTmuxOp(taskId, async (stillCurrent) => {
     for (const key of keys) {
+      bumpKeystroke(state);
       if (!tmux(["send-keys", "-t", state.sessionName, key]).ok) return;
       // Inter-key gap mirrors dismissTmuxPrompt: a bursted pair can read as a
       // single Ink event, and the gap lets the dispose re-gate fire.
@@ -1912,6 +2040,7 @@ export async function driveAskAnswers(
   let ok = false;
   await queueTmuxOp(taskId, async (stillCurrent) => {
     for (const key of body) {
+      bumpKeystroke(state);
       if (!tmux(["send-keys", "-t", state.sessionName, key]).ok) return;
       // Inter-key gap mirrors sendModalKeys: a bursted pair can read as a
       // single Ink event, and the gap lets the dispose re-gate fire.
@@ -1927,6 +2056,7 @@ export async function driveAskAnswers(
         const step = decideAskDriveStep(detectAskModal(captureTail(state)), confirmSent, 0);
         if (step === "done") { ok = true; return; }
         if (step === "send-enter") {
+          bumpKeystroke(state);
           if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
           confirmSent = true;
         }
@@ -1946,6 +2076,7 @@ export async function driveAskAnswers(
       if (step === "done") { ok = true; return; }
       if (step === "fail") return;
       if (step === "send-enter") {
+        bumpKeystroke(state);
         if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
         confirmSent = true;
         resends++;
@@ -1990,6 +2121,29 @@ interface SessionState {
    *  `sessionIdleInfo` (the reaper's idle signal, T4/orchestrator.ts) and the
    *  `pollTimer`'s own self-throttle just above. */
   lastActivityAt: number;
+  /**
+   * `Date.now()` stamp of the last time AGETOR ITSELF drove keystrokes into
+   * this session's pane — the single write site is `bumpKeystroke`, called
+   * from every place this module pastes text or sends keys (see that
+   * function's doc for the enumerated list). Initialized to the construction
+   * time in `makeSessionState`, exactly like `lastActivityAt`.
+   *
+   * Deliberately NOT the same clock as `lastActivityAt`, which also counts
+   * claude's own life signs (JSONL appends, pane diffs). The idle-settle net
+   * in `scrapeOnce` needs "have WE touched this pane recently?", not "has
+   * anything at all changed?": the whole point of that net is to close out a
+   * turn on a pane where nothing is happening, and a pane that repaints on
+   * its own (claude 2.1.246's status-bar hint flickers ~1 Hz — see
+   * `EFFORT_HINT_SUFFIX_RE` / `normalizePaneForActivity`) would otherwise
+   * keep `lastActivityAt` pinned at "now" forever and hold the gate shut. The
+   * hazard that gate exists to defend against — settling a turn whose prompt
+   * we only just delivered — is entirely a function of OUR keystrokes, which
+   * is exactly what this field measures.
+   *
+   * `lastActivityAt` is left alone (still the reaper's idle clock, still
+   * bumped by pane diffs and JSONL appends); `bumpKeystroke` is additive.
+   */
+  lastKeystrokeAt: number;
   /** Last full tmux pane capture `scrapeOnce` took (the same trimmed tail
    *  text used for modal matching), kept purely to detect "the pane changed
    *  since last capture" as an activity signal independent of JSONL writes —
@@ -2289,6 +2443,72 @@ interface SessionState {
    * guard (before any text reached the composer) has nothing to flag.
    */
   composerHoldsText: boolean;
+  /**
+   * True for the duration of `mirrorModelViaPicker`'s driving `queueTmuxOp`
+   * callback (finding #3, wave-5 re-review) — set true right before that op
+   * starts polling for the bare `/model` picker, cleared in a `finally` so
+   * every exit path restores it. While true, `scrapeOnce` skips registering
+   * a NEW `tmux_prompt` card (both the generic and unparsable matcher paths
+   * converge on one registration call — see that call site) but still runs
+   * its `__external__` auto-cancel sweep for anything already registered.
+   * Mirrors `askCollecting`'s "a known driver owns the pane right now" idea:
+   * the picker's footer (`Enter to set as default · s to use this session
+   * only · Esc to cancel`) makes it `highConfidence` in `matchNumberedModal`,
+   * so without this it would card on the very first scrape tick after
+   * agetor opened it — and a concurrent card click racing this function's
+   * own keystrokes would enqueue `dismissTmuxPrompt` behind the mirror's own
+   * op on the same per-task chain, risking a wrong-row confirm. False by
+   * default; reset to false on dispose (defensive — the op's own `finally`
+   * should already have cleared it by the time a session tears down, but a
+   * session death mid-drive shouldn't leave a stale suppression behind).
+   */
+  drivingPrompt: boolean;
+  /**
+   * `Date.now()` at the moment `mirrorModelViaPicker` last sent the picker's
+   * session-only confirm key (`s`) into this session — i.e. the last time
+   * AGETOR ITSELF drove a `/model` outcome. `0` when it never has.
+   *
+   * Read at exactly one place: the local-setting-sync seam in `dispatchLine`,
+   * which turns it into `LocalSettingInfo.viaMirror`
+   * (`Date.now() - lastModelMirrorAt < MODEL_MIRROR_ATTRIBUTION_MS`). That
+   * boolean is what lets the orchestrator tell claude's `Kept model as <X>`
+   * outcome apart in the only two ways it can arise:
+   *   - agetor's own mirror popped `Switch model?` and the user DECLINED it
+   *     (`viaMirror` true) — the row was already written optimistically and
+   *     genuinely needs correcting back to what the session kept;
+   *   - the user opened a bare `/model` themselves and pressed Esc
+   *     (`viaMirror` false) — claude reports the model it kept, which says
+   *     NOTHING about the next-run model the user deliberately picked in the
+   *     dropdown. Syncing there silently discarded that choice (live smoke:
+   *     a row set to a model the 2.1.246 picker can't select, then reverted
+   *     to `Sonnet 5` by a bare `/model` + Esc).
+   *
+   * Stamped ONLY on the `s` keystroke actually landing — not on the opening
+   * `/model` paste, and not on the `target not offered` Escape exit. That
+   * Escape produces the very same `Kept model as` line a user's own Esc does,
+   * and it means the row's target model wasn't on offer, so it must NOT be
+   * allowed to overwrite the row either.
+   *
+   * Reset to 0 on dispose, like every other per-session clock — a respawned
+   * session must not inherit a previous process's attribution window.
+   */
+  lastModelMirrorAt: number;
+  /**
+   * The reasoning-effort id this session's claude process was LAUNCHED with —
+   * i.e. whatever `CLAUDE_CODE_EFFORT_LEVEL` the spawn env carried
+   * (`agents.ts`'s `buildCommand` writes that var and drops unknown ids), or
+   * `null` when the env carried none (a model that declines effort) or when
+   * there was no launch env to read at all (`reattachSession`,
+   * `rebuildEventsFromJsonl`, the test helper).
+   *
+   * Read-only bookkeeping, surfaced through `getSessionLaunchEffort` for the
+   * orchestrator's breadcrumb — "this session is pinned to <launchEffort> by
+   * CLAUDE_CODE_EFFORT_LEVEL". Deliberately NOT updated when claude's own
+   * `/effort` changes the LIVE effort mid-session: the env var is what the
+   * process started with and cannot be re-set without a respawn, which is
+   * exactly the fact the breadcrumb needs to state. Cleared on dispose.
+   */
+  launchEffort: string | null;
 }
 
 interface TurnSlot {
@@ -2386,6 +2606,9 @@ interface MakeSessionStateOpts {
    *  to seed the suppression baseline without also seeding `permissionMode`). */
   lastAnnouncedPermissionMode?: string | null;
   bypassEnabled?: boolean;
+  /** See `SessionState.launchEffort`. Only `spawnClaudeViaTmux` has a launch
+   *  env to read this off; every other construction site leaves it null. */
+  launchEffort?: string | null;
 }
 
 function makeSessionState(o: MakeSessionStateOpts): SessionState {
@@ -2402,6 +2625,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     permissionMode: o.permissionMode ?? null,
     lastAnnouncedPermissionMode: o.lastAnnouncedPermissionMode ?? o.permissionMode ?? null,
     bypassEnabled: o.bypassEnabled ?? false,
+    launchEffort: o.launchEffort ?? null,
     // Defaults shared by every site — timers, scrape state, staging buffers.
     watcher: null,
     pollTimer: null,
@@ -2411,6 +2635,10 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     // reattach, rebuild, the test helper) routes through here, so stamping
     // "now" here covers all of them uniformly.
     lastActivityAt: Date.now(),
+    // Same "start the clock at construction" rule as `lastActivityAt` above:
+    // a session that has existed for less than STUCK_TURN_FALLBACK_MS is
+    // structurally ineligible for the idle-settle net, spawn prompt or not.
+    lastKeystrokeAt: Date.now(),
     scrapeLastPaneText: null,
     scrapeLastFingerprint: null,
     scrapeUnparsableStreak: 0,
@@ -2431,6 +2659,11 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     continuationWatchdog: null,
     paneGrowInFlight: false,
     composerHoldsText: false,
+    drivingPrompt: false,
+    // Never mirrored yet. `0` is deliberately a real timestamp value rather
+    // than `null`: `Date.now() - 0` is ~56 years, so the attribution window
+    // reads false without a special case at the seam.
+    lastModelMirrorAt: 0,
   };
 }
 
@@ -2441,6 +2674,47 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
  *  grep-able and can't silently drift out of sync with the doc comment. */
 function bumpActivity(state: SessionState): void {
   state.lastActivityAt = Date.now();
+}
+
+/**
+ * Stamp `lastKeystrokeAt` to "now" — the single write site for the
+ * "agetor last touched this pane" clock (see the field's doc on
+ * `SessionState` for why it is separate from `lastActivityAt`). Call this
+ * IMMEDIATELY BEFORE any tmux call that delivers keystrokes or a paste to the
+ * session's pane, so the stamp is set even when that call then fails: a
+ * `send-keys` that reports `.ok === false` may still have delivered bytes,
+ * and the conservative reading (we touched the pane) is the one that keeps
+ * the idle-settle net from closing a turn we may just have started.
+ *
+ * The full set of call sites (keep this list in sync — it is what makes the
+ * clock's meaning greppable):
+ *   - `queuePaste`, at ENQUEUE (finding #1, wave-5 re-review — before it ever
+ *     calls `queueTmuxOp`, since queuing a paste on a long-idle session is
+ *     already the intent to type, and the queued op can sit behind other work
+ *     on the per-task chain for multiple scrape ticks before it actually
+ *     runs), and again right before each `pastePromptSync` dispatch, before
+ *     the deferred bracketed Enter, and before the composer-clear keystrokes;
+ *   - `walkCursor` (the shared arrow-nav loop behind `dismissTmuxPrompt` and
+ *     `mirrorModelViaPicker`) and `dismissTmuxPrompt`'s own literal-key and
+ *     confirm keystrokes;
+ *   - `sendModalKeys` and `driveAskAnswers` (native modal driving), and the
+ *     ask-collector's pane navigation (`tmuxPaneIo.send`);
+ *   - `cycleToModeInner`'s Shift+Tab (`BTab`) batch;
+ *   - `autoConfirmSlashModal`'s Enter and `mirrorModelViaPicker`'s
+ *     `s` / `Escape`;
+ *   - `confirmStartupDialog`'s arrows + Enter (finding #6, wave-5 re-review —
+ *     looked up via `sessions.get(taskId)` since that function is handed only
+ *     a session NAME, not a `SessionState`; a prior version of this doc
+ *     claimed there was "no SessionState yet" at that point, which is false —
+ *     `spawnClaudeViaTmux` calls `sessions.set` before it ever arms the boot
+ *     poller that reaches `confirmStartupDialog`, so the state exists and a
+ *     miss there would leave the boot-time idle-settle net blind to agetor's
+ *     own auto-confirm keystrokes);
+ *   - the Ctrl+C interrupts (`makeAgent().kill`, `interruptTaskSession`,
+ *     `reattachSession`'s kill handle).
+ */
+function bumpKeystroke(state: SessionState): void {
+  state.lastKeystrokeAt = Date.now();
 }
 
 /* ────────────────────────────────────────────────────────────────────────── *
@@ -2760,7 +3034,12 @@ interface PaneIo {
 function tmuxPaneIo(state: SessionState): PaneIo {
   return {
     capture: () => captureFullPane(state),
-    send: (key) => tmux(["send-keys", "-t", state.sessionName, key]).ok,
+    send: (key) => {
+      // Ask-collector cursor navigation is still agetor typing into the live
+      // pane — same idle-settle clock as every other keystroke path.
+      bumpKeystroke(state);
+      return tmux(["send-keys", "-t", state.sessionName, key]).ok;
+    },
     size: () => paneSize(state),
     resize: (w, h) => resizePane(state, w, h),
     restore: (w, h) => restorePaneSize(state, w, h),
@@ -3531,6 +3810,12 @@ function dispatchLine(state: SessionState, line: string): void {
       setting: state.lastLocalCommandName === "/model" ? "model" : "effort",
       args: state.lastLocalCommandArgs ?? "",
       stdout: extractLocalCommandStdout(evt),
+      // Snapshot "agetor's own model mirror drove this" AT DISPATCH TIME —
+      // the closest moment to claude's own report we have. Only the
+      // orchestrator's `Kept model as` branch reads it; see
+      // `SessionState.lastModelMirrorAt` for why a user-driven bare `/model`
+      // + Esc must never sync the row.
+      viaMirror: Date.now() - state.lastModelMirrorAt < MODEL_MIRROR_ATTRIBUTION_MS,
     });
   }
 
@@ -4382,6 +4667,12 @@ function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch
   // the arm logic because the notice veto below scans this same window.
   const paneLines = lines
     .map((l) => l.trimEnd())
+    // Same treatment `normalizePaneForActivity` gives the status-bar row: the
+    // right-hand `● high · /effort` hint flickers on 2.1.246, and a bar row
+    // inside this window would otherwise jitter the fingerprint — which the
+    // `__external__` sweep reads as "the prompt went away" and resolves the
+    // card, only to re-register it on the next tick.
+    .map(stripVolatileStatusBarHint)
     .filter((l) => l.length > 0 && !VOLATILE_PANE_LINE_RE.test(l))
     .slice(-12);
   // Usage-limit auto-continue notice (`continuing automatically/shortly · esc
@@ -4687,14 +4978,30 @@ export function matchStartupConsentDialog(pane: string): StartupDialogMatch | nu
  * transient `send-keys` failure leaves the fingerprint UN-latched and the next
  * poll tick retries — otherwise a half-sent confirm would silently strand the
  * dialog until the boot timeout.
+ *
+ * `taskId` is used ONLY to bump `lastKeystrokeAt` on this session's
+ * `SessionState` (finding #6, wave-5 re-review) — the caller's boot-poller
+ * IIFE already has `opts.taskId` in scope by construction (`spawnClaudeViaTmux`
+ * calls `sessions.set(opts.taskId, state)` before it ever arms the boot
+ * poller that reaches this function — see `bumpKeystroke`'s doc, which this
+ * corrects: there IS a `SessionState` to stamp by the time this runs, unlike
+ * that doc's old claim). Looked up fresh (`sessions.get`) rather than passed
+ * as a `SessionState` directly so a respawn mid-dialog (unlikely inside the
+ * bounded boot window, but not impossible) can't stamp a torn-down state.
  */
-async function confirmStartupDialog(sessionName: string, m: StartupDialogMatch): Promise<boolean> {
+async function confirmStartupDialog(taskId: string, sessionName: string, m: StartupDialogMatch): Promise<boolean> {
+  const bumpIfLive = (): void => {
+    const state = sessions.get(taskId);
+    if (state) bumpKeystroke(state);
+  };
   const delta = m.acceptIndex - m.cursorIndex;
   const arrow = delta >= 0 ? "Down" : "Up";
   for (let i = 0; i < Math.abs(delta); i++) {
+    bumpIfLive();
     if (!tmux(["send-keys", "-t", sessionName, arrow]).ok) return false;
     await Bun.sleep(30);
   }
+  bumpIfLive();
   return tmux(["send-keys", "-t", sessionName, "Enter"]).ok;
 }
 
@@ -4745,23 +5052,35 @@ function unparsableStreakCleared(streak: number): boolean {
  *
  * docs/plans/model-effort-local-command-turns.md §10 review finding #1: the
  * caller's `eligible` computation additionally requires
- * `now - state.lastActivityAt > STUCK_TURN_FALLBACK_MS` — `sendTurn`/
- * `pasteFollowUp` call `bumpActivity` themselves BEFORE ever enqueueing the
- * paste (`queuePaste` itself never calls it — finding #11a, §10 re-review),
- * plus a pane change bumps it too, so a just-sent, not-yet-delivered prompt
- * is structurally ineligible to settle,
- * while a genuinely static stuck pane still qualifies. This matters because
- * `decideScrapeTick` runs every ~1s while a turn is in flight, an
- * image-bearing paste's own bracketed gap can sleep up to
- * `IMAGE_ATTACH_SETTLE_MAX_MS` (3s) before its Enter goes out, and a queued
- * dropdown-mirror op (`sendSlashCommand`'s auto-confirm poll) can hold the
- * chain another 0.7-2.7s (`slashCommandSettleMs` + up to
+ * `now - state.lastKeystrokeAt > STUCK_TURN_FALLBACK_MS` — every path that
+ * delivers text or keys to the pane calls `bumpKeystroke` (see its doc for
+ * the enumerated list), so a just-sent, not-yet-delivered prompt is
+ * structurally ineligible to settle, while a genuinely static stuck pane
+ * still qualifies. This matters because `decideScrapeTick` runs every ~1s
+ * while a turn is in flight, an image-bearing paste's own bracketed gap can
+ * sleep up to `IMAGE_ATTACH_SETTLE_MAX_MS` (3s) before its Enter goes out,
+ * and a queued dropdown-mirror op (`sendSlashCommand`'s auto-confirm poll)
+ * can hold the chain another 0.7-2.7s (`slashCommandSettleMs` + up to
  * `SLASH_CONFIRM_WINDOW_MS`) — comfortably enough elapsed real time to
  * accumulate 3 "eligible" ticks well before the pane has genuinely gone
  * stale, on a session that was otherwise idle past `STUCK_TURN_FALLBACK_MS`
- * a turn or two ago. Requiring recent activity to ALSO be quiet past the
- * same 60s threshold closes that race without weakening the net for a truly
- * stuck pane (which by definition has no recent activity either).
+ * a turn or two ago.
+ *
+ * The clock used to be `lastActivityAt`, and that was WRONG in the one case
+ * this net exists for (smoke, claude 2.1.246): `lastActivityAt` is also
+ * bumped by `scrapeOnce`'s own pane diff, and claude's idle status bar
+ * flickers its right-hand hint (`● high · /effort`) roughly once a second, so
+ * the diff re-stamped the clock on every other tick and the 60s term was
+ * NEVER satisfied on a genuinely idle pane. A run stranded by an unsettleable
+ * local-command adoption sat `running` for 6 minutes with `paneShowsIdleInputBox`
+ * true the whole time and `signalIdleSettle` never firing. `lastKeystrokeAt`
+ * measures only what AGETOR did, which is the actual hazard (settling a turn
+ * whose prompt we just delivered) — claude repainting its own chrome is not.
+ * `normalizePaneForActivity` additionally strips that status bar's own
+ * flickering hint segment (`EFFORT_HINT_SUFFIX_RE`) out of the activity
+ * diff — while keeping the rest of the bar row, mode name included — so
+ * `lastActivityAt` stops being pinned on the hint alone, but the settle gate
+ * no longer depends on that either way.
  */
 function idleSettleTick(p: { eligible: boolean; streak: number }): { streak: number; fire: boolean } {
   if (!p.eligible) return { streak: 0, fire: false };
@@ -4880,11 +5199,62 @@ const SPINNER_GLYPH = "[✻✽✶✳✢·⚹✴]";
  *  `· Loading… more text` out. Animated (the glyph cycles), so it's volatile
  *  as well as busy. */
 const SPINNER_ACTIVE_LINE = `^\\s*${SPINNER_GLYPH}\\s+\\S+…(?:\\s*\\(|\\s*$)`;
-/** Elapsed spinner summary, e.g. `✻ Cooked for 2m 18s`, `✻ Brewed for 9s`,
- *  `✻ Cogitated for 5s` — no ellipsis. Still "busy" while a turn is in flight
- *  (a long non-shell tool call whose only pane signal is the elapsed timer).
- *  The `\d+[smh]` unit anchor keeps prose like `· foo for 3 reasons` out. */
-const SPINNER_ELAPSED_LINE = `^\\s*${SPINNER_GLYPH}\\s+\\S+\\s+for\\s+\\d+[smh]`;
+/**
+ * The COMPLETED-turn marker claude appends to a finished turn's elapsed
+ * spinner line. Smoke evidence (claude 2.1.246, live pane on an IDLE session
+ * three minutes after the turn ended, sitting 5 non-blank rows from the
+ * bottom — i.e. always inside `WORKING_CHROME_WINDOW_LINES`):
+ *
+ *   ✻ Churned for 1s · done 5:35 PM
+ *
+ * The LIVE forms carry no such suffix — `✻ Cooked for 2m 18s` (bare elapsed)
+ * and `✽ Frosting… (2m 52s · ↓ 12.1k tokens)` (ticking parenthetical) — so
+ * `· done` is the one token that tells a FINISHED summary apart from a
+ * still-running one.
+ *
+ * Two different questions ride on this line, which is why the marker is its
+ * own constant rather than a tweak to `SPINNER_ELAPSED_LINE` itself:
+ *
+ *   - **"is claude WORKING?" → no.** `WORKING_LINE_RE` therefore consumes
+ *     `SPINNER_ELAPSED_WORKING_LINE` (the same shape with this marker negated)
+ *     instead. Without that negation every idle pane that has EVER finished a
+ *     turn reads as working, which was the live bug: `mirrorModelViaPicker`
+ *     bailed `turn in flight` on every such session (so the dropdown's model
+ *     mirror could never run), the idle-settle net and the unparsable footer
+ *     arm — both gated on `!paneWorking` — stayed suppressed, and
+ *     `paneShowsComposerText` (which early-returns on working chrome) was
+ *     pinned false, so a composer-dirty withhold could never clear.
+ *   - **"is this line VOLATILE?" → yes, still.** `VOLATILE_PANE_LINE_RE` keeps
+ *     matching it via the un-negated `SPINNER_ELAPSED_LINE`. Both of that
+ *     regex's consumers — `matchUnparsableModal`'s fingerprint/`paneText`
+ *     window and `normalizePaneForActivity`'s activity diff — already strip
+ *     the ticking form, and letting the done form back in would make the tick
+ *     where `✻ Churned for 1s` becomes `✻ Churned for 1s · done 5:35 PM` read
+ *     as a pane change: a fingerprint jitter under a live modal (the
+ *     `__external__` sweep would cancel its own card and re-register it), and
+ *     a reaper idle-clock reset on a session that just went quiet.
+ *
+ * Only the elapsed arm is negated. `TOKEN_COUNTER_LINE` is deliberately left
+ * alone: no captured done-line carries a token counter, and this codebase
+ * only widens pane regexes against a captured pane.
+ */
+const TURN_DONE_SUMMARY_RE = /·\s*done\b/;
+/** Shared body of the elapsed spinner summary, e.g. `✻ Cooked for 2m 18s`,
+ *  `✻ Brewed for 9s`, `✻ Cogitated for 5s` — no ellipsis. Spliced into BOTH
+ *  variants below so the shape itself can't drift between them. The
+ *  `\d+[smh]` unit anchor keeps prose like `· foo for 3 reasons` out. */
+const SPINNER_ELAPSED_BODY = `${SPINNER_GLYPH}\\s+\\S+\\s+for\\s+\\d+[smh]`;
+/** Elapsed spinner summary in ANY state — still ticking OR carrying the
+ *  completed-turn `· done <time>` suffix. This is the VOLATILE-chrome form
+ *  (`VOLATILE_PANE_LINE_RE`); see `TURN_DONE_SUMMARY_RE` for why the done form
+ *  must stay volatile even though it is no longer "working". */
+const SPINNER_ELAPSED_LINE = `^\\s*${SPINNER_ELAPSED_BODY}`;
+/** Elapsed spinner summary that is still RUNNING — the same shape MINUS the
+ *  completed-turn form (`TURN_DONE_SUMMARY_RE`, negated as a line-wide
+ *  lookahead). Genuinely "busy" while a turn is in flight (a long non-shell
+ *  tool call whose only pane signal is the elapsed timer), which is why
+ *  `WORKING_LINE_RE` — and only `WORKING_LINE_RE` — uses this variant. */
+const SPINNER_ELAPSED_WORKING_LINE = `^(?!.*${TURN_DONE_SUMMARY_RE.source})\\s*${SPINNER_ELAPSED_BODY}`;
 /** Ticking token counter that rides the spinner line and the background-agent
  *  roster, e.g. `… · ↓ 12.1k tokens`, `general-purpose  10s · ↓ 46.2k tokens`.
  *  Anchored to the `·`-separator + arrow so a bare `↓ 5 tokens` in prose can't
@@ -4904,12 +5274,20 @@ const TOKEN_COUNTER_LINE = "·\\s*(?:↓|↑)\\s*[0-9.]+k?\\s*tokens";
  *  from (leading glyph, `·`-separated status-bar item, `still running`) so
  *  look-alike transcript prose — `· 3 shell scripts were updated`, `Waiting
  *  for 2 background agents to report back.` — can't read as working. Add a
- *  form only with a captured pane to back it. */
+ *  form only with a captured pane to back it.
+ *
+ *  The elapsed arm is `SPINNER_ELAPSED_WORKING_LINE`, NOT the plain
+ *  `SPINNER_ELAPSED_LINE` that `VOLATILE_PANE_LINE_RE` uses: a FINISHED
+ *  turn's summary row (`✻ Churned for 1s · done 5:35 PM`) keeps the elapsed
+ *  shape forever on an idle pane, so without the negation this whole
+ *  predicate reads `true` on every session that ever completed a turn — see
+ *  `TURN_DONE_SUMMARY_RE` for the live evidence and the four consumers that
+ *  broke. */
 const WORKING_LINE_RE = new RegExp(
   [
     ESC_TO_INTERRUPT,
     SPINNER_ACTIVE_LINE,
-    SPINNER_ELAPSED_LINE,
+    SPINNER_ELAPSED_WORKING_LINE,
     TOKEN_COUNTER_LINE,
     `^\\s*${SPINNER_GLYPH}\\s+Waiting for \\d+ background agent`,
     "\\d+\\s+shells?\\s+still\\s+running",
@@ -4946,17 +5324,92 @@ const WORKING_CHROME_WINDOW_LINES = 16;
  *  instantly — acceptable for a "go press Enter in the terminal" card. */
 const MODAL_NOTICE_RE = /continuing automatically|continuing shortly/i;
 
-/** Pane chrome that repaints on a fixed cadence independent of anything
- *  meaningful — the animated spinner line and its token counter (shared with
- *  `WORKING_LINE_RE`) and the rotating `Tip:` banner. Matched AFTER trailing
- *  whitespace is trimmed (see `normalizePaneForActivity`). Filtering these
- *  before fingerprinting is what keeps the stability gate and the `__external__`
- *  sweep from jittering on the animated `✻→✽→✶` glyph and the ticking
- *  `↓ N tokens` counter. */
+/** Bottom-of-pane status-bar text when claude is idle at its input box.
+ *  Evidence (2.1.245, five captured variants — the trailing `· ← 1 agent`
+ *  suffix is optional, present only when a background agent is running, so
+ *  it is NOT anchored here):
+ *    `⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`
+ *    `⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`
+ *    `⏸ manual mode on · ? for shortcuts · ← 1 agent` (no shift+tab hint)
+ *    `⏵⏵ accept edits on (shift+tab to cycle) · ← 1 agent`
+ *    `⏸ plan mode on (shift+tab to cycle) · ← 1 agent`
+ *  Anchored on the leading mode glyph (`⏵⏵`/`⏸`) plus either cycle hint —
+ *  narrower than `readPaneMode`'s per-mode regexes (which must tell the five
+ *  modes APART) because this only has to answer "is the bottom line a status
+ *  bar at all", not which mode it names. A working pane's OWN status bar can
+ *  carry the SAME `(shift+tab to cycle)` phrase with an `esc to interrupt`
+ *  segment spliced in — this regex alone can't tell the two apart, which is
+ *  why `paneShowsIdleInputBox` additionally rejects any matched bar
+ *  containing `esc to interrupt` (see that function's doc).
+ *
+ *  Declared ABOVE `VOLATILE_PANE_LINE_RE` (it used to sit below
+ *  `paneShowsClaudeWorking`) purely so that regex can splice this one's
+ *  `.source` in as an alternative at module-evaluation time — a `const`
+ *  referenced before its initializer runs would throw on TDZ. */
+const STATUS_BAR_RE = /^\s*(?:⏵⏵|⏸)\s.*(?:\(shift\+tab to cycle\)|\? for shortcuts)/;
+
+/**
+ * Pane chrome that repaints on a fixed cadence independent of anything
+ * meaningful — the animated spinner line and its token counter (shared with
+ * `WORKING_LINE_RE`) and the rotating `Tip:` banner. Matched AFTER trailing
+ * whitespace is trimmed. Has TWO consumers, both stripping whole LINES that
+ * match before doing further work on what's left — `matchUnparsableModal`'s
+ * `paneLines` (the window its `paneText`/fingerprint are built from) and
+ * `normalizePaneForActivity` (the "did the pane meaningfully change" diff
+ * `scrapeOnce` uses to drive `lastActivityAt`) — so an edit here changes the
+ * unparsable card's displayed text AND the reaper's activity signal
+ * together; keep both in mind when touching this regex. Filtering these
+ * before fingerprinting/diffing is what keeps the stability gate and the
+ * `__external__` sweep from jittering on the animated `✻→✽→✶` glyph and the
+ * ticking `↓ N tokens` counter.
+ *
+ * Uses the UN-negated `SPINNER_ELAPSED_LINE`, so a COMPLETED turn's summary
+ * row (`✻ Churned for 1s · done 5:35 PM`) is still stripped here even though
+ * `WORKING_LINE_RE` no longer treats it as working — the tick where the
+ * ticking form gains its `· done <time>` suffix is a chrome repaint, not a
+ * meaningful pane change, and letting it through would jitter the unparsable
+ * card's fingerprint and reset the reaper's idle clock. See
+ * `TURN_DONE_SUMMARY_RE` for the full split.
+ *
+ * Does NOT include claude's own bottom status bar (`STATUS_BAR_RE`) — see
+ * `EFFORT_HINT_SUFFIX_RE` below for why an entire-line arm for it was wrong,
+ * and `normalizePaneForActivity` for the narrower fix (finding #8, wave-5
+ * re-review). `STATUS_BAR_RE` itself is unchanged and still lives just above
+ * this constant only for the TDZ ordering reason in its own doc, not because
+ * this regex still splices it in.
+ */
 const VOLATILE_PANE_LINE_RE = new RegExp(
-  [ESC_TO_INTERRUPT, SPINNER_ACTIVE_LINE, SPINNER_ELAPSED_LINE, TOKEN_COUNTER_LINE, "^\\s*Tip:"].join("|"),
+  [
+    ESC_TO_INTERRUPT,
+    SPINNER_ACTIVE_LINE,
+    SPINNER_ELAPSED_LINE,
+    TOKEN_COUNTER_LINE,
+    "^\\s*Tip:",
+  ].join("|"),
   "i",
 );
+
+/**
+ * The flickering RIGHT-HAND hint segment claude 2.1.246 splices onto the
+ * bottom status bar while idle — smoke evidence: one capture read
+ * `⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent            ● high · /effort`
+ * at 15:56:06.5 and the IDENTICAL row without the trailing `● high · /effort`
+ * segment at 15:56:05. The two captures differ ONLY in that trailing
+ * segment — same mode glyph, same cycle hint, same agent count — which is
+ * why stripping the WHOLE status-bar row (the old `VOLATILE_PANE_LINE_RE`
+ * arm this replaces) was the wrong fix: it also erased the mode name itself
+ * from both consumers listed on `VOLATILE_PANE_LINE_RE`'s doc, hiding a
+ * genuine terminal-side mode flip (bypass → auto, say) from
+ * `normalizePaneForActivity`'s activity diff and from the unparsable card's
+ * displayed `paneText`. This regex targets only the self-flickering
+ * suffix — a leading run of whitespace, the `●`/`◉` glyph, one word, ` · `,
+ * then `/effort`, anchored to end-of-line — so `normalizePaneForActivity`
+ * can strip just that segment off a matched `STATUS_BAR_RE` row and keep the
+ * rest of the line (mode glyph, mode name, cycle hint, agent count) intact
+ * for the activity diff. Exported via `__forTest` alongside the helper that
+ * applies it.
+ */
+const EFFORT_HINT_SUFFIX_RE = /\s+[●◉]\s+\S+\s+·\s+\/effort\s*$/;
 
 /** True when the live pane shows claude actively working (see
  *  `WORKING_LINE_RE`), checked over the last `WORKING_CHROME_WINDOW_LINES`
@@ -4974,25 +5427,6 @@ function paneShowsClaudeWorking(tail: string): boolean {
   const nonBlank = tail.split("\n").filter((l) => l.trim().length > 0);
   return nonBlank.slice(-WORKING_CHROME_WINDOW_LINES).some((l) => WORKING_LINE_RE.test(l));
 }
-
-/** Bottom-of-pane status-bar text when claude is idle at its input box.
- *  Evidence (2.1.245, five captured variants — the trailing `· ← 1 agent`
- *  suffix is optional, present only when a background agent is running, so
- *  it is NOT anchored here):
- *    `⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent`
- *    `⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent`
- *    `⏸ manual mode on · ? for shortcuts · ← 1 agent` (no shift+tab hint)
- *    `⏵⏵ accept edits on (shift+tab to cycle) · ← 1 agent`
- *    `⏸ plan mode on (shift+tab to cycle) · ← 1 agent`
- *  Anchored on the leading mode glyph (`⏵⏵`/`⏸`) plus either cycle hint —
- *  narrower than `readPaneMode`'s per-mode regexes (which must tell the five
- *  modes APART) because this only has to answer "is the bottom line a status
- *  bar at all", not which mode it names. A working pane's OWN status bar can
- *  carry the SAME `(shift+tab to cycle)` phrase with an `esc to interrupt`
- *  segment spliced in — this regex alone can't tell the two apart, which is
- *  why `paneShowsIdleInputBox` additionally rejects any matched bar
- *  containing `esc to interrupt` (see that function's doc). */
-const STATUS_BAR_RE = /^\s*(?:⏵⏵|⏸)\s.*(?:\(shift\+tab to cycle\)|\? for shortcuts)/;
 
 /** How many trailing NON-BLANK pane lines ABOVE the status bar
  *  `paneShowsIdleInputBox` searches for a bare `❯` prompt row. The idle
@@ -5125,21 +5559,39 @@ const COMPOSER_CLEAR_KEYS = ["Escape", "Escape"];
 const COMPOSER_CLEAR_SETTLE_MS = 300;
 
 /**
+ * Strip claude's self-flickering `● <effort> · /effort` status-bar hint
+ * (`EFFORT_HINT_SUFFIX_RE`) off a matched `STATUS_BAR_RE` row, leaving the
+ * rest of the bar (mode glyph, mode name, cycle hint, agent count) intact —
+ * a no-op on any line that isn't a recognized status bar (finding #8,
+ * wave-5 re-review). Factored out of `normalizePaneForActivity` so the
+ * "only this segment is volatile, not the whole row" rule is unit-testable
+ * directly against a bare status-bar string, without a live tmux pane.
+ */
+function stripVolatileStatusBarHint(line: string): string {
+  return STATUS_BAR_RE.test(line) ? line.replace(EFFORT_HINT_SUFFIX_RE, "") : line;
+}
+
+/**
  * Normalize a captured pane tail into the form used for the "did the pane
  * meaningfully change" activity signal in `scrapeOnce`. Mirrors the
  * normalization the modal matchers (`matchNumberedModal`, `detectAskModal`)
  * already apply when fingerprinting a pane — right-trim each line, since
  * `tmux capture-pane` pads rows with trailing spaces that vary run to run —
- * and additionally drops lines that are pure volatile chrome (see
- * `VOLATILE_PANE_LINE_RE`). Without this, a session idling at the REPL can
- * keep resetting the reaper's 30-minute idle clock (`lastActivityAt`)
- * forever purely from chrome redraws that never touch real transcript
- * content, neutering the reaper. Only affects the activity-diff comparison —
- * modal matching still runs against the raw, unnormalized tail. */
+ * strips claude's OWN self-flickering status-bar hint segment
+ * (`stripVolatileStatusBarHint`, finding #8, wave-5 re-review — narrower than
+ * dropping the whole bar row, which used to hide a genuine mode flip from
+ * this same activity diff), and additionally drops lines that are pure
+ * volatile chrome otherwise (see `VOLATILE_PANE_LINE_RE`). Without this, a
+ * session idling at the REPL can keep resetting the reaper's 30-minute idle
+ * clock (`lastActivityAt`) forever purely from chrome redraws that never
+ * touch real transcript content, neutering the reaper. Only affects the
+ * activity-diff comparison — modal matching still runs against the raw,
+ * unnormalized tail. */
 function normalizePaneForActivity(tail: string): string {
   return tail
     .split("\n")
     .map((line) => line.trimEnd())
+    .map(stripVolatileStatusBarHint)
     .filter((line) => !VOLATILE_PANE_LINE_RE.test(line))
     .join("\n");
 }
@@ -5308,17 +5760,18 @@ function scrapeOnce(state: SessionState): void {
   // `paneIdle: false` so this reads the "other" watchdog conditions
   // (in-flight, quiet past `STUCK_TURN_FALLBACK_MS`, not working, no ask
   // card) independent of the idle gate — `paneIdle` above already carries
-  // the real idle signal for this branch. Additionally requires recent
-  // activity to ALSO be quiet past `STUCK_TURN_FALLBACK_MS` (finding #1,
-  // docs/plans/model-effort-local-command-turns.md §10 review) — see
-  // `idleSettleTick`'s doc for why a just-sent, not-yet-delivered prompt
-  // must be structurally ineligible here. Held to the same
+  // the real idle signal for this branch. Additionally requires AGETOR'S OWN
+  // last keystroke into this pane (`lastKeystrokeAt`, not the general-purpose
+  // `lastActivityAt`) to be quiet past `STUCK_TURN_FALLBACK_MS` — see
+  // `idleSettleTick`'s doc for why a just-sent, not-yet-delivered prompt must
+  // be structurally ineligible here, and why the clock had to stop being
+  // `lastActivityAt`. Held to the same
   // `UNPARSABLE_STABILITY_TICKS` stability bar `matchUnparsableModal` uses
   // (via `idleSettleTick`), so a single transient idle-looking frame can't
   // settle a run that's actually still busy. This is the version-proof net
   // for any turn that never gets an `end_turn` line — see `signalIdleSettle`.
   const idleSettleEligible = paneIdle
-    && now - state.lastActivityAt > STUCK_TURN_FALLBACK_MS
+    && now - state.lastKeystrokeAt > STUCK_TURN_FALLBACK_MS
     && pendingPrompts.length === 0
     && stuckTurnFallbackArmed({
       turnInFlight: turnInFlight(state),
@@ -5393,6 +5846,20 @@ function scrapeOnce(state: SessionState): void {
     state.scrapeLastFingerprint = match.fingerprint;
     if (!cleared) return;
   }
+
+  // Agetor itself is driving this exact modal (`mirrorModelViaPicker`'s
+  // queued op owns walking the picker and confirming it — see
+  // `SessionState.drivingPrompt`) — never register a competing card for a
+  // picker agetor opened itself. This is the single point BOTH the
+  // unparsable path and the generic-stability path above converge on before
+  // ever reaching `registerTmuxPrompt`, so one check here covers both rather
+  // than duplicating it in each branch. Same idea as the `askCollecting`
+  // guard higher up in this function (suppress registration while a KNOWN
+  // driver owns the pane), just placed at this convergence point instead.
+  // The `__external__` auto-cancel sweep above is untouched — a picker that
+  // disappears out from under the mirror (session death, external
+  // dismissal) still auto-cancels normally.
+  if (state.drivingPrompt) return;
 
   // Already registered? Nothing to do — the previous tick's broadcast
   // is what the UI is showing.
@@ -6025,6 +6492,15 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
     // (--dangerously-skip-permissions) — that's what puts
     // `bypassPermissions` into the Shift+Tab cycle.
     bypassEnabled: opts.mode === "bypass",
+    // The effort this process is actually pinned to. `ClaudeLaunchOptions` has
+    // no `effort` field — `agents.ts`'s `buildCommand` translates the task's
+    // effort id into the `CLAUDE_CODE_EFFORT_LEVEL` env var (dropping ids
+    // claude doesn't know), and that env is what reaches us as `opts.env` and
+    // then `fullEnv`. Reading it back off the env we are about to launch WITH
+    // is therefore the one source that can't disagree with the process: no
+    // second translation, no chance of recording an id that got filtered out.
+    // Absent for a model that declines effort → null.
+    launchEffort: fullEnv.CLAUDE_CODE_EFFORT_LEVEL ?? null,
   });
   // Dispose any prior state for this task before overwriting the map entry, so
   // a re-run (the previous session persisted, then the user hit Run again)
@@ -6263,7 +6739,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
             // interactive card while we auto-confirm it).
             lastGenericFingerprint = null;
             if (m.fingerprint !== lastConfirmedFingerprint) {
-              if (await confirmStartupDialog(sessionName, m)) {
+              if (await confirmStartupDialog(opts.taskId, sessionName, m)) {
                 lastConfirmedFingerprint = m.fingerprint;
                 opts.onChunk("status", `claude startup dialog auto-confirmed (${m.name})`);
               }
@@ -6498,6 +6974,7 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
       // done promise so the orchestrator's done-handler records `cancelled`.
       // Drop any staged end_turn so a late-arriving JSONL line can't fire it
       // post-cancel and emit a spurious "turn complete" banner.
+      bumpKeystroke(s);
       tmux(["send-keys", "-t", s.sessionName, "C-c"]);
       const err = new Error("cancelled");
       s.pendingEndTurn = null;
@@ -6530,6 +7007,12 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
  * even on the (theoretical) already-popped-slot race, since it's the
  * orchestrator's own phase-aware handling that matters there, not this
  * function's bookkeeping (finding #6, §10 re-review).
+ *
+ * The returned `SpawnedAgent` carries `pasteOutcome` — a never-rejecting
+ * promise for whether the prompt actually reached claude's composer (see the
+ * field's doc on `SpawnedAgent`). It is the awaitable twin of the
+ * `onPasteFailure` callback: same outcomes, plus the success case, and it
+ * always settles even when the queued tmux op is dropped without running.
  */
 export function sendTurn(
   taskId: string,
@@ -6578,8 +7061,16 @@ export function sendTurn(
   // replayed as a new user turn once the current one finishes. Our
   // `turnQueue` mirrors that: subsequent end_turn events pop slots in
   // FIFO order.
+  //
+  // `pasteOutcome` (exposed on the returned `SpawnedAgent`) is settled from
+  // `queuePaste`'s `onPasteOutcome` hook, which fires exactly once per paste —
+  // success, failure, or "the op was dropped" — so the promise can never hang
+  // and never rejects.
+  let settlePasteOutcome!: (outcome: PasteOutcome) => void;
+  const pasteOutcome = new Promise<PasteOutcome>((resolve) => { settlePasteOutcome = resolve; });
   void queuePaste(taskId, state.sessionName, prompt, 0, state, {
     bracketed: true,
+    onPasteOutcome: (outcome) => settlePasteOutcome(outcome),
     onPasteFailure: (outcome) => {
       // Guard against a (theoretical) race where the slot already popped
       // normally between the push above and this failure callback firing —
@@ -6608,7 +7099,7 @@ export function sendTurn(
       opts?.onPasteFailure?.(outcome);
     },
   });
-  return makeAgent(taskId, done);
+  return makeAgent(taskId, done, pasteOutcome);
 }
 
 /**
@@ -6636,7 +7127,23 @@ export function sendTurn(
  * fire a staged `pendingEndTurn` and pop the live slot mid-turn — resolving
  * the active run early. So we set the hold, paste, and nothing else.
  *
- * Returns false when no live session exists (caller falls back to spawning).
+ * **Return shape.** `false` when no live session exists (caller falls back to
+ * spawning) — deliberately the same falsy value this function has always
+ * returned for that case, so every existing `if (pasteFollowUp(…))` /
+ * `const delivered = pasteFollowUp(…); if (delivered)` call site keeps
+ * working unchanged. On the happy path it now returns an OBJECT rather than
+ * `true`:
+ *
+ *   `{ delivered: true; pasteOutcome: Promise<PasteOutcome> }`
+ *
+ * `delivered: true` means only what the old `true` meant — a live session
+ * exists and the paste has been ENQUEUED — while `pasteOutcome` is the
+ * never-rejecting promise for whether those keystrokes actually reached
+ * claude's composer (same contract as `SpawnedAgent.pasteOutcome`; settles
+ * exactly once, including when the queued op is dropped without running).
+ * The two are deliberately separate: enqueueing is synchronous and the
+ * caller's optimistic "user" bubble depends on it, but the real delivery
+ * verdict only exists a tick or more later.
  *
  * @param opts.onPasteFailure Forwarded verbatim to the underlying
  * `queuePaste` — fires when the paste (including a withheld one, from
@@ -6644,12 +7151,14 @@ export function sendTurn(
  * pushes no turn slot to settle, so the orchestrator's callback has nothing
  * to reject; it re-stashes `prompt` back into the task's backlog instead, so
  * a message folded in while a live claude modal is up isn't silently lost.
+ * The callback and `pasteOutcome` describe the same event — use whichever
+ * shape fits the call site; both fire for every failure.
  */
 export function pasteFollowUp(
   taskId: string,
   prompt: string,
   opts?: { onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void },
-): boolean {
+): { delivered: true; pasteOutcome: Promise<PasteOutcome> } | false {
   const state = sessions.get(taskId);
   if (!state) return false;
   // A folded-in follow-up paste is a life signal — reset the idle clock and
@@ -6664,11 +7173,14 @@ export function pasteFollowUp(
   // has already gone JSONL-quiet before claude replays it (plan limitation
   // L1 in docs/plans/catch-unknown-command-error.md).
   state.pendingSlashToken = slashTokenOf(prompt);
+  let settlePasteOutcome!: (outcome: PasteOutcome) => void;
+  const pasteOutcome = new Promise<PasteOutcome>((resolve) => { settlePasteOutcome = resolve; });
   void queuePaste(taskId, state.sessionName, prompt, 0, state, {
     bracketed: true,
+    onPasteOutcome: (outcome) => settlePasteOutcome(outcome),
     onPasteFailure: opts?.onPasteFailure,
   });
-  return true;
+  return { delivered: true, pasteOutcome };
 }
 
 /** How often `sendSlashCommand`'s auto-confirm step re-captures the pane
@@ -6765,16 +7277,29 @@ async function stillBlocking(state: SessionState): Promise<boolean> {
 }
 
 /**
+ * @internal — no production caller since wave 5 (the dropdown mirror for
+ * `/model` uses `mirrorModelViaPicker`, which drives the bare picker and
+ * confirms with `s` instead of typing `/model <id>`; `/effort` is never
+ * mirrored onto a live session at all — the orchestrator only writes it into
+ * the LAUNCH env, `CLAUDE_CODE_EFFORT_LEVEL`, so there's no live-session
+ * mirror to send it through). Kept for the test suite, which still drives it
+ * directly to exercise the paste-queue + auto-confirm plumbing this shares
+ * with `mirrorModelViaPicker` (`autoConfirmSlashModal`). `opts.autoConfirm:
+ * "effort"` in particular has no production producer at all today — no code
+ * path ever calls `sendSlashCommand(..., { autoConfirm: "effort" })` outside
+ * tests — but the branch is left in rather than special-cased away, since a
+ * future live-session effort mirror would need exactly this plumbing.
+ *
  * Send a slash-command (or any literal keystroke line) to the task's tmux
  * session. The line is pasted via load-buffer + paste-buffer + Enter just like
  * a user prompt, so multi-word commands and embedded spaces survive intact.
  * Returns false when no live session exists for the task — caller decides
  * whether to spawn fresh or surface an error.
  *
- * Used by the orchestrator to mirror inline config edits onto a live claude
- * session: `/model <id>`, `/effort <id>`. (Permission-mode changes don't have
- * a slash command — see `cycleToMode`.) Keeping the session alive preserves
- * the conversation context across config changes.
+ * Historically used by the orchestrator to mirror inline config edits onto a
+ * live claude session: `/model <id>`, `/effort <id>`. (Permission-mode
+ * changes don't have a slash command — see `cycleToMode`.) Keeping the
+ * session alive preserves the conversation context across config changes.
  *
  * @param opts `autoConfirm` names which config dimension this mirror is for
  * (`"model"` / `"effort"`) so a follow-up auto-accepts claude's "Switch
@@ -6848,52 +7373,444 @@ export function sendSlashCommand(
   if (opts?.autoConfirm) {
     const kind = opts.autoConfirm;
     void queueTmuxOp(taskId, async (stillCurrent) => {
-      const attempts = Math.ceil(SLASH_CONFIRM_WINDOW_MS / SLASH_CONFIRM_POLL_MS);
-      let idleStreak = 0;
-      for (let i = 0; i < attempts; i++) {
-        if (!stillCurrent()) return;
-        const tail = captureConfirmPane(state);
-        const match = matchSlashConfirmModal(tail, kind);
-        if (match) {
-          if (!stillCurrent()) return;
-          if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
-          // Stamp answered only AFTER the Enter actually landed (finding #6):
-          // a failed send-keys means the confirm is still genuinely on the
-          // pane, so it must stay eligible for the scraper's own matcher
-          // chain to card normally rather than being silently suppressed.
-          markTmuxPromptAnswered(taskId, match.fingerprint);
-          for (const pending of activeTmuxPromptsForTask(taskId)) {
-            if (pending.fingerprint === match.fingerprint) {
-              answerTmuxPrompt(pending.id, { key: "__external__" });
-            }
-          }
-          return;
-        }
-        // A DIFFERENT blocking modal than the confirm we're polling for — a
-        // permission prompt that popped mid-turn, an AskUserQuestion, or the
-        // WRONG-kind confirm (`matchSlashConfirmModal` above already ruled
-        // out the matching kind, but a numbered modal with some other header
-        // still satisfies `paneShowsBlockingPrompt`). Never our confirm, and
-        // never safe to press Enter into — that would confirm whatever
-        // that OTHER modal's cursor happens to be on. Leave it for the
-        // scraper's own matcher chain to card in the usual way; bail out of
-        // this poll now instead of spending the rest of the window on a pane
-        // this step isn't going to act on.
-        if (paneShowsBlockingPrompt(tail)) return;
-        // Not the confirm (most commonly: the inline no-confirm path already
-        // went through) — keep polling. Never send Enter on anything else.
-        // Early exit: two consecutive idle-input-box sightings mean claude
-        // already settled with no confirm modal — give up now rather than
-        // spending the rest of SLASH_CONFIRM_WINDOW_MS polling nothing (see
-        // this function's doc for why that matters for the tmux op chain).
-        idleStreak = paneShowsIdleInputBox(tail) ? idleStreak + 1 : 0;
-        if (idleStreak >= SLASH_CONFIRM_IDLE_BREAK_TICKS) return;
-        if (i < attempts - 1) await Bun.sleep(SLASH_CONFIRM_POLL_MS);
-      }
-      // Window elapsed with no confirm modal — the common case. No-op.
+      await autoConfirmSlashModal(taskId, state, kind, stillCurrent);
     }, state);
   }
   return true;
+}
+
+/**
+ * Poll the pane for claude's mid-conversation `Switch model?` /
+ * `Change effort level?` confirm and accept it with Enter — the confirm half
+ * of `sendSlashCommand({ autoConfirm })`, factored out so
+ * `mirrorModelViaPicker` runs the IDENTICAL code path rather than a second
+ * copy of it (both are "agetor changed a setting on the user's behalf, so the
+ * user shouldn't have to click a second time to say yes"). See
+ * `sendSlashCommand`'s doc for the full rationale; the mechanics are:
+ *
+ *   - poll `captureConfirmPane` every `SLASH_CONFIRM_POLL_MS` for up to
+ *     `SLASH_CONFIRM_WINDOW_MS`;
+ *   - on the first `matchSlashConfirmModal(tail, kind)` hit send Enter, and
+ *     ONLY once that send-keys succeeded stamp the fingerprint answered and
+ *     resolve any card the scraper raced into existence for it;
+ *   - bail immediately on a DIFFERENT blocking modal (never press Enter into
+ *     one), and bail after `SLASH_CONFIRM_IDLE_BREAK_TICKS` consecutive
+ *     idle-input-box sightings (the common inline no-confirm path);
+ *   - Enter is NEVER sent on unmatched pane content.
+ *
+ * MUST be called from inside a `queueTmuxOp` body, whose `stillCurrent`
+ * predicate it re-checks before every pane read and before the Enter.
+ * Returns true iff the confirm was found AND its Enter landed.
+ */
+async function autoConfirmSlashModal(
+  taskId: string,
+  state: SessionState,
+  kind: "model" | "effort",
+  stillCurrent: () => boolean,
+): Promise<boolean> {
+  const attempts = Math.ceil(SLASH_CONFIRM_WINDOW_MS / SLASH_CONFIRM_POLL_MS);
+  let idleStreak = 0;
+  for (let i = 0; i < attempts; i++) {
+    if (!stillCurrent()) return false;
+    const tail = captureConfirmPane(state);
+    const match = matchSlashConfirmModal(tail, kind);
+    if (match) {
+      if (!stillCurrent()) return false;
+      bumpKeystroke(state);
+      if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return false;
+      // Stamp answered only AFTER the Enter actually landed (finding #6):
+      // a failed send-keys means the confirm is still genuinely on the
+      // pane, so it must stay eligible for the scraper's own matcher
+      // chain to card normally rather than being silently suppressed.
+      clearRegisteredPrompt(taskId, match.fingerprint);
+      return true;
+    }
+    // A DIFFERENT blocking modal than the confirm we're polling for — a
+    // permission prompt that popped mid-turn, an AskUserQuestion, or the
+    // WRONG-kind confirm (`matchSlashConfirmModal` above already ruled
+    // out the matching kind, but a numbered modal with some other header
+    // still satisfies `paneShowsBlockingPrompt`). Never our confirm, and
+    // never safe to press Enter into — that would confirm whatever
+    // that OTHER modal's cursor happens to be on. Leave it for the
+    // scraper's own matcher chain to card in the usual way; bail out of
+    // this poll now instead of spending the rest of the window on a pane
+    // this step isn't going to act on.
+    if (paneShowsBlockingPrompt(tail)) return false;
+    // Not the confirm (most commonly: the inline no-confirm path already
+    // went through) — keep polling. Never send Enter on anything else.
+    // Early exit: two consecutive idle-input-box sightings mean claude
+    // already settled with no confirm modal — give up now rather than
+    // spending the rest of SLASH_CONFIRM_WINDOW_MS polling nothing (see
+    // this function's doc for why that matters for the tmux op chain).
+    idleStreak = paneShowsIdleInputBox(tail) ? idleStreak + 1 : 0;
+    if (idleStreak >= SLASH_CONFIRM_IDLE_BREAK_TICKS) return false;
+    if (i < attempts - 1) await Bun.sleep(SLASH_CONFIRM_POLL_MS);
+  }
+  // Window elapsed with no confirm modal — the common case. No-op.
+  return false;
+}
+
+/**
+ * The model FAMILY word a bare-`/model` picker row names, or null when the
+ * row's label has no leading word at all.
+ *
+ * Captured picker rows (claude 2.1.246, smoke; the column gap is a run of
+ * spaces, and `✔` marks the row that is currently in effect):
+ *
+ *   1. Default (recommended)  Opus 5 with 1M context, best for complex work
+ *   2. Opus (1M context)      Opus 5 with 1M context …
+ *   3. Fable                  Fable 5 …
+ *   4. Sonnet ✔               Sonnet 5 …
+ *   5. Haiku                  Haiku 4.5 …
+ *
+ * So the parse is: take everything before the FIRST run of ≥2 spaces (that
+ * column gap is what separates the name from the description — a single space
+ * can't be used, several names contain one), strip `✔`, then take the leading
+ * word. The leading-word step is load-bearing, not cosmetic: row 2's name is
+ * `Opus (1M context)`, and a caller asking for the `Opus` family must match it
+ * (an exact whole-name comparison would miss, and the feature would report
+ * "target not offered" for the single most common target).
+ *
+ * Taking only the leading word is also what keeps the DESCRIPTION out of the
+ * decision — row 1's description says "Opus 5 …" while its name is `Default`,
+ * and picking it would write a *floating* default rather than the family the
+ * caller asked for.
+ */
+function pickerRowFamily(label: string): string | null {
+  const name = (label.split(/\s{2,}/)[0] ?? "").replace(/✔/g, "").trim();
+  return /^[A-Za-z][A-Za-z0-9.+-]*/.exec(name)?.[0] ?? null;
+}
+
+/**
+ * Index of the bare-`/model` picker row whose family word (see
+ * `pickerRowFamily`) equals `family`, case-insensitively — or `-1` when no
+ * row does.
+ *
+ * `Default` is never a match, from BOTH directions: a row whose own family
+ * word is `Default` is skipped, and a caller passing `"default"` gets `-1`.
+ * Claude's `Default (recommended)` row pins the account's floating default
+ * rather than a concrete family, so answering the picker with it would leave
+ * `task.model` describing something that can silently change under the task
+ * later — exactly the drift this whole mirror exists to remove.
+ *
+ * Pure (no pane, no tmux) so the mapping is unit-testable directly. Returns
+ * the FIRST match if claude ever ships two rows for one family; today's
+ * picker has exactly one row per family.
+ */
+function pickerChoiceIndexForFamily(choices: TmuxPromptChoice[], family: string): number {
+  const want = family.trim().toLowerCase();
+  if (want.length === 0 || want === "default") return -1;
+  return choices.findIndex((c) => {
+    const rowFamily = pickerRowFamily(c.label)?.toLowerCase();
+    return rowFamily !== undefined && rowFamily !== "default" && rowFamily === want;
+  });
+}
+
+/** Why `mirrorModelViaPicker` couldn't complete. A literal union (like
+ *  `CycleFailureReason`) so producer and consumer can't drift on a typo —
+ *  the orchestrator's breadcrumb wording is chosen by string equality. */
+export type MirrorModelFailureReason =
+  | "no live session"
+  | "turn in flight"
+  | "paste withheld"
+  | "picker not shown"
+  | "target not offered"
+  | "keystroke failed";
+
+export type MirrorModelResult =
+  | { ok: true; chosen: string }
+  | { ok: false; reason: MirrorModelFailureReason };
+
+/**
+ * Mirror a model change onto a live claude session by DRIVING THE BARE
+ * `/model` PICKER and confirming it with `s` ("use this session only") —
+ * never by typing `/model <id>`.
+ *
+ * **Why not `/model <id>`.** Smoke-verified on claude 2.1.246: typing
+ * `/model claude-sonnet-5` (what the dropdown mirror used to send) is a
+ * GLOBAL write — `~/.claude/settings.json`'s `model` key changes, so every
+ * future claude the user starts ANYWHERE inherits agetor's pick. A task-level
+ * dropdown must not have machine-level side effects. The bare picker's footer
+ * offers `Enter to set as default · s to use this session only · Esc to
+ * cancel`; `s` scopes the change to the live session, which is exactly the
+ * blast radius a per-task setting should have. (This is the same reasoning,
+ * and the same key, that `matchNumberedModal`'s `confirmKey` already applies
+ * when a HUMAN answers the picker through a card — see
+ * `SESSION_ONLY_CONFIRM_RE`. `task.model` still syncs from claude's own
+ * `<local-command-stdout>` either way, so agetor's bookkeeping doesn't depend
+ * on which key confirmed.)
+ *
+ * **The 2.1.246 picker** (smoke capture) — 5 rows, `✔` on the row in effect,
+ * a `≥2`-space column gap between each row's name and its description:
+ *
+ *   ❯ 1. Default (recommended)  Opus 5 with 1M context, best for complex work
+ *     2. Opus (1M context)      Opus 5 with 1M context …
+ *     3. Fable                  Fable 5 …
+ *     4. Sonnet ✔               Sonnet 5 …
+ *     5. Haiku                  Haiku 4.5 …
+ *   Enter to set as default · s to use this session only · Esc to cancel
+ *
+ * It registered as a card in 1.05 s in that capture, comfortably inside
+ * `SLASH_CONFIRM_WINDOW_MS`. Pressing `s` on a row other than the current one
+ * then pops `Switch model?` (`❯ 1. Yes, switch to Opus 5 (1M context)` /
+ * `2. No, go back`), which this function accepts through the SAME
+ * `autoConfirmSlashModal` path `sendSlashCommand({ autoConfirm: "model" })`
+ * uses — the user already chose in the dropdown, so a second click would be
+ * noise. `targetFamily` is one of `Opus` / `Sonnet` / `Fable` / `Haiku`; the
+ * orchestrator owns mapping an agetor model id onto that word.
+ *
+ * **Sequencing.** The bare `/model` paste goes through `queuePaste` (so it
+ * inherits the modal guard — a picker must never be opened by pasting INTO
+ * some other live modal) with the usual `slashCommandSettleMs`. Everything
+ * after it — poll, arrow-walk, `s`, confirm — runs in ONE `queueTmuxOp`
+ * enqueued SYNCHRONOUSLY right behind that paste, with no `await` in between,
+ * so nothing else on the task's tmux chain can interleave between opening the
+ * picker and answering it. Every keystroke is gated on `stillCurrent()`.
+ *
+ * **Never open the picker on a busy session** (finding #2, wave-5
+ * re-review). Checked twice: once at entry, before the `/model` paste is
+ * even enqueued, and again as the FIRST thing the driving `queueTmuxOp`
+ * callback does once it actually runs — the entry check ran before that
+ * paste was even queued, and claude can transition into working chrome
+ * (a background agent picking up, a long tool call) in the gap between
+ * enqueue and this op's turn on the per-task chain. Both checks are the same
+ * test: `turnInFlight(state)` (a live JSONL turn slot) OR
+ * `paneShowsClaudeWorking(capturePastePane(state))` (working chrome with no
+ * turn slot at all — background-agent activity). Either hit returns
+ * `{ ok: false, reason: "turn in flight" }` WITHOUT pasting anything (the
+ * entry check) or without driving any further keystrokes (the re-check,
+ * which runs after the `/model` paste already went out on the chain — see
+ * "Sequencing" above). This matters because claude's TUI QUEUES a bare
+ * slash command typed mid-turn instead of opening the picker immediately —
+ * it can replay as a picker minutes later, long after this function's own
+ * poll window has given up, with nothing left to drive it.
+ *
+ * **Failure modes**, all of which leave the session in a state the user or
+ * the scraper can take over from:
+ *   - `no live session` — nothing to drive (also returned when the queued op
+ *     was dropped because the session was replaced mid-flight).
+ *   - `turn in flight` — a turn was in flight (or the pane showed claude
+ *     working) at entry, or again by the time the driving op ran; see above.
+ *     NO keystroke is sent.
+ *   - `paste withheld` — `queuePaste`'s modal guard refused to open the
+ *     picker; `opts.onPasteFailure` fires with the real outcome first. NO
+ *     keystroke is sent.
+ *   - `picker not shown` — the poll window elapsed with no picker on the
+ *     pane. NO keystroke is sent; whatever IS on the pane is left for the
+ *     scraper's own matcher chain to card.
+ *   - `target not offered` — the picker is up but has no row for
+ *     `targetFamily` (claude renamed or dropped it). The picker is CLOSED
+ *     with `Escape` rather than left hanging, and never confirmed on a
+ *     wrong row; the fingerprint is stamped answered only if that Escape's
+ *     `send-keys` actually landed (finding #4, wave-5 re-review) — a failed
+ *     send-keys leaves the picker genuinely on the pane, so it must stay
+ *     eligible for the scraper's own matcher chain to card, mirroring the
+ *     same rule `autoConfirmSlashModal` applies to its own Enter.
+ *   - `keystroke failed` — a `send-keys` returned non-zero part-way through.
+ *
+ * **Suppresses the scraper while driving** (finding #3, wave-5 re-review):
+ * `SessionState.drivingPrompt` is set for the duration of the driving
+ * `queueTmuxOp` callback (try/finally, so it clears on every exit path) —
+ * `scrapeOnce` skips registering a NEW `tmux_prompt` card while it's true,
+ * the same idea as the existing `askCollecting` guard. The picker's footer
+ * (`Enter to set as default · s to use this session only · Esc to cancel`)
+ * makes it `highConfidence` in `matchNumberedModal` — it would otherwise card
+ * on the very first scrape tick, and a concurrent card click racing this
+ * function's own keystrokes would enqueue `dismissTmuxPrompt` behind this
+ * op on the same per-task chain, potentially confirming the wrong row.
+ *
+ * **Stamps the mirror attribution window.** The moment the session-only
+ * confirm key lands, `SessionState.lastModelMirrorAt` is set to now — the
+ * only write site for that clock. It is what lets the orchestrator treat a
+ * following `Kept model as <X>` (the user declining the `Switch model?` this
+ * function just provoked) as a row correction, while a `Kept model as <X>`
+ * from a bare user-typed `/model` + Esc leaves the row's next-run choice
+ * alone. Neither the opening paste nor the `target not offered` Escape exit
+ * stamps it — see the field's doc.
+ */
+export async function mirrorModelViaPicker(
+  taskId: string,
+  targetFamily: string,
+  opts?: { onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void },
+): Promise<MirrorModelResult> {
+  const state = sessions.get(taskId);
+  if (!state) return { ok: false, reason: "no live session" };
+
+  // Never open the picker on a busy session (finding #2, wave-5 re-review) —
+  // see this function's doc. Checked again as the first thing the driving op
+  // does below.
+  if (turnInFlight(state) || paneShowsClaudeWorking(capturePastePane(state))) {
+    return { ok: false, reason: "turn in flight" };
+  }
+
+  // Open the picker. Guarded (no `skipModalGuard`) — pasting `/model` into a
+  // live modal would confirm whatever its cursor is on instead of opening
+  // anything. `onPasteFailure` runs synchronously inside the queued paste op,
+  // and every reader below runs strictly after that op, so the outcome is
+  // always recorded before it is read.
+  //
+  // Recorded into an ARRAY rather than a `let … | null` purely for
+  // TypeScript's benefit: a `let` whose only assignment lives inside a
+  // callback stays narrowed to its `null` initializer at the read site, which
+  // turns `failure.op` into a property access on `never`.
+  const pasteFailures: Array<Extract<PasteOutcome, { ok: false }>> = [];
+  void queuePaste(taskId, state.sessionName, "/model", slashCommandSettleMs, state, {
+    onPasteFailure: (outcome) => {
+      pasteFailures.push(outcome);
+      opts?.onPasteFailure?.(outcome);
+    },
+  });
+
+  // Default reason covers the case where `queueTmuxOp`'s identity gate drops
+  // the body entirely (the session was disposed/respawned between enqueue and
+  // run) — nothing was driven, and "no live session" is the honest report.
+  let result: MirrorModelResult = { ok: false, reason: "no live session" };
+  await queueTmuxOp(taskId, async (stillCurrent) => {
+    if (pasteFailures.length > 0) return;
+
+    // Re-check busy-ness (finding #2, wave-5 re-review): the entry check
+    // above ran before the "/model" paste was even enqueued; claude can have
+    // transitioned into working chrome on its own (a background agent
+    // picking up, a long tool call) by the time THIS op actually gets its
+    // turn on the per-task chain — strictly after that paste's own op. Bail
+    // without driving any further keystrokes into a pane that may now be
+    // busy — including one where the bare `/model` we just pasted got
+    // swallowed into claude's queued-input buffer instead of opening the
+    // picker immediately.
+    if (turnInFlight(state) || paneShowsClaudeWorking(capturePastePane(state))) {
+      result = { ok: false, reason: "turn in flight" };
+      return;
+    }
+
+    // Suppress the scraper's own card registration for the duration of this
+    // op (finding #3, wave-5 re-review) — see this function's doc. Cleared
+    // in `finally` so every exit path (including a thrown error) restores it.
+    state.drivingPrompt = true;
+    try {
+      // Poll for the picker. Identified structurally, NOT by matching row
+      // text: a numbered modal whose footer advertises the session-only
+      // confirm (`ScrapeMatch.confirmKey === "s"`, set by `matchNumberedModal`
+      // off `SESSION_ONLY_CONFIRM_RE`) is exactly claude's picker and nothing
+      // else in its UI today. Reusing that signal means this driver and the
+      // card path agree on what a picker is by construction.
+      const attempts = Math.ceil(SLASH_CONFIRM_WINDOW_MS / SLASH_CONFIRM_POLL_MS);
+      let picker: ScrapeMatch | null = null;
+      for (let i = 0; i < attempts; i++) {
+        if (!stillCurrent()) return;
+        const m = matchNumberedModal(captureConfirmPane(state));
+        if (m && m.confirmKey === "s" && typeof m.cursorIndex === "number") {
+          picker = m;
+          break;
+        }
+        if (i < attempts - 1) await Bun.sleep(SLASH_CONFIRM_POLL_MS);
+      }
+      if (picker === null) {
+        // Never send a keystroke into a pane we couldn't identify.
+        result = { ok: false, reason: "picker not shown" };
+        return;
+      }
+
+      const targetIndex = pickerChoiceIndexForFamily(picker.choices, targetFamily);
+      if (targetIndex < 0) {
+        // The picker IS up, so leaving it would strand claude on a modal the
+        // user never opened. Close it with Escape (the footer's own cancel
+        // affordance).
+        if (!stillCurrent()) {
+          result = { ok: false, reason: "no live session" };
+          return;
+        }
+        bumpKeystroke(state);
+        const escape = tmux(["send-keys", "-t", state.sessionName, "Escape"]);
+        // Stamp the fingerprint answered ONLY when the Escape actually
+        // landed (finding #4, wave-5 re-review) — mirrors the symmetry
+        // `autoConfirmSlashModal` already applies to its own Enter: a failed
+        // send-keys means the picker is genuinely STILL on the pane, so it
+        // must stay eligible for the scraper's own matcher chain to card
+        // normally (once `drivingPrompt` clears below) rather than being
+        // silently suppressed with nothing left to drive it.
+        if (escape.ok) clearRegisteredPrompt(taskId, picker.fingerprint);
+        result = { ok: false, reason: "target not offered" };
+        return;
+      }
+
+      // Walk the cursor onto the target row, then confirm session-only. Same
+      // choreography (and the same 30 ms inter-press gaps + `stillCurrent()`
+      // re-gates) a card click takes through `dismissTmuxPrompt`.
+      const delta = targetIndex - picker.cursorIndex!;
+      const arrow = delta >= 0 ? "Down" : "Up";
+      if (!(await walkCursor(state, arrow, Math.abs(delta), stillCurrent))) {
+        result = { ok: false, reason: "keystroke failed" };
+        return;
+      }
+      if (!stillCurrent()) return;
+      // `picker.confirmKey` is "s" by the poll's own predicate; read it off
+      // the match rather than hardcoding, so a future footer wording change
+      // flows through `SESSION_ONLY_CONFIRM_RE` in one place.
+      bumpKeystroke(state);
+      if (!tmux(["send-keys", "-t", state.sessionName, picker.confirmKey!]).ok) {
+        result = { ok: false, reason: "keystroke failed" };
+        return;
+      }
+      // Attribution stamp — the ONLY write site for `lastModelMirrorAt`, and
+      // deliberately here rather than at the opening `/model` paste or on the
+      // `target not offered` Escape exit: this is the single point at which
+      // agetor has committed to a model CHANGE, so it is the only outcome
+      // whose `Kept model as …` (the user declining the resulting
+      // `Switch model?`) should be allowed to write back to the task row. See
+      // `SessionState.lastModelMirrorAt`.
+      state.lastModelMirrorAt = Date.now();
+      // Only AFTER the key landed (same rule as `autoConfirmSlashModal`): a
+      // failed send-keys leaves the picker genuinely on the pane and it must
+      // stay eligible for the scraper to card.
+      clearRegisteredPrompt(taskId, picker.fingerprint);
+
+      // `s` on a DIFFERENT family pops `Switch model?`. Accept it through the
+      // shared path — a no-op (and a cheap one, thanks to its idle-break)
+      // when claude applied the change inline instead.
+      await autoConfirmSlashModal(taskId, state, "model", stillCurrent);
+
+      result = { ok: true, chosen: pickerRowFamily(picker.choices[targetIndex]!.label) ?? targetFamily };
+    } finally {
+      state.drivingPrompt = false;
+    }
+  }, state);
+
+  // A failed opening paste wins over whatever the op recorded: it returned
+  // immediately and never touched the pane. `modal-guard` is the deliberate
+  // withhold (a live modal was up); anything else is a tmux call that didn't
+  // land — including `PASTE_DROPPED_OUTCOME`, where the queued op never ran
+  // because the session was replaced. Either way no keystroke went out, which
+  // is what `keystroke failed` says.
+  const failure = pasteFailures[0];
+  if (failure) {
+    return { ok: false, reason: failure.op === "modal-guard" ? "paste withheld" : "keystroke failed" };
+  }
+  return result;
+}
+
+/**
+ * Mark `fingerprint` as just-answered for `taskId` AND resolve any card the
+ * scraper already registered for it. Two halves that must always happen
+ * together once agetor itself has answered a modal:
+ *
+ *   - `markTmuxPromptAnswered` stops the NEXT scrape tick from re-registering
+ *     a ghost duplicate while tmux/claude are still repainting;
+ *   - `answerTmuxPrompt(…, "__external__")` clears a card that was ALREADY
+ *     registered, instead of leaving the user looking at (and able to click)
+ *     a modal that is no longer on the pane.
+ *
+ * Extracted from `autoConfirmSlashModal`'s success branch so
+ * `mirrorModelViaPicker` gets identical treatment on both of its
+ * modal-dismissing exits — the confirmed pick and the `Escape` on an
+ * unavailable family.
+ */
+function clearRegisteredPrompt(taskId: string, fingerprint: string): void {
+  markTmuxPromptAnswered(taskId, fingerprint);
+  for (const pending of activeTmuxPromptsForTask(taskId)) {
+    if (pending.fingerprint === fingerprint) {
+      answerTmuxPrompt(pending.id, { key: "__external__" });
+    }
+  }
 }
 
 /** Reasons `cycleToMode` can fail. Modeled as a literal union (rather than
@@ -7131,6 +8048,7 @@ async function cycleToModeInner(taskId: string, targetAgetorMode: string): Promi
     // plain `Tab`, which never cycles the mode (this was the original bug:
     // every "mode change" silently no-op'd).
     const keys = Array<string>(presses).fill("BTab");
+    bumpKeystroke(state);
     tmux(["send-keys", "-t", state.sessionName, ...keys]);
 
     // Verify by scraping the status bar, NOT the JSONL: claude only journals
@@ -7223,6 +8141,11 @@ export function dropSession(taskId: string): void {
 export function interruptTaskSession(taskId: string): boolean {
   const name = sessionNameFor(taskId);
   if (!sessionExistsByName(name)) return false;
+  // Best-effort: this path deliberately works from the session NAME alone
+  // (there may be no in-memory state after a restart), but when there IS a
+  // live state, stamp the keystroke clock like every other send-keys site.
+  const state = sessions.get(taskId);
+  if (state) bumpKeystroke(state);
   tmux(["send-keys", "-t", name, "C-c"]);
   return true;
 }
@@ -7266,6 +8189,23 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   state.lastLocalCommandName = null;
   state.lastLocalCommandArgs = null;
   state.composerHoldsText = false;
+  // Defensive — `mirrorModelViaPicker`'s own `finally` should already have
+  // cleared this by the time a session tears down; a session death mid-drive
+  // shouldn't leave a stale suppression behind on a respawned state either
+  // (this is a fresh object being disposed, not the new one, but the reset
+  // keeps the invariant "every SessionState starts non-driving" honest even
+  // if some future caller ever inspects a disposed-but-still-referenced one).
+  state.drivingPrompt = false;
+  // A respawned session must not inherit the previous process's mirror
+  // attribution window — a `Kept model as` line from the NEW session would
+  // otherwise be credited to a mirror that drove the OLD one.
+  state.lastModelMirrorAt = 0;
+  // The launch pin belongs to the process this state was tracking; that
+  // process is gone. Clearing it means a stale read can never claim a
+  // torn-down session was pinned to something (`getSessionLaunchEffort`
+  // already returns null for a task with no state at all, so this only
+  // matters for the window where a caller still holds the object).
+  state.launchEffort = null;
   const err = new Error("session killed");
   // Null `resolve`/`reject` after rejecting each slot (finding #6, §10
   // re-review) — mirrors `popEndOfTurn`'s own settle convention and is what
@@ -7287,8 +8227,15 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   pasteChains.delete(state.taskId);
 }
 
-function makeAgent(taskId: string, done: Promise<number>): SpawnedAgent {
+function makeAgent(
+  taskId: string,
+  done: Promise<number>,
+  /** Optional third handle — see `SpawnedAgent.pasteOutcome`. Only `sendTurn`
+   *  passes one; every other construction site has no paste to report on. */
+  pasteOutcome?: Promise<PasteOutcome>,
+): SpawnedAgent {
   return {
+    pasteOutcome,
     kill: () => {
       // Interrupt every queued turn for this task. Ctrl+C aborts whatever
       // claude is doing in the TUI and clears its queued-input buffer
@@ -7298,6 +8245,7 @@ function makeAgent(taskId: string, done: Promise<number>): SpawnedAgent {
       // and emit a spurious "turn complete" banner on the cancelled run.
       const state = sessions.get(taskId);
       if (!state) return;
+      bumpKeystroke(state);
       tmux(["send-keys", "-t", state.sessionName, "C-c"]);
       const err = new Error("cancelled");
       state.pendingEndTurn = null;
@@ -7396,6 +8344,11 @@ export const __forTest = {
    *  auto-continue notice veto, and the unparsable stability streak length —
    *  exposed so the truth table is unit-testable without a live tmux pane. */
   WORKING_LINE_RE,
+  /** The completed-turn `· done <time>` marker that keeps a finished turn's
+   *  elapsed summary row out of `WORKING_LINE_RE` while leaving it inside
+   *  `VOLATILE_PANE_LINE_RE` — exposed so the asymmetry (idle pane, but still
+   *  volatile chrome) can be asserted directly. */
+  TURN_DONE_SUMMARY_RE,
   MODAL_NOTICE_RE,
   paneShowsClaudeWorking,
   WORKING_CHROME_WINDOW_LINES,
@@ -7564,6 +8517,13 @@ export const __forTest = {
   paneShowsIdleInputBox,
   STATUS_BAR_RE,
   IDLE_PROMPT_SEARCH_LINES,
+  /** The flickering right-hand `● <effort> · /effort` status-bar hint regex,
+   *  plus the pure helper that strips it off a matched `STATUS_BAR_RE` row —
+   *  exposed so the "narrower than the whole line" truth table (finding #8,
+   *  wave-5 re-review) is unit-testable directly against bare strings,
+   *  without a live tmux pane. */
+  EFFORT_HINT_SUFFIX_RE,
+  stripVolatileStatusBarHint,
   signalIdleSettle,
   /** Explanatory status text emitted immediately before the "turn complete"
    *  banner when `signalIdleSettle` closes out a turn — exposed so tests can
@@ -7646,6 +8606,29 @@ export const __forTest = {
    *  can install/restore it via the same `__forTest` surface as every other
    *  seam in this file. */
   setLocalSettingChangedHandler,
+  /** Picker-driven model mirror — re-exported (already a top-level `export`)
+   *  so tests reach it through the same surface as the helpers below. Drive
+   *  it with `setCaptureConfirmPane` to feed it a synthetic picker/confirm
+   *  pane, exactly as the `sendSlashCommand` auto-confirm tests do. */
+  mirrorModelViaPicker,
+  /** The pure half of that mirror: which picker row a family word selects,
+   *  and the row-name parse behind it. Exposed so the `Opus (1M context)` /
+   *  `Sonnet ✔` / `Default (recommended)` truth table — including the
+   *  never-pick-Default rule from both directions — is unit-testable without
+   *  a live tmux pane. */
+  pickerChoiceIndexForFamily,
+  pickerRowFamily,
+  /** The mirror-attribution window that becomes `LocalSettingInfo.viaMirror`
+   *  — exposed so a test can assert the boundary (a `Kept model as` inside
+   *  the window is agetor's own declined `Switch model?`; one outside it is
+   *  the user's own bare `/model` + Esc) without hardcoding 15 s. */
+  MODEL_MIRROR_ATTRIBUTION_MS,
+  /** The "agetor last touched this pane" clock: its single write site, so a
+   *  test can age or refresh it deterministically instead of sleeping out
+   *  `STUCK_TURN_FALLBACK_MS`, and the launch-effort accessor the
+   *  orchestrator's breadcrumb reads. */
+  bumpKeystroke,
+  getSessionLaunchEffort,
 };
 
 /**
@@ -7787,7 +8770,7 @@ function pastePromptSync(
  *  `phase` to tailor what they tell the user — e.g. `"pre-enter"` and
  *  `"composer-dirty"` both mean the message is already sitting in claude's
  *  input box, so re-sending it would duplicate rather than deliver it. */
-type PasteOutcome =
+export type PasteOutcome =
   | { ok: true }
   | { ok: false; op: "load-buffer"; stderr: string }
   | { ok: false; op: "paste-buffer"; stderr: string }
@@ -8032,6 +9015,18 @@ function queueTmuxOp(
  * itself didn't go out. Any paste whose Enter actually goes out successfully
  * clears the flag — submitting the composer, including a message the flag
  * may have been set for.
+ *
+ * **Dropped ops** (finding #5, wave-5 re-review): a queued paste can also
+ * never run its body at all — `queueTmuxOp`'s own identity gate drops it
+ * when `dropSession` tears down (or a respawn replaces) the `SessionState`
+ * this paste was scheduled against before the chain reaches it. That case is
+ * NOT silent: the returned promise's own backstop (see `PASTE_DROPPED_OUTCOME`
+ * below) fires `opts.onPasteOutcome`/`opts.onPasteFailure` with a
+ * `stderr` that says exactly what happened, so a dropped op now behaves like
+ * any other paste failure — a caller that pushed a turn slot for this paste
+ * (`sendTurn`) settles it instead of leaving the run stuck `running`, and the
+ * orchestrator's `onPasteFailure` handling re-stashes the message rather than
+ * losing it when `dropSession` lands mid-paste.
  */
 function queuePaste(
   taskId: string,
@@ -8048,6 +9043,26 @@ function queuePaste(
      *  run stuck `running` forever. `reportPasteFailure` (the visible-chunk
      *  + log side of this) always runs regardless of whether this is set. */
     onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void;
+    /**
+     * Called EXACTLY ONCE with this paste's terminal outcome — `{ ok: true }`
+     * when the text (and, on the bracketed path, its trailing Enter) actually
+     * went out, or the same failing outcome `onPasteFailure` receives. This is
+     * the superset hook: every `onPasteFailure` call is preceded by an
+     * `onPasteOutcome` call carrying the identical object, and the success
+     * case has no `onPasteFailure` equivalent at all.
+     *
+     * "Exactly once" is guaranteed even for the paths that never reach either
+     * paste branch — a `!stillCurrent()` abort mid-op, or `queueTmuxOp`'s own
+     * identity gate dropping the body before it runs. Those resolve with a
+     * synthesized `{ op: "send-keys" }` failure (see `PASTE_DROPPED_OUTCOME`)
+     * once the queued op's promise settles, so a caller awaiting a promise
+     * built on this hook can never hang.
+     *
+     * `sendTurn` / `pasteFollowUp` use it to expose `pasteOutcome` on their
+     * return value; nothing else needs it (the failure-only hook above is
+     * enough when you only care about the bad path).
+     */
+    onPasteOutcome?: (outcome: PasteOutcome) => void;
     /**
      * Override the modal guard's grace window (default `PASTE_MODAL_GRACE_MS`)
      * for this paste only. Pass `0` to still RUN the guard check — unlike
@@ -8081,6 +9096,17 @@ function queuePaste(
     skipModalGuard?: boolean;
   } = {},
 ): Promise<void> {
+  // Bump the keystroke clock at ENQUEUE, before this paste ever reaches
+  // `queueTmuxOp` (finding #1, wave-5 re-review). Queuing a paste IS the
+  // intent to type — without this, a `sendTurn` whose paste sits queued
+  // behind other per-task tmux ops on a long-idle session could still be
+  // idle-settled by `scrapeOnce` (which gates on `lastKeystrokeAt`, not
+  // "is something queued") before the paste is ever dispatched, closing the
+  // turn out from under a message that hasn't been delivered yet. The bump
+  // inside the queued op itself (right before each dispatch, below) stays —
+  // it is NOT redundant: it re-covers the case where dequeue itself was
+  // delayed well past this enqueue-time stamp.
+  if (expectedState) bumpKeystroke(expectedState);
   // Non-bracketed path: load-buffer + paste-buffer + delete-buffer +
   // send-keys Enter all happen synchronously inside pastePromptSync, so
   // the only await is the optional settle — no tmux calls land after the
@@ -8116,7 +9142,21 @@ function queuePaste(
   // bail out of this op without sleeping the settle window. A transient
   // failure that still succeeds on `.ok` behaves exactly as before this
   // change; only genuine `.ok === false` results take the new path.
-  return queueTmuxOp(taskId, async (stillCurrent) => {
+  //
+  // `report` is the single notification funnel for this paste's terminal
+  // outcome: it fires `opts.onPasteOutcome` (always) and `opts.onPasteFailure`
+  // (failures only), and is idempotent — first call wins — so the
+  // "op was dropped" backstop attached to the returned promise below can be
+  // unconditional without ever double-reporting a paste that already
+  // succeeded or already failed for a real reason.
+  let outcomeReported = false;
+  const report = (outcome: PasteOutcome): void => {
+    if (outcomeReported) return;
+    outcomeReported = true;
+    opts.onPasteOutcome?.(outcome);
+    if (!outcome.ok) opts.onPasteFailure?.(outcome);
+  };
+  const chain = queueTmuxOp(taskId, async (stillCurrent) => {
     // Modal guard — see this function's doc. Runs BEFORE either paste path,
     // and only when there's a real SessionState to gate on (the identity
     // check `queueTmuxOp` already relies on) and the caller hasn't opted
@@ -8143,7 +9183,7 @@ function queuePaste(
             "paste withheld: claude is waiting on a prompt — answer it in the card or the terminal and resend";
           onChunk?.("status", message);
           console.error(`[claude-tmux] ${message} (task ${taskId})`);
-          opts.onPasteFailure?.(outcome);
+          report(outcome);
           return;
         }
         await Bun.sleep(PASTE_MODAL_POLL_MS);
@@ -8179,7 +9219,7 @@ function queuePaste(
           "paste withheld: claude's input box still holds your earlier message — it will be cleared once claude is idle; resend after that";
         onChunk?.("status", message);
         console.error(`[claude-tmux] ${message} (task ${taskId})`);
-        opts.onPasteFailure?.(outcome);
+        report(outcome);
         return;
       }
       if (paneShowsComposerText(tail)) {
@@ -8187,6 +9227,7 @@ function queuePaste(
         // server, socket gone, session vanished mid-op) exactly like any
         // other tmux call — check `.ok` rather than assuming the clear
         // keystrokes landed just because a pane re-capture follows.
+        bumpKeystroke(expectedState);
         const clearResult = tmux(["send-keys", "-t", sessionName, ...COMPOSER_CLEAR_KEYS]);
         if (!clearResult.ok) {
           const outcome: Extract<PasteOutcome, { ok: false }> =
@@ -8196,7 +9237,7 @@ function queuePaste(
             "paste withheld: claude's input box still holds your earlier message — it will be cleared once claude is idle; resend after that";
           onChunk?.("status", message);
           console.error(`[claude-tmux] ${message} (task ${taskId})`);
-          opts.onPasteFailure?.(outcome);
+          report(outcome);
           return;
         }
         insertedComposerClearDelay = true;
@@ -8218,7 +9259,7 @@ function queuePaste(
             "paste withheld: claude's input box still holds your earlier message — it will be cleared once claude is idle; resend after that";
           onChunk?.("status", message);
           console.error(`[claude-tmux] ${message} (task ${taskId})`);
-          opts.onPasteFailure?.(outcome);
+          report(outcome);
           return;
         }
         expectedState.composerHoldsText = false;
@@ -8242,7 +9283,7 @@ function queuePaste(
           "paste withheld: claude's input box still holds your earlier message — it will be cleared once claude is idle; resend after that";
         onChunk?.("status", message);
         console.error(`[claude-tmux] ${message} (task ${taskId})`);
-        opts.onPasteFailure?.(outcome);
+        report(outcome);
         return;
       }
     }
@@ -8267,15 +9308,16 @@ function queuePaste(
           "paste withheld: claude is waiting on a prompt — answer it in the card or the terminal and resend";
         onChunk?.("status", message);
         console.error(`[claude-tmux] ${message} (task ${taskId})`);
-        opts.onPasteFailure?.(outcome);
+        report(outcome);
         return;
       }
     }
     if (opts.bracketed) {
+      if (expectedState) bumpKeystroke(expectedState);
       const result = pastePromptSync(sessionName, text, { bracketed: true, skipEnter: true });
       if (!result.ok) {
         reportPasteFailure(taskId, expectedState, result);
-        opts.onPasteFailure?.(result);
+        report(result);
         return;
       }
       const imageCount = countImagePaths(text);
@@ -8313,10 +9355,11 @@ function queuePaste(
             "paste withheld before Enter: claude opened a prompt — your message is still in claude's input box; it will be cleared before your next send";
           onChunk?.("status", message);
           console.error(`[claude-tmux] ${message} (task ${taskId})`);
-          opts.onPasteFailure?.(outcome);
+          report(outcome);
           return;
         }
       }
+      if (expectedState) bumpKeystroke(expectedState);
       const enter = tmux(["send-keys", "-t", sessionName, "Enter"]);
       if (!enter.ok) {
         const outcome: TmuxPasteFailure =
@@ -8329,13 +9372,17 @@ function queuePaste(
         // next paste on this session would concatenate on top of it instead
         // of clearing it first.
         if (expectedState) expectedState.composerHoldsText = true;
-        opts.onPasteFailure?.(outcome);
+        report(outcome);
         return;
       }
       // Successful Enter — the composer is submitted; any earlier withheld
       // text (which may be THIS message itself) is no longer sitting there.
       if (expectedState) expectedState.composerHoldsText = false;
+      // Terminal success for the bracketed path: the paste-buffer AND its
+      // trailing Enter both went out, so the message is genuinely delivered.
+      report({ ok: true });
     } else {
+      if (expectedState) bumpKeystroke(expectedState);
       const result = pastePromptSync(sessionName, text, { bracketed: opts.bracketed });
       if (!result.ok) {
         reportPasteFailure(taskId, expectedState, result);
@@ -8346,14 +9393,49 @@ function queuePaste(
         // holds this text exactly like the bracketed path's Enter-failure
         // branch above.
         if (expectedState && result.op === "send-keys") expectedState.composerHoldsText = true;
-        opts.onPasteFailure?.(result);
+        report(result);
         return;
       }
       if (expectedState) expectedState.composerHoldsText = false;
+      // Terminal success for the non-bracketed path: `pastePromptSync`
+      // without `skipEnter` runs load-buffer + paste-buffer + Enter all
+      // synchronously, so an `ok` result means all three landed.
+      report({ ok: true });
     }
     if (settleMs > 0) await Bun.sleep(settleMs);
   }, expectedState);
+  // Terminal-outcome backstop: every `return` inside the op body above either
+  // reported already or bailed on `!stillCurrent()` — and `queueTmuxOp` can
+  // also drop the body outright at its own identity gate, before a single
+  // line of it runs. Both mean the keystrokes never went out. `report` is
+  // idempotent, so firing it unconditionally once the chain settles turns
+  // "exactly once" into a guarantee (see `opts.onPasteOutcome`) without ever
+  // overriding a real outcome that already went through.
+  void chain.then(() => report(PASTE_DROPPED_OUTCOME));
+  return chain;
 }
+
+/**
+ * Terminal outcome for a paste whose queued tmux op never ran (or aborted
+ * part-way) because the session it was scheduled against stopped being the
+ * current one — `queueTmuxOp`'s identity gate, or one of the in-op
+ * `stillCurrent()` re-gates; both mean a `dropSession` / respawn landed
+ * first, and no keystrokes reached the pane.
+ *
+ * Deliberately modeled as the EXISTING `op: "send-keys"` failure rather than
+ * a new `PasteOutcome` member: consumers (`reportPasteFailure`'s
+ * `"tmux <op> — …"` template, the orchestrator's `handlePasteWithheld`, which
+ * branches on `op === "modal-guard"` and then on `phase`) already narrow over
+ * today's union, and widening it would silently change every one of those
+ * branches. `"send-keys"` is also the honest reading — the keystrokes are
+ * exactly what didn't happen. The `stderr` text is what distinguishes this
+ * from a real tmux failure in a log or a status chunk.
+ */
+const PASTE_DROPPED_OUTCOME: TmuxPasteFailure = {
+  ok: false,
+  op: "send-keys",
+  stderr: "paste dropped: the session was disposed or respawned before the queued paste ran",
+};
 
 /**
  * Surface a persistent paste failure so a run never sits `running` forever

@@ -464,3 +464,50 @@ tmux failures get their own wording; display-name matching requires a word bound
 trailing Enter marks the composer dirty; the clear keystroke's result is checked;
 `paneShowsBlockingPrompt` delegates to `pickScrapeMatch`; the `PASTE_MODAL_*` test exports
 are live getters.
+
+## 11. Grill + headless smoke + wave 5 (2026-08-26)
+
+Owner decisions (grill): idle-settle stays *succeeded → review*; the `/model` picker card
+confirms with **`s`** (`ee155a7`, generic `confirmKey`); no push / PR / `ultracode` for now.
+
+**Smoke** (real `startApiServer()` on `~/.agetor-dev`, real claude **2.1.246**, throwaway
+task, deleted): baseline, typed `/effort`, bare `/effort` (6-choice card, horizontal nav
+verified with a real `Left`), bare `/model` (`s` → `Set model to … for this session only`,
+`~/.claude/settings.json` untouched, `task.model` synced), the paste guard while a permission
+modal was up (withheld at +1.9 s, backlog re-stash, modal cursor untouched, stray composer
+text cleared) and cleanup all **passed**. Scenario 5 (dropdown mirror) **failed** on three
+counts, all claude-version facts: `CLAUDE_CODE_EFFORT_LEVEL` (pinned at spawn) outranks every
+`/effort` form; typed `/model <id>` writes the user's global default; and the mirror's JSONL
+twins were adopted as an `origin: continuation` run that sat `running` for 6 min — the
+idle-settle net was defeated by the flickering right-hand `● high · /effort` status-bar hint
+resetting `lastActivityAt`. This is very likely the original report's reproduction path.
+
+**Wave 5 (owner decisions):** effort is never mirrored (row + `applies on the next run`
+breadcrumb, `getSessionLaunchEffort`); the model mirror drives the picker with `s`
+(`mirrorModelViaPicker` + `claudeModelPickerFamily`; unrepresentable ids → breadcrumb);
+local-command twins are never continuation content; the idle-settle gate keys on
+`lastKeystrokeAt` and the status-bar row is volatile for the activity diff; `sendTurn` /
+`pasteFollowUp` expose `pasteOutcome`, `sendInput` awaits it (5 s race) and returns
+`withheld` + `savedToBacklog`, and every `sendRunInput` caller in the webview (composer, tray,
+commit/push, resolve-conflicts, diff composer) clears its draft and toasts instead of
+treating the send as delivered; `<local-command-stdout>` ANSI is stripped in the bubble.
+
+**Wave-5 re-review + smoke 2 + wave 6 (2026-08-26).** The opus re-review of wave 5 found 6
+medium / 5 low, all applied: keystroke clock bumped at paste *enqueue*; `mirrorModelViaPicker`
+bails `turn in flight` on a busy session and sets `drivingPrompt` so the scraper never cards
+the picker it is driving; the `target not offered` Escape is `.ok`-checked; the ask-card
+free-text route threads `withheld`/`savedToBacklog`; the `pasteOutcome` race is a 15 s
+backstop with its timer cleared; backlog re-stash dedupes against the whole backlog (the tray
+no longer filters locally); `no live session` / `turn in flight` get next-run wording; a
+dropped paste carries a descriptive `stderr`; only the flickering `● high · /effort` suffix is
+volatile (`EFFORT_HINT_SUFFIX_RE`, applied to both the activity diff and the unparsable
+fingerprint), not the whole status-bar row; `sendSlashCommand` is test-only.
+Smoke 2 (2.1.246): effort dropdown (no paste + breadcrumb), the withheld route
+(`{delivered:false, withheld:true, savedToBacklog:true}` in 1.9 s), backlog dedupe, the
+ask-card free-text answer and a 90 s idle sanity all **passed**; the model mirror **never
+fired** — `paneShowsClaudeWorking` matched the completed-turn summary row
+(`✻ Churned for 1s · done 5:35 PM`) as working chrome, so every idle pane that ever finished a
+turn read as busy (also the second contributor to smoke 1's stuck run). Wave 6:
+`SPINNER_ELAPSED_WORKING_LINE` excludes `TURN_DONE_SUMMARY_RE` (the row stays volatile), and
+`Kept model as …` drift-corrects the row only when agetor's own mirror produced it
+(`viaMirror`) — a user's Esc on the picker no longer clobbers a next-run selection.

@@ -853,3 +853,96 @@ test("a small (<=4KB) follow-up resume still embeds the prompt in new-session ar
     rmSync(path.dirname(expectedJsonlPath), { recursive: true, force: true });
   }
 });
+
+// ─── launchEffort (wave 5): the effort a live session was actually launched
+// with, read back off the launch env rather than re-derived — see
+// `SessionState.launchEffort` / `getSessionLaunchEffort`'s doc in
+// claude-tmux.ts. Drives `spawnClaudeViaTmux` directly (bypassing agents.ts/
+// orchestrator entirely) since `launchEffort` is pinned synchronously, before
+// spawnClaudeViaTmux's async boot-wait IIFE even starts — no need for the
+// heavier sendInput/orchestrator harness the tests above use. The JSONL path
+// is pre-created (same trick the "gone"/"large prompt" tests above use for a
+// *resume* spawn) purely so the async boot-wait settles promptly instead of
+// leaving a ~30s BOOT_TIMEOUT_MS poller dangling past this test's lifetime —
+// getSessionLaunchEffort's own value doesn't depend on that at all. ───
+
+test("spawnClaudeViaTmux pins state.launchEffort from CLAUDE_CODE_EFFORT_LEVEL in the launch env; getSessionLaunchEffort mirrors it and clears on dispose", async () => {
+  const { bin } = fakeRoutingTmuxBin(1, "can't find session: =agetor-launch-effort");
+  process.env.AGETOR_TMUX_BIN = bin;
+
+  const { __forTest, spawnClaudeViaTmux, dropSession, jsonlPathFor } = await import("./claude-tmux.ts");
+
+  const taskId = `task-launch-effort-${randomUUID()}`;
+  const sessionId = randomUUID();
+  const cwd = mkdtempSync(path.join(tmpdir(), "agetor-launch-effort-"));
+  const jsonlPath = jsonlPathFor(cwd, sessionId, null);
+  mkdirSync(path.dirname(jsonlPath), { recursive: true });
+  writeFileSync(jsonlPath, "");
+
+  try {
+    const agent = spawnClaudeViaTmux({
+      taskId,
+      argv: ["claude", "--session-id", sessionId, "hello"],
+      env: { CLAUDE_CODE_EFFORT_LEVEL: "high" },
+      cwd,
+      onChunk: () => {},
+      sessionId,
+      configDir: null,
+      mode: null,
+    });
+    agent.done.catch(() => {}); // never resolves in this fake-tmux harness — not under test here
+
+    // Pinned synchronously inside spawnClaudeViaTmux, before its async
+    // boot-wait IIFE even starts.
+    expect(__forTest.getSessionLaunchEffort(taskId)).toBe("high");
+
+    // Let the boot-wait poller notice the pre-created JSONL and settle
+    // (attachTailer) before tearing down, so cleanup doesn't race a
+    // still-in-flight boot IIFE.
+    await new Promise((r) => setTimeout(r, 300));
+  } finally {
+    dropSession(taskId);
+    // Torn-down session's pinned effort is gone — getSessionLaunchEffort
+    // reads live SessionState, not a cached snapshot.
+    expect(__forTest.getSessionLaunchEffort(taskId)).toBeNull();
+    rmSync(path.dirname(jsonlPath), { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("spawnClaudeViaTmux with no CLAUDE_CODE_EFFORT_LEVEL in the launch env leaves getSessionLaunchEffort null (a model that declines effort)", async () => {
+  const { bin } = fakeRoutingTmuxBin(1, "can't find session: =agetor-launch-effort-none");
+  process.env.AGETOR_TMUX_BIN = bin;
+
+  const { __forTest, spawnClaudeViaTmux, dropSession, jsonlPathFor } = await import("./claude-tmux.ts");
+
+  const taskId = `task-launch-effort-none-${randomUUID()}`;
+  const sessionId = randomUUID();
+  const cwd = mkdtempSync(path.join(tmpdir(), "agetor-launch-effort-none-"));
+  const jsonlPath = jsonlPathFor(cwd, sessionId, null);
+  mkdirSync(path.dirname(jsonlPath), { recursive: true });
+  writeFileSync(jsonlPath, "");
+
+  try {
+    const agent = spawnClaudeViaTmux({
+      taskId,
+      argv: ["claude", "--session-id", sessionId, "hello"],
+      env: {},
+      cwd,
+      onChunk: () => {},
+      sessionId,
+      configDir: null,
+      mode: null,
+    });
+    agent.done.catch(() => {});
+
+    expect(__forTest.getSessionLaunchEffort(taskId)).toBeNull();
+
+    await new Promise((r) => setTimeout(r, 300));
+  } finally {
+    dropSession(taskId);
+    expect(__forTest.getSessionLaunchEffort(taskId)).toBeNull();
+    rmSync(path.dirname(jsonlPath), { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});

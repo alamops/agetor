@@ -19,6 +19,7 @@ const {
   GEMINI_PROMPT_ARGV_MAX_BYTES,
   isValidEnvKey,
   toTerminalAppleScript,
+  claudeModelPickerFamily,
 } = await import("./agents.ts");
 
 beforeEach(() => {
@@ -230,6 +231,37 @@ test("claude-code 'sonnet-5' maps to --model claude-sonnet-5", () => {
     "--permission-mode", "auto",
     "--", "do thing",
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// claudeModelPickerFamily (src/bun/agents.ts) — maps an agetor claude-code
+// model id to the model-FAMILY label claude 2.1.246's bare `/model` picker
+// actually offers as a selectable row. Sole caller: reconcileTaskSession's
+// model mirror (orchestrator.ts), which feeds the result to
+// mirrorModelViaPicker (claude-tmux.ts).
+// ---------------------------------------------------------------------------
+
+test("claudeModelPickerFamily maps each current-release id to its picker row family", () => {
+  expect(claudeModelPickerFamily("opus-5")).toBe("Opus");
+  expect(claudeModelPickerFamily("sonnet-5")).toBe("Sonnet");
+  expect(claudeModelPickerFamily("fable-5")).toBe("Fable");
+  expect(claudeModelPickerFamily("haiku-4.5")).toBe("Haiku");
+});
+
+test("claudeModelPickerFamily returns null for ids the picker's single per-family row would misrepresent, has no row for, or doesn't recognize", () => {
+  // Superseded-within-family ids: the picker's row always resolves to the
+  // family's CURRENT release, which is a DIFFERENT specific version than
+  // these — mirroring would silently switch the session to the wrong one.
+  expect(claudeModelPickerFamily("opus-4.8")).toBeNull();
+  expect(claudeModelPickerFamily("opus-4.7")).toBeNull();
+  expect(claudeModelPickerFamily("opus-4.6")).toBeNull();
+  expect(claudeModelPickerFamily("sonnet-4.6")).toBeNull();
+  // No picker row at all for this one.
+  expect(claudeModelPickerFamily("mythos-5")).toBeNull();
+  // Unknown/future raw id — never guess.
+  expect(claudeModelPickerFamily("claude-opus-6")).toBeNull();
+  // Empty string.
+  expect(claudeModelPickerFamily("")).toBeNull();
 });
 
 test("claude-code prefixes the prompt with `--` so a leading-dash prompt isn't parsed as a flag", () => {

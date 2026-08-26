@@ -96,12 +96,36 @@ export function claudeModelIdFromDisplayName(name: string): string | null {
  */
 const CLAUDE_EFFORT_IDS = new Set(["max", "xhigh", "high", "medium", "low"]);
 
-/** A `/model` outcome that resolved to an agetor model id — either claude
- *  just set it, or claude reports it KEPT this id after a declined confirm
- *  (see `parseClaudeLocalSetting`'s `Kept model as` handling). */
+/**
+ * A `/model` outcome that resolved to an agetor model id — either claude
+ * just SET it, or claude reports it KEPT this id (see
+ * `parseClaudeLocalSetting`'s `Kept model as` handling).
+ *
+ * `kept` distinguishes the two, and the caller must not ignore it. A `Set
+ * model to <X>` outcome (`kept` absent/false) is an unconditional real
+ * change. A `Kept model as <X>` outcome (`kept: true`) is NOT a change at
+ * all — it's claude restating the model the live session is already on, and
+ * it is emitted by two very different events that this parse cannot tell
+ * apart from the text alone:
+ *
+ *   1. the user DECLINED the `Switch model?` confirm that agetor's own
+ *      dropdown mirror provoked — the row was written optimistically before
+ *      the mirror ran, so it needs correcting back;
+ *   2. the user opened a bare `/model` themselves and pressed Esc — claude
+ *      restates the session's model, which says nothing whatsoever about the
+ *      model the user deliberately chose in the dropdown for the NEXT run.
+ *
+ * Only `LocalSettingInfo.viaMirror` separates them, and only the caller has
+ * it — `applyClaudeLocalSetting` is where that decision lives. Case (2)
+ * silently overwriting a deliberate next-run pick is the live bug this flag
+ * exists to prevent.
+ */
 export interface ClaudeLocalModelOutcome {
   kind: "model";
   id: string;
+  /** Present (and `true`) only for a `Kept model as <X>` outcome — see this
+   *  interface's doc. Absent for `Set model to <X>`. */
+  kept?: true;
 }
 
 /** A `/effort` outcome that resolved to an agetor-tracked effort id. */
@@ -148,16 +172,17 @@ export type ClaudeLocalSettingOutcome =
  * substitute for a stdout that doesn't confirm a real change.
  *
  * Model resolution order:
- *   1. `Kept model as <name>` is a REAL outcome, not a no-op — it's what
- *      claude reports when the user declines the "Switch model?" confirm.
- *      This matters when e.g. the Task Details dropdown already wrote a new
- *      model onto the task row before the user declined in the session: the
- *      row needs correcting back to what the session actually kept. Synced
- *      exactly like a `Set model to` outcome (same display-name lookup), and
- *      its `unrepresentable` `raw` is qualifier-stripped the same way too
- *      (finding #11e, docs/plans/model-effort-local-command-turns.md §10
- *      re-review) — the two branches previously diverged, leaving `(1M
- *      context)`/`(default)` in this branch's breadcrumb but not the other.
+ *   1. `Kept model as <name>` resolves the same way a `Set model to` outcome
+ *      does (same display-name lookup, and its `unrepresentable` `raw` is
+ *      qualifier-stripped identically — finding #11e, docs/plans/
+ *      model-effort-local-command-turns.md §10 re-review), but is tagged
+ *      `kept: true` because it is NOT a change: claude is restating the
+ *      model the session is already on. Whether that restatement should be
+ *      written to the task row depends on WHO provoked it, which is
+ *      `LocalSettingInfo.viaMirror`'s job, not this parse's — see
+ *      `ClaudeLocalModelOutcome`'s doc and `applyClaudeLocalSetting`. This
+ *      function deliberately does not read `viaMirror`: it stays a pure
+ *      "what did claude report" mapping, and the policy lives in one place.
  *   2. Otherwise, the first line MUST match `Set model to <name>` — read
  *      from the FIRST LINE only (claude sometimes appends further lines,
  *      e.g. a note or caveat, and since `.` doesn't match `\n`, matching
@@ -208,7 +233,14 @@ export function parseClaudeLocalSetting(info: LocalSettingInfo): ClaudeLocalSett
       // `raw` is qualifier-stripped (finding #11e, §10 re-review) — matches
       // the `Set model to` branch below so the breadcrumb is consistent
       // regardless of which outcome produced it.
-      return id ? { kind: "model", id } : { kind: "unrepresentable", setting: "model", raw: stripModelQualifiers(name) };
+      //
+      // `kept: true` is what tells the orchestrator this is a RESTATEMENT,
+      // not a change — the `unrepresentable` branch needs no such flag: it
+      // never writes the row either way, so "kept" vs "set" doesn't change
+      // its behaviour.
+      return id
+        ? { kind: "model", id, kept: true }
+        : { kind: "unrepresentable", setting: "model", raw: stripModelQualifiers(name) };
     }
 
     const setMatch = /^Set model to (.+)$/.exec(firstLine);
@@ -264,4 +296,24 @@ export function describeUnrepresentableLocalSetting(
   current: string | null,
 ): string {
   return `claude is now on "${outcome.raw}", which agetor can't store — task ${outcome.setting} left as ${current ?? "unset"}`;
+}
+
+/**
+ * Status-breadcrumb text for a `Kept model as <kept>` outcome that
+ * `applyClaudeLocalSetting` deliberately did NOT sync — the user opened a
+ * bare `/model` themselves and dismissed it, so claude restated the live
+ * session's model while the task row holds a different, deliberately-chosen
+ * model for the next run (typically one the installed picker can't select at
+ * all, which is exactly why it was left as a next-run choice).
+ *
+ * Both values are agetor model ids, so the two halves of the sentence are
+ * directly comparable. `effective` is the model the NEXT run will actually
+ * use — i.e. the row's own id, or the claude-code default when the row was
+ * never pinned — not a raw `null`. The caller only emits this when the two
+ * genuinely differ; a restatement that AGREES with the row is silent (there
+ * is no drift to explain, and a breadcrumb on every `/model` + Esc would be
+ * pure noise).
+ */
+export function describeKeptModelNotSynced(kept: string, effective: string): string {
+  return `claude kept ${kept} for this session — the task's model ${effective} still applies on the next run`;
 }

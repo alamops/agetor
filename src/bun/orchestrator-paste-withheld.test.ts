@@ -93,8 +93,13 @@ test("withheld folded follow-up: re-stashed to backlog with a status breadcrumb,
     // `startTask` above and this call — R1 must still be in `active` when
     // `sendInput` reads it, so this folds instead of spawning a new turn.
     const sent = await sendInput(r1, "hello again");
-    expect(sent.delivered).toBe(true); // optimistic — pasteFollowUp returns synchronously
-    if (sent.delivered) expect(sent.runId).toBe(r1);
+    // `sendInput` now AWAITS the paste's real outcome before resolving (§10
+    // "withheld sends surface at the HTTP layer") — a modal-guard withhold
+    // reports delivered:false, not the old optimistic true.
+    if (sent.delivered) throw new Error(`expected the withheld send to report delivered:false, got ${JSON.stringify(sent)}`);
+    expect(sent.withheld).toBe(true);
+    expect(sent.savedToBacklog).toBe(true);
+    expect(sent.reason).toContain("backlog");
 
     // The optimistic "user" bubble landed even though the paste itself will
     // be withheld a moment later.
@@ -119,9 +124,13 @@ test("withheld folded follow-up: re-stashed to backlog with a status breadcrumb,
     // than racing the same fold window.
     await waitFor(() => tasks.get(taskId)?.column !== "running");
 
-    // Second identical send — dedupe: the backlog must not grow past 1.
+    // Second identical send — dedupe: the backlog must not grow past 1. This
+    // resend takes the idle path (R1 already resolved above) and is withheld
+    // by the same blocking pane, so it too reports delivered:false now.
     const sent2 = await sendInput(r1, "hello again");
-    expect(sent2.delivered).toBe(true);
+    if (sent2.delivered) throw new Error(`expected the withheld resend to report delivered:false, got ${JSON.stringify(sent2)}`);
+    expect(sent2.withheld).toBe(true);
+    expect(sent2.savedToBacklog).toBe(true);
     await claudeTmux.__forTest.pasteChains.get(taskId);
     // Give the (now idle-path) run row a moment to settle to failed too.
     await waitFor(() => {
@@ -177,16 +186,23 @@ test("withheld idle send: the fresh run ends failed, the task returns to ready, 
 
   try {
     const sent = await sendInput(r1, "are you there");
-    expect(sent.delivered).toBe(true);
-    if (!sent.delivered) return;
-    const newRunId = sent.runId;
-    // A genuinely new run row was created for the idle send (not folded).
-    expect(newRunId).not.toBe(r1);
+    // `sendInput` now awaits the paste's real outcome before resolving — a
+    // withheld modal-guard paste reports delivered:false (and, unlike the
+    // internal `ClaudeTurnResult`, the public `SendInputResult` shape carries
+    // no `runId` on that branch), so the fresh run row is found by process
+    // of elimination below instead.
+    if (sent.delivered) throw new Error(`expected the withheld send to report delivered:false, got ${JSON.stringify(sent)}`);
+    expect(sent.withheld).toBe(true);
+    expect(sent.savedToBacklog).toBe(true);
+    expect(sent.reason).toContain("backlog");
 
     await claudeTmux.__forTest.pasteChains.get(taskId);
-    await waitFor(() => runs.get(newRunId)?.status === "failed");
+    await waitFor(() => runs.listForTask(taskId).some((r) => r.id !== r1 && r.status === "failed"));
 
-    expect(runs.get(newRunId)?.status).toBe("failed");
+    // A genuinely new run row was created for the idle send (not folded).
+    const newRun = runs.listForTask(taskId).find((r) => r.id !== r1);
+    expect(newRun).toBeTruthy();
+    expect(newRun?.status).toBe("failed");
     expect(tasks.get(taskId)?.column).toBe("ready");
 
     const backlog = tasks.get(taskId)?.backlog ?? [];
@@ -344,7 +360,13 @@ test("reconcileTaskSession: a withheld /plan mirror leaves a '\u26a0\ufe0f plan 
 /** Recording variant of a fake tmux bin — same recipe as
  *  claude-tmux-local-command.test.ts's own helper (duplicated here per this
  *  task's "no cross-test-file imports" convention). Appends one
- *  `{ ms, argv }` JSON line per invocation. */
+ *  `{ ms, argv, stdin }` JSON line per invocation. `stdin` is captured
+ *  best-effort (empty string on any read failure) — `load-buffer -` reads the
+ *  pasted text from stdin, so recording it lets a test assert on the EXACT
+ *  text that went into the buffer (e.g. a bare `/model` vs. `/model
+ *  claude-opus-5`), not just the argv shape. Reading fd 0 synchronously is
+ *  safe even for calls where the real caller passed `stdin: "ignore"`
+ *  (`Bun.spawnSync` maps that to `/dev/null`, which reads as immediate EOF). */
 function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(path.join(tmpdir(), "agetor-tmux-rec-"));
   const binPath = path.join(dir, "tmux");
@@ -352,8 +374,9 @@ function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T
   writeFileSync(
     binPath,
     `#!${process.execPath}\n` +
-      `import { appendFileSync } from "node:fs";\n` +
-      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv: process.argv.slice(2) }) + "\\n");\n`,
+      `import { appendFileSync, readFileSync } from "node:fs";\n` +
+      `let stdin = ""; try { stdin = readFileSync(0, "utf8"); } catch {}\n` +
+      `appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ ms: Date.now(), argv: process.argv.slice(2), stdin }) + "\\n");\n`,
   );
   chmodSync(binPath, 0o755);
   const prevBin = process.env.AGETOR_TMUX_BIN;
@@ -364,7 +387,7 @@ function withRecordingTmuxBin<T>(fn: (logPath: string) => Promise<T>): Promise<T
   });
 }
 
-function readTmuxLog(logPath: string): Array<{ ms: number; argv: string[] }> {
+function readTmuxLog(logPath: string): Array<{ ms: number; argv: string[]; stdin: string }> {
   let raw: string;
   try {
     raw = readFileSync(logPath, "utf8");
@@ -543,5 +566,715 @@ test("sendSlashCommand({autoConfirm}): a confirm that only renders after two sti
     __forTest.setSlashCommandSettleMs(prevSettle);
     __forTest.uninstallSession(taskId);
     void promptId;
+  }
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 7 — Non-withheld send resolves promptly: `resolveClaudeTurnOutcome`'s
+ * `PASTE_OUTCOME_TIMEOUT_MS` (15s — widened from 5s to give a queued
+ * `/model` picker mirror ahead of the paste on the same per-task tmux chain
+ * enough headroom, per its own doc comment in orchestrator.ts) race must not
+ * delay an ordinary (non-withheld) send — it should settle off the paste's
+ * real, fast outcome.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("non-withheld send: delivered:true resolves promptly, driven by the paste's real outcome, not the 15s race timeout", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+    const { db, tasks } = await import("./db.ts");
+    const claudeTmux = await import("./claude-tmux.ts");
+
+    const created = await createTask({
+      title: "non-withheld-fold",
+      prompt: "first message",
+      agent: "claude-code",
+      workdir: process.cwd(),
+      isolation: "none",
+      model: "sonnet-5",
+      effort: "high",
+    });
+    if ("error" in created) throw new Error(created.error);
+    const taskId = created.task.id;
+
+    const res = await startTask(taskId);
+    expect("runId" in res).toBe(true);
+    if (!("runId" in res)) return;
+    const r1 = res.runId;
+
+    // Install a REAL session so this takes the fold-capable path, same as
+    // test 1 above — but the pane is a plain idle composer this time, so the
+    // modal guard never engages and the paste lands immediately.
+    claudeTmux.__forTest.installSession(taskId, freshJsonl());
+    const prevCapture = claudeTmux.__forTest.setCapturePastePane(() => "");
+
+    try {
+      // TIMING INVARIANT (mirrors test 1): no await between `startTask`
+      // above and this call — R1 must still be in `active` when `sendInput`
+      // reads it, so this folds instead of spawning a new turn.
+      const start = Date.now();
+      const sent = await sendInput(r1, "hello again");
+      const afterSend = Date.now();
+      const elapsed = afterSend - start;
+
+      if (!sent.delivered) throw new Error(`expected delivered:true, got ${JSON.stringify(sent)}`);
+      expect(sent.runId).toBe(r1);
+
+      // The 15s race (`PASTE_OUTCOME_TIMEOUT_MS`) must not be what resolved
+      // this — a real, non-withheld paste lands almost immediately. The
+      // fake tmux bin spawns a real subprocess per tmux call (load-buffer /
+      // paste-buffer / delete-buffer / send-keys), so the bound here is
+      // generous for a loaded machine while still catching a regression that
+      // waits out anywhere near the full 15s race.
+      expect(elapsed).toBeLessThan(3000);
+
+      // Cross-check against the recorded paste's own landing time: `sendInput`
+      // should have resolved shortly after the paste's last real tmux call,
+      // not after padding out most of a 15s wait.
+      const log = readTmuxLog(logPath);
+      expect(log.length).toBeGreaterThan(0);
+      const lastCallMs = Math.max(...log.map((e) => e.ms));
+      expect(afterSend - lastCallMs).toBeLessThan(2000);
+    } finally {
+      claudeTmux.__forTest.setCapturePastePane(prevCapture);
+      claudeTmux.__forTest.uninstallSession(taskId);
+      db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+    }
+  });
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 8 — Model mirror success: the full 2.1.246 `/model` picker walk — open the
+ * bare picker, arrow from the in-effect row to the target family, confirm
+ * session-only ("s"), and auto-accept the resulting "Switch model?" confirm.
+ * Never a typed `/model <id>` (that rewrites claude's GLOBAL default).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Verbatim-shaped claude 2.1.246 bare `/model` picker (5 rows, `✔` marks the
+ *  row currently in effect, a run of ≥2 spaces gaps the name from its
+ *  description) — copied from `mirrorModelViaPicker`'s own doc comment.
+ *  Cursor starts on the Sonnet row (index 3), matching `before.model:
+ *  "sonnet-5"` below. */
+const MODEL_PICKER_PANE_CURSOR_ON_SONNET = [
+  "  1. Default (recommended)  Opus 5 with 1M context, best for complex work",
+  "  2. Opus (1M context)      Opus 5 with 1M context, cheaper for simple tasks",
+  "  3. Fable                  Fable 5 — balanced speed and capability",
+  "❯ 4. Sonnet ✔               Sonnet 5 — fast and cost-effective",
+  "  5. Haiku                  Haiku 4.5 — fastest, most economical",
+  "Enter to set as default · s to use this session only · Esc to cancel",
+].join("\n");
+
+/** Verbatim-shaped mid-conversation "Switch model?" confirm that follows
+ *  pressing `s` on a row other than the one currently in effect. */
+const SWITCH_MODEL_CONFIRM_PANE = [
+  "Switch model?",
+  "",
+  "❯ 1. Yes, switch to Opus 5 (1M context)",
+  "  2. No, go back",
+].join("\n");
+
+test("reconcileTaskSession: a full /model picker mirror walks the cursor, confirms session-only ('s'), and auto-accepts the resulting 'Switch model?' confirm — never a typed /model <id>", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-model-picker-success",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+
+  const prevSettle = claudeTmux.__forTest.setSlashCommandSettleMs(0);
+  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(() => ""); // idle — guard passes
+  let confirmPaneCalls = 0;
+  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(() => {
+    confirmPaneCalls++;
+    // `mirrorModelViaPicker`'s picker-detection poll registers on its very
+    // FIRST sighting (no stability-gate, unlike the scraper's own matcher
+    // chain), so exactly one call sees the picker; every call after the
+    // arrow-walk + "s" keystroke belongs to the SEPARATE
+    // `autoConfirmSlashModal` poll, which must see the "Switch model?"
+    // confirm instead.
+    return confirmPaneCalls <= 1 ? MODEL_PICKER_PANE_CURSOR_ON_SONNET : SWITCH_MODEL_CONFIRM_PANE;
+  });
+
+  try {
+    await withRecordingTmuxBin(async (logPath) => {
+      const before = tasks.get(taskId)!;
+      const after = { ...before, model: "opus-5" };
+      await reconcileTaskSession(taskId, before, after);
+      // Belt-and-suspenders against any lingering chained op, mirroring this
+      // file's other reconcileTaskSession tests, before reading the log.
+      await claudeTmux.__forTest.pasteChains.get(taskId);
+
+      const log = readTmuxLog(logPath);
+      const loadBufferStdins = log.filter((e) => e.argv[0] === "load-buffer").map((e) => e.stdin);
+      // Only ever a BARE "/model" paste — never the user's global-default
+      // form `/model claude-opus-5`.
+      expect(loadBufferStdins).toEqual(["/model"]);
+
+      const sendKeys = log.filter((e) => e.argv[0] === "send-keys").map((e) => e.argv[e.argv.length - 1]);
+      // The trailing 4 keys: the arrow walk from index 3 (Sonnet) to index 1
+      // (Opus), the session-only confirm, and the auto-accepted "Switch
+      // model?" Enter. (The very first Enter in the full log submits the
+      // bare `/model` line itself, opening the picker.)
+      expect(sendKeys.slice(-4)).toEqual(["Up", "Up", "s", "Enter"]);
+    });
+  } finally {
+    claudeTmux.__forTest.setCaptureConfirmPane(prevConfirmPane);
+    claudeTmux.__forTest.setCapturePastePane(prevPastePane);
+    claudeTmux.__forTest.setSlashCommandSettleMs(prevSettle);
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 9 — Model mirror: an id whose family the 2.1.246 picker can't select
+ * exactly (`claudeModelPickerFamily` → null) skips the live mirror entirely.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("reconcileTaskSession: a model id the picker can't select exactly (opus-4.8) skips the live mirror entirely — no paste at all, just an 'applies on the next run' breadcrumb", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-model-unsupported-family",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+
+  const runId = randomUUID();
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    exitCode: 0,
+    tmuxSession: `agetor-test-${taskId}`,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+  });
+
+  try {
+    await withRecordingTmuxBin(async (logPath) => {
+      const before = tasks.get(taskId)!;
+      const after = { ...before, model: "opus-4.8" };
+      await reconcileTaskSession(taskId, before, after);
+
+      const log = readTmuxLog(logPath);
+      // `claudeModelPickerFamily("opus-4.8")` is null — reconcileTaskSession
+      // must never even open the picker for an id it can't select exactly.
+      expect(log.some((e) => e.argv[0] === "load-buffer")).toBe(false);
+      expect(log.filter((e) => e.argv[0] === "send-keys")).toHaveLength(0);
+    });
+
+    const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statusTexts).toContain(
+      "model opus-4.8 applies on the next run — claude's picker can't select it for this session",
+    );
+  } finally {
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 10 — Model mirror: the picker never renders (idle pane throughout) → poll
+ * timeout → "picker not shown" breadcrumb, with no keystroke ever sent.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("reconcileTaskSession: model mirror poll timeout when the picker never renders yields a 'picker not shown' breadcrumb", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-model-picker-not-shown",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+
+  const runId = randomUUID();
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    exitCode: 0,
+    tmuxSession: `agetor-test-${taskId}`,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+  });
+
+  const prevSettle = claudeTmux.__forTest.setSlashCommandSettleMs(0);
+  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(() => "");
+  // Idle throughout — the picker never renders on the pane at all.
+  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(() => "");
+
+  try {
+    const before = tasks.get(taskId)!;
+    const after = { ...before, model: "opus-5" };
+    await reconcileTaskSession(taskId, before, after);
+
+    const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statusTexts).toContain(
+      "⚠️ model change not applied — picker not shown; the task's model is opus-5 but the session kept its previous one",
+    );
+  } finally {
+    claudeTmux.__forTest.setCaptureConfirmPane(prevConfirmPane);
+    claudeTmux.__forTest.setCapturePastePane(prevPastePane);
+    claudeTmux.__forTest.setSlashCommandSettleMs(prevSettle);
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 11 — Model mirror: the picker is up but doesn't offer the target family
+ * (claude renamed/dropped its row) → Escape closes it, "target not offered".
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Same picker shape as `MODEL_PICKER_PANE_CURSOR_ON_SONNET` but WITHOUT the
+ *  Fable row — used to drive `mirrorModelViaPicker`'s "target not offered"
+ *  branch for `targetFamily: "Fable"`. */
+const MODEL_PICKER_PANE_NO_FABLE = [
+  "  1. Default (recommended)  Opus 5 with 1M context, best for complex work",
+  "  2. Opus (1M context)      Opus 5 with 1M context, cheaper for simple tasks",
+  "❯ 3. Sonnet ✔               Sonnet 5 — fast and cost-effective",
+  "  4. Haiku                  Haiku 4.5 — fastest, most economical",
+  "Enter to set as default · s to use this session only · Esc to cancel",
+].join("\n");
+
+test("reconcileTaskSession: model mirror closes the picker with Escape when the target family isn't offered, leaving a 'target not offered' breadcrumb", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-model-target-not-offered",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+
+  const runId = randomUUID();
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    exitCode: 0,
+    tmuxSession: `agetor-test-${taskId}`,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+  });
+
+  const prevSettle = claudeTmux.__forTest.setSlashCommandSettleMs(0);
+  const prevPastePane = claudeTmux.__forTest.setCapturePastePane(() => "");
+  const prevConfirmPane = claudeTmux.__forTest.setCaptureConfirmPane(() => MODEL_PICKER_PANE_NO_FABLE);
+
+  try {
+    await withRecordingTmuxBin(async (logPath) => {
+      const before = tasks.get(taskId)!;
+      const after = { ...before, model: "fable-5" };
+      await reconcileTaskSession(taskId, before, after);
+      await claudeTmux.__forTest.pasteChains.get(taskId);
+
+      const sendKeys = readTmuxLog(logPath)
+        .filter((e) => e.argv[0] === "send-keys")
+        .map((e) => e.argv[e.argv.length - 1]);
+      expect(sendKeys).toContain("Escape");
+      // No arrow walk and no confirm — the picker was closed, not driven.
+      expect(sendKeys).not.toContain("s");
+    });
+
+    const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statusTexts.some((t) => t.startsWith("⚠️ model change not applied — target not offered"))).toBe(true);
+    expect(statusTexts.some((t) => t.includes("fable-5"))).toBe(true);
+  } finally {
+    claudeTmux.__forTest.setCaptureConfirmPane(prevConfirmPane);
+    claudeTmux.__forTest.setCapturePastePane(prevPastePane);
+    claudeTmux.__forTest.setSlashCommandSettleMs(prevSettle);
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 12 — Effort is NEVER mirrored into a live session (unlike model): no tmux
+ * paste at all, just a breadcrumb naming the pinned launch effort.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("reconcileTaskSession: an effort change is never mirrored into the live session — no tmux paste at all, just an 'applies on the next run' breadcrumb naming the pinned launch effort", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-effort-pinned",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const state = claudeTmux.__forTest.installSession(taskId, freshJsonl());
+  // Pin a launch effort distinct from both before.effort and after.effort so
+  // the assertion can only pass if the breadcrumb read THIS value, not a
+  // fallback.
+  state.launchEffort = "medium";
+
+  const runId = randomUUID();
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    exitCode: 0,
+    tmuxSession: `agetor-test-${taskId}`,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+  });
+
+  try {
+    await withRecordingTmuxBin(async (logPath) => {
+      const before = tasks.get(taskId)!;
+      const after = { ...before, effort: "xhigh" };
+      await reconcileTaskSession(taskId, before, after);
+
+      const log = readTmuxLog(logPath);
+      expect(log.some((e) => e.argv[0] === "load-buffer")).toBe(false);
+      expect(log.some((e) => e.argv[0] === "paste-buffer")).toBe(false);
+      expect(log.some((e) => e.argv[0] === "send-keys")).toBe(false);
+    });
+
+    const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statusTexts).toContain(
+      "effort xhigh applies on the next run — this session is pinned to medium by CLAUDE_CODE_EFFORT_LEVEL",
+    );
+  } finally {
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 13 — Effort breadcrumb fallback: no in-memory launch-effort pin recorded →
+ * falls back to `before.effort` (see `emitEffortPinnedStatus`'s `?? beforeEffort`).
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("reconcileTaskSession: effort breadcrumb falls back to before.effort when the live session recorded no launch-effort pin", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-effort-fallback",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  // No `state.launchEffort` override — stays null (default), so
+  // `getSessionLaunchEffort` returns null and the breadcrumb must fall back
+  // to `before.effort` ("high", from createTask above).
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+
+  const runId = randomUUID();
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    exitCode: 0,
+    tmuxSession: `agetor-test-${taskId}`,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+  });
+
+  try {
+    const before = tasks.get(taskId)!;
+    const after = { ...before, effort: "low" };
+    await reconcileTaskSession(taskId, before, after);
+
+    const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statusTexts).toContain(
+      "effort low applies on the next run — this session is pinned to high by CLAUDE_CODE_EFFORT_LEVEL",
+    );
+  } finally {
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 14 — Model mirror: NO in-memory session state at all (`mirrorModelViaPicker`
+ * only ever consults the in-memory `sessions` map — never `sessionExists`, a
+ * REAL tmux `has-session` probe) reports "no live session" on the next-run
+ * breadcrumb, never the ⚠️ failure framing. This file's top-level
+ * `AGETOR_TMUX_BIN=/bin/echo` makes every tmux invocation exit 0 by default,
+ * so `sessionExists(taskId)` is ambient-true here with no extra stubbing —
+ * pinning that the mirror still correctly reports "no live session" (rather
+ * than crashing, or treating the real tmux session as drivable) is exactly
+ * the boot-reconciliation gap CLAUDE.md documents: a tmux session can outlive
+ * agetor's process with no SessionState to paste into.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("reconcileTaskSession: a model change with NO in-memory session state (even though the real tmux session still exists) reports 'no live session' on the next-run breadcrumb, never the ⚠️ failure framing", async () => {
+  const { createTask, reconcileTaskSession } = await import("./orchestrator.ts");
+  const { db, tasks, runs } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "reconcile-model-no-session-state",
+    prompt: "p",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  // Deliberately NO claudeTmux.__forTest.installSession call.
+  expect(claudeTmux.hasSessionState(taskId)).toBe(false);
+  expect(claudeTmux.sessionExists(taskId)).toBe(true);
+
+  const runId = randomUUID();
+  runs.insert({
+    id: runId,
+    taskId,
+    agent: "claude-code",
+    status: "succeeded",
+    startedAt: Date.now(),
+    endedAt: Date.now(),
+    exitCode: 0,
+    tmuxSession: `agetor-test-${taskId}`,
+    claudeSessionId: null,
+    codexSessionId: null,
+    cursorSessionId: null,
+    geminiSessionId: null,
+  });
+
+  try {
+    const before = tasks.get(taskId)!;
+    const after = { ...before, model: "opus-5" };
+    await reconcileTaskSession(taskId, before, after);
+
+    const statusTexts = runs.events(runId).filter((e) => e.stream === "status").map((e) => e.data);
+    expect(statusTexts).toContain("model opus-5 applies on the next run — no live session");
+    expect(statusTexts.some((t) => t.startsWith("⚠️"))).toBe(false);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 15 — Whole-backlog dedupe: `restashPasteWithheldText` scans the WHOLE
+ * backlog (not just index 0) — a repeated withhold of a message that's since
+ * been pushed off the front by another draft must still dedupe.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("withheld send: whole-backlog dedupe — a withheld message whose matching text already sits at backlog index 1 (not index 0) is not duplicated", async () => {
+  const { createTask, startTask, sendInput } = await import("./orchestrator.ts");
+  const { db, runs, tasks, backlog } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+
+  const created = await createTask({
+    title: "withheld-dedupe-whole-backlog",
+    prompt: "first message",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const res = await startTask(taskId);
+  if (!("runId" in res)) throw new Error("expected the fake driver to start a run");
+  const r1 = res.runId;
+  await waitFor(() => tasks.get(taskId)?.column !== "running");
+
+  // `backlog.add` unshifts (newest draft on top) — adding "are you there"
+  // FIRST, then "already saved for later" SECOND, leaves "are you there" at
+  // index 1, not index 0. A dedupe keyed only on `task.backlog[0]` would miss
+  // this and add a THIRD (duplicate) item below.
+  backlog.add(taskId, { text: "are you there" });
+  backlog.add(taskId, { text: "already saved for later" });
+  const seeded = tasks.get(taskId)!;
+  expect(seeded.backlog.map((m) => m.text)).toEqual(["already saved for later", "are you there"]);
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+  const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
+  const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
+  const prevCapture = claudeTmux.__forTest.setCapturePastePane(() => BLOCKING_PANE);
+
+  try {
+    const sent = await sendInput(r1, "are you there");
+    if (sent.delivered) throw new Error(`expected the withheld send to report delivered:false, got ${JSON.stringify(sent)}`);
+    expect(sent.withheld).toBe(true);
+
+    await claudeTmux.__forTest.pasteChains.get(taskId);
+    await waitFor(() => runs.listForTask(taskId).some((r) => r.id !== r1 && r.status === "failed"));
+
+    const after = tasks.get(taskId)!;
+    // Still exactly 2 items — the whole-backlog scan found the match at
+    // index 1 (not just index 0) and skipped adding a third.
+    expect(after.backlog.length).toBe(2);
+    expect(after.backlog.map((m) => m.text).sort()).toEqual(
+      ["already saved for later", "are you there"].sort(),
+    );
+  } finally {
+    claudeTmux.__forTest.setCapturePastePane(prevCapture);
+    claudeTmux.__forTest.setPasteModalGraceMs(prevGrace);
+    claudeTmux.__forTest.setPasteModalPollMs(prevPoll);
+    claudeTmux.__forTest.uninstallSession(taskId);
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+}, 10_000);
+
+/* ────────────────────────────────────────────────────────────────────────── *
+ * 16 — Ask-card free-text route: POST /ask-questions/:id/answer's custom/
+ * free-text branch routes through `sendInput` (the ONLY ask-answer path that
+ * can withhold — the "drive" path types keys straight into an already-open
+ * modal, with no composer paste for a blocking modal to hold up), so a
+ * blocking modal on the pane withholds it exactly like any other send and
+ * threads the full { withheld, savedToBacklog, reason } shape into the HTTP
+ * response.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("POST /ask-questions/:id/answer: a custom free-text answer while a blocking modal is on the pane reports { ok:false, withheld:true, savedToBacklog:true } and stashes the answer text in the task's backlog", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { db, tasks } = await import("./db.ts");
+  const claudeTmux = await import("./claude-tmux.ts");
+  const { startApiServer, API_TOKEN } = await import("./server.ts");
+  const { registerScrapedAskQuestions } = await import("./interactions.ts");
+  const { formatAnswersMessage } = await import("./claude-questions.ts");
+
+  const created = await createTask({
+    title: "ask-answer-withheld",
+    prompt: "first message",
+    agent: "claude-code",
+    workdir: process.cwd(),
+    isolation: "none",
+    model: "sonnet-5",
+    effort: "high",
+  });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  const res = await startTask(taskId);
+  if (!("runId" in res)) throw new Error("expected the fake driver to start a run");
+  const r1 = res.runId;
+  // Idle before answering, same as the other ask-driven scenarios in this
+  // file — the answer route's `sendInput` call takes the idle (new-run) path
+  // rather than folding into a still-active run.
+  await waitFor(() => tasks.get(taskId)?.column !== "running");
+
+  claudeTmux.__forTest.installSession(taskId, freshJsonl());
+  const prevGrace = claudeTmux.__forTest.setPasteModalGraceMs(20);
+  const prevPoll = claudeTmux.__forTest.setPasteModalPollMs(10);
+  const prevCapture = claudeTmux.__forTest.setCapturePastePane(() => BLOCKING_PANE);
+
+  const specs = [{ question: "Which approach?", multiSelect: false, options: ["A", "B"] }];
+  const expectedText = formatAnswersMessage(specs, [{ selected: [], custom: "my own answer" }]);
+
+  const askReq = registerScrapedAskQuestions({
+    taskId,
+    runId: r1,
+    questions: [{ question: "Which approach?", options: [{ label: "A" }, { label: "B" }] }],
+    fingerprint: "fp-ask-answer-withheld",
+  });
+
+  const server = startApiServer() as unknown as { stop: () => void };
+  try {
+    const httpRes = await fetch(`http://127.0.0.1:4427/ask-questions/${askReq.id}/answer`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ answers: [{ selected: [], custom: "my own answer" }] }),
+    });
+    expect(httpRes.status).toBe(200);
+    const body = await httpRes.json();
+    expect(body.ok).toBe(false);
+    expect(body.withheld).toBe(true);
+    expect(body.savedToBacklog).toBe(true);
+    expect(typeof body.reason).toBe("string");
+    expect(body.reason as string).toContain("backlog");
+
+    await claudeTmux.__forTest.pasteChains.get(taskId);
+    await waitFor(() => (tasks.get(taskId)?.backlog.length ?? 0) >= 1);
+    const backlog = tasks.get(taskId)?.backlog ?? [];
+    expect(backlog.some((m) => m.text === expectedText)).toBe(true);
+  } finally {
+    claudeTmux.__forTest.setCapturePastePane(prevCapture);
+    claudeTmux.__forTest.setPasteModalGraceMs(prevGrace);
+    claudeTmux.__forTest.setPasteModalPollMs(prevPoll);
+    claudeTmux.__forTest.uninstallSession(taskId);
+    server.stop();
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
 }, 10_000);

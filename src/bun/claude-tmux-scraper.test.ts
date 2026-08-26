@@ -39,6 +39,11 @@ const {
   idleSettleTick,
   paneShowsComposerText,
   SESSION_ONLY_CONFIRM_RE,
+  pickerRowFamily,
+  pickerChoiceIndexForFamily,
+  stripVolatileStatusBarHint,
+  EFFORT_HINT_SUFFIX_RE,
+  TURN_DONE_SUMMARY_RE,
 } = __forTest;
 
 /** Real tmux pane captures of claude-code 2.1.161's AskUserQuestion modal —
@@ -656,6 +661,65 @@ test("matchUnparsableModal — fingerprint is stable across an inserted volatile
   expect(withTip.fingerprint).toBe(clean.fingerprint);
 });
 
+test("matchUnparsableModal — fingerprint is stable across an inserted completed-turn 'done' summary line (still volatile, per VOLATILE_PANE_LINE_RE's un-negated SPINNER_ELAPSED_LINE)", () => {
+  // TURN_DONE_SUMMARY_RE's own doc: the elapsed-summary row keeps carrying
+  // its `· done <time>` suffix on an idle pane forever after a turn
+  // completes. It's no longer "working" (WORKING_LINE_RE negates this form),
+  // but it must stay VOLATILE — a card's fingerprint or the reaper's
+  // activity diff must not jitter on the tick where this suffix appears.
+  const clean = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
+  const withDoneRow = matchUnparsableModal(
+    SHORT_UNPARSABLE_PANE.replace("Do a thing?", "Do a thing?\n✻ Churned for 1s · done 5:35 PM"),
+    false,
+  )!;
+  expect(withDoneRow.fingerprint).toBe(clean.fingerprint);
+});
+
+// ── stripVolatileStatusBarHint / EFFORT_HINT_SUFFIX_RE (wave-5 finding #8) ──
+//
+// Smoke evidence, claude 2.1.246: on a genuinely idle session the status
+// bar's right-hand hint FLICKERS on its own — one capture read
+//   ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent            ● high · /effort
+// and the identical row WITHOUT the trailing `● high · /effort` segment a
+// second later. An EARLIER fix stripped the WHOLE status-bar row via
+// VOLATILE_PANE_LINE_RE whenever it carried this hint — but that also erased
+// the mode name itself from the activity diff and the unparsable card's
+// paneText, hiding a genuine terminal-side mode flip. The current fix is
+// narrower: `stripVolatileStatusBarHint` strips ONLY the self-flickering
+// suffix off a matched `STATUS_BAR_RE` row (via `EFFORT_HINT_SUFFIX_RE`),
+// leaving the mode glyph / name / cycle hint / agent count intact — this is
+// what `normalizePaneForActivity` (not itself exposed via __forTest, since
+// its only call site is the private `scrapeOnce`) applies to every line
+// before its own VOLATILE_PANE_LINE_RE filter, so the activity-diff yields
+// the SAME normalized value for the idle pane with and without the suffix.
+
+test("stripVolatileStatusBarHint — strips the self-flickering '● <effort> · /effort' suffix off a status-bar row, yielding the SAME value as the row without it", () => {
+  const withSuffix = "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent            ● high · /effort";
+  const withoutSuffix = "⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent";
+  expect(stripVolatileStatusBarHint(withSuffix)).toBe(withoutSuffix);
+  // The already-bare row (no suffix to strip) round-trips unchanged — proof
+  // this is the SAME normalized value on both sides of the flicker, not just
+  // "produces something".
+  expect(stripVolatileStatusBarHint(withoutSuffix)).toBe(withoutSuffix);
+  expect(stripVolatileStatusBarHint(withSuffix)).toBe(stripVolatileStatusBarHint(withoutSuffix));
+});
+
+test("stripVolatileStatusBarHint — a no-op on any line that ISN'T a recognized status bar, even one shaped exactly like the hint suffix", () => {
+  // The gate is `STATUS_BAR_RE.test(line)` first — narrower than the whole
+  // row being blindly regex-replaced regardless of context (finding #8).
+  const notAStatusBar = "some transcript line · ← 1 agent            ● high · /effort";
+  expect(stripVolatileStatusBarHint(notAStatusBar)).toBe(notAStatusBar);
+});
+
+test("EFFORT_HINT_SUFFIX_RE — matches only the trailing '● <word> · /effort' segment, anchored to end of line", () => {
+  expect(EFFORT_HINT_SUFFIX_RE.test("· ← 1 agent            ● high · /effort")).toBe(true);
+  expect(EFFORT_HINT_SUFFIX_RE.test(" ● high · /effort")).toBe(true);
+  // Not anchored at end-of-line — must not match trailing prose past it.
+  expect(EFFORT_HINT_SUFFIX_RE.test(" ● high · /effort trailing text")).toBe(false);
+  // No leading whitespace before the glyph — the regex requires `\s+` first.
+  expect(EFFORT_HINT_SUFFIX_RE.test("● high · /effort")).toBe(false);
+});
+
 test("matchUnparsableModal — a genuinely different modal gets a different fingerprint", () => {
   const a = matchUnparsableModal(SHORT_UNPARSABLE_PANE, false)!;
   const b = matchUnparsableModal(`Do a DIFFERENT thing?\n\nEnter to continue · Esc to cancel`, false)!;
@@ -1229,6 +1293,63 @@ ${IDLE_BORDER}
   ${statusBar}`;
 }
 
+/**
+ * Same idle pane as `idlePane`, but with claude's completed-turn elapsed
+ * summary (`✻ Churned for 1s · done 5:35 PM`, `TURN_DONE_SUMMARY_RE`'s own
+ * doc) inserted where the smoke evidence found it — sitting exactly 5
+ * non-blank rows from the bottom of the pane (counting up: status bar,
+ * border, bare `❯ ` prompt, border, this line), i.e. still comfortably inside
+ * `WORKING_CHROME_WINDOW_LINES`.
+ */
+function idlePaneWithDoneRow(statusBar: string): string {
+  return `❯ /model sonnet
+  ⎿  Set model to Sonnet 5 and saved as your default for new sessions
+
+✻ Churned for 1s · done 5:35 PM
+
+${IDLE_BORDER}
+❯
+${IDLE_BORDER}
+  ${statusBar}`;
+}
+
+// ── TURN_DONE_SUMMARY_RE / the completed-turn 'done' marker ─────────────────
+// (docs/plans/model-effort-local-command-turns.md §10) — the one token that
+// tells a FINISHED elapsed-summary row (`✻ Churned for 1s · done 5:35 PM`)
+// apart from a still-RUNNING one (`✻ Cooked for 2m 18s`). See
+// SPINNER_ELAPSED_WORKING_LINE / SPINNER_ELAPSED_LINE's doc comments for the
+// two different questions ("is it working?" vs "is it volatile?") that ride
+// on this split.
+
+test("TURN_DONE_SUMMARY_RE — matches the completed-turn marker, not a still-running elapsed summary", () => {
+  expect(TURN_DONE_SUMMARY_RE.test("✻ Churned for 1s · done 5:35 PM")).toBe(true);
+  expect(TURN_DONE_SUMMARY_RE.test("✻ Cooked for 2m 18s")).toBe(false);
+});
+
+test("paneShowsClaudeWorking — false on an idle tail carrying a completed turn's 'done' summary 5 rows above the input box, even though the live ticking forms of the SAME elapsed shape still read as working", () => {
+  // The negation in SPINNER_ELAPSED_WORKING_LINE is what makes this false —
+  // without it, ANY session that ever finished a turn would read as
+  // permanently working (see that constant's own doc for the four real
+  // consumers that broke: mirrorModelViaPicker's busy bail, the idle-settle
+  // net, the unparsable footer arm, and paneShowsComposerText).
+  const idleWithDoneRow = idlePaneWithDoneRow("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
+  expect(paneShowsClaudeWorking(idleWithDoneRow)).toBe(false);
+
+  // The same elapsed-summary SHAPE, minus the "· done" suffix, is still
+  // genuinely working — a long non-shell tool call whose only pane signal is
+  // the ticking elapsed timer.
+  expect(paneShowsClaudeWorking("✻ Cooked for 2m 18s")).toBe(true);
+  expect(paneShowsClaudeWorking("✽ Frosting… (2m 52s · ↓ 12.1k tokens)")).toBe(true);
+});
+
+test("idle+done tail (a completed turn's summary row still on screen 3 minutes later) reads as idle across the whole chain: paneShowsIdleInputBox true, pickScrapeMatch null, paneShowsBlockingPrompt false", () => {
+  const pane = idlePaneWithDoneRow("⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent");
+  expect(paneShowsClaudeWorking(pane)).toBe(false);
+  expect(paneShowsIdleInputBox(pane)).toBe(true);
+  expect(pickScrapeMatch(pane, { paneWorking: paneShowsClaudeWorking(pane), watchdogArmed: false })).toBeNull();
+  expect(paneShowsBlockingPrompt(pane)).toBe(false);
+});
+
 // ── Model picker (bare `/model`) ─────────────────────────────────────────────
 
 const MODEL_PICKER_PANE = `   Select model
@@ -1278,6 +1399,51 @@ test("pickScrapeMatch — the /model picker's confirmKey rides along through the
   expect(direct.confirmKey).toBe("s");
   const dispatched = pickScrapeMatch(MODEL_PICKER_PANE, { paneWorking: false, watchdogArmed: false });
   expect(dispatched!.confirmKey).toBe("s");
+});
+
+// ── pickerRowFamily / pickerChoiceIndexForFamily — the 2.1.246 bare /model
+// picker's row-name parse (mirrorModelViaPicker's pure half). Verbatim rows
+// from that function's own doc comment in claude-tmux.ts:
+//   1. Default (recommended)  Opus 5 with 1M context, best for complex work
+//   2. Opus (1M context)      Opus 5 with 1M context …
+//   3. Fable                  Fable 5 …
+//   4. Sonnet ✔               Sonnet 5 …
+//   5. Haiku                  Haiku 4.5 …
+// (labels below omit the leading "N. " — matchNumberedModal already strips
+// that before a row reaches `choices[].label`.)
+
+test("pickerRowFamily — 2.1.246 bare /model picker row labels", () => {
+  expect(pickerRowFamily("Default (recommended)  Opus 5 with 1M context, best for complex work")).toBe("Default");
+  expect(pickerRowFamily("Opus (1M context)      Opus 5 with 1M context, best for complex work")).toBe("Opus");
+  expect(pickerRowFamily("Fable                  Fable 5, most capable for your hardest and longest-running tasks"))
+    .toBe("Fable");
+  expect(pickerRowFamily("Sonnet ✔               Sonnet 5, efficient for routine tasks")).toBe("Sonnet");
+  expect(pickerRowFamily("Haiku                  Haiku 4.5, fastest for quick answers")).toBe("Haiku");
+});
+
+test("pickerRowFamily — no leading word at all yields null", () => {
+  expect(pickerRowFamily("")).toBeNull();
+  expect(pickerRowFamily("   ")).toBeNull();
+});
+
+test("pickerChoiceIndexForFamily — 2.1.246 bare /model picker: Default is never selectable (from either direction), known families resolve by index, unknown family is -1", () => {
+  const choices = [
+    { key: "1", label: "Default (recommended)  Opus 5 with 1M context, best for complex work" },
+    { key: "2", label: "Opus (1M context)      Opus 5 with 1M context, best for complex work" },
+    { key: "3", label: "Fable                  Fable 5, most capable for your hardest and longest-running tasks" },
+    { key: "4", label: "Sonnet ✔               Sonnet 5, efficient for routine tasks" },
+    { key: "5", label: "Haiku                  Haiku 4.5, fastest for quick answers" },
+  ];
+  expect(pickerChoiceIndexForFamily(choices, "Opus")).toBe(1);
+  expect(pickerChoiceIndexForFamily(choices, "Sonnet")).toBe(3);
+  expect(pickerChoiceIndexForFamily(choices, "Fable")).toBe(2);
+  expect(pickerChoiceIndexForFamily(choices, "Haiku")).toBe(4);
+  expect(pickerChoiceIndexForFamily(choices, "Mythos")).toBe(-1);
+  // Never-pick-Default, from both directions.
+  expect(pickerChoiceIndexForFamily(choices, "Default")).toBe(-1);
+  expect(pickerChoiceIndexForFamily(choices, "default")).toBe(-1);
+  // Case-insensitive match on a real family.
+  expect(pickerChoiceIndexForFamily(choices, "opus")).toBe(1);
 });
 
 // ── Effort slider (bare `/effort`) ───────────────────────────────────────────
