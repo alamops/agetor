@@ -1653,13 +1653,27 @@ function effortFallbackForModelChange(
  * the same table the RunPanel picker filters against). Model equality is
  * checked both by raw id AND via `toClaudeModelArg` so an alias (e.g. claude
  * reporting "sonnet" resolved to agetor id `sonnet-5`) can never flip the
- * stored id against an already-equivalent one.
+ * stored id against an already-equivalent one. A `null` `task.model` (the
+ * row has never had an explicit model written to it — the task simply runs
+ * on claude's/agetor's default) is compared as if it already held
+ * `DEFAULT_MODEL["claude-code"]`: a bare `/model` immediately followed by Esc
+ * reports `Kept model as <the default's display name>`, which resolves to
+ * that same default id — without this, the row would get pinned to an
+ * explicit id it never asked for, just because the user opened and closed
+ * the picker without changing anything.
  *
  * A model sync that lands on a model which no longer supports the task's
  * saved effort adjusts the effort in the SAME `tasks.update` — mirroring
  * `effortFallbackForModelChange` above (itself a mirror of the RunPanel's
  * own effect) — rather than leaving a row with an impossible (model,
- * effort) pair until the next unrelated PATCH happens to fix it.
+ * effort) pair until the next unrelated PATCH happens to fix it. This
+ * cascaded effort adjustment is, like every other write this function makes,
+ * NEVER mirrored into the live session via `sendSlashCommand` — claude's own
+ * live model/effort pair is left exactly as claude set it; the row-side
+ * adjustment only governs what the model dropdown shows and what the NEXT
+ * spawn (or the next explicit `/effort` from the dropdown) will use. The
+ * breadcrumb says so explicitly ("for the next run") so the user doesn't
+ * read it as "agetor just changed your live effort".
  *
  * Returns true when a row actually changed (and a status breadcrumb was
  * attempted on the task's most recent run, if one exists).
@@ -1689,9 +1703,14 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
   let breadcrumb: string;
 
   if (outcome.kind === "model") {
+    // A never-set row (`task.model === null`) runs on the default model, so
+    // compare against DEFAULT_MODEL rather than `null`/"" — otherwise a bare
+    // `/model` + Esc ("Kept model as <default>") would pin an explicit id
+    // onto a task that never asked for one (see the function doc).
+    const effectiveCurrentModel = task.model ?? DEFAULT_MODEL["claude-code"];
     const unchanged =
-      outcome.id === task.model
-      || toClaudeModelArg(outcome.id) === toClaudeModelArg(task.model ?? "");
+      outcome.id === effectiveCurrentModel
+      || toClaudeModelArg(outcome.id) === toClaudeModelArg(effectiveCurrentModel);
     if (unchanged) return false;
 
     patch = { model: outcome.id };
@@ -1700,9 +1719,12 @@ export function applyClaudeLocalSetting(taskId: string, info: LocalSettingInfo):
     const effortFallback = effortFallbackForModelChange("claude-code", outcome.id, task.effort);
     if (effortFallback !== undefined) {
       patch.effort = effortFallback;
+      // "for the next run" — this cascaded adjustment is NEVER mirrored into
+      // the live session (see the function doc); it only governs the next
+      // spawn, so the wording must not read as "your live effort changed".
       breadcrumb += effortFallback === null
-        ? `; effort cleared (not supported on ${outcome.id})`
-        : `; effort adjusted to ${effortFallback} (not supported on ${outcome.id})`;
+        ? `; effort cleared for the next run (not supported on ${outcome.id})`
+        : `; effort adjusted to ${effortFallback} for the next run (not supported on ${outcome.id})`;
     }
   } else {
     // outcome.kind === "effort" — validate against the (agent, model) pair
@@ -2479,7 +2501,7 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
     // the run, since the "user" bubble below is appended optimistically
     // before the paste's real outcome is known.
     const delivered = pasteFollowUp(taskId, line, {
-      onPasteFailure: () => handleFoldedFollowUpPasteWithheld(taskId, activeRunId, line),
+      onPasteFailure: (outcome) => handlePasteWithheld(taskId, activeRunId, line, outcome),
     });
     if (delivered) {
       const data = normalizeUserText(line);
@@ -2529,32 +2551,132 @@ function sendTurnInExistingSession(task: Task, taskId: string, line: string): st
   const onChunk = makeChunkHandler(newRunId, taskId, kind, task.mode);
   onChunk("user", normalizeUserText(line));
 
-  const agent = sendTurn(taskId, line, onChunk);
+  const agent = sendTurn(taskId, line, onChunk, {
+    onPasteFailure: (outcome) => handlePasteWithheld(taskId, newRunId, line, outcome),
+  });
   registerActiveRun(newRunId, taskId, task, agent);
   attachDoneHandler(newRunId, taskId, agent);
   return newRunId;
 }
 
 /**
- * `pasteFollowUp`'s `onPasteFailure` hook for the fold-while-busy path
- * (`sendTurnInExistingSession` above): a blocking claude modal (T7's paste
- * guard, docs/plans/model-effort-local-command-turns.md §10) was still on
- * the pane when the queued paste's grace window elapsed, so the follow-up
- * was never delivered to the live session. The optimistic "user" bubble
- * `sendTurnInExistingSession` already appended stays in the transcript
- * (matching every other optimistic-paste case — see its own comment), but
- * the message text itself would otherwise be lost entirely. Re-stash it
- * into the task's backlog tray so the user can resend it once they've
- * answered whatever claude is waiting on, and say so on the active run.
+ * Shared `onPasteFailure` hook for BOTH claude paste paths in
+ * `sendTurnInExistingSession` above — the fold-while-busy follow-up (via
+ * `pasteFollowUp`) and a fresh idle turn (via `sendTurn`): a blocking claude
+ * modal (T7's paste guard, docs/plans/model-effort-local-command-turns.md
+ * §10) was still on the pane when the queued paste's grace window elapsed,
+ * so `text` was never actually delivered to the live session as intended.
+ * The optimistic "user" bubble the caller already appended stays in the
+ * transcript (matching every other optimistic-paste case), but `text` itself
+ * would otherwise be lost. `outcome.op`/`outcome.phase` say WHERE the
+ * withhold happened:
+ *
+ *   - `outcome.op !== "modal-guard"` (finding #5, §10 re-review): a REAL
+ *     tmux subprocess failure — `load-buffer`/`paste-buffer`/`send-keys`
+ *     exited non-zero (dead server, socket gone, session vanished mid-op) —
+ *     forwarded verbatim by `sendTurn`/`pasteFollowUp` with no `phase` at
+ *     all (only the driver's own synthesized `"modal-guard"` outcomes carry
+ *     one). Falling through to the phase-based branches below used to
+ *     mislabel this as "claude is waiting on a prompt", which it isn't. The
+ *     driver's `reportPasteFailure` already emitted a `"paste failed: tmux
+ *     <op> — …"` status chunk on this run before calling `onPasteFailure`,
+ *     so this branch does NOT repeat that wording — it re-stashes `text`
+ *     and adds a separate, backlog-focused status.
+ *   - `"pre-enter"`: the bracketed paste itself landed — `text` is already
+ *     sitting in claude's input box, just missing its trailing Enter. Also
+ *     re-stashed (finding #3, §10 re-review): the driver's composer-clear
+ *     flow now actively CLEARS this leftover text with `Escape Escape`
+ *     before the session's next paste (finding #2, §10 re-review), so
+ *     leaving it un-stashed here would mean it's silently wiped with no
+ *     record once that clear runs. `restashPasteWithheldText`'s dedupe
+ *     against `task.backlog[0]` still prevents pile-up across repeated
+ *     pre-enter withholds of the same message.
+ *   - `"composer-dirty"`: an EARLIER withheld message is still sitting in
+ *     claude's input box (mid-turn there's no safe way to clear it), so this
+ *     NEW paste was withheld before ever reaching the pane. Re-stashed like
+ *     `"pre-paste"`, with its own status wording naming the earlier message.
+ *   - `"pre-paste"` (or a missing `phase` on an otherwise-`"modal-guard"`
+ *     outcome, which shouldn't happen in practice): nothing reached the pane
+ *     at all — re-stash `text` into the task's backlog tray so it isn't
+ *     lost outright.
+ *
+ * Re-stashing dedupes against the backlog's own most-recently-added item
+ * (`task.backlog[0]` — items are unshifted onto the front, see `backlog.add`
+ * in db.ts) so a paste that keeps failing across retries with the same text
+ * doesn't pile up duplicate drafts.
+ *
+ * `backlog.add` is called directly rather than through the server's
+ * `backlogGuard` (an HTTP-route-level check, not something this internal
+ * plumbing goes through) — that's safe ONLY because every caller of this
+ * function is reachable exclusively through `sendInput`, which auto-
+ * unarchives the task before dispatching a turn. This function still
+ * re-checks `tasks.get(taskId)?.archivedAt == null` immediately before
+ * adding, in case a concurrent `archiveTask` raced the unarchive between
+ * `sendInput`'s check and this callback (`onPasteFailure` fires
+ * synchronously inside the tmux call chain, not on the same tick as
+ * `sendInput`'s own unarchive) — skip + log rather than resurrect an
+ * archived task's backlog out from under an in-flight archive.
+ *
  * `text` is already the fully-composed message (references, if any, are
  * flattened into it client-side before it ever reaches `sendInput` — see
  * the `/runs/:id/input` route), so there's nothing further to pass through.
  */
-function handleFoldedFollowUpPasteWithheld(taskId: string, runId: string, text: string): void {
-  backlog.add(taskId, { text });
-  const data = "message saved to your backlog — claude is waiting on a prompt; answer it and send the message from the tray";
+function handlePasteWithheld(
+  taskId: string,
+  runId: string,
+  text: string,
+  outcome: { ok: false; op: string; phase?: "pre-paste" | "pre-enter" | "composer-dirty"; stderr: string },
+): void {
+  let data: string;
+  if (outcome.op !== "modal-guard") {
+    // A genuine tmux subprocess failure, not a modal withhold (finding #5,
+    // §10 re-review) — see this function's doc for why this must be checked
+    // BEFORE the phase-based branches below.
+    restashPasteWithheldText(taskId, text);
+    data = "message saved to your backlog — the paste to claude's session failed; resend from the tray";
+  } else if (outcome.phase === "pre-enter") {
+    // Re-stashed (finding #3, §10 re-review) — see this function's doc.
+    restashPasteWithheldText(taskId, text);
+    data =
+      "paste withheld: claude opened a prompt before your message was sent — it's saved to your backlog (claude's input box will be cleared before your next send); resend from the tray";
+  } else if (outcome.phase === "composer-dirty") {
+    restashPasteWithheldText(taskId, text);
+    data = "paste withheld: claude's input box still holds an earlier message — saved this one to your backlog; resend from the tray once claude is idle";
+  } else {
+    // "pre-paste", or a missing phase (an older/synthesized outcome) —
+    // nothing reached the pane at all.
+    restashPasteWithheldText(taskId, text);
+    data = "message saved to your backlog — claude is waiting on a prompt; answer it and send the message from the tray";
+  }
   runs.appendEvent(runId, "status", data);
   emit({ runId, taskId, stream: "status", data, ts: Date.now() });
+}
+
+/** Re-stash a withheld paste's text into the task's backlog tray, deduping
+ *  against the most-recently-added item so retries of the same failed paste
+ *  don't pile up duplicate drafts. Skips (and logs) rather than adding when
+ *  the task is gone or archived — see `handlePasteWithheld`'s doc for why
+ *  that race is possible despite `sendInput` auto-unarchiving up front. */
+function restashPasteWithheldText(taskId: string, text: string): void {
+  const task = tasks.get(taskId);
+  if (!task || task.archivedAt != null) {
+    console.warn(`[agetor] handlePasteWithheld: task ${taskId} not found or archived — skipping backlog re-stash`);
+    return;
+  }
+  const last = task.backlog[0];
+  if (!last || last.text !== text) backlog.add(taskId, { text });
+}
+
+/** Test hook: exercise `handlePasteWithheld` directly against a real task
+ *  row without driving a full tmux paste-failure scenario. Not part of the
+ *  public surface. */
+export function __handlePasteWithheldForTest(
+  taskId: string,
+  runId: string,
+  text: string,
+  outcome: { ok: false; op: string; phase?: "pre-paste" | "pre-enter" | "composer-dirty"; stderr: string },
+): void {
+  handlePasteWithheld(taskId, runId, text, outcome);
 }
 
 /**

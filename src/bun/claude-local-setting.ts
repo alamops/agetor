@@ -18,27 +18,71 @@ export function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
+/** Strip claude's parenthesized qualifiers (`(1M context)`, `(default)`, …)
+ *  from a `/model` display name and collapse the resulting whitespace, e.g.
+ *  turning `"Opus 5 (1M context) (default) and saved …"` into `"Opus 5 and
+ *  saved …"`. Shared by `claudeModelIdFromDisplayName` (label matching) and
+ *  `parseClaudeLocalSetting` (computing the `unrepresentable` outcome's `raw`
+ *  text) so both strip qualifiers identically. */
+function stripModelQualifiers(name: string): string {
+  return name.replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ").trim();
+}
+
 /**
  * Resolve a `/model` display name — as it appears in claude's own
- * `Set model to <name> …` stdout — to an agetor model id. Handles the
- * qualifiers claude appends inline (`(1M context)`, `(default)`, …) by
- * stripping every parenthesized segment before matching, case-insensitively,
- * against `AGENT_OPTIONS["claude-code"].models[].label`. A raw `claude-…` id
- * (shouldn't normally reach this path, but harmless if it does) passes
- * through verbatim. Returns null when nothing matches.
+ * `Set model to <name> …` / `Kept model as <name>` stdout — to an agetor
+ * model id. Qualifiers claude appends inline (`(1M context)`, `(default)`, …)
+ * are stripped first (`stripModelQualifiers`); then the LONGEST
+ * `AGENT_OPTIONS["claude-code"].models[].label` that the (case-insensitive)
+ * remaining text STARTS WITH wins.
+ *
+ * This is a prefix match, not exact equality, because the text after the
+ * model name varies by how `/model` was invoked and isn't fully pinned down:
+ * `and saved as your default for new sessions` for the default (`d`) path,
+ * but the picker's session-only (`s`) key omits that suffix in favor of
+ * something like `for this session` — the exact wording was never confirmed
+ * against a live session. Matching on `startsWith` makes the trailing
+ * wording irrelevant to whether the model itself is recognized.
+ *
+ * The match additionally requires a WORD BOUNDARY right after the label
+ * (finding #4, docs/plans/model-effort-local-command-turns.md §10 re-review):
+ * `lower === l || lower.startsWith(l + " ")`, never a bare `lower.startsWith(l)`.
+ * Without that, a longer real model name that happens to start with a
+ * shorter label's characters would mismatch — `"Opus 5.1 …"` would resolve to
+ * `opus-5` (the `"Opus 5"` label is a character-prefix of `"Opus 5.1"`, just
+ * not a WORD-boundary one), and `"Haiku 4.5.1"` would resolve to `haiku-4.5`.
+ * Requiring the label be either the whole (trimmed) string or followed by a
+ * space keeps `"Opus 5 and saved …"` matching (space boundary) while making
+ * `"Opus 5.1 …"` correctly fall through to `unrepresentable` — agetor's
+ * curated list has no `Opus 5.1` entry, so silently rounding it down to
+ * `Opus 5` would store the wrong model id.
+ *
+ * A raw `claude-…` id at the start of the text passes through verbatim — just
+ * the leading token, not anything trailing it. This deliberately differs from
+ * the label path: an id is already a valid CLI arg (house style: an unknown
+ * id passes through verbatim because it's still usable as-is), whereas a
+ * display name is NOT an id — an unrecognized one has no verbatim escape
+ * hatch and must resolve via the label table or come back `null` (surfaced by
+ * `parseClaudeLocalSetting` as `{ kind: "unrepresentable" }`, never silently
+ * stored). Returns null when nothing matches.
  */
 export function claudeModelIdFromDisplayName(name: string): string | null {
-  const stripped = name
-    .replace(/\([^)]*\)/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const stripped = stripModelQualifiers(name);
   if (!stripped) return null;
-  if (/^claude-/.test(stripped)) return stripped;
+  const claudeIdToken = /^(claude-\S+)/.exec(stripped);
+  if (claudeIdToken) return claudeIdToken[1]!;
   const lower = stripped.toLowerCase();
+  let matched: { id: string; label: string } | null = null;
   for (const opt of AGENT_OPTIONS["claude-code"].models) {
-    if (opt.label.toLowerCase() === lower) return opt.id;
+    const l = opt.label.toLowerCase();
+    // Word-boundary match (finding #4, §10 re-review) — see this function's
+    // doc for why a bare `startsWith` over-matches a longer real name that
+    // merely shares a shorter label's leading characters.
+    if (lower === l || lower.startsWith(l + " ")) {
+      if (!matched || opt.label.length > matched.label.length) matched = opt;
+    }
   }
-  return null;
+  return matched ? matched.id : null;
 }
 
 /**
@@ -109,30 +153,47 @@ export type ClaudeLocalSettingOutcome =
  *      This matters when e.g. the Task Details dropdown already wrote a new
  *      model onto the task row before the user declined in the session: the
  *      row needs correcting back to what the session actually kept. Synced
- *      exactly like a `Set model to` outcome (same display-name lookup).
- *   2. An arg that matches a `CLAUDE_MODEL_FLAG` value exactly (the dropdown
- *      mirror's own `/model <flag>`, or a user typing the raw flag) resolves
- *      directly via `claudeModelIdFromArg`.
- *   3. Otherwise (no arg, or an alias like `sonnet`/`opus`/`default` the
- *      arg-based lookup can't invert) fall back to the ANSI-stripped
- *      stdout's `Set model to <name> …` display name — read from the FIRST
- *      LINE only: claude sometimes appends further lines (a note, a
- *      caveat) after that line, and since `.` doesn't match `\n`, matching
- *      the regex against the full multi-line stdout silently fails to
- *      capture anything.
+ *      exactly like a `Set model to` outcome (same display-name lookup), and
+ *      its `unrepresentable` `raw` is qualifier-stripped the same way too
+ *      (finding #11e, docs/plans/model-effort-local-command-turns.md §10
+ *      re-review) — the two branches previously diverged, leaving `(1M
+ *      context)`/`(default)` in this branch's breadcrumb but not the other.
+ *   2. Otherwise, the first line MUST match `Set model to <name>` — read
+ *      from the FIRST LINE only (claude sometimes appends further lines,
+ *      e.g. a note or caveat, and since `.` doesn't match `\n`, matching
+ *      against the full multi-line stdout would silently fail to capture
+ *      anything). No match (`Cancelled`, an error, empty stdout) → `null`,
+ *      even when `args` carries a perfectly valid raw `claude-*` id —
+ *      `args` is never consulted before a real "Set model to" outcome is
+ *      confirmed, otherwise a declined confirm could still write the value
+ *      that was merely typed.
+ *   3. Only once a real "Set model to" outcome is confirmed: an `args` that
+ *      matches a `CLAUDE_MODEL_FLAG` value exactly (the dropdown mirror's
+ *      own `/model <flag>`, or a user typing the raw flag) resolves
+ *      directly via `claudeModelIdFromArg` — this is the one case `args` is
+ *      a MORE reliable resolver than the display name, since it round-trips
+ *      losslessly, whereas an alias like `sonnet`/`opus`/`default` can't be
+ *      inverted from the arg alone.
+ *   4. Otherwise (no arg, or an alias the arg-based lookup can't invert)
+ *      fall back to `claudeModelIdFromDisplayName` on the full first-line
+ *      remainder after "Set model to " — see that function's doc for the
+ *      prefix-match rationale (the trailing clause's wording varies by
+ *      invocation and isn't fully known).
  *   A display name/id that resolves via neither `AGENT_OPTIONS` nor the
  *   `claude-…` passthrough is `{ kind: "unrepresentable" }`, not null — the
- *   value is real, agetor just can't store it.
+ *   value is real, agetor just can't store it. Its `raw` text has the one
+ *   CONFIRMED trailing clause (`and saved …`) trimmed off; an unconfirmed
+ *   (session-only) suffix is left in place rather than guessed at.
  *
  * Effort resolution: only `Set effort level to <id>` is a real change —
  * `Cancelled`, a future `Kept effort level as …`, or any other line bails to
- * null. Given that prefix, the id is parsed from stdout first (lowercased
- * before the support check, since claude's `Set effort level to` id is
- * already lowercase but a caller-supplied `args` might not be — e.g.
- * `{ args: "HIGH", stdout: "Set effort level to high" }` must resolve to
- * `high`); `args` is consulted only if the stdout capture itself came back
- * empty. An id outside `CLAUDE_EFFORT_IDS` (`ultracode`) is
- * `{ kind: "unrepresentable" }`.
+ * `null`. Given that match, the id is read from `match[1]` and lowercased
+ * (claude's own id is already lowercase, but a caller-supplied `args` used
+ * for the support check elsewhere might not be — irrelevant here since
+ * `args` is never read in this branch: `(\w+)` cannot capture an empty
+ * string, so once the regex matches there is nothing left for an `args`
+ * fallback to contribute). An id outside `CLAUDE_EFFORT_IDS` (`ultracode`)
+ * is `{ kind: "unrepresentable" }`.
  */
 export function parseClaudeLocalSetting(info: LocalSettingInfo): ClaudeLocalSettingOutcome {
   const stdout = stripAnsi(info.stdout).trim();
@@ -144,24 +205,33 @@ export function parseClaudeLocalSetting(info: LocalSettingInfo): ClaudeLocalSett
     if (keptMatch) {
       const name = keptMatch[1]!.trim();
       const id = claudeModelIdFromDisplayName(name);
-      return id ? { kind: "model", id } : { kind: "unrepresentable", setting: "model", raw: name };
+      // `raw` is qualifier-stripped (finding #11e, §10 re-review) — matches
+      // the `Set model to` branch below so the breadcrumb is consistent
+      // regardless of which outcome produced it.
+      return id ? { kind: "model", id } : { kind: "unrepresentable", setting: "model", raw: stripModelQualifiers(name) };
     }
+
+    const setMatch = /^Set model to (.+)$/.exec(firstLine);
+    if (!setMatch) return null;
+    const remainder = setMatch[1]!;
+
     if (args) {
       const id = claudeModelIdFromArg(args);
       if (id) return { kind: "model", id };
     }
-    const match = /^Set model to (.+?)(?: and saved\b|$)/.exec(firstLine);
-    const displayName = match?.[1];
-    if (!displayName) return null;
-    const id = claudeModelIdFromDisplayName(displayName);
-    return id ? { kind: "model", id } : { kind: "unrepresentable", setting: "model", raw: displayName };
+
+    const id = claudeModelIdFromDisplayName(remainder);
+    if (id) return { kind: "model", id };
+
+    const raw = stripModelQualifiers(remainder).replace(/\s+and saved\b[\s\S]*$/, "");
+    return { kind: "unrepresentable", setting: "model", raw };
   }
 
-  // setting === "effort"
+  // setting === "effort" — no `args` fallback (see doc above): once
+  // `Set effort level to (\w+)` matches, `match[1]` is always non-empty.
   const match = /^Set effort level to (\w+)/.exec(stdout);
   if (!match) return null;
-  const candidate = ((match[1] ?? "") || args).toLowerCase();
-  if (!candidate) return null;
+  const candidate = match[1]!.toLowerCase();
   return CLAUDE_EFFORT_IDS.has(candidate)
     ? { kind: "effort", id: candidate }
     : { kind: "unrepresentable", setting: "effort", raw: candidate };

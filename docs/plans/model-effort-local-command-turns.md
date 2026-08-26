@@ -386,8 +386,9 @@ Phase 7 run is recorded in the final report).
   `reportPasteFailure`-style status (`paste withheld: claude is waiting on a prompt — answer
   the card (or the terminal) and resend`) + `onPasteFailure({ op: "modal-guard" })`, so
   `sendTurn` settles its slot (run `failed` → task `ready`) instead of losing the message and
-  silently confirming whatever the cursor was on. The boot-time deferred paste opts out
-  (`skipModalGuard`) — the boot poller already owns startup modals. The auto-confirm poll
+  silently confirming whatever the cursor was on. The boot-time deferred paste keeps the
+  check with a zero grace (`modalGuardGraceMs: 0`) — its give-up branch can reach the paste
+  with an un-carded prompt on screen; `skipModalGuard` remains a test-only opt-out. The auto-confirm poll
   also stops when a *foreign* blocking prompt appears (left to the scraper).
 - **Setting sync (T7 + T8).** The driver's `lastLocalCommand` now keeps `{ name, args }` from
   the `<command-name>` line; on a `<local-command-stdout>` for `/model` or `/effort` it fires
@@ -398,16 +399,19 @@ Phase 7 run is recorded in the final report).
   `parseClaudeLocalSetting(info)` → `{ model } | { effort } | null`. Model: an arg equal to a
   `CLAUDE_MODEL_FLAG` value maps back to its agetor id; otherwise the stdout display name
   (`Set model to <name> …`, qualifiers `(1M context)` / `(default)` and ANSI bold stripped)
-  is matched case-insensitively against `AGENT_OPTIONS["claude-code"].models[].label`; a raw
-  `claude-…` id passes through verbatim; `Kept model as …` → null. Effort: arg or
-  `Set effort level to <id>` restricted to the claude-supported ids
+  is matched by longest `AGENT_OPTIONS["claude-code"].models[].label` prefix (so the picker's
+  session-only `s` suffix parses too); a raw `claude-…` id passes through verbatim; the arg is
+  consulted only AFTER stdout confirms a `Set model to …` outcome; `Kept model as …` syncs
+  (drift correction after a declined confirm); anything else → `unrepresentable` breadcrumb. Effort: `Set effort level to <id>`
+  (outcome-first — the typed arg is never trusted on its own) restricted to the claude-supported ids
   (`max|xhigh|high|medium|low`); `ultracode` / `Cancelled` → null. Orchestrator
   `applyClaudeLocalSetting(taskId, info)`: claude-code tasks only; no-op when the value is
   unchanged (model compared through `toClaudeModelArg` so an alias can't flip the id);
   `tasks.update` directly (the PATCH route is the only `reconcileTaskSession` caller, so this
   never re-mirrors) + a status breadcrumb on the latest run (`model synced from claude: …`).
-  Consequence accepted: the Task Details effort-fallback effect may follow a model sync with
-  a legitimate `/effort <supported>` mirror — same rule the picker already enforces.
+  A model sync cascades the RunPanel effort-fallback rule into the same `tasks.update` and
+  deliberately does NOT mirror `/effort` into the live session — claude owns its live pair;
+  the row is for the next spawn.
 
 **Not swept in (different tickets):** `/compact` turns (no stdout, unsettled today);
 reattach replay of a local-command run (idle-settle covers it).
@@ -431,3 +435,32 @@ still takes one pane read before bailing (no keystroke is ever sent).
 Verification: `bun run typecheck` clean; `claude-tmux-local-command` + `claude-tmux-queue`
 100/100, `claude-local-setting` + `orchestrator` + `agents` 144/144; full `bun test`
 3197 pass / 3 skip / 0 fail (Fix-D's run; the haiku Phase 7 run is in the final report).
+
+**/code-review "fix all" (2026-08-26).** A third pass (own read of the two review-fix commits +
+three delegated sub-reviews) found 3 high / 5 medium / 9 low / 2 info; all 19 applied. The
+behaviour changes: the idle-settle net additionally requires 60 s since `lastActivityAt`
+(a just-sent prompt on a long-idle session could otherwise be settled ~3 s after Send —
+`decideScrapeTick` runs every 1 s while a turn is in flight, and an image paste sleeps up
+to 3 s before Enter); every withhold is double-sampled (`stillBlocking`); withheld outcomes
+carry a `phase`, a `pre-enter` withhold leaves the text in claude's composer and the driver
+clears it with `Escape Escape` before the next idle paste (spike-verified on 2.1.245: `C-u`
+never clears, `C-c` arms the exit hint, nothing clears mid-turn — so mid-turn the next paste
+is withheld `composer-dirty` and re-stashed); `sendTurn` forwards `onPasteFailure` so an idle
+send is re-stashed like a folded one; the model parser is outcome-first and matches display
+names by longest label prefix; a `null`-model row is not pinned by `Kept model as <default>`;
+the slider needs its footer both within 3 lines of the label row AND at the bottom of the
+pane; `markTmuxPromptAnswered` is stamped after the Enter lands; hot-path regex/prompt-list
+allocations hoisted; the idle-settle text derives from `STUCK_TURN_FALLBACK_MS`. Tests: the
+idle-settle net (`idleSettleTick`), `slashCommand` population, the orchestrator withhold
+handlers, `nav` end-to-end, a late-rendering confirm, and the shared `pickScrapeMatch` chain
+are now pinned; guard tests run against a 20 ms grace seam.
+Re-review of that delta (opus) found 1 high / 4 medium / 6 low, all applied: the composer
+predicates now anchor on the LIVE `❯` row (the bottom-most one above the status bar — the
+transcript echo of the previous line uses the same glyph and had made an empty composer read
+as "text present"); the clear is verified positively and the pane re-guarded before the
+paste; `pre-enter` withholds are re-stashed too (the clear deletes the composer copy); real
+tmux failures get their own wording; display-name matching requires a word boundary (`Opus
+5.1` → unrepresentable, not `opus-5`); `sendTurn` always notifies its caller; a failed
+trailing Enter marks the composer dirty; the clear keystroke's result is checked;
+`paneShowsBlockingPrompt` delegates to `pickScrapeMatch`; the `PASTE_MODAL_*` test exports
+are live getters.

@@ -2247,6 +2247,21 @@ interface SessionState {
    *  this so it never races the scraper's own restore (which would fight over
    *  window-size mid-grow and could strand the pane at the wrong size). */
   paneGrowInFlight: boolean;
+  /**
+   * True when a PRIOR `queuePaste` on this session withheld its trailing
+   * Enter (the pre-Enter TOCTOU re-check — see `queuePaste`'s doc) while the
+   * pasted text was already sitting in claude's composer, unsubmitted. Set
+   * on that withhold; the NEXT `queuePaste` call checks this flag before
+   * pasting again so the new message doesn't land concatenated after the
+   * stranded one (docs/plans/model-effort-local-command-turns.md §10 review
+   * finding #2). Cleared when: the composer is confirmed clear (idle pane,
+   * bare prompt row) before the next paste; a live Escape-Escape clear
+   * succeeds; or any paste's own Enter goes out successfully (submitting
+   * whatever was in the composer, including a message this flag was set
+   * for). Never set by anything else — a paste that fails at the PRE-paste
+   * guard (before any text reached the composer) has nothing to flag.
+   */
+  composerHoldsText: boolean;
 }
 
 interface TurnSlot {
@@ -2388,6 +2403,7 @@ function makeSessionState(o: MakeSessionStateOpts): SessionState {
     subagentWatcher: null,
     continuationWatchdog: null,
     paneGrowInFlight: false,
+    composerHoldsText: false,
   };
 }
 
@@ -3972,8 +3988,30 @@ const SLIDER_TRACK_MIN_CHARS = 10;
 
 /** Footer claude's slider draws below the label row — captured verbatim as
  *  `←/→ to adjust · Enter to confirm · Esc to cancel` (plan §2). One of the
- *  slider matcher's three required, independent signals (plan §3.4/§7). */
+ *  slider matcher's four required, independent signals (plan §3.4/§7). */
 const SLIDER_FOOTER_RE = /←\/→ to adjust/;
+
+/** Bound on how many non-blank lines below the track `matchSliderModal`
+ *  will look for the label row (docs/plans/model-effort-local-command-
+ *  turns.md §10 review finding #5). The captured layout has the label row
+ *  immediately below the track (distance 1); 2 is slack, not tight. */
+const LABEL_ROW_SEARCH_NONBLANK = 2;
+
+/** Bound on how many non-blank lines below the LABEL ROW `matchSliderModal`
+ *  will look for the footer (signal c, finding #5) — an ADDITIONAL
+ *  requirement layered on top of (not a replacement for) the "last 3
+ *  non-blank lines of the whole tail" check (signal d): anchoring to the
+ *  label row is what keeps the footer tied to THIS slider's own widget
+ *  rather than any `←/→ to adjust` text elsewhere in the pane; the
+ *  whole-tail check is what confirms the widget is still live at the
+ *  bottom of the pane, not stale scrollback. See `matchSliderModal`'s doc
+ *  for the two distinct echo shapes each half defeats. Captured layout:
+ *  labels / `xhigh + workflows` sub-row / blank / footer — the blank row
+ *  doesn't count toward `nonBlankSeen`, so the footer is only the 2ND
+ *  non-blank line below the label row (finding #11d, §10 re-review: this
+ *  used to claim "3 non-blank lines … lands exactly on the footer", which
+ *  double-counted the blank row), one line of slack short of this bound. */
+const FOOTER_SEARCH_NONBLANK = 3;
 
 /**
  * Recognise claude 2.1.245's bare `/effort` slider widget — captured
@@ -3996,22 +4034,52 @@ const SLIDER_FOOTER_RE = /←\/→ to adjust/;
  * drives `dismissTmuxPrompt` through its horizontal nav (`nav: "horizontal"`
  * below) instead of the default vertical Down/Up.
  *
- * Three independent signals, ALL required — mirrors the discipline of
+ * Four independent signals, ALL required — mirrors the discipline of
  * `matchUnparsableModal`'s footer/watchdog arms, where a single loose signal
- * would risk matching ordinary transcript output:
+ * would risk matching ordinary transcript output (docs/plans/model-effort-
+ * local-command-turns.md §10 review finding #5, corrected after an initial
+ * pass dropped signal (d) and regressed the echo case below):
  *   (a) a track line matching `SLIDER_TRACK_RE` (exactly one `▲`) that ALSO
  *       carries at least `SLIDER_TRACK_MIN_CHARS` track characters — rules
  *       out a lone `▲` glyph on its own line, which the regex alone would
  *       accept — searched from the bottom of the tail so a stale frame
  *       further up a long pane can't win over a live one (same tail-anchored
  *       posture every other matcher here takes);
- *   (b) the next NON-BLANK line below it is a label row of at least two
- *       tokens matching `[a-z][a-z0-9+]*`, separated by at least two spaces
- *       — the sub-label row under the last entry (`xhigh + workflows`) sits
- *       on a DIFFERENT, later line and is never consulted;
- *   (c) a footer matching `SLIDER_FOOTER_RE` within the last 3 non-blank
- *       tail lines — the same window `matchNumberedModal`'s high-confidence
- *       check and `matchUnparsableModal`'s footer arm use.
+ *   (b) a label row of at least two tokens matching `[a-z][a-z0-9+]*`,
+ *       separated by at least two spaces, found within the next
+ *       `LABEL_ROW_SEARCH_NONBLANK` (2) NON-BLANK lines below the track —
+ *       the sub-label row under the last entry (`xhigh + workflows`) sits on
+ *       a DIFFERENT, later line and is never consulted;
+ *   (c) a footer matching `SLIDER_FOOTER_RE` within `FOOTER_SEARCH_NONBLANK`
+ *       (3) non-blank lines BELOW THE LABEL ROW found in (b) — anchored to
+ *       THIS slider's own label row, not just anywhere in the pane;
+ *   (d) that SAME footer line (the exact one (c) found, tracked by line
+ *       index) is ALSO one of the last 3 non-blank lines of the WHOLE
+ *       tail — i.e. the widget is genuinely sitting at the bottom of the
+ *       pane right now, not stale scrollback.
+ * The captured layout is track / labels / `xhigh + workflows` sub-row /
+ * blank / footer, so (b), (c), and (d) all hold with slack against the
+ * measured evidence for a real, live slider.
+ *
+ * (c) and (d) are deliberately independent checks, not one merged "footer
+ * near the bottom" test, because each defeats a DIFFERENT stale-echo shape:
+ *   - An OLD slider echo (complete with its own label + footer) sitting in
+ *     scrollback, followed by more transcript and then an idle input box:
+ *     (c) alone would still match — the echo's own footer is right there,
+ *     within `FOOTER_SEARCH_NONBLANK` lines of the echo's own label row.
+ *     (d) is what rejects it: that footer is buried under whatever now
+ *     follows it, so it is NOT among the tail's last 3 non-blank lines.
+ *   - An OLD echo sitting ABOVE a LIVE slider whose track has since
+ *     scrolled off the top of the captured tail (so only the live label +
+ *     footer are still visible, no `▲` track for them): the bottom-up track
+ *     search in (a) falls back to the echo's stale track line (the only one
+ *     left in view), and the live footer legitimately IS in the tail's last
+ *     3 non-blank lines — so (d) alone would wrongly pass. (c) is what
+ *     rejects it: the live footer sits far below the STALE label row (b)
+ *     found for the stale track, well outside `FOOTER_SEARCH_NONBLANK`
+ *     lines — so this returns null and correctly falls through to
+ *     `matchUnparsableModal` instead of fabricating a card for a widget
+ *     whose actual track is no longer visible to drive against.
  *
  * `cursorIndex` is the label whose horizontal centre column is nearest the
  * `▲` column (ties broken toward the lower index via strict `<`) — the `▲`
@@ -4019,11 +4087,12 @@ const SLIDER_FOOTER_RE = /←\/→ to adjust/;
  * is what makes the mapping stable across every discrete slider position.
  * `highConfidence: true`: unlike `matchNumberedModal`'s footer fast-path
  * (extra confidence layered on an already-parsed choice set), the footer
- * here (signal c) is a REQUIRED condition for a match to exist at all, so a
- * first sighting is already as trustworthy as a stable one — same reasoning
- * `matchUnparsableModal`'s doc gives for why IT is never `highConfidence`,
- * applied in the opposite direction. `nav: "horizontal"` is what tells
- * `dismissTmuxPrompt` to send `Right`/`Left` instead of `Down`/`Up`.
+ * here (signals c/d together) is a REQUIRED condition for a match to exist
+ * at all, so a first sighting is already as trustworthy as a stable one —
+ * same reasoning `matchUnparsableModal`'s doc gives for why IT is never
+ * `highConfidence`, applied in the opposite direction. `nav: "horizontal"`
+ * is what tells `dismissTmuxPrompt` to send `Right`/`Left` instead of
+ * `Down`/`Up`.
  */
 function matchSliderModal(tail: string): ScrapeMatch | null {
   const lines = tail.split("\n");
@@ -4045,16 +4114,27 @@ function matchSliderModal(tail: string): ScrapeMatch | null {
   const arrowCol = lines[trackIdx]!.indexOf("▲");
   if (arrowCol < 0) return null; // unreachable — SLIDER_TRACK_RE guarantees one
 
-  // (b) Label row — the next non-blank line below the track.
+  // (b) Label row — search up to LABEL_ROW_SEARCH_NONBLANK non-blank lines
+  // below the track for one shaped like a label row, rather than assuming
+  // the very next non-blank line is it. The captured layout has it
+  // immediately below (distance 1), so this bound is slack, not tight.
   let labelIdx = -1;
-  for (let i = trackIdx + 1; i < lines.length; i++) {
-    if (lines[i]!.trim().length > 0) { labelIdx = i; break; }
+  let tokens: string[] = [];
+  {
+    let nonBlankSeen = 0;
+    for (let i = trackIdx + 1; i < lines.length && nonBlankSeen < LABEL_ROW_SEARCH_NONBLANK; i++) {
+      if (lines[i]!.trim().length === 0) continue;
+      nonBlankSeen++;
+      const candidateTokens = lines[i]!.split(/\s{2,}/).map((s) => s.trim()).filter((s) => s.length > 0);
+      if (candidateTokens.length >= 2 && candidateTokens.every((t) => /^[a-z][a-z0-9+]*$/.test(t))) {
+        labelIdx = i;
+        tokens = candidateTokens;
+        break;
+      }
+    }
   }
   if (labelIdx < 0) return null;
   const labelLine = lines[labelIdx]!;
-  const tokens = labelLine.split(/\s{2,}/).map((s) => s.trim()).filter((s) => s.length > 0);
-  if (tokens.length < 2) return null;
-  if (!tokens.every((t) => /^[a-z][a-z0-9+]*$/.test(t))) return null;
   // Column of each label's start on the label line, walked left-to-right so
   // the search-from cursor always advances past the token just found.
   const labels: Array<{ label: string; start: number }> = [];
@@ -4066,9 +4146,44 @@ function matchSliderModal(tail: string): ScrapeMatch | null {
     searchFrom = idx + t.length;
   }
 
-  // (c) Footer within the last 3 non-blank tail lines.
-  const nonBlank = lines.filter((l) => l.trim().length > 0);
-  if (!nonBlank.slice(-3).some((l) => SLIDER_FOOTER_RE.test(l))) return null;
+  // (c) Footer within FOOTER_SEARCH_NONBLANK non-blank lines BELOW THE LABEL
+  // ROW (finding #5) — anchoring to the label row is what keeps this signal
+  // about THIS slider's own footer, not any `←/→ to adjust` text that
+  // happens to sit near it. Tracked by absolute line index (not just found-
+  // or-not) because (d) below needs to check THIS specific line, not merely
+  // that some line in the window matched.
+  let footerIdx = -1;
+  {
+    let nonBlankSeen = 0;
+    for (let i = labelIdx + 1; i < lines.length && nonBlankSeen < FOOTER_SEARCH_NONBLANK; i++) {
+      if (lines[i]!.trim().length === 0) continue;
+      nonBlankSeen++;
+      if (SLIDER_FOOTER_RE.test(lines[i]!)) { footerIdx = i; break; }
+    }
+  }
+  if (footerIdx < 0) return null;
+
+  // (d) That SAME footer line must ALSO be one of the last 3 non-blank lines
+  // of the WHOLE tail — i.e. the widget is genuinely at the bottom of the
+  // pane right now, not stale scrollback. (c) alone would still match an old
+  // slider echo sitting above an idle input box (its own footer is right
+  // there, within 3 non-blank lines of its own label row); (d) is what
+  // rejects that, since the echo's footer is buried under whatever now
+  // follows it (an idle box, more transcript, …) and is therefore NOT among
+  // the tail's last 3 non-blank lines. Conversely, (c) is what protects
+  // against the opposite case — an old echo sitting ABOVE a live slider
+  // whose track has since scrolled off the top of the captured tail: the
+  // live footer legitimately IS in the last 3 non-blank lines, but it is not
+  // within `FOOTER_SEARCH_NONBLANK` lines of the ECHO's label row, so (c)
+  // returns null before (d) is ever reached — correctly falling through to
+  // `matchUnparsableModal` rather than fabricating a card for a widget whose
+  // track we can no longer see.
+  const nonBlankIdxs: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]!.trim().length > 0) nonBlankIdxs.push(i);
+  }
+  const last3Idxs = new Set(nonBlankIdxs.slice(-3));
+  if (!last3Idxs.has(footerIdx)) return null;
 
   // Nearest-centre cursor mapping. Strict `<` keeps a tie on the lower index.
   let cursorIndex = 0;
@@ -4146,7 +4261,7 @@ function stuckTurnFallbackArmed(p: {
  * try this only once none of the three real matchers hit). What's left by
  * then is an unnumbered arrow-key widget, a free-text/device-code prompt, a
  * single-option modal (`matchNumberedModal` requires ≥2), a slider-shaped
- * pane missing one of `matchSliderModal`'s three required signals, a prose
+ * pane missing one of `matchSliderModal`'s four required signals, a prose
  * confirmation, or a genuinely wedged turn. Registers a `tmux_prompt` with
  * empty `choices` — there's no keystroke this scraper can plan, so the UI's
  * job is just "tell the user to go answer it in the attached terminal", not
@@ -4216,6 +4331,25 @@ function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch
   const paneText = paneLines.join("\n");
   const fingerprint = sha1(`unparsable:${paneText}`);
   return { paneText, choices: [], cursorIndex: 0, fingerprint, unparsable: true };
+}
+
+/**
+ * The matcher-chain union shared by BOTH call sites that need to turn a raw
+ * pane tail into a `ScrapeMatch`: the runtime scraper (`scrapeOnce`) and the
+ * boot poller's generic-modal branch — factored out (docs/plans/model-
+ * effort-local-command-turns.md §10 review finding #9) so the two can't
+ * silently drift apart, and so the precedence itself
+ * (numbered > yes-no > slider > unparsable, gated on `paneWorking`) is
+ * unit-testable without a live tmux pane.
+ *
+ * `watchdogArmed` is the caller's own `stuckTurnFallbackArmed` decision at
+ * runtime; the boot poller always passes `false` — no turn is in flight yet
+ * during boot, so only `matchUnparsableModal`'s FOOTER arm can ever fire
+ * there, never its watchdog arm.
+ */
+function pickScrapeMatch(tail: string, opts: { paneWorking: boolean; watchdogArmed: boolean }): ScrapeMatch | null {
+  return matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)
+    ?? (opts.paneWorking ? null : matchUnparsableModal(tail, opts.watchdogArmed));
 }
 
 /**
@@ -4328,15 +4462,21 @@ function matchSlashConfirmModal(tail: string, kind: "model" | "effort"): ScrapeM
  * neither of which is "deliver this as the next chat message." Naming
  * mirrors `paneShowsClaudeWorking` / `paneShowsIdleInputBox`: a pane-state
  * question, not an action.
+ *
+ * Built directly on the shared `pickScrapeMatch` chain (docs/plans/model-
+ * effort-local-command-turns.md §10 re-review finding #10) rather than
+ * re-listing `matchNumberedModal ?? matchYesNoModal ?? matchSliderModal` and
+ * the `paneWorking`-gated `matchUnparsableModal` fallback by hand — this
+ * function had drifted into a THIRD hand-copy of that same chain (alongside
+ * `scrapeOnce` and the boot poller), which is exactly the kind of duplication
+ * that lets one copy silently fall behind when the chain's precedence or
+ * gating changes. The `detectAskModal(tail) === "question"` check stays
+ * separate — it's not part of `pickScrapeMatch` (see the doc above for why
+ * the `"review"` kind is deliberately excluded here).
  */
 function paneShowsBlockingPrompt(tail: string): boolean {
-  if (matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)) return true;
   if (detectAskModal(tail) === "question") return true;
-  // Mirrors `scrapeOnce`'s `paneWorking ? null : matchUnparsableModal(...)`:
-  // never treat working chrome as a blocking modal.
-  if (paneShowsClaudeWorking(tail)) return false;
-  if (matchUnparsableModal(tail, false)) return true;
-  return false;
+  return pickScrapeMatch(tail, { paneWorking: paneShowsClaudeWorking(tail), watchdogArmed: false }) !== null;
 }
 
 /**
@@ -4521,6 +4661,45 @@ function unparsableStreakCleared(streak: number): boolean {
   return streak >= UNPARSABLE_STABILITY_TICKS;
 }
 
+/**
+ * Pure per-tick step for `scrapeOnce`'s idle-settle streak (mirrors
+ * `nextUnparsableStreak`/`unparsableStreakCleared`'s split, combined into one
+ * function since the caller needs both the next streak value AND whether to
+ * fire on this tick). `eligible` is the caller's own `idleSettleEligible`
+ * decision for THIS tick; `streak` is `state.scrapeIdleSettleStreak` going
+ * in. Not eligible ⇒ reset to 0, never fire. Eligible ⇒ increment; firing
+ * (and resetting back to 0) once the streak reaches
+ * `UNPARSABLE_STABILITY_TICKS` — the same stability bar the unparsable
+ * fallback itself uses, so a single transient idle-looking frame can't
+ * settle a run that's actually still busy.
+ *
+ * docs/plans/model-effort-local-command-turns.md §10 review finding #1: the
+ * caller's `eligible` computation additionally requires
+ * `now - state.lastActivityAt > STUCK_TURN_FALLBACK_MS` — `sendTurn`/
+ * `pasteFollowUp` call `bumpActivity` themselves BEFORE ever enqueueing the
+ * paste (`queuePaste` itself never calls it — finding #11a, §10 re-review),
+ * plus a pane change bumps it too, so a just-sent, not-yet-delivered prompt
+ * is structurally ineligible to settle,
+ * while a genuinely static stuck pane still qualifies. This matters because
+ * `decideScrapeTick` runs every ~1s while a turn is in flight, an
+ * image-bearing paste's own bracketed gap can sleep up to
+ * `IMAGE_ATTACH_SETTLE_MAX_MS` (3s) before its Enter goes out, and a queued
+ * dropdown-mirror op (`sendSlashCommand`'s auto-confirm poll) can hold the
+ * chain another 0.7-2.7s (`slashCommandSettleMs` + up to
+ * `SLASH_CONFIRM_WINDOW_MS`) — comfortably enough elapsed real time to
+ * accumulate 3 "eligible" ticks well before the pane has genuinely gone
+ * stale, on a session that was otherwise idle past `STUCK_TURN_FALLBACK_MS`
+ * a turn or two ago. Requiring recent activity to ALSO be quiet past the
+ * same 60s threshold closes that race without weakening the net for a truly
+ * stuck pane (which by definition has no recent activity either).
+ */
+function idleSettleTick(p: { eligible: boolean; streak: number }): { streak: number; fire: boolean } {
+  if (!p.eligible) return { streak: 0, fire: false };
+  const streak = p.streak + 1;
+  if (streak >= UNPARSABLE_STABILITY_TICKS) return { streak: 0, fire: true };
+  return { streak, fire: false };
+}
+
 /** A scrape tick is skipped when the JSONL has been written to this
  *  recently — claude is mid-stream, so whatever's on the pane is
  *  likely transient output (a numbered list being printed) and not a
@@ -4613,6 +4792,13 @@ function decideScrapeTick(p: {
  *  separator/bullet in claude's prose, so anchoring is what stops a stray
  *  `foo · bar…` from reading as a spinner. */
 const ESC_TO_INTERRUPT = "esc to interrupt";
+/** Compiled once at module scope (docs/plans/model-effort-local-command-
+ *  turns.md §10 review finding #7) — `paneShowsIdleInputBox` and
+ *  `paneShowsComposerText` both run on every scrape/paste-guard tick, so a
+ *  fresh `new RegExp(ESC_TO_INTERRUPT, "i")` per call was needless per-tick
+ *  allocation on a hot path. Behaviourally identical to constructing it
+ *  inline. */
+const ESC_TO_INTERRUPT_RE = new RegExp(ESC_TO_INTERRUPT, "i");
 /** The rotating spinner glyph set claude draws at the start of its working /
  *  elapsed / background-agent lines (`✻→✽→✶→✳→✢→·`, with two rarer starbursts
  *  seen in older captures). */
@@ -4752,51 +4938,121 @@ const STATUS_BAR_RE = /^\s*(?:⏵⏵|⏸)\s.*(?:\(shift\+tab to cycle\)|\? for s
  *  be mistaken for the live prompt. */
 const IDLE_PROMPT_SEARCH_LINES = 8;
 
-/** True when the pane shows claude idle at its input box: a status-bar line
- *  matching `STATUS_BAR_RE` that (a) is the LAST or second-to-last non-blank
- *  pane line, (b) does NOT itself contain `esc to interrupt`, with (c) a bare
- *  prompt line (`❯` and nothing else typed) somewhere in the
- *  `IDLE_PROMPT_SEARCH_LINES` non-blank lines above it. All three are
- *  required together:
+/**
+ * The single LIVE prompt row within the idle chrome window — the
+ * BOTTOM-MOST line matching a leading `❯` among the up-to-
+ * `IDLE_PROMPT_SEARCH_LINES` non-blank pane lines directly above the
+ * anchored status bar. Anchoring: the status bar must be the LAST or
+ * second-to-last non-blank pane line (checking the last TWO, not just the
+ * last, is slack for a trailing artifact row `tmux capture-pane` can leave
+ * behind the true bottom line) and must NOT itself carry `esc to interrupt`
+ * (that phrase, spliced into an otherwise-identical `(shift+tab to cycle)`
+ * bar, is how a WORKING pane's own status bar is told apart from an idle
+ * one). Returns `null` when no such bar is anchored there at all — most
+ * likely a modal replacing it, or a stale status-bar-shaped line sitting in
+ * scrollback above one.
  *
- *   - The position anchor (a) is what keeps a status-bar-shaped line sitting
- *     in scrollback ABOVE a real modal (or followed by ordinary transcript
- *     rows) from ever being mistaken for the live one — a real modal
- *     replaces the status bar entirely, so the genuine bar always sits at
- *     the very bottom. Checking the last TWO (not just the last) non-blank
- *     lines, rather than requiring an exact match on the final line, is
- *     slack for a trailing artifact row `tmux capture-pane` can leave behind
- *     the true bottom line, without opening the window wide enough for a
- *     stale bar to win from further up.
- *   - `STATUS_BAR_RE` alone cannot tell an idle status bar apart from a
- *     WORKING one whose bar carries the identical `(shift+tab to cycle)`
- *     phrase with an `esc to interrupt` segment spliced in — hence check (b).
- *     NOTE: that segment blinks at ~1 Hz in claude's real TUI, so this gate
- *     can legitimately read `true` on the blink-OFF tick of an otherwise-busy
- *     pane. That's fine: `paneShowsClaudeWorking` (the spinner line) is what
- *     actually protects the settle path from a still-busy turn —
- *     `scrapeOnce`'s idle-settle eligibility already requires `!paneWorking`
- *     independent of this function.
- *   - The bounded search window (c) plus the bare-prompt requirement means a
- *     real modal (which replaces both the prompt row and the status bar)
- *     can never satisfy this even when it sits close to a stale idle-looking
- *     bar higher up.
+ * Bottom-most, not "any row" (docs/plans/model-effort-local-command-
+ * turns.md §10 re-review finding #1): claude ECHOES the user's last
+ * submitted line in the transcript with the SAME `❯` glyph — e.g.
+ * `❯ /model sonnet` rendered above its own `⎿  Set model to …` result line.
+ * That echo can sit inside the `IDLE_PROMPT_SEARCH_LINES` search window
+ * above an otherwise EMPTY live composer, so "does any row in the window
+ * match a `❯`-prefixed line" was true on an idle pane with nothing typed —
+ * the exact false positive that made `paneShowsComposerText` fire forever
+ * after a `pre-enter` withhold's clear (the echo never goes away) and sent
+ * a stray `Escape Escape` into an empty box on the next retry. The live
+ * composer always renders as the row IMMEDIATELY above the status bar (only
+ * border/hint chrome between them, never ordinary transcript), so taking the
+ * LAST matching row — closest to the bar — picks the real composer over any
+ * stale echo further up.
+ */
+function livePromptRow(tail: string): string | null {
+  const nonBlank = tail.split("\n").filter((l) => l.trim().length > 0);
+  if (nonBlank.length === 0) return null;
+  const lastTwo = nonBlank.slice(-2);
+  const barRelIndex = lastTwo.findIndex((l) => STATUS_BAR_RE.test(l));
+  if (barRelIndex === -1) return null;
+  if (ESC_TO_INTERRUPT_RE.test(lastTwo[barRelIndex]!)) return null;
+  const barAbsIndex = nonBlank.length - lastTwo.length + barRelIndex;
+  const above = nonBlank.slice(Math.max(0, barAbsIndex - IDLE_PROMPT_SEARCH_LINES), barAbsIndex);
+  for (let i = above.length - 1; i >= 0; i--) {
+    if (/^\s*❯/.test(above[i]!)) return above[i]!;
+  }
+  return null;
+}
+
+/** True when the pane shows claude idle at its input box: `livePromptRow`
+ *  finds a live prompt row and that row is BARE — `❯` and nothing else typed
+ *  (`/^\s*❯\s*$/`). `paneShowsComposerText` immediately below is this
+ *  predicate's complement on the SAME row (finding #1, §10 re-review):
+ *  exactly one of the two is true whenever `livePromptRow` finds a row at
+ *  all, bare vs. non-bare.
+ *
+ *  NOTE: unlike `paneShowsComposerText`, this does not separately check
+ *  `!paneShowsClaudeWorking(tail)` — the status bar's own `esc to interrupt`
+ *  rejection (inside `livePromptRow`) is normally enough, and this gate can
+ *  legitimately read `true` on the blink-OFF tick of that phrase on an
+ *  otherwise-busy pane. That's fine: `paneShowsClaudeWorking` (the spinner
+ *  line) is what actually protects the settle path from a still-busy turn —
+ *  `scrapeOnce`'s idle-settle eligibility already requires `!paneWorking`
+ *  independent of this function.
  *
  *  Gates the stuck-turn watchdog (`stuckTurnFallbackArmed`'s `paneIdle`
  *  param) — claude idle at the input box is proof a turn ended without ever
  *  writing an `end_turn` line, not a stuck/unparsable modal; see
  *  `signalIdleSettle` for how that gets settled instead of carded. */
 function paneShowsIdleInputBox(tail: string): boolean {
-  const nonBlank = tail.split("\n").filter((l) => l.trim().length > 0);
-  if (nonBlank.length === 0) return false;
-  const lastTwo = nonBlank.slice(-2);
-  const barRelIndex = lastTwo.findIndex((l) => STATUS_BAR_RE.test(l));
-  if (barRelIndex === -1) return false;
-  if (new RegExp(ESC_TO_INTERRUPT, "i").test(lastTwo[barRelIndex]!)) return false;
-  const barAbsIndex = nonBlank.length - lastTwo.length + barRelIndex;
-  const above = nonBlank.slice(Math.max(0, barAbsIndex - IDLE_PROMPT_SEARCH_LINES), barAbsIndex);
-  return above.some((l) => /^\s*❯\s*$/.test(l));
+  const row = livePromptRow(tail);
+  return row !== null && /^\s*❯\s*$/.test(row);
 }
+
+/**
+ * True when the pane shows claude idle at its input box (same `livePromptRow`
+ * anchoring as `paneShowsIdleInputBox`) but with UNSENT TEXT already sitting
+ * in the box — the live row is non-bare (`/^\s*❯\s+\S/`, at least one
+ * non-whitespace character after the `❯`) rather than the bare `❯` that
+ * function requires. The multi-line paste placeholder (`❯ [Pasted text #1
+ * +12 lines]`) is non-bare too — correctly treated as composer text.
+ *
+ * Also requires `!paneShowsClaudeWorking(tail)` explicitly (rather than
+ * relying only on the status-bar's own `esc to interrupt` rejection, as
+ * `paneShowsIdleInputBox` does) since this is called directly by
+ * `queuePaste`'s composer-clear check with no separate `paneWorking`
+ * variable already computed at the call site.
+ *
+ * Used by `queuePaste` (docs/plans/model-effort-local-command-turns.md §10
+ * review finding #2) to detect that a PRIOR withheld paste's text is still
+ * sitting in the composer before pasting a NEW message — pasting on top of
+ * it would concatenate rather than replace.
+ */
+function paneShowsComposerText(tail: string): boolean {
+  if (paneShowsClaudeWorking(tail)) return false;
+  const row = livePromptRow(tail);
+  return row !== null && /^\s*❯\s+\S/.test(row);
+}
+
+/**
+ * Keystrokes `queuePaste`'s composer-clear check sends to clear claude's
+ * input box of a stranded, unsent message before pasting a new one over it.
+ * Both keys in ONE `send-keys` call — live-verified (claude 2.1.245, this
+ * session's spike, docs/plans/model-effort-local-command-turns.md §10):
+ * with text in the box while IDLE, `Escape Escape` sent together clears it;
+ * a SINGLE Escape only shows the hint `Esc again to clear`, and a SECOND,
+ * separately-sent Escape ~1s later does NOT clear (claude only recognises
+ * the double-tap within one input read). `C-u` never clears the box
+ * (idle or mid-turn). `C-c` does clear it, but arms claude's own
+ * `Press Ctrl-C again to exit` — a second one would quit claude — so it is
+ * never used for this. There is deliberately no mid-turn clear path: Esc and
+ * C-c both interrupt a live turn, so the composer-dirty branch below
+ * withholds instead of ever sending these keys while claude is working.
+ */
+const COMPOSER_CLEAR_KEYS = ["Escape", "Escape"];
+
+/** Settle time after `COMPOSER_CLEAR_KEYS` before re-checking whether the
+ *  composer actually cleared. Short — this is a local Ink re-render, not a
+ *  network round-trip. */
+const COMPOSER_CLEAR_SETTLE_MS = 300;
 
 /**
  * Normalize a captured pane tail into the form used for the "did the pane
@@ -4823,10 +5079,19 @@ function normalizePaneForActivity(tail: string): string {
  *  fingerprint no longer matches the pane. */
 function scrapeOnce(state: SessionState): void {
   const now = Date.now();
+  // Computed once and reused for every read below (`decideScrapeTick`'s
+  // `activePromptCount`, the idle-settle gate, and the `__external__` sweep)
+  // instead of re-querying the registry three times per tick (docs/plans/
+  // model-effort-local-command-turns.md §10 review finding #7). Safe to share
+  // across all three: nothing between here and the sweep mutates the tmux-
+  // prompt registry (the ask-card handling below touches `state.askCardId`,
+  // a separate subsystem) — the first mutation of it in this function is the
+  // sweep itself.
+  const pendingPrompts = activeTmuxPromptsForTask(state.taskId);
   const tick = decideScrapeTick({
     turnInFlight: state.turnQueue.length > 0,
     lastJsonlAppendAt: state.lastJsonlAppendAt,
-    activePromptCount: activeTmuxPromptsForTask(state.taskId).length,
+    activePromptCount: pendingPrompts.length,
     // Keep polling at full rate while an AskUserQuestion card is live, so the
     // resolve-on-modal-gone backstop fires if the user answers it via a real
     // `tmux attach` (external dismissal) rather than the card.
@@ -4953,14 +5218,17 @@ function scrapeOnce(state: SessionState): void {
   const paneIdle = paneShowsIdleInputBox(tail);
   const match = (claudeIsWriting || (askOnPane && !askUnrecoverable))
     ? null
-    : (matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail) ?? (paneWorking ? null : matchUnparsableModal(tail, stuckTurnFallbackArmed({
-        turnInFlight: turnInFlight(state),
-        lastJsonlAppendAt: state.lastJsonlAppendAt,
-        now,
+    : pickScrapeMatch(tail, {
         paneWorking,
-        askCardLive: state.askCardId !== null,
-        paneIdle,
-      }))));
+        watchdogArmed: stuckTurnFallbackArmed({
+          turnInFlight: turnInFlight(state),
+          lastJsonlAppendAt: state.lastJsonlAppendAt,
+          now,
+          paneWorking,
+          askCardLive: state.askCardId !== null,
+          paneIdle,
+        }),
+      });
 
   // Idle-settle net: the SAME conditions that would arm the stuck-turn
   // watchdog above, but with the pane genuinely idle at the input box
@@ -4970,13 +5238,18 @@ function scrapeOnce(state: SessionState): void {
   // `paneIdle: false` so this reads the "other" watchdog conditions
   // (in-flight, quiet past `STUCK_TURN_FALLBACK_MS`, not working, no ask
   // card) independent of the idle gate — `paneIdle` above already carries
-  // the real idle signal for this branch. Held to the same
-  // `UNPARSABLE_STABILITY_TICKS` stability bar `matchUnparsableModal` uses,
-  // so a single transient idle-looking frame can't settle a run that's
-  // actually still busy. This is the version-proof net for any turn that
-  // never gets an `end_turn` line — see `signalIdleSettle`.
+  // the real idle signal for this branch. Additionally requires recent
+  // activity to ALSO be quiet past `STUCK_TURN_FALLBACK_MS` (finding #1,
+  // docs/plans/model-effort-local-command-turns.md §10 review) — see
+  // `idleSettleTick`'s doc for why a just-sent, not-yet-delivered prompt
+  // must be structurally ineligible here. Held to the same
+  // `UNPARSABLE_STABILITY_TICKS` stability bar `matchUnparsableModal` uses
+  // (via `idleSettleTick`), so a single transient idle-looking frame can't
+  // settle a run that's actually still busy. This is the version-proof net
+  // for any turn that never gets an `end_turn` line — see `signalIdleSettle`.
   const idleSettleEligible = paneIdle
-    && activeTmuxPromptsForTask(state.taskId).length === 0
+    && now - state.lastActivityAt > STUCK_TURN_FALLBACK_MS
+    && pendingPrompts.length === 0
     && stuckTurnFallbackArmed({
       turnInFlight: turnInFlight(state),
       lastJsonlAppendAt: state.lastJsonlAppendAt,
@@ -4985,22 +5258,16 @@ function scrapeOnce(state: SessionState): void {
       askCardLive: state.askCardId !== null,
       paneIdle: false,
     });
-  if (idleSettleEligible) {
-    state.scrapeIdleSettleStreak += 1;
-    if (state.scrapeIdleSettleStreak >= UNPARSABLE_STABILITY_TICKS) {
-      state.scrapeIdleSettleStreak = 0;
-      signalIdleSettle(state);
-    }
-  } else {
-    state.scrapeIdleSettleStreak = 0;
-  }
+  const idleTick = idleSettleTick({ eligible: idleSettleEligible, streak: state.scrapeIdleSettleStreak });
+  state.scrapeIdleSettleStreak = idleTick.streak;
+  if (idleTick.fire) signalIdleSettle(state);
 
   // Auto-cancel: any registered prompt for this task whose fingerprint
   // is NOT what we see now has been dismissed (either externally via
   // `tmux attach`, or the dialog was transient). Resolve those entries
   // so the UI stops showing them.
   const stillPresent = new Set<string>(match ? [match.fingerprint] : []);
-  for (const pending of activeTmuxPromptsForTask(state.taskId)) {
+  for (const pending of pendingPrompts) {
     if (!stillPresent.has(pending.fingerprint)) {
       answerTmuxPrompt(pending.id, { key: "__external__" });
     }
@@ -5382,7 +5649,7 @@ function signalUnknownCommand(state: SessionState): void {
  *  informational only, never something the orchestrator's chunk handler
  *  pattern-matches on to change the task's column. */
 const IDLE_SETTLE_STATUS_TEXT =
-  "agetor closed this turn — claude sat idle at the input box for 60s with no end_turn";
+  `agetor closed this turn — claude sat idle at the input box for ${Math.round(STUCK_TURN_FALLBACK_MS / 1000)}s with no end_turn`;
 
 /**
  * Settle an in-flight turn because the watchdog observed claude idle at its
@@ -5947,8 +6214,9 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
           // real startup wizard has no working chrome, so it still surfaces;
           // the `MODAL_NOTICE_RE` auto-continue veto lives inside
           // `matchUnparsableModal` itself, so it already applies here too.
-          const generic = matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)
-            ?? (paneShowsClaudeWorking(tail) ? null : matchUnparsableModal(tail, false));
+          // `pickScrapeMatch` (finding #9) is the SAME chain the runtime
+          // scraper uses, with `watchdogArmed: false` — see its own doc.
+          const generic = pickScrapeMatch(tail, { paneWorking: paneShowsClaudeWorking(tail), watchdogArmed: false });
           if (!generic) { lastGenericFingerprint = null; continue; }
           // External dismissal: a previously surfaced startup prompt whose
           // content no longer matches the pane (user answered it from a real
@@ -6179,8 +6447,24 @@ export function reattachSession(opts: ReattachOptions): SpawnedAgent | null {
  * Send a follow-up prompt to an existing claude tmux session. Returns a
  * fresh SpawnedAgent whose `done` resolves on the NEXT end_turn after this
  * paste. Caller must ensure `sessionExists(taskId)` is true.
+ *
+ * `opts.onPasteFailure`, when provided, is invoked with the SAME failing
+ * `PasteOutcome` AFTER this function's own internal `onPasteFailure` logic
+ * below has already rejected the turn slot — when there was still a slot to
+ * reject (docs/plans/model-effort-local-command-turns.md §10 review finding
+ * #4) — so a caller that also wants to react to the specific failure (e.g.
+ * surface a phase-aware status, or re-stash the prompt) sees the slot
+ * already settled, never a race against it. It ALSO fires unconditionally
+ * even on the (theoretical) already-popped-slot race, since it's the
+ * orchestrator's own phase-aware handling that matters there, not this
+ * function's bookkeeping (finding #6, §10 re-review).
  */
-export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler): SpawnedAgent {
+export function sendTurn(
+  taskId: string,
+  prompt: string,
+  onChunk: ChunkHandler,
+  opts?: { onPasteFailure?: (outcome: Extract<PasteOutcome, { ok: false }>) => void },
+): SpawnedAgent {
   const state = sessions.get(taskId);
   if (!state) {
     const err = new Error(`no live session for task ${taskId}`);
@@ -6224,21 +6508,32 @@ export function sendTurn(taskId: string, prompt: string, onChunk: ChunkHandler):
   // FIFO order.
   void queuePaste(taskId, state.sessionName, prompt, 0, state, {
     bracketed: true,
-    onPasteFailure: () => {
+    onPasteFailure: (outcome) => {
       // Guard against a (theoretical) race where the slot already popped
       // normally between the push above and this failure callback firing —
       // `popEndOfTurn` nulls both `resolve`/`reject` before invoking them,
       // so a non-null `reject` here means the slot is still genuinely
       // pending. Remove it from the queue (if still present) so a later
       // end_turn doesn't try to pop an already-settled slot, then reject
-      // `done` so the orchestrator's run settles instead of hanging.
-      if (!slot.reject) return;
-      const idx = state.turnQueue.indexOf(slot);
-      if (idx !== -1) state.turnQueue.splice(idx, 1);
-      const reject = slot.reject;
-      slot.resolve = null;
-      slot.reject = null;
-      reject(new Error("paste failed"));
+      // `done` so the orchestrator's run settles instead of hanging. This
+      // slot-settling half is skipped once the slot already popped — but
+      // the caller's own `onPasteFailure` below must still fire regardless
+      // (finding #6, §10 re-review): a real paste failure needs the
+      // orchestrator's phase-aware handling (backlog re-stash, status text)
+      // even on that rare already-popped race, not just when this function's
+      // own bookkeeping had something left to do.
+      if (slot.reject) {
+        const idx = state.turnQueue.indexOf(slot);
+        if (idx !== -1) state.turnQueue.splice(idx, 1);
+        const reject = slot.reject;
+        slot.resolve = null;
+        slot.reject = null;
+        reject(new Error("paste failed"));
+      }
+      // Contract (finding #4, docs/plans/model-effort-local-command-turns.md
+      // §10 review): invoke the caller's own onPasteFailure AFTER the slot
+      // rejection above, with the SAME outcome object.
+      opts?.onPasteFailure?.(outcome);
     },
   });
   return makeAgent(taskId, done);
@@ -6348,9 +6643,12 @@ let capturePastePane: (state: SessionState) => string = captureTail;
 /**
  * How often `queuePaste`'s modal guard re-captures the pane while a
  * blocking claude modal (`paneShowsBlockingPrompt`) is showing. Mirrors
- * `SLASH_CONFIRM_POLL_MS`'s role for `sendSlashCommand`'s confirm poll.
+ * `SLASH_CONFIRM_POLL_MS`'s role for `sendSlashCommand`'s confirm poll. Also
+ * `stillBlocking`'s own confirmation-sleep duration. `let`, not `const` — see
+ * `__forTest.setPasteModalPollMs`; tests shrink it so guard tests don't pay
+ * the full poll cadence.
  */
-const PASTE_MODAL_POLL_MS = 250;
+let PASTE_MODAL_POLL_MS = 250;
 
 /**
  * Total window `queuePaste`'s modal guard waits for a blocking modal to
@@ -6363,9 +6661,36 @@ const PASTE_MODAL_POLL_MS = 250;
  * clears a modal) is serialized on the SAME per-task `queueTmuxOp` chain
  * this guard runs inside: while the guard is polling, a queued dismiss
  * click sits behind it, so a long grace here would make answering the very
- * modal this guard is waiting on feel stuck.
+ * modal this guard is waiting on feel stuck. `let`, not `const` — see
+ * `__forTest.setPasteModalGraceMs`.
  */
-const PASTE_MODAL_GRACE_MS = 1_500;
+let PASTE_MODAL_GRACE_MS = 1_500;
+
+/**
+ * Double-sample confirmation used by `queuePaste`'s modal guard before it
+ * ever acts on a blocking-pane sighting (docs/plans/model-effort-local-
+ * command-turns.md §10 review finding #3): samples `paneShowsBlockingPrompt`
+ * once, sleeps `PASTE_MODAL_POLL_MS`, then samples again — resolves `true`
+ * only when BOTH samples hit. A single frame can be a mid-repaint transient
+ * (an auto-confirm's own Enter still settling back to an idle composer, a
+ * modal about to clear) rather than a persistent block; acting on one sample
+ * risks withholding — or, at the pre-Enter site, flagging
+ * `composerHoldsText` for — a paste that was actually about to be safe.
+ *
+ * Used at both single-shot guard decisions in `queuePaste`: the pre-paste
+ * deadline decision (including the `modalGuardGraceMs: 0` boot-time path,
+ * which previously withheld off a bare single sample — "one extra sample,
+ * not zero" is exactly what this closes) and the pre-Enter TOCTOU re-check
+ * (previously a single synchronous check). NOT used inside the pre-paste
+ * polling loop's own `while` condition — that loop already re-samples the
+ * pane every `PASTE_MODAL_POLL_MS` tick on its own; this function is only for
+ * the "am I about to act on this" moment.
+ */
+async function stillBlocking(state: SessionState): Promise<boolean> {
+  if (!paneShowsBlockingPrompt(capturePastePane(state))) return false;
+  await Bun.sleep(PASTE_MODAL_POLL_MS);
+  return paneShowsBlockingPrompt(capturePastePane(state));
+}
 
 /**
  * Send a slash-command (or any literal keystroke line) to the task's tmux
@@ -6405,13 +6730,17 @@ const PASTE_MODAL_GRACE_MS = 1_500;
  * behind the paste AND its `slashCommandSettleMs` settle window without this
  * function needing to await anything itself). That step polls the pane
  * every `SLASH_CONFIRM_POLL_MS` for up to `SLASH_CONFIRM_WINDOW_MS`; on the
- * first `matchSlashConfirmModal(tail, kind)` hit it stamps the fingerprint
- * answered (`markTmuxPromptAnswered` — so a `tmux_prompt` the scraper may
- * have raced into existence for it is not ghost-registered on the next
- * tick) and sends Enter, then resolves any already-registered prompt for
- * that exact fingerprint immediately (`answerTmuxPrompt(..., { key:
- * "__external__" })`) rather than waiting for the next scrape's auto-cancel
- * sweep to notice it's gone. Anything else on the pane — the inline
+ * first `matchSlashConfirmModal(tail, kind)` hit it sends Enter and, only
+ * once that send-keys actually succeeds, stamps the fingerprint answered
+ * (`markTmuxPromptAnswered` — so a `tmux_prompt` the scraper may have raced
+ * into existence for it is not ghost-registered on the next tick — finding
+ * #6, docs/plans/model-effort-local-command-turns.md §10 review: stamping
+ * BEFORE a send-keys that might still fail would mark the confirm answered
+ * when it demonstrably wasn't, leaving nothing to re-card it) and resolves
+ * any already-registered prompt for that exact fingerprint immediately
+ * (`answerTmuxPrompt(..., { key: "__external__" })`) rather than waiting for
+ * the next scrape's auto-cancel sweep to notice it's gone. Anything else on
+ * the pane — the inline
  * no-confirm path is the COMMON case on 2.1.245 — is a no-op: Enter is
  * NEVER sent on unmatched pane content, and the window just elapses.
  *
@@ -6454,9 +6783,13 @@ export function sendSlashCommand(
         const tail = captureConfirmPane(state);
         const match = matchSlashConfirmModal(tail, kind);
         if (match) {
-          markTmuxPromptAnswered(taskId, match.fingerprint);
           if (!stillCurrent()) return;
           if (!tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok) return;
+          // Stamp answered only AFTER the Enter actually landed (finding #6):
+          // a failed send-keys means the confirm is still genuinely on the
+          // pane, so it must stay eligible for the scraper's own matcher
+          // chain to card normally rather than being silently suppressed.
+          markTmuxPromptAnswered(taskId, match.fingerprint);
           for (const pending of activeTmuxPromptsForTask(taskId)) {
             if (pending.fingerprint === match.fingerprint) {
               answerTmuxPrompt(pending.id, { key: "__external__" });
@@ -6860,8 +7193,20 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   state.pendingEndTurn = null;
   state.lastLocalCommandName = null;
   state.lastLocalCommandArgs = null;
+  state.composerHoldsText = false;
   const err = new Error("session killed");
-  for (const slot of state.turnQueue.splice(0)) slot.reject?.(err);
+  // Null `resolve`/`reject` after rejecting each slot (finding #6, §10
+  // re-review) — mirrors `popEndOfTurn`'s own settle convention and is what
+  // makes `sendTurn`'s onPasteFailure guard comment ("a non-null `reject`
+  // here means the slot is still genuinely pending") actually true: without
+  // this, a slot this function just rejected still LOOKS pending to that
+  // guard if a paste failure for it fires afterwards.
+  for (const slot of state.turnQueue.splice(0)) {
+    const reject = slot.reject;
+    slot.resolve = null;
+    slot.reject = null;
+    reject?.(err);
+  }
   // Drop the chain map entry — the identity gate inside `queueTmuxOp`
   // will already skip any in-flight thunks that captured the now-disposed
   // `state` (they won't run their bodies), so this delete is just
@@ -6952,8 +7297,8 @@ export const __forTest = {
   clearedStabilityGate,
   /** The bare `/effort` slider matcher plus its tuning regexes/constant —
    *  exposed so the scraper test suite can pin the nearest-centre cursor
-   *  mapping and the three-signal (track/label/footer) requirement without a
-   *  live tmux pane. */
+   *  mapping and the four-signal (track / label / footer-near-label /
+   *  footer-at-bottom-of-pane) requirement without a live tmux pane. */
   matchSliderModal,
   SLIDER_TRACK_RE,
   SLIDER_TRACK_MIN_CHARS,
@@ -7156,9 +7501,39 @@ export const __forTest = {
    *  without a live tmux pane. */
   paneShowsBlockingPrompt,
   /** Tuning constants for `queuePaste`'s modal guard — exposed so tests can
-   *  compute expected poll counts / windows rather than hardcoding them. */
-  PASTE_MODAL_POLL_MS,
-  PASTE_MODAL_GRACE_MS,
+   *  compute expected poll counts / windows rather than hardcoding them.
+   *  Getters, not plain property shorthand (finding #9, §10 re-review): both
+   *  values are backed by module-scope `let`s that `setPasteModalPollMs` /
+   *  `setPasteModalGraceMs` mutate, so a shorthand `PASTE_MODAL_POLL_MS,`
+   *  would have captured the value ONCE at module-load time and never
+   *  reflected a later `set…Ms` call through this same `__forTest` object —
+   *  a getter reads the live variable on every access instead. */
+  get PASTE_MODAL_POLL_MS(): number { return PASTE_MODAL_POLL_MS; },
+  get PASTE_MODAL_GRACE_MS(): number { return PASTE_MODAL_GRACE_MS; },
+  /** Override `queuePaste`'s modal guard grace window (default
+   *  `PASTE_MODAL_GRACE_MS`) — same shape as `setBracketedEnterGapMs`.
+   *  Tests shrink it so a persistently-blocked-pane guard test doesn't have
+   *  to pay the full production grace. Returns the previous value so the
+   *  test can restore it in `afterEach`. */
+  setPasteModalGraceMs(ms: number): number {
+    const prev = PASTE_MODAL_GRACE_MS;
+    PASTE_MODAL_GRACE_MS = ms;
+    return prev;
+  },
+  /** Override `queuePaste`'s modal guard poll interval (default
+   *  `PASTE_MODAL_POLL_MS`) — also `stillBlocking`'s own confirmation-sleep
+   *  duration. Same shape as `setBracketedEnterGapMs`. Tests shrink it
+   *  (e.g. to ~20ms) so guard tests don't pay the full poll cadence.
+   *  Returns the previous value. */
+  setPasteModalPollMs(ms: number): number {
+    const prev = PASTE_MODAL_POLL_MS;
+    PASTE_MODAL_POLL_MS = ms;
+    return prev;
+  },
+  /** Double-sample confirmation behind the modal guard's pre-paste-deadline
+   *  and pre-Enter decisions — exposed so a test can assert directly that a
+   *  single transient sighting is never enough on its own. */
+  stillBlocking,
   /** Override how `queuePaste`'s modal guard reads the live pane before
    *  pasting (production captures the tmux pane tail). Tests inject a
    *  synthetic modal (or idle) pane so the guard can be driven without a
@@ -7169,6 +7544,27 @@ export const __forTest = {
     capturePastePane = fn;
     return prev;
   },
+  /** Composer-clear check behind `queuePaste`'s composer-dirty branch: the
+   *  pure pane predicate (`paneShowsComposerText`) plus the keystrokes/settle
+   *  it sends to clear a stranded message before pasting a new one — exposed
+   *  so both are unit-testable without a live tmux pane/session. */
+  paneShowsComposerText,
+  COMPOSER_CLEAR_KEYS,
+  COMPOSER_CLEAR_SETTLE_MS,
+  /** Pure per-tick step for `scrapeOnce`'s idle-settle streak — exposed so
+   *  the eligible/streak/fire truth table (including the `lastActivityAt`
+   *  recency requirement layered on at the call site) is unit-testable
+   *  without a live tmux pane. */
+  idleSettleTick,
+  /** The matcher-chain union shared by `scrapeOnce` and the boot poller —
+   *  exposed so the numbered > yes-no > slider > unparsable precedence (and
+   *  the `paneWorking` gate on the last arm) is unit-testable directly,
+   *  without duplicating it against each call site separately. */
+  pickScrapeMatch,
+  /** Compiled-once `esc to interrupt` matcher shared by `paneShowsIdleInputBox`
+   *  and `paneShowsComposerText` — exposed for tests that want to assert
+   *  against the regex itself rather than the string literal. */
+  ESC_TO_INTERRUPT_RE,
   /** Orchestrator injection seam for claude's own `/model`/`/effort`
    *  outcome — re-exported (it's already a top-level `export`) so tests
    *  can install/restore it via the same `__forTest` surface as every other
@@ -7305,13 +7701,22 @@ function pastePromptSync(
  *  Modeled as one union member per `op` (rather than a single failure member
  *  with a union-typed `op` field) specifically so `TmuxPasteFailure` below
  *  can `Exclude` the synthesized member and leave real narrowing behind —
- *  see its own doc. */
+ *  see its own doc. The `modal-guard` member alone carries `phase` (finding
+ *  #2, docs/plans/model-effort-local-command-turns.md §10 review) — WHICH of
+ *  `queuePaste`'s three withhold sites produced it: `"pre-paste"` (the
+ *  before-any-tmux-call guard), `"pre-enter"` (the TOCTOU re-check right
+ *  before the bracketed Enter — the text already landed in claude's
+ *  composer), or `"composer-dirty"` (a NEW paste's own composer-clear check
+ *  found the box still holding an earlier withheld message). Callers use
+ *  `phase` to tailor what they tell the user — e.g. `"pre-enter"` and
+ *  `"composer-dirty"` both mean the message is already sitting in claude's
+ *  input box, so re-sending it would duplicate rather than deliver it. */
 type PasteOutcome =
   | { ok: true }
   | { ok: false; op: "load-buffer"; stderr: string }
   | { ok: false; op: "paste-buffer"; stderr: string }
   | { ok: false; op: "send-keys"; stderr: string }
-  | { ok: false; op: "modal-guard"; stderr: string };
+  | { ok: false; op: "modal-guard"; phase: "pre-paste" | "pre-enter" | "composer-dirty"; stderr: string };
 
 /**
  * The subset of `PasteOutcome` failures that actually came from a tmux
@@ -7492,26 +7897,65 @@ function queueTmuxOp(
  * claude modal — the confirm the user hasn't answered yet would swallow the
  * pasted text and/or confirm whatever the cursor happens to be on, neither
  * of which is "deliver this as the next chat message." If the modal is
- * still there after the grace window, the paste is WITHHELD (no
- * `pastePromptSync` call at all): a `status` chunk + console log surface
- * it, and `opts.onPasteFailure` fires with `{ ok: false, op: "modal-guard"
- * }` exactly like any other paste failure, so a caller with a turn slot
- * (`sendTurn`) settles it as failed instead of leaving the run stuck
- * `running`.
+ * STILL there once the grace window elapses, `stillBlocking` (a double
+ * sample — finding #3, §10 review) confirms it isn't just a mid-repaint
+ * transient before the paste is WITHHELD (no `pastePromptSync` call at
+ * all): a `status` chunk + console log surface it, and `opts.onPasteFailure`
+ * fires with `{ ok: false, op: "modal-guard", phase: "pre-paste" }` exactly
+ * like any other paste failure, so a caller with a turn slot (`sendTurn`)
+ * settles it as failed instead of leaving the run stuck `running`.
  *
- * The SAME guard re-runs a second time — one-shot, no polling — right
- * before the deferred bracketed Enter (when `opts.bracketed`), still gated
- * on `expectedState && !opts.skipModalGuard`. A TOCTOU window opens between
- * the pre-paste guard clearing and the Enter actually going out: the
- * `bracketedEnterGapMs` / image-attach sleep and the `stillCurrent()`
- * re-gate both land in between, and either can outlast a NEW blocking modal
- * appearing (a permission prompt claude's own tool call raises mid-paste,
- * for instance) that the pre-paste guard never saw. By this point the text
- * is ALREADY sitting in claude's input buffer — the paste itself already
- * landed — so a hit here withholds only the Enter, with the same
- * `{ ok: false, op: "modal-guard" }` outcome but a status message that says
- * so explicitly (answer the new prompt, then check the input box) rather
- * than repeating the pre-paste wording.
+ * **Composer-clear check** (finding #2, §10 review; re-reviewed §10 again):
+ * right after the pre-paste guard clears and before either paste path runs,
+ * when `expectedState.composerHoldsText` is set (a PRIOR paste on this
+ * session withheld its Enter with text already sitting in claude's
+ * composer — see the pre-Enter re-check below, and the trailing-Enter
+ * failure branches in both paste paths, which set the same flag), this
+ * either clears that leftover text (`COMPOSER_CLEAR_KEYS`, idle pane only,
+ * checked for `.ok` like any other tmux call) or withholds the NEW paste
+ * with `phase: "composer-dirty"` — pasting on top of unsent text would
+ * concatenate rather than replace it. No safe clear exists while claude is
+ * working (Escape/Ctrl-C would interrupt the turn), so a working pane
+ * withholds immediately instead of attempting one. The clear is verified
+ * POSITIVELY afterwards — `paneShowsIdleInputBox` must report a confirmed
+ * bare row (and `paneShowsBlockingPrompt` must NOT be showing) — rather than
+ * merely `!paneShowsComposerText`, which can't tell "cleared to bare" apart
+ * from "a NEW modal replaced the composer entirely" (a modal fails
+ * `paneShowsComposerText` too). The "already bare" branch requires that same
+ * positive `paneShowsIdleInputBox` read rather than the negation, for the
+ * identical reason; a pane that satisfies neither predicate (no live prompt
+ * row at all) withholds rather than guessing.
+ *
+ * WHEN the composer-clear block above actually attempted a clear (sent
+ * `COMPOSER_CLEAR_KEYS` and slept `COMPOSER_CLEAR_SETTLE_MS` — not the
+ * already-bare branch, which inserts no delay) — a further one-shot,
+ * double-sampled (`stillBlocking`) re-check of `paneShowsBlockingPrompt` runs
+ * right before dispatch, covering BOTH paste paths, since the non-bracketed
+ * one sends paste+Enter synchronously with no pre-Enter net of its own
+ * (unlike the bracketed path's own re-check below).
+ *
+ * The modal guard re-runs a THIRD time — one-shot, double-sampled via
+ * `stillBlocking`, no polling loop — right before the deferred bracketed
+ * Enter (when `opts.bracketed`), still gated on `expectedState &&
+ * !opts.skipModalGuard`. A TOCTOU window opens between the pre-paste guard
+ * clearing and the Enter actually going out: the `bracketedEnterGapMs` /
+ * image-attach sleep and the `stillCurrent()` re-gate both land in between,
+ * and either can outlast a NEW blocking modal appearing (a permission
+ * prompt claude's own tool call raises mid-paste, for instance) that the
+ * pre-paste guard never saw. By this point the text is ALREADY sitting in
+ * claude's input buffer — the paste itself already landed — so a hit here
+ * withholds only the Enter, with `{ ok: false, op: "modal-guard", phase:
+ * "pre-enter" }` and a status message that says so explicitly (the message
+ * is already in the input box; it'll be cleared before the next send)
+ * rather than repeating the pre-paste wording, and it sets
+ * `expectedState.composerHoldsText = true` so the composer-clear check
+ * above knows to clean up before the next paste. A genuine tmux `send-keys`
+ * failure on that same trailing Enter (bracketed or not) sets the identical
+ * flag (finding #7, §10 re-review) — the preceding `paste-buffer` already
+ * landed the text, so the composer holds it regardless of WHY the Enter
+ * itself didn't go out. Any paste whose Enter actually goes out successfully
+ * clears the flag — submitting the composer, including a message the flag
+ * may have been set for.
  */
 function queuePaste(
   taskId: string,
@@ -7531,8 +7975,13 @@ function queuePaste(
     /**
      * Override the modal guard's grace window (default `PASTE_MODAL_GRACE_MS`)
      * for this paste only. Pass `0` to still RUN the guard check — unlike
-     * `skipModalGuard`, which skips it outright — but never actually wait
-     * for a hit to clear: see the boot-time deferred-prompt paste in
+     * `skipModalGuard`, which skips it outright — with the deadline already
+     * elapsed, so the ONLY delay left is `stillBlocking`'s own one-poll
+     * double-sample confirmation (finding #11b, §10 re-review: this used to
+     * say "never actually wait", which stopped being true once that
+     * double-sample was added — a zero grace still costs one
+     * `PASTE_MODAL_POLL_MS` sleep, just never a real waiting-for-the-user
+     * grace window): see the boot-time deferred-prompt paste in
      * `spawnClaudeViaTmux`, the one caller that needs exactly this (finding
      * #6, docs/plans/model-effort-local-command-turns.md §10).
      */
@@ -7604,8 +8053,15 @@ function queuePaste(
       const guardDeadline = Date.now() + graceMs;
       while (paneShowsBlockingPrompt(capturePastePane(expectedState))) {
         if (Date.now() >= guardDeadline) {
+          // Double-sample before withholding (finding #3, docs/plans/model-
+          // effort-local-command-turns.md §10 review) — also what turns the
+          // `modalGuardGraceMs: 0` boot-time path into "one extra sample, not
+          // zero": a single frame can be a mid-repaint transient.
+          const blocked = await stillBlocking(expectedState);
+          if (!stillCurrent()) return;
+          if (!blocked) break;
           const outcome: Extract<PasteOutcome, { ok: false }> =
-            { ok: false, op: "modal-guard", stderr: "claude modal on pane" };
+            { ok: false, op: "modal-guard", phase: "pre-paste", stderr: "claude modal on pane" };
           const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
           const message =
             "paste withheld: claude is waiting on a prompt — answer it in the card or the terminal and resend";
@@ -7616,6 +8072,127 @@ function queuePaste(
         }
         await Bun.sleep(PASTE_MODAL_POLL_MS);
         if (!stillCurrent()) return;
+      }
+    }
+    // Composer-clear check (finding #2, docs/plans/model-effort-local-
+    // command-turns.md §10 review): a PRIOR paste on this session withheld
+    // its Enter (the pre-Enter TOCTOU re-check below) with the text already
+    // sitting, unsent, in claude's composer — `expectedState.composerHoldsText`
+    // records that. Pasting a NEW message now would land concatenated after
+    // that leftover text instead of replacing it, so — only when the guard
+    // itself is active — either clear the composer first or withhold.
+    //
+    // `insertedComposerClearDelay` tracks whether the branch below actually
+    // sent `COMPOSER_CLEAR_KEYS` and slept `COMPOSER_CLEAR_SETTLE_MS` — the
+    // ONLY sub-branch that opens a real TOCTOU window before either paste
+    // path. It gates the pre-paste re-check right below this block: a
+    // composer that was already bare (no keystrokes, no sleep) is no more
+    // stale than what the top-of-function guard already confirmed a moment
+    // earlier, so re-checking there would just be an extra pane read with
+    // nothing to catch.
+    let insertedComposerClearDelay = false;
+    if (expectedState && !opts.skipModalGuard && expectedState.composerHoldsText) {
+      const tail = capturePastePane(expectedState);
+      if (paneShowsClaudeWorking(tail)) {
+        // No safe mid-turn clear — Escape/Ctrl-C would interrupt the live
+        // turn (see COMPOSER_CLEAR_KEYS's doc) — so withhold until idle.
+        const outcome: Extract<PasteOutcome, { ok: false }> =
+          { ok: false, op: "modal-guard", phase: "composer-dirty", stderr: "claude composer holds unsent text" };
+        const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
+        const message =
+          "paste withheld: claude's input box still holds your earlier message — it will be cleared once claude is idle; resend after that";
+        onChunk?.("status", message);
+        console.error(`[claude-tmux] ${message} (task ${taskId})`);
+        opts.onPasteFailure?.(outcome);
+        return;
+      }
+      if (paneShowsComposerText(tail)) {
+        // (finding #8, §10 re-review) `send-keys` can itself fail (dead
+        // server, socket gone, session vanished mid-op) exactly like any
+        // other tmux call — check `.ok` rather than assuming the clear
+        // keystrokes landed just because a pane re-capture follows.
+        const clearResult = tmux(["send-keys", "-t", sessionName, ...COMPOSER_CLEAR_KEYS]);
+        if (!clearResult.ok) {
+          const outcome: Extract<PasteOutcome, { ok: false }> =
+            { ok: false, op: "modal-guard", phase: "composer-dirty", stderr: clearResult.stderr || "composer-clear send-keys failed" };
+          const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
+          const message =
+            "paste withheld: claude's input box still holds your earlier message — it will be cleared once claude is idle; resend after that";
+          onChunk?.("status", message);
+          console.error(`[claude-tmux] ${message} (task ${taskId})`);
+          opts.onPasteFailure?.(outcome);
+          return;
+        }
+        insertedComposerClearDelay = true;
+        await Bun.sleep(COMPOSER_CLEAR_SETTLE_MS);
+        if (!stillCurrent()) return;
+        // Confirm the clear POSITIVELY (finding #2, §10 re-review) — a
+        // negative check (`!paneShowsComposerText`) can't distinguish
+        // "cleared to a bare prompt" from "a NEW blocking modal replaced the
+        // composer entirely" (which also fails `paneShowsComposerText`,
+        // since that predicate requires `!paneShowsClaudeWorking` and a
+        // genuine `❯`-row, neither of which a modal provides). Require both
+        // "no blocking prompt" AND a confirmed bare row before trusting it.
+        const after = capturePastePane(expectedState);
+        if (paneShowsBlockingPrompt(after) || !paneShowsIdleInputBox(after)) {
+          const outcome: Extract<PasteOutcome, { ok: false }> =
+            { ok: false, op: "modal-guard", phase: "composer-dirty", stderr: "composer clear did not take" };
+          const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
+          const message =
+            "paste withheld: claude's input box still holds your earlier message — it will be cleared once claude is idle; resend after that";
+          onChunk?.("status", message);
+          console.error(`[claude-tmux] ${message} (task ${taskId})`);
+          opts.onPasteFailure?.(outcome);
+          return;
+        }
+        expectedState.composerHoldsText = false;
+      } else if (paneShowsIdleInputBox(tail)) {
+        // Prompt line already bare — the user submitted or cleared it some
+        // other way (typed Enter themselves, a modal that consumed it, …).
+        // Nothing left to clear. Requires the POSITIVE `paneShowsIdleInputBox`
+        // read (finding #2, §10 re-review), not merely `!paneShowsComposerText`
+        // — an ambiguous pane (no anchored status bar at all, e.g. a modal)
+        // must not be waved through as "already bare".
+        expectedState.composerHoldsText = false;
+      } else {
+        // Neither a confirmed dirty composer nor a confirmed idle one —
+        // `livePromptRow` found no anchored live prompt row at all (most
+        // likely a blocking modal that appeared since the pre-paste guard
+        // above ran). Withhold rather than paste blind.
+        const outcome: Extract<PasteOutcome, { ok: false }> =
+          { ok: false, op: "modal-guard", phase: "composer-dirty", stderr: "claude pane state unclear" };
+        const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
+        const message =
+          "paste withheld: claude's input box still holds your earlier message — it will be cleared once claude is idle; resend after that";
+        onChunk?.("status", message);
+        console.error(`[claude-tmux] ${message} (task ${taskId})`);
+        opts.onPasteFailure?.(outcome);
+        return;
+      }
+    }
+    // Pre-paste re-check (finding #2, §10 re-review): ONLY when the
+    // composer-clear block above actually inserted its own keystrokes +
+    // COMPOSER_CLEAR_SETTLE_MS (300 ms) — see `insertedComposerClearDelay` —
+    // is there a real TOCTOU window before either paste path below that
+    // neither the top-of-function guard nor the composer-clear check itself
+    // ever saw (e.g. a permission prompt that appeared during that sleep).
+    // Re-run the same double-sampled check right before dispatch so BOTH
+    // paste paths get this net — the non-bracketed path sends paste+Enter
+    // synchronously with no separate pre-Enter check of its own, unlike the
+    // bracketed path below.
+    if (insertedComposerClearDelay && expectedState && !opts.skipModalGuard) {
+      const blocked = await stillBlocking(expectedState);
+      if (!stillCurrent()) return;
+      if (blocked) {
+        const outcome: Extract<PasteOutcome, { ok: false }> =
+          { ok: false, op: "modal-guard", phase: "pre-paste", stderr: "claude modal on pane" };
+        const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
+        const message =
+          "paste withheld: claude is waiting on a prompt — answer it in the card or the terminal and resend";
+        onChunk?.("status", message);
+        console.error(`[claude-tmux] ${message} (task ${taskId})`);
+        opts.onPasteFailure?.(outcome);
+        return;
       }
     }
     if (opts.bracketed) {
@@ -7640,32 +8217,63 @@ function queuePaste(
       // pasted text is ALREADY in claude's input buffer at this point (the
       // paste itself already landed) — only the Enter is at risk of
       // confirming the wrong thing — so withhold just the Enter and say so.
-      if (expectedState && !opts.skipModalGuard && paneShowsBlockingPrompt(capturePastePane(expectedState))) {
-        const outcome: Extract<PasteOutcome, { ok: false }> =
-          { ok: false, op: "modal-guard", stderr: "claude modal on pane" };
-        const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
-        const message =
-          "paste withheld before Enter: claude opened a prompt — answer it, then check the input box and resend if needed";
-        onChunk?.("status", message);
-        console.error(`[claude-tmux] ${message} (task ${taskId})`);
-        opts.onPasteFailure?.(outcome);
-        return;
+      if (expectedState && !opts.skipModalGuard) {
+        // Double-sample here too (finding #3) — this was previously a single
+        // synchronous check; a mid-repaint transient shouldn't strand the
+        // already-landed paste text unsent any more than the pre-paste guard
+        // should.
+        const blocked = await stillBlocking(expectedState);
+        if (!stillCurrent()) return;
+        if (blocked) {
+          // The text is ALREADY sitting in claude's composer at this point
+          // (the paste itself already landed) — flag it so the NEXT queued
+          // paste clears it first instead of concatenating after it
+          // (finding #2).
+          expectedState.composerHoldsText = true;
+          const outcome: Extract<PasteOutcome, { ok: false }> =
+            { ok: false, op: "modal-guard", phase: "pre-enter", stderr: "claude modal on pane" };
+          const onChunk = expectedState.turnQueue[0]?.onChunk ?? expectedState.lastChunk;
+          const message =
+            "paste withheld before Enter: claude opened a prompt — your message is still in claude's input box; it will be cleared before your next send";
+          onChunk?.("status", message);
+          console.error(`[claude-tmux] ${message} (task ${taskId})`);
+          opts.onPasteFailure?.(outcome);
+          return;
+        }
       }
       const enter = tmux(["send-keys", "-t", sessionName, "Enter"]);
       if (!enter.ok) {
         const outcome: TmuxPasteFailure =
           { ok: false, op: "send-keys", stderr: enter.stderr };
         reportPasteFailure(taskId, expectedState, outcome);
+        // (finding #7, §10 re-review) The paste-buffer call above already
+        // succeeded — the text IS sitting in claude's composer even though
+        // the trailing Enter itself failed at the tmux level — so flag it
+        // exactly like the modal-guard `pre-enter` withhold does, or the
+        // next paste on this session would concatenate on top of it instead
+        // of clearing it first.
+        if (expectedState) expectedState.composerHoldsText = true;
         opts.onPasteFailure?.(outcome);
         return;
       }
+      // Successful Enter — the composer is submitted; any earlier withheld
+      // text (which may be THIS message itself) is no longer sitting there.
+      if (expectedState) expectedState.composerHoldsText = false;
     } else {
       const result = pastePromptSync(sessionName, text, { bracketed: opts.bracketed });
       if (!result.ok) {
         reportPasteFailure(taskId, expectedState, result);
+        // (finding #7, §10 re-review) `pastePromptSync` without `skipEnter`
+        // runs load-buffer + paste-buffer + send-keys Enter all
+        // synchronously — an `op: "send-keys"` failure here means the paste
+        // itself already landed and only the Enter didn't, so the composer
+        // holds this text exactly like the bracketed path's Enter-failure
+        // branch above.
+        if (expectedState && result.op === "send-keys") expectedState.composerHoldsText = true;
         opts.onPasteFailure?.(result);
         return;
       }
+      if (expectedState) expectedState.composerHoldsText = false;
     }
     if (settleMs > 0) await Bun.sleep(settleMs);
   }, expectedState);

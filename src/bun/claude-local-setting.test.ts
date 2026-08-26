@@ -2,6 +2,7 @@ import { test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { Task } from "../shared/types.ts";
 
 // db.ts opens its sqlite connection at module-load time, and orchestrator.ts
 // (transitively, via claude-tmux.ts / codex-tmux.ts / …) imports db.ts. Set
@@ -16,11 +17,16 @@ process.env.AGETOR_TMUX_BIN = "/bin/echo";
 process.env.AGETOR_CLAUDE_ARGS = "";
 
 const { claudeModelIdFromArg } = await import("./agents.ts");
-const { parseClaudeLocalSetting, describeLocalSettingSync, describeUnrepresentableLocalSetting } =
-  await import("./claude-local-setting.ts");
-const { createTask, applyClaudeLocalSetting } = await import("./orchestrator.ts");
+const {
+  parseClaudeLocalSetting,
+  describeLocalSettingSync,
+  describeUnrepresentableLocalSetting,
+  claudeModelIdFromDisplayName,
+} = await import("./claude-local-setting.ts");
+const { createTask, applyClaudeLocalSetting, __handlePasteWithheldForTest } = await import("./orchestrator.ts");
 const { tasks, runs } = await import("./db.ts");
 const { hasSessionState } = await import("./claude-tmux.ts");
+const { DEFAULT_MODEL, AGENT_OPTIONS } = await import("../shared/types.ts");
 
 // ---------------------------------------------------------------------------
 // claudeModelIdFromArg (src/bun/agents.ts)
@@ -137,6 +143,131 @@ test("model: a raw claude-<id> stdout display name passes through verbatim", () 
     stdout: "Set model to claude-opus-6 and saved as your default for new sessions",
   });
   expect(result).toEqual({ kind: "model", id: "claude-opus-6" });
+});
+
+// ---------------------------------------------------------------------------
+// claudeModelIdFromDisplayName — word boundary after the label (finding #4,
+// docs/plans/model-effort-local-command-turns.md §10 re-review): a bare
+// `startsWith` would let a longer real model name that merely shares a
+// shorter label's leading characters resolve to the WRONG (shorter) model —
+// "Opus 5.1" reading as "opus-5", "Haiku 4.5.1" reading as "haiku-4.5". The
+// match must be either the whole (trimmed, qualifier-stripped) string or the
+// label followed by a space.
+// ---------------------------------------------------------------------------
+
+test("claudeModelIdFromDisplayName: 'Opus 5.1' does not word-boundary-match the 'Opus 5' label — null", () => {
+  expect(
+    claudeModelIdFromDisplayName("Opus 5.1 (1M context) and saved as your default for new sessions"),
+  ).toBeNull();
+});
+
+test("claudeModelIdFromDisplayName: 'Haiku 4.5.1' does not word-boundary-match the 'Haiku 4.5' label — null", () => {
+  expect(claudeModelIdFromDisplayName("Haiku 4.5.1")).toBeNull();
+});
+
+test("claudeModelIdFromDisplayName: 'Opus 5 and saved …' matches via the space word boundary", () => {
+  expect(claudeModelIdFromDisplayName("Opus 5 and saved as your default for new sessions")).toBe("opus-5");
+});
+
+test("claudeModelIdFromDisplayName: 'Sonnet 5 for this session only' matches via the space word boundary", () => {
+  expect(claudeModelIdFromDisplayName("Sonnet 5 for this session only")).toBe("sonnet-5");
+});
+
+test("model: 'Opus 5.1 (1M context) and saved …' resolves to 'unrepresentable' with a qualifier-stripped raw of 'Opus 5.1'", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Opus 5.1 (1M context) and saved as your default for new sessions",
+  });
+  expect(result).toEqual({ kind: "unrepresentable", setting: "model", raw: "Opus 5.1" });
+});
+
+test("model: 'Haiku 4.5.1' (no qualifiers, no 'and saved' suffix) resolves to 'unrepresentable' with the raw name untouched", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Haiku 4.5.1",
+  });
+  expect(result).toEqual({ kind: "unrepresentable", setting: "model", raw: "Haiku 4.5.1" });
+});
+
+test("model: 'Kept model as Opus 6 (1M context)' strips the qualifier from 'raw' the same way the 'Set model to' branch does", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Kept model as Opus 6 (1M context)",
+  });
+  expect(result).toEqual({ kind: "unrepresentable", setting: "model", raw: "Opus 6" });
+});
+
+// ---------------------------------------------------------------------------
+// parseClaudeLocalSetting — model, outcome-first (args is never consulted
+// before a real "Set model to" / "Kept model as" outcome is confirmed)
+// ---------------------------------------------------------------------------
+
+test("model: 'Cancelled' resolves to null even with a raw claude-* arg", () => {
+  // Verified bug this fixes: today's args-first fast path resolves a raw
+  // claude-* arg via claudeModelIdFromArg BEFORE ever checking whether
+  // stdout confirms a change happened — so a declined "Switch model?"
+  // confirm ("Cancelled") would still write the typed arg's id.
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "claude-opus-4-7",
+    stdout: "Cancelled",
+  });
+  expect(result).toBeNull();
+});
+
+test("model: a confirmed 'Set model to' outcome resolves via the matching claude-* arg", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "claude-opus-4-7",
+    stdout: "Set model to Opus 4.7 and saved as your default for new sessions",
+  });
+  expect(result).toEqual({ kind: "model", id: "opus-4.7" });
+});
+
+test("model: 'Kept model as' is still checked first — args is never consulted for that branch", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "claude-opus-5",
+    stdout: "Kept model as Opus 4.8",
+  });
+  expect(result).toEqual({ kind: "model", id: "opus-4.8" });
+});
+
+// ---------------------------------------------------------------------------
+// parseClaudeLocalSetting — model, session-only `/model` suffix (the
+// picker's `s` key omits "and saved as your default for new sessions"; exact
+// wording unconfirmed, so matching is prefix-based against AGENT_OPTIONS
+// labels rather than suffix-based)
+// ---------------------------------------------------------------------------
+
+test("model: a session-only suffix with no 'and saved' clause still resolves via label-prefix match", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Sonnet 5 for this session",
+  });
+  expect(result).toEqual({ kind: "model", id: "sonnet-5" });
+});
+
+test("model: a session-only suffix AND a parenthesized qualifier both resolve via the longest label prefix", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Opus 5 (1M context) for this session only",
+  });
+  expect(result).toEqual({ kind: "model", id: "opus-5" });
+});
+
+test("model: an unrecognized name with the known 'and saved' suffix still reports a clean 'raw' (unrepresentable)", () => {
+  const result = parseClaudeLocalSetting({
+    setting: "model",
+    args: "",
+    stdout: "Set model to Opus 6 and saved as your default for new sessions",
+  });
+  expect(result).toEqual({ kind: "unrepresentable", setting: "model", raw: "Opus 6" });
 });
 
 // ---------------------------------------------------------------------------
@@ -348,6 +479,57 @@ test("applyClaudeLocalSetting 'Kept model as' corrects a row that already drifte
   expect(latestStatus(task.id).some((d) => d === "model synced from claude: opus-4.8")).toBe(true);
 });
 
+// ---------------------------------------------------------------------------
+// applyClaudeLocalSetting — null-model pinning: a task whose `model` column
+// has never been explicitly set runs on DEFAULT_MODEL["claude-code"], so a
+// bare `/model` + Esc ("Kept model as <the default>") must not pin an
+// explicit id onto a row that never asked for one.
+// ---------------------------------------------------------------------------
+
+// `createTask` itself always materializes `input.model ?? DEFAULT_MODEL[kind]`
+// onto a new row (see `createTask`'s `const model = input.model ?? …`), so a
+// genuinely-null `model` column can't be produced through the public
+// create path — it's a shape that predates migration 015 (default
+// model/effort seeding) or comes from a direct DB write. Force it via
+// `tasks.update` directly, same as a pre-migration row would read today.
+async function makeNullModelClaudeTask(): Promise<Task> {
+  const task = await makeClaudeTask(DEFAULT_MODEL["claude-code"], null);
+  const updated = tasks.update(task.id, { model: null });
+  if (!updated) throw new Error("tasks.update returned null");
+  return updated;
+}
+
+test("applyClaudeLocalSetting: 'Kept model as <default>' on a null-model task is a no-op — the row stays null", async () => {
+  const task = await makeNullModelClaudeTask();
+  expect(task.model).toBeNull();
+
+  const defaultLabel = AGENT_OPTIONS["claude-code"].models.find(
+    (m) => m.id === DEFAULT_MODEL["claude-code"],
+  )!.label;
+
+  const changed = applyClaudeLocalSetting(task.id, {
+    setting: "model",
+    args: "",
+    stdout: `Kept model as ${defaultLabel}`,
+  });
+
+  expect(changed).toBe(false);
+  expect(tasks.get(task.id)?.model).toBeNull();
+});
+
+test("applyClaudeLocalSetting: a genuine model change on a null-model task still pins the explicit id", async () => {
+  const task = await makeNullModelClaudeTask();
+
+  const changed = applyClaudeLocalSetting(task.id, {
+    setting: "model",
+    args: "",
+    stdout: "Set model to Sonnet 5 and saved as your default for new sessions",
+  });
+
+  expect(changed).toBe(true);
+  expect(tasks.get(task.id)?.model).toBe("sonnet-5");
+});
+
 test("applyClaudeLocalSetting syncs task.effort; an unsupported claude id and a cancel are no-ops", async () => {
   const task = await makeClaudeTaskWithRun("opus-4.8", "medium");
 
@@ -420,7 +602,7 @@ test("applyClaudeLocalSetting adjusts an unsupported effort in the SAME update w
   // mirrors RunPanel's own effort-fallback effect exactly.
   expect(after?.effort).toBe("high");
   expect(
-    latestStatus(task.id).some((d) => d === "model synced from claude: sonnet-4.6; effort adjusted to high (not supported on sonnet-4.6)"),
+    latestStatus(task.id).some((d) => d === "model synced from claude: sonnet-4.6; effort adjusted to high for the next run (not supported on sonnet-4.6)"),
   ).toBe(true);
 });
 
@@ -440,7 +622,7 @@ test("applyClaudeLocalSetting clears the effort in the SAME update when the new 
   expect(after?.model).toBe("haiku-4.5");
   expect(after?.effort).toBeNull();
   expect(
-    latestStatus(task.id).some((d) => d === "model synced from claude: haiku-4.5; effort cleared (not supported on haiku-4.5)"),
+    latestStatus(task.id).some((d) => d === "model synced from claude: haiku-4.5; effort cleared for the next run (not supported on haiku-4.5)"),
   ).toBe(true);
 });
 
@@ -580,4 +762,190 @@ test("applyClaudeLocalSetting never re-mirrors the change back into a live claud
   }).not.toThrow();
 
   expect(hasSessionState(task.id)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// handlePasteWithheld (src/bun/orchestrator.ts) — exercised via
+// __handlePasteWithheldForTest against a real temp-db task, per the T7 paste
+// guard's phase-aware withhold handling (docs/plans/model-effort-local-
+// command-turns.md §10).
+// ---------------------------------------------------------------------------
+
+test("handlePasteWithheld: 'pre-paste' re-stashes the text into the backlog with a status breadcrumb", async () => {
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const run = runs.listForTask(task.id)[0]!;
+
+  __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
+    ok: false,
+    op: "modal-guard",
+    phase: "pre-paste",
+    stderr: "",
+  });
+
+  const after = tasks.get(task.id);
+  expect(after?.backlog).toHaveLength(1);
+  expect(after?.backlog[0]?.text).toBe("hello claude");
+  expect(
+    latestStatus(task.id).some(
+      (d) => d === "message saved to your backlog — claude is waiting on a prompt; answer it and send the message from the tray",
+    ),
+  ).toBe(true);
+});
+
+test("handlePasteWithheld: two 'pre-paste' withholds with identical text dedupe to a single backlog item", async () => {
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const run = runs.listForTask(task.id)[0]!;
+
+  __handlePasteWithheldForTest(task.id, run.id, "same text", {
+    ok: false,
+    op: "modal-guard",
+    phase: "pre-paste",
+    stderr: "",
+  });
+  __handlePasteWithheldForTest(task.id, run.id, "same text", {
+    ok: false,
+    op: "modal-guard",
+    phase: "pre-paste",
+    stderr: "",
+  });
+
+  const after = tasks.get(task.id);
+  expect(after?.backlog).toHaveLength(1);
+});
+
+test("handlePasteWithheld: 'pre-enter' IS re-stashed too — the composer-clear flow wipes the leftover text before the next send", async () => {
+  // Wave 2 change (finding #3, §10 re-review): the driver's composer-clear
+  // flow now actively CLEARS a stranded pre-enter paste with "Escape Escape"
+  // before the session's NEXT paste — so leaving this un-stashed here would
+  // mean it's silently wiped with no record once that clear runs. Same
+  // re-stash + dedupe as every other phase now, with its own status wording
+  // that tells the user their input box will be cleared (not "answer the
+  // prompt", which is "pre-paste"'s wording, and which no longer applies here
+  // since the text already reached claude's composer, not a blocking modal).
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const run = runs.listForTask(task.id)[0]!;
+
+  __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
+    ok: false,
+    op: "modal-guard",
+    phase: "pre-enter",
+    stderr: "",
+  });
+
+  const after = tasks.get(task.id);
+  expect(after?.backlog).toHaveLength(1);
+  expect(after?.backlog[0]?.text).toBe("hello claude");
+  expect(
+    latestStatus(task.id).some(
+      (d) =>
+        d ===
+        "paste withheld: claude opened a prompt before your message was sent — it's saved to your backlog (claude's input box will be cleared before your next send); resend from the tray",
+    ),
+  ).toBe(true);
+});
+
+test("handlePasteWithheld: two 'pre-enter' withholds with identical text dedupe to a single backlog item", async () => {
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const run = runs.listForTask(task.id)[0]!;
+
+  __handlePasteWithheldForTest(task.id, run.id, "same text", {
+    ok: false,
+    op: "modal-guard",
+    phase: "pre-enter",
+    stderr: "",
+  });
+  __handlePasteWithheldForTest(task.id, run.id, "same text", {
+    ok: false,
+    op: "modal-guard",
+    phase: "pre-enter",
+    stderr: "",
+  });
+
+  const after = tasks.get(task.id);
+  expect(after?.backlog).toHaveLength(1);
+});
+
+test("handlePasteWithheld: a genuine tmux subprocess failure (op !== 'modal-guard', no phase) re-stashes with tmux-failure wording, not the modal wording", async () => {
+  // finding #5, §10 re-review: load-buffer/paste-buffer/send-keys exiting
+  // non-zero is a REAL tmux failure, not a modal withhold — it must be
+  // checked BEFORE the phase-based branches, and its wording must not claim
+  // "claude is waiting on a prompt" (that's the pre-paste/no-phase modal
+  // wording) since no modal was ever involved.
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const run = runs.listForTask(task.id)[0]!;
+
+  __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
+    ok: false,
+    op: "send-keys",
+    stderr: "no server running on socket",
+  });
+
+  const after = tasks.get(task.id);
+  expect(after?.backlog).toHaveLength(1);
+  expect(after?.backlog[0]?.text).toBe("hello claude");
+  expect(
+    latestStatus(task.id).some(
+      (d) => d === "message saved to your backlog — the paste to claude's session failed; resend from the tray",
+    ),
+  ).toBe(true);
+});
+
+test("handlePasteWithheld: tmux-failure outcomes with 'load-buffer' or 'paste-buffer' ops also use the tmux-failure wording", async () => {
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const run = runs.listForTask(task.id)[0]!;
+
+  __handlePasteWithheldForTest(task.id, run.id, "load-buffer failure", {
+    ok: false,
+    op: "load-buffer",
+    stderr: "boom",
+  });
+  __handlePasteWithheldForTest(task.id, run.id, "paste-buffer failure", {
+    ok: false,
+    op: "paste-buffer",
+    stderr: "boom",
+  });
+
+  const statuses = latestStatus(task.id);
+  expect(
+    statuses.filter(
+      (d) => d === "message saved to your backlog — the paste to claude's session failed; resend from the tray",
+    ).length,
+  ).toBe(2);
+});
+
+test("handlePasteWithheld: 'composer-dirty' re-stashes the NEW text with its own status wording", async () => {
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const run = runs.listForTask(task.id)[0]!;
+
+  __handlePasteWithheldForTest(task.id, run.id, "second message", {
+    ok: false,
+    op: "modal-guard",
+    phase: "composer-dirty",
+    stderr: "",
+  });
+
+  const after = tasks.get(task.id);
+  expect(after?.backlog).toHaveLength(1);
+  expect(after?.backlog[0]?.text).toBe("second message");
+  expect(
+    latestStatus(task.id).some(
+      (d) => d === "paste withheld: claude's input box still holds an earlier message — saved this one to your backlog; resend from the tray once claude is idle",
+    ),
+  ).toBe(true);
+});
+
+test("handlePasteWithheld: an archived task is never re-stashed", async () => {
+  const task = await makeClaudeTaskWithRun("opus-4.8", "xhigh");
+  const run = runs.listForTask(task.id)[0]!;
+  tasks.update(task.id, { archivedAt: Date.now() });
+
+  __handlePasteWithheldForTest(task.id, run.id, "hello claude", {
+    ok: false,
+    op: "modal-guard",
+    phase: "pre-paste",
+    stderr: "",
+  });
+
+  const after = tasks.get(task.id);
+  expect(after?.backlog).toHaveLength(0);
 });
