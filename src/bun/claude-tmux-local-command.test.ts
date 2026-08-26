@@ -834,6 +834,75 @@ test("dismissTmuxPrompt: no nav (regression guard) still sends Down,Down,Enter f
 });
 
 /* ────────────────────────────────────────────────────────────────────────── *
+ * dismissTmuxPrompt — confirmKey (claude 2.1.245 bare /model picker's
+ * "s to use this session only" — plan §8 Q6: a card click through agetor
+ * must not rewrite the user's global claude default model)
+ * ────────────────────────────────────────────────────────────────────────── */
+
+test("dismissTmuxPrompt: confirmKey:'s' sends the arrow-nav sequence then 's' instead of Enter — NOT plain Enter", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const { taskId } = freshSession();
+    try {
+      // cursorIndex 5 (current selection, key "6" — mirrors the /model
+      // picker's cursor sitting on the current model) → target key "4" is
+      // index 3 → delta -2 → two Up presses, then the confirmKey "s" in
+      // place of the usual trailing Enter.
+      const ok = await dismissTmuxPrompt(taskId, "4", {
+        choices: sixChoices,
+        cursorIndex: 5,
+        confirmKey: "s",
+      });
+      expect(ok).toBe(true);
+      const keys = readTmuxLog(logPath)
+        .filter((e) => e.argv[0] === "send-keys")
+        .map((e) => e.argv[e.argv.length - 1]);
+      expect(keys).toEqual(["Up", "Up", "s"]);
+      expect(keys).not.toContain("Enter");
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("dismissTmuxPrompt: same nav as the confirmKey test above, but WITHOUT confirmKey, still ends in Enter", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const { taskId } = freshSession();
+    try {
+      const ok = await dismissTmuxPrompt(taskId, "4", { choices: sixChoices, cursorIndex: 5 });
+      expect(ok).toBe(true);
+      const keys = readTmuxLog(logPath)
+        .filter((e) => e.argv[0] === "send-keys")
+        .map((e) => e.argv[e.argv.length - 1]);
+      expect(keys).toEqual(["Up", "Up", "Enter"]);
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+test("dismissTmuxPrompt: confirmKey is ignored on the y/N literal-keystroke path (no cursorIndex ⇒ no arrow nav)", async () => {
+  await withRecordingTmuxBin(async (logPath) => {
+    const { taskId } = freshSession();
+    try {
+      // No cursorIndex ⇒ useArrowNav is false ⇒ the y/n branch sends the
+      // literal key, then still confirms with a plain Enter regardless of
+      // confirmKey — confirmKey only ever applies on the arrow-nav path.
+      const ok = await dismissTmuxPrompt(taskId, "y", {
+        choices: [{ key: "y", label: "Yes" }, { key: "n", label: "No" }],
+        confirmKey: "s",
+      });
+      expect(ok).toBe(true);
+      const keys = readTmuxLog(logPath)
+        .filter((e) => e.argv[0] === "send-keys")
+        .map((e) => e.argv[e.argv.length - 1]);
+      expect(keys).toEqual(["y", "Enter"]);
+    } finally {
+      __forTest.uninstallSession(taskId);
+    }
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── *
  * sendSlashCommand({ autoConfirm }) — the dropdown-mirror auto-accept step
  * ────────────────────────────────────────────────────────────────────────── */
 

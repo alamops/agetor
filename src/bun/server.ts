@@ -4208,6 +4208,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             choices: pending.choices,
             cursorIndex: pending.cursorIndex,
             nav: pending.nav,
+            confirmKey: pending.confirmKey,
           });
           if (!delivered) {
             return json(

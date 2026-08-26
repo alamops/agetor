@@ -38,6 +38,7 @@ const {
   paneShowsBlockingPrompt,
   idleSettleTick,
   paneShowsComposerText,
+  SESSION_ONLY_CONFIRM_RE,
 } = __forTest;
 
 /** Real tmux pane captures of claude-code 2.1.161's AskUserQuestion modal —
@@ -162,6 +163,10 @@ test("matchNumberedModal — tool-use permission prompt: wrapped description's '
     "Yes, and don't ask again for example MCP server – Fetch Records commands in /Users/me/.agetor/worktrees/demo",
   );
   expect(m!.choices[2]!.label).toBe("No");
+  // A permission prompt's footer (`Esc to cancel · Tab to amend`) never
+  // mentions a session-only confirm — `confirmKey` must stay undefined so
+  // this modal is still dismissed with a plain Enter.
+  expect(m!.confirmKey).toBeUndefined();
 });
 
 test("matchNumberedModal — a same-indent line under the last option is not folded into its label", () => {
@@ -589,6 +594,18 @@ test("MODAL_FOOTER_RE — matches the three evidence-backed footer phrasings, ca
   expect(MODAL_FOOTER_RE.test("←/→ to change usage · Enter to continue · Esc to cancel")).toBe(true);
   expect(MODAL_FOOTER_RE.test("ENTER TO CONTINUE")).toBe(true);
   expect(MODAL_FOOTER_RE.test("? for shortcuts")).toBe(false);
+});
+
+test("SESSION_ONLY_CONFIRM_RE — matches the bare /model picker's session-only confirm phrasing", () => {
+  expect(SESSION_ONLY_CONFIRM_RE.test("Enter to set as default · s to use this session only · Esc to cancel")).toBe(
+    true,
+  );
+});
+
+test("SESSION_ONLY_CONFIRM_RE — does not match ordinary modal footers (permission prompts, the effort slider, plain Esc-to-cancel)", () => {
+  expect(SESSION_ONLY_CONFIRM_RE.test("Esc to cancel · Tab to amend")).toBe(false);
+  expect(SESSION_ONLY_CONFIRM_RE.test("←/→ to adjust · Enter to confirm · Esc to cancel")).toBe(false);
+  expect(SESSION_ONLY_CONFIRM_RE.test("Enter to continue · Esc to cancel")).toBe(false);
 });
 
 // ── Fingerprint stability ────────────────────────────────────────────────
@@ -1247,6 +1264,22 @@ test("matchSlashConfirmModal — the /model picker is not a Switch model?/Change
   expect(matchSlashConfirmModal(MODEL_PICKER_PANE, "effort")).toBeNull();
 });
 
+test("matchNumberedModal — 2.1.245 bare /model picker: confirmKey is 's' (footer offers 's to use this session only')", () => {
+  // Owner decision (plan §8 Q6, 2026-08-26): a card click through agetor
+  // must confirm with 's' (session-only), never plain Enter (which would
+  // rewrite the user's global claude default model).
+  const m = matchNumberedModal(MODEL_PICKER_PANE);
+  expect(m).not.toBeNull();
+  expect(m!.confirmKey).toBe("s");
+});
+
+test("pickScrapeMatch — the /model picker's confirmKey rides along through the shared chain", () => {
+  const direct = matchNumberedModal(MODEL_PICKER_PANE)!;
+  expect(direct.confirmKey).toBe("s");
+  const dispatched = pickScrapeMatch(MODEL_PICKER_PANE, { paneWorking: false, watchdogArmed: false });
+  expect(dispatched!.confirmKey).toBe("s");
+});
+
 // ── Effort slider (bare `/effort`) ───────────────────────────────────────────
 
 const EFFORT_SLIDER_XHIGH_PANE = `   Effort
@@ -1634,6 +1667,14 @@ test("matchNumberedModal — both confirms parse as a plain 2-choice modal, not 
   expect(effort!.highConfidence).toBeFalsy();
   expect(model!.choices.length).toBe(2);
   expect(model!.highConfidence).toBeFalsy();
+});
+
+test("matchNumberedModal — neither 'Switch model?' nor 'Change effort level?' confirm carries a session-only confirmKey", () => {
+  // These confirms have no footer at all (see the test above), let alone the
+  // /model picker's session-only phrasing — they must always dismiss with
+  // the default Enter.
+  expect(matchNumberedModal(EFFORT_CONFIRM_PANE)!.confirmKey).toBeUndefined();
+  expect(matchNumberedModal(MODEL_CONFIRM_PANE)!.confirmKey).toBeUndefined();
 });
 
 // ── Idle input box (`paneShowsIdleInputBox`) ────────────────────────────────

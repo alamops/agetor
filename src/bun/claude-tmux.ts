@@ -1616,6 +1616,19 @@ export function getCurrentPermissionMode(taskId: string): string | null {
  * to sending the literal `y`/`n` keystroke, which claude's confirm
  * helper handles directly.
  *
+ * `ctx.confirmKey`: on the arrow-nav path, the trailing keystroke is
+ * `ctx.confirmKey ?? "Enter"` instead of a hardcoded Enter. This exists for
+ * claude 2.1.245's bare `/model` picker, whose footer reads `Enter to set as
+ * default · s to use this session only · Esc to cancel` — plain Enter there
+ * writes the pick as the user's *global* default for all future claude
+ * sessions, a side effect a card click through agetor must never cause on
+ * the user's behalf. `matchNumberedModal` sets `confirmKey: "s"` whenever
+ * that footer text is present (see `SESSION_ONLY_CONFIRM_RE`), which scopes
+ * the change to the live session instead; `task.model` still syncs from
+ * claude's own `<local-command-stdout>` line regardless of which key
+ * confirmed the picker. The y/N path never carries a `confirmKey` (that
+ * shape has no arrow nav or footer to match) and is unaffected.
+ *
  * Each arrow press is its own `send-keys` invocation with a small sleep
  * between them. A bursted `Down Down Enter` lands as one read on
  * claude's stdin and the trailing Enter can be consumed before the
@@ -1660,6 +1673,14 @@ export async function dismissTmuxPrompt(
      * matcher today registers a vertical-nav (or nav-less y/N) prompt.
      */
     nav?: "vertical" | "horizontal";
+    /**
+     * Key that confirms the highlighted choice on the arrow-nav path,
+     * in place of Enter — see the function doc above and
+     * `ScrapeMatch.confirmKey`. `undefined` ⇒ Enter (every modal but the
+     * bare `/model` picker today). Never consulted on the y/N literal-
+     * keystroke path.
+     */
+    confirmKey?: string;
   },
 ): Promise<boolean> {
   const state = sessions.get(taskId);
@@ -1708,12 +1729,18 @@ export async function dismissTmuxPrompt(
       await Bun.sleep(50);
       if (!stillCurrent()) return;
     }
-    // Explicit re-gate before the trailing Enter — symmetric with the
-    // per-arrow check inside the loop and the y/n path above. Future
-    // edits that insert an `await` between the loop end and this Enter
-    // would otherwise reopen the dispose-during-gap race.
+    // Explicit re-gate before the trailing confirm keystroke — symmetric
+    // with the per-arrow check inside the loop and the y/n path above.
+    // Future edits that insert an `await` between the loop end and this
+    // keystroke would otherwise reopen the dispose-during-gap race.
     if (!stillCurrent()) return;
-    ok = tmux(["send-keys", "-t", state.sessionName, "Enter"]).ok;
+    // Arrow-nav path only: `ctx.confirmKey` (e.g. "s" for the bare /model
+    // picker's "use this session only") stands in for Enter so a card click
+    // through agetor can't mutate the user's global claude config — see the
+    // function doc above. The y/n path above already sent its own literal
+    // keystroke and always confirms with a plain Enter here.
+    const finalKey = useArrowNav ? (ctx.confirmKey ?? "Enter") : "Enter";
+    ok = tmux(["send-keys", "-t", state.sessionName, finalKey]).ok;
   }, state);
   return ok;
 }
@@ -3812,7 +3839,41 @@ interface ScrapeMatch {
    *  choice buttons. Deliberately never paired with `highConfidence` — see
    *  `matchUnparsableModal`. */
   unparsable?: boolean;
+  /** Key that confirms the highlighted choice when it isn't Enter.
+   *  `undefined` ⇒ Enter, the default for every modal. Set by
+   *  `matchNumberedModal` when the footer itself advertises an alternate
+   *  confirm keystroke — today only claude 2.1.245's bare `/model` picker,
+   *  whose footer reads `Enter to set as default · s to use this session
+   *  only · Esc to cancel` (docs/plans/model-effort-local-command-turns.md
+   *  §2, §8 Q6). Evidence-gated and generic: any future modal whose footer
+   *  matches `SESSION_ONLY_CONFIRM_RE` gets the same treatment, with no
+   *  `/model`-specific branch anywhere in the matcher or the dismissal path.
+   *  Threaded through `registerTmuxPrompt` → `TmuxPromptRequest.confirmKey`
+   *  (interactions.ts) → the server route → `dismissTmuxPrompt`'s
+   *  `ctx.confirmKey`, which sends it in place of Enter on the arrow-nav
+   *  path. */
+  confirmKey?: string;
 }
+
+/**
+ * Matches a modal footer that offers a session-only confirm alongside the
+ * default Enter — verbatim from claude 2.1.245's bare `/model` picker
+ * (docs/plans/model-effort-local-command-turns.md §2, §8 Q6):
+ * `Enter to set as default · s to use this session only · Esc to cancel`.
+ * A card click through agetor answers a modal on the user's behalf while
+ * they're not watching the TUI; confirming with plain Enter there would
+ * rewrite the user's *global* claude default model, a side effect the user
+ * never asked for by clicking a card. `s` scopes the change to the live
+ * session instead — `task.model` still syncs from claude's own
+ * `<local-command-stdout>` line regardless of which key confirmed the
+ * picker (`applyClaudeLocalSetting`), so agetor's own bookkeeping doesn't
+ * depend on this choice.
+ *
+ * Deliberately generic (matches the footer text, not "is this the /model
+ * picker") so a future claude version that offers the same session-only
+ * escape hatch on some other modal is covered without a new branch.
+ */
+const SESSION_ONLY_CONFIRM_RE = /\bs to use this session only\b/;
 
 /** Recognise claude's standard numbered-choice modal:
  *
@@ -3927,7 +3988,16 @@ function matchNumberedModal(tail: string): ScrapeMatch | null {
   // a stray "Esc to cancel" buried mid-output from falsely qualifying.
   const nonBlank = lines.filter((l) => l.trim().length > 0);
   const highConfidence = nonBlank.slice(-2).some((l) => /Esc to cancel/.test(l));
-  return { paneText, choices, cursorIndex, fingerprint, highConfidence };
+  // Session-only confirm affordance (see `SESSION_ONLY_CONFIRM_RE`): a wider
+  // window than the high-confidence check above (3 lines, not 2) since this
+  // isn't anchored to being the very last row, only near the bottom of the
+  // modal. Evidence-gated on the footer text alone — no check for "is this
+  // the /model picker" anywhere here, so any future modal with the same
+  // session-only escape hatch is covered automatically. Deliberately not
+  // folded into `fingerprint`: it describes the footer's affordance, not the
+  // choice set, so it must not bust the stability gate on its own.
+  const confirmKey = nonBlank.slice(-3).some((l) => SESSION_ONLY_CONFIRM_RE.test(l)) ? "s" : undefined;
+  return { paneText, choices, cursorIndex, fingerprint, highConfidence, confirmKey };
 }
 
 /** Decide whether a scrape match has cleared the stability gate this tick.
@@ -5344,6 +5414,7 @@ function scrapeOnce(state: SessionState): void {
     nav: match.nav,
     fingerprint: match.fingerprint,
     unparsable: match.unparsable,
+    confirmKey: match.confirmKey,
   });
 }
 
@@ -6253,6 +6324,7 @@ export function spawnClaudeViaTmux(opts: ClaudeLaunchOptions): SpawnedAgent {
             nav: generic.nav,
             fingerprint: generic.fingerprint,
             unparsable: generic.unparsable,
+            confirmKey: generic.confirmKey,
           });
           sawStartupPromptThisWindow = true;
           opts.onChunk("status", "claude is asking a question on startup — answer it to continue");
@@ -7295,6 +7367,10 @@ export const __forTest = {
   matchYesNoModal,
   matchStartupConsentDialog,
   clearedStabilityGate,
+  /** Footer regex behind `matchNumberedModal`'s `confirmKey: "s"` — exposed
+   *  so the scraper test suite can assert the pattern directly (positive/
+   *  negative) as well as through the matcher. */
+  SESSION_ONLY_CONFIRM_RE,
   /** The bare `/effort` slider matcher plus its tuning regexes/constant —
    *  exposed so the scraper test suite can pin the nearest-centre cursor
    *  mapping and the four-signal (track / label / footer-near-label /

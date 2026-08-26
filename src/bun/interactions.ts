@@ -121,6 +121,20 @@ export interface TmuxPromptRequest {
    *  `"horizontal"` ⇒ `Right`/`Left` (claude 2.1.245's `/effort` slider,
    *  which reads "←/→ to adjust · Enter to confirm"). */
   nav?: "vertical" | "horizontal";
+  /** Key that confirms the highlighted choice on the arrow-nav path in
+   *  place of Enter — `undefined` for every modal but claude 2.1.245's bare
+   *  `/model` picker, whose footer offers `s to use this session only`
+   *  alongside the default `Enter to set as default`. A card click through
+   *  agetor must not mutate the user's *global* claude default the way a
+   *  plain Enter there would; `task.model` still syncs from claude's own
+   *  `<local-command-stdout>` regardless of which key confirmed the picker
+   *  (docs/plans/model-effort-local-command-turns.md §2, §8 Q6). Set by
+   *  `matchNumberedModal` (claude-tmux.ts) whenever the footer text is
+   *  present — evidence-gated, not a `/model`-specific special case — and
+   *  consumed by `dismissTmuxPrompt`'s `ctx.confirmKey`. Deliberately not
+   *  mirrored into the webview (`src/mainview/lib/api.ts`): the UI never
+   *  reads it, same as `nav`. */
+  confirmKey?: string;
   /** Stable hash of the matched block — used to debounce duplicate
    *  registrations across consecutive scrapes and to detect external
    *  dismissal (the prompt disappeared from the pane). */
@@ -291,6 +305,7 @@ export function registerTmuxPrompt(args: {
   nav?: "vertical" | "horizontal";
   fingerprint: string;
   unparsable?: boolean;
+  confirmKey?: string;
 }): { id: string; req: TmuxPromptRequest; answer: Promise<TmuxPromptAnswer> } {
   // Defend the reserved-key namespace — `__external__` / `__cancelled__`
   // must be unambiguously sentinels, not legitimate user keystrokes.
@@ -300,6 +315,18 @@ export function registerTmuxPrompt(args: {
         `registerTmuxPrompt: choice key '${c.key}' is reserved (keys starting with '__' are sentinels)`,
       );
     }
+  }
+  // Defensive, not load-bearing today: `matchNumberedModal` is the only
+  // producer of `confirmKey` and only ever sets `"s"`. But this is the seam
+  // a future matcher goes through too, and `dismissTmuxPrompt` sends
+  // whatever arrives here straight to `tmux send-keys` — reject anything
+  // that isn't a single printable ASCII letter so a bug (or a hostile
+  // producer) can never smuggle a key *name* like `"Enter"` or `"C-c"`
+  // through this field.
+  if (args.confirmKey !== undefined && !/^[A-Za-z]$/.test(args.confirmKey)) {
+    throw new Error(
+      `registerTmuxPrompt: confirmKey '${args.confirmKey}' must be a single printable ASCII letter`,
+    );
   }
   const id = randomUUID();
   const req: TmuxPromptRequest = {
@@ -314,6 +341,7 @@ export function registerTmuxPrompt(args: {
     fingerprint: args.fingerprint,
     createdAt: Date.now(),
     unparsable: args.unparsable,
+    confirmKey: args.confirmKey,
   };
   const answer = new Promise<TmuxPromptAnswer>((resolve) => {
     tmuxPrompts.set(id, { req, resolve });
