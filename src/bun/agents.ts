@@ -1,5 +1,6 @@
 import path from "node:path";
 import { cursorModelArg, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
+import { settleSubagentById } from "./claude-subagents.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
   CLAUDE_UNKNOWN_COMMAND_STATUS_PREFIX,
@@ -10,6 +11,7 @@ import {
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
 import { spawnCursorViaTmux } from "./cursor-tmux.ts";
+import { subagents as subagentsDb } from "./db.ts";
 import { spawnGeminiViaTmux } from "./gemini-tmux.ts";
 import { gitWritableRootsSync } from "./worktree.ts";
 
@@ -726,7 +728,42 @@ export function __getFakeDriver(taskId: string): FakeDriverInstance | undefined 
  */
 export const FAKE_CLAUDE_TODOS_PROMPT_MARKER = "__agetor_fake_claude_todos__";
 
-function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): SpawnedAgent {
+/**
+ * Same prompt-marker trick as {@link FAKE_CLAUDE_TODOS_PROMPT_MARKER}, for the
+ * "Claude Code Monitor" scenario (see
+ * `docs/plans/claude-code-monitors-hold-running.md`): drives the real "held
+ * in `running` by a live monitor, released when it ends" flow through
+ * `orchestrator.ts`'s DB-derived hold predicate (`subagents.hasRunning`)
+ * without a real Claude CLI. The real driver discovers a monitor's two-line
+ * launch (`tool_use` name `"Monitor"` + its `tool_result` stub, both tailed
+ * from the session JSONL by `claude-subagents.ts`'s
+ * `scanLineForMonitorLaunch`/`scanLineForMonitorStub`) and its terminal event
+ * the same way — but this fake driver emits chunks only, writes no JSONL, and
+ * attaches no `claude-subagents.ts` watcher, so the scenario below inserts
+ * and later settles the `subagents` row itself, directly, matching the shape
+ * the real scan would produce.
+ *
+ * Optional `:<ms>` suffix sets how long the monitor stays "running" before it
+ * settles — e.g. `__agetor_fake_claude_monitor__:1500` settles 1.5s after
+ * arming. Defaults to {@link FAKE_CLAUDE_MONITOR_DEFAULT_SETTLE_MS} (4000);
+ * clamped to a floor of {@link FAKE_CLAUDE_MONITOR_MIN_SETTLE_MS} (50) so a
+ * caller can't race the settle ahead of the +12ms turn-resolution chunk.
+ *
+ * Exported (like the TODOS marker) so `e2e/monitor-hold.spec.ts` can drive
+ * this scenario from a task's prompt — the e2e worker-shared backend fixture
+ * (`e2e/fixtures.ts`) can't set per-test env vars, only per-test prompt text.
+ * Per that same constraint, e2e specs can't `import` from `src/bun/*` and
+ * must keep a **literal copy** of this exact string.
+ */
+export const FAKE_CLAUDE_MONITOR_PROMPT_MARKER = "__agetor_fake_claude_monitor__";
+/** No regex-special characters appear in {@link FAKE_CLAUDE_MONITOR_PROMPT_MARKER}
+ *  (letters/underscores only), so it's safe to splice directly into a pattern
+ *  without escaping. */
+const FAKE_CLAUDE_MONITOR_SETTLE_MS_RE = new RegExp(`${FAKE_CLAUDE_MONITOR_PROMPT_MARKER}:(\\d+)`);
+const FAKE_CLAUDE_MONITOR_DEFAULT_SETTLE_MS = 4000;
+const FAKE_CLAUDE_MONITOR_MIN_SETTLE_MS = 50;
+
+function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler, runId?: string): SpawnedAgent {
   const record: string[] = [`spawn:${prompt}`];
   let resolveDone!: (code: number) => void;
   const done = new Promise<number>((res) => { resolveDone = res; });
@@ -878,6 +915,87 @@ function makeFakeAgent(taskId: string, prompt: string, onChunk: ChunkHandler): S
     });
     after(23, () => onChunk("assistant", "Starting Phase 1 — Investigate now."));
     after(26, () => { onChunk("status", "turn complete"); resolveDone(0); });
+  } else if (prompt.includes(FAKE_CLAUDE_MONITOR_PROMPT_MARKER)) {
+    // Test hook: simulate arming a Claude Code `Monitor` and later ending it
+    // — see FAKE_CLAUDE_MONITOR_PROMPT_MARKER's doc comment above for why
+    // this scenario inserts/settles the `subagents` row itself instead of
+    // relying on claude-subagents.ts's JSONL-tailing discovery. Chunk shapes
+    // match exactly what claude-tmux.ts's real mapper produces for a Monitor
+    // launch: a `tool_use` chunk's `data` is `{id, name, input, serverSide}`,
+    // its matching `tool_result` chunk's `data` is `{toolUseId, content,
+    // isError}` with `content` echoing the real "Monitor started (task <id>,
+    // timeout <ms>ms)…" stub text `scanLineForMonitorStub` parses `taskId`
+    // out of.
+    //
+    // Only turn 1 (a fresh spawn, never a `--resume`) runs this scenario,
+    // same convention as every other canned scenario in this driver.
+    const settleMsMatch = prompt.match(FAKE_CLAUDE_MONITOR_SETTLE_MS_RE);
+    const parsedSettleMs = settleMsMatch ? Number(settleMsMatch[1]) : NaN;
+    const settleMs = Number.isFinite(parsedSettleMs)
+      ? Math.max(FAKE_CLAUDE_MONITOR_MIN_SETTLE_MS, parsedSettleMs)
+      : FAKE_CLAUDE_MONITOR_DEFAULT_SETTLE_MS;
+    // Keyed on the RUN, not the task: `subagentsDb.insertIfAbsent` is
+    // INSERT OR IGNORE, so a task-keyed id would collide with the already-
+    // `completed` row from a previous run (an e2e retry, Stop→Start, a re-run
+    // of the marker prompt) and silently degrade to a plain fake turn with no
+    // hold. Same reasoning as `fakePlanCallCounter` in the cursor fake.
+    const monitorId = `fake-monitor-${runId ?? taskId}`;
+    after(5, () => {
+      onChunk(
+        "tool_use",
+        JSON.stringify({
+          id: "fake-monitor-1",
+          name: "Monitor",
+          input: { command: "tail -f build.log", description: "Fake monitor", timeout_ms: 60000, persistent: false },
+          serverSide: false,
+        }),
+        "fake-monitor-1-tu",
+      );
+    });
+    after(8, () => {
+      onChunk(
+        "tool_result",
+        JSON.stringify({
+          toolUseId: "fake-monitor-1",
+          content: `Monitor started (task ${monitorId}, timeout 60000ms). You will be notified on each event.`,
+          isError: false,
+        }),
+        "fake-monitor-1-tr",
+      );
+      // The real discovery path (claude-subagents.ts) would insert this row
+      // off the same two lines just emitted above; this fake driver writes
+      // no JSONL for that watcher to tail, so it inserts directly.
+      subagentsDb.insertIfAbsent({
+        id: monitorId,
+        taskId,
+        runId: runId ?? null,
+        parentKind: "monitor",
+        agentType: "monitor",
+        description: "Fake monitor",
+        spawnDepth: 1,
+        sourcePath: "",
+        toolUseId: "fake-monitor-1",
+        status: "running",
+        startedAt: Date.now(),
+        endedAt: null,
+      });
+      record.push(`monitor:armed:${monitorId}`);
+    });
+    after(12, () => {
+      onChunk("assistant", "Armed a monitor; waiting for events.");
+      onChunk("status", "turn complete");
+      resolveDone(0);
+    });
+    after(settleMs, () => {
+      // Mirrors the live path's receipt settle
+      // (`setBackgroundTaskSettledHandler` → `settleSubagentById(id,
+      // "completed", "receipt")`) that fires when a `<task-notification>`
+      // carries the monitor's terminal event — this is what flips
+      // `subagents.hasRunning(taskId)` false and releases the orchestrator's
+      // hold, moving the card from `running` to `review`.
+      settleSubagentById(monitorId, "completed", "receipt");
+      record.push(`monitor:settled:${monitorId}`);
+    });
   } else {
     after(5, () => onChunk("stdout", `fake response to: ${prompt}`));
     after(20, () => { onChunk("status", "turn complete"); resolveDone(0); });
@@ -1023,7 +1141,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       // Build the command anyway so the fake records the prompt going by;
       // the fake's behaviour doesn't depend on the argv shape.
       buildCommand(harness, prompt, opts);
-      return makeFakeAgent(taskId, prompt, onChunk);
+      return makeFakeAgent(taskId, prompt, onChunk, runId);
     }
     // Pre-generate a session uuid when we're not resuming. The driver will
     // expect claude to write its JSONL at the deterministic path derived
@@ -1063,7 +1181,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       if (process.env.AGETOR_FAKE_CURSOR_PLAN === "1") {
         return makeFakeCursorPlanAgent(taskId, prompt, onChunk);
       }
-      return makeFakeAgent(taskId, prompt, onChunk);
+      return makeFakeAgent(taskId, prompt, onChunk, runId);
     }
     const built = buildCommand(harness, prompt, opts);
     return spawnCursorViaTmux({
@@ -1088,7 +1206,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
       // stand-in, `fake-codex-thread-${taskId}`).
       const sessionId = opts.resumeSessionId ?? `fake-gemini-session-${taskId}`;
       onSessionId?.(sessionId);
-      return makeFakeAgent(taskId, prompt, onChunk);
+      return makeFakeAgent(taskId, prompt, onChunk, runId);
     }
     // Pre-generate a session uuid when we're not resuming — mirrors claude's
     // pattern (`--session-id` up front) rather than codex's discover-later
@@ -1119,7 +1237,7 @@ export function spawnAgent(args: SpawnAgentArgs): SpawnedAgent {
     // can route follow-ups through `codex exec resume` — mirrors what a real
     // `thread.started` event would deliver.
     onSessionId?.(`fake-codex-thread-${taskId}`);
-    return makeFakeAgent(taskId, prompt, onChunk);
+    return makeFakeAgent(taskId, prompt, onChunk, runId);
   }
   // Resolve git dirs outside the cwd (the source repo's `.git` for a linked
   // worktree) so a codex `auto` run that has to write there escalates its
