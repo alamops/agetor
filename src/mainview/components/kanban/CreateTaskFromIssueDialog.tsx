@@ -8,8 +8,8 @@ import type { GitHubIssueThreadResult } from "../../../shared/types.ts";
 import {
   buildIssueTaskPrompt,
   issueTaskTitle,
-  normalizeIssueUrl,
   renderIssueThreadMarkdown,
+  sameIssueUrl,
 } from "../../../shared/issue-task.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { createAndStartTask, TaskLaunchPickers, useTaskLaunch } from "./TaskLaunchPickers";
@@ -54,7 +54,11 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
 
   // Reset per-open transient state, then fetch the thread this dialog was
   // opened for. Mirrors useTaskLaunch's own on-open fetch, but this one is
-  // keyed on `context` too since it needs the issue's path/number.
+  // keyed on `context` too since it needs the issue's path/number. Keyed on
+  // `context`'s primitive fields rather than the object itself — the caller
+  // (GitHubDialog's `IssueActions`) re-renders on every board poll, and an
+  // equal-valued-but-new-identity `context` object must NOT re-trigger this
+  // (it would refetch the thread and reset `promptDirty`, wiping edits).
   useEffect(() => {
     setPromptDirty(false);
     setSubmitError(null);
@@ -66,7 +70,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
     api.getGitHubIssueThread(context.path, context.number)
       .then((result) => {
         if (cancelled) return;
-        if (normalizeIssueUrl(result.item.htmlUrl) !== normalizeIssueUrl(context.url)) {
+        if (!sameIssueUrl(result.item.htmlUrl, context.url)) {
           setThreadError("That issue belongs to a different repository than this project.");
           return;
         }
@@ -76,7 +80,7 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
       .finally(() => { if (!cancelled) setThreadLoading(false); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, context]);
+  }, [open, context?.path, context?.number, context?.url]);
 
   // Seed (and re-seed) the prompt from the fetched thread, but only while
   // the user hasn't started editing it — matches ResolveConflictsDialog's

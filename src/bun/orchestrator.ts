@@ -6,7 +6,7 @@ import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentA
 import { checkHarness } from "./agent-status.ts";
 import { resolveClaudePlan, upsertClaudePlanFromExitPlanMode, upsertDetectedPlan } from "./task-plans.ts";
 import { deriveTodoProgress, summarizeTodoProgress } from "../shared/todo-progress.ts";
-import { ISSUE_SNAPSHOT_FILENAME, parseIssueUrl } from "../shared/issue-task.ts";
+import { ISSUE_SNAPSHOT_FILENAME, normalizeIssueUrl, parseIssueUrl } from "../shared/issue-task.ts";
 import { providerRepoForDir } from "./git-provider.ts";
 import {
   AGENT_OPTIONS,
@@ -3590,7 +3590,11 @@ export async function createTask(
   // at create time only — `issueUrl` is never patchable afterward (kept out
   // of the PATCH allow-list in server.ts). A bad or wrong-repo URL rejects
   // the whole create, since "View issue" and the PR-body "Closes #N" prefill
-  // both trust this field being correct.
+  // both trust this field being correct. The stored value is the
+  // `normalizeIssueUrl` form (lowercased host, no query/hash/slug tail), not
+  // the raw string the caller sent — so the durable field is always
+  // canonical and directly comparable via `normalizeIssueUrl`/`sameIssueUrl`
+  // elsewhere, regardless of which slug/query the user happened to paste.
   let validatedIssueUrl: string | null = null;
   let parsedIssue: ReturnType<typeof parseIssueUrl> = null;
   const rawIssueUrl = input.issueUrl?.trim() || "";
@@ -3606,7 +3610,7 @@ export async function createTask(
         error: `issue URL points at ${parsedIssue.owner}/${parsedIssue.repo}, but the project's remote is ${repoInfo.owner}/${repoInfo.name}`,
       };
     }
-    validatedIssueUrl = rawIssueUrl;
+    validatedIssueUrl = normalizeIssueUrl(rawIssueUrl);
   }
 
   const task = tasks.insert({

@@ -17,9 +17,10 @@ import { mergeModelOptions } from "../../../shared/model-options.ts";
 import {
   buildIssueTaskPrompt,
   issueTaskTitle,
-  normalizeIssueUrl,
   parseIssueUrl,
   renderIssueThreadMarkdown,
+  sameIssueUrl,
+  withoutSnapshotParagraph,
 } from "../../../shared/issue-task.ts";
 import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { Button } from "@/components/ui/button";
@@ -224,6 +225,18 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   // ProjectPicker will auto-select the most-recently-used project from the
   // persisted list.
   const [workdir, setWorkdir] = useState("");
+  // Staleness guard for `loadIssueFromUrl`'s fetch, mirroring the
+  // `cancelled`-flag pattern `CreateTaskFromIssueDialog` uses for its own
+  // on-open fetch: `workdirRef` mirrors the latest `workdir` (a plain closure
+  // over `workdir` would only see the value from the render that started the
+  // fetch, so a project switch mid-fetch wouldn't be detected), the sequence
+  // ref detects a newer load superseding this one, and the mounted ref
+  // catches an unmount mid-fetch.
+  const workdirRef = useRef(workdir);
+  useEffect(() => { workdirRef.current = workdir; }, [workdir]);
+  const issueLoadSeqRef = useRef(0);
+  const issueFormMountedRef = useRef(true);
+  useEffect(() => () => { issueFormMountedRef.current = false; }, []);
   const [isolate, setIsolate] = useState(true);
   const [baseRef, setBaseRef] = useState("");
   // Branch nomenclature for the selected project (loaded from the server;
@@ -254,10 +267,17 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
 
   // The issue-thread same-repo guarantee is per project — a linked issue (or
   // a stale error) from a previously-selected project must not survive a
-  // project switch.
+  // project switch. When a link is actually cleared, also strip the snapshot
+  // paragraph it added to the prompt — otherwise switching projects leaves a
+  // dangling "read the snapshot file" pointer to a file that was never
+  // attached to the new project's task.
   useEffect(() => {
-    setIssueLink(null);
+    if (issueLink) {
+      setIssueLink(null);
+      setPrompt((p) => withoutSnapshotParagraph(p));
+    }
     setIssueError(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workdir]);
 
   // The tag-visible pattern for the current config + type, e.g. `feature/<slug>`.
@@ -557,11 +577,20 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
       setIssueError("Not a recognized GitHub/GitLab/Bitbucket issue URL");
       return;
     }
+    const seq = ++issueLoadSeqRef.current;
+    // True once this fetch's result is no longer relevant: the component
+    // unmounted, a newer load superseded this one, or the user switched
+    // projects while this one was in flight.
+    const stale = () =>
+      !issueFormMountedRef.current
+      || issueLoadSeqRef.current !== seq
+      || workdirRef.current.trim() !== dir;
     setIssueBusy(true);
     setIssueError(null);
     try {
       const thread = await api.getGitHubIssueThread(dir, parsed.number);
-      if (normalizeIssueUrl(thread.item.htmlUrl) !== normalizeIssueUrl(raw)) {
+      if (stale()) return;
+      if (!sameIssueUrl(thread.item.htmlUrl, raw)) {
         setIssueError("That issue belongs to a different repository than the selected project");
         return;
       }
@@ -575,9 +604,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
       });
       setIssueUrlDraft("");
     } catch (e) {
+      if (stale()) return;
       setIssueError(e instanceof Error ? e.message : String(e));
     } finally {
-      setIssueBusy(false);
+      // Gated on the sequence only (not the full `stale()`, which also trips
+      // on a plain project switch) — a project switch with no new load in
+      // flight must still clear busy, or the Load button on the new project
+      // stays disabled forever.
+      if (issueLoadSeqRef.current === seq) setIssueBusy(false);
     }
   };
 
@@ -853,7 +887,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                     Issue #{issueLink.number}
                     <button
                       type="button"
-                      onClick={() => setIssueLink(null)}
+                      onClick={() => {
+                        setIssueLink(null);
+                        setPrompt((p) => withoutSnapshotParagraph(p));
+                      }}
                       title="Unlink issue"
                       aria-label="Unlink issue"
                       className="ml-0.5 text-muted-foreground transition-colors hover:text-foreground"

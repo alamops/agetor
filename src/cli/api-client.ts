@@ -32,6 +32,11 @@ const REQUEST_TIMEOUT_MS = 15_000;
  *  which can be slow on a large/cold repo — give it a more generous budget so a
  *  slow worktree create doesn't surface as a false "core did not respond". */
 const START_TIMEOUT_MS = 60_000;
+/** The issue-thread route fetches the issue plus its full comment thread from
+ *  the provider's API (GitHub/GitLab/Bitbucket) — a cold call, or one with a
+ *  long comment thread across pages, can comfortably exceed the default 15s
+ *  budget. Mirrors `START_TIMEOUT_MS`'s rationale. */
+const ISSUE_THREAD_TIMEOUT_MS = 60_000;
 
 export class ApiError extends Error {
   constructor(
@@ -205,7 +210,7 @@ export class AgetorClient {
    *  --issue`'s derived title/prompt/snapshot. */
   getIssueThread(path: string, number: number): Promise<{ ok: true } & GitHubIssueThreadResult> {
     const params = new URLSearchParams({ path, number: String(number) });
-    return this.req("GET", `/github/issue-thread?${params.toString()}`);
+    return this.req("GET", `/github/issue-thread?${params.toString()}`, undefined, ISSUE_THREAD_TIMEOUT_MS);
   }
 
   // ── harnesses ──────────────────────────────────────────────────────────────

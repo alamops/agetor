@@ -210,14 +210,16 @@ const IS_MAC_PLATFORM =
  * `onOpenPullRequest`). No-op when `issueUrl` doesn't parse (not an
  * issue-sourced task) or the body already references the issue number, so a
  * user-edited body already mentioning the issue is never double-appended.
+ * The re-check is a word-boundary regex (`#7` must not match `#71`) rather
+ * than a plain substring test.
  */
 function appendIssueCloseDirective(body: string, issueUrl: string | null | undefined): string {
   const parsed = parseIssueUrl(issueUrl);
   if (!parsed) return body;
   const marker = `#${parsed.number}`;
-  if (body.includes(marker)) return body;
+  if (new RegExp(`#${parsed.number}(?!\\d)`).test(body)) return body;
   const directive = parsed.provider === "bitbucket" ? `Issue ${marker}` : `Closes ${marker}`;
-  return `${body}\n\n${directive}`;
+  return body ? `${body}\n\n${directive}` : directive;
 }
 
 function formatDuration(r: Run): string {

@@ -642,9 +642,14 @@ export const api = {
     return j<{ ok: true; item: GitHubListItem }>(`/github/pull-detail?${q.toString()}`);
   },
   /** A single issue plus its full comment thread — powers every "create a
-   *  task from this issue" entry point (dialog, New Task form paste-URL). */
-  getGitHubIssueThread: (path: string, number: number) => {
+   *  task from this issue" entry point (dialog, New Task form paste-URL).
+   *  `opts.includeComments: false` (the "View issue" prefill's use case, which
+   *  only needs the item) appends `includeComments=false` to skip the
+   *  server's comments fetch; omitted (the default `true`) sends no query
+   *  param at all, matching every other optional-flag param in this file. */
+  getGitHubIssueThread: (path: string, number: number, opts?: { includeComments?: boolean }) => {
     const q = new URLSearchParams({ path, number: String(number) });
+    if (opts?.includeComments === false) q.set("includeComments", "false");
     return j<{ ok: true } & GitHubIssueThreadResult>(`/github/issue-thread?${q.toString()}`);
   },
   getGitHubPullChecks: (input: { path: string; number: number }) => {

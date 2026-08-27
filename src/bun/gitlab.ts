@@ -919,8 +919,15 @@ export async function listGitLabComments(repo: ProviderRepoInfo, number: number,
 /** Matches `getGitHubIssueThread`'s shape — a single issue by iid, normalized
  *  through the same `normalizeItem` mapper `getGitLabPullDetail` uses, plus
  *  its full comment thread via `collectGitLabNotes`. `refetchCommand` is
- *  always null here — the facade (`git-host.ts`) fills it in. */
-export async function getGitLabIssueThread(repo: ProviderRepoInfo, iid: number): Promise<GitLabIssueThreadResponse> {
+ *  always null here — the facade (`git-host.ts`) fills it in.
+ *  `includeComments` (default `true`) mirrors `getGitHubIssueThread`'s flag —
+ *  `false` skips `collectGitLabNotes` entirely and returns `comments: [],
+ *  truncated: false`, for a caller ("View issue") that only needs the item. */
+export async function getGitLabIssueThread(
+  repo: ProviderRepoInfo,
+  iid: number,
+  includeComments = true,
+): Promise<GitLabIssueThreadResponse> {
   if (!Number.isInteger(iid) || iid <= 0) return { ok: false, error: "issue number must be positive" };
   const token = await gitlabToken(repo.remoteHost);
   const projectId = encodeProjectId(repo.owner, repo.name);
@@ -930,6 +937,10 @@ export async function getGitLabIssueThread(repo: ProviderRepoInfo, iid: number):
   if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
   const item = normalizeItem("issues", json);
   if (!item) return { ok: false, error: "GitLab returned an unexpected issue response" };
+
+  if (!includeComments) {
+    return { ok: true, repo: `${repo.owner}/${repo.name}`, item, comments: [], truncated: false, refetchCommand: null };
+  }
 
   const notes = await collectGitLabNotes(repo, iid, "issues");
   if (!notes.ok) return notes;

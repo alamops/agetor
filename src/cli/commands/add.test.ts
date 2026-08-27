@@ -1,4 +1,5 @@
 import { test, expect, mock, afterAll } from "bun:test";
+import path from "node:path";
 import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import type { Flags } from "../context.ts";
 import type { GitHubComment, GitHubIssueThreadResult, GitHubListItem, Task } from "../../shared/types.ts";
@@ -53,7 +54,7 @@ afterAll(() => {
   mock.module("../output.ts", () => realOutputSnapshot);
 });
 
-const { parseAdd, cmdAdd } = await import("./add.ts");
+const { parseAdd, cmdAdd, chooseAddPath } = await import("./add.ts");
 
 // ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -283,4 +284,62 @@ test("cmdAdd: no --issue, no --title, non-TTY throws an error that mentions --is
   currentClient = client;
 
   await expect(cmdAdd([], flags())).rejects.toThrow(/--issue/);
+});
+
+test("cmdAdd: a relative --workdir is resolved before getIssueThread and createTask both see it", async () => {
+  reset();
+  const thread = makeThread();
+  const { client, getIssueThreadCalls, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const rel = "../rel";
+  const resolved = path.resolve(rel);
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", rel], flags({ json: true }));
+
+  expect(getIssueThreadCalls).toEqual([{ path: resolved, number: 7 }]);
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.workdir).toBe(resolved);
+});
+
+test("cmdAdd: --issue is accepted case-insensitively against the thread's htmlUrl (sameIssueUrl, not exact normalizeIssueUrl equality)", async () => {
+  reset();
+  const thread = makeThread({
+    item: makeItem({ htmlUrl: "https://github.com/owner/repo/issues/7" }),
+  });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+
+  await cmdAdd(
+    ["--issue", "https://github.com/Owner/Repo/issues/7", "--workdir", "/tmp/acme-widgets"],
+    flags({ json: true }),
+  );
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.issueUrl).toBe(thread.item.htmlUrl);
+});
+
+// ── chooseAddPath (pure) ─────────────────────────────────────────────────
+//
+// `cmdAdd` always runs with the mocked `isTTY: false`, so it can't exercise
+// the TTY/wizard branch end-to-end without driving `@clack/prompts`. The
+// branching itself is factored into this pure, directly-testable helper —
+// these tests cover the fix for `--issue` alone wrongly bypassing the wizard
+// (its issue-derived title/prompt used to make `o.title && prompt` look
+// "complete" even in a real terminal session).
+
+test("chooseAddPath: --issue alone (not explicit) in a TTY without --json goes to the wizard", () => {
+  expect(chooseAddPath({ explicit: false, isTTY: true, json: false })).toBe("wizard");
+});
+
+test("chooseAddPath: explicit --title + --prompt goes non-interactive even in a TTY without --json", () => {
+  expect(chooseAddPath({ explicit: true, isTTY: true, json: false })).toBe("non-interactive");
+});
+
+test("chooseAddPath: non-TTY always goes non-interactive, explicit or not", () => {
+  expect(chooseAddPath({ explicit: false, isTTY: false, json: false })).toBe("non-interactive");
+  expect(chooseAddPath({ explicit: true, isTTY: false, json: false })).toBe("non-interactive");
+});
+
+test("chooseAddPath: --json always goes non-interactive, even in a TTY", () => {
+  expect(chooseAddPath({ explicit: false, isTTY: true, json: true })).toBe("non-interactive");
 });

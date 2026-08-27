@@ -73,6 +73,7 @@ import { isMergedPull, mergedPullReplacement } from "@/lib/pull-merged";
 import { isCredentialError } from "@/lib/credential-error";
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
+import { sameIssueUrl } from "../../../shared/issue-task.ts";
 import { ResolveConflictsDialog, type ResolveConflictsContext } from "./ResolveConflictsDialog";
 import { CreateTaskFromIssueDialog } from "./CreateTaskFromIssueDialog";
 import {
@@ -1224,9 +1225,12 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // change starts returning one instead of a non-2xx status, and including a
   // fetched item whose URL doesn't match the prefill's `url` (item numbers
   // are per-repo, so a project-path mismatch upstream could otherwise land
-  // the user on an unrelated repo's item #N). `normalizePrUrl` is a generic
-  // URL normalizer despite the name — reused here for issues too rather than
-  // adding a duplicate. Mergeability invalidation only applies to PRs; an
+  // the user on an unrelated repo's item #N). PRs compare via `normalizePrUrl`
+  // (a plain string normalizer); issues compare via `sameIssueUrl`'s parsed-
+  // identity check since issue URLs vary more across providers. The issue
+  // fetch skips comments (`includeComments: false`) — this is only a
+  // same-repo check + preview; the detail subpage refetches comments itself
+  // once it navigates in. Mergeability invalidation only applies to PRs; an
   // issue has no such cache.
   useEffect(() => {
     if (!open) return;
@@ -1242,12 +1246,15 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
             if (!result?.ok || !result.item) throw new Error("Pull request not found");
             return result.item;
           }
-          const result = await api.getGitHubIssueThread(pending.projectPath, pending.number);
+          const result = await api.getGitHubIssueThread(pending.projectPath, pending.number, { includeComments: false });
           if (!result?.ok || !result.item) throw new Error("Issue not found");
           return result.item;
         })();
         if (cancelled || viewRef.current.kind !== "list") return;
-        if (normalizePrUrl(item.htmlUrl) !== normalizePrUrl(pending.url)) {
+        const sameItem = pending.kind === "pulls"
+          ? normalizePrUrl(item.htmlUrl) === normalizePrUrl(pending.url)
+          : sameIssueUrl(item.htmlUrl, pending.url);
+        if (!sameItem) {
           throw new Error(
             pending.kind === "pulls"
               ? "That pull request URL points at a different repository — opening in browser."
@@ -7208,6 +7215,15 @@ function IssueActions({
   // conflict-resolution, which is a GitHub-only, open-PR-only affordance).
   const [taskOpen, setTaskOpen] = useState(false);
   const [taskConfirmed, setTaskConfirmed] = useState(false);
+  // Stable identity across re-renders (the board's 2s poll re-renders this
+  // whole tree) — an inline object literal here would get a new reference
+  // every render, and CreateTaskFromIssueDialog's fetch/reset effect used to
+  // be keyed on that reference, refetching the thread and wiping the user's
+  // in-progress prompt edits on every poll tick.
+  const taskContext = useMemo(
+    () => ({ path, number: item.number, url: item.htmlUrl, title: item.title }),
+    [path, item.number, item.htmlUrl, item.title],
+  );
   return (
     <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -7341,7 +7357,7 @@ function IssueActions({
       <CreateTaskFromIssueDialog
         open={taskOpen}
         onClose={() => setTaskOpen(false)}
-        context={{ path, number: item.number, url: item.htmlUrl, title: item.title }}
+        context={taskContext}
         onCreated={() => {
           setTaskConfirmed(true);
           setTimeout(() => setTaskConfirmed(false), 5_000);

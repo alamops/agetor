@@ -430,6 +430,21 @@ test("issueThread dispatches a github repo directly (sourcePath already stamped)
   }
 });
 
+test("issueThread with includeComments:false passes it through to the github adapter, skipping the comments fetch", async () => {
+  const dir = await makeGitHubRepo("acme", "app1b");
+  createdDirs.push(dir);
+  fetchMock = mockGitHubFetch([
+    { match: /\/repos\/acme\/app1b\/issues\/7$/, json: githubIssueJson({ html_url: "https://github.com/acme/app1b/issues/7" }) },
+    // Deliberately no route for the /comments endpoint — if it were fetched
+    // anyway, mockGitHubFetch would throw "no route for ..." and fail loudly.
+  ]);
+  const res = await issueThread({ dir, number: 7, includeComments: false });
+  expect(res.ok).toBe(true);
+  if (!res.ok) return;
+  expect(res.comments).toEqual([]);
+  expect(res.truncated).toBe(false);
+});
+
 test("issueThread dispatches a gitlab repo and stitches sourcePath onto the item", async () => {
   const dir = await makeRepo("https://gitlab.com/acme/app.git");
   fetchMock = mockGitHubFetch([
@@ -509,7 +524,7 @@ test("issueThread on a repo with no supported git remote returns the facade's NO
 // refetchCommandFor — pure, no I/O
 // ---------------------------------------------------------------------------
 
-test("refetchCommandFor builds a `gh issue view <url> --comments` command for github when gh is available", () => {
+test("refetchCommandFor builds a `gh issue view <url> --comments` command for github when gh is available, single-quoting the url", () => {
   expect(
     refetchCommandFor({
       provider: "github",
@@ -519,7 +534,20 @@ test("refetchCommandFor builds a `gh issue view <url> --comments` command for gi
       ghAvailable: true,
       glabAvailable: true,
     }),
-  ).toBe("gh issue view https://github.com/acme/app/issues/7 --comments");
+  ).toBe("gh issue view 'https://github.com/acme/app/issues/7' --comments");
+});
+
+test("refetchCommandFor escapes an embedded single quote in the url as '\\''", () => {
+  expect(
+    refetchCommandFor({
+      provider: "github",
+      htmlUrl: "https://github.com/acme/app/issues/7'; rm -rf /",
+      repo: "acme/app",
+      number: 7,
+      ghAvailable: true,
+      glabAvailable: true,
+    }),
+  ).toBe("gh issue view 'https://github.com/acme/app/issues/7'\\''; rm -rf /' --comments");
 });
 
 test("refetchCommandFor returns null for github when gh is not available", () => {
@@ -535,7 +563,7 @@ test("refetchCommandFor returns null for github when gh is not available", () =>
   ).toBeNull();
 });
 
-test("refetchCommandFor builds a `glab issue view <n> --comments --repo <owner/name>` command for gitlab when glab is available", () => {
+test("refetchCommandFor builds a `glab issue view <n> --comments --repo <owner/name>` command for gitlab when glab is available, single-quoting the repo slug", () => {
   expect(
     refetchCommandFor({
       provider: "gitlab",
@@ -545,7 +573,20 @@ test("refetchCommandFor builds a `glab issue view <n> --comments --repo <owner/n
       ghAvailable: true,
       glabAvailable: true,
     }),
-  ).toBe("glab issue view 5 --comments --repo acme/app");
+  ).toBe("glab issue view 5 --comments --repo 'acme/app'");
+});
+
+test("refetchCommandFor keeps a nested GitLab group's repo slug intact when single-quoting it", () => {
+  expect(
+    refetchCommandFor({
+      provider: "gitlab",
+      htmlUrl: "https://gitlab.com/group/sub/project/-/issues/5",
+      repo: "group/sub/project",
+      number: 5,
+      ghAvailable: true,
+      glabAvailable: true,
+    }),
+  ).toBe("glab issue view 5 --comments --repo 'group/sub/project'");
 });
 
 test("refetchCommandFor returns null for gitlab when glab is not available", () => {

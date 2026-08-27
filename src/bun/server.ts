@@ -1014,7 +1014,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (typeof number !== "number" || !Number.isInteger(number) || number <= 0) {
             return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await gitHost.issueThread({ dir, number });
+          // "false"/"0" → skip the comments fetch (the "View issue" prefill only
+          // needs the item); anything else (including absent) → the default true.
+          const includeCommentsParam = url.searchParams.get("includeComments");
+          const includeComments = includeCommentsParam !== "false" && includeCommentsParam !== "0";
+          const result = await gitHost.issueThread({ dir, number, includeComments });
           if (!result.ok) {
             return json({ error: result.error }, { status: 400, headers: corsHeaders(req) });
           }

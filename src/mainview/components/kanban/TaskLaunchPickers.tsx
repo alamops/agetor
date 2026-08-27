@@ -3,10 +3,13 @@ import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { api, type AgentModelMap } from "@/lib/api";
+import { mergeModelOptions } from "../../../shared/model-options.ts";
 import {
   AGENT_OPTIONS,
+  CATALOG_SCOPED_KINDS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  cursorModelIdCoveredByCatalog,
   supportedEfforts,
   supportedModes,
   type AgentKind,
@@ -35,6 +38,10 @@ export interface TaskLaunch {
   availableHarnesses: Harness[];
   agents: AgentStatus[];
   agentModels: AgentModelMap;
+  /** Per-harness model catalog (fx account-scoped, keyed by harness id) —
+   *  preferred over `agentModels`' kind-level list when it has an entry for
+   *  the selected harness, mirroring `NewTaskForm`'s `harnessModels` prop. */
+  harnessModels: Record<string, { id: string; label?: string }[]>;
   agent: string;
   kind: AgentKind;
   selectedStatus: AgentStatus | undefined;
@@ -61,6 +68,7 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
   const [harnesses, setHarnesses] = useState<Harness[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
   const [agentModels, setAgentModels] = useState<AgentModelMap>({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] });
+  const [harnessModels, setHarnessModels] = useState<Record<string, { id: string; label?: string }[]>>({});
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -86,12 +94,13 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
     setLoadError(null);
     setLoading(true);
     let cancelled = false;
-    Promise.all([api.listHarnesses(), api.listAgentModels(), api.listPreferences()])
-      .then(([payload, models, prefs]) => {
+    Promise.all([api.listHarnesses(), api.listAgentModels(), api.listHarnessModels(), api.listPreferences()])
+      .then(([payload, models, harnessModelPayload, prefs]) => {
         if (cancelled) return;
         setHarnesses(payload.harnesses);
         setAgents(payload.statuses);
         setAgentModels(models);
+        setHarnessModels(harnessModelPayload.byHarness);
         const enabled = payload.harnesses.filter((h) => h.enabled);
         const want = prefs.defaultHarness;
         const nextAgent =
@@ -132,13 +141,22 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
 
   const { models: staticModels } = AGENT_OPTIONS[kind];
   const modes = supportedModes(kind, model);
+  // Merge the curated list with whatever this harness's CLI catalog
+  // discovery surfaced, per the shared rules in `mergeModelOptions` — mirrors
+  // `NewTaskForm`'s identical computation. Prefer the per-harness catalog
+  // (keyed by harness id — distinguishes a second `fx-2` account from the
+  // built-in fx harness) over the kind-level map, which only exists as a
+  // fallback for an older daemon predating `GET /agent-models/harnesses`.
   const models = useMemo(() => {
-    const known = new Set(staticModels.map((m) => m.id));
-    const extras = (agentModels[kind] ?? [])
-      .filter((m) => !known.has(m.id))
-      .map((m): typeof staticModels[number] => ({ id: m.id, label: m.label ?? m.id }));
-    return [...staticModels, ...extras];
-  }, [staticModels, agentModels, kind]);
+    const discoveredForAgent = (harnessModels[agent] ?? agentModels[kind] ?? [])
+      .filter((m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id));
+    return mergeModelOptions({
+      curated: staticModels,
+      discovered: discoveredForAgent,
+      selected: model,
+      scoped: CATALOG_SCOPED_KINDS.has(kind),
+    });
+  }, [staticModels, harnessModels, agentModels, agent, kind, model]);
   const efforts = supportedEfforts(kind, model);
 
   useEffect(() => {
@@ -184,6 +202,7 @@ export function useTaskLaunch(open: boolean): TaskLaunch {
     availableHarnesses,
     agents,
     agentModels,
+    harnessModels,
     agent,
     kind,
     selectedStatus,

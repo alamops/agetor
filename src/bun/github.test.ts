@@ -137,6 +137,41 @@ test("parseGitRemote extracts host/owner/name across url syntaxes", () => {
   expect(parseGitRemote("/absolute/path/repo.git")).toBeNull();
 });
 
+// A nested GitLab group ("group/sub/project") has more than one path segment
+// after the owner — all three syntaxes must keep every one of them as `name`
+// (not just the last), matching each other exactly. https used to truncate
+// this to just "sub" (see docs/plans/new-task-from-git-issue.md code review).
+test("parseGitRemote keeps every path segment after the owner as name for a nested GitLab group — https, ssh://, and scp-like all agree", () => {
+  const { parseGitRemote } = __githubInternals;
+  const expected = { host: "gitlab.com", rawHost: "gitlab.com", owner: "group", name: "sub/project" };
+  expect(parseGitRemote("https://gitlab.com/group/sub/project.git")).toEqual(expected);
+  expect(parseGitRemote("https://gitlab.com/group/sub/project")).toEqual(expected);
+  expect(parseGitRemote("ssh://git@gitlab.com/group/sub/project.git")).toEqual(expected);
+  expect(parseGitRemote("git@gitlab.com:group/sub/project.git")).toEqual(expected);
+});
+
+test("parseGitRemote strips a trailing slash (with or without .git) from a nested https/ssh remote", () => {
+  const { parseGitRemote } = __githubInternals;
+  expect(parseGitRemote("https://gitlab.com/group/sub/project.git/")).toEqual({
+    host: "gitlab.com",
+    rawHost: "gitlab.com",
+    owner: "group",
+    name: "sub/project",
+  });
+  expect(parseGitRemote("https://github.com/o/r/")).toEqual({
+    host: "github.com",
+    rawHost: "github.com",
+    owner: "o",
+    name: "r",
+  });
+  expect(parseGitRemote("ssh://git@gitlab.com/group/sub/project.git/")).toEqual({
+    host: "gitlab.com",
+    rawHost: "gitlab.com",
+    owner: "group",
+    name: "sub/project",
+  });
+});
+
 test("matchesFilters matches on assignee login (case-insensitive), rejects non-assignees", () => {
   const item = makeItem();
   expect(matchesFilters(item, "", [], "bob")).toBe(true);
@@ -1395,6 +1430,26 @@ test("getGitHubIssueThread happy path normalizes the issue, follows Link paginat
   }
 });
 
+test("getGitHubIssueThread with includeComments:false skips the comments fetch entirely", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets1b");
+  const mock = mockGitHubFetch([
+    { match: /\/repos\/acme\/widgets1b\/issues\/7$/, json: githubIssue({ html_url: "https://github.com/acme/widgets1b/issues/7" }) },
+    // Deliberately no route for the /comments endpoint — if the adapter
+    // fetched it anyway, mockGitHubFetch would throw "no route for ..." and
+    // fail this test loudly.
+  ]);
+  try {
+    const res = await getGitHubIssueThread({ dir, number: 7, includeComments: false });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.comments).toEqual([]);
+    expect(res.truncated).toBe(false);
+    expect(mock.calls).toHaveLength(1); // issue fetch only
+  } finally {
+    mock.restore();
+  }
+});
+
 test("getGitHubIssueThread stops at the 5-page cap, fetching exactly 500 comments and reporting truncated:true", async () => {
   const dir = await makeGitHubRepo("acme", "bigthread");
   const routes: Parameters<typeof mockGitHubFetch>[0] = [
@@ -1455,14 +1510,33 @@ test("getGitHubIssueThread rejects a payload that carries a pull_request key, me
   }
 });
 
-test("getGitHubIssueThread maps a non-2xx GitHub response to {ok:false, error} the same plain way getGitHubPullDetail does", async () => {
+test("getGitHubIssueThread maps a non-2xx GitHub response through privateRepoHint (unlike getGitHubPullDetail, left alone)", async () => {
   const dir = await makeGitHubRepo("acme", "widgets3");
   const mock = mockGitHubFetch([
     { match: "/repos/acme/widgets3/issues/404", status: 404, json: { message: "Not Found" } },
   ]);
   try {
     const res = await getGitHubIssueThread({ dir, number: 404 });
-    expect(res).toEqual({ ok: false, error: "Not Found" });
+    // GITHUB_TOKEN is set for this whole file (see beforeAll above), so the
+    // hadToken branch of privateRepoHint's message is the one that fires.
+    expect(res).toEqual({
+      ok: false,
+      error: "acme/widgets3 was not found on GitHub — if the repo is private, add a token for github.com in "
+        + "Settings → Git host tokens (the configured token cannot access it — check it belongs to the right account)",
+    });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubIssueThread leaves a non-404 non-2xx response's message unchanged", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets3b");
+  const mock = mockGitHubFetch([
+    { match: "/repos/acme/widgets3b/issues/500", status: 500, json: { message: "Internal Server Error" } },
+  ]);
+  try {
+    const res = await getGitHubIssueThread({ dir, number: 500 });
+    expect(res).toEqual({ ok: false, error: "Internal Server Error" });
   } finally {
     mock.restore();
   }

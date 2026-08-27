@@ -591,15 +591,19 @@ export function canonicalGitHost(host: string): string {
  *  scp-like (`[user@]host:owner/repo`) form. `host` is canonicalized via
  *  canonicalGitHost; `rawHost` is the lowercased pre-canonicalization host
  *  (the ssh alias itself, when one is in play) — callers that need to route a
- *  per-identity token use `rawHost`, not `host`. Returns null for local paths
- *  and anything unrecognized. */
+ *  per-identity token use `rawHost`, not `host`. `name` keeps every path
+ *  segment after the first (owner) — a nested GitLab group like
+ *  `group/sub/project` yields `owner: "group", name: "sub/project"` from ALL
+ *  THREE syntaxes (https, ssh://, scp-like) — with a trailing `.git` and a
+ *  trailing `/` stripped. Returns null for local paths and anything
+ *  unrecognized. */
 export function parseGitRemote(raw: string): { host: string; rawHost: string; owner: string; name: string } | null {
   const remote = raw.trim();
   if (!remote) return null;
 
-  const https = /^https?:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/([^/]+)\/([^/#?]+?)(?:\.git)?(?:[/?#].*)?$/i.exec(remote);
-  const ssh = /^ssh:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/([^/]+)\/(.+?)(?:\.git)?$/i.exec(remote);
-  const scp = /^(?:[^@/\s]+@)?([^/:\s]+):([^/:]+)\/(.+?)(?:\.git)?$/i.exec(remote);
+  const https = /^https?:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/([^/]+)\/(.+?)(?:\.git)?\/?(?:[?#].*)?$/i.exec(remote);
+  const ssh = /^ssh:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/([^/]+)\/(.+?)(?:\.git)?\/?$/i.exec(remote);
+  const scp = /^(?:[^@/\s]+@)?([^/:\s]+):([^/:]+)\/(.+?)(?:\.git)?\/?$/i.exec(remote);
   const m = https ?? ssh ?? scp;
   if (!m) return null;
   const rawHost = m[1]!.toLowerCase();
@@ -1985,15 +1989,24 @@ const ISSUE_THREAD_MAX_PAGES = 5;
  * `GET /repos/:o/:r/issues/:number` plus its full comment thread (up to
  * `ISSUE_THREAD_MAX_PAGES` pages of 100) — the payload behind "create a task
  * from this issue". Mirrors `getGitHubPullDetail`'s repo/token/fetch shape,
- * with two differences: GitHub's `/issues/:number` endpoint also returns pull
- * requests (they share the same underlying object), so a payload carrying a
- * `pull_request` key is rejected before normalizing; and the comments loop
- * follows `link: rel="next"` the same way `listGitHubPullCommits` does.
- * `refetchCommand` is always null here — the facade (`git-host.ts`) fills it
- * in, since it depends on whether `gh` is on PATH, not on anything this
- * function knows.
+ * with three differences: GitHub's `/issues/:number` endpoint also returns
+ * pull requests (they share the same underlying object), so a payload
+ * carrying a `pull_request` key is rejected before normalizing; the comments
+ * loop follows `link: rel="next"` the same way `listGitHubPullCommits` does;
+ * and — unlike `getGitHubPullDetail`, left alone — a 404 on the issue GET is
+ * run through `privateRepoHint` (the same enrichment `listGitHubItems` uses)
+ * so an unauthenticated private-repo 404 points at Settings → Git host
+ * tokens instead of reading as "this issue doesn't exist". `refetchCommand`
+ * is always null here — the facade (`git-host.ts`) fills it in, since it
+ * depends on whether `gh` is on PATH, not on anything this function knows.
+ * `includeComments` (default `true`) lets a caller that only needs the item
+ * itself — "View issue" — skip the comments fetch entirely; `false`
+ * short-circuits to `comments: [], truncated: false` without ever hitting
+ * the comments endpoint.
  */
-export async function getGitHubIssueThread(input: GitHubItemNumberInput): Promise<GitHubIssueThreadResponse> {
+export async function getGitHubIssueThread(
+  input: GitHubItemNumberInput & { includeComments?: boolean },
+): Promise<GitHubIssueThreadResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!Number.isInteger(input.number) || input.number <= 0) {
@@ -2005,12 +2018,16 @@ export async function getGitHubIssueThread(input: GitHubItemNumberInput): Promis
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: privateRepoHint(res.status, apiError(json, res.status, res.statusText), repo, !!token) };
   if (json && typeof json === "object" && "pull_request" in json) {
     return { ok: false, error: `#${input.number} is a pull request, not an issue` };
   }
   const item = normalizeItem("issues", json, input.dir);
   if (!item) return { ok: false, error: "GitHub returned an unexpected issue response" };
+
+  if (input.includeComments === false) {
+    return { ok: true, repo: repoSlug(repo), item, comments: [], truncated: false, refetchCommand: null };
+  }
 
   const comments: GitHubComment[] = [];
   let next: string | null =

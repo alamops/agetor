@@ -40,6 +40,15 @@ async function makeRepoWithNoRemote(): Promise<string> {
   return dir;
 }
 
+/** A throwaway git repo whose `origin` is a GitLab remote at an arbitrary
+ *  (possibly nested-group) path, e.g. `group/sub/project`. */
+async function makeRepoWithGitLabOrigin(ownerRepoPath: string): Promise<string> {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-issue-orch-repo-gl-"));
+  await git(["init", "-b", "main"], dir);
+  await git(["remote", "add", "origin", `https://gitlab.com/${ownerRepoPath}.git`], dir);
+  return dir;
+}
+
 beforeAll(async () => {
   await import("./db.ts");
 });
@@ -70,6 +79,40 @@ test("createTask stores issueUrl, writes the snapshot file under dataDir/issue-t
   const matches = task.references.filter((r) => r.path === snapshotPath);
   expect(matches).toHaveLength(1);
   expect(matches[0]).toEqual({ path: snapshotPath, isDirectory: false });
+});
+
+test("createTask stores issueUrl normalized (normalizeIssueUrl) — a pasted slug tail reads back cut to the issues/<n> segment", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const repo = await makeRepoWithGitHubOrigin("o", "r1n");
+
+  const created = await createTask({
+    title: "Issue #7: fix the thing",
+    prompt: "x",
+    workdir: repo,
+    agent: "claude-code",
+    isolation: "none",
+    issueUrl: "https://github.com/o/r1n/issues/7/some-title?query=1#hash",
+  });
+  if ("error" in created) throw new Error(created.error);
+  // normalizeIssueUrl cuts the slug/query/hash tail — the durable field is
+  // the canonical `…/issues/<n>` form, not the raw pasted string.
+  expect(created.task.issueUrl).toBe("https://github.com/o/r1n/issues/7");
+});
+
+test("createTask accepts a nested GitLab group issue URL against a matching-nested-group remote (parseGitRemote keeps every segment after owner as name)", async () => {
+  const { createTask } = await import("./orchestrator.ts");
+  const repo = await makeRepoWithGitLabOrigin("group/sub/project");
+
+  const created = await createTask({
+    title: "Issue #7: nested group",
+    prompt: "x",
+    workdir: repo,
+    agent: "claude-code",
+    isolation: "none",
+    issueUrl: "https://gitlab.com/group/sub/project/-/issues/7",
+  });
+  if ("error" in created) throw new Error(created.error);
+  expect(created.task.issueUrl).toBe("https://gitlab.com/group/sub/project/-/issues/7");
 });
 
 test("createTask rejects a pull-request URL passed as issueUrl", async () => {

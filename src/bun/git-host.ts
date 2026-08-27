@@ -473,13 +473,24 @@ export async function pullDetail(input: { dir: string; number: number }): Promis
   return { ...res, item: withSourcePath(res.item, input.dir) };
 }
 
+/** Single-quotes a shell argument for interpolation into the commands
+ *  `refetchCommandFor` builds, escaping any embedded single quote as the
+ *  standard POSIX `'\''` (close quote, escaped literal quote, reopen quote).
+ *  Pure — unit-tested directly and via `refetchCommandFor`. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 /**
  * Pure — no I/O — so it's unit-testable without a fake `gh`/`glab` on PATH.
  * Only GitHub and GitLab have a re-fetch CLI: `gh issue view <htmlUrl>
  * --comments` works against GHES hosts too (the URL form, not `--repo`),
  * and `glab issue view <number> --comments --repo <owner/name>` mirrors it
  * for GitLab. Bitbucket has no equivalent CLI, so it's always null; either
- * provider is also null when its CLI isn't on PATH.
+ * provider is also null when its CLI isn't on PATH. `htmlUrl` and `repo`
+ * are single-quoted (`shellQuote`) before interpolation — both come from the
+ * API response, not a fixed shape, so an unescaped embedded `'` (or shell
+ * metacharacter) could otherwise break the command a user copy-pastes.
  */
 export function refetchCommandFor(args: {
   provider: GitProvider;
@@ -490,10 +501,10 @@ export function refetchCommandFor(args: {
   glabAvailable: boolean;
 }): string | null {
   if (args.provider === "github") {
-    return args.ghAvailable ? `gh issue view ${args.htmlUrl} --comments` : null;
+    return args.ghAvailable ? `gh issue view ${shellQuote(args.htmlUrl)} --comments` : null;
   }
   if (args.provider === "gitlab") {
-    return args.glabAvailable ? `glab issue view ${args.number} --comments --repo ${args.repo}` : null;
+    return args.glabAvailable ? `glab issue view ${args.number} --comments --repo ${shellQuote(args.repo)}` : null;
   }
   return null;
 }
@@ -508,20 +519,25 @@ export function refetchCommandFor(args: {
  * has). `refetchCommand` is filled in here, not by the adapters — it depends
  * on whether `gh`/`glab` are on PATH, which is this facade's concern, not
  * theirs. `Bun.which` is called with the `PATH` option (see `agent-status.ts`)
- * — omitting it can silently return null in some environments.
+ * — omitting it can silently return null in some environments. `includeComments`
+ * (default `true`) passes straight through to whichever adapter serves the
+ * request — `false` is what "View issue" uses to fetch just the item.
  */
-export async function issueThread(input: { dir: string; number: number }): Promise<IssueThreadResponse> {
+export async function issueThread(
+  input: { dir: string; number: number; includeComments?: boolean },
+): Promise<IssueThreadResponse> {
   const repoInfo = await providerRepoForDir(input.dir);
   if (!repoInfo) return { ok: false, error: NO_REMOTE_ERROR };
+  const includeComments = input.includeComments ?? true;
 
   let res: IssueThreadResponse;
   if (repoInfo.provider === "github") {
-    res = await getGitHubIssueThread(input);
+    res = await getGitHubIssueThread({ ...input, includeComments });
   } else if (repoInfo.provider === "gitlab") {
-    const r = await getGitLabIssueThread(repoInfo, input.number);
+    const r = await getGitLabIssueThread(repoInfo, input.number, includeComments);
     res = r.ok ? { ...r, item: withSourcePath(r.item, input.dir) } : r;
   } else {
-    const r = await getBitbucketIssueThread(repoInfo, input.number);
+    const r = await getBitbucketIssueThread(repoInfo, input.number, includeComments);
     res = r.ok ? { ...r, item: withSourcePath(r.item, input.dir) } : r;
   }
   if (!res.ok) return res;

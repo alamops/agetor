@@ -683,6 +683,25 @@ test("getBitbucketIssueThread happy path normalizes the issue and its comments",
   }
 });
 
+test("getBitbucketIssueThread with includeComments:false skips listBitbucketComments entirely", async () => {
+  const repo = makeBitbucketRepo("acme", "app1b");
+  const mock = mockGitHubFetch([
+    { match: /\/2\.0\/repositories\/acme\/app1b\/issues\/7$/, json: bitbucketIssueJson() },
+    // Deliberately no route for the /comments endpoint — if the adapter
+    // fetched it anyway, mockGitHubFetch would throw "no route for ..." and
+    // fail this test loudly.
+  ]);
+  try {
+    const res = await getBitbucketIssueThread(repo, 7, false);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.comments).toEqual([]);
+    expect(res.truncated).toBe(false);
+  } finally {
+    mock.restore();
+  }
+});
+
 test("getBitbucketIssueThread maps a 404 WITH credentials present to the issue-tracker-disabled friendly error", async () => {
   const repo = makeBitbucketRepo("acme", "app2");
   const mock = mockGitHubFetch([

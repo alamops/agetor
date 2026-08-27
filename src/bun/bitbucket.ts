@@ -1563,8 +1563,15 @@ export async function getBitbucketPullDetail(repo: ProviderRepoInfo, number: num
  *  2026-08-20; a 404 with credentials sent still maps to the same friendly
  *  "issue tracker is not enabled" hint `createBitbucketIssue` uses, since an
  *  authenticated 404 on this endpoint means the tracker itself is gone, not
- *  that the issue doesn't exist. */
-export async function getBitbucketIssueThread(repo: ProviderRepoInfo, id: number): Promise<BitbucketIssueThreadResponse> {
+ *  that the issue doesn't exist. `includeComments` (default `true`) mirrors
+ *  `getGitHubIssueThread`'s flag — `false` skips `listBitbucketComments`
+ *  entirely and returns `comments: [], truncated: false`, for a caller
+ *  ("View issue") that only needs the item. */
+export async function getBitbucketIssueThread(
+  repo: ProviderRepoInfo,
+  id: number,
+  includeComments = true,
+): Promise<BitbucketIssueThreadResponse> {
   const serverError = bitbucketServerError(repo);
   if (serverError) return { ok: false, error: serverError };
   if (!Number.isInteger(id) || id <= 0) return { ok: false, error: "issue number must be positive" };
@@ -1580,6 +1587,10 @@ export async function getBitbucketIssueThread(repo: ProviderRepoInfo, id: number
   }
   const item = normalizeBitbucketIssue(json, null);
   if (!item) return { ok: false, error: "Bitbucket returned an unexpected issue response" };
+
+  if (!includeComments) {
+    return { ok: true, repo: `${repo.owner}/${repo.name}`, item, comments: [], truncated: false, refetchCommand: null };
+  }
 
   const commentsRes = await listBitbucketComments(repo, id, "issues");
   if (!commentsRes.ok) return commentsRes;

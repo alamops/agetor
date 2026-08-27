@@ -593,6 +593,26 @@ test("getGitLabIssueThread happy path normalizes the issue, drops a system note,
   }
 });
 
+test("getGitLabIssueThread with includeComments:false skips collectGitLabNotes entirely", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    { match: /\/projects\/acme%2Fapp\/issues\/5$/, json: gitlabIssue() },
+    // Deliberately no route for the /notes endpoint — if the adapter fetched
+    // it anyway, mockGitLabFetch would throw "no route for ..." and fail
+    // this test loudly.
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 5, false);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.comments).toEqual([]);
+    expect(res.truncated).toBe(false);
+    expect(mock.calls).toHaveLength(1); // issue fetch only
+  } finally {
+    mock.restore();
+  }
+});
+
 test("getGitLabIssueThread rejects a non-positive/non-integer iid before any fetch", async () => {
   const repo = sampleRepo();
   const mock = mockGitLabFetch([]); // any fetch call would throw — proves none happens
