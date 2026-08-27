@@ -11,6 +11,7 @@ import {
   Ban,
   Bell,
   BellOff,
+  Bot,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -73,6 +74,7 @@ import { isCredentialError } from "@/lib/credential-error";
 import { BinaryFilePreview, binaryFileBasename, binaryPreviewSides } from "./BinaryFilePreview";
 import { binaryPreviewKind } from "../../../shared/attachments.ts";
 import { ResolveConflictsDialog, type ResolveConflictsContext } from "./ResolveConflictsDialog";
+import { CreateTaskFromIssueDialog } from "./CreateTaskFromIssueDialog";
 import {
   backToList,
   openCompose,
@@ -183,16 +185,20 @@ export interface GitHubPullPrefill {
   taskId: string;
 }
 
-/** One-shot prefill for the PR detail subpage (T4, "View PR" from a task's
- *  run panel): selects the given project, switches to the pulls tab, fetches
- *  the single PR by number, and navigates straight to `openDetail(item)` —
- *  landing on the same in-app detail subpage a list click would, instead of
- *  shelling out to the browser. `prUrl` is kept alongside so a fetch failure
- *  can still fall back to the plain external link. */
-export interface GitHubPullDetailPrefill {
+/** One-shot prefill for an item's detail subpage (T4, "View PR" from a task's
+ *  run panel; also "View issue"): selects the given project, switches to the
+ *  matching tab (`kind`), fetches the single item by number, and navigates
+ *  straight to `openDetail(item)` — landing on the same in-app detail
+ *  subpage a list click would, instead of shelling out to the browser.
+ *  `url` is kept alongside so a fetch failure can still fall back to the
+ *  plain external link. Generalized from an earlier PR-only prefill type so
+ *  "View issue" reuses the same one mechanism/guards instead of a parallel
+ *  copy. */
+export interface GitHubItemDetailPrefill {
   projectPath: string;
+  kind: GitHubItemKind;
   number: number;
-  prUrl: string;
+  url: string;
 }
 
 interface Props {
@@ -206,8 +212,9 @@ interface Props {
   pullPrefill?: GitHubPullPrefill | null;
   /** Same one-shot-by-reference contract as `pullPrefill` above, mirrored
    *  with its own ref pair — see the two-part effect pair around
-   *  `pendingPullDetailPrefillRef` below. */
-  pullDetailPrefill?: GitHubPullDetailPrefill | null;
+   *  `pendingItemDetailPrefillRef` below. Covers both "View PR" and
+   *  "View issue" via `GitHubItemDetailPrefill.kind`. */
+  itemDetailPrefill?: GitHubItemDetailPrefill | null;
   onClose: () => void;
   /** Wired from App.tsx: closes this dialog and opens SettingsDialog. Optional
    *  so other mounts (tests, storybook-style usages) don't need to supply it —
@@ -546,7 +553,7 @@ function credentialSetupStep1(provider: GitProvider | "mixed" | null): string {
   }
 }
 
-export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, pullDetailPrefill, onClose, onOpenSettings }: Props) {
+export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, itemDetailPrefill, onClose, onOpenSettings }: Props) {
   const [projectPath, setProjectPath] = useState("");
   // "All repositories" (G8/F15) — see AGGREGATE_PROJECT_PATH.
   const isAggregate = projectPath === AGGREGATE_PROJECT_PATH;
@@ -826,10 +833,11 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // Holds a prefill that part 1 (below) has pointed project/kind at but part
   // 2 (after the composer-reset effect) hasn't applied yet.
   const pendingPullPrefillRef = useRef<GitHubPullPrefill | null>(null);
-  // Same one-shot-by-reference bookkeeping as the pair above, for the PR
-  // detail subpage prefill instead of the New-PR composer prefill.
-  const lastPullDetailPrefillRef = useRef<GitHubPullDetailPrefill | null>(null);
-  const pendingPullDetailPrefillRef = useRef<GitHubPullDetailPrefill | null>(null);
+  // Same one-shot-by-reference bookkeeping as the pair above, for the item
+  // detail subpage prefill (PR or issue, per `kind`) instead of the New-PR
+  // composer prefill.
+  const lastItemDetailPrefillRef = useRef<GitHubItemDetailPrefill | null>(null);
+  const pendingItemDetailPrefillRef = useRef<GitHubItemDetailPrefill | null>(null);
 
   // Wipes every pull + issue composer field, including the prefill task-id
   // tag — the single source of truth for "reset the composers" so the
@@ -885,37 +893,38 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     setKind("pulls");
   }, [open, pullPrefill]);
 
-  // PR-detail prefill consumption, part 1 of 2 — same shape as the New-PR
-  // prefill's part 1 above: point project + kind at the target PR, but leave
-  // the actual fetch-and-navigate to part 2 (declared after the composer-
-  // reset effect) so a project switch has already landed. Also pops any
-  // stale surviving view back to the list: the dialog stays mounted and
+  // Item-detail prefill consumption, part 1 of 2 — same shape as the New-PR
+  // prefill's part 1 above: point project + kind at the target item, but
+  // leave the actual fetch-and-navigate to part 2 (declared after the
+  // composer-reset effect) so a project switch has already landed. Also pops
+  // any stale surviving view back to the list: the dialog stays mounted and
   // `view` survives close (see the close-reset effect below), so reopening
-  // on the SAME project (a same-project "View PR" click, the common case)
-  // leaves `view` on the previous task's `{kind:"detail"}` — and since
-  // `projectPath`/`kind` are then value-no-ops, the `[projectPath, kind]`
-  // reset effect never fires to pop it. Left alone, that stale view would
-  // false-trip part 2's `viewRef.current.kind !== "list"` guard once the
-  // fetch resolves, silently discarding the freshly-fetched PR and leaving
-  // the previous task's PR on screen (the "View PR opens the wrong PR" bug).
-  // A fresh prefill is an explicit navigation, so it pops back to the list
-  // first — which is also what the user sees while the fetch is in flight —
-  // mirroring the New-PR prefill's part 2 below, which unconditionally calls
-  // `setView(openCompose())` on the same "navigation wins" principle. If the
-  // stale view happens to be `compose`, popping it must go through
-  // `resetComposers()` too, to honor the same invariant `exitCompose` documents
-  // below (otherwise `pullPrefillTaskId` stays armed).
+  // on the SAME project (a same-project "View PR"/"View issue" click, the
+  // common case) leaves `view` on the previous task's `{kind:"detail"}` —
+  // and since `projectPath`/`kind` are then value-no-ops, the
+  // `[projectPath, kind]` reset effect never fires to pop it. Left alone,
+  // that stale view would false-trip part 2's `viewRef.current.kind !==
+  // "list"` guard once the fetch resolves, silently discarding the
+  // freshly-fetched item and leaving the previous task's item on screen (the
+  // "View PR opens the wrong PR" bug). A fresh prefill is an explicit
+  // navigation, so it pops back to the list first — which is also what the
+  // user sees while the fetch is in flight — mirroring the New-PR prefill's
+  // part 2 below, which unconditionally calls `setView(openCompose())` on
+  // the same "navigation wins" principle. If the stale view happens to be
+  // `compose`, popping it must go through `resetComposers()` too, to honor
+  // the same invariant `exitCompose` documents below (otherwise
+  // `pullPrefillTaskId` stays armed).
   useEffect(() => {
-    if (!open || !pullDetailPrefill) return;
-    if (lastPullDetailPrefillRef.current === pullDetailPrefill) return;
-    lastPullDetailPrefillRef.current = pullDetailPrefill;
-    pendingPullDetailPrefillRef.current = pullDetailPrefill;
-    setProjectPath(pullDetailPrefill.projectPath);
-    setKind("pulls");
+    if (!open || !itemDetailPrefill) return;
+    if (lastItemDetailPrefillRef.current === itemDetailPrefill) return;
+    lastItemDetailPrefillRef.current = itemDetailPrefill;
+    pendingItemDetailPrefillRef.current = itemDetailPrefill;
+    setProjectPath(itemDetailPrefill.projectPath);
+    setKind(itemDetailPrefill.kind);
     // compose can only be left via resetComposers — see exitCompose below.
     if (viewRef.current.kind === "compose") resetComposers();
     setView((cur) => (cur.kind === "list" ? cur : backToList()));
-  }, [open, pullDetailPrefill, resetComposers]);
+  }, [open, itemDetailPrefill, resetComposers]);
 
   // Stable signal of the aggregate candidate set (G8): the joined project paths
   // when "All repositories" is selected, "" otherwise. Threaded into the reload
@@ -1197,50 +1206,72 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     pendingPullPrefillRef.current = null;
   }, [open, projectPath, kind, pullPrefill]);
 
-  // PR-detail prefill consumption, part 2 of 2 — declared after the reset
+  // Item-detail prefill consumption, part 2 of 2 — declared after the reset
   // effect for the same reason as the New-PR prefill's part 2: the reset
   // effect's `[projectPath, kind]` deps fire in the same pass as part 1's
   // `setProjectPath`/`setKind`, and declaration order makes reset run first,
   // so by the time this runs the list body wouldn't have been popped back
-  // over whatever we're about to set here. Fetches the single PR by number
-  // and navigates to its detail subpage; guards against a stale in-flight
-  // fetch (dialog closed/reopened, or these deps re-firing for another
-  // reason) via the effect's own `cancelled` cleanup flag, same pattern as
-  // any other fetch-in-effect, AND against the user having already navigated
-  // away from the list while the fetch was in flight (`viewRef` — a plain
-  // closure over `view` would only see the value from the render that
-  // started the fetch). Falls back to the plain external link on any
-  // failure — including a well-formed `{ ok: false }` body, in case a future
-  // server change starts returning one instead of a non-2xx status, and
-  // including a fetched item whose URL doesn't match the prefill's `prUrl`
-  // (item numbers are per-repo, so a project-path mismatch upstream could
-  // otherwise land the user on an unrelated repo's PR #N).
+  // over whatever we're about to set here. Fetches the single item by number
+  // (a PR via `getGitHubPullDetail`, an issue via `getGitHubIssueThread`) and
+  // navigates to its detail subpage; guards against a stale in-flight fetch
+  // (dialog closed/reopened, or these deps re-firing for another reason) via
+  // the effect's own `cancelled` cleanup flag, same pattern as any other
+  // fetch-in-effect, AND against the user having already navigated away from
+  // the list while the fetch was in flight (`viewRef` — a plain closure over
+  // `view` would only see the value from the render that started the
+  // fetch). Falls back to the plain external link on any failure —
+  // including a well-formed `{ ok: false }` body, in case a future server
+  // change starts returning one instead of a non-2xx status, and including a
+  // fetched item whose URL doesn't match the prefill's `url` (item numbers
+  // are per-repo, so a project-path mismatch upstream could otherwise land
+  // the user on an unrelated repo's item #N). `normalizePrUrl` is a generic
+  // URL normalizer despite the name — reused here for issues too rather than
+  // adding a duplicate. Mergeability invalidation only applies to PRs; an
+  // issue has no such cache.
   useEffect(() => {
     if (!open) return;
-    const pending = pendingPullDetailPrefillRef.current;
-    if (!pending || projectPath !== pending.projectPath || kind !== "pulls") return;
-    pendingPullDetailPrefillRef.current = null;
+    const pending = pendingItemDetailPrefillRef.current;
+    if (!pending || projectPath !== pending.projectPath || kind !== pending.kind) return;
+    pendingItemDetailPrefillRef.current = null;
     let cancelled = false;
     void (async () => {
       try {
-        const result = await api.getGitHubPullDetail(pending.projectPath, pending.number);
+        const item = await (async () => {
+          if (pending.kind === "pulls") {
+            const result = await api.getGitHubPullDetail(pending.projectPath, pending.number);
+            if (!result?.ok || !result.item) throw new Error("Pull request not found");
+            return result.item;
+          }
+          const result = await api.getGitHubIssueThread(pending.projectPath, pending.number);
+          if (!result?.ok || !result.item) throw new Error("Issue not found");
+          return result.item;
+        })();
         if (cancelled || viewRef.current.kind !== "list") return;
-        if (!result?.ok || !result.item) throw new Error("Pull request not found");
-        if (normalizePrUrl(result.item.htmlUrl) !== normalizePrUrl(pending.prUrl)) {
-          throw new Error("That pull request URL points at a different repository — opening in browser.");
+        if (normalizePrUrl(item.htmlUrl) !== normalizePrUrl(pending.url)) {
+          throw new Error(
+            pending.kind === "pulls"
+              ? "That pull request URL points at a different repository — opening in browser."
+              : "That issue URL points at a different repository — opening in browser.",
+          );
         }
         // This fetch already IS a fresh detail fetch — mark the entry-refresh
         // bookkeeping as done for this key so the refresh-on-detail-entry
         // effect doesn't immediately re-fetch the same thing, while still
         // invalidating mergeability (that effect only ever fetches
         // mergeability, never invalidates a cache it didn't populate).
-        lastDetailRefreshKeyRef.current = itemKey(result.item);
-        invalidateMergeability(itemKey(result.item));
-        setView(openDetail(result.item));
+        lastDetailRefreshKeyRef.current = itemKey(item);
+        if (pending.kind === "pulls") invalidateMergeability(itemKey(item));
+        setView(openDetail(item));
       } catch (err) {
         if (cancelled || viewRef.current.kind !== "list") return;
-        toast.error(err instanceof Error ? err.message : "Could not load the pull request");
-        void api.openExternal(pending.prUrl).catch((e: unknown) => {
+        toast.error(
+          err instanceof Error
+            ? err.message
+            : pending.kind === "pulls"
+              ? "Could not load the pull request"
+              : "Could not load the issue",
+        );
+        void api.openExternal(pending.url).catch((e: unknown) => {
           toast.error(e instanceof Error ? e.message : "Could not open the browser");
         });
       }
@@ -1248,7 +1279,7 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
     return () => {
       cancelled = true;
     };
-  }, [open, projectPath, kind, pullDetailPrefill]);
+  }, [open, projectPath, kind, itemDetailPrefill]);
 
   // Close wipes both composers' field state + prefill bookkeeping, and pops an
   // active compose page back to the list. Without the pull-composer half of
@@ -1262,15 +1293,15 @@ export function GitHubDialog({ open, projects, initialProjectPath, pullPrefill, 
   // Detail/panel views are deliberately left untouched here — survival across
   // a generic close/reopen (no prefill) is intentional. A prefill-driven
   // reopen is a different case and handles its own stale-view pop in the
-  // PR-detail prefill's part 1 effect above, not here.
+  // item-detail prefill's part 1 effect above, not here.
   useEffect(() => {
     if (open) return;
     setView((cur) => (cur.kind === "compose" ? backToList() : cur));
     resetComposers();
     pendingPullPrefillRef.current = null;
     lastPullPrefillRef.current = null;
-    pendingPullDetailPrefillRef.current = null;
-    lastPullDetailPrefillRef.current = null;
+    pendingItemDetailPrefillRef.current = null;
+    lastItemDetailPrefillRef.current = null;
   }, [open, resetComposers]);
 
   const availableLabels = useMemo(() => {
@@ -7171,6 +7202,12 @@ function IssueActions({
   const ownDisabled = isBusy || !canModifyOwn;
   const ownTitle = canModifyOwn ? undefined : PUSH_ONLY_TITLE;
   const nextState = item.state === "open" ? "closed" : "open";
+  // "Work on this with Agetor" — the issue-tracker sibling of PullActions'
+  // "Resolve with Agetor" (`resolveOpen`/`resolveConfirmed` below it). Shown
+  // for every issue regardless of provider or open/closed state (unlike
+  // conflict-resolution, which is a GitHub-only, open-PR-only affordance).
+  const [taskOpen, setTaskOpen] = useState(false);
+  const [taskConfirmed, setTaskConfirmed] = useState(false);
   return (
     <div className="mt-3 rounded-md border border-border/60 bg-card p-3">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -7178,18 +7215,33 @@ function IssueActions({
           <Tag className="size-3.5" />
           Issue actions
         </div>
-        {message && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-success">
-            <CheckCircle2 className="size-3.5" />
-            {message}
-          </span>
-        )}
-        {error && (
-          <span className="inline-flex items-center gap-1 text-[11px] text-danger">
-            <AlertCircle className="size-3.5" />
-            {error}
-          </span>
-        )}
+        {/* Everything after the label is one flex cluster — same rationale as
+            PullActions' header row: with more than two direct children,
+            `justify-between` spreads space evenly across all of them instead
+            of keeping "label" and "controls" as two groups. */}
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="outline" data-testid="issue-work-with-agetor" onClick={() => setTaskOpen(true)}>
+            <Bot className="mr-2 size-3.5" /> Work on this with Agetor
+          </Button>
+          {taskConfirmed && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-success">
+              <CheckCircle2 className="size-3.5" />
+              Task created and started
+            </span>
+          )}
+          {message && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-success">
+              <CheckCircle2 className="size-3.5" />
+              {message}
+            </span>
+          )}
+          {error && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-danger">
+              <AlertCircle className="size-3.5" />
+              {error}
+            </span>
+          )}
+        </div>
       </div>
       <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,0.7fr)_auto]">
         <LabelAssigneeMilestoneFields
@@ -7286,6 +7338,15 @@ function IssueActions({
           )}
         </div>
       )}
+      <CreateTaskFromIssueDialog
+        open={taskOpen}
+        onClose={() => setTaskOpen(false)}
+        context={{ path, number: item.number, url: item.htmlUrl, title: item.title }}
+        onCreated={() => {
+          setTaskConfirmed(true);
+          setTimeout(() => setTaskConfirmed(false), 5_000);
+        }}
+      />
     </div>
   );
 }

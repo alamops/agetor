@@ -1,7 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, ClipboardList, Code2, GitBranch, RefreshCw, SlidersHorizontal } from "lucide-react";
+import {
+  AlertCircle,
+  ChevronLeft,
+  ChevronRight,
+  CircleDot,
+  ClipboardList,
+  Code2,
+  GitBranch,
+  Loader2,
+  RefreshCw,
+  SlidersHorizontal,
+  X,
+} from "lucide-react";
 import { api, type AgentModelMap, type AvailableCommand, type AvailableExtension, type BranchNamingConfig } from "@/lib/api";
 import { mergeModelOptions } from "../../../shared/model-options.ts";
+import {
+  buildIssueTaskPrompt,
+  issueTaskTitle,
+  normalizeIssueUrl,
+  parseIssueUrl,
+  renderIssueThreadMarkdown,
+} from "../../../shared/issue-task.ts";
+import { promptByteOverage } from "../../../shared/prompt-limits.ts";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -85,6 +105,12 @@ interface Props {
       maxMode: boolean;
       references: TaskReference[];
       taskType: TaskType;
+      /** URL of the issue this task was seeded from, when the user loaded
+       *  one via the "From issue" row. Validated + same-repo checked server-side. */
+      issueUrl?: string;
+      /** Full markdown snapshot of the issue + its comment thread — only
+       *  meaningful alongside `issueUrl`. */
+      issueSnapshot?: string;
     },
     options: { start: boolean },
   ) => void;
@@ -164,6 +190,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [taskType, setTaskType] = useState<TaskType>(DEFAULT_TASK_TYPE);
+  // "From issue" row — paste a GitHub/GitLab/Bitbucket issue URL, fetch its
+  // thread for the *selected project*, and seed title/prompt from it. See
+  // `CreateTaskFromIssueDialog` for the sibling flow off the issue detail
+  // page; this is the lighter paste-URL entry point from the sidebar.
+  const [issueUrlDraft, setIssueUrlDraft] = useState("");
+  const [issueBusy, setIssueBusy] = useState(false);
+  const [issueError, setIssueError] = useState<string | null>(null);
+  const [issueLink, setIssueLink] = useState<{ url: string; number: number; snapshot: string } | null>(null);
   // Soft-deleted harnesses are excluded from the picker and the default-
   // fallback logic. The full `harnesses` list is still used for
   // `selectedHarness` lookup so the resolved kind stays correct even for a
@@ -216,6 +250,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
       .then((c) => { if (!cancelled) setBranchConfig(c); })
       .catch(() => { if (!cancelled) setBranchConfig(DEFAULT_BRANCH_CONFIG); });
     return () => { cancelled = true; };
+  }, [workdir]);
+
+  // The issue-thread same-repo guarantee is per project — a linked issue (or
+  // a stale error) from a previously-selected project must not survive a
+  // project switch.
+  useEffect(() => {
+    setIssueLink(null);
+    setIssueError(null);
   }, [workdir]);
 
   // The tag-visible pattern for the current config + type, e.g. `feature/<slug>`.
@@ -492,8 +534,52 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
     setMode(codePlan.plan);
   };
 
+  // Gemini's one-shot tmux launch has no deferred-paste fallback for an
+  // oversized prompt — surfaced here (and blocking submit) rather than
+  // letting it fail at spawn time. Mirrors CreateTaskFromIssueDialog's guard.
+  const promptOverage = promptByteOverage(kind, prompt);
+  const selectedHarnessLabel = selectedHarness?.label ?? agent;
+
   const canSubmit =
-    title.trim() && prompt.trim() && workdir.trim() && (!isolate || branchValidation.ok);
+    title.trim() && prompt.trim() && workdir.trim() && (!isolate || branchValidation.ok)
+    && promptOverage == null;
+
+  // Parses + fetches the pasted issue URL against the *selected project*,
+  // then seeds title (only if empty) and prompt (appended if non-empty) from
+  // the thread — mirrors CreateTaskFromIssueDialog's seeding rules, minus
+  // the dialog's own editable-launch-pickers UI (this form already has one).
+  const loadIssueFromUrl = async () => {
+    const raw = issueUrlDraft.trim();
+    const dir = workdir.trim();
+    if (!raw || issueBusy || !dir) return;
+    const parsed = parseIssueUrl(raw);
+    if (!parsed) {
+      setIssueError("Not a recognized GitHub/GitLab/Bitbucket issue URL");
+      return;
+    }
+    setIssueBusy(true);
+    setIssueError(null);
+    try {
+      const thread = await api.getGitHubIssueThread(dir, parsed.number);
+      if (normalizeIssueUrl(thread.item.htmlUrl) !== normalizeIssueUrl(raw)) {
+        setIssueError("That issue belongs to a different repository than the selected project");
+        return;
+      }
+      if (!title.trim()) setTitle(issueTaskTitle(thread.item));
+      const built = buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt;
+      setPrompt((cur) => (cur.trim() ? `${cur}\n\n${built}` : built));
+      setIssueLink({
+        url: thread.item.htmlUrl,
+        number: parsed.number,
+        snapshot: renderIssueThreadMarkdown(thread),
+      });
+      setIssueUrlDraft("");
+    } catch (e) {
+      setIssueError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setIssueBusy(false);
+    }
+  };
 
   const submit = ({ start }: { start: boolean }) => {
     if (!canSubmit) return;
@@ -519,6 +605,8 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
         maxMode: kind === "cursor" ? maxMode : false,
         references,
         taskType,
+        issueUrl: issueLink?.url,
+        issueSnapshot: issueLink?.snapshot,
       },
       { start },
     );
@@ -537,6 +625,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
     setBaseRef("");
     setReferences([]);
     setDropHint(null);
+    setIssueLink(null);
+    setIssueUrlDraft("");
+    setIssueError(null);
     // Reset the branch field so the next task re-derives from its (now empty)
     // title and gets a fresh unique token; drop any manual override.
     setBranchDirty(false);
@@ -721,6 +812,59 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
               </div>
 
               <div className="space-y-1">
+                <label className="text-muted-foreground">From issue</label>
+                <div className="flex items-center gap-1.5">
+                  <Input
+                    data-testid="issue-url-input"
+                    placeholder="Paste a GitHub/GitLab issue URL"
+                    value={issueUrlDraft}
+                    onChange={(e) => setIssueUrlDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key !== "Enter") return;
+                      e.preventDefault();
+                      void loadIssueFromUrl();
+                    }}
+                    disabled={!workdir.trim()}
+                    title={!workdir.trim() ? "Pick a project first" : undefined}
+                    className="min-w-0 flex-1"
+                  />
+                  <Button
+                    data-testid="issue-url-load"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void loadIssueFromUrl()}
+                    disabled={!workdir.trim() || issueBusy}
+                    title={!workdir.trim() ? "Pick a project first" : undefined}
+                  >
+                    {issueBusy ? <Loader2 className="size-3.5 animate-spin" /> : "Load"}
+                  </Button>
+                </div>
+                {issueError && (
+                  <p className="flex items-center gap-1 text-[10px] text-danger">
+                    <AlertCircle className="size-3 shrink-0" /> {issueError}
+                  </p>
+                )}
+                {issueLink && (
+                  <div
+                    data-testid="issue-link-chip"
+                    className="inline-flex items-center gap-1 rounded border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[11px] text-muted-foreground"
+                  >
+                    <CircleDot className="size-3 shrink-0" />
+                    Issue #{issueLink.number}
+                    <button
+                      type="button"
+                      onClick={() => setIssueLink(null)}
+                      title="Unlink issue"
+                      aria-label="Unlink issue"
+                      className="ml-0.5 text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-1">
                 <label className="text-muted-foreground">Title</label>
                 <Input
                   ref={titleRef}
@@ -770,6 +914,13 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                 </div>
                 {dropHint && (
                   <p className="text-[10px] text-muted-foreground">{dropHint}</p>
+                )}
+                {promptOverage && (
+                  <div className="rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+                    This prompt is {Math.ceil(promptOverage.bytes / 1024)} KB — {selectedHarnessLabel}'s
+                    one-shot launch caps prompts at {Math.floor(promptOverage.limit / 1024)} KB. Pick
+                    another harness or trim the prompt.
+                  </div>
                 )}
               </div>
 

@@ -140,6 +140,7 @@ agetor                       # full-screen live dashboard (board + streaming det
 
 # create · inspect
 agetor add                   # create a task (guided wizard, or --title/--prompt[/--start])
+agetor add --issue <url>     # seed a task from a GitHub/GitLab issue + its thread (uses --workdir or the cwd)
 agetor ls [filters]          # list tasks (--column/--agent/--type/--repo/--search/--archived/--all)
 agetor ps                    # list running / blocked tasks only
 agetor show <id>             # details, runs, pending interactions

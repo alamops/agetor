@@ -53,6 +53,7 @@ const ACTION_GROUP: Record<TaskMenuAction, TaskMenuGroup> = {
   diff: "inspect",
   "open-in-finder": "inspect",
   "view-pr": "inspect",
+  "view-issue": "inspect",
   "mark-read": "utility",
   "mark-unread": "utility",
   "copy-branch": "utility",

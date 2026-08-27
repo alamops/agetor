@@ -14,6 +14,7 @@ export type TaskMenuAction =
   | "diff"
   | "open-in-finder"
   | "view-pr"
+  | "view-issue"
   | "mark-read"
   | "mark-unread"
   | "copy-branch"
@@ -88,6 +89,9 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   entries.push({ action: "open-in-finder", label: "Open in Finder", group: "inspect" });
   if (task.prUrl) {
     entries.push({ action: "view-pr", label: "View pull request", group: "inspect" });
+  }
+  if (task.issueUrl) {
+    entries.push({ action: "view-issue", label: "View issue", group: "inspect" });
   }
 
   // utility — read/unread + copy entries share one group so they render as a
