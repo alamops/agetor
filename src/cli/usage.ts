@@ -19,6 +19,8 @@ export const USAGE: Record<string, string> = {
     --model <id>   --mode <id>   --effort <id>
     --type <t>         task | subtask | epic | feature | bug | spike
     --ref <path>       attach a file/folder reference (repeatable)
+    --issue <url>      seed title/prompt from a GitHub/GitLab issue + its thread
+                        (needs --workdir or cwd inside the repo; --title/--prompt optional)
     --start            run immediately (creates in 'ready', not 'backlog')`,
 
   ls: `usage: agetor ls [filters]

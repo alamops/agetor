@@ -7,6 +7,13 @@ import type { AgetorClient, CreateTaskInput } from "../api-client.ts";
 import { flagValue } from "../args.ts";
 import { resolveRefs, warnMissingRefs } from "../refs.ts";
 import {
+  parseIssueUrl,
+  normalizeIssueUrl,
+  issueTaskTitle,
+  renderIssueThreadMarkdown,
+  buildIssueTaskPrompt,
+} from "../../shared/issue-task.ts";
+import {
   AGENT_OPTIONS,
   DEFAULT_MODEL,
   DEFAULT_EFFORT,
@@ -32,9 +39,12 @@ interface AddOpts {
   type?: string;
   start?: boolean;
   refs: string[];
+  /** Seed title/prompt from a GitHub/GitLab/Bitbucket issue + its comment
+   *  thread — resolved against `--workdir` (or cwd) in `cmdAdd`. */
+  issue?: string;
 }
 
-function parseAdd(args: string[]): AddOpts {
+export function parseAdd(args: string[]): AddOpts {
   const o: AddOpts = { refs: [] };
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -57,6 +67,7 @@ function parseAdd(args: string[]): AddOpts {
       case "--type": o.type = val(); break;
       case "--ref": o.refs.push(val()); break;
       case "--start": o.start = true; break;
+      case "--issue": o.issue = val(); break;
       default: break;
     }
   }
@@ -72,6 +83,27 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
 
   const client = await getClient(flags);
 
+  // `--issue <url>` seeds title/prompt from the issue + its comment thread
+  // (same route the app's issue dialogs and New Task form use) and stamps
+  // `issueUrl`/`issueSnapshot` onto the created task. Resolved against
+  // `--workdir` (or cwd) since the thread fetch needs a repo to match against.
+  let issueUrl: string | undefined;
+  let issueSnapshot: string | undefined;
+  if (o.issue) {
+    const parsed = parseIssueUrl(o.issue);
+    if (!parsed) throw new Error("--issue: not a recognized GitHub/GitLab/Bitbucket issue URL");
+    const workdir = o.workdir ?? process.cwd();
+    const thread = await client.getIssueThread(workdir, parsed.number);
+    if (normalizeIssueUrl(thread.item.htmlUrl) !== normalizeIssueUrl(o.issue)) {
+      throw new Error("--issue: that issue belongs to a different repository than --workdir");
+    }
+    o.title ??= issueTaskTitle(thread.item);
+    prompt ??= buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt;
+    o.workdir = workdir;
+    issueUrl = thread.item.htmlUrl;
+    issueSnapshot = renderIssueThreadMarkdown(thread);
+  }
+
   let input: CreateTaskInput | null;
   if (o.title && prompt) {
     input = baseInput(o, o.title, prompt);
@@ -79,12 +111,16 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     input = await wizard(client, o, prompt);
   } else {
     throw new Error(
-      "agetor add needs --title and --prompt (or --prompt-file) when not run interactively",
+      "agetor add needs --title and --prompt (or --prompt-file), or --issue <url>, when not run interactively",
     );
   }
   if (!input) {
     out("cancelled");
     return;
+  }
+  if (issueUrl) {
+    input.issueUrl = issueUrl;
+    input.issueSnapshot = issueSnapshot;
   }
   if (input.references?.length) warnMissingRefs(input.references);
 

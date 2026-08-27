@@ -1,4 +1,5 @@
 import path from "node:path";import { cursorModelArg, FX_PROVIDER_STATUS_PREFIX, MODEL_EFFORT_SUPPORT, SESSION_DIED_STATUS_PREFIX, type AgentKind, type Harness } from "../shared/types.ts";
+import { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
 import { settleSubagentById } from "./claude-subagents.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
@@ -66,8 +67,12 @@ export const CLAUDE_PROMPT_ARGV_MAX_BYTES = 4096;
  * during the spike that would have confirmed it). Follow up and remove this
  * cap in favor of stdin delivery once confirmed; until then, fail loudly
  * rather than guess at unverified CLI behavior.
+ *
+ * Lives in `src/shared/prompt-limits.ts` (the webview/CLI need it too, to
+ * pre-check an issue-task prompt before ever calling createTask) and is
+ * re-exported here so existing importers of `./agents.ts` keep resolving.
  */
-export const GEMINI_PROMPT_ARGV_MAX_BYTES = 4096;
+export { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
 
 export interface AgentRunOptions {
   /** Friendly mode id; see AGENT_OPTIONS in shared/types.ts. */

@@ -3,6 +3,7 @@ import type {
   GitHubChecksResult,
   GitHubComment,
   GitHubCommentsResult,
+  GitHubIssueThreadResult,
   GitHubItemKind,
   GitHubItemState,
   GitHubLabel,
@@ -94,6 +95,7 @@ type GitLabDiffResponse = ({ ok: true } & TaskDiff) | GitLabError;
 type GitLabPullDefaultsResponse = ({ ok: true } & GitHubPullDefaultsResult) | GitLabError;
 type GitLabIssueResponse = ({ ok: true; item: GitHubListItem; message?: string }) | GitLabError;
 type GitLabCommentsResponse = ({ ok: true } & GitHubCommentsResult) | GitLabError;
+type GitLabIssueThreadResponse = ({ ok: true } & GitHubIssueThreadResult) | GitLabError;
 type GitLabCommentResponse = ({ ok: true; comment: GitHubComment }) | GitLabError;
 type GitLabPullLineCommentResponse = ({ ok: true; comment: GitHubPullLineComment }) | GitLabError;
 type GitLabPullReviewCommentsResponse = ({ ok: true } & GitHubPullReviewCommentsResult) | GitLabError;
@@ -868,14 +870,17 @@ export async function getGitLabPullBlob(
   };
 }
 
-/** Matches `listGitHubComments`'s `GitHubCommentsResponse` shape. Uses the
- *  notes API (`sort=asc&order_by=created_at`, chronological — matching
- *  GitHub's own comment ordering) and **skips system notes** (`system: true`
- *  — GitLab posts automated notes for label/assignee/milestone changes etc.
- *  into the same notes stream; GitHub has no equivalent noise in its
- *  `/issues/:n/comments` endpoint, so filtering keeps the two providers'
- *  comment lists comparable). */
-export async function listGitLabComments(repo: ProviderRepoInfo, number: number, kind: GitHubItemKind): Promise<GitLabCommentsResponse> {
+/**
+ * Shared paging loop behind `listGitLabComments` and `getGitLabIssueThread` —
+ * drains up to 5 pages of `sort=asc&order_by=created_at` notes, skipping
+ * `system: true` notes (see `listGitLabComments`'s doc comment), and reports
+ * `truncated: true` when a next page still existed after the 5-page cap.
+ */
+async function collectGitLabNotes(
+  repo: ProviderRepoInfo,
+  number: number,
+  kind: GitHubItemKind,
+): Promise<{ ok: true; comments: GitHubComment[]; truncated: boolean } | GitLabError> {
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "item number must be positive" };
   const token = await gitlabToken(repo.remoteHost);
   const projectId = encodeProjectId(repo.owner, repo.name);
@@ -895,7 +900,48 @@ export async function listGitLabComments(repo: ProviderRepoInfo, number: number,
     }
     url = resolveNextPage(res, url);
   }
-  return { ok: true, repo: `${repo.owner}/${repo.name}`, itemNumber: number, comments };
+  return { ok: true, comments, truncated: url != null };
+}
+
+/** Matches `listGitHubComments`'s `GitHubCommentsResponse` shape. Uses the
+ *  notes API (`sort=asc&order_by=created_at`, chronological — matching
+ *  GitHub's own comment ordering) and **skips system notes** (`system: true`
+ *  — GitLab posts automated notes for label/assignee/milestone changes etc.
+ *  into the same notes stream; GitHub has no equivalent noise in its
+ *  `/issues/:n/comments` endpoint, so filtering keeps the two providers'
+ *  comment lists comparable). */
+export async function listGitLabComments(repo: ProviderRepoInfo, number: number, kind: GitHubItemKind): Promise<GitLabCommentsResponse> {
+  const res = await collectGitLabNotes(repo, number, kind);
+  if (!res.ok) return res;
+  return { ok: true, repo: `${repo.owner}/${repo.name}`, itemNumber: number, comments: res.comments };
+}
+
+/** Matches `getGitHubIssueThread`'s shape — a single issue by iid, normalized
+ *  through the same `normalizeItem` mapper `getGitLabPullDetail` uses, plus
+ *  its full comment thread via `collectGitLabNotes`. `refetchCommand` is
+ *  always null here — the facade (`git-host.ts`) fills it in. */
+export async function getGitLabIssueThread(repo: ProviderRepoInfo, iid: number): Promise<GitLabIssueThreadResponse> {
+  if (!Number.isInteger(iid) || iid <= 0) return { ok: false, error: "issue number must be positive" };
+  const token = await gitlabToken(repo.remoteHost);
+  const projectId = encodeProjectId(repo.owner, repo.name);
+  const res = await fetchGitLab(`${gitlabApiBase(repo)}/projects/${projectId}/issues/${iid}`, token);
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: errorFrom(res, json, repo, !!token) };
+  const item = normalizeItem("issues", json);
+  if (!item) return { ok: false, error: "GitLab returned an unexpected issue response" };
+
+  const notes = await collectGitLabNotes(repo, iid, "issues");
+  if (!notes.ok) return notes;
+
+  return {
+    ok: true,
+    repo: `${repo.owner}/${repo.name}`,
+    item,
+    comments: notes.comments,
+    truncated: notes.truncated,
+    refetchCommand: null,
+  };
 }
 
 export async function createGitLabComment(repo: ProviderRepoInfo, number: number, kind: GitHubItemKind, body: string): Promise<GitLabCommentResponse> {

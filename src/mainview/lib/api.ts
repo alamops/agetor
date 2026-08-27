@@ -6,6 +6,7 @@ import type {
   BranchNamingConfig,
   ColumnId,
   GlobalEvent,
+  GitHubIssueThreadResult,
   GitHubItemKind,
   GitHubItemState,
   GitHubCheckRun,
@@ -104,6 +105,7 @@ export type {
   GitHubCommentsResult,
   GitHubCommitStatus,
   GitHubCommitStatusResult,
+  GitHubIssueThreadResult,
   GitHubItemKind,
   GitHubItemState,
   GitProvider,
@@ -638,6 +640,12 @@ export const api = {
   getGitHubPullDetail: (path: string, number: number) => {
     const q = new URLSearchParams({ path, number: String(number) });
     return j<{ ok: true; item: GitHubListItem }>(`/github/pull-detail?${q.toString()}`);
+  },
+  /** A single issue plus its full comment thread — powers every "create a
+   *  task from this issue" entry point (dialog, New Task form paste-URL). */
+  getGitHubIssueThread: (path: string, number: number) => {
+    const q = new URLSearchParams({ path, number: String(number) });
+    return j<{ ok: true } & GitHubIssueThreadResult>(`/github/issue-thread?${q.toString()}`);
   },
   getGitHubPullChecks: (input: { path: string; number: number }) => {
     const q = new URLSearchParams({
@@ -1183,6 +1191,14 @@ export const api = {
     column?: ColumnId;
     references?: TaskReference[];
     taskType?: TaskType;
+    /** URL of the issue this task is created from — validated and same-repo
+     *  checked server-side (`createTask`); powers "View issue" and the
+     *  PR-body `Closes #N` prefill. */
+    issueUrl?: string;
+    /** Full markdown snapshot of the issue + its comment thread, written to
+     *  a per-task file and attached as a reference. Only meaningful
+     *  alongside `issueUrl`. */
+    issueSnapshot?: string;
   }) =>
     // retry: false — a replay would create a duplicate task + branch.
     j<Task>("/tasks", { method: "POST", body: JSON.stringify(input) }, { retry: false }),

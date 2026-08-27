@@ -13,6 +13,7 @@ import type {
   GitHubDiscussionComment,
   GitHubDiscussionDetail,
   GitHubDiscussionsResult,
+  GitHubIssueThreadResponse,
   GitHubItemKind,
   GitHubItemState,
   GitHubLabel,
@@ -1972,6 +1973,62 @@ export async function getGitHubPullDetail(input: GitHubItemNumberInput): Promise
   const item = normalizeItem("pulls", json, input.dir);
   if (!item) return { ok: false, error: "GitHub returned an unexpected pull request response" };
   return { ok: true, item };
+}
+
+/** Number of `per_page=100` comment pages the thread fetch will follow before
+ *  giving up and reporting `truncated: true` — a hard cap of 500 comments so
+ *  a runaway issue thread can't turn "create a task from this issue" into an
+ *  unbounded fetch. */
+const ISSUE_THREAD_MAX_PAGES = 5;
+
+/**
+ * `GET /repos/:o/:r/issues/:number` plus its full comment thread (up to
+ * `ISSUE_THREAD_MAX_PAGES` pages of 100) — the payload behind "create a task
+ * from this issue". Mirrors `getGitHubPullDetail`'s repo/token/fetch shape,
+ * with two differences: GitHub's `/issues/:number` endpoint also returns pull
+ * requests (they share the same underlying object), so a payload carrying a
+ * `pull_request` key is rejected before normalizing; and the comments loop
+ * follows `link: rel="next"` the same way `listGitHubPullCommits` does.
+ * `refetchCommand` is always null here — the facade (`git-host.ts`) fills it
+ * in, since it depends on whether `gh` is on PATH, not on anything this
+ * function knows.
+ */
+export async function getGitHubIssueThread(input: GitHubItemNumberInput): Promise<GitHubIssueThreadResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.number) || input.number <= 0) {
+    return { ok: false, error: "issue number must be positive" };
+  }
+
+  const token = await githubToken(repo.remoteHost ?? null);
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  if (json && typeof json === "object" && "pull_request" in json) {
+    return { ok: false, error: `#${input.number} is a pull request, not an issue` };
+  }
+  const item = normalizeItem("issues", json, input.dir);
+  if (!item) return { ok: false, error: "GitHub returned an unexpected issue response" };
+
+  const comments: GitHubComment[] = [];
+  let next: string | null =
+    `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${input.number}/comments?per_page=100`;
+  for (let page = 0; next && page < ISSUE_THREAD_MAX_PAGES; page++) {
+    const commentsRes = await fetchGitHub(next, token, "application/vnd.github+json");
+    if (!("status" in commentsRes)) return commentsRes;
+    const commentsBody = await commentsRes.json().catch(() => null);
+    if (!commentsRes.ok) return { ok: false, error: apiError(commentsBody, commentsRes.status, commentsRes.statusText) };
+    if (!Array.isArray(commentsBody)) return { ok: false, error: "GitHub returned an unexpected comments response" };
+    for (const raw of commentsBody) {
+      const comment = normalizeComment(raw);
+      if (comment) comments.push(comment);
+    }
+    next = pageLinks(commentsRes.headers.get("link"));
+  }
+
+  return { ok: true, repo: repoSlug(repo), item, comments, truncated: next != null, refetchCommand: null };
 }
 
 export async function listGitHubComments(input: GitHubItemNumberInput): Promise<GitHubCommentsResponse> {

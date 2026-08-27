@@ -23,6 +23,7 @@ export async function cmdShow(args: string[], flags: Flags): Promise<void> {
   );
   out(`  ${label("workdir")} ${c.dim(task.workdir)}`);
   if (task.branch) out(`  ${label("branch")} ${task.branch}`);
+  if (task.issueUrl) out(`  ${label("issue")} ${task.issueUrl}`);
   out(`  ${label("prompt")} ${c.dim(truncate(task.prompt, 240))}`);
   if (pending.length > 0) {
     out(
