@@ -154,7 +154,7 @@ export function normalizeIssueUrl(url: string): string {
   const host = parsed.host.toLowerCase().replace(/^www\./, "");
   const segments = parsed.pathname.split("/").filter(Boolean).map((s) => s.toLowerCase());
   const dashIdx = segments.indexOf("-");
-  if (dashIdx >= 0 && segments[dashIdx + 1] === "work_items") {
+  if (dashIdx >= 2 && segments[dashIdx + 1] === "work_items") {
     segments[dashIdx + 1] = "issues";
   }
   const issuesIdx = segments.indexOf("issues");
@@ -237,7 +237,7 @@ export function renderIssueThreadMarkdown(t: {
   lines.push(`- Labels: ${item.labels.length ? item.labels.map((l) => l.name).join(", ") : "(none)"}`);
   lines.push(`- Created: ${item.createdAt}`);
   lines.push(`- Updated: ${item.updatedAt}`);
-  lines.push(commentsError ? `- Comments: not fetched — ${commentsError}` : `- Comments: ${comments.length}`);
+  lines.push(commentsError ? `- Comments: not fetched — ${agentFacingCommentsError(commentsError)}` : `- Comments: ${comments.length}`);
   if (truncated) lines.push(`- Thread truncated at the fetch cap`);
   lines.push("");
   lines.push(`## Description`);
@@ -247,7 +247,7 @@ export function renderIssueThreadMarkdown(t: {
   if (commentsError) {
     lines.push(`## Comments`);
     lines.push("");
-    lines.push(`_(comments were not fetched: ${commentsError})_`);
+    lines.push(`_(comments were not fetched: ${agentFacingCommentsError(commentsError)})_`);
   } else {
     lines.push(`## Comments (${comments.length})`);
     for (const c of comments) {
@@ -284,6 +284,18 @@ const SNAPSHOT_PARAGRAPH_PREFIX = "The complete thread snapshot";
  * when set, the comments phrase becomes "(comments were not fetched)" instead
  * of claiming "all 0 comments" are in the snapshot.
  */
+/** `commentsError` as written for the human (dialog/form/CLI) ends with UI navigation
+ *  advice — "add a token for <host> in Settings → Git host tokens (the configured
+ *  token was rejected …)". The agent can't open Settings, so the prompt and the
+ *  snapshot carry only the reason; the re-fetch command paragraph is the agent's
+ *  actionable path. Pure; exported for tests. */
+export function agentFacingCommentsError(err: string): string {
+  return err
+    .replace(/\s*—\s*add a token\b[^\n]*$/, "")
+    .replace(/\s*\(the configured token[^)]*\)\s*$/, "")
+    .trim();
+}
+
 export function snapshotParagraph(
   n: number,
   commentCount: number,
@@ -400,7 +412,7 @@ export function buildIssueTaskPrompt(
     `Author: ${item.author ? `@${item.author.login}` : "unknown"}`,
     `Labels: ${item.labels.length ? item.labels.map((l) => l.name).join(", ") : "(none)"}`,
     `Opened: ${item.createdAt}`,
-    commentsError ? `Comments: not fetched — ${commentsError}` : `${comments.length} comments`,
+    commentsError ? `Comments: not fetched — ${agentFacingCommentsError(commentsError)}` : `${comments.length} comments`,
   ];
   paragraphs.push(
     [

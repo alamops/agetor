@@ -8,6 +8,7 @@ import {
   sameIssueUrl,
   snapshotParagraph,
   withoutSnapshotParagraph,
+  agentFacingCommentsError,
 } from "./issue-task.ts";
 import type { GitHubComment, GitHubIssueThreadResult, GitHubListItem } from "./types.ts";
 
@@ -492,10 +493,11 @@ describe("renderIssueThreadMarkdown", () => {
 describe("renderIssueThreadMarkdown — commentsError", () => {
   const COMMENTS_ERROR =
     "acme/widgets: GitLab requires a token to read this (401) — add a token for gitlab.com in Settings → Git host tokens";
+  const COMMENTS_REASON = "acme/widgets: GitLab requires a token to read this (401)";
 
   test("metadata bullet reads 'not fetched — <error>' instead of a count", () => {
     const md = renderIssueThreadMarkdown({ ...makeThread(), commentsError: COMMENTS_ERROR });
-    expect(md).toContain(`- Comments: not fetched — ${COMMENTS_ERROR}`);
+    expect(md).toContain(`- Comments: not fetched — ${COMMENTS_REASON}`);
     expect(md).not.toContain("- Comments: 0");
   });
 
@@ -503,7 +505,7 @@ describe("renderIssueThreadMarkdown — commentsError", () => {
     const md = renderIssueThreadMarkdown({ ...makeThread(), commentsError: COMMENTS_ERROR });
     expect(md).toContain("## Comments");
     expect(md).not.toContain("## Comments (0)");
-    expect(md).toContain(`_(comments were not fetched: ${COMMENTS_ERROR})_`);
+    expect(md).toContain(`_(comments were not fetched: ${COMMENTS_REASON})_`);
   });
 
   test("absent commentsError renders the ordinary count bullet and heading, unaffected", () => {
@@ -672,11 +674,12 @@ describe("buildIssueTaskPrompt", () => {
   describe("commentsError (GitLab anonymous-notes 401/403 degradation)", () => {
     const COMMENTS_ERROR =
       "acme/widgets: GitLab requires a token to read this (401) — add a token for gitlab.com in Settings → Git host tokens";
+    const COMMENTS_REASON = "acme/widgets: GitLab requires a token to read this (401)";
 
     test("metadata line reads 'Comments: not fetched — <error>' instead of a count", () => {
       const t = makeThread({ commentsError: COMMENTS_ERROR });
       const { prompt } = buildIssueTaskPrompt({ ...t, snapshotAttached: true });
-      expect(prompt).toContain(`Comments: not fetched — ${COMMENTS_ERROR}`);
+      expect(prompt).toContain(`Comments: not fetched — ${COMMENTS_REASON}`);
       expect(prompt).not.toContain("0 comments");
     });
 
@@ -770,5 +773,19 @@ describe("snapshotParagraph / withoutSnapshotParagraph", () => {
     const attached = buildIssueTaskPrompt({ ...t, snapshotAttached: true }).prompt;
     const omitted = buildIssueTaskPrompt({ ...t, snapshotAttached: false }).prompt;
     expect(withoutSnapshotParagraph(attached)).toBe(omitted);
+  });
+});
+
+describe("agentFacingCommentsError", () => {
+  test("drops the human-only 'add a token … Settings' tail and the rejected-token clause", () => {
+    const human = "acme/widgets: GitLab requires authentication (401) — insufficient_scope — add a token for gitlab.com in Settings → Git host tokens (the configured token was rejected — check it belongs to the right account)";
+    expect(agentFacingCommentsError(human)).toBe("acme/widgets: GitLab requires authentication (401) — insufficient_scope");
+    expect(agentFacingCommentsError("plain reason")).toBe("plain reason");
+  });
+  test("prompt and snapshot never mention Settings when comments weren't fetched", () => {
+    const item: any = { kind: "issues", number: 3, title: "t", state: "open", draft: false, htmlUrl: "https://gitlab.com/g/p/-/issues/3", author: null, assignees: [], milestone: null, body: "b", labels: [], comments: 0, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", closedAt: null, mergedAt: null, locked: false, sourcePath: null };
+    const t = { repo: "g/p", item, comments: [], truncated: false, refetchCommand: null, snapshotAttached: true, commentsError: "g/p: GitLab requires authentication (401) — add a token for gitlab.com in Settings → Git host tokens" };
+    expect(buildIssueTaskPrompt(t).prompt).not.toContain("Settings");
+    expect(renderIssueThreadMarkdown(t)).not.toContain("Settings");
   });
 });

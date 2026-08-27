@@ -15,6 +15,7 @@ import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Unique port, distinct from every other *.test.ts file's AGETOR_API_PORT.
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-issue-thread-endpoint-"));
+const ORIGINAL_DATA_DIR = process.env.AGETOR_DATA_DIR;
 process.env.AGETOR_DATA_DIR = DATA_DIR;
 process.env.AGETOR_API_PORT = "4589";
 
@@ -47,6 +48,10 @@ afterAll(() => {
   // would risk yanking the shared db.ts singleton's sqlite file out from
   // under a still-open connection another *.test.ts file depends on.
   rmTestDataDir(DATA_DIR);
+  // Restore the ambient env so a later-loaded file never inherits a path that
+  // may no longer exist (mirrors bitbucket-network.test.ts).
+  if (ORIGINAL_DATA_DIR === undefined) delete process.env.AGETOR_DATA_DIR;
+  else process.env.AGETOR_DATA_DIR = ORIGINAL_DATA_DIR;
   for (const dir of createdDirs) rmSync(dir, { recursive: true, force: true });
 });
 

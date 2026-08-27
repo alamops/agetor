@@ -943,7 +943,7 @@ test("getGitLabIssueThread degrades on a 401 from /notes with no token — comme
     expect(res.comments).toEqual([]);
     expect(res.truncated).toBe(false);
     expect(res.commentsError).toBeTruthy();
-    expect(res.commentsError).toContain("requires a token");
+    expect(res.commentsError).toContain("requires authentication");
     expect(res.commentsError).toContain("Settings → Git host tokens");
   } finally {
     mock.restore();
@@ -1017,7 +1017,7 @@ test("getGitLabIssueThread still fails outright when the issue itself 404s — u
   }
 });
 
-test("listGitLabComments surfaces the new 401 wording too (requires a token)", async () => {
+test("listGitLabComments surfaces the new 401 wording too (requires authentication)", async () => {
   const repo = sampleRepo();
   const savedToken = process.env.GITLAB_TOKEN;
   delete process.env.GITLAB_TOKEN;
@@ -1028,7 +1028,7 @@ test("listGitLabComments surfaces the new 401 wording too (requires a token)", a
     const res = await listGitLabComments(repo, 49, "issues");
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("expected failure");
-    expect(res.error).toContain("requires a token");
+    expect(res.error).toContain("requires authentication");
     expect(res.error).toContain("Settings → Git host tokens");
   } finally {
     mock.restore();

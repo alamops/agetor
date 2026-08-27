@@ -408,10 +408,10 @@ test("authHint passes non-401/403/404 statuses through unchanged", () => {
   expect(authHint(502, "boom", REPO, true)).toBe("boom");
 });
 
-test("authHint enriches 401 with 'requires a token' wording, distinct from 404's 'not found' wording", () => {
+test("authHint enriches 401 with 'requires authentication' wording, distinct from 404's 'not found' wording", () => {
   const msg = authHint(401, "Unauthorized", REPO, false);
   expect(msg).toContain("acme/app");
-  expect(msg).toContain("requires a token to read this (401)");
+  expect(msg).toContain("requires authentication (401)");
   expect(msg).toContain("Settings → Git host tokens");
   expect(msg).not.toContain("was not found on GitLab");
 });
@@ -697,4 +697,16 @@ test("listGitLabComments (shared by getGitLabIssueThread) excludes system notes 
   } finally {
     mock.restore();
   }
+});
+
+test("authHint keeps GitLab's own 401/403 body message (it often names the real fix) but drops the generic 'NNN Status' fallback", () => {
+  const { authHint } = __gitlabInternals;
+  const REPO = { provider: "gitlab", host: "gitlab.com", remoteHost: "gitlab.com", owner: "acme", name: "widgets" } as const;
+  const scoped = authHint(403, "insufficient_scope", REPO as any, true);
+  expect(scoped).toContain("denied access (403)");
+  expect(scoped).toContain("insufficient_scope");
+  expect(scoped).toContain("Settings → Git host tokens");
+  const generic = authHint(401, "401 Unauthorized", REPO as any, false);
+  expect(generic).toContain("requires authentication (401)");
+  expect(generic).not.toContain("401 Unauthorized");
 });

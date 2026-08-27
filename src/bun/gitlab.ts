@@ -183,8 +183,12 @@ function authHint(status: number, message: string, repo: ProviderRepoInfo, hadTo
       ? `${base} (the configured token cannot access it — check it belongs to the right account)`
       : base;
   }
-  const verb = status === 401 ? "requires a token to read this (401)" : "denied access (403)";
-  const base = `${slug}: GitLab ${verb} — add a token for ${host} in Settings → ${GIT_HOST_TOKENS_SECTION}`;
+  const verb = status === 401 ? "requires authentication (401)" : "denied access (403)";
+  // Keep GitLab's own body message (e.g. `insufficient_scope`) — it often names the
+  // real fix — but drop the generic `NNN Status` fallback `apiError` synthesizes
+  // when the body carried nothing, which would only repeat the status.
+  const detail = message && !/^\d{3}\b/.test(message) ? ` — ${message}` : "";
+  const base = `${slug}: GitLab ${verb}${detail} — add a token for ${host} in Settings → ${GIT_HOST_TOKENS_SECTION}`;
   return hadToken
     ? `${base} (the configured token was rejected — check it belongs to the right account)`
     : base;
@@ -961,6 +965,9 @@ export async function listGitLabComments(repo: ProviderRepoInfo, number: number,
  *  `src/shared/issue-task.ts`) render that honestly instead of claiming the
  *  issue has zero comments. Any other notes failure (5xx, network) still
  *  fails the thread as before. */
+// Known edge: a 401/403 that arrives mid-pagination (token revoked between
+// pages) discards the pages already collected and reports "not fetched" —
+// accepted as-is; the re-fetch command is the recovery path either way.
 export async function getGitLabIssueThread(
   repo: ProviderRepoInfo,
   iid: number,
