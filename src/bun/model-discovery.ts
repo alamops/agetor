@@ -1,8 +1,10 @@
 import { harnesses } from "./db.ts";
-import { harnessEnv } from "./agents.ts";
+import { harnessEnv, resolveBin } from "./agents.ts";
 import {
   refreshDiscoveredModels,
   refreshFxHarnessModels,
+  refreshKindModels,
+  pruneHarnessDiscovery,
   getDiscoveredModels,
   getHarnessDiscoveredModels,
   isDiscoveryReady,
@@ -38,17 +40,22 @@ const DEBOUNCE_MS = 500;
 const DEFAULT_PERIODIC_MS = 15 * 60_000;
 
 /**
- * Every *enabled* fx harness, as an `FxHarnessTarget` (its own `harnessEnv`,
- * so an additional-account `fx-2`-style harness is probed under its own
- * `HOME` override rather than agetor's process env). Disabled harnesses are
- * skipped — they're hidden from every picker, so probing them would just
- * burn a ~0.3-0.9s spawn for a catalog nothing renders.
+ * Every *enabled* fx harness, as an `FxHarnessTarget` (its own `harnessEnv`
+ * and `resolveBin` — so an additional-account `fx-2`-style harness is probed
+ * under its own `HOME` override rather than agetor's process env, *and* a
+ * harness with its own configured `bin` (a second fx install, say) is probed
+ * against that binary rather than the process-wide `AGETOR_FX_BIN ?? "fx"`
+ * default — `resolveBin` is the exact same resolver `agents.ts` uses for
+ * every real fx spawn, so discovery can never target a different binary than
+ * the one a run would actually launch). Disabled harnesses are skipped —
+ * they're hidden from every picker, so probing them would just burn a
+ * ~0.3-0.9s spawn for a catalog nothing renders.
  */
 function discoveryTargets(): FxHarnessTarget[] {
   return harnesses
     .list()
     .filter((h) => h.enabled !== false && h.kind === "fx")
-    .map((h) => ({ harnessId: h.id, env: harnessEnv(h) }));
+    .map((h) => ({ harnessId: h.id, env: harnessEnv(h), bin: resolveBin(h) }));
 }
 
 /**
@@ -103,29 +110,80 @@ function publishIfChanged(): void {
 /**
  * Full sweep: every kind's built-in discoverer plus every enabled fx
  * harness's own account-scoped catalog. Broadcasts `agent_models_changed`
- * for whichever harnesses' lists changed.
+ * for whichever harnesses' lists changed. Never throws — this is called
+ * fire-and-forget (`void refreshAllModels()`) from index.ts/headless.ts at
+ * boot and from the periodic timer, with no caller left to observe a
+ * rejection, so a failure here must degrade to a logged no-op rather than an
+ * unhandled-rejection crash risk.
+ *
+ * `discoveryTargets` is passed as a thunk, not its already-called result —
+ * `refreshDiscoveredModels` resolves it only once this call's turn in the
+ * serialized queue actually starts, so a sweep that was enqueued behind
+ * another in-flight refresh still sees any harness created/deleted in the
+ * meantime, rather than pruning it from a stale snapshot taken at enqueue
+ * time.
  */
 export async function refreshAllModels(): Promise<void> {
-  await refreshDiscoveredModels({ fxHarnesses: discoveryTargets() });
-  publishIfChanged();
+  try {
+    await refreshDiscoveredModels({ fxHarnesses: discoveryTargets });
+    publishIfChanged();
+  } catch (err) {
+    console.error("[agetor] model discovery failed:", err);
+  }
 }
 
 /**
- * Refreshes exactly one harness. For fx this probes that harness's own
- * account-scoped catalog directly; for every other kind (and for an
- * unknown/deleted harness id, which can't be resolved to a kind) there's no
- * single-kind refresh exposed by `agent-discovery.ts` — kind-level lists are
- * shared across every harness of that kind — so it falls back to a full
- * sweep. Either way, broadcasts on change.
+ * Refreshes exactly one harness — kind-targeted, not a five-kind sweep:
+ * an unknown/deleted harness id does nothing at all (there's nothing to
+ * refresh and no kind to resolve it to); fx probes that harness's own
+ * account-scoped catalog directly (`refreshFxHarnessModels`, keyed by
+ * harness id, since fx's catalog varies per harness); every other kind
+ * refreshes just that kind's shared cache (`refreshKindModels` — kind-level
+ * lists are shared across every harness of that kind, so there's nothing
+ * harness-specific left to probe beyond the kind itself). Publishes at most
+ * once per call either way. Never throws — every call site here fires this
+ * unawaited (`void refreshHarnessModels(...)`), so a failure must degrade to
+ * a logged no-op.
  */
 export async function refreshHarnessModels(harnessId: string): Promise<void> {
   const harness = harnesses.get(harnessId);
-  if (harness && harness.kind === "fx") {
-    await refreshFxHarnessModels({ harnessId: harness.id, env: harnessEnv(harness) });
-  } else {
-    await refreshAllModels();
+  if (!harness) return;
+  try {
+    if (harness.kind === "fx") {
+      await refreshFxHarnessModels({ harnessId: harness.id, env: harnessEnv(harness), bin: resolveBin(harness) });
+    } else {
+      await refreshKindModels(harness.kind);
+    }
+    publishIfChanged();
+  } catch (err) {
+    console.error("[agetor] model discovery failed:", err);
   }
-  publishIfChanged();
+}
+
+/**
+ * Called when a harness is deleted: prunes its per-harness discovery cache
+ * entry (no probe — there's nothing left to refresh) and drops its
+ * transition-detector bookkeeping (`lastStatusKey` + any pending debounce
+ * timer, see `noteHarnessStatuses`) so a deleted harness id can't linger in
+ * either map forever, then publishes once so any UI holding the deleted
+ * harness's stale catalog gets the same "it's gone" signal a full sweep
+ * would have produced — cheaper than `refreshAllModels()`, which the DELETE
+ * route used to call just to exercise its own pruning-by-absence logic.
+ * Never throws, matching every other scheduler entry point.
+ */
+export function noteHarnessRemoved(harnessId: string): void {
+  try {
+    pruneHarnessDiscovery(harnessId);
+    lastStatusKey.delete(harnessId);
+    const timer = pendingDebounce.get(harnessId);
+    if (timer) {
+      clearTimeout(timer);
+      pendingDebounce.delete(harnessId);
+    }
+    publishIfChanged();
+  } catch (err) {
+    console.error("[agetor] model discovery failed:", err);
+  }
 }
 
 /**
@@ -167,6 +225,11 @@ function scheduleDebouncedRefresh(harnessId: string): void {
     // caller to observe a rejection.
     refreshHarnessModels(harnessId).catch(() => { /* swallow */ });
   }, DEBOUNCE_MS);
+  // Matches every other background timer in this file/index.ts/headless.ts:
+  // a debounce timer must never by itself keep the process alive past its
+  // own idle-shutdown / before-quit path. `.unref?.()` since some
+  // lightweight test environments' timer objects don't implement it.
+  timer.unref?.();
   pendingDebounce.set(harnessId, timer);
 }
 
@@ -177,17 +240,38 @@ function scheduleDebouncedRefresh(harnessId: string): void {
  * harness whose `{available, path, version, loggedIn}` key changed since the
  * last sighting schedules a debounced (500ms, per-harness, resettable)
  * refresh — this is what picks up `fx login`, an install, or a binary/version
- * swap without waiting for the 15-minute periodic sweep. Never throws.
+ * swap without waiting for the 15-minute periodic sweep.
+ *
+ * `checkAllHarnesses()` (the sole real caller, via `GET /harnesses`) always
+ * probes every harness currently in the DB, so any harness id present in
+ * `lastStatusKey`/`pendingDebounce` but absent from this call's `statuses`
+ * has been deleted since the previous poll — those entries are pruned (and
+ * any pending debounce timer for them cleared) so both maps can't grow
+ * unboundedly over a long-lived process's lifetime. (Deletion also goes
+ * through `noteHarnessRemoved`, which prunes immediately rather than waiting
+ * for the next poll — this is the backstop for any harness removal that
+ * doesn't route through it.) Never throws.
  */
 export function noteHarnessStatuses(statuses: HarnessStatus[]): void {
   try {
+    const seen = new Set<string>();
     for (const s of statuses) {
+      seen.add(s.harnessId);
       const key = statusKey(s);
       const prev = lastStatusKey.get(s.harnessId);
       lastStatusKey.set(s.harnessId, key);
       if (prev === undefined) continue; // first sight — boot already discovered
       if (prev === key) continue; // unchanged
       scheduleDebouncedRefresh(s.harnessId);
+    }
+    for (const harnessId of [...lastStatusKey.keys()]) {
+      if (seen.has(harnessId)) continue;
+      lastStatusKey.delete(harnessId);
+      const timer = pendingDebounce.get(harnessId);
+      if (timer) {
+        clearTimeout(timer);
+        pendingDebounce.delete(harnessId);
+      }
     }
   } catch {
     /* never throws */
@@ -234,4 +318,10 @@ function resetForTests(): void {
 export const __testing = {
   resetForTests,
   pendingRefreshCount: () => pendingDebounce.size,
+  /** The raw pending debounce timer for one harness id, if any — used to
+   *  assert it's `.unref()`'d without exposing the whole map. */
+  debounceTimerFor: (harnessId: string) => pendingDebounce.get(harnessId),
+  /** Whether `noteHarnessStatuses` is still tracking a transition key for
+   *  this harness id — used to assert pruning-by-absence. */
+  hasLastStatusKey: (harnessId: string) => lastStatusKey.has(harnessId),
 };

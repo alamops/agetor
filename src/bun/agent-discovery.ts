@@ -220,18 +220,41 @@ function parseFxModels(stdout: string): DiscoveredModel[] {
  * from fx's CLI, so every discovered entry is `{id}` only — the picker falls
  * back to rendering the bare id, same as codex.
  */
-async function discoverFx(env?: Record<string, string>): Promise<DiscoveredModel[]> {
+/**
+ * The default fx binary resolution — `AGETOR_FX_BIN ?? "fx"`, rehydrated
+ * against `process.env.PATH` — used whenever a caller doesn't hand in an
+ * explicit `bin` (see `discoverFx` below). Factored out so the "is this
+ * target indistinguishable from the built-in/kind-level probe" checks in
+ * `runRefresh`/`runRefreshFxHarnessModels` can compare a target's `bin`
+ * against this same computation instead of re-deriving it inline.
+ */
+function defaultFxBin(): string {
+  const fallback = process.env.AGETOR_FX_BIN ?? "fx";
+  return Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+}
+
+async function discoverFx(env?: Record<string, string>, bin?: string): Promise<DiscoveredModel[]> {
   // Resolve exactly the way discoverCodex/discoverCursor do above:
   // rehydrated-PATH lookup only — no import of the sqlite-backed database
   // module (which opens+migrates the DB as an import-time side effect) and
   // no import of the process-spawning agents/harness-env module (whose
   // module chain registers fx's process signal handlers) — neither belongs
   // in a module whose whole contract is "best-effort, never a hard
-  // dependency, never throws". The optional `env` parameter is not an
-  // exception to that: it's a plain key-value bag the *caller* builds one
-  // layer up (from `harnessEnv(harness)`) and hands in, never a harness
-  // object or a DB read performed here — this module stays a leaf, callers
-  // pass envs in.
+  // dependency, never throws". The optional `env`/`bin` parameters are not
+  // an exception to that: they're plain values the *caller* builds one
+  // layer up (`env` from `harnessEnv(harness)`, `bin` from
+  // `resolveBin(harness)` — both in `agents.ts`) and hands in, never a
+  // harness object or a DB read performed here — this module stays a leaf,
+  // callers pass resolved values in.
+  //
+  // `bin`, when given, is preferred outright over the `AGETOR_FX_BIN ?? "fx"`
+  // fallback below — a harness's own configured `bin` (set by the user when
+  // adding an alias, e.g. a second fx install) must win over agetor's
+  // process-wide default, the same way every other harness kind's spawn
+  // already resolves `harness.bin` first (see `resolveBin` in `agents.ts`).
+  // Before this parameter existed, discovery silently ignored a harness's
+  // `bin` and always probed the process-wide default binary regardless of
+  // which harness was actually being refreshed.
   //
   // The whole body is wrapped below (try/catch → []) as a backstop: even a
   // future change here that starts throwing synchronously must still
@@ -239,16 +262,20 @@ async function discoverFx(env?: Record<string, string>): Promise<DiscoveredModel
   // alongside the other four discoverers and one throw must never strand
   // them all.
   try {
-    const fallback = process.env.AGETOR_FX_BIN ?? "fx";
-    const bin = Bun.which(fallback, { PATH: process.env.PATH }) ?? fallback;
+    const resolved = bin ?? defaultFxBin();
     // Confirm the binary actually resolves before spending a probe on it —
     // an unresolvable name (fx not installed) would otherwise just make
     // Bun.spawn throw inside runProbe, which is caught there too, but
     // bailing here skips the spawn attempt entirely and reads clearer as
-    // "skipped".
-    const resolvable = isAbsolute(bin) ? existsSync(bin) : Bun.which(bin, { PATH: process.env.PATH }) !== null;
+    // "skipped". Same absolute-path/bare-name split for an explicit `bin` as
+    // for the fallback: an absolute path (the only shape `harness.bin` can
+    // ever hold — server.ts validates it) is checked with `existsSync`; a
+    // bare name is resolved against PATH.
+    const resolvable = isAbsolute(resolved)
+      ? existsSync(resolved)
+      : Bun.which(resolved, { PATH: process.env.PATH }) !== null;
     if (!resolvable) return [];
-    const probe = await runProbe([bin, "models", "--json"], env);
+    const probe = await runProbe([resolved, "models", "--json"], env);
     if (!probe.ok || !probe.stdout) return [];
     return parseFxModels(probe.stdout);
   } catch {
@@ -257,15 +284,35 @@ async function discoverFx(env?: Record<string, string>): Promise<DiscoveredModel
 }
 
 /**
+ * True when `target` is indistinguishable from the kind-level built-in probe
+ * (`discoverFx()` with no args) — no env override AND either no `bin` at all
+ * or a `bin` that resolves to exactly the same binary the no-args call would
+ * pick. Used to decide whether a per-harness fx probe can (a) reuse the
+ * kind-level result instead of spawning fx a second time for an identical
+ * probe, and (b) drift-correct the kind-level "fx" cache. A target with a
+ * *different* `bin` — even with an empty `env` — is a different binary (and
+ * possibly a different account), so it must never share either shortcut.
+ */
+function isBuiltinLikeFxTarget(target: FxHarnessTarget): boolean {
+  if (Object.keys(target.env).length !== 0) return false;
+  return target.bin === undefined || target.bin === defaultFxBin();
+}
+
+/**
  * One fx harness to probe for its own account-scoped catalog. `env` is the
  * harness's spawn-env overrides (typically a `HOME` override for an
  * additional-account harness, mirroring `harnessEnv(harness)` one layer up
  * in `agents.ts`) — an empty object means "the built-in fx harness, probe
  * under agetor's own process env, same account as the kind-level cache".
+ * `bin`, when given, is the harness's own resolved binary path (mirroring
+ * `resolveBin(harness)` in `agents.ts` — the same resolver every real fx
+ * spawn uses) — omitted, discovery falls back to `AGETOR_FX_BIN ?? "fx"`,
+ * same as before this field existed.
  */
 export interface FxHarnessTarget {
   harnessId: string;
   env: Record<string, string>;
+  bin?: string;
 }
 
 const cache = new Map<AgentKind, DiscoveredModel[]>();
@@ -317,11 +364,20 @@ export function getHarnessDiscoveredModels(harnessId: string): DiscoveredModel[]
 
 /**
  * A fresh snapshot object of every known harness's discovered models.
- * Callers get their own plain object each call, never a live view into the
- * internal `Map`.
+ * Callers get their own plain object each call, *and* their own copy of
+ * each harness's array — `Object.fromEntries(harnessCache)` alone would
+ * still hand out the same array *references* stored in the Map, so a caller
+ * mutating a returned array would silently corrupt the live cache. Test-only
+ * in practice (production reads go through `getHarnessDiscoveredModels`/
+ * `getHarnessModelMap`), but the "never a live view" contract should hold
+ * regardless of caller.
  */
 export function getAllHarnessDiscoveredModels(): Record<string, DiscoveredModel[]> {
-  return Object.fromEntries(harnessCache);
+  const out: Record<string, DiscoveredModel[]> = {};
+  for (const [harnessId, models] of harnessCache) {
+    out[harnessId] = [...models];
+  }
+  return out;
 }
 
 /**
@@ -334,17 +390,25 @@ export function isDiscoveryReady(): boolean {
   return ready;
 }
 
-async function runRefresh(opts?: { fxHarnesses?: FxHarnessTarget[] }): Promise<void> {
+/**
+ * `opts.fxHarnesses` may be given as a plain array, or as a thunk returning
+ * one — see `refreshDiscoveredModels`'s doc comment for why the thunk form
+ * exists.
+ */
+export type FxHarnessTargetsOption = FxHarnessTarget[] | (() => FxHarnessTarget[]);
+
+async function runRefresh(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Promise<void> {
   try {
     // Promise.allSettled, not Promise.all: every discoverer above is already
     // internally best-effort (probe failures resolve to []), but this is the
     // backstop against one of them throwing anyway (a stray import-time or
-    // synchronous bug) — index.ts/headless.ts call this as a bare
-    // `void refreshDiscoveredModels()` at boot, so an unhandled rejection
-    // here surfaces as an unhandled-rejection crash risk, and with
-    // Promise.all a single rejection would strand every OTHER kind's cache
-    // (they'd never get set, staying whatever they were before — empty on
-    // first boot) even though only one kind actually failed.
+    // synchronous bug) — index.ts/headless.ts call `refreshAllModels()`
+    // (model-discovery.ts, which wraps this function) as a bare
+    // `void refreshAllModels()` at boot, so an unhandled rejection here
+    // surfaces as an unhandled-rejection crash risk, and with Promise.all a
+    // single rejection would strand every OTHER kind's cache (they'd never
+    // get set, staying whatever they were before — empty on first boot)
+    // even though only one kind actually failed.
     const results = await Promise.allSettled([
       discoverCodex(),
       discoverClaude(),
@@ -357,15 +421,25 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTarget[] }): Promise<v
       cache.set(kinds[i]!, result.status === "fulfilled" ? result.value : []);
     });
 
-    const targets = opts?.fxHarnesses;
+    // Resolve a thunk *here*, inside the enqueued run, not back at the
+    // `refreshDiscoveredModels` call site — a caller (e.g. `refreshAllModels`,
+    // which passes its `discoveryTargets` function directly) may enumerate a
+    // harness list that changes between "this call was enqueued" and "this
+    // call actually runs" (a concurrent create/delete while a sweep is
+    // queued behind another in-flight run). Resolving late is what keeps a
+    // queued sweep from pruning a harness that was created after the sweep
+    // was enqueued but before it started running.
+    const targetsOpt = opts?.fxHarnesses;
+    const targets = typeof targetsOpt === "function" ? targetsOpt() : targetsOpt;
     if (targets) {
-      // Reuse the kind-level fx result computed just above for any
-      // built-in-account target (empty env) instead of spawning fx a second
-      // time for what would be an identical probe.
+      // Reuse the kind-level fx result computed just above for any target
+      // that's indistinguishable from that probe (no env override, and
+      // either no `bin` or a `bin` matching the default resolution) instead
+      // of spawning fx a second time for what would be an identical probe.
       const builtIn = cache.get("fx") ?? [];
       const targetResults = await Promise.allSettled(
         targets.map((target) =>
-          Object.keys(target.env).length === 0 ? Promise.resolve(builtIn) : discoverFx(target.env),
+          isBuiltinLikeFxTarget(target) ? Promise.resolve(builtIn) : discoverFx(target.env, target.bin),
         ),
       );
       const seen = new Set<string>();
@@ -392,25 +466,36 @@ async function runRefresh(opts?: { fxHarnesses?: FxHarnessTarget[] }): Promise<v
  * `opts.fxHarnesses` is given, the harness-level fx cache too. Calls are
  * serialized through `enqueue` (see its comment) so two overlapping calls
  * with different `fxHarnesses` target lists can't drop either one's targets.
+ *
+ * `opts.fxHarnesses` accepts a thunk (`() => FxHarnessTarget[]`) as well as
+ * a plain array — `runRefresh` resolves it only once its turn in the queue
+ * actually starts, so a target list built from a live DB read (as
+ * `refreshAllModels`'s `discoveryTargets` is) reflects the harness set at
+ * *run* time, not at the moment this function was called and possibly left
+ * waiting behind another in-flight refresh.
  */
-export function refreshDiscoveredModels(opts?: { fxHarnesses?: FxHarnessTarget[] }): Promise<void> {
+export function refreshDiscoveredModels(opts?: { fxHarnesses?: FxHarnessTargetsOption }): Promise<void> {
   return enqueue(() => runRefresh(opts));
 }
 
 async function runRefreshFxHarnessModels(target: FxHarnessTarget): Promise<DiscoveredModel[]> {
   let models: DiscoveredModel[];
   try {
-    models = Object.keys(target.env).length === 0 ? await discoverFx() : await discoverFx(target.env);
+    models = isBuiltinLikeFxTarget(target) ? await discoverFx() : await discoverFx(target.env, target.bin);
   } catch {
     models = [];
   }
   harnessCache.set(target.harnessId, models);
-  // An empty env *is* the built-in fx harness's account, so drift-correct
+  // A target indistinguishable from the built-in kind-level probe (empty
+  // env, no distinguishing bin — see `isBuiltinLikeFxTarget`) drift-corrects
   // the kind-level cache too — otherwise a manual refresh of just the
   // built-in harness would update harnessCache but leave
   // `getDiscoveredModels("fx")` (still read by every non-harness-aware
-  // caller) stale until the next full sweep.
-  if (Object.keys(target.env).length === 0) {
+  // caller) stale until the next full sweep. A target with its own `bin`
+  // (a distinct binary/account even with an empty env) must NOT drift-
+  // correct the shared kind-level cache — that would blend a harness
+  // alias's catalog into the built-in's.
+  if (isBuiltinLikeFxTarget(target)) {
     cache.set("fx", models);
   }
   return models;
@@ -424,6 +509,68 @@ async function runRefreshFxHarnessModels(target: FxHarnessTarget): Promise<Disco
  */
 export function refreshFxHarnessModels(target: FxHarnessTarget): Promise<DiscoveredModel[]> {
   return enqueue(() => runRefreshFxHarnessModels(target));
+}
+
+async function runRefreshKind(kind: AgentKind): Promise<void> {
+  let models: DiscoveredModel[];
+  try {
+    switch (kind) {
+      case "codex":
+        models = await discoverCodex();
+        break;
+      case "claude-code":
+        models = await discoverClaude();
+        break;
+      case "cursor":
+        models = await discoverCursor();
+        break;
+      case "gemini":
+        models = await discoverGemini();
+        break;
+      case "fx":
+        models = await discoverFx();
+        break;
+    }
+  } catch {
+    models = [];
+  }
+  cache.set(kind, models);
+}
+
+/**
+ * Refreshes exactly one agent kind's kind-level cache — cheaper than the
+ * five-kind `refreshDiscoveredModels` sweep when only one harness's
+ * availability/config changed (see model-discovery.ts's
+ * `refreshHarnessModels`, which routes every non-fx harness edit here
+ * instead of a full sweep). Runs through the same serialized queue as
+ * `refreshDiscoveredModels`/`refreshFxHarnessModels` so it can't race a
+ * concurrent full sweep or per-harness fx probe.
+ *
+ * `kind: "fx"` only refreshes the kind-level "fx" entry (the built-in
+ * account's catalog, as exposed by `getDiscoveredModels("fx")` and the
+ * byte-compatible `GET /agent-models` endpoint) — it never touches any
+ * per-harness cache entry. fx's own harness-scoped catalogs are always
+ * refreshed through `refreshFxHarnessModels` instead (model-discovery.ts's
+ * `refreshHarnessModels` routes every fx harness, built-in or alias, there
+ * rather than here), since fx's catalog varies per harness while every
+ * other kind's is shared.
+ */
+export function refreshKindModels(kind: AgentKind): Promise<void> {
+  return enqueue(() => runRefreshKind(kind));
+}
+
+/**
+ * Drops one harness's entry from the per-harness discovered-models cache.
+ * No probe, no queue hop — cheap and synchronous. Used when a harness is
+ * deleted: there's nothing left to refresh, only stale cache state to clear
+ * so it doesn't linger in `getAllHarnessDiscoveredModels()`/
+ * `getHarnessDiscoveredModels()` forever (the alternative, a full
+ * `refreshDiscoveredModels` sweep just to exercise its own pruning-by-
+ * absence logic, would re-probe every other kind and every other fx harness
+ * for no reason).
+ */
+export function pruneHarnessDiscovery(harnessId: string): void {
+  harnessCache.delete(harnessId);
 }
 
 /**

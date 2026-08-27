@@ -154,3 +154,11 @@ Defaults taken where the owner didn't object (reversible at approval):
 | Existing tasks pinned to a now-unavailable model | out of scope — user data, not rewritten (see §7) |
 | Codex discovery returning 0 ids | out of scope — unrelated probe, separate ticket |
 | Onboarding checklist / Settings mentioning fx models | none exist (grep) — nothing to do |
+
+## 10. Outcome (appended after delivery, 2026-08-27)
+
+- Commits on `feature/update-available-models-in-fx-sh`: `a4ea3cc` wave 1, `c52e820` wave 2, wave 3 = review fixes + tests (this commit).
+- Phase 5 review (opus, repo `code-review` skill): 0 must-fix / 5 should-fix / 7 nice-to-have — all twelve fixed (harness `bin` honored by discovery, kind-targeted refreshes, `pruneHarnessDiscovery`/`noteHarnessRemoved`, 404 on unknown `?harness=`, try/catch on fire-and-forget refreshes, `lastStatusKey` pruning + unref'd debounce, thunked target list, identity-preserving picker state, unlisted-model hint in the details picker, CLI/doc drift).
+- Tests: `bun run typecheck` clean; `bun test` 3716 pass / 0 fail / 3 skip (192 files; skips are pre-existing tmux-unavailable cases); Playwright 50/50 (14 specs, default workers) after fixing a **pre-existing** cross-spec leak surfaced by the added spec — `App.tsx:1624` seeds the Git dialog's project from `tasks[0]?.workdir`, so `fx-interactions.spec.ts`'s started tmpdir tasks hijacked `pr-merged-state.spec.ts`'s dialog whenever the two shared a worker; fixed test-only (explicit project selection + afterAll cleanup).
+- Spike artifacts: `fx models --json` authenticated (158) vs empty-`HOME` (230); headless-daemon boot-race timing (`fx=0` at t+0/0.5 s, 158 at t+1 s).
+- Out of scope, noted: codex discovery returned 0 ids in the spike; the `todo-progress` spec fails only under `--workers=1` (a mode the suite isn't designed for); tasks pinned to a now-unavailable fx model are shown as an unlisted row, never rewritten.

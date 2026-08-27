@@ -263,7 +263,11 @@ export class AgetorClient {
   }
   /** Force a fresh discovery sweep. Omit `harnessId` to refresh every
    *  enabled harness; pass one to refresh just that harness (e.g. right
-   *  after `fx login`). Returns the same kind map as `agentModels()`. */
+   *  after `fx login`). Returns the same kind-keyed map as `agentModels()`
+   *  — byte-compatible with that route, so a refresh of a non-built-in fx
+   *  harness (e.g. `fx-2`) is NOT reflected in this response (the kind map
+   *  only ever carries the built-in fx harness's list). Callers that need
+   *  the per-harness view must call `harnessModels()` afterwards. */
   refreshAgentModels(harnessId?: string): Promise<Record<string, { id: string; label?: string }[]>> {
     const qs = harnessId ? `?harness=${encodeURIComponent(harnessId)}` : "";
     return this.req("POST", `/agent-models${qs}`);

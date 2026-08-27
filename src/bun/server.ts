@@ -148,6 +148,7 @@ import { getDiscoveredModels } from "./agent-discovery.ts";
 import {
   refreshAllModels,
   refreshHarnessModels,
+  noteHarnessRemoved,
   getHarnessModelMap,
   noteHarnessStatuses,
 } from "./model-discovery.ts";
@@ -3058,8 +3059,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             const updated = harnesses.update(req.params.id, patch);
             // home/bin/env can each change which account's (or which
             // binary's) catalog this harness resolves to — re-probe rather
-            // than let the picker show a stale list until the next
-            // periodic sweep.
+            // than let the picker show a stale list until the next periodic
+            // sweep. `refreshHarnessModels` → `resolveBin(harness)` (the
+            // same resolver every real fx spawn uses) is what makes a `bin`
+            // edit actually change what gets probed, not just what gets
+            // spawned.
             void refreshHarnessModels(updated.id);
             return json(updated, { headers: corsHeaders(req) });
           } catch (e) {
@@ -3073,9 +3077,13 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           try {
             harnesses.delete(req.params.id);
             // Prunes the deleted harness out of the per-harness discovery
-            // cache (a full sweep's target list no longer includes it — see
-            // agent-discovery.ts's pruning behavior in runRefresh).
-            void refreshAllModels();
+            // cache and its transition-detector bookkeeping, then publishes
+            // once — cheaper than a full `refreshAllModels()` sweep (which
+            // used to be called here just to exercise its own
+            // pruning-by-absence logic in agent-discovery.ts's runRefresh;
+            // that path still exists as a backstop for any harness removal
+            // that doesn't route through this DELETE handler).
+            noteHarnessRemoved(req.params.id);
             return new Response(null, { status: 204, headers: corsHeaders(req) });
           } catch (e) {
             if (e instanceof HarnessInUseError) {
@@ -3281,8 +3289,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // omitted, it re-probes everything. Both branches await the
           // refresh before responding, same as the unqualified form always
           // has, so a caller reading this response sees the fresh list.
+          //
+          // The response body is ALWAYS the kind-keyed map below, byte-
+          // compatible with the unqualified POST/GET — including when
+          // `?harness=` names a non-built-in alias (e.g. a second fx
+          // account), whose per-harness catalog has no slot in this
+          // kind-keyed shape at all. To read that harness's own list after
+          // the refresh resolves, follow up with `GET /agent-models/harnesses`
+          // (keyed by harness id, not kind).
           const harnessId = new URL(req.url).searchParams.get("harness");
           if (harnessId) {
+            if (!harnesses.get(harnessId)) {
+              return json({ error: "unknown harness" }, { status: 404, headers: corsHeaders(req) });
+            }
             await refreshHarnessModels(harnessId);
           } else {
             await refreshAllModels();

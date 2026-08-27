@@ -5511,7 +5511,13 @@ function CompactSelect({
   placeholder,
 }: {
   value: string;
-  options: readonly { id: string; label: string }[];
+  // `hint`/`unlisted` are optional so plain `{id,label}` rows (every other
+  // call site — Mode, Effort) keep compiling unchanged; only the Model row's
+  // `mergedModels()` result actually populates them. Mirrors NewTaskForm's
+  // `<option title={m.unlisted ? m.hint : undefined}>` so a stale
+  // `task.model` no longer in this account's catalog still surfaces its
+  // "not in this account's model catalog" explanation on hover here too.
+  options: readonly { id: string; label: string; hint?: string; unlisted?: boolean }[];
   onChange: (next: string) => void;
   disabled?: boolean;
   placeholder?: string;
@@ -5527,7 +5533,7 @@ function CompactSelect({
         <option value="">{placeholder}</option>
       ) : (
         options.map((o) => (
-          <option key={o.id} value={o.id}>{o.label}</option>
+          <option key={o.id} value={o.id} title={o.unlisted ? o.hint : undefined}>{o.label}</option>
         ))
       )}
     </Select>

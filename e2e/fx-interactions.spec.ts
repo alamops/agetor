@@ -48,6 +48,21 @@ interface TaskRow {
   title: string;
 }
 
+/**
+ * Ids of every task `createAndStartFakeFxTask` has created in this file, so
+ * `test.afterAll` below can delete every one of them once the file's tests
+ * are done. Left behind, each is a `workdir: tmpdir()` row that outlives
+ * this file and — because `GET /tasks` orders newest-first — can become
+ * `tasks[0]` for whatever spec runs next in the same worker (the worker-
+ * scoped `backend` fixture, e2e/fixtures.ts, is shared across every spec
+ * file that lands in that worker). `App.tsx`'s Git dialog falls back to
+ * `tasks[0]?.workdir` when no task/prefill points it elsewhere, so a
+ * leftover tmpdir task there makes the dialog default to a synthetic,
+ * unregistered "T" project — exactly the failure this cleanup prevents in
+ * e2e/pr-merged-state.spec.ts (see that file's header comment).
+ */
+const createdTaskIds: string[] = [];
+
 async function enableFxHarness(backend: E2EBackend): Promise<void> {
   const res = await fetch(`${backend.apiBase}/harnesses/fx`, {
     method: "PATCH",
@@ -86,6 +101,10 @@ async function createAndStartFakeFxTask(
   });
   expect(createRes.ok(), `POST /tasks -> ${createRes.status()}: ${await createRes.text()}`).toBeTruthy();
   const task = (await createRes.json()) as TaskRow;
+  // Recorded before the start assertion below so a failed `start` still
+  // leaves this task's id tracked for afterAll cleanup — the POST /tasks
+  // row already exists at this point regardless of what start does next.
+  createdTaskIds.push(task.id);
 
   const startRes = await request.post(`${backend.apiBase}/tasks/${task.id}/start`, {
     headers: auth,
@@ -119,6 +138,39 @@ async function openTask(page: Page, title: string) {
 test.describe("fx interactions", () => {
   test.beforeAll(async ({ backend }) => {
     await enableFxHarness(backend);
+  });
+
+  /** Deletes every task this file created and, defensively, any leftover
+   *  `workdir: tmpdir()` project row — see the `createdTaskIds` comment
+   *  above for why this matters to sibling specs sharing the worker.
+   *  `afterAll` only has worker-scoped fixtures (`backend`) available, same
+   *  as `beforeAll` — the `request` fixture is test-scoped — so this uses
+   *  plain `fetch` with the bearer token, mirroring `enableFxHarness`. */
+  test.afterAll(async ({ backend }) => {
+    const auth = { authorization: `Bearer ${backend.apiToken}` };
+
+    for (const id of createdTaskIds) {
+      await fetch(`${backend.apiBase}/tasks/${id}`, { method: "DELETE", headers: auth }).catch(() => {});
+    }
+
+    // This file's tasks are never registered as projects — createTask
+    // (src/bun/orchestrator.ts) deliberately never upserts a task's workdir
+    // into the projects table. This check is purely defensive against that
+    // changing: if a `tmpdir()` project row exists anyway, remove it too so
+    // it can't leak into a sibling spec's project picker.
+    const projectsRes = await fetch(`${backend.apiBase}/projects`, { headers: auth });
+    if (projectsRes.ok) {
+      const registered = (await projectsRes.json()) as Array<{ path: string }>;
+      const dir = tmpdir();
+      for (const p of registered) {
+        if (p.path !== dir) continue;
+        await fetch(`${backend.apiBase}/projects`, {
+          method: "DELETE",
+          headers: { ...auth, "content-type": "application/json" },
+          body: JSON.stringify({ path: p.path }),
+        }).catch(() => {});
+      }
+    }
   });
 
   test("fake TaskCreate/TaskUpdate turn renders the todo card and board badge for an fx task", async ({

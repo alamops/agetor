@@ -13,7 +13,6 @@ import {
   CATALOG_SCOPED_KINDS,
   supportedEfforts,
   type AgentKind,
-  type AgentOption,
 } from "../../shared/types.ts";
 import { mergeModelOptions, type DiscoveredModel } from "../../shared/model-options.ts";
 

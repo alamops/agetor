@@ -386,20 +386,45 @@ function AppInner() {
       setHarnessesLoaded(true);
     } catch { /* leave previous state */ }
   }, []);
+  // Last-serialized-form cache for `agentModels`/`harnessModels`, mirroring
+  // `taskReconcileCacheRef`'s rationale above: the ready-retry (every 2s
+  // until ready), the twice-per-refocus `onVisible`, and every SSE-triggered
+  // refetch would otherwise call `setAgentModels`/`setHarnessModels` with a
+  // brand-new object graph even when the fetched catalog is byte-identical
+  // to what's already rendered — re-rendering `NewTaskForm` and the whole
+  // `RunPanel` for nothing. A plain `JSON.stringify` compare is cheap at
+  // this scale (a handful of harnesses/kinds, once per poll).
+  const agentModelsJsonRef = useRef<string>(JSON.stringify({ "claude-code": [], codex: [], cursor: [], gemini: [], fx: [] }));
+  const harnessModelsJsonRef = useRef<string>(JSON.stringify({}));
   const refreshAgentModels = useCallback(async () => {
-    try { setAgentModels(await api.listAgentModels()); } catch { /* leave previous state */ }
+    try {
+      const map = await api.listAgentModels();
+      const json = JSON.stringify(map);
+      if (json !== agentModelsJsonRef.current) {
+        agentModelsJsonRef.current = json;
+        setAgentModels(map);
+      }
+    } catch { /* leave previous state */ }
   }, []);
   /** Refetch the per-harness catalog. Errors (including a 404 from an old
    *  daemon that predates this route) are swallowed and leave state as-is —
    *  `discoveryReady` simply never flips true, and the bounded ready-retry
    *  effect below gives up after 30 attempts, at which point every picker
-   *  just falls back to `agentModels`' kind-level list (today's behavior). */
-  const refreshHarnessModels = useCallback(async () => {
+   *  just falls back to `agentModels`' kind-level list (today's behavior).
+   *  Returns the fetched `ready` boolean (or `false` on failure) so the
+   *  ready-retry effect can read the *fresh* value instead of a stale
+   *  closure over `discoveryReady` state — see that effect's comment. */
+  const refreshHarnessModels = useCallback(async (): Promise<boolean> => {
     try {
       const map = await api.listHarnessModels();
-      setHarnessModels(map.byHarness);
+      const json = JSON.stringify(map.byHarness);
+      if (json !== harnessModelsJsonRef.current) {
+        harnessModelsJsonRef.current = json;
+        setHarnessModels(map.byHarness);
+      }
       setDiscoveryReady(map.ready);
-    } catch { /* leave previous state */ }
+      return map.ready;
+    } catch { /* leave previous state */ return false; }
   }, []);
   /** Manual ↻ in a model picker: force a fresh discovery probe (one harness,
    *  or every enabled harness when omitted), then refetch both maps so the
@@ -512,6 +537,17 @@ function AppInner() {
   // `ready: true`) can't spin the retry forever — every picker just falls
   // back to `agentModels`' kind-level list once the cap is hit, matching
   // pre-discovery behavior.
+  //
+  // The stop condition reads the value `refreshHarnessModels` just fetched
+  // (its resolved `ready`), not `discoveryReady` state read from this
+  // closure — that state was always `false` at the moment this effect ran
+  // (a `true` value makes the effect return above before ever scheduling a
+  // tick), so a stale in-closure read could never observe the flip to
+  // `true`. What actually stops the loop when the sweep finishes is React
+  // re-running this effect (since `discoveryReady` is a dep) and its
+  // cleanup clearing the pending timer; checking the fresh return value
+  // here is a same-tick belt-and-suspenders stop, not the primary
+  // mechanism.
   useEffect(() => {
     if (discoveryReady) return;
     let cancelled = false;
@@ -520,8 +556,8 @@ function AppInner() {
     const tick = () => {
       if (cancelled) return;
       attempts += 1;
-      void refreshHarnessModels().finally(() => {
-        if (cancelled || discoveryReady || attempts >= 30) return;
+      void refreshHarnessModels().then((ready) => {
+        if (cancelled || ready || attempts >= 30) return;
         timer = setTimeout(tick, 2_000);
       });
     };

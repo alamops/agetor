@@ -92,6 +92,22 @@ async function withFxBin(bin: string, run: () => Promise<void>): Promise<void> {
   }
 }
 
+/** Same idea as `withFxBin`, for probing the real (kind-shared, non-fx)
+ *  "codex" built-in harness row — used to distinguish a kind-targeted
+ *  refresh (`refreshKindModels`) from a true no-op or a full sweep, since
+ *  codex's discoverer (unlike claude-code's, which is always []) actually
+ *  respects a stub binary's output. */
+async function withCodexBin(bin: string, run: () => Promise<void>): Promise<void> {
+  const prev = process.env.AGETOR_CODEX_BIN;
+  process.env.AGETOR_CODEX_BIN = bin;
+  try {
+    await run();
+  } finally {
+    if (prev === undefined) delete process.env.AGETOR_CODEX_BIN;
+    else process.env.AGETOR_CODEX_BIN = prev;
+  }
+}
+
 function makeStatus(harnessId: string, overrides: Partial<HarnessStatus> = {}): HarnessStatus {
   return {
     harnessId,
@@ -291,10 +307,32 @@ test("refreshHarnessModels: probing one fx harness broadcasts that harness's id 
   }
 });
 
-test("refreshHarnessModels: an unknown/non-fx harness id falls back to a full sweep instead of throwing", async () => {
+test("refreshHarnessModels: an unknown harness id is a true no-op — never throws, never touches any kind-level cache, never publishes", async () => {
   resetAll();
-  await expect(scheduler.refreshHarnessModels("does-not-exist")).resolves.toBeUndefined();
-  await expect(scheduler.refreshHarnessModels("claude-code")).resolves.toBeUndefined();
+  const events: AppEvent[] = [];
+  const unsubscribe = subscribeAppEvents((e) => events.push(e));
+  try {
+    const codexBin = plantFakeFxModelsBin(`echo 'unused-model-x'; exit 0`);
+    await withCodexBin(codexBin, async () => {
+      await expect(scheduler.refreshHarnessModels("does-not-exist")).resolves.toBeUndefined();
+      // A true no-op never probes anything, so codex's kind-level cache
+      // (which this stub, if probed, would populate) must stay exactly as
+      // it was before the call — [] here since resetAll() cleared it.
+      expect(discovery.getDiscoveredModels("codex")).toEqual([]);
+    });
+  } finally {
+    unsubscribe();
+  }
+  expect(events.filter((e) => e.type === "agent_models_changed")).toEqual([]);
+});
+
+test("refreshHarnessModels: a known non-fx harness id (e.g. codex, a real built-in row) does a kind-targeted refresh — not a full sweep, not a no-op", async () => {
+  resetAll();
+  const codexBin = plantFakeFxModelsBin(`echo 'gpt-9-test'; exit 0`);
+  await withCodexBin(codexBin, async () => {
+    await expect(scheduler.refreshHarnessModels("codex")).resolves.toBeUndefined();
+    expect(discovery.getDiscoveredModels("codex")).toEqual([{ id: "gpt-9-test" }]);
+  });
 });
 
 /* ── getHarnessModelMap ───────────────────────────────────────────────────── */
@@ -333,4 +371,88 @@ test("getHarnessModelMap: an enabled fx harness is keyed by its own per-harness 
     const mapAfterDisable = scheduler.getHarnessModelMap();
     expect(mapAfterDisable.byHarness[created.id]).toBeUndefined();
   });
+});
+
+/* ── noteHarnessRemoved (code-review finding #2: the DELETE route used to
+ * call a full refreshAllModels() sweep just to exercise its own
+ * pruning-by-absence logic — noteHarnessRemoved prunes directly instead) ── */
+
+test("noteHarnessRemoved: prunes the harness's discovered-models cache entry (mirrors server.ts's DELETE route, which calls this right after harnesses.delete)", async () => {
+  resetAll();
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["m1"]}'; exit 0`), async () => {
+    const created = insertFxHarness({ id: "fx-remove-cache-test" });
+    await scheduler.refreshHarnessModels(created.id);
+    expect(discovery.getHarnessDiscoveredModels(created.id)).toEqual([{ id: "m1" }]);
+
+    harnesses.delete(created.id);
+    scheduler.noteHarnessRemoved(created.id);
+  });
+  expect(discovery.getHarnessDiscoveredModels("fx-remove-cache-test")).toEqual([]);
+});
+
+test("noteHarnessRemoved: clears the harness's transition-detector bookkeeping — lastStatusKey and any pending debounce timer", () => {
+  resetAll();
+  scheduler.noteHarnessStatuses([makeStatus("remove-bookkeeping", { available: false })]);
+  scheduler.noteHarnessStatuses([makeStatus("remove-bookkeeping", { available: true })]); // schedules a debounce
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
+  expect(scheduler.__testing.hasLastStatusKey("remove-bookkeeping")).toBe(true);
+
+  scheduler.noteHarnessRemoved("remove-bookkeeping");
+
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
+  expect(scheduler.__testing.hasLastStatusKey("remove-bookkeeping")).toBe(false);
+});
+
+test("noteHarnessRemoved: never throws, even for a harness id that was never tracked", () => {
+  resetAll();
+  expect(() => scheduler.noteHarnessRemoved("never-existed")).not.toThrow();
+});
+
+/* ── noteHarnessStatuses pruning + unref (code-review finding #8:
+ * lastStatusKey/pendingDebounce never pruned a departed harness id, and the
+ * debounce timer itself was never unref'd) ──────────────────────────────── */
+
+test("noteHarnessStatuses: a harness absent from a later statuses list is pruned from lastStatusKey — reappearing later is treated as a first sighting again (no refresh scheduled)", () => {
+  resetAll();
+  scheduler.noteHarnessStatuses([makeStatus("pruned-a", { available: true })]);
+  expect(scheduler.__testing.hasLastStatusKey("pruned-a")).toBe(true);
+
+  scheduler.noteHarnessStatuses([]); // "pruned-a" no longer reported -> pruned
+
+  expect(scheduler.__testing.hasLastStatusKey("pruned-a")).toBe(false);
+
+  // Reappears with a status that would read as a transition had the prior
+  // key survived — since it was pruned, this is a fresh first sighting, so
+  // no refresh is scheduled.
+  scheduler.noteHarnessStatuses([makeStatus("pruned-a", { available: false, path: null, version: null, loggedIn: null })]);
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
+});
+
+test("noteHarnessStatuses: pruning a harness absent from a later statuses list also clears its pending debounce timer", () => {
+  resetAll();
+  scheduler.noteHarnessStatuses([makeStatus("pruned-timer", { available: false })]);
+  scheduler.noteHarnessStatuses([makeStatus("pruned-timer", { available: true })]); // transition -> schedules a debounce
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(1);
+
+  scheduler.noteHarnessStatuses([]); // no longer reported -> pruned + timer cleared
+
+  expect(scheduler.__testing.pendingRefreshCount()).toBe(0);
+});
+
+test("noteHarnessStatuses: a harness still present in a later statuses list is not pruned, even when a sibling harness is absent", () => {
+  resetAll();
+  scheduler.noteHarnessStatuses([makeStatus("keep-a"), makeStatus("keep-b")]);
+  scheduler.noteHarnessStatuses([makeStatus("keep-a")]); // "keep-b" no longer reported
+
+  expect(scheduler.__testing.hasLastStatusKey("keep-a")).toBe(true);
+  expect(scheduler.__testing.hasLastStatusKey("keep-b")).toBe(false);
+});
+
+test("noteHarnessStatuses: the scheduled debounce timer is unref'd (never itself keeps the process alive)", () => {
+  resetAll();
+  scheduler.noteHarnessStatuses([makeStatus("unref-check", { available: false })]);
+  scheduler.noteHarnessStatuses([makeStatus("unref-check", { available: true })]);
+  const timer = scheduler.__testing.debounceTimerFor("unref-check");
+  expect(timer).toBeDefined();
+  expect((timer as unknown as { hasRef: () => boolean }).hasRef()).toBe(false);
 });

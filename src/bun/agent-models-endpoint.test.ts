@@ -97,8 +97,18 @@ test("POST /agent-models?harness=fx refreshes just that harness and still return
   expect(Array.isArray(body["fx"])).toBe(true);
 });
 
-test("POST /agent-models?harness=<unknown-id> falls back to a full sweep rather than erroring", async () => {
+test("POST /agent-models?harness=<unknown-id> returns 404 { error } instead of running a full sweep", async () => {
   const res = await fetch(url("/agent-models?harness=does-not-exist"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(res.status).toBe(404);
+  const body = await res.json();
+  expect(body.error).toBe("unknown harness");
+});
+
+test("POST /agent-models?harness=<known-id> (e.g. claude-code, a real built-in row) still refreshes and returns 200", async () => {
+  const res = await fetch(url("/agent-models?harness=claude-code"), {
     method: "POST",
     headers: { authorization: `Bearer ${token}` },
   });
@@ -130,4 +140,37 @@ test("POST /harnesses (create a new fx alias) is reflected in GET /agent-models/
   // discovery probe — triggered fire-and-forget by the create route — has
   // resolved yet: an unresolved probe just means an empty array here).
   expect(Array.isArray(body.byHarness["fx-endpoint-test"])).toBe(true);
+});
+
+test("DELETE /harnesses/:id (code-review finding #2) calls noteHarnessRemoved instead of a full sweep, and the harness is gone from GET /agent-models/harnesses", async () => {
+  // Note: `byHarness` is built from `harnesses.list()`, so a deleted row
+  // drops out of it regardless of discovery-cache state — this end-to-end
+  // check mainly proves the DELETE route's `noteHarnessRemoved` call
+  // doesn't throw / doesn't block the response. The cache-pruning behavior
+  // itself (harnessCache no longer holding a stale entry for the deleted
+  // id) is unit-tested directly against `getHarnessDiscoveredModels` in
+  // model-discovery.test.ts, since no HTTP endpoint exposes that internal
+  // cache's full contents.
+  const createRes = await fetch(url("/harnesses"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ id: "fx-delete-endpoint-test", kind: "fx", label: "fx (delete endpoint test)" }),
+  });
+  expect(createRes.status).toBe(200);
+
+  const beforeDelete = await fetch(url("/agent-models/harnesses"), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect((await beforeDelete.json()).byHarness["fx-delete-endpoint-test"]).toBeDefined();
+
+  const deleteRes = await fetch(url("/harnesses/fx-delete-endpoint-test"), {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(deleteRes.status).toBe(204);
+
+  const afterDelete = await fetch(url("/agent-models/harnesses"), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect((await afterDelete.json()).byHarness["fx-delete-endpoint-test"]).toBeUndefined();
 });

@@ -78,6 +78,26 @@ const PREFLIGHT_TIMEOUT_MS = 2_000;
  * machine. Callers must invoke this after `dataDir` exists but before
  * spawning the backend, since `AGETOR_FX_BIN` must already point at an
  * executable file by the time `headless.ts` starts probing it.
+ *
+ * Also answers `fx models --json` (`src/bun/agent-discovery.ts`'s
+ * `discoverFx`, added by `docs/plans/fx-model-catalog-refresh.md`), which
+ * every enabled fx harness gets probed with — at boot, on enable, on manual
+ * ↻, and periodically. Without a real answer here that probe would resolve
+ * to an empty catalog (a malformed/non-JSON response degrades to `[]`,
+ * never a throw — see `parseFxModels`), which would make every fx-model-
+ * picker e2e assertion trivially true against an empty list instead of
+ * proving the account-scoped merge (`mergeModelOptions`,
+ * curated ∩ discovered + discovered-only) actually happened. The three ids
+ * below are deliberately a small, fixed catalog independent of the real
+ * fx.sh Gateway catalog: two overlap curated `AGENT_OPTIONS.fx.models` rows
+ * (`zai/glm-5.3-flash` — the curated default — and `openai/gpt-5.2`) to
+ * exercise the "curated ∩ discovered" intersection, and one
+ * (`e2e/discovered-only`) has no curated row at all, to exercise the
+ * discovered-only-id append path. Deliberately still NOT implementing
+ * `status --json` — that keeps the pre-flight auth check failing OPEN
+ * (`loggedIn: null`) against this stub, exactly as documented above and in
+ * CLAUDE.md's fx bullet, so no e2e spec (this file's callers included) is
+ * ever blocked by the auth pre-flight.
  */
 function writeFxStubBin(dataDir: string): string {
   const binDir = path.join(dataDir, "fx-stub-bin");
@@ -93,6 +113,10 @@ function writeFxStubBin(dataDir: string): string {
       "fi",
       'if [ "$1" = "--version" ]; then',
       '  echo "0.0.4-fake"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "models" ] && [ "$2" = "--json" ]; then',
+      '  echo \'{"kind":"models","count":3,"shown_count":3,"more_count":0,"private_models_hidden":false,"ids":["zai/glm-5.3-flash","openai/gpt-5.2","e2e/discovered-only"]}\'',
       "  exit 0",
       "fi",
       "exit 0",

@@ -8,8 +8,11 @@ import {
   getDiscoveredModels,
   getHarnessDiscoveredModels,
   isDiscoveryReady,
+  pruneHarnessDiscovery,
   refreshDiscoveredModels,
   refreshFxHarnessModels,
+  refreshKindModels,
+  type FxHarnessTarget,
 } from "./agent-discovery.ts";
 
 test("codex parser picks model ids out of a verbose listing", () => {
@@ -328,4 +331,136 @@ test("refreshFxHarnessModels: an empty-env target also drift-corrects the kind-l
   });
   expect(getHarnessDiscoveredModels("fx")).toEqual([{ id: "fresh" }]);
   expect(getDiscoveredModels("fx")).toEqual([{ id: "fresh" }]);
+});
+
+/* ── per-target `bin` (code-review finding #1: discovery used to ignore
+ * harness.bin entirely — every fx probe went through AGETOR_FX_BIN ?? "fx"
+ * regardless of what a harness alias had configured) ───────────────────── */
+
+test("refreshDiscoveredModels: a target's explicit `bin` is probed instead of AGETOR_FX_BIN, while a target with no `bin` still falls back to it — even with the same empty env on both", async () => {
+  __testing.resetForTests();
+  const builtinBin = plantFakeFxModelsBin(`echo '{"ids":["builtin-model"]}'; exit 0`);
+  const secondBin = plantFakeFxModelsBin(`echo '{"ids":["second-stub-model"]}'; exit 0`);
+  await withFxBin(builtinBin, async () => {
+    await refreshDiscoveredModels({
+      fxHarnesses: [
+        { harnessId: "fx", env: {} }, // no `bin` -> AGETOR_FX_BIN (builtinBin)
+        { harnessId: "fx-second", env: {}, bin: secondBin }, // explicit `bin` wins
+      ],
+    });
+  });
+  expect(getHarnessDiscoveredModels("fx")).toEqual([{ id: "builtin-model" }]);
+  expect(getHarnessDiscoveredModels("fx-second")).toEqual([{ id: "second-stub-model" }]);
+  // The built-in (no-bin) target's result also drift-corrects the kind-level
+  // cache, same as before this field existed.
+  expect(getDiscoveredModels("fx")).toEqual([{ id: "builtin-model" }]);
+});
+
+test("refreshFxHarnessModels: an explicit `bin` on the target is honored independent of AGETOR_FX_BIN, and — unlike an empty-env/no-bin target — does not drift-correct the kind-level cache", async () => {
+  __testing.resetForTests();
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["seed"]}'; exit 0`), async () => {
+    await refreshDiscoveredModels({ fxHarnesses: [{ harnessId: "fx", env: {} }] });
+  });
+  expect(getDiscoveredModels("fx")).toEqual([{ id: "seed" }]);
+
+  // A different AGETOR_FX_BIN is in effect here to prove the target's own
+  // `bin` — not the env var — is what gets probed.
+  const customBin = plantFakeFxModelsBin(`echo '{"ids":["custom"]}'; exit 0`);
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["should-not-be-used"]}'; exit 0`), async () => {
+    const result = await refreshFxHarnessModels({ harnessId: "fx-custom-bin", env: {}, bin: customBin });
+    expect(result).toEqual([{ id: "custom" }]);
+  });
+  expect(getHarnessDiscoveredModels("fx-custom-bin")).toEqual([{ id: "custom" }]);
+  // Even though env is empty, the explicit bin makes this a *different*
+  // binary/account than the built-in — the kind-level "fx" cache must stay
+  // exactly what it was.
+  expect(getDiscoveredModels("fx")).toEqual([{ id: "seed" }]);
+});
+
+/* ── refreshKindModels / pruneHarnessDiscovery (code-review finding #2:
+ * every harness edit used to trigger a full five-CLI sweep) ─────────────── */
+
+async function withEnvOverride(name: string, value: string, run: () => Promise<void>): Promise<void> {
+  const prev = process.env[name];
+  process.env[name] = value;
+  try {
+    await run();
+  } finally {
+    if (prev === undefined) delete process.env[name];
+    else process.env[name] = prev;
+  }
+}
+
+function plantBin(name: string, script: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-refresh-kind-"));
+  const bin = path.join(dir, name);
+  writeFileSync(bin, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+  return bin;
+}
+
+test("refreshKindModels: refreshes only the targeted kind's cache, leaving a sibling kind untouched", async () => {
+  __testing.resetForTests();
+  const codexBin = plantBin("codex", `echo 'model-one-x'; exit 0`);
+  const cursorBin = plantBin("cursor-agent", `echo 'model-two-y'; exit 0`);
+
+  await withEnvOverride("AGETOR_CODEX_BIN", codexBin, () =>
+    withEnvOverride("AGETOR_CURSOR_BIN", cursorBin, async () => {
+      await refreshKindModels("codex");
+      expect(getDiscoveredModels("codex")).toEqual([{ id: "model-one-x" }]);
+      // refreshKindModels("codex") must never have probed cursor.
+      expect(getDiscoveredModels("cursor")).toEqual([]);
+    }));
+});
+
+test("pruneHarnessDiscovery: drops one harness's cache entry with no probe, leaving a sibling entry untouched", async () => {
+  __testing.resetForTests();
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["x"]}'; exit 0`), async () => {
+    await refreshDiscoveredModels({
+      fxHarnesses: [
+        { harnessId: "prune-a", env: {} },
+        { harnessId: "prune-b", env: { HOME: "/nonexistent-agetor-prune-b" } },
+      ],
+    });
+  });
+  expect(getAllHarnessDiscoveredModels()).toEqual({
+    "prune-a": [{ id: "x" }],
+    "prune-b": [{ id: "x" }],
+  });
+
+  pruneHarnessDiscovery("prune-b");
+
+  expect(getAllHarnessDiscoveredModels()).toEqual({ "prune-a": [{ id: "x" }] });
+});
+
+test("getAllHarnessDiscoveredModels: returns copied arrays, not a live view — mutating a returned array must not corrupt the cache", async () => {
+  __testing.resetForTests();
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["stable"]}'; exit 0`), async () => {
+    await refreshDiscoveredModels({ fxHarnesses: [{ harnessId: "copy-check", env: {} }] });
+  });
+  const snapshot = getAllHarnessDiscoveredModels();
+  snapshot["copy-check"]!.push({ id: "mutated-in-caller" });
+  expect(getHarnessDiscoveredModels("copy-check")).toEqual([{ id: "stable" }]);
+});
+
+/* ── refreshDiscoveredModels: `fxHarnesses` as a thunk (code-review finding
+ * #10: a queued full sweep could prune a harness created after its target
+ * list was snapshotted, if the list were resolved eagerly at the call site
+ * instead of when the enqueued run actually starts) ─────────────────────── */
+
+test("refreshDiscoveredModels: a thunk `fxHarnesses` is resolved inside the enqueued run, not at call time", async () => {
+  __testing.resetForTests();
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["x"]}'; exit 0`), async () => {
+    let targets: FxHarnessTarget[] = [{ harnessId: "before-run", env: {} }];
+    const promise = refreshDiscoveredModels({ fxHarnesses: () => targets });
+    // Mutate the thunk's return value synchronously, before the enqueued run
+    // has had any chance to execute — `enqueue` schedules it via
+    // `chain.then(run, run)`, a microtask that can't fire until this
+    // synchronous block yields control, which it hasn't done yet here. If
+    // the thunk were resolved eagerly at this call site instead of inside
+    // the enqueued run, this reassignment would have no effect on the
+    // outcome below.
+    targets = [{ harnessId: "after-run", env: {} }];
+    await promise;
+  });
+  expect(getAllHarnessDiscoveredModels()).toEqual({ "after-run": [{ id: "x" }] });
 });
