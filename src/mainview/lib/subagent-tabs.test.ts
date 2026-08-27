@@ -211,3 +211,38 @@ test("resolveActiveStream: accepts a running bg_session row's id", () => {
 test("shouldShowSubagentTabs: a completed bg_session row with the parent turn idle collapses the strip", () => {
   expect(shouldShowSubagentTabs([sub("shell", "completed", 0, "bg_session")], false)).toBe(false);
 });
+
+// ── monitor (Claude Code Monitor) tab coverage ──────────────────────────────
+// docs/plans/claude-code-monitors-hold-running.md §3/§5 TT2: a live Claude
+// Code `Monitor` tool call surfaces as a `parentKind: "monitor"` row and must
+// be tabbable exactly like a `"subagent"`/`"bg_session"`/`"workflow_agent"`
+// row (only `"workflow"` containers are excluded by `isTabbable`) — no new
+// logic needed here, this just locks in that the existing generic handling
+// covers the new kind, mirroring the bg_session coverage above.
+
+test("sortSubagentTabs: a monitor row is included and sorts with running-first ordering", () => {
+  const subs = [
+    sub("a", "completed", 0, "subagent"),
+    sub("b", "running", 1, "monitor"),
+    sub("c", "completed", 2, "workflow_agent"),
+  ];
+  expect(sortSubagentTabs(subs).map((s) => s.id)).toEqual(["b", "a", "c"]);
+});
+
+test("anySubagentRunning: a running monitor row counts as running", () => {
+  expect(anySubagentRunning([sub("m", "running", 0, "monitor")])).toBe(true);
+  expect(anySubagentRunning([sub("m", "completed", 0, "monitor")])).toBe(false);
+});
+
+test("shouldShowSubagentTabs: a lone running monitor row shows tabs even with the parent turn idle", () => {
+  expect(shouldShowSubagentTabs([sub("m", "running", 0, "monitor")], false)).toBe(true);
+});
+
+test("resolveActiveStream: accepts a running monitor row's id", () => {
+  const subs = [sub("m", "running", 0, "monitor")];
+  expect(resolveActiveStream("m", true, subs)).toBe("m");
+});
+
+test("shouldShowSubagentTabs: a completed monitor row with the parent turn idle collapses the strip", () => {
+  expect(shouldShowSubagentTabs([sub("m", "completed", 0, "monitor")], false)).toBe(false);
+});

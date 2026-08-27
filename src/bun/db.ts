@@ -1295,6 +1295,21 @@ export const runs = {
     ).all(subagentId);
     return new Set(rows.map((r) => r.line_uuid));
   },
+  /** Whether ANY persisted event for `subagentId` carries a `line_uuid`
+   *  starting with `prefix` — a targeted probe for a marker key such as
+   *  claude-subagents.ts's `monitor:<id>:terminal:` (an authoritative Monitor
+   *  receipt on record), cheaper than materialising every uuid via
+   *  `seenLineUuidsForSubagent` just to scan a chatty stream for one prefix.
+   *  Compared with `substr` rather than `LIKE` so a `%`/`_` in the prefix
+   *  can't widen the match. */
+  hasLineUuidPrefixForSubagent(subagentId: string, prefix: string): boolean {
+    const row = db.query<{ one: number }, [string, string, string]>(
+      `SELECT 1 as one FROM run_events
+       WHERE subagent_id = ? AND line_uuid IS NOT NULL AND substr(line_uuid, 1, length(?)) = ?
+       LIMIT 1`,
+    ).get(subagentId, prefix, prefix);
+    return row !== null;
+  },
 };
 
 interface SubagentRow {
@@ -1318,7 +1333,7 @@ interface SubagentRow {
  *  still land on a member of the union, so `toSubagent` falls back to
  *  `"subagent"` for anything not listed here. Keep in sync with
  *  `Subagent.parentKind` in shared/types.ts. */
-const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent"]);
+const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent", "monitor"]);
 
 function toSubagent(r: SubagentRow): Subagent {
   return {

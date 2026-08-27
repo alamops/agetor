@@ -13,8 +13,9 @@ export const MAX_VISIBLE_TABS = 6;
  * A Claude Code Workflow's container row (`parentKind: "workflow"`) has no
  * event stream of its own — it exists only to hold the task in `running` for
  * the workflow's lifetime — so it never becomes a tab. Every other row
- * (`"subagent"`, `"bg_session"`, and `"workflow_agent"` — one agent inside a
- * workflow, a normal sidechain transcript) is tabbable.
+ * (`"subagent"`, `"bg_session"`, `"monitor"` — a Claude Code Monitor whose tab
+ * streams its events — and `"workflow_agent"` — one agent inside a workflow, a
+ * normal sidechain transcript) is tabbable.
  */
 function isTabbable(s: Subagent): boolean {
   return s.parentKind !== "workflow";

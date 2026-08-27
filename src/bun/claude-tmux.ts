@@ -206,17 +206,25 @@ function activeRunProbeSafe(taskId: string): string | null {
 
 /**
  * Handler the orchestrator installs to learn that a background task/agent
- * named in a task-notification JSONL line has settled, so it can flip the
- * matching `subagents` row and re-check the hold predicate above. Fired
- * from `dispatchLine` whenever a task-notification's `<task-id>` can be
- * parsed out of the line — tolerant by design: when no id is found the call
- * is simply skipped, since session death and boot reconciliation are
- * independent settle signals that don't depend on this one firing.
+ * named in a task-notification JSONL line has settled — or, for a Monitor,
+ * merely reported an ordinary event — so it can flip the matching
+ * `subagents` row and re-check the hold predicate above. Fired from
+ * `dispatchLine` whenever a task-notification's `<task-id>` can be parsed
+ * out of the line — tolerant by design: when no id is found the call is
+ * simply skipped, since session death and boot reconciliation are
+ * independent settle signals that don't depend on this one firing. The
+ * third argument is the notification's raw payload: a background shell or
+ * Task-tool agent's `<task-id>` is only ever seen once, on completion, but a
+ * Monitor reuses the exact same envelope for every intermediate event and
+ * again for its terminal one — the callee needs the body to tell the two
+ * apart instead of treating every naming of the id as a completion receipt.
  */
-let backgroundTaskSettledFn: ((taskId: string, agentId: string) => void) | null = null;
+let backgroundTaskSettledFn:
+  | ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void)
+  | null = null;
 export function setBackgroundTaskSettledHandler(
-  fn: ((taskId: string, agentId: string) => void) | null,
-): ((taskId: string, agentId: string) => void) | null {
+  fn: ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void) | null,
+): ((taskId: string, agentId: string, body: string, lineTimestampMs?: number | null) => void) | null {
   const prev = backgroundTaskSettledFn;
   backgroundTaskSettledFn = fn;
   return prev;
@@ -226,9 +234,14 @@ export function setBackgroundTaskSettledHandler(
  *  reach the tailer — mirrors `fireSettle` in claude-subagents.ts; the hook
  *  runs orchestrator logic we don't control, and a bad handler must not
  *  take the JSONL tail down. */
-function fireBackgroundTaskSettled(taskId: string, agentId: string): void {
+function fireBackgroundTaskSettled(
+  taskId: string,
+  agentId: string,
+  body: string,
+  lineTimestampMs: number | null = null,
+): void {
   try {
-    backgroundTaskSettledFn?.(taskId, agentId);
+    backgroundTaskSettledFn?.(taskId, agentId, body, lineTimestampMs);
   } catch (e) {
     console.error(`[claude-tmux] background-task-settled hook threw for task ${taskId}:`, e);
   }
@@ -469,6 +482,12 @@ interface UserMessage {
  * until we add a renderer for it.
  */
 interface ParsedJsonlEvent {
+  /** ISO-8601 write time claude stamps on every line — forwarded (as epoch ms)
+   *  to the background-task-notification handler so claude-subagents can
+   *  derive the same time-bucketed dedup key for a Monitor event that its
+   *  own restart-safe scan of this line derives; without it the live and
+   *  scan paths would persist the same event under two keys. */
+  timestamp?: string;
   type?: string;
   /** Claude 2.1.x system events carry a `subtype` discriminator — observed
    *  values: `turn_duration` (durationMs + messageCount, emitted right after
@@ -634,9 +653,15 @@ function taskNotificationContent(evt: ParsedJsonlEvent): string | null {
  * real transcripts under `~/.claude/projects/`) `<task-id>` in the
  * notification and `<agentId>` in that filename are the same token for a
  * background AGENT (Task-tool) completion. For a background *shell command*
- * notification there's no matching subagent row; `setBackgroundTaskSettledHandler`'s
- * callee is expected to no-op on an id it doesn't recognise. Returns `null`
- * when no `<task-id>` tag is present so callers degrade gracefully.
+ * notification there's no matching subagent row; for a Monitor the id names
+ * a task that's still alive — a Monitor reuses this exact tag on every
+ * ordinary event, not just its terminal one, so naming the id is no longer
+ * proof of completion by itself. `setBackgroundTaskSettledHandler`'s callee
+ * (`claude-subagents.ts`'s `handleBackgroundTaskNotification`) is expected
+ * to no-op on an id it doesn't recognise, and to consult the raw body (the
+ * hook's third argument) to tell a Monitor's event apart from its terminal
+ * receipt. Returns `null` when no `<task-id>` tag is present so callers
+ * degrade gracefully.
  */
 function extractTaskNotificationAgentId(content: string): string | null {
   const m = /<task-id>([^<]+)<\/task-id>/.exec(content);
@@ -3124,7 +3149,10 @@ function dispatchLine(state: SessionState, line: string): void {
   if (state.taskId !== "__rebuild__") {
     if (notifContent) {
       const agentId = extractTaskNotificationAgentId(notifContent);
-      if (agentId) fireBackgroundTaskSettled(state.taskId, agentId);
+      if (agentId) {
+        const lineTs = typeof evt.timestamp === "string" ? Date.parse(evt.timestamp) : NaN;
+        fireBackgroundTaskSettled(state.taskId, agentId, notifContent, Number.isFinite(lineTs) ? lineTs : null);
+      }
     }
   }
 
@@ -3965,15 +3993,24 @@ const TOKEN_COUNTER_LINE = "·\\s*(?:↓|↑)\\s*[0-9.]+k?\\s*tokens";
  *  (`SPINNER_ACTIVE_LINE`) and its elapsed summary (`SPINNER_ELAPSED_LINE`);
  *  the ticking token counter (`TOKEN_COUNTER_LINE`); the status-bar
  *  `esc to interrupt`; a background-agent wait `✻ Waiting for 1 background
- *  agent to finish`; and a live shell `✻ Brewed for 9s · 1 shell still
- *  running` / status-bar `· 1 shell ·`. Unlike 1 Hz-blinking `esc to
- *  interrupt` alone, this union stays true across a working turn's quiet-JSONL
- *  windows (background agents, long tool calls) — exactly when the old
- *  watchdog false-fired. Every arm is anchored to the chrome shape it came
- *  from (leading glyph, `·`-separated status-bar item, `still running`) so
+ *  agent to finish`; a live shell `✻ Brewed for 9s · 1 shell still
+ *  running` / status-bar `· 1 shell ·`; and a live Monitor `✻ Cooked for
+ *  4m 32s · 2 monitors still running` / status-bar `⏵⏵ auto mode on · 1
+ *  monitor · esc to interrupt · ← 4 agents · ↓ to manage` (that second
+ *  capture already matches on `esc to interrupt` alone, but the `· 1
+ *  monitor ·` status-bar item gets its own arm for the same reason shells
+ *  do — the elapsed-summary form doesn't always coincide with an active
+ *  turn's interrupt chrome). Unlike 1 Hz-blinking `esc to interrupt` alone,
+ *  this union stays true across a working turn's quiet-JSONL windows
+ *  (background agents, long tool calls) — exactly when the old watchdog
+ *  false-fired. Every arm is anchored to the chrome shape it came from
+ *  (leading glyph, `·`-separated status-bar item, `still running`) so
  *  look-alike transcript prose — `· 3 shell scripts were updated`, `Waiting
- *  for 2 background agents to report back.` — can't read as working. Add a
- *  form only with a captured pane to back it. */
+ *  for 2 background agents to report back.` — can't read as working.
+ *  Deliberately excludes "N agents" (`← 4 agents` above) — that counter is
+ *  other local Claude sessions, not this task's background work (plan
+ *  `docs/plans/claude-code-monitors-hold-running.md` §8 Q1). Add a form
+ *  only with a captured pane to back it. */
 const WORKING_LINE_RE = new RegExp(
   [
     ESC_TO_INTERRUPT,
@@ -3983,6 +4020,8 @@ const WORKING_LINE_RE = new RegExp(
     `^\\s*${SPINNER_GLYPH}\\s+Waiting for \\d+ background agent`,
     "\\d+\\s+shells?\\s+still\\s+running",
     "·\\s*\\d+\\s+shells?\\s*(?:·|$)",
+    `^\\s*${SPINNER_GLYPH}[^\\n]*·\\s*\\d+\\s+monitors?\\s+still\\s+running`,
+    "·\\s*\\d+\\s+monitors?\\s*(?:·|$)",
   ].join("|"),
   "i",
 );

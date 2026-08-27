@@ -82,13 +82,13 @@ import {
   reattachGeminiSession,
 } from "./gemini-tmux.ts";
 import {
+  attachSubagentWatcher,
+  handleBackgroundTaskNotification,
+  orphanRunningSubagents,
+  pumpWatcherForHoldCheck,
+  setParkedDiscoveryHandler,
   setSubagentEmitter,
   setSubagentSettleHook,
-  setParkedDiscoveryHandler,
-  settleSubagentById,
-  orphanRunningSubagents,
-  attachSubagentWatcher,
-  pumpWatcherForHoldCheck,
 } from "./claude-subagents.ts";
 import {
   prepareWorkdir,
@@ -294,18 +294,19 @@ setActiveRunProbe((taskId) => {
   return active.has(task.runId) ? task.runId : null;
 });
 
-// Background-task settle signal: a parent task-notification JSONL line named
-// the finishing agent/background-task id — settle that subagent row the same
-// way a naturally-detected completion would (DB flip → lifecycle emit →
-// settle hook → `maybeReleaseHeldTask`). Tolerant by design: a line whose id
-// matches no row, or a duplicate fired again on reattach replay, is a no-op
-// inside `settleSubagentById`. `source: "receipt"` (claude-subagents.ts fix 4)
-// — this IS the live `<task-notification>` dispatch, the harness's own
-// authoritative completion signal, so the settled row should resist a
-// trailing assistant/attachment flush resurrecting it the way an inferred
-// settle would allow.
-setBackgroundTaskSettledHandler((_taskId, agentId) => {
-  settleSubagentById(agentId, "completed", "receipt");
+// Background-task notification signal: a parent task-notification JSONL line
+// named a background agent/task id. The raw payload is handed to
+// claude-subagents, which owns the receipt rule: for ordinary rows ANY
+// notification naming the id is the harness's authoritative completion
+// receipt (DB flip → lifecycle emit → settle hook → `maybeReleaseHeldTask`,
+// `source: "receipt"` so a trailing assistant/attachment flush can't resurrect
+// the row the way an inferred settle would allow) — but a Claude Code
+// Monitor's ordinary events ride the SAME `<task-notification>` envelope as
+// its completion, so a `monitor` row settles only on a terminal receipt and
+// records everything else as activity. Tolerant by design: an id matching no
+// row, or a duplicate fired again on reattach replay, is a no-op.
+setBackgroundTaskSettledHandler((taskId, agentId, body, lineTimestampMs) => {
+  handleBackgroundTaskNotification(taskId, agentId, body, lineTimestampMs);
 });
 
 /**
