@@ -9,6 +9,8 @@ import {
   labels,
   pullReopen,
   pullBlob,
+  issueThread,
+  refetchCommandFor,
 } from "./git-host.ts";
 import { makeGitHubRepo } from "./github-test-util.ts";
 import { mockGitHubFetch, type FetchMock } from "./github-test-util.ts";
@@ -378,4 +380,206 @@ test("pullBlob on a repo with no supported git remote returns 400 without a path
     error: "project does not have a supported git remote (GitHub, GitLab, or Bitbucket)",
   });
   expect(fetchMock.calls).toHaveLength(0);
+});
+
+// ---------------------------------------------------------------------------
+// issueThread dispatch (docs/plans/new-task-from-git-issue.md, Task A)
+// ---------------------------------------------------------------------------
+
+function githubIssueJson(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    number: 7,
+    title: "Something is broken",
+    state: "open",
+    html_url: "https://github.com/acme/app/issues/7",
+    draft: false,
+    user: { login: "octocat" },
+    assignees: [],
+    milestone: null,
+    body: "steps to reproduce",
+    labels: [],
+    comments: 0,
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-02T00:00:00Z",
+    closed_at: null,
+    merged_at: null,
+    locked: false,
+    ...overrides,
+  };
+}
+
+test("issueThread dispatches a github repo directly (sourcePath already stamped) with refetchCommand null when gh isn't on PATH", async () => {
+  const dir = await makeGitHubRepo("acme", "app");
+  createdDirs.push(dir);
+  fetchMock = mockGitHubFetch([
+    { match: /\/repos\/acme\/app\/issues\/7$/, json: githubIssueJson() },
+    { match: "/repos/acme/app/issues/7/comments", json: [] },
+  ]);
+  const originalPath = process.env.PATH;
+  process.env.PATH = "/nonexistent-agetor-test-path"; // deny the gh/glab shellouts
+  try {
+    const res = await issueThread({ dir, number: 7 });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.item.number).toBe(7);
+    expect(res.item.kind).toBe("issues");
+    expect(res.item.sourcePath).toBe(dir);
+    expect(res.refetchCommand).toBeNull();
+  } finally {
+    process.env.PATH = originalPath;
+  }
+});
+
+test("issueThread dispatches a gitlab repo and stitches sourcePath onto the item", async () => {
+  const dir = await makeRepo("https://gitlab.com/acme/app.git");
+  fetchMock = mockGitHubFetch([
+    {
+      match: /\/projects\/acme%2Fapp\/issues\/5$/,
+      json: {
+        iid: 5,
+        title: "Bug report",
+        state: "opened",
+        web_url: "https://gitlab.com/acme/app/-/issues/5",
+        author: { username: "alice" },
+        assignees: [],
+        milestone: null,
+        description: "body",
+        labels: [],
+        user_notes_count: 0,
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-02T00:00:00Z",
+      },
+    },
+    { match: "/issues/5/notes", json: [] },
+  ]);
+  const originalPath = process.env.PATH;
+  process.env.PATH = "/nonexistent-agetor-test-path"; // deny the glab shellout
+  try {
+    const res = await issueThread({ dir, number: 5 });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.item.number).toBe(5);
+    expect(res.item.kind).toBe("issues");
+    expect(res.item.sourcePath).toBe(dir);
+    expect(res.refetchCommand).toBeNull(); // glab not on PATH
+  } finally {
+    process.env.PATH = originalPath;
+  }
+});
+
+test("issueThread dispatches a bitbucket repo and stitches sourcePath onto the item; refetchCommand is always null (no Bitbucket CLI)", async () => {
+  const dir = await makeRepo("https://bitbucket.org/acme/app.git");
+  fetchMock = mockGitHubFetch([
+    {
+      match: /\/2\.0\/repositories\/acme\/app\/issues\/9$/,
+      json: {
+        id: 9,
+        title: "Something",
+        state: "open",
+        links: { html: { href: "https://bitbucket.org/acme/app/issues/9" } },
+        reporter: { nickname: "alice", links: {} },
+        content: { raw: "body" },
+        comment_count: 0,
+        created_on: "2026-01-01T00:00:00Z",
+        updated_on: "2026-01-02T00:00:00Z",
+      },
+    },
+    { match: "/issues/9/comments", json: { values: [] } },
+  ]);
+
+  const res = await issueThread({ dir, number: 9 });
+  expect(res.ok).toBe(true);
+  if (!res.ok) return;
+  expect(res.item.number).toBe(9);
+  expect(res.item.kind).toBe("issues");
+  expect(res.item.sourcePath).toBe(dir);
+  expect(res.refetchCommand).toBeNull();
+});
+
+test("issueThread on a repo with no supported git remote returns the facade's NO_REMOTE_ERROR", async () => {
+  const dir = await makeRepo("git@example.com:acme/app.git");
+  const res = await issueThread({ dir, number: 1 });
+  expect(res).toEqual({
+    ok: false,
+    error: "project does not have a supported git remote (GitHub, GitLab, or Bitbucket)",
+  });
+});
+
+// ---------------------------------------------------------------------------
+// refetchCommandFor — pure, no I/O
+// ---------------------------------------------------------------------------
+
+test("refetchCommandFor builds a `gh issue view <url> --comments` command for github when gh is available", () => {
+  expect(
+    refetchCommandFor({
+      provider: "github",
+      htmlUrl: "https://github.com/acme/app/issues/7",
+      repo: "acme/app",
+      number: 7,
+      ghAvailable: true,
+      glabAvailable: true,
+    }),
+  ).toBe("gh issue view https://github.com/acme/app/issues/7 --comments");
+});
+
+test("refetchCommandFor returns null for github when gh is not available", () => {
+  expect(
+    refetchCommandFor({
+      provider: "github",
+      htmlUrl: "https://github.com/acme/app/issues/7",
+      repo: "acme/app",
+      number: 7,
+      ghAvailable: false,
+      glabAvailable: true,
+    }),
+  ).toBeNull();
+});
+
+test("refetchCommandFor builds a `glab issue view <n> --comments --repo <owner/name>` command for gitlab when glab is available", () => {
+  expect(
+    refetchCommandFor({
+      provider: "gitlab",
+      htmlUrl: "https://gitlab.com/acme/app/-/issues/5",
+      repo: "acme/app",
+      number: 5,
+      ghAvailable: true,
+      glabAvailable: true,
+    }),
+  ).toBe("glab issue view 5 --comments --repo acme/app");
+});
+
+test("refetchCommandFor returns null for gitlab when glab is not available", () => {
+  expect(
+    refetchCommandFor({
+      provider: "gitlab",
+      htmlUrl: "https://gitlab.com/acme/app/-/issues/5",
+      repo: "acme/app",
+      number: 5,
+      ghAvailable: true,
+      glabAvailable: false,
+    }),
+  ).toBeNull();
+});
+
+test("refetchCommandFor always returns null for bitbucket, regardless of gh/glab availability", () => {
+  expect(
+    refetchCommandFor({
+      provider: "bitbucket",
+      htmlUrl: "https://bitbucket.org/acme/app/issues/9",
+      repo: "acme/app",
+      number: 9,
+      ghAvailable: true,
+      glabAvailable: true,
+    }),
+  ).toBeNull();
+  expect(
+    refetchCommandFor({
+      provider: "bitbucket",
+      htmlUrl: "https://bitbucket.org/acme/app/issues/9",
+      repo: "acme/app",
+      number: 9,
+      ghAvailable: false,
+      glabAvailable: false,
+    }),
+  ).toBeNull();
 });

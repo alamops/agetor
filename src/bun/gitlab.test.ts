@@ -2,9 +2,13 @@
 // exercised entirely through `__gitlabInternals` — no network, no fetch mock.
 // Complements gitlab-network.test.ts, which exercises the exported async
 // functions end-to-end (URL/header/pagination shapes) via a mocked fetch.
-import { expect, test } from "bun:test";
-import { __gitlabInternals } from "./gitlab.ts";
-import { sampleRepo } from "./gitlab-test-util.ts";
+import { expect, test, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { __clearApiHostCacheForTest } from "./git-provider.ts";
+import { __gitlabInternals, getGitLabIssueThread, listGitLabComments } from "./gitlab.ts";
+import { cleanupSshStubs, gitlabIssue, gitlabNote, mockGitLabFetch, sampleRepo, writeSshStub } from "./gitlab-test-util.ts";
 
 const {
   encodeProjectId,
@@ -507,4 +511,145 @@ test("gitlabStateParams maps all→[\"all\"] regardless of kind", () => {
 test("gitlabStateParams fans closed pulls out to [closed, merged], but issues stay [closed]", () => {
   expect(gitlabStateParams("pulls", "closed")).toEqual(["closed", "merged"]);
   expect(gitlabStateParams("issues", "closed")).toEqual(["closed"]);
+});
+
+// ---------------------------------------------------------------------------
+// getGitLabIssueThread / listGitLabComments (docs/plans/new-task-from-git-issue.md,
+// Task A) — network-level tests against a mocked fetch, mirroring
+// gitlab-network.test.ts's own setup (hermetic AGETOR_DATA_DIR + GITLAB_TOKEN,
+// an identity ssh stub so gitlabApiBase's host resolution never depends on the
+// real ~/.ssh/config, and per-test cache resets).
+// ---------------------------------------------------------------------------
+
+const ORIGINAL_DATA_DIR = process.env.AGETOR_DATA_DIR;
+const ORIGINAL_GITLAB_TOKEN = process.env.GITLAB_TOKEN;
+const ORIGINAL_SSH_BIN = process.env.AGETOR_SSH_BIN;
+let issueThreadDataDir: string;
+
+beforeAll(() => {
+  issueThreadDataDir = mkdtempSync(path.join(tmpdir(), "agetor-gitlab-issue-thread-"));
+  process.env.AGETOR_DATA_DIR = issueThreadDataDir;
+  process.env.GITLAB_TOKEN = "test-token";
+});
+
+afterAll(() => {
+  rmSync(issueThreadDataDir, { recursive: true, force: true });
+  if (ORIGINAL_DATA_DIR === undefined) delete process.env.AGETOR_DATA_DIR;
+  else process.env.AGETOR_DATA_DIR = ORIGINAL_DATA_DIR;
+  if (ORIGINAL_GITLAB_TOKEN === undefined) delete process.env.GITLAB_TOKEN;
+  else process.env.GITLAB_TOKEN = ORIGINAL_GITLAB_TOKEN;
+});
+
+beforeEach(() => {
+  __clearApiHostCacheForTest();
+  process.env.AGETOR_SSH_BIN = writeSshStub('#!/bin/sh\necho "hostname $3"\n');
+});
+
+afterEach(() => {
+  __clearApiHostCacheForTest();
+  cleanupSshStubs();
+  if (ORIGINAL_SSH_BIN === undefined) delete process.env.AGETOR_SSH_BIN;
+  else process.env.AGETOR_SSH_BIN = ORIGINAL_SSH_BIN;
+});
+
+test("getGitLabIssueThread happy path normalizes the issue, drops a system note, and follows x-next-page pagination", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    // End-anchored so this never swallows the /notes sub-path request below
+    // (a plain substring match would, since it's that request's URL prefix).
+    { match: /\/projects\/acme%2Fapp\/issues\/5$/, json: gitlabIssue() },
+    {
+      match: /\/issues\/5\/notes\?sort=asc&order_by=created_at&per_page=100$/,
+      json: [
+        gitlabNote({ id: 1, body: "added label ~bug", system: true, author: { username: "bot" } }),
+        gitlabNote({ id: 2, body: "a real comment", system: false, author: { username: "alice" } }),
+      ],
+      headers: { "x-next-page": "2" },
+    },
+    {
+      match: "page=2",
+      json: [gitlabNote({ id: 3, body: "a later comment", system: false, author: { username: "bob" } })],
+      // No x-next-page on the last page — resolveNextPage treats that as the end.
+    },
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 5);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.repo).toBe("acme/app");
+    expect(res.item.kind).toBe("issues");
+    expect(res.item.number).toBe(5);
+    // The adapter never resolves a working directory (see gitlab.ts's module
+    // doc comment) — sourcePath is always null here; the facade stitches it on.
+    expect(res.item.sourcePath).toBeNull();
+    expect(res.comments.map((c) => c.id)).toEqual([2, 3]); // system note (id:1) dropped
+    expect(res.truncated).toBe(false);
+    // The adapter never resolves gh/glab availability itself — the facade
+    // (git-host.ts's issueThread) fills refetchCommand in.
+    expect(res.refetchCommand).toBeNull();
+    expect(mock.calls).toHaveLength(3); // 1 issue fetch + 2 note pages
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabIssueThread rejects a non-positive/non-integer iid before any fetch", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([]); // any fetch call would throw — proves none happens
+
+  for (const bad of [0, -1, 2.5]) {
+    const res = await getGitLabIssueThread(repo, bad);
+    expect(res).toEqual({ ok: false, error: "issue number must be positive" });
+  }
+  expect(mock.calls).toHaveLength(0);
+  mock.restore();
+});
+
+test("getGitLabIssueThread surfaces the notes fetch's error after a successful issue fetch", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    { match: /\/projects\/acme%2Fapp\/issues\/6$/, json: gitlabIssue({ iid: 6 }) },
+    { match: "/issues/6/notes", status: 404, json: { message: "404 Project Not Found" } },
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 6);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    // A 404 is enriched by authHint (Settings pointer) rather than surfacing
+    // the raw API message verbatim — same wording apiError/authHint tests
+    // above already pin for the pure helper.
+    expect(res.error).toContain("acme/app");
+    expect(res.error).toContain("Settings");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitLabComments (shared by getGitLabIssueThread) excludes system notes and follows x-next-page pagination — pinning the existing behavior", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    {
+      match: /\/issues\/8\/notes\?sort=asc&order_by=created_at&per_page=100$/,
+      json: [
+        gitlabNote({ id: 10, body: "changed milestone", system: true }),
+        gitlabNote({ id: 11, body: "first real comment", system: false }),
+      ],
+      headers: { "x-next-page": "2" },
+    },
+    {
+      match: "page=2",
+      json: [gitlabNote({ id: 12, body: "second real comment", system: false })],
+    },
+  ]);
+  try {
+    const res = await listGitLabComments(repo, 8, "issues");
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.repo).toBe("acme/app");
+    expect(res.itemNumber).toBe(8);
+    expect(res.comments.map((c) => c.id)).toEqual([11, 12]);
+    expect(mock.calls).toHaveLength(2);
+  } finally {
+    mock.restore();
+  }
 });

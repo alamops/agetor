@@ -215,6 +215,70 @@ describe("buildTaskContextMenu", () => {
     });
   });
 
+  describe("view-issue (inspect group)", () => {
+    test("absent when issueUrl is null", () => {
+      const task = makeTask({ issueUrl: null });
+      expect(actions(buildTaskContextMenu(task, { isOpen: false }))).not.toContain("view-issue");
+    });
+
+    test("absent when issueUrl is undefined (legacy fixture)", () => {
+      const task = makeTask();
+      expect(actions(buildTaskContextMenu(task, { isOpen: false }))).not.toContain("view-issue");
+    });
+
+    test("present, right after open-in-finder, when only issueUrl is set", () => {
+      const task = makeTask({ issueUrl: "https://github.com/o/r/issues/9" });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual(["open", "start", "diff", "open-in-finder", "view-issue", "delete"]);
+      const openInFinderIdx = actions(entries).indexOf("open-in-finder");
+      const viewIssueIdx = actions(entries).indexOf("view-issue");
+      expect(viewIssueIdx).toBe(openInFinderIdx + 1);
+
+      const entry = entries.find((e) => e.action === "view-issue")!;
+      expect(entry.label).toBe("View issue");
+      expect(entry.group).toBe("inspect");
+    });
+
+    test("present, immediately after view-pr, when both prUrl and issueUrl are set", () => {
+      const task = makeTask({
+        prUrl: "https://github.com/o/r/pull/1",
+        issueUrl: "https://github.com/o/r/issues/9",
+      });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+
+      expect(actions(entries)).toEqual([
+        "open",
+        "start",
+        "diff",
+        "open-in-finder",
+        "view-pr",
+        "view-issue",
+        "delete",
+      ]);
+      const viewPrIdx = actions(entries).indexOf("view-pr");
+      const viewIssueIdx = actions(entries).indexOf("view-issue");
+      expect(viewIssueIdx).toBe(viewPrIdx + 1);
+    });
+
+    test("present on an archived task (mirrors view-pr: inspect entries don't depend on archived state)", () => {
+      const task = makeTask({
+        column: "done",
+        hasOpenableRun: true,
+        archivedAt: Date.now(),
+        issueUrl: "https://github.com/o/r/issues/9",
+      });
+      const entries = buildTaskContextMenu(task, { isOpen: false });
+      expect(actions(entries)).toContain("view-issue");
+    });
+
+    test("present while the run panel for this task is open (mirrors view-pr: inspect entries don't depend on isOpen)", () => {
+      const task = makeTask({ issueUrl: "https://github.com/o/r/issues/9" });
+      const entries = buildTaskContextMenu(task, { isOpen: true });
+      expect(actions(entries)).toContain("view-issue");
+    });
+  });
+
   test("kitchen sink: review + branch + worktreePath + prUrl + unread -> full sequence in order", () => {
     const task = makeTask({
       column: "review",

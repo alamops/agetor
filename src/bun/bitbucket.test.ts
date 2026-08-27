@@ -2,9 +2,13 @@
 // through `__bitbucketInternals` (no network, no filesystem). Complements
 // bitbucket-network.test.ts, which drives the exported functions end-to-end
 // through a mocked `fetch`.
-import { test, expect } from "bun:test";
-import { __bitbucketInternals } from "./bitbucket.ts";
-import { makeBitbucketRepo } from "./bitbucket-test-util.ts";
+import { test, expect, beforeAll, afterAll, afterEach } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { __clearApiHostCacheForTest } from "./git-provider.ts";
+import { __bitbucketInternals, getBitbucketIssueThread } from "./bitbucket.ts";
+import { makeBitbucketRepo, mockGitHubFetch } from "./bitbucket-test-util.ts";
 
 const {
   repoBasePath,
@@ -565,4 +569,159 @@ test("bitbucketViewerUuid resolves to null without any network call when there a
   } finally {
     globalThis.fetch = original;
   }
+});
+
+// ---------------------------------------------------------------------------
+// getBitbucketIssueThread (docs/plans/new-task-from-git-issue.md, Task A) —
+// network-level tests against a mocked fetch, mirroring
+// bitbucket-network.test.ts's own setup (hermetic AGETOR_DATA_DIR +
+// BITBUCKET_TOKEN so bitbucketCreds() never touches a real store).
+// ---------------------------------------------------------------------------
+
+const ORIGINAL_DATA_DIR = process.env.AGETOR_DATA_DIR;
+const ORIGINAL_TOKEN = process.env.BITBUCKET_TOKEN;
+const ORIGINAL_EMAIL = process.env.BITBUCKET_EMAIL;
+const ORIGINAL_SSH_BIN = process.env.AGETOR_SSH_BIN;
+let issueThreadDataDir: string;
+let sshStubDirs: string[] = [];
+
+beforeAll(() => {
+  issueThreadDataDir = mkdtempSync(path.join(tmpdir(), "agetor-bb-issue-thread-"));
+  process.env.AGETOR_DATA_DIR = issueThreadDataDir;
+  process.env.BITBUCKET_TOKEN = "test-token";
+  delete process.env.BITBUCKET_EMAIL;
+});
+
+afterAll(() => {
+  rmSync(issueThreadDataDir, { recursive: true, force: true });
+  if (ORIGINAL_DATA_DIR === undefined) delete process.env.AGETOR_DATA_DIR;
+  else process.env.AGETOR_DATA_DIR = ORIGINAL_DATA_DIR;
+  if (ORIGINAL_TOKEN === undefined) delete process.env.BITBUCKET_TOKEN;
+  else process.env.BITBUCKET_TOKEN = ORIGINAL_TOKEN;
+  if (ORIGINAL_EMAIL === undefined) delete process.env.BITBUCKET_EMAIL;
+  else process.env.BITBUCKET_EMAIL = ORIGINAL_EMAIL;
+});
+
+// Every exported entry point opens with a `bitbucketServerError` guard
+// (docs/plans/per-host-git-api-bases.md) that resolves `repo.remoteHost`
+// through `apiHostForRemote` (git-provider.ts, `ssh -G` under the hood) —
+// reset the cache + AGETOR_SSH_BIN after every test in this section, mirroring
+// bitbucket-network.test.ts's own hygiene.
+afterEach(() => {
+  __clearApiHostCacheForTest();
+  if (ORIGINAL_SSH_BIN === undefined) delete process.env.AGETOR_SSH_BIN;
+  else process.env.AGETOR_SSH_BIN = ORIGINAL_SSH_BIN;
+  for (const dir of sshStubDirs) rmSync(dir, { recursive: true, force: true });
+  sshStubDirs = [];
+});
+
+/** Writes an executable stub standing in for `ssh`, mirroring
+ *  bitbucket-network.test.ts's own `writeSshStub` — `apiHostForRemote` invokes
+ *  it as `<stub> -G -- <host>`, so `$3` is the (lowercased) host argument. */
+function writeSshStub(script: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-bb-issue-thread-ssh-stub-"));
+  sshStubDirs.push(dir);
+  const binPath = path.join(dir, "ssh");
+  writeFileSync(binPath, script, { mode: 0o755 });
+  return binPath;
+}
+
+function bitbucketIssueJson(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 7,
+    title: "Something is broken",
+    state: "open",
+    links: { html: { href: "https://bitbucket.org/acme/app/issues/7" } },
+    reporter: { nickname: "alice", links: {} },
+    assignee: null,
+    content: { raw: "steps to reproduce" },
+    comment_count: 2,
+    created_on: "2026-01-01T00:00:00Z",
+    updated_on: "2026-01-02T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function bitbucketCommentJson(id: number): Record<string, unknown> {
+  return {
+    id,
+    content: { raw: `comment ${id}` },
+    links: { html: { href: `https://bitbucket.org/acme/app/issues/7#comment-${id}` } },
+    user: { nickname: "bob", links: {} },
+    created_on: "2026-01-01T00:00:00Z",
+    updated_on: "2026-01-01T00:00:00Z",
+  };
+}
+
+test("getBitbucketIssueThread happy path normalizes the issue and its comments", async () => {
+  const repo = makeBitbucketRepo("acme", "app");
+  const mock = mockGitHubFetch([
+    { match: /\/2\.0\/repositories\/acme\/app\/issues\/7$/, json: bitbucketIssueJson() },
+    {
+      match: "/2.0/repositories/acme/app/issues/7/comments",
+      json: { values: [bitbucketCommentJson(1), bitbucketCommentJson(2)] },
+    },
+  ]);
+  try {
+    const res = await getBitbucketIssueThread(repo, 7);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.repo).toBe("acme/app");
+    expect(res.item.kind).toBe("issues");
+    expect(res.item.number).toBe(7);
+    expect(res.item.htmlUrl).toBe("https://bitbucket.org/acme/app/issues/7");
+    expect(res.item.sourcePath).toBeNull();
+    expect(res.comments.map((c) => c.id)).toEqual([1, 2]);
+    // Bitbucket's comments adapter drains every page itself — no page-count
+    // cap the way GitHub/GitLab have, so this is always false.
+    expect(res.truncated).toBe(false);
+    // The adapter never resolves gh/glab availability — Bitbucket has no
+    // re-fetch CLI at all, and the facade never fills one in for it either.
+    expect(res.refetchCommand).toBeNull();
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketIssueThread maps a 404 WITH credentials present to the issue-tracker-disabled friendly error", async () => {
+  const repo = makeBitbucketRepo("acme", "app2");
+  const mock = mockGitHubFetch([
+    { match: "/issues/9", status: 404, json: { type: "error", error: { message: "Not Found" } } },
+  ]);
+  try {
+    // REPO carries no per-host stored token, but beforeAll's BITBUCKET_TOKEN
+    // env fallback means a credential IS sent here — this is the authed case,
+    // matching listBitbucketItems's own issue-tracker-disabled shortcut.
+    const res = await getBitbucketIssueThread(repo, 9);
+    expect(res).toEqual({ ok: false, error: "issue tracker is not enabled for this repository" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketIssueThread rejects a Bitbucket Server/DC remote host with zero fetch calls — server-host rejection unchanged", async () => {
+  process.env.AGETOR_SSH_BIN = writeSshStub('#!/bin/sh\necho "hostname $3"\n');
+  const serverRepo = makeBitbucketRepo("acme", "app", "bitbucket.mycompany.com");
+  const mock = mockGitHubFetch([]);
+  try {
+    const res = await getBitbucketIssueThread(serverRepo, 1);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("Bitbucket Server / Data Center is not supported");
+    expect(mock.calls).toHaveLength(0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getBitbucketIssueThread rejects a non-positive/non-integer id before any fetch (before the creds lookup too)", async () => {
+  const repo = makeBitbucketRepo("acme", "app3");
+  const mock = mockGitHubFetch([]); // any fetch call would throw — proves none happens, not even bitbucketCreds()
+
+  for (const bad of [0, -1, 3.5]) {
+    const res = await getBitbucketIssueThread(repo, bad);
+    expect(res).toEqual({ ok: false, error: "issue number must be positive" });
+  }
+  expect(mock.calls).toHaveLength(0);
+  mock.restore();
 });
