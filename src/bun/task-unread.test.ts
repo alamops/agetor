@@ -418,3 +418,264 @@ test("a run that emits a top-level assistant chunk flips the task to unread by t
     db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
   }
 });
+
+// ---------------------------------------------------------------------------
+// 8. Task.hasAssistantMessages derivation, and tasks.markUnread no-op on a
+//    task that has never observed an assistant event (nothing to re-flag).
+// ---------------------------------------------------------------------------
+
+test("hasAssistantMessages is false on a fresh task and flips true after noteAssistantEvent; markUnread is a no-op with no assistant event yet", () => {
+  const taskId = randomUUID();
+  tasks.insert(makeTaskRow(taskId));
+  try {
+    expect(tasks.get(taskId)?.hasAssistantMessages).toBe(false);
+
+    // No assistant event yet — `last_assistant_event_id IS NOT NULL` guard
+    // fails, so this is a no-op: still caught-up/false on both derived
+    // fields, not a spurious unread flip.
+    const noop = tasks.markUnread(taskId);
+    expect(noop).not.toBeNull();
+    expect(noop?.unread).toBe(false);
+    expect(noop?.hasAssistantMessages).toBe(false);
+    expect(watermarkRow(taskId)?.last_seen_event_id).toBeNull();
+
+    tasks.noteAssistantEvent(taskId, 1);
+    expect(tasks.get(taskId)?.hasAssistantMessages).toBe(true);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 9. tasks.markUnread semantics: flips a caught-up task back to unread, and
+//    is idempotent (the raw watermark column doesn't keep moving on repeat
+//    calls).
+// ---------------------------------------------------------------------------
+
+test("markUnread flips a caught-up task back to unread, and is idempotent (raw last_seen_event_id column stable across repeat calls)", () => {
+  const taskId = randomUUID();
+  tasks.insert(makeTaskRow(taskId));
+  try {
+    tasks.noteAssistantEvent(taskId, 20);
+    tasks.markSeen(taskId);
+    expect(tasks.get(taskId)?.unread).toBe(false);
+
+    const unread = tasks.markUnread(taskId);
+    expect(unread).not.toBeNull();
+    expect(unread?.id).toBe(taskId);
+    expect(unread?.unread).toBe(true);
+    // last_assistant_event_id - 1: exactly the latest message reads as
+    // unread, not the whole history.
+    expect(watermarkRow(taskId)?.last_seen_event_id).toBe(19);
+
+    // Idempotent: calling again while already unread is a no-op (the `>=`
+    // guard fails once last_seen_event_id < last_assistant_event_id), and
+    // the raw column does not move any further on the repeat call.
+    const unreadAgain = tasks.markUnread(taskId);
+    expect(unreadAgain).not.toBeNull();
+    expect(unreadAgain?.unread).toBe(true);
+    expect(watermarkRow(taskId)?.last_seen_event_id).toBe(19);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 10. markSeen re-clears after markUnread, and a later assistant event
+//     flips it back to unread again — watermark semantics stay intact
+//     through a full mark-unread → mark-seen → new-message cycle.
+// ---------------------------------------------------------------------------
+
+test("markSeen re-clears after markUnread, and a later assistant event flips it back to unread", () => {
+  const taskId = randomUUID();
+  tasks.insert(makeTaskRow(taskId));
+  try {
+    tasks.noteAssistantEvent(taskId, 30);
+    tasks.markSeen(taskId);
+    expect(tasks.get(taskId)?.unread).toBe(false);
+
+    tasks.markUnread(taskId);
+    expect(tasks.get(taskId)?.unread).toBe(true);
+
+    const seenAgain = tasks.markSeen(taskId);
+    expect(seenAgain?.unread).toBe(false);
+    expect(watermarkRow(taskId)?.last_seen_event_id).toBe(30);
+
+    tasks.noteAssistantEvent(taskId, 31);
+    expect(tasks.get(taskId)?.unread).toBe(true);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 11. markUnread's guard: a task that's already unread because of a
+//     watermark well below (not just caught up to) last_assistant_event_id
+//     must not have its raw last_seen_event_id column moved at all — the
+//     `>=` guard only fires when the task is currently caught-up-or-ahead.
+// ---------------------------------------------------------------------------
+
+test("markUnread does not move the raw watermark when the task is already unread via a lower (not just caught-up) last_seen_event_id", () => {
+  const taskId = randomUUID();
+  tasks.insert(makeTaskRow(taskId));
+  try {
+    tasks.noteAssistantEvent(taskId, 10);
+    tasks.markSeen(taskId); // caught up at 10
+    tasks.noteAssistantEvent(taskId, 50); // new message; last_seen_event_id stays at 10, well below 50
+    expect(watermarkRow(taskId)?.last_seen_event_id).toBe(10);
+    expect(tasks.get(taskId)?.unread).toBe(true);
+
+    const result = tasks.markUnread(taskId);
+    expect(result).not.toBeNull();
+    expect(result?.unread).toBe(true);
+    // Guard `COALESCE(last_seen_event_id, 0) >= last_assistant_event_id`
+    // (10 >= 50) is false, so the UPDATE never fires — the raw column must
+    // stay exactly where it was, not jump up to last_assistant_event_id - 1.
+    expect(watermarkRow(taskId)?.last_seen_event_id).toBe(10);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 12. Neither markUnread nor markSeen bumps updated_at — both are
+//     server-managed read-state, not a task mutation.
+// ---------------------------------------------------------------------------
+
+test("markUnread and markSeen never touch updatedAt, across a full mark-unread/mark-seen cycle", async () => {
+  const taskId = randomUUID();
+  const inserted = tasks.insert(makeTaskRow(taskId));
+  const originalUpdatedAt = inserted.updatedAt;
+  try {
+    tasks.noteAssistantEvent(taskId, 5);
+
+    await new Promise((r) => setTimeout(r, 5));
+    tasks.markSeen(taskId);
+    expect(tasks.get(taskId)?.updatedAt).toBe(originalUpdatedAt);
+
+    await new Promise((r) => setTimeout(r, 5));
+    tasks.markUnread(taskId);
+    expect(tasks.get(taskId)?.updatedAt).toBe(originalUpdatedAt);
+
+    await new Promise((r) => setTimeout(r, 5));
+    tasks.markSeen(taskId);
+    expect(tasks.get(taskId)?.updatedAt).toBe(originalUpdatedAt);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 13. markUnread on an unknown task id.
+// ---------------------------------------------------------------------------
+
+test("markUnread returns null for an unknown task id", () => {
+  expect(tasks.markUnread("does-not-exist")).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// 14. DELETE /tasks/:id/seen route ("Mark as unread" in the board's task
+//     context menu).
+// ---------------------------------------------------------------------------
+
+test("DELETE /tasks/:id/seen returns 200 with the full Task JSON, unread flipped to true, and stays true on a repeat call", async () => {
+  const taskId = randomUUID();
+  tasks.insert(makeTaskRow(taskId));
+  try {
+    tasks.noteAssistantEvent(taskId, 7);
+    const seenRes = await call(`/tasks/${taskId}/seen`, { method: "POST" });
+    expect(seenRes.status).toBe(200);
+    expect(((await seenRes.json()) as Task).unread).toBe(false);
+
+    const res = await call(`/tasks/${taskId}/seen`, { method: "DELETE" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Task;
+    expect(body.id).toBe(taskId);
+    expect(body.unread).toBe(true);
+    expect(body.hasAssistantMessages).toBe(true);
+    // Full Task shape, not just a partial ack.
+    expect(body.title).toBe("t");
+    expect(body.column).toBe("ready");
+
+    // Repeat DELETE: still 200, still unread (idempotent no-op underneath).
+    const res2 = await call(`/tasks/${taskId}/seen`, { method: "DELETE" });
+    expect(res2.status).toBe(200);
+    expect(((await res2.json()) as Task).unread).toBe(true);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+test("DELETE /tasks/:id/seen 404s for an unknown task id, and 401s without a bearer token", async () => {
+  const res = await call(`/tasks/does-not-exist/seen`, { method: "DELETE" });
+  expect(res.status).toBe(404);
+  const body = (await res.json()) as { error: string };
+  expect(body.error).toBe("not found");
+
+  const taskId = randomUUID();
+  tasks.insert(makeTaskRow(taskId));
+  try {
+    tasks.noteAssistantEvent(taskId, 1);
+    const unauthed = await fetch(`${BASE}/tasks/${taskId}/seen`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+    });
+    expect(unauthed.status).toBe(401);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+test("DELETE /tasks/:id/seen works on an archived task (re-flagging in the archived view is not a mutation)", async () => {
+  const taskId = randomUUID();
+  tasks.insert(makeTaskRow(taskId));
+  try {
+    tasks.noteAssistantEvent(taskId, 3);
+    tasks.markSeen(taskId);
+    tasks.update(taskId, { archivedAt: Date.now() });
+    expect(tasks.get(taskId)?.unread).toBe(false);
+    expect(tasks.get(taskId)?.archivedAt).not.toBeNull();
+
+    const res = await call(`/tasks/${taskId}/seen`, { method: "DELETE" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Task;
+    expect(body.unread).toBe(true);
+    // Still archived — marking unread isn't a task mutation and shouldn't
+    // touch archivedAt either way.
+    expect(body.archivedAt).not.toBeNull();
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 15. hasAssistantMessages surfaces on both GET /tasks and GET /tasks/:id
+//     (the board's task context menu gates "Mark as unread" on it).
+// ---------------------------------------------------------------------------
+
+test("GET /tasks and GET /tasks/:id include hasAssistantMessages as a boolean, flipping true after an assistant event", async () => {
+  const taskId = randomUUID();
+  tasks.insert(makeTaskRow(taskId));
+  try {
+    const singleBefore = await call(`/tasks/${taskId}`);
+    const singleBeforeBody = (await singleBefore.json()) as Task;
+    expect(typeof singleBeforeBody.hasAssistantMessages).toBe("boolean");
+    expect(singleBeforeBody.hasAssistantMessages).toBe(false);
+
+    const listBefore = (await (await call(`/tasks`)).json()) as Task[];
+    const listBeforeRow = listBefore.find((t) => t.id === taskId);
+    expect(typeof listBeforeRow?.hasAssistantMessages).toBe("boolean");
+    expect(listBeforeRow?.hasAssistantMessages).toBe(false);
+
+    tasks.noteAssistantEvent(taskId, 9);
+
+    const singleAfter = (await (await call(`/tasks/${taskId}`)).json()) as Task;
+    expect(singleAfter.hasAssistantMessages).toBe(true);
+
+    const listAfter = (await (await call(`/tasks`)).json()) as Task[];
+    const listAfterRow = listAfter.find((t) => t.id === taskId);
+    expect(listAfterRow?.hasAssistantMessages).toBe(true);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});

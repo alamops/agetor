@@ -923,6 +923,15 @@ export interface Task {
    * dedicated mark-seen route.
    */
   unread?: boolean;
+  /**
+   * Derived, never stored: `last_assistant_event_id != null` — the task has
+   * observed at least one top-level `assistant` event, so there is something
+   * a "Mark as unread" (`DELETE /tasks/:id/seen`) can honestly re-flag. The
+   * board's task context menu gates that entry on this so the "New messages"
+   * dot is never shown for a task with no assistant messages. Optional and
+   * server-managed for exactly the same reasons as `unread` above.
+   */
+  hasAssistantMessages?: boolean;
   createdAt: number;
   updatedAt: number;
   /**
@@ -2694,9 +2703,12 @@ export type SubagentStatus =
  * session (`"bg_session"`); a Claude Code Workflow (`/workflow`) run's container
  * row (`"workflow"` — id = the workflow's background taskId, sourcePath = its
  * transcriptDir, no event stream of its own — exists to hold the task in
- * `running` for the workflow's lifetime); and one agent inside a workflow
+ * `running` for the workflow's lifetime); one agent inside a workflow
  * (`"workflow_agent"` — a normal sidechain transcript rendered as a read-only
- * tab).
+ * tab); and a Claude Code `Monitor` the main agent armed (`"monitor"` — id =
+ * the monitor's `taskId` from its launch stub, no source file of its own, its
+ * tab streams each `<event>` the monitor reports; holds the task in `running`
+ * until the monitor times out or is stopped).
  */
 export interface Subagent {
   /** Claude's agentId — the basename of `subagents/agent-<id>.jsonl`. */
@@ -2704,7 +2716,7 @@ export interface Subagent {
   taskId: string;
   /** Parent run that was in flight when this subagent was spawned. */
   runId: string | null;
-  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent";
+  parentKind: "subagent" | "bg_session" | "workflow" | "workflow_agent" | "monitor";
   /** Registered subagent type, e.g. "Explore" / "general-purpose". */
   agentType: string | null;
   /** Short human label from the spawning Agent tool call. */

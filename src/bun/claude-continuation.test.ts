@@ -247,6 +247,73 @@ test("replayed (deduped) lines do not trigger the factory even when they'd other
   }
 });
 
+test("a /effort local-command's <command-name> line and its <local-command-stdout> twin do NOT adopt a continuation, even with an empty turnQueue and a factory installed — both chunks still reach lastChunk", async () => {
+  // wave-5 regression pin: isContinuationContentEvent excludes BOTH
+  // local-command twins (parseLocalCommandLine / isLocalCommandStdoutEvent),
+  // specifically so the orchestrator's dropdown mirror (sendSlashCommand,
+  // which pushes no turn slot) can flip /model or /effort on an IDLE task
+  // without maybeAdoptContinuation mistaking claude's own command-echo lines
+  // for genuine new content and adopting a phantom run that can never settle
+  // (see this function's doc comment in claude-tmux.ts — the observed bug
+  // sat `running` for 6 minutes). Contrast the assistant-content adoption
+  // test above, which pins the positive case this negative case guards.
+  const { taskId, jsonlPath } = freshSession();
+  const state = __forTest.installSession(taskId, jsonlPath);
+  try {
+    const firstOut = await resolveFirstTurn(state, jsonlPath);
+
+    let calls = 0;
+    const prev = setContinuationRunFactory((tid) => {
+      calls++;
+      return { onChunk: () => {}, onAdopted: () => {} };
+    });
+    try {
+      appendFileSync(
+        jsonlPath,
+        JSON.stringify({
+          type: "user",
+          uuid: "cont-cmd-1",
+          message: {
+            role: "user",
+            content:
+              "<command-name>/effort</command-name>\n<command-message>effort</command-message>\n<command-args>high</command-args>",
+          },
+        }) + "\n",
+      );
+      __forTest.flushSync(state);
+
+      expect(calls).toBe(0);
+      expect(state.turnQueue.length).toBe(0);
+
+      appendFileSync(
+        jsonlPath,
+        JSON.stringify({
+          type: "user",
+          uuid: "cont-cmd-2",
+          message: {
+            role: "user",
+            content:
+              "<local-command-stdout>Set effort level to high (saved as your default for new sessions)</local-command-stdout>",
+          },
+        }) + "\n",
+      );
+      __forTest.flushSync(state);
+
+      expect(calls).toBe(0); // still never adopted — no slot was ever pushed
+      expect(state.turnQueue.length).toBe(0);
+      // Both lines still reach the session — routed via the hangover
+      // lastChunk (the first turn's own recorder), exactly like the ordinary
+      // "factory returning null" / "no factory installed" cases below.
+      expect(firstOut.some((r) => r.data.includes("<command-name>/effort</command-name>"))).toBe(true);
+      expect(firstOut.some((r) => r.data.includes("<local-command-stdout>Set effort level to high"))).toBe(true);
+    } finally {
+      setContinuationRunFactory(prev);
+    }
+  } finally {
+    __forTest.uninstallSession(taskId);
+  }
+});
+
 // ─── notification-triggered adoption (docs/plans/adopt-continuation-on-task-notification.md §3) ──
 //
 // `maybeAdoptContinuation`'s eligibility is now `isContinuationContentEvent(evt)
@@ -524,7 +591,7 @@ test("firing a watchdog whose armed slot is no longer the active turn is a no-op
       const displaced = state.turnQueue.shift();
       expect(displaced).toBe(armed!.slot);
       let bResolved = false;
-      const bSlot = { onChunk: () => {}, resolve: () => { bResolved = true; }, reject: () => {} };
+      const bSlot = { onChunk: () => {}, resolve: () => { bResolved = true; }, reject: () => {}, slashCommand: null };
       state.turnQueue.push(bSlot as unknown as (typeof state.turnQueue)[number]);
 
       __forTest.fireContinuationWatchdog(state);

@@ -1266,10 +1266,19 @@ export const api = {
     j<TaskGitStatus>(`/tasks/${taskId}/git-status`),
   cancelRun: (runId: string) =>
     j<{ cancelled: boolean }>(`/runs/${runId}/cancel`, { method: "POST" }),
+  // Mirrors the orchestrator's `SendInputResult` (src/bun/orchestrator.ts) —
+  // keep the two in sync. `withheld`/`savedToBacklog` are only ever present
+  // alongside `delivered: false`: they distinguish "claude is showing a
+  // modal, so the message was withheld and re-stashed into the backlog tray"
+  // from an ordinary delivery failure (run/task not found, worktree restore
+  // failure, …), which carries neither flag.
   sendRunInput: (runId: string, line: string) =>
     // retry: false — a replay would paste a duplicate message into a live
     // agent tmux session.
-    j<{ delivered: true; runId: string } | { delivered: false; reason: string }>(
+    j<
+      | { delivered: true; runId: string }
+      | { delivered: false; reason: string; withheld?: boolean; savedToBacklog?: boolean }
+    >(
       `/runs/${runId}/input`,
       { method: "POST", body: JSON.stringify({ line }) },
       { retry: false },
@@ -1281,6 +1290,15 @@ export const api = {
    *  don't wait for the next poll). Idempotent; safe to fire-and-forget. */
   markTaskSeen: (taskId: string) =>
     j<Task>(`/tasks/${taskId}/seen`, { method: "POST" }),
+  /** Re-flags a task's read watermark as unread — the board's task context
+   *  menu's "Mark as unread" entry, restoring `task.unread`'s "New messages"
+   *  dot. No-op (server-side) when the task has no assistant messages yet
+   *  (`task.hasAssistantMessages` is the client-side gate for showing the
+   *  menu entry at all). Returns the full updated Task so the caller can
+   *  merge only the `unread` field back into board state, same as
+   *  `markTaskSeen`. */
+  markTaskUnread: (taskId: string) =>
+    j<Task>(`/tasks/${taskId}/seen`, { method: "DELETE" }),
 
   // Messages backlog — saved, not-yet-sent draft messages parked on a task.
   // Every mutation returns the full updated Task so the caller can re-sync.
@@ -1495,12 +1513,23 @@ export const api = {
   },
 
   /** Answer claude's AskUserQuestion (scraper-sourced). One entry per
-   *  question in the original tool input, in the same order. */
+   *  question in the original tool input, in the same order.
+   *
+   *  Mirrors `sendRunInput`'s shape for the custom/free-text answer path —
+   *  that's the only branch capable of a withhold (dismissing the modal then
+   *  delivering the answer as a follow-up turn via `sendInput`; the
+   *  drive-a-numbered-modal path types keys straight into the open modal, no
+   *  paste to withhold). `withheld`/`savedToBacklog`/`reason` are only ever
+   *  present alongside `ok: false`, and only for that free-text path — see
+   *  `/ask-questions/:id/answer` in server.ts. */
   answerAskQuestions: (id: string, body: { answers: Array<{ selected: string[]; custom?: string }> }) =>
-    j<{ ok: boolean }>(`/ask-questions/${id}/answer`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
+    j<{ ok: boolean; withheld?: boolean; savedToBacklog?: boolean; reason?: string }>(
+      `/ask-questions/${id}/answer`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    ),
   /** Answer a tmux-pane-scraped REPL prompt. `key` must be one of the
    *  keys advertised on the request — the server validates against the
    *  recorded set before injecting keystrokes via `tmux send-keys`. */

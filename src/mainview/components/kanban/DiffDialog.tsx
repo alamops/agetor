@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { toast } from "sonner";
 import {
   AlertCircle, BookmarkPlus, ChevronDown, ChevronRight, FileMinus, FilePen, FilePlus,
   FileSymlink, GitCompare, Loader2, Send, X,
@@ -584,6 +585,19 @@ export function DiffDialog({ open, task, onClose }: Props) {
       }
       const composed = composeDiffMessage(draft.trim(), blocks);
       const res = await api.sendRunInput(resumableRunId, composed);
+      if (!res.delivered && res.withheld && res.savedToBacklog) {
+        // Claude is showing a modal — the paste was withheld and the server
+        // already re-stashed this exact message into the task's backlog tray
+        // (orchestrator's `sendInput` / `handlePasteWithheld`) rather than
+        // lose it. Nothing failed, so clear the composer + selection exactly
+        // like the delivered branch above (the text now lives in the tray —
+        // leaving it here too would duplicate it on next send/save), and
+        // toast the outcome instead of treating it as an error. Don't also
+        // call addBacklogItem: that would double-stash the server's copy.
+        clearSelection();
+        toast(res.reason);
+        return;
+      }
       if (!res.delivered) {
         setHint(res.reason);
         return;

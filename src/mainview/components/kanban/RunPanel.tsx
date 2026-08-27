@@ -3,12 +3,11 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 import {
-  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,
-  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
+  Archive, ArchiveRestore, ArrowDown, ArrowUp, BookmarkPlus, Bot, Check, ChevronDown, ChevronUp, ClipboardList, CornerDownRight, Eye, FolderOpen, FileText, FilePenLine, FilePlus, Folder,  GitCommit, GitCompare, GitMerge, GitPullRequest, Globe, HelpCircle, ListTodo, Plug, Radar, RefreshCw, Search, Send, ShieldAlert, Slash, SquareSlash,
   Sparkles, Square, Terminal, Trash2, Wrench, X,
 } from "lucide-react";
 import { api, commitPushPrompt, type AgentModelMap, type AvailableCommand, type AvailableExtension, type PendingInteraction } from "@/lib/api";
-import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs } from "@/lib/subagent-tabs";
+import { shouldShowSubagentTabs, resolveActiveStream, splitTabsForOverflow, sortSubagentTabs, anySubagentRunning } from "@/lib/subagent-tabs";
 import { prHeadBranch, shouldOfferCommitPush, shouldOfferOpenPr, type TaskGitStatus } from "@/lib/commit-push";
 import { findMatchingEventIds, resolveActiveMatchIndex, stepMatchIndex } from "@/lib/event-search";
 import { EXPAND_EVENT, isExpandTargetFor } from "@/lib/expand-on-jump";
@@ -1534,6 +1533,40 @@ function RunPanelBody({
     return runs.some((r) => r.status === "running") ? "active" : "off";
   }, [activeStream, subagentList, interactions.length, runs]);
 
+  /** Summary for the "Holding in running" line on the Main stream: the turn
+   *  itself has resolved (no run is `running`, no interaction card is up) but
+   *  the card is still parked in the `running` column because background work
+   *  (a Monitor, a bg shell, a workflow, or an in-session subagent) hasn't
+   *  settled yet — see `holdForSubagents` in orchestrator.ts, the DB-side
+   *  predicate this line explains to the user. `null` whenever nothing is
+   *  held, so the render site can gate on a single truthy check. Cheap: one
+   *  pass over `subagentList`, which the 2s poll already rebuilds regardless.
+   */
+  const holdSummary = useMemo(() => {
+    if (activeStream !== "main") return null;
+    if (task.column !== "running") return null;
+    if (interactions.length > 0) return null;
+    if (runs.some((r) => r.status === "running")) return null;
+    if (!anySubagentRunning(subagentList)) return null;
+    const running = subagentList.filter((s) => s.status === "running");
+    let monitors = 0;
+    let shells = 0;
+    let workflows = 0;
+    let agents = 0;
+    for (const s of running) {
+      if (s.parentKind === "monitor") monitors++;
+      else if (s.parentKind === "bg_session") shells++;
+      else if (s.parentKind === "workflow") workflows++;
+      else agents++;
+    }
+    const parts: string[] = [];
+    if (monitors > 0) parts.push(`${monitors} monitor${monitors > 1 ? "s" : ""}`);
+    if (shells > 0) parts.push(`${shells} shell${shells > 1 ? "s" : ""}`);
+    if (workflows > 0) parts.push(`${workflows} workflow${workflows > 1 ? "s" : ""}`);
+    if (agents > 0) parts.push(`${agents} agent${agents > 1 ? "s" : ""}`);
+    return parts.length > 0 ? `Holding in running — ${parts.join(" · ")} still active` : null;
+  }, [activeStream, task.column, interactions.length, runs, subagentList]);
+
   // The run-status RunEventList uses to gate its bottom heartbeat. On a
   // background-agent tab this must reflect THAT subagent's status, not the main
   // run's — otherwise a subagent still running after the parent turn resolved
@@ -2091,9 +2124,7 @@ function RunPanelBody({
     const body = appendReferences(line, sendRefs);
     try {
       const res = await api.sendRunInput(resumableRunId, body);
-      if (!res.delivered) {
-        setSendHint(res.reason);
-      } else {
+      if (res.delivered) {
         setInput("");
         setSendRefs([]);
         // The composer is now empty — clear the persisted draft so it can't
@@ -2129,6 +2160,27 @@ function RunPanelBody({
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
         });
+      } else if (res.withheld && res.savedToBacklog) {
+        // Claude is showing a modal — the paste was withheld and the server
+        // already re-stashed this exact message into the task's backlog tray
+        // rather than lose it (orchestrator's `sendInput` / `handlePasteWithheld`).
+        // Clear the composer + persisted draft exactly like the delivered
+        // branch above: the text now lives in the tray, so leaving it here
+        // too would duplicate it on next send. Refresh the tray right away
+        // instead of waiting for the next 2s task poll, and toast the
+        // outcome — there's no run/turn here to carry a status line the way
+        // a mid-turn withhold would.
+        setInput("");
+        setSendRefs([]);
+        cancelDraftSaveTimer();
+        draftGenRef.current++;
+        lastSavedDraftRef.current = null;
+        draftPristineRef.current = false;
+        void api.clearTaskDraft(task.id).catch(() => {});
+        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        toast(res.reason);
+      } else {
+        setSendHint(res.reason);
       }
     } catch (e) {
       setSendHint(e instanceof Error ? e.message : String(e));
@@ -2190,9 +2242,7 @@ function RunPanelBody({
     const body = appendReferences(item.text, item.references);
     try {
       const res = await api.sendRunInput(resumableRunId, body);
-      if (!res.delivered) {
-        setSendHint(res.reason);
-      } else {
+      if (res.delivered) {
         try {
           const updated = await api.deleteBacklogItem(task.id, item.id);
           setBacklogItems(updated.backlog);
@@ -2210,6 +2260,19 @@ function RunPanelBody({
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
         });
+      } else if (res.withheld && res.savedToBacklog) {
+        // `item` was never deleted above (delivery failed), so it's still
+        // sitting in `backlogItems` — do NOT delete it here. The server's
+        // re-stash (`restashPasteWithheldText`, orchestrator.ts) now dedupes
+        // against the WHOLE backlog rather than just its most-recent item
+        // (finding #3, §10 re-review), so it recognizes `item`'s own text is
+        // already present and does NOT write a duplicate entry — no local
+        // filtering needed here any more. Just refetch and adopt whatever the
+        // server has.
+        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        toast(res.reason);
+      } else {
+        setSendHint(res.reason);
       }
     } catch (e) {
       setSendHint(e instanceof Error ? e.message : String(e));
@@ -2290,9 +2353,7 @@ function RunPanelBody({
     setSendHint(null);
     try {
       const res = await api.sendRunInput(resumableRunId, message);
-      if (!res.delivered) {
-        setSendHint(res.reason);
-      } else {
+      if (res.delivered) {
         setRebuilt(null);
         setRebuildNote(null);
         void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
@@ -2300,6 +2361,16 @@ function RunPanelBody({
         requestAnimationFrame(() => {
           logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
         });
+      } else if (res.withheld && res.savedToBacklog) {
+        // Claude is showing a modal — the canned commit/push message was
+        // withheld and stashed into the backlog tray instead of being lost.
+        // Refresh the tray right away and toast the outcome; there's no
+        // run/turn here to carry a status line the way a mid-turn withhold
+        // would.
+        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        toast(res.reason);
+      } else {
+        setSendHint(res.reason);
       }
     } catch (e) {
       setSendHint(e instanceof Error ? e.message : String(e));
@@ -2350,14 +2421,7 @@ function RunPanelBody({
     setSendHint(null);
     try {
       const res = await api.sendRunInput(resumableRunId, prompt);
-      if (!res.delivered) {
-        setSendHint(res.reason);
-        // The button can be hidden by the time this resolves — archived,
-        // a subagent tab (dock-level), or the mergeability re-fetch clearing
-        // `prStatus` — any of which would make `sendHint` invisible, so
-        // toast to surface the failure regardless.
-        toast.error(res.reason);
-      } else {
+      if (res.delivered) {
         setRebuilt(null);
         setRebuildNote(null);
         void api.listRuns(task.id).then((list) => setRuns(list)).catch(() => {});
@@ -2368,6 +2432,21 @@ function RunPanelBody({
         if (resolveConflictsSentTimerRef.current) clearTimeout(resolveConflictsSentTimerRef.current);
         setResolveConflictsSent(true);
         resolveConflictsSentTimerRef.current = setTimeout(() => setResolveConflictsSent(false), 5_000);
+      } else if (res.withheld && res.savedToBacklog) {
+        // Claude is showing a modal — the merge/resolve-conflicts prompt was
+        // withheld and stashed into the backlog tray instead of being lost.
+        // Refresh the tray right away; toast (not toast.error — nothing
+        // failed, the message just landed somewhere other than the agent)
+        // since the button can be hidden by the time this resolves.
+        void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+        toast(res.reason);
+      } else {
+        setSendHint(res.reason);
+        // The button can be hidden by the time this resolves — archived,
+        // a subagent tab (dock-level), or the mergeability re-fetch clearing
+        // `prStatus` — any of which would make `sendHint` invisible, so
+        // toast to surface the failure regardless.
+        toast.error(res.reason);
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -2756,10 +2835,21 @@ function RunPanelBody({
                 onInteractionResolved={dismissInteraction}
                 runStatus={activeRunStatus}
                 indicatorMode={indicatorMode}
+                holdSummary={holdSummary}
                 taskId={task.id}
                 plans={kind === "cursor" || kind === "claude-code" ? plans : NO_PLANS}
                 onOpenPlan={onOpenPlan}
                 agentKind={kind}
+                onAskAnswerWithheld={(reason) => {
+                  // Same informational framing as `send()`'s withheld branch
+                  // above: claude was showing some OTHER blocking modal when
+                  // the free-text ask-card answer tried to land as a
+                  // follow-up turn, so the server re-stashed it into the
+                  // backlog tray instead of losing it. Refresh the tray right
+                  // away and toast (not toast.error — nothing failed).
+                  toast(reason);
+                  void api.getTask(task.id).then((fresh) => setBacklogItems(fresh.backlog)).catch(() => {});
+                }}
               />
             </>
           )}
@@ -3431,8 +3521,12 @@ function SubagentTab({ s, selected, onSelect }: { s: Subagent; selected: boolean
           Task-tool subagents in a mixed strip. Keyed on parentKind — the
           actual discriminator for "is this a bg shell" — rather than
           agentType, which is just the literal string bg shells happen to
-          carry. */}
+          carry. A Claude Code Monitor (parentKind "monitor") gets its own
+          radar glyph for the same reason — its label already reads "monitor"
+          via the `agentType ?? "agent"` fallback above, but the icon still
+          needs to read as distinct from a plain Task-tool subagent tab. */}
       {s.parentKind === "bg_session" && <Terminal className="size-3 shrink-0 text-muted-foreground" />}
+      {s.parentKind === "monitor" && <Radar className="size-3 shrink-0 text-muted-foreground" />}
       <span className="max-w-[10rem] truncate">{label}</span>
       {s.description && (
         <span className="max-w-[12rem] truncate text-muted-foreground/70">· {s.description}</span>
@@ -3722,16 +3816,25 @@ function RunEventList({
   onInteractionResolved,
   runStatus,
   indicatorMode = "off",
+  holdSummary = null,
   taskId,
   plans = [],
   onOpenPlan,
   agentKind,
+  onAskAnswerWithheld,
 }: {
   events: RunEvent[];
   interactions?: PendingInteraction[];
   onInteractionResolved?: (id: string) => void;
   runStatus?: Run["status"] | null;
   indicatorMode?: RunIndicatorMode;
+  /** Non-null when the Main stream's turn has resolved but the task is still
+   *  held in `running` by background work (a Monitor, a bg shell, a workflow,
+   *  or a subagent) — rendered as a `HoldingIndicator` instead of the regular
+   *  `RunningIndicator`, mutually exclusive with it. Computed by the caller
+   *  (`holdSummary` in `RunPanelBody`) since it needs `task.column` and
+   *  `runs`, neither of which this component has. */
+  holdSummary?: string | null;
   /** Threaded through to each `UserMessageBlock`'s `AttachmentChips` so a
    *  relative attachment ref can resolve against the task's worktree/workdir
    *  when the user clicks it. */
@@ -3753,6 +3856,12 @@ function RunEventList({
    *  needs it; cursor/codex/gemini tasks would otherwise pay the same
    *  per-tool_use JSON-parse cost for a value nothing consumes). */
   agentKind?: AgentKind;
+  /** Forwarded to `AskQuestionsCard` — fires when a free-text ask-card answer
+   *  came back `{ ok: false, withheld: true, savedToBacklog: true, reason }`
+   *  (some OTHER blocking modal was up when the answer tried to land as a
+   *  follow-up turn), so the caller can toast the outcome and refresh the
+   *  backlog tray exactly like the composer's own withheld branch. */
+  onAskAnswerWithheld?: (reason: string) => void;
 }) {
   // Index tool_results by their tool_use_id so the tool-use card can show
   // Normalise legacy `[tool: Name] {...}` / `[thinking] ...` / `[result] ...`
@@ -3994,7 +4103,14 @@ function RunEventList({
       const onResolved = onInteractionResolved ?? (() => {});
       switch (it.kind) {
         case "ask_questions":
-          return <AskQuestionsCard key={`int-${it.id}`} req={it} onResolved={onResolved} />;
+          return (
+            <AskQuestionsCard
+              key={`int-${it.id}`}
+              req={it}
+              onResolved={onResolved}
+              onWithheld={onAskAnswerWithheld}
+            />
+          );
         case "tmux_prompt":
           return (
             <TmuxPromptCard
@@ -4041,6 +4157,7 @@ function RunEventList({
         </section>
       ))}
       {indicatorMode !== "off" && runStatus === "running" && <RunningIndicator />}
+      {holdSummary && <HoldingIndicator text={holdSummary} />}
     </div>
   );
 }
@@ -4060,6 +4177,25 @@ function RunningIndicator() {
         <span className="relative inline-flex size-2 rounded-full bg-success" />
       </span>
       <span>Agent is working…</span>
+    </div>
+  );
+}
+
+/**
+ * Pinned-at-bottom explainer for the "held in running" state: the turn itself
+ * has resolved but the card stays in `running` because background work (a
+ * Monitor, a bg shell, a workflow, or a subagent) hasn't settled yet — see
+ * `holdSummary` above for the gating. Deliberately mutually exclusive with
+ * `RunningIndicator` (only one of the two is ever rendered) and visually
+ * quieter — a steady dot rather than `RunningIndicator`'s pulsing one, since
+ * nothing is happening on the Main stream right now; the activity is
+ * elsewhere, in the background tabs this line points at.
+ */
+function HoldingIndicator({ text }: { text: string }) {
+  return (
+    <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+      <span className="inline-flex size-2 shrink-0 rounded-full bg-info" />
+      <span>{text}</span>
     </div>
   );
 }
@@ -5394,9 +5530,14 @@ function summarizeToolInput(toolName: string, input: unknown): string {
 function AskQuestionsCard({
   req,
   onResolved,
+  onWithheld,
 }: {
   req: Extract<PendingInteraction, { kind: "ask_questions" }>;
   onResolved: (id: string) => void;
+  /** Fires when the free-text answer path came back withheld-and-saved (see
+   *  `RunEventList`'s `onAskAnswerWithheld` doc). Undefined for the
+   *  drive-a-numbered-modal path, which can't withhold. */
+  onWithheld?: (reason: string) => void;
 }) {
   // One entry per question. selected = picked option labels; custom = optional free-text.
   const [answers, setAnswers] = useState<Array<{ selected: string[]; custom: string }>>(
@@ -5435,12 +5576,22 @@ function AskQuestionsCard({
     if (!canSubmit || submitting) return;
     setSubmitting(true);
     try {
-      await api.answerAskQuestions(req.id, {
+      const res = await api.answerAskQuestions(req.id, {
         answers: answers.map((a) => ({
           selected: a.selected,
           custom: a.custom.trim() || undefined,
         })),
       });
+      // The server drops the card regardless of outcome (see its own doc):
+      // the Escape it sent before attempting delivery already dismissed
+      // THIS modal, so keeping the card up wouldn't let the user retry
+      // answering it. A withheld-and-saved outcome (some OTHER blocking
+      // modal came up while delivering the follow-up turn) is purely
+      // informational — surface it exactly like the composer's own withheld
+      // branch (toast + backlog refresh) before dropping the card.
+      if (res.withheld && res.savedToBacklog) {
+        onWithheld?.(res.reason ?? "claude is waiting on a prompt — your answer was saved to the backlog tray");
+      }
       onResolved(req.id);
     } finally {
       setSubmitting(false);

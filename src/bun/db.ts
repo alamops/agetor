@@ -291,6 +291,10 @@ const toTask = (r: TaskRow, counts?: TaskCounts): Task => ({
   // `last_assistant_event_id` (no assistant event ever observed) always
   // reads as false, matching "an upgraded/brand-new DB starts all-read".
   unread: r.last_assistant_event_id != null && r.last_assistant_event_id > (r.last_seen_event_id ?? 0),
+  // Derived, never stored: whether the task has ever observed a top-level
+  // assistant event — the gate for "Mark as unread" (there's nothing to
+  // honestly re-flag on a task that's never gotten a response).
+  hasAssistantMessages: r.last_assistant_event_id != null,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   archivedAt: r.archived_at,
@@ -354,7 +358,7 @@ export const tasks = {
     // Round-trip via `get` so the returned shape carries the computed
     // hasOpenableRun field (false for a brand-new task — but callers
     // that mutate t shouldn't accidentally get a stale shape).
-    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, unread: false, archivedAt: null };
+    return this.get(t.id) ?? { ...t, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0, todoProgress: t.todoProgress ?? null, unread: false, hasAssistantMessages: false, archivedAt: null };
   },
   update(id: string, patch: Partial<Task>): Task | null {
     const current = this.get(id);
@@ -417,6 +421,34 @@ export const tasks = {
        WHERE id = ?
          AND last_assistant_event_id IS NOT NULL
          AND COALESCE(last_seen_event_id, 0) < last_assistant_event_id`,
+      [taskId],
+    );
+    return this.get(taskId);
+  },
+  /**
+   * Mark a task's unread watermark back to un-caught-up: `last_seen_event_id`
+   * is set to `last_assistant_event_id - 1` (not `0` or `NULL`) so exactly
+   * the latest assistant message reads as unread — matching "one new
+   * message" semantics for a future unread count, rather than an arbitrary
+   * pile of history. Single guarded UPDATE, atomic (no SELECT + UPDATE
+   * race). The `>=` guard makes this a no-op when the task is already
+   * unread, so it can never move an already-lower watermark back up (e.g. a
+   * stale double-click on "Mark as unread"). A task with no assistant event
+   * yet (`last_assistant_event_id IS NULL`) is also a no-op — there is
+   * nothing to honestly re-flag. Called from `DELETE /tasks/:id/seen`
+   * (board's task context menu). Returns the freshly updated Task, or null
+   * if the task doesn't exist.
+   */
+  markUnread(taskId: string): Task | null {
+    // No `updated_at` bump, same reason as `markSeen`: this is server-managed
+    // read-state, not a task mutation, and touching `updated_at` would defeat
+    // `reconcileById`'s identity preservation.
+    db.run(
+      `UPDATE tasks SET
+         last_seen_event_id = last_assistant_event_id - 1
+       WHERE id = ?
+         AND last_assistant_event_id IS NOT NULL
+         AND COALESCE(last_seen_event_id, 0) >= last_assistant_event_id`,
       [taskId],
     );
     return this.get(taskId);
@@ -1302,6 +1334,21 @@ export const runs = {
     ).all(subagentId);
     return new Set(rows.map((r) => r.line_uuid));
   },
+  /** Whether ANY persisted event for `subagentId` carries a `line_uuid`
+   *  starting with `prefix` — a targeted probe for a marker key such as
+   *  claude-subagents.ts's `monitor:<id>:terminal:` (an authoritative Monitor
+   *  receipt on record), cheaper than materialising every uuid via
+   *  `seenLineUuidsForSubagent` just to scan a chatty stream for one prefix.
+   *  Compared with `substr` rather than `LIKE` so a `%`/`_` in the prefix
+   *  can't widen the match. */
+  hasLineUuidPrefixForSubagent(subagentId: string, prefix: string): boolean {
+    const row = db.query<{ one: number }, [string, string, string]>(
+      `SELECT 1 as one FROM run_events
+       WHERE subagent_id = ? AND line_uuid IS NOT NULL AND substr(line_uuid, 1, length(?)) = ?
+       LIMIT 1`,
+    ).get(subagentId, prefix, prefix);
+    return row !== null;
+  },
 };
 
 interface SubagentRow {
@@ -1325,7 +1372,7 @@ interface SubagentRow {
  *  still land on a member of the union, so `toSubagent` falls back to
  *  `"subagent"` for anything not listed here. Keep in sync with
  *  `Subagent.parentKind` in shared/types.ts. */
-const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent"]);
+const PARENT_KINDS = new Set<string>(["subagent", "bg_session", "workflow", "workflow_agent", "monitor"]);
 
 function toSubagent(r: SubagentRow): Subagent {
   return {

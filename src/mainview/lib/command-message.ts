@@ -144,14 +144,23 @@ function tryParsePlainEcho(text: string): CommandInvocation | null {
 const LOCAL_STDOUT_SELF_CLOSING_RE = /^\s*<local-command-stdout\s*\/>\s*$/;
 const LOCAL_STDOUT_RE = /^\s*<local-command-stdout>([\s\S]*?)<\/local-command-stdout>\s*$/;
 
+/** ANSI SGR ("Select Graphic Rendition") escape sequences — e.g. claude's
+ *  `\x1b[1m`/`\x1b[22m` bold toggle around the model name in `/model`'s
+ *  stdout ("Set model to \x1b[1mOpus 5 (1M context)\x1b[22m for this session
+ *  only"). tmux's pane capture forwards these raw; rendered verbatim they'd
+ *  show as literal escape-code noise in the command-output bubble. */
+const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
+
 /** (c) output of a local (non-slash) command, wrapped by claude CLI in
  *  `<local-command-stdout>`. Returns `null` (not `""`) when the shape doesn't
  *  match at all, so callers can distinguish "no match" from "matched, empty
- *  output". */
+ *  output". ANSI SGR codes are stripped before trimming — rendering-only,
+ *  same as the trim itself; `canonicalizeUserText` (which feeds dedup keys)
+ *  never routes through here and is unaffected. */
 function tryParseLocalCommandStdout(text: string): string | null {
   if (LOCAL_STDOUT_SELF_CLOSING_RE.test(text)) return "";
   const m = LOCAL_STDOUT_RE.exec(text);
-  return m ? (m[1] ?? "").trim() : null;
+  return m ? (m[1] ?? "").replace(ANSI_SGR_RE, "").trim() : null;
 }
 
 /**
