@@ -179,13 +179,29 @@ export interface AvailableExtension {
   kind: "mcp" | "skill" | "plugin";
 }
 
-/** Per-agent model id list discovered from the CLI at boot. */
+/** Per-kind model id list from the CLI's own catalog discovery — kept fresh
+ *  by the boot sweep, the periodic 15-minute re-probe, harness-status
+ *  transitions, and a manual refresh (`refreshAgentModels`), not just at
+ *  boot. For fx (account-scoped catalogs), this kind-level map reflects the
+ *  built-in harness only — see `HarnessModelMap` for the per-harness list a
+ *  multi-account setup needs. */
 export interface AgentModelMap {
   "claude-code": { id: string; label?: string }[];
   "codex": { id: string; label?: string }[];
   "cursor": { id: string; label?: string }[];
   "gemini": { id: string; label?: string }[];
   "fx": { id: string; label?: string }[];
+}
+
+/** Per-harness model id list from `GET /agent-models/harnesses` — one entry
+ *  per *enabled* harness (every kind, not just fx; non-fx harnesses carry
+ *  their kind's list so callers have a single lookup keyed by harness id,
+ *  which is what `task.agent` / the New Task form's `agent` state hold).
+ *  `ready` is false until the boot discovery sweep has resolved at least
+ *  once — before that, `byHarness` may be incomplete or empty. */
+export interface HarnessModelMap {
+  ready: boolean;
+  byHarness: Record<string, { id: string; label?: string }[]>;
 }
 
 /** Pending multi-question card from claude's built-in AskUserQuestion tool
@@ -460,7 +476,18 @@ export const api = {
   deleteSavedPrompt: (id: string) =>
     j<{ ok: true }>(`/saved-prompts/${encodeURIComponent(id)}`, { method: "DELETE" }),
   listAgentModels: () => j<AgentModelMap>("/agent-models"),
-  refreshAgentModels: () => j<AgentModelMap>("/agent-models", { method: "POST" }),
+  /** Per-harness model catalog (fx account-scoped, one entry per enabled
+   *  harness) — see `HarnessModelMap`. */
+  listHarnessModels: () => j<HarnessModelMap>("/agent-models/harnesses"),
+  /** Force a fresh discovery probe. Omit `harnessId` to refresh every
+   *  enabled harness; pass one to refresh just that harness (the picker's
+   *  manual ↻ button). Always returns the unchanged kind-level map — refetch
+   *  `listHarnessModels()` separately for the per-harness view. */
+  refreshAgentModels: (harnessId?: string) =>
+    j<AgentModelMap>(
+      harnessId ? `/agent-models?harness=${encodeURIComponent(harnessId)}` : "/agent-models",
+      { method: "POST" },
+    ),
   listProjects: () => j<Project[]>("/projects"),
   pickProject: (startingFolder?: string) =>
     j<{ project: Project | null }>("/projects/pick", {
@@ -1605,11 +1632,14 @@ export const api = {
 
   /** App-level event stream — carries `quit_request` (the main process
    *  sends it when the user hits Cmd+Q while runs are active), `open_task`
-   *  (a native-notification deep-link click), and `harness_usage` (a fresh
+   *  (a native-notification deep-link click), `harness_usage` (a fresh
    *  usage/quota snapshot from the background poller or a force-refresh —
-   *  see `getAllUsage`/`refreshHarnessUsage`). No type whitelist here: every
-   *  `AppEvent` variant is forwarded to `onEvent` as-is, so a new variant
-   *  needs no change in this function. Live-only (no replay). */
+   *  see `getAllUsage`/`refreshHarnessUsage`), and `agent_models_changed`
+   *  (the model-discovery scheduler re-probed one or more harnesses and at
+   *  least one catalog changed — refetch `listAgentModels`/
+   *  `listHarnessModels`). No type whitelist here: every `AppEvent` variant
+   *  is forwarded to `onEvent` as-is, so a new variant needs no change in
+   *  this function. Live-only (no replay). */
   subscribeAppEvents(onEvent: (e: AppEvent) => void): () => void {
     const es = new EventSource(`${BASE}/app/events?token=${encodeURIComponent(API_TOKEN)}`);
     es.onmessage = (m) => {

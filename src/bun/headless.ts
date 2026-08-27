@@ -4,7 +4,7 @@ import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, reapIdleSessions } from "./orchestrator.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
-import { refreshDiscoveredModels } from "./agent-discovery.ts";
+import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
 import { reapLiveFxProcs } from "./fx-acp.ts";
 import {
   writeCoreCreds,
@@ -117,7 +117,14 @@ export async function runDaemon(): Promise<void> {
   // daemon can find claude/codex/tmux and doesn't leave stale "running" cards.
   rehydratePath();
   reconcileOrphans();
-  void refreshDiscoveredModels();
+  // Same boot-sweep + periodic-refresh pair as index.ts's desktop boot path
+  // (see its comment for the full rationale) — the daemon needs the same
+  // model-discovery freshness the app gets, and `startPeriodicDiscovery`'s
+  // timer is `.unref()`'d internally, satisfying this file's rule that a
+  // background timer must never be what keeps the daemon alive past its own
+  // idle-shutdown path.
+  void refreshAllModels();
+  startPeriodicDiscovery();
 
   // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4):
   // mirrors index.ts's wiring so the headless daemon doesn't accumulate the

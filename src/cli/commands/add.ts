@@ -10,10 +10,12 @@ import {
   AGENT_OPTIONS,
   DEFAULT_MODEL,
   DEFAULT_EFFORT,
+  CATALOG_SCOPED_KINDS,
   supportedEfforts,
   type AgentKind,
   type AgentOption,
 } from "../../shared/types.ts";
+import { mergeModelOptions, type DiscoveredModel } from "../../shared/model-options.ts";
 
 interface AddOpts {
   title?: string;
@@ -160,7 +162,18 @@ async function wizard(
     .listHarnesses()
     .catch(() => ({ harnesses: [], statuses: [] }));
   const prefs = await client.getPreferences().catch(() => ({}) as Record<string, string>);
-  const discovered = await client.agentModels().catch(() => ({}) as Record<string, string[]>);
+  // Kind-level catalog (older-daemon-safe fallback) and per-harness catalog
+  // (what the app's pickers actually use — a second fx harness with its own
+  // account sees its own list). Each is independently `.catch`-guarded so a
+  // daemon that hasn't landed `/agent-models/harnesses` yet (or either probe
+  // failing outright) degrades to the kind map instead of crashing the
+  // wizard — see plan §3 D6.
+  const discovered = await client
+    .agentModels()
+    .catch(() => ({}) as Record<string, DiscoveredModel[]>);
+  const harnessModels = await client
+    .harnessModels()
+    .catch(() => ({ ready: true, byHarness: {} as Record<string, DiscoveredModel[]> }));
 
   let agent = o.agent;
   if (!agent) {
@@ -181,8 +194,18 @@ async function wizard(
 
   let model = o.model;
   if (!model) {
-    const options = mergeModels(AGENT_OPTIONS[kind].models, discovered[kind] ?? []);
-    const picked = await pickOption("Model", options, prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind]);
+    const initial = prefs[`lastModel:${kind}`] ?? DEFAULT_MODEL[kind];
+    // Prefer the per-harness catalog (keyed by harness id, e.g. distinguishes
+    // an additional `fx-2` account from the built-in `fx`); fall back to the
+    // kind-level map for an older daemon without `/agent-models/harnesses`.
+    const catalog: DiscoveredModel[] = (agent && harnessModels.byHarness[agent]) || discovered[kind] || [];
+    const options = mergeModelOptions({
+      curated: AGENT_OPTIONS[kind].models,
+      discovered: catalog,
+      selected: initial,
+      scoped: CATALOG_SCOPED_KINDS.has(kind),
+    });
+    const picked = await pickOption("Model", options, initial);
     if (picked === null) return cancelled();
     model = picked;
   }
@@ -236,23 +259,15 @@ async function wizard(
   return baseInput({ ...o, agent, model, mode, effort, workdir }, title, prompt);
 }
 
-/** Curated model list + any discovered ids not already curated (tagged
- *  "discovered"), so a newer model shows up without a code change. */
-export function mergeModels(curated: AgentOption[], discovered: string[]): AgentOption[] {
-  const known = new Set(curated.map((m) => m.id));
-  return [
-    ...curated,
-    ...discovered
-      .filter((id) => !known.has(id))
-      .map((id) => ({ id, label: id, hint: "discovered" })),
-  ];
-}
-
 /** A select that returns the chosen value (or null on cancel), pre-selecting
- *  `initial` when it's a valid option. */
+ *  `initial` when it's a valid option. Structurally typed (`id`/`label`/
+ *  optional `hint`) rather than `AgentOption[]` so it accepts both plain
+ *  curated rows (modes, efforts) and `mergeModelOptions`'s `ModelOption[]`
+ *  (models) without a cast — both shapes carry the fields this cares about
+ *  and nothing else is read. */
 async function pickOption(
   message: string,
-  opts: AgentOption[],
+  opts: ReadonlyArray<{ id: string; label: string; hint?: string }>,
   initial: string | undefined,
 ): Promise<string | null> {
   const pick = await p.select({

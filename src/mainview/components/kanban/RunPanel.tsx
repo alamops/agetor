@@ -28,6 +28,7 @@ import { abbreviateHome, cn } from "@/lib/utils";
 import { iconForRef, refBasename } from "@/lib/file-icons";
 import {
   AGENT_OPTIONS,
+  CATALOG_SCOPED_KINDS,
   DEFAULT_EFFORT,
   DEFAULT_MODEL,
   EVENTS_WINDOW_MAX,
@@ -56,6 +57,7 @@ import {
   type TaskReference,
 } from "../../../shared/types.ts";
 import { appendReferences } from "../../../shared/refs.ts";
+import { mergeModelOptions } from "../../../shared/model-options.ts";
 import { draftsEqual, normalizeDraft } from "@/lib/draft";
 import { createEventDeduper } from "@/lib/event-dedup";
 import { collapseRepeatedStatusChips } from "@/lib/status-collapse";
@@ -142,6 +144,17 @@ interface Props {
    *  every known harness (built-ins + aliases). */
   harnesses: Harness[];
   agentModels: AgentModelMap;
+  /** Per-harness model catalog (fx account-scoped) — see `HarnessModelMap`
+   *  on the api client. Preferred over `agentModels` for the task's own
+   *  harness id wherever the panel resolves the model picker's options. */
+  harnessModels: Record<string, { id: string; label?: string }[]>;
+  /** Force a fresh discovery probe (one harness, or every enabled harness
+   *  when omitted) then refetch both model maps. Threaded down to
+   *  `TaskDetails`' inline editor for the same manual-↻ affordance
+   *  NewTaskForm has; the SSE `agent_models_changed` path keeps both maps
+   *  fresh regardless, so this is a convenience, not the only freshness
+   *  source. */
+  onRefreshModels: (harnessId?: string) => Promise<void>;
   homeDir: string;
   onClose: () => void;
   /** Open the git diff viewer for the given task. */
@@ -231,7 +244,7 @@ function formatUsageCount(n: number): string {
  * the kanban behind it stays visible but de-emphasized. The panel keeps the
  * last task mounted during the exit animation so the slide-out doesn't snap.
  */
-export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest }: Props) {
+export function RunPanel({ task, agents, harnesses, agentModels, harnessModels, onRefreshModels, homeDir, onClose, onShowDiff, onArchive, onUnarchive, onOpenPullRequest, onViewPullRequest }: Props) {
   // `mountedTask` lags behind `task` so that when the parent sets task → null
   // we keep rendering the old contents while the exit animation plays.
   const [mountedTask, setMountedTask] = useState<Task | null>(task);
@@ -316,6 +329,8 @@ export function RunPanel({ task, agents, harnesses, agentModels, homeDir, onClos
           agents={agents}
           harnesses={harnesses}
           agentModels={agentModels}
+          harnessModels={harnessModels}
+          onRefreshModels={onRefreshModels}
           homeDir={homeDir}
           open={open}
           onClose={onClose}
@@ -339,6 +354,8 @@ function RunPanelBody({
   agents,
   harnesses,
   agentModels,
+  harnessModels,
+  onRefreshModels,
   homeDir,
   open,
   onClose,
@@ -352,6 +369,8 @@ function RunPanelBody({
   agents: AgentStatus[];
   harnesses: Harness[];
   agentModels: AgentModelMap;
+  harnessModels: Record<string, { id: string; label?: string }[]>;
+  onRefreshModels: (harnessId?: string) => Promise<void>;
   homeDir: string;
   /** Whether the panel is in its "open" (not mid-close-animation, not
    *  pre-mount) state — mirrors `RunPanel`'s own `open` state. Gates the
@@ -2716,6 +2735,8 @@ function RunPanelBody({
         agents={agents}
         harnesses={harnesses}
         agentModels={agentModels}
+        harnessModels={harnessModels}
+        onRefreshModels={onRefreshModels}
         homeDir={homeDir}
         tmuxSession={latestRun?.tmuxSession ?? null}
       />
@@ -5143,6 +5164,8 @@ function TaskDetails({
   agents,
   harnesses,
   agentModels,
+  harnessModels,
+  onRefreshModels,
   homeDir,
   tmuxSession,
 }: {
@@ -5150,12 +5173,17 @@ function TaskDetails({
   agents: AgentStatus[];
   harnesses: Harness[];
   agentModels: AgentModelMap;
+  harnessModels: Record<string, { id: string; label?: string }[]>;
+  onRefreshModels: (harnessId?: string) => Promise<void>;
   homeDir: string;
   /** Tmux session name from the latest run (claude-code only). `null` when
    *  no run has spawned a session yet — the Tmux row hides itself in that
    *  case rather than presenting an Attach button that's guaranteed to 404. */
   tmuxSession: string | null;
 }) {
+  // Spins the Model row's ↻ button while a manual `onRefreshModels` probe is
+  // in flight for this task's harness — mirrors NewTaskForm's affordance.
+  const [refreshingModels, setRefreshingModels] = useState(false);
   const editable = task.column !== "running" && task.column !== "blocked";
   const kind = harnessKindOf(task.agent, harnesses);
 
@@ -5272,12 +5300,39 @@ function TaskDetails({
             )}
           </dd>
 
-          <dt className="text-muted-foreground">Model</dt>
+          <dt className="flex items-center gap-1 text-muted-foreground">
+            Model
+            {editable && (
+              <button
+                type="button"
+                title="Refresh model list"
+                aria-label="Refresh model list"
+                data-testid="refresh-models-details"
+                disabled={refreshingModels}
+                className={cn(
+                  "text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50",
+                  refreshingModels && "animate-spin",
+                )}
+                onClick={async () => {
+                  setRefreshingModels(true);
+                  try {
+                    await onRefreshModels(task.agent);
+                  } catch {
+                    // The SSE / ready-retry paths also refetch.
+                  } finally {
+                    setRefreshingModels(false);
+                  }
+                }}
+              >
+                <RefreshCw className="size-3" />
+              </button>
+            )}
+          </dt>
           <dd className="min-w-0">
             {editable ? (
               <CompactSelect
                 value={task.model ?? DEFAULT_MODEL[kind]}
-                options={mergedModels(kind, agentModels)}
+                options={mergedModels(kind, task.agent, agentModels, harnessModels, task.model ?? DEFAULT_MODEL[kind])}
                 onChange={(model) => void save({ model })}
               />
             ) : (
@@ -5424,16 +5479,28 @@ function TaskDetails({
   );
 }
 
-/** Merge curated AGENT_OPTIONS models with CLI-discovered ones (same logic as
- *  NewTaskForm) so the inline editor surfaces every model the user can pick. */
-function mergedModels(agent: AgentKind, agentModels: AgentModelMap) {
-  const stat = AGENT_OPTIONS[agent].models;
-  const known = new Set(stat.map((m) => m.id));
-  const extras = (agentModels[agent] ?? [])
-    .filter((m) => !known.has(m.id))
-    .filter((m) => agent !== "cursor" || !cursorModelIdCoveredByCatalog(m.id))
-    .map((m): typeof stat[number] => ({ id: m.id, label: m.label ?? m.id }));
-  return [...stat, ...extras];
+/** Merge curated AGENT_OPTIONS models with this harness's CLI-discovered
+ *  catalog via the shared `mergeModelOptions` helper (same rules NewTaskForm
+ *  uses — plan `fx-model-catalog-refresh.md` §3 D3) so the inline editor
+ *  surfaces every model the user can pick. Prefers the per-harness catalog
+ *  (keyed by `harnessId`, e.g. `task.agent`) over the kind-level map, which
+ *  only exists as a fallback for an older daemon predating
+ *  `GET /agent-models/harnesses`. */
+function mergedModels(
+  kind: AgentKind,
+  harnessId: string,
+  agentModels: AgentModelMap,
+  harnessModels: Record<string, { id: string; label?: string }[]>,
+  selected: string | null,
+) {
+  const discovered = (harnessModels[harnessId] ?? agentModels[kind] ?? [])
+    .filter((m) => kind !== "cursor" || !cursorModelIdCoveredByCatalog(m.id));
+  return mergeModelOptions({
+    curated: AGENT_OPTIONS[kind].models,
+    discovered,
+    selected,
+    scoped: CATALOG_SCOPED_KINDS.has(kind),
+  });
 }
 
 function CompactSelect({

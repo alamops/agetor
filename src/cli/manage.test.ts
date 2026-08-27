@@ -126,6 +126,27 @@ test("agentModels returns discovered model ids per kind", async () => {
     const models = await client.agentModels();
     expect(Array.isArray(models["claude-code"])).toBe(true);
     expect(Array.isArray(models["codex"])).toBe(true);
+    // Server rows are `{id, label?}[]`, not bare strings — pin the shape
+    // `agentModels()`'s corrected return type now declares.
+    for (const kind of ["claude-code", "codex"]) {
+      for (const row of models[kind] ?? []) {
+        expect(typeof row.id).toBe("string");
+      }
+    }
+  });
+}, 30_000);
+
+test("harnessModels returns { ready, byHarness } keyed by enabled harness id", async () => {
+  await withClient(4536, async (client) => {
+    const res = await client.harnessModels();
+    expect(typeof res.ready).toBe("boolean");
+    expect(typeof res.byHarness).toBe("object");
+    // Every enabled built-in harness should have a row (possibly an empty
+    // discovered list) once the daemon exposes this route — plan
+    // `fx-model-catalog-refresh.md` §3 D4/D6, server side landed in T6.
+    for (const kind of Object.keys(res.byHarness)) {
+      expect(Array.isArray(res.byHarness[kind])).toBe(true);
+    }
   });
 }, 30_000);
 
