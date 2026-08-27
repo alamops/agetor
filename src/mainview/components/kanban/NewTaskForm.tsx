@@ -236,7 +236,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   useEffect(() => { workdirRef.current = workdir; }, [workdir]);
   const issueLoadSeqRef = useRef(0);
   const issueFormMountedRef = useRef(true);
-  useEffect(() => () => { issueFormMountedRef.current = false; }, []);
+  // Set on mount AND reset in cleanup: React StrictMode runs mount → unmount →
+  // mount on the first render, so a cleanup-only effect would leave the ref
+  // stuck at `false` and every load would read as stale (the form-path e2e
+  // caught exactly that — the title never seeded).
+  useEffect(() => {
+    issueFormMountedRef.current = true;
+    return () => { issueFormMountedRef.current = false; };
+  }, []);
   const [isolate, setIsolate] = useState(true);
   const [baseRef, setBaseRef] = useState("");
   // Branch nomenclature for the selected project (loaded from the server;

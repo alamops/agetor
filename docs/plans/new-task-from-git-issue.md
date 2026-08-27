@@ -188,3 +188,12 @@ Assumptions (orchestrator, routine):
 - GHES: `gh issue view <url>` form handles non-github.com hosts; `glab` gets `--repo owner/name` (self-managed hosts rely on the user's glab config).
 
 Out of scope (different tickets): TUI task creation (none exists today); an agetor MCP "fetch issue" tool; GitHub timeline events (labels/cross-refs) in the thread; issue → task from a PR's linked issues.
+
+## 9. Outcome (2026-08-27)
+
+- **Gates:** grill (2 passes) and plan approval both answered by the owner.
+- **Commits on `feature/new-task-from-git-issue`** (base `4544fd5`): `372454b` wave 1 · `d66c5d7` wave 2 · `b05933f` tests · `968635f` review fixes · StrictMode mounted-ref fix (this commit).
+- **Review (opus, `code-review` skill):** 1 must-fix, 8 should-fix, 9 nits → 17 fixed; #11 (host check in the same-repo guard) skipped as moot — `providerRepoForDir` can't resolve GHES remotes today.
+- **Tests:** `bun run typecheck` green; `bun test` 3865 pass / 3 skip (pre-existing tmux-on-PATH skips) / 0 fail across 197 files; `e2e/issue-task.spec.ts` 3/3 (dialog path, form path, wrong-repo), `pr-merged-state` + `task-context-menu` 12/12. Run e2e with `bun node_modules/@playwright/test/cli.js test e2e/issue-task.spec.ts`.
+- **Post-review regression caught by e2e:** the New Task form's staleness guard used a cleanup-only "mounted" ref, which React StrictMode leaves permanently `false` (mount → unmount → mount) — every issue load read as stale and the title never seeded. Fixed by setting the ref in the effect body.
+- **Left as-is (different tickets):** `getGitHubPullDetail` still lacks the private-repo 404 hint (pre-existing; the issue path now has it); `src/bun/pull-detail.test.ts` still `rmSync`s the shared `AGETOR_DATA_DIR` in `afterAll` (fragile across files, hasn't bitten); `parseGitRemote`'s https fix also corrects GitLab subgroup HTTPS clones for the whole Git dialog (previously wrong owner/name) — verify against a real subgroup project when convenient.
