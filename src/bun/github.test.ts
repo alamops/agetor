@@ -1,5 +1,5 @@
 import { expect, test, beforeAll } from "bun:test";
-import { __githubInternals, getGitHubIssueThread, githubRepoFromRemoteForTest } from "./github.ts";
+import { __githubInternals, getGitHubIssueThread, getGitHubPullDetail, githubRepoFromRemoteForTest } from "./github.ts";
 import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
 import type { GitHubListItem } from "../shared/types.ts";
 
@@ -1510,7 +1510,7 @@ test("getGitHubIssueThread rejects a payload that carries a pull_request key, me
   }
 });
 
-test("getGitHubIssueThread maps a non-2xx GitHub response through privateRepoHint (unlike getGitHubPullDetail, left alone)", async () => {
+test("getGitHubIssueThread maps a non-2xx GitHub response through privateRepoHint", async () => {
   const dir = await makeGitHubRepo("acme", "widgets3");
   const mock = mockGitHubFetch([
     { match: "/repos/acme/widgets3/issues/404", status: 404, json: { message: "Not Found" } },
@@ -1536,6 +1536,38 @@ test("getGitHubIssueThread leaves a non-404 non-2xx response's message unchanged
   ]);
   try {
     const res = await getGitHubIssueThread({ dir, number: 500 });
+    expect(res).toEqual({ ok: false, error: "Internal Server Error" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubPullDetail maps a non-2xx GitHub response through privateRepoHint, mirroring getGitHubIssueThread", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets3c");
+  const mock = mockGitHubFetch([
+    { match: "/repos/acme/widgets3c/pulls/404", status: 404, json: { message: "Not Found" } },
+  ]);
+  try {
+    const res = await getGitHubPullDetail({ dir, number: 404 });
+    // GITHUB_TOKEN is set for this whole file (see beforeAll above), so the
+    // hadToken branch of privateRepoHint's message is the one that fires.
+    expect(res).toEqual({
+      ok: false,
+      error: "acme/widgets3c was not found on GitHub — if the repo is private, add a token for github.com in "
+        + "Settings → Git host tokens (the configured token cannot access it — check it belongs to the right account)",
+    });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitHubPullDetail leaves a non-404 non-2xx response's message unchanged", async () => {
+  const dir = await makeGitHubRepo("acme", "widgets3d");
+  const mock = mockGitHubFetch([
+    { match: "/repos/acme/widgets3d/pulls/500", status: 500, json: { message: "Internal Server Error" } },
+  ]);
+  try {
+    const res = await getGitHubPullDetail({ dir, number: 500 });
     expect(res).toEqual({ ok: false, error: "Internal Server Error" });
   } finally {
     mock.restore();

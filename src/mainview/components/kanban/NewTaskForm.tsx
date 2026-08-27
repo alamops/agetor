@@ -199,6 +199,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
   const [issueBusy, setIssueBusy] = useState(false);
   const [issueError, setIssueError] = useState<string | null>(null);
   const [issueLink, setIssueLink] = useState<{ url: string; number: number; snapshot: string } | null>(null);
+  // Non-blocking sibling of `issueError`: set when the issue itself loaded
+  // fine but its comment thread couldn't be fetched (`thread.commentsError`,
+  // e.g. GitLab's 401-to-anonymous `/notes`). Kept distinct from `issueError`
+  // (the load-failure path, which blocks the link) so a successfully-linked
+  // issue can still surface a heads-up without reading as a failure.
+  const [issueWarning, setIssueWarning] = useState<string | null>(null);
   // Soft-deleted harnesses are excluded from the picker and the default-
   // fallback logic. The full `harnesses` list is still used for
   // `selectedHarness` lookup so the resolved kind stays correct even for a
@@ -284,6 +290,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
       setPrompt((p) => withoutSnapshotParagraph(p));
     }
     setIssueError(null);
+    setIssueWarning(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workdir]);
 
@@ -594,6 +601,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
       || workdirRef.current.trim() !== dir;
     setIssueBusy(true);
     setIssueError(null);
+    setIssueWarning(null);
     try {
       const thread = await api.getGitHubIssueThread(dir, parsed.number);
       if (stale()) return;
@@ -610,6 +618,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
         snapshot: renderIssueThreadMarkdown(thread),
       });
       setIssueUrlDraft("");
+      if (thread.commentsError) setIssueWarning(thread.commentsError);
     } catch (e) {
       if (stale()) return;
       setIssueError(e instanceof Error ? e.message : String(e));
@@ -669,6 +678,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
     setIssueLink(null);
     setIssueUrlDraft("");
     setIssueError(null);
+    setIssueWarning(null);
     // Reset the branch field so the next task re-derives from its (now empty)
     // title and gets a fresh unique token; drop any manual override.
     setBranchDirty(false);
@@ -897,6 +907,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                       onClick={() => {
                         setIssueLink(null);
                         setPrompt((p) => withoutSnapshotParagraph(p));
+                        setIssueWarning(null);
                       }}
                       title="Unlink issue"
                       aria-label="Unlink issue"
@@ -905,6 +916,14 @@ export function NewTaskForm({ onSubmit, agents, harnesses, agentModels, harnessM
                       <X className="size-3" />
                     </button>
                   </div>
+                )}
+                {issueLink && issueWarning && (
+                  <p
+                    data-testid="issue-comments-warning"
+                    className="flex items-center gap-1 text-[10px] text-warning"
+                  >
+                    <AlertCircle className="size-3 shrink-0" /> Comments weren't fetched — {issueWarning}
+                  </p>
                 )}
               </div>
 

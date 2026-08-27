@@ -1960,7 +1960,11 @@ export async function getGitHubPullBlob(input: GetGitHubPullBlobInput): Promise<
  *  `listGitHubItems` use, so the UI's PR detail subpage renders an item
  *  shaped identically to one that arrived via a list fetch. Unlike the
  *  mutation endpoints above, this is a plain read — no token is required for
- *  a public repo (`fetchGitHub` already treats `token: null` as anonymous). */
+ *  a public repo (`fetchGitHub` already treats `token: null` as anonymous).
+ *  A non-2xx response runs through `privateRepoHint` (the same enrichment
+ *  `getGitHubIssueThread`/`listGitHubItems` use) so an unauthenticated
+ *  private-repo 404 points at Settings → Git host tokens instead of reading
+ *  as "this pull request doesn't exist"; any other status passes through. */
 export async function getGitHubPullDetail(input: GitHubItemNumberInput): Promise<GitHubIssueResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
@@ -1973,7 +1977,7 @@ export async function getGitHubPullDetail(input: GitHubItemNumberInput): Promise
   const res = await fetchGitHub(url, token, "application/vnd.github+json");
   if (!("status" in res)) return res;
   const json = await res.json().catch(() => null);
-  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  if (!res.ok) return { ok: false, error: privateRepoHint(res.status, apiError(json, res.status, res.statusText), repo, !!token) };
   const item = normalizeItem("pulls", json, input.dir);
   if (!item) return { ok: false, error: "GitHub returned an unexpected pull request response" };
   return { ok: true, item };
@@ -1993,10 +1997,10 @@ const ISSUE_THREAD_MAX_PAGES = 5;
  * pull requests (they share the same underlying object), so a payload
  * carrying a `pull_request` key is rejected before normalizing; the comments
  * loop follows `link: rel="next"` the same way `listGitHubPullCommits` does;
- * and — unlike `getGitHubPullDetail`, left alone — a 404 on the issue GET is
- * run through `privateRepoHint` (the same enrichment `listGitHubItems` uses)
- * so an unauthenticated private-repo 404 points at Settings → Git host
- * tokens instead of reading as "this issue doesn't exist". `refetchCommand`
+ * and a non-2xx response on the issue GET is run through `privateRepoHint`
+ * (the same enrichment `getGitHubPullDetail`/`listGitHubItems` use) so an
+ * unauthenticated private-repo 404 points at Settings → Git host tokens
+ * instead of reading as "this issue doesn't exist". `refetchCommand`
  * is always null here — the facade (`git-host.ts`) fills it in, since it
  * depends on whether `gh` is on PATH, not on anything this function knows.
  * `includeComments` (default `true`) lets a caller that only needs the item

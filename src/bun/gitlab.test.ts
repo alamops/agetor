@@ -403,9 +403,34 @@ test("authHint mentions the configured token can't access it when hadToken is tr
   expect(msg).toContain("cannot access it");
 });
 
-test("authHint passes non-401/404 statuses through unchanged", () => {
+test("authHint passes non-401/403/404 statuses through unchanged", () => {
   expect(authHint(500, "boom", REPO, false)).toBe("boom");
-  expect(authHint(403, "forbidden", REPO, true)).toBe("forbidden");
+  expect(authHint(502, "boom", REPO, true)).toBe("boom");
+});
+
+test("authHint enriches 401 with 'requires a token' wording, distinct from 404's 'not found' wording", () => {
+  const msg = authHint(401, "Unauthorized", REPO, false);
+  expect(msg).toContain("acme/app");
+  expect(msg).toContain("requires a token to read this (401)");
+  expect(msg).toContain("Settings → Git host tokens");
+  expect(msg).not.toContain("was not found on GitLab");
+});
+
+test("authHint's 401 wording says the configured token was rejected when hadToken is true", () => {
+  const msg = authHint(401, "Unauthorized", REPO, true);
+  expect(msg).toContain("the configured token was rejected");
+});
+
+test("authHint enriches 403 with 'denied access' wording", () => {
+  const msg = authHint(403, "forbidden", REPO, false);
+  expect(msg).toContain("acme/app");
+  expect(msg).toContain("denied access (403)");
+  expect(msg).toContain("Settings → Git host tokens");
+});
+
+test("authHint's 403 wording also says the configured token was rejected when hadToken is true", () => {
+  const msg = authHint(403, "forbidden", REPO, true);
+  expect(msg).toContain("the configured token was rejected");
 });
 
 test("authHint falls back to gitlab.com when remoteHost is empty", () => {

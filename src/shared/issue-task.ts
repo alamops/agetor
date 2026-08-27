@@ -46,6 +46,11 @@ function isCanonicalPositiveInt(s: string | undefined): s is string {
  *
  *  1. GitLab nested-group form: `/<group>/<subgroup...>/<project>/-/issues/<n>`
  *     — owner is the joined group path, repo is the last segment before `/-/`.
+ *     Also accepts GitLab's work-items view of the same issue,
+ *     `/-/work_items/<n>` (verified live 2026-08-27: a project's issues can
+ *     report `web_url` in either form) — same owner/repo derivation, provider
+ *     still `"gitlab"`. `normalizeIssueUrl` canonicalizes the work-items form
+ *     to the issues form, so the two compare equal everywhere that matters.
  *  2. Legacy GitLab (no `/-/`): `/<owner>/<repo>/issues/<n>` on a host whose
  *     name contains "gitlab".
  *  3. Bitbucket: `/<workspace>/<repo_slug>/issues/<n>[/anything]` on a host
@@ -75,11 +80,13 @@ export function parseIssueUrl(url: string | null | undefined): ParsedIssueUrl | 
   const host = parsed.hostname.toLowerCase();
   const segments = parsed.pathname.split("/").filter(Boolean);
 
-  // (1) GitLab nested-group form.
+  // (1) GitLab nested-group form — `/-/issues/<n>` or the work-items view of
+  // the same issue, `/-/work_items/<n>`.
   const dashIdx = segments.indexOf("-");
+  const dashMarker = segments[dashIdx + 1];
   if (
     dashIdx >= 2
-    && segments[dashIdx + 1] === "issues"
+    && (dashMarker === "issues" || dashMarker === "work_items")
     && isCanonicalPositiveInt(segments[dashIdx + 2])
   ) {
     const ownerRepo = segments.slice(0, dashIdx);
@@ -128,6 +135,14 @@ export function parseIssueUrl(url: string | null | undefined): ParsedIssueUrl | 
  * gone through `parseIssueUrl` when that matters. For a structural identity
  * check (case/host/number all folded, not just string equality of the
  * normalized form) prefer `sameIssueUrl`.
+ *
+ * Also canonicalizes GitLab's work-items view of an issue (`/-/work_items/N`,
+ * see `parseIssueUrl`) to the issues form (`/-/issues/N`) before the generic
+ * cut runs, so `task.issueUrl` and every display always use one canonical
+ * path regardless of which GitLab surface the URL was copied from. Anchored
+ * on the literal `-` path segment immediately preceding `work_items` (mirrors
+ * `parseIssueUrl`'s `dashIdx` check) so an unrelated repo/segment merely named
+ * "work_items" elsewhere in a non-GitLab path is never touched.
  */
 export function normalizeIssueUrl(url: string): string {
   let parsed: URL;
@@ -138,6 +153,10 @@ export function normalizeIssueUrl(url: string): string {
   }
   const host = parsed.host.toLowerCase().replace(/^www\./, "");
   const segments = parsed.pathname.split("/").filter(Boolean).map((s) => s.toLowerCase());
+  const dashIdx = segments.indexOf("-");
+  if (dashIdx >= 0 && segments[dashIdx + 1] === "work_items") {
+    segments[dashIdx + 1] = "issues";
+  }
   const issuesIdx = segments.indexOf("issues");
   const cut = issuesIdx >= 0 ? segments.slice(0, issuesIdx + 2) : segments;
   const path = cut.length > 0 ? `/${cut.join("/")}` : "";
@@ -191,14 +210,21 @@ export const ISSUE_PROMPT_INLINE_MAX_BYTES = 32_768;
  * snapshot file (`ISSUE_SNAPSHOT_FILENAME`) and attached as a task reference,
  * so the agent can read the full thread regardless of the prompt's inline
  * cap or a capped harness's argv limit.
+ *
+ * `commentsError` (see `GitHubIssueThreadResult`) — set when the comment
+ * thread couldn't be fetched (e.g. GitLab's 401-to-anonymous-`/notes`
+ * reality, see `getGitLabIssueThread`) — replaces the metadata bullet and the
+ * whole `## Comments` section with an honest "not fetched" note instead of
+ * claiming the issue has zero comments.
  */
 export function renderIssueThreadMarkdown(t: {
   repo: string;
   item: GitHubListItem;
   comments: GitHubComment[];
   truncated: boolean;
+  commentsError?: string | null;
 }): string {
-  const { repo, item, comments, truncated } = t;
+  const { repo, item, comments, truncated, commentsError } = t;
   const lines: string[] = [];
   lines.push(`# Issue #${item.number}: ${item.title}`);
   lines.push("");
@@ -211,19 +237,25 @@ export function renderIssueThreadMarkdown(t: {
   lines.push(`- Labels: ${item.labels.length ? item.labels.map((l) => l.name).join(", ") : "(none)"}`);
   lines.push(`- Created: ${item.createdAt}`);
   lines.push(`- Updated: ${item.updatedAt}`);
-  lines.push(`- Comments: ${comments.length}`);
+  lines.push(commentsError ? `- Comments: not fetched — ${commentsError}` : `- Comments: ${comments.length}`);
   if (truncated) lines.push(`- Thread truncated at the fetch cap`);
   lines.push("");
   lines.push(`## Description`);
   lines.push("");
   lines.push(item.body.trim() ? item.body : "_(no description)_");
   lines.push("");
-  lines.push(`## Comments (${comments.length})`);
-  for (const c of comments) {
+  if (commentsError) {
+    lines.push(`## Comments`);
     lines.push("");
-    lines.push(`### @${c.author?.login ?? "unknown"} — ${c.createdAt} — ${c.htmlUrl}`);
-    lines.push("");
-    lines.push(c.body);
+    lines.push(`_(comments were not fetched: ${commentsError})_`);
+  } else {
+    lines.push(`## Comments (${comments.length})`);
+    for (const c of comments) {
+      lines.push("");
+      lines.push(`### @${c.author?.login ?? "unknown"} — ${c.createdAt} — ${c.htmlUrl}`);
+      lines.push("");
+      lines.push(c.body);
+    }
   }
   return lines.join("\n");
 }
@@ -247,10 +279,21 @@ const SNAPSHOT_PARAGRAPH_PREFIX = "The complete thread snapshot";
  * file was actually written). Factored out as a stable, independently
  * testable unit — and so `withoutSnapshotParagraph` has one exact string
  * shape to strip back out.
+ *
+ * `commentsError` (additive 4th param, mirrors `GitHubIssueThreadResult`) —
+ * when set, the comments phrase becomes "(comments were not fetched)" instead
+ * of claiming "all 0 comments" are in the snapshot.
  */
-export function snapshotParagraph(n: number, commentCount: number, truncated: boolean): string {
-  return `${SNAPSHOT_PARAGRAPH_PREFIX} (issue body + all ${commentCount} comments`
-    + `${truncated ? ", truncated at the fetch cap" : ""}) is saved as `
+export function snapshotParagraph(
+  n: number,
+  commentCount: number,
+  truncated: boolean,
+  commentsError?: string | null,
+): string {
+  const commentsPhrase = commentsError
+    ? "issue body (comments were not fetched)"
+    : `issue body + all ${commentCount} comments${truncated ? ", truncated at the fetch cap" : ""}`;
+  return `${SNAPSHOT_PARAGRAPH_PREFIX} (${commentsPhrase}) is saved as `
     + `\`${ISSUE_SNAPSHOT_FILENAME(n)}\`, listed under "Referenced files/folders" below — `
     + "read it if the inline excerpt is cut short.";
 }
@@ -310,7 +353,7 @@ export function buildIssueTaskPrompt(
   t: GitHubIssueThreadResult & { snapshotAttached: boolean },
   opts?: { inlineMaxBytes?: number },
 ): { prompt: string; inlinedComments: number } {
-  const { repo, item, comments, truncated, refetchCommand, snapshotAttached } = t;
+  const { repo, item, comments, truncated, refetchCommand, snapshotAttached, commentsError } = t;
   const number = item.number;
   const provider = parseIssueUrl(item.htmlUrl)?.provider ?? "github";
   const inlineMaxBytes = opts?.inlineMaxBytes ?? ISSUE_PROMPT_INLINE_MAX_BYTES;
@@ -330,7 +373,7 @@ export function buildIssueTaskPrompt(
       + "Do not push. Leave the commit local — the user will review and push it themselves.",
   );
   if (snapshotAttached) {
-    paragraphs.push(snapshotParagraph(number, comments.length, truncated));
+    paragraphs.push(snapshotParagraph(number, comments.length, truncated, commentsError));
   }
   if (refetchCommand) {
     paragraphs.push(`To re-fetch the live thread later, run: \`${refetchCommand}\``);
@@ -357,7 +400,7 @@ export function buildIssueTaskPrompt(
     `Author: ${item.author ? `@${item.author.login}` : "unknown"}`,
     `Labels: ${item.labels.length ? item.labels.map((l) => l.name).join(", ") : "(none)"}`,
     `Opened: ${item.createdAt}`,
-    `${comments.length} comments`,
+    commentsError ? `Comments: not fetched — ${commentsError}` : `${comments.length} comments`,
   ];
   paragraphs.push(
     [
@@ -374,9 +417,12 @@ export function buildIssueTaskPrompt(
   // against the FULL prompt built so far, not just the thread section) stays
   // under budget. Omitted entirely for a thread with nothing to show (no
   // comments and nothing was cut off by the fetch cap) rather than emitting
-  // a bare "## Thread" heading with nothing under it.
+  // a bare "## Thread" heading with nothing under it — and omitted
+  // unconditionally when `commentsError` is set (the metadata line above
+  // already says why; `comments`/`truncated` are `[]`/`false` in that case
+  // anyway, so this guard is defense-in-depth, not load-bearing).
   let inlinedComments = 0;
-  if (comments.length > 0 || truncated) {
+  if (!commentsError && (comments.length > 0 || truncated)) {
     const base = paragraphs.join("\n\n");
     const threadLines: string[] = ["## Thread"];
     for (const c of comments) {

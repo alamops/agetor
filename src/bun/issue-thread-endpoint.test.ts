@@ -7,10 +7,11 @@
 // dynamically imported in beforeAll (both capture their config at import
 // time), and a bearer-token `authed()` helper drives every request.
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { makeGitHubRepo, mockGitHubFetch } from "./github-test-util.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Unique port, distinct from every other *.test.ts file's AGETOR_API_PORT.
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-issue-thread-endpoint-"));
@@ -41,17 +42,11 @@ afterAll(() => {
   server?.stop?.();
   if (ORIGINAL_GITHUB_TOKEN === undefined) delete process.env.GITHUB_TOKEN;
   else process.env.GITHUB_TOKEN = ORIGINAL_GITHUB_TOKEN;
-  // Deliberately does NOT rmSync(DATA_DIR, ...): `bun test` shares one process
-  // (and one module registry) across every *.test.ts file it's given, so
-  // db.ts — imported here dynamically — is a singleton for the whole run.
-  // Whichever *.test.ts file's AGETOR_DATA_DIR happened to be set when db.ts
-  // was FIRST imported is the one every other file's db.ts import actually
-  // shares (see draft-endpoint.test.ts / orchestrator-baseref.test.ts, which
-  // follow the same no-cleanup convention for this exact reason) — deleting
-  // this directory here would risk yanking the sqlite file out from under a
-  // still-open connection a later-loaded test file's `createTask`/`tasks.*`
-  // call depends on, surfacing as an opaque SQLITE_IOERR rather than this
-  // file's own tests failing.
+  // Uses rmTestDataDir instead of a bare rmSync(DATA_DIR, ...): see that
+  // helper's doc comment (test-data-dir.ts) for why an unconditional rm here
+  // would risk yanking the shared db.ts singleton's sqlite file out from
+  // under a still-open connection another *.test.ts file depends on.
+  rmTestDataDir(DATA_DIR);
   for (const dir of createdDirs) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -282,4 +277,31 @@ test("POST /tasks with a valid issueUrl for a workdir with no remote 400s with t
   expect(body.error).toContain(dir);
   expect(body.error).toContain("github");
   expect(body.error).toContain("no");
+});
+
+// ---------------------------------------------------------------------------
+// rmTestDataDir (test-data-dir.ts) — its coverage lives here rather than in a
+// dedicated file. Uses a synthetic `agetor.sqlite` marker in a throwaway dir
+// rather than asserting on DATA_DIR above: db.ts's module-level open happens
+// exactly once for the whole `bun test` process, in whichever *.test.ts
+// file's AGETOR_DATA_DIR happened to be active at that moment (see
+// rmTestDataDir's own doc comment) — that's reliably THIS file's DATA_DIR
+// when it runs alone or alongside just pull-detail.test.ts, but NOT
+// guaranteed when the full suite runs together (some alphabetically-earlier
+// file that also imports db.ts, e.g. draft-endpoint.test.ts, can win the
+// race instead) — so asserting against the real DATA_DIR here is racy across
+// the full suite. A synthetic marker file exercises the same guard logic
+// deterministically regardless of load order.
+// ---------------------------------------------------------------------------
+
+test("rmTestDataDir refuses a dir holding a sqlite file, removes a dir that doesn't", () => {
+  const withSqlite = mkdtempSync(path.join(tmpdir(), "agetor-test-data-dir-live-"));
+  writeFileSync(path.join(withSqlite, "agetor.sqlite"), "");
+  expect(rmTestDataDir(withSqlite)).toBe(false);
+  expect(existsSync(withSqlite)).toBe(true); // refused, not removed
+  rmSync(withSqlite, { recursive: true, force: true }); // this test's own cleanup
+
+  const empty = mkdtempSync(path.join(tmpdir(), "agetor-test-data-dir-empty-"));
+  expect(rmTestDataDir(empty)).toBe(true);
+  expect(existsSync(empty)).toBe(false);
 });

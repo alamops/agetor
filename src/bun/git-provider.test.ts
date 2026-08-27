@@ -14,6 +14,7 @@ import {
 } from "./git-provider.ts";
 import { setGitHubToken, tokenForHost } from "./github-tokens.ts";
 import { makeAliasGitHubRepo } from "./github-test-util.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // git-provider.ts resolves AGETOR_DATA_DIR lazily at call time (via
 // github-tokens.ts's resolveDataDir), so — like github-tokens.test.ts — it's
@@ -50,7 +51,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(dataDir, { recursive: true, force: true });
+  rmTestDataDir(dataDir);
   for (const key of ENV_KEYS) {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key];

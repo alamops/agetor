@@ -14,6 +14,7 @@ import {
 } from "./git-host.ts";
 import { makeGitHubRepo } from "./github-test-util.ts";
 import { mockGitHubFetch, type FetchMock } from "./github-test-util.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // git-host.ts dispatches through git-provider.ts's providerRepoForDir (a real
 // `git remote` shellout against a temp repo) and, for gitlab/bitbucket, through
@@ -44,7 +45,7 @@ beforeEach(() => {
 afterEach(() => {
   fetchMock?.restore();
   fetchMock = null;
-  rmSync(dataDir, { recursive: true, force: true });
+  rmTestDataDir(dataDir);
   for (const key of ENV_KEYS) {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key];

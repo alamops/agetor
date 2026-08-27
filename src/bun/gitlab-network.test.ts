@@ -2,12 +2,13 @@
 // exercising the real request/response path (URL, headers, body, pagination,
 // error mapping) via the fetch-mock harness reused from github-test-util.ts.
 // Complements gitlab.test.ts, which unit-tests the pure helpers in isolation.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { __clearApiHostCacheForTest } from "./git-provider.ts";
-import { cleanupSshStubs, gitlabMergeRequest, mockGitLabFetch, sampleAliasRepo, sampleRepo, sampleSelfHostedRepo, writeSshStub } from "./gitlab-test-util.ts";
+import { cleanupSshStubs, gitlabIssue, gitlabMergeRequest, gitlabNote, mockGitLabFetch, sampleAliasRepo, sampleRepo, sampleSelfHostedRepo, writeSshStub } from "./gitlab-test-util.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 import {
   __gitlabInternals,
   closeGitLabPull,
@@ -15,6 +16,7 @@ import {
   createGitLabIssue,
   createGitLabPull,
   createGitLabPullLineComment,
+  getGitLabIssueThread,
   getGitLabPullBlob,
   getGitLabPullChecks,
   getGitLabPullDefaults,
@@ -92,7 +94,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  rmSync(dataDir, { recursive: true, force: true });
+  rmTestDataDir(dataDir);
   if (ORIGINAL_DATA_DIR === undefined) delete process.env.AGETOR_DATA_DIR;
   else process.env.AGETOR_DATA_DIR = ORIGINAL_DATA_DIR;
   if (ORIGINAL_GITLAB_TOKEN === undefined) delete process.env.GITLAB_TOKEN;
@@ -909,6 +911,144 @@ test("a 401 response surfaces the authHint wording pointing at Settings", async 
     if (res.ok) throw new Error("expected failure");
     expect(res.error).toContain("Settings");
     expect(res.error).toContain("Git host tokens");
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// getGitLabIssueThread / listGitLabComments — anonymous-notes 401/403
+// degradation (F3, docs/plans/new-task-from-git-issue.md §10). Verified live
+// 2026-08-27 against a public gitlab.com project: `GET /issues/:iid` answers
+// 200 anonymously, but `GET /issues/:iid/notes` answers 401 even there — the
+// item itself is fine, only the comment thread needs a token. `getGitLabIssueThread`
+// degrades (returns `ok: true`, `comments: []`, `commentsError` set) rather
+// than failing the whole thread for 401/403; any other notes failure (5xx) or
+// a failure on the issue fetch itself still fails the thread as before.
+// ---------------------------------------------------------------------------
+
+test("getGitLabIssueThread degrades on a 401 from /notes with no token — commentsError explains why", async () => {
+  const repo = sampleRepo();
+  const savedToken = process.env.GITLAB_TOKEN;
+  delete process.env.GITLAB_TOKEN;
+  const mock = mockGitLabFetch([
+    { match: /\/projects\/acme%2Fapp\/issues\/44$/, json: gitlabIssue({ iid: 44 }) },
+    { match: "/issues/44/notes", status: 401, json: { message: "401 Unauthorized" } },
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 44);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.item.number).toBe(44);
+    expect(res.comments).toEqual([]);
+    expect(res.truncated).toBe(false);
+    expect(res.commentsError).toBeTruthy();
+    expect(res.commentsError).toContain("requires a token");
+    expect(res.commentsError).toContain("Settings → Git host tokens");
+  } finally {
+    mock.restore();
+    if (savedToken === undefined) delete process.env.GITLAB_TOKEN;
+    else process.env.GITLAB_TOKEN = savedToken;
+  }
+});
+
+test("getGitLabIssueThread's commentsError says the token was rejected when one was configured", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    { match: /\/projects\/acme%2Fapp\/issues\/45$/, json: gitlabIssue({ iid: 45 }) },
+    { match: "/issues/45/notes", status: 401, json: { message: "401 Unauthorized" } },
+  ]);
+  try {
+    // beforeAll sets GITLAB_TOKEN="test-token" for this whole file, so this
+    // request has a token — the rejected-token variant should appear instead
+    // of the no-token variant above.
+    const res = await getGitLabIssueThread(repo, 45);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.commentsError).toContain("rejected");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabIssueThread also degrades (not fails) on a 403 from /notes", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    { match: /\/projects\/acme%2Fapp\/issues\/46$/, json: gitlabIssue({ iid: 46 }) },
+    { match: "/issues/46/notes", status: 403, json: { message: "403 Forbidden" } },
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 46);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.comments).toEqual([]);
+    expect(res.commentsError).toContain("denied access");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabIssueThread still fails the whole thread on a non-401/403 notes failure (500)", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    { match: /\/projects\/acme%2Fapp\/issues\/47$/, json: gitlabIssue({ iid: 47 }) },
+    { match: "/issues/47/notes", status: 500, json: { message: "Internal Server Error" } },
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 47);
+    expect(res.ok).toBe(false);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("getGitLabIssueThread still fails outright when the issue itself 404s — unchanged 'not found' wording", async () => {
+  const repo = sampleRepo();
+  const mock = mockGitLabFetch([
+    { match: /\/projects\/acme%2Fapp\/issues\/48$/, status: 404, json: { message: "404 Project Not Found" } },
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 48);
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("was not found on GitLab");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("listGitLabComments surfaces the new 401 wording too (requires a token)", async () => {
+  const repo = sampleRepo();
+  const savedToken = process.env.GITLAB_TOKEN;
+  delete process.env.GITLAB_TOKEN;
+  const mock = mockGitLabFetch([
+    { match: "/issues/49/notes", status: 401, json: { message: "401 Unauthorized" } },
+  ]);
+  try {
+    const res = await listGitLabComments(repo, 49, "issues");
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("expected failure");
+    expect(res.error).toContain("requires a token");
+    expect(res.error).toContain("Settings → Git host tokens");
+  } finally {
+    mock.restore();
+    if (savedToken === undefined) delete process.env.GITLAB_TOKEN;
+    else process.env.GITLAB_TOKEN = savedToken;
+  }
+});
+
+test("a /-/work_items/N web_url on the issue fixture flows through normalizeItem untouched — normalization is a shared-layer (issue-task.ts) concern, not the adapter's", async () => {
+  const repo = sampleRepo();
+  const workItemsUrl = "https://gitlab.com/gitlab-com/gl-infra/production/-/work_items/44";
+  const mock = mockGitLabFetch([
+    { match: /\/projects\/acme%2Fapp\/issues\/50$/, json: gitlabIssue({ iid: 50, web_url: workItemsUrl }) },
+    { match: "/issues/50/notes", json: [gitlabNote({ id: 1 })] },
+  ]);
+  try {
+    const res = await getGitLabIssueThread(repo, 50);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.error);
+    expect(res.item.htmlUrl).toBe(workItemsUrl);
   } finally {
     mock.restore();
   }

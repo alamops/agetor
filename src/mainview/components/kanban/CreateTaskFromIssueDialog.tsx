@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertCircle, Bot, Loader2, X } from "lucide-react";
+import { AlertCircle, AlertTriangle, Bot, Loader2, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -194,10 +194,18 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
           {!loading && !error && !!context && !!thread && (
             <div className="space-y-3">
               <div className="rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-[11px] text-muted-foreground">
-                Creates a task on a fresh branch in its own worktree. The issue and its{" "}
-                {thread.comments.length} comment{thread.comments.length === 1 ? "" : "s"}{" "}
-                {thread.comments.length === 1 ? "is" : "are"} embedded in the prompt and saved as a
-                referenced snapshot file. The agent commits locally; it never pushes.
+                Creates a task on a fresh branch in its own worktree.{" "}
+                {thread.commentsError ? (
+                  "The issue is embedded in the prompt (comments couldn't be fetched) and saved as a referenced snapshot file."
+                ) : (
+                  <>
+                    The issue and its {thread.comments.length} comment
+                    {thread.comments.length === 1 ? "" : "s"}{" "}
+                    {thread.comments.length === 1 ? "is" : "are"} embedded in the prompt and saved as a
+                    referenced snapshot file.
+                  </>
+                )}{" "}
+                The agent commits locally; it never pushes.
                 {thread.truncated && " Thread truncated at the fetch cap."}
                 {thread.refetchCommand && (
                   <div className="mt-1">
@@ -205,6 +213,20 @@ export function CreateTaskFromIssueDialog({ open, onClose, context, onCreated }:
                   </div>
                 )}
               </div>
+
+              {thread.commentsError && (
+                <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-2 text-[11px] text-warning">
+                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                  <div>
+                    <div>Comments weren't fetched — {thread.commentsError}</div>
+                    {thread.refetchCommand && (
+                      <div className="mt-1">
+                        The agent can fetch them itself with the re-fetch command in the prompt.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
 
               <div className="space-y-1">
                 <label className="text-muted-foreground">Prompt</label>

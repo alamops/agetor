@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pullMergeability } from "./git-host.ts";
 import { makeGitHubRepo, mockGitHubFetch, type FetchMock } from "./github-test-util.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 
 // Facade-level dispatch tests for `pullMergeability` (src/bun/git-host.ts),
 // mirroring git-host.test.ts's idiom exactly: a real throwaway git repo per
@@ -36,7 +37,7 @@ beforeEach(() => {
 afterEach(() => {
   fetchMock?.restore();
   fetchMock = null;
-  rmSync(dataDir, { recursive: true, force: true });
+  rmTestDataDir(dataDir);
   for (const key of ENV_KEYS) {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key];

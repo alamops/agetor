@@ -318,6 +318,55 @@ test("cmdAdd: --issue is accepted case-insensitively against the thread's htmlUr
   expect(createTaskCalls[0]!.issueUrl).toBe(thread.item.htmlUrl);
 });
 
+test("cmdAdd: --issue whose thread has commentsError prints a terminal warning (non-JSON) and still creates a prompt mentioning 'not fetched'", async () => {
+  reset();
+  const commentsError =
+    "GitLab requires a token to read this (401) — add a token for gitlab.com in Settings → Git host tokens";
+  const thread = makeThread({ commentsError });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: false }));
+
+  expect(outputs.some((line) => line.includes("comments not fetched") && line.includes(commentsError))).toBe(true);
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.prompt).toContain("not fetched");
+  // Non-JSON mode never prints a `warnings` array.
+  expect(jsonOutputs).toEqual([]);
+});
+
+test("cmdAdd: --issue whose thread has commentsError folds it into --json's warnings array, not the plain-text path", async () => {
+  reset();
+  const commentsError = "the configured token was rejected";
+  const thread = makeThread({ commentsError });
+  const { client, createTaskCalls } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: true }));
+
+  expect(createTaskCalls.length).toBe(1);
+  expect(createTaskCalls[0]!.prompt).toContain("not fetched");
+  expect(jsonOutputs.length).toBe(1);
+  expect((jsonOutputs[0] as { warnings?: string[] }).warnings).toEqual([commentsError]);
+  // The warning text is never separately printed to stdout in JSON mode.
+  expect(outputs).toEqual([]);
+});
+
+test("cmdAdd: --issue whose thread has no commentsError omits `warnings` from the --json result entirely", async () => {
+  reset();
+  const thread = makeThread();
+  const { client } = makeClient(thread);
+  currentClient = client;
+  const dir = "/tmp/acme-widgets";
+
+  await cmdAdd(["--issue", thread.item.htmlUrl, "--workdir", dir], flags({ json: true }));
+
+  expect(jsonOutputs.length).toBe(1);
+  expect(jsonOutputs[0] as object).not.toHaveProperty("warnings");
+});
+
 // ── chooseAddPath (pure) ─────────────────────────────────────────────────
 //
 // `cmdAdd` always runs with the mocked `isTTY: false`, so it can't exercise

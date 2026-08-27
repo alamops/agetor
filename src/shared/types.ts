@@ -2301,6 +2301,12 @@ export interface GitHubIssueThreadResult {
   comments: GitHubComment[];
   truncated: boolean;
   refetchCommand: string | null;
+  /** Set when the item itself loaded but its comment thread couldn't be
+   *  fetched (e.g. GitLab answers 401 to anonymous `/notes` even on public
+   *  projects); `comments` is `[]` and `truncated` is `false` in that case.
+   *  Absent/null when comments were fetched (or skipped via
+   *  `includeComments: false`). */
+  commentsError?: string | null;
 }
 
 export type GitHubIssueThreadResponse = ({ ok: true } & GitHubIssueThreadResult) | { ok: false; error: string };

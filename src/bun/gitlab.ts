@@ -162,17 +162,31 @@ function apiError(body: unknown, status: number, statusText: string): string {
   return `${status} ${statusText}`;
 }
 
-/** Enriches a 401/404 with an actionable pointer to Settings, mirroring
+/** Enriches a 401/403/404 with an actionable pointer to Settings, mirroring
  *  github.ts's `privateRepoHint` wording — GitLab, like GitHub, answers 404
- *  (not 403) for a private project the caller can't see, and plain 401 for no
- *  credentials at all. Any other status is returned unchanged. Pure —
- *  unit-tested via `__gitlabInternals`. */
+ *  (not 403) for a private *project* the caller can't see at all, so that
+ *  case keeps the original "was not found" wording unchanged. 401 and 403 get
+ *  their own, more specific wording: verified live (2026-08-27) that GitLab
+ *  answers 401 to an anonymous `GET /notes` request even on a fully public
+ *  project's issue — the project itself is visible, but that sub-resource
+ *  demands a token — so "was not found" would be actively misleading there;
+ *  403 (a token that's valid but lacks permission) gets the same treatment.
+ *  Any other status is returned unchanged. Pure — unit-tested via
+ *  `__gitlabInternals`. */
 function authHint(status: number, message: string, repo: ProviderRepoInfo, hadToken: boolean): string {
-  if (status !== 401 && status !== 404) return message;
+  if (status !== 401 && status !== 403 && status !== 404) return message;
   const host = repo.remoteHost || GITLAB_CLOUD_HOST;
-  const base = `${repo.owner}/${repo.name} was not found on GitLab — if the project is private, add a token for ${host} in Settings → ${GIT_HOST_TOKENS_SECTION}`;
+  const slug = `${repo.owner}/${repo.name}`;
+  if (status === 404) {
+    const base = `${slug} was not found on GitLab — if the project is private, add a token for ${host} in Settings → ${GIT_HOST_TOKENS_SECTION}`;
+    return hadToken
+      ? `${base} (the configured token cannot access it — check it belongs to the right account)`
+      : base;
+  }
+  const verb = status === 401 ? "requires a token to read this (401)" : "denied access (403)";
+  const base = `${slug}: GitLab ${verb} — add a token for ${host} in Settings → ${GIT_HOST_TOKENS_SECTION}`;
   return hadToken
-    ? `${base} (the configured token cannot access it — check it belongs to the right account)`
+    ? `${base} (the configured token was rejected — check it belongs to the right account)`
     : base;
 }
 
@@ -875,12 +889,21 @@ export async function getGitLabPullBlob(
  * drains up to 5 pages of `sort=asc&order_by=created_at` notes, skipping
  * `system: true` notes (see `listGitLabComments`'s doc comment), and reports
  * `truncated: true` when a next page still existed after the 5-page cap.
+ *
+ * A non-OK response's HTTP status rides along on the failure shape (`status`)
+ * so `getGitLabIssueThread` can tell a 401/403 (notes require auth GitLab
+ * doesn't require for the item itself — see `authHint`'s doc comment) apart
+ * from every other failure and degrade the thread instead of failing it
+ * outright. `listGitLabComments`'s public return type drops the extra field
+ * (its `GitLabCommentsResponse` union has no slot for it) — TS's structural
+ * typing lets the wider value through unchanged since it's a variable
+ * reassignment, not an object literal.
  */
 async function collectGitLabNotes(
   repo: ProviderRepoInfo,
   number: number,
   kind: GitHubItemKind,
-): Promise<{ ok: true; comments: GitHubComment[]; truncated: boolean } | GitLabError> {
+): Promise<{ ok: true; comments: GitHubComment[]; truncated: boolean } | { ok: false; error: string; status?: number }> {
   if (!Number.isInteger(number) || number <= 0) return { ok: false, error: "item number must be positive" };
   const token = await gitlabToken(repo.remoteHost);
   const projectId = encodeProjectId(repo.owner, repo.name);
@@ -891,7 +914,7 @@ async function collectGitLabNotes(
     const res = await fetchGitLab(url, token);
     if (!("status" in res)) return res;
     const body = await res.json().catch(() => null);
-    if (!res.ok) return { ok: false, error: errorFrom(res, body, repo, !!token) };
+    if (!res.ok) return { ok: false, error: errorFrom(res, body, repo, !!token), status: res.status };
     if (!Array.isArray(body)) return { ok: false, error: "GitLab returned an unexpected notes response" };
     for (const raw of body) {
       if (raw && typeof raw === "object" && (raw as Record<string, unknown>).system === true) continue;
@@ -922,7 +945,22 @@ export async function listGitLabComments(repo: ProviderRepoInfo, number: number,
  *  always null here — the facade (`git-host.ts`) fills it in.
  *  `includeComments` (default `true`) mirrors `getGitHubIssueThread`'s flag —
  *  `false` skips `collectGitLabNotes` entirely and returns `comments: [],
- *  truncated: false`, for a caller ("View issue") that only needs the item. */
+ *  truncated: false`, for a caller ("View issue") that only needs the item.
+ *
+ *  **Anonymous-notes reality** (verified live 2026-08-27 against a public
+ *  gitlab.com project): `GET /issues/:iid` answers 200 with no credentials at
+ *  all, but `GET /issues/:iid/notes` answers 401 even on that same public
+ *  project — GitLab gates the notes/discussions endpoints behind auth
+ *  unconditionally, regardless of project visibility. Failing the whole
+ *  thread over that would make "paste a public issue URL, get a task" not
+ *  work for the overwhelmingly common anonymous/no-token case, so a
+ *  401/403 from `collectGitLabNotes` degrades the thread instead of failing
+ *  it: the issue item is still returned, `comments: []`, `truncated: false`,
+ *  and `commentsError` carries the (already Settings-hinted, via `authHint`)
+ *  reason — callers (`buildIssueTaskPrompt`/`renderIssueThreadMarkdown`,
+ *  `src/shared/issue-task.ts`) render that honestly instead of claiming the
+ *  issue has zero comments. Any other notes failure (5xx, network) still
+ *  fails the thread as before. */
 export async function getGitLabIssueThread(
   repo: ProviderRepoInfo,
   iid: number,
@@ -943,7 +981,20 @@ export async function getGitLabIssueThread(
   }
 
   const notes = await collectGitLabNotes(repo, iid, "issues");
-  if (!notes.ok) return notes;
+  if (!notes.ok) {
+    if (notes.status === 401 || notes.status === 403) {
+      return {
+        ok: true,
+        repo: `${repo.owner}/${repo.name}`,
+        item,
+        comments: [],
+        truncated: false,
+        refetchCommand: null,
+        commentsError: notes.error,
+      };
+    }
+    return notes;
+  }
 
   return {
     ok: true,

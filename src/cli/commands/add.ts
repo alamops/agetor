@@ -94,6 +94,13 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
   // `--workdir` (or cwd) since the thread fetch needs a repo to match against.
   let issueUrl: string | undefined;
   let issueSnapshot: string | undefined;
+  // Set from `thread.commentsError` when the issue loaded but its comment
+  // thread couldn't be fetched (e.g. GitLab's 401-to-anonymous `/notes` even
+  // on a public project) — surfaced as a terminal warning below, and folded
+  // into the `--json` result's `warnings` array instead of the plain-text
+  // print, matching the dialog/form's non-blocking treatment of the same
+  // signal.
+  let issueWarning: string | undefined;
   if (o.issue) {
     const parsed = parseIssueUrl(o.issue);
     if (!parsed) throw new Error("--issue: not a recognized GitHub/GitLab/Bitbucket issue URL");
@@ -110,6 +117,10 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
     prompt ??= buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt;
     issueUrl = thread.item.htmlUrl;
     issueSnapshot = renderIssueThreadMarkdown(thread);
+    if (thread.commentsError) {
+      issueWarning = thread.commentsError;
+      if (!flags.json) out(c.yellow("⚠ comments not fetched — " + thread.commentsError));
+    }
   }
 
   let input: CreateTaskInput | null;
@@ -147,7 +158,9 @@ export async function cmdAdd(args: string[], flags: Flags): Promise<void> {
       started = false;
     }
   }
-  if (flags.json) return printJson({ task, started });
+  if (flags.json) {
+    return printJson(issueWarning ? { task, started, warnings: [issueWarning] } : { task, started });
+  }
   out(
     `${c.green("✓")} created ${c.dim(task.id.slice(0, 8))} — ${task.title}` +
       (started ? c.cyan("  ▸ started") : ""),

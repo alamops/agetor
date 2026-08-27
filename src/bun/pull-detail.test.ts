@@ -25,6 +25,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { makeGitHubRepo, mockGitHubFetch, type FetchMock } from "./github-test-util.ts";
+import { rmTestDataDir } from "./test-data-dir.ts";
 import { sampleRepo, gitlabMergeRequest } from "./gitlab-test-util.ts";
 import { makeBitbucketRepo } from "./bitbucket-test-util.ts";
 import { getGitHubPullDetail } from "./github.ts";
@@ -91,7 +92,7 @@ afterEach(() => {
 
 afterAll(() => {
   server?.stop?.();
-  rmSync(ROUTE_DATA_DIR, { recursive: true, force: true });
+  rmTestDataDir(ROUTE_DATA_DIR);
 });
 
 async function git(args: string[], cwd: string): Promise<void> {
@@ -178,7 +179,7 @@ test("getGitHubPullDetail happy path normalizes the item and stamps sourcePath w
   expect(fetchMock.calls[0]!.method).toBe("GET");
 });
 
-test("getGitHubPullDetail maps a non-2xx GitHub response to {ok:false, error}", async () => {
+test("getGitHubPullDetail maps a non-2xx GitHub response through privateRepoHint", async () => {
   const dir = await makeGitHubRepo("acme", "widgets2");
   createdDirs.push(dir);
   fetchMock = mockGitHubFetch([
@@ -186,7 +187,13 @@ test("getGitHubPullDetail maps a non-2xx GitHub response to {ok:false, error}", 
   ]);
 
   const res = await getGitHubPullDetail({ dir, number: 9 });
-  expect(res).toEqual({ ok: false, error: "Not Found" });
+  // GITHUB_TOKEN is forced to "gh-test-token" in beforeEach above, so the
+  // hadToken branch of privateRepoHint's message is the one that fires.
+  expect(res).toEqual({
+    ok: false,
+    error: "acme/widgets2 was not found on GitHub — if the repo is private, add a token for github.com in "
+      + "Settings → Git host tokens (the configured token cannot access it — check it belongs to the right account)",
+  });
 });
 
 test("getGitHubPullDetail rejects a non-positive/non-integer number before any fetch", async () => {
