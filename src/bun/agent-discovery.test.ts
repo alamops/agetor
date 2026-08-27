@@ -2,7 +2,15 @@ import { test, expect } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { __testing, getDiscoveredModels, refreshDiscoveredModels } from "./agent-discovery.ts";
+import {
+  __testing,
+  getAllHarnessDiscoveredModels,
+  getDiscoveredModels,
+  getHarnessDiscoveredModels,
+  isDiscoveryReady,
+  refreshDiscoveredModels,
+  refreshFxHarnessModels,
+} from "./agent-discovery.ts";
 
 test("codex parser picks model ids out of a verbose listing", () => {
   const stdout = [
@@ -139,15 +147,19 @@ async function withFxBin(bin: string, run: () => Promise<void>): Promise<void> {
 }
 
 test("discoverFx (via refreshDiscoveredModels): valid `models --json` output populates the fx cache", async () => {
+  // Ids here are arbitrary parsing fixtures, not a claim about what's in any
+  // account's real catalog — swapped off the two ids that used to be here
+  // (`moonshotai/kimi-k3`, `openai/gpt-5.5`) since neither is guaranteed to
+  // still be curated/available; the test only cares that parsing round-trips.
   await withFxBin(
     plantFakeFxModelsBin(
-      `if [ "$1" = "models" ] && [ "$2" = "--json" ]; then echo '{"ids":["moonshotai/kimi-k3","openai/gpt-5.5"]}'; exit 0; fi\nexit 1`,
+      `if [ "$1" = "models" ] && [ "$2" = "--json" ]; then echo '{"ids":["zai/glm-5.3-flash","openai/gpt-5.2"]}'; exit 0; fi\nexit 1`,
     ),
     async () => {
       await refreshDiscoveredModels();
       expect(getDiscoveredModels("fx")).toEqual([
-        { id: "moonshotai/kimi-k3" },
-        { id: "openai/gpt-5.5" },
+        { id: "zai/glm-5.3-flash" },
+        { id: "openai/gpt-5.2" },
       ]);
     },
   );
@@ -178,4 +190,142 @@ test("discoverFx: binary missing entirely -> [] without throwing", async () => {
     await refreshDiscoveredModels();
     expect(getDiscoveredModels("fx")).toEqual([]);
   });
+});
+
+/* ── per-harness discovery (T3: harness-keyed cache, `ready`, serialization,
+ * `refreshFxHarnessModels`) ─────────────────────────────────────────────── */
+
+/** Plant a fake `fx` binary whose `models --json` output branches on `$HOME`
+ *  — used to prove two fx harnesses (different env overrides) get different,
+ *  account-scoped catalogs from the very same binary. */
+function plantHomeBranchingFxBin(homeForA: string): string {
+  return plantFakeFxModelsBin(
+    [
+      `if [ "$1" = "models" ] && [ "$2" = "--json" ]; then`,
+      `  if [ "$HOME" = "${homeForA}" ]; then echo '{"ids":["a/one"]}'; else echo '{"ids":["b/two"]}'; fi`,
+      `  exit 0`,
+      `fi`,
+      `exit 1`,
+    ].join("\n"),
+  );
+}
+
+test("isDiscoveryReady: false after resetForTests(), true after the first refresh settles — even a failing stub", async () => {
+  __testing.resetForTests();
+  expect(isDiscoveryReady()).toBe(false);
+  await withFxBin(plantFakeFxModelsBin(`exit 1`), async () => {
+    await refreshDiscoveredModels();
+  });
+  expect(isDiscoveryReady()).toBe(true);
+});
+
+test("refreshDiscoveredModels: per-harness fx targets each get their own account-scoped catalog", async () => {
+  __testing.resetForTests();
+  const homeA = mkdtempSync(path.join(tmpdir(), "agetor-fx-home-a-"));
+  const bin = plantHomeBranchingFxBin(homeA);
+  await withFxBin(bin, async () => {
+    await refreshDiscoveredModels({
+      fxHarnesses: [
+        { harnessId: "fx", env: {} },
+        { harnessId: "fx-2", env: { HOME: homeA } },
+      ],
+    });
+  });
+  // "fx-2" is probed under HOME=homeA -> the "a" branch.
+  expect(getHarnessDiscoveredModels("fx-2")).toEqual([{ id: "a/one" }]);
+  // "fx" has an empty env override -> probed under agetor's own process env
+  // (not homeA) -> the "b" branch, same as the kind-level built-in result.
+  expect(getHarnessDiscoveredModels("fx")).toEqual([{ id: "b/two" }]);
+  expect(getHarnessDiscoveredModels("fx")).toEqual(getDiscoveredModels("fx"));
+});
+
+test("refreshDiscoveredModels: pruning drops a harness absent from a later call; omitting opts leaves harnessCache untouched", async () => {
+  __testing.resetForTests();
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["x"]}'; exit 0`), async () => {
+    await refreshDiscoveredModels({
+      fxHarnesses: [
+        { harnessId: "fx", env: {} },
+        { harnessId: "fx-2", env: { HOME: "/nonexistent-agetor-fx-home-a" } },
+      ],
+    });
+    expect(getAllHarnessDiscoveredModels()).toEqual({
+      fx: [{ id: "x" }],
+      "fx-2": [{ id: "x" }],
+    });
+
+    // "fx-2" is absent from this call's target list -> pruned.
+    await refreshDiscoveredModels({ fxHarnesses: [{ harnessId: "fx", env: {} }] });
+    expect(getAllHarnessDiscoveredModels()).toEqual({ fx: [{ id: "x" }] });
+
+    // A call with no opts at all must leave harnessCache exactly as-is —
+    // it never enters the fxHarnesses branch, so nothing is pruned or added.
+    await refreshDiscoveredModels();
+    expect(getAllHarnessDiscoveredModels()).toEqual({ fx: [{ id: "x" }] });
+  });
+});
+
+test("refreshDiscoveredModels: overlapping calls serialize — the final harness cache reflects only the second call's targets", async () => {
+  __testing.resetForTests();
+  const bin = plantFakeFxModelsBin(`sleep 0.05; echo '{"ids":["x"]}'; exit 0`);
+  await withFxBin(bin, async () => {
+    // Fire both without awaiting between them — if the old `inflight`
+    // short-circuit were still in place, the second call would just return
+    // the first call's promise and its target list would never be probed.
+    const first = refreshDiscoveredModels({
+      fxHarnesses: [
+        { harnessId: "fx", env: {} },
+        { harnessId: "old-harness", env: {} },
+      ],
+    });
+    const second = refreshDiscoveredModels({
+      fxHarnesses: [
+        { harnessId: "fx", env: {} },
+        { harnessId: "new-harness", env: {} },
+      ],
+    });
+    await Promise.all([first, second]);
+  });
+  const all = getAllHarnessDiscoveredModels();
+  expect(Object.keys(all).sort()).toEqual(["fx", "new-harness"]);
+  expect(all["new-harness"]).toEqual([{ id: "x" }]);
+  expect(all["fx"]).toEqual([{ id: "x" }]);
+});
+
+test("refreshFxHarnessModels: updates only the targeted harness, leaving the kind cache alone when env is non-empty", async () => {
+  __testing.resetForTests();
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["seed"]}'; exit 0`), async () => {
+    await refreshDiscoveredModels({
+      fxHarnesses: [
+        { harnessId: "fx", env: {} },
+        { harnessId: "fx-2", env: { HOME: "/nonexistent-agetor-fx-home-b" } },
+      ],
+    });
+  });
+
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["updated"]}'; exit 0`), async () => {
+    const result = await refreshFxHarnessModels({
+      harnessId: "fx-2",
+      env: { HOME: "/nonexistent-agetor-fx-home-b" },
+    });
+    expect(result).toEqual([{ id: "updated" }]);
+  });
+
+  expect(getHarnessDiscoveredModels("fx-2")).toEqual([{ id: "updated" }]);
+  expect(getHarnessDiscoveredModels("fx")).toEqual([{ id: "seed" }]); // untouched
+  expect(getDiscoveredModels("fx")).toEqual([{ id: "seed" }]); // kind cache untouched (env wasn't empty)
+});
+
+test("refreshFxHarnessModels: an empty-env target also drift-corrects the kind-level cache (it IS the built-in account)", async () => {
+  __testing.resetForTests();
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["seed"]}'; exit 0`), async () => {
+    await refreshDiscoveredModels({ fxHarnesses: [{ harnessId: "fx", env: {} }] });
+  });
+  expect(getDiscoveredModels("fx")).toEqual([{ id: "seed" }]);
+
+  await withFxBin(plantFakeFxModelsBin(`echo '{"ids":["fresh"]}'; exit 0`), async () => {
+    const result = await refreshFxHarnessModels({ harnessId: "fx", env: {} });
+    expect(result).toEqual([{ id: "fresh" }]);
+  });
+  expect(getHarnessDiscoveredModels("fx")).toEqual([{ id: "fresh" }]);
+  expect(getDiscoveredModels("fx")).toEqual([{ id: "fresh" }]);
 });

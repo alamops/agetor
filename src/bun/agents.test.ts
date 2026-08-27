@@ -907,10 +907,10 @@ test("fx with defaults emits acp --model <id> --log-file <dataDir>/fx-logs/<runI
 });
 
 test("fx model id passes through verbatim — no translation table, unlike claude", () => {
-  const { cmd } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, model: "anthropic/claude-opus-5" });
+  const { cmd } = buildCommand(builtin("fx"), "hi", { ...fxDefaults, model: "openai/gpt-5.2" });
   const i = cmd.indexOf("--model");
   expect(i).toBeGreaterThan(-1);
-  expect(cmd[i + 1]).toBe("anthropic/claude-opus-5");
+  expect(cmd[i + 1]).toBe("openai/gpt-5.2");
 });
 
 test.each(["auto", "ask", "yolo"])(
